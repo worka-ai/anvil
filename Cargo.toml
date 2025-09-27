@@ -1,0 +1,71 @@
+[package]
+name = "anvil"
+authors = ["Courtney Robinson <courtney@worka.ai>"]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+rust-version = "1.89.0"
+
+[features]
+gcp = ["dep:prost-types", "tonic/tls-ring"]
+routeguide = ["dep:async-stream", "dep:tokio-stream", "dep:rand", "dep:serde", "dep:serde_json"]
+reflection = ["dep:tonic-reflection"]
+autoreload = ["dep:tokio-stream", "tokio-stream?/net", "dep:listenfd"]
+health = ["dep:tonic-health"]
+grpc-web = ["dep:tonic-web", "dep:bytes", "dep:http", "dep:hyper", "dep:hyper-util", "dep:tracing-subscriber", "dep:tower", "dep:tower-http", "tower-http?/cors"]
+tracing = ["dep:tracing", "dep:tracing-subscriber"]
+uds = ["dep:tokio-stream", "tokio-stream?/net", "dep:tower", "dep:hyper", "dep:hyper-util"]
+streaming = ["dep:tokio-stream", "dep:h2"]
+mock = ["dep:tokio-stream", "dep:tower", "dep:hyper-util"]
+json-codec = ["dep:serde", "dep:serde_json", "dep:bytes"]
+compression = ["tonic/gzip"]
+tls = ["tonic/tls-ring"]
+tls-rustls = ["dep:http", "dep:hyper", "dep:hyper-util", "dep:hyper-rustls", "dep:tower", "tower-http/util", "tower-http/add-extension", "dep:tokio-rustls"]
+tls-client-auth = ["tonic/tls-ring"]
+types = ["dep:tonic-types"]
+h2c = ["dep:hyper", "dep:tower", "dep:http", "dep:hyper-util"]
+cancellation = ["dep:tokio-util"]
+
+full = ["gcp", "routeguide", "reflection", "autoreload", "health", "grpc-web", "tracing", "uds", "streaming", "mock", "json-codec", "compression", "tls", "tls-rustls", "tls-client-auth", "types", "cancellation", "h2c", "tonic-prost"]
+default = ["full"]
+tonic-prost = ["dep:tonic-prost"]
+
+[dependencies]
+anyhow = { version = "1" }
+blake3 = "1.8.2"
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres"] }
+thiserror = { version = "2.0.16" }
+tokio = { version = "1.47.1", features = ["full"] }
+
+prost = "0.14.1"
+
+tonic = "0.14.2"
+tonic-web = { version = "0.14.2", optional = true }
+tonic-health = { version = "0.14.2", optional = true }
+tonic-reflection = { version = "0.14.2", optional = true }
+tonic-types = { version = "0.14.2", optional = true }
+tonic-prost = { version = "0.14.2", optional = true }
+lazy_static = { version = "1.5.0" }
+
+async-stream = { version = "0.3", optional = true }
+tokio-stream = { version = "0.1", optional = true }
+tokio-util = { version = "0.7.8", optional = true }
+tower = { version = "0.5", optional = true }
+rand = { version = "0.9", optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+tracing = { version = "0.1.16", optional = true }
+tracing-subscriber = { version = "0.3", features = ["tracing-log", "fmt"], optional = true }
+prost-types = { version = "0.14", optional = true }
+http = { version = "1", optional = true }
+hyper = { version = "1", optional = true }
+hyper-util = { version = "0.1.4", optional = true }
+listenfd = { version = "1.0", optional = true }
+bytes = { version = "1", optional = true }
+h2 = { version = "0.4", optional = true }
+tokio-rustls = { version = "0.26.1", optional = true, features = ["ring", "tls12"], default-features = false }
+hyper-rustls = { version = "0.27.0", features = ["http2", "ring", "tls12"], optional = true, default-features = false }
+tower-http = { version = "0.6", optional = true }
+
+[build-dependencies]
+tonic-prost-build = { version = "0.14.2" }

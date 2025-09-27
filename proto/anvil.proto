@@ -1,0 +1,158 @@
+syntax = "proto3";
+
+package anvil;
+
+// Bucket Service
+service BucketService {
+  rpc CreateBucket(CreateBucketRequest) returns (CreateBucketResponse);
+  rpc DeleteBucket(DeleteBucketRequest) returns (DeleteBucketResponse);
+  rpc ListBuckets(ListBucketsRequest) returns (ListBucketsResponse);
+  rpc GetBucketPolicy(GetBucketPolicyRequest) returns (GetBucketPolicyResponse);
+  rpc PutBucketPolicy(PutBucketPolicyRequest) returns (PutBucketPolicyResponse);
+}
+
+message CreateBucketRequest {
+  string bucket_name = 1;
+}
+
+message CreateBucketResponse {}
+
+message DeleteBucketRequest {
+  string bucket_name = 1;
+}
+
+message DeleteBucketResponse {}
+
+message ListBucketsRequest {}
+
+message Bucket {
+    string name = 1;
+    string creation_date = 2;
+}
+
+message ListBucketsResponse {
+    repeated Bucket buckets = 1;
+}
+
+message GetBucketPolicyRequest {
+    string bucket_name = 1;
+}
+
+message GetBucketPolicyResponse {
+    string policy_json = 1;
+}
+
+message PutBucketPolicyRequest {
+    string bucket_name = 1;
+    string policy_json = 2;
+}
+
+message PutBucketPolicyResponse {}
+
+
+// Object Service
+service ObjectService {
+  rpc PutObject(stream PutObjectRequest) returns (PutObjectResponse);
+  rpc GetObject(GetObjectRequest) returns (stream GetObjectResponse);
+  rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
+  rpc HeadObject(HeadObjectRequest) returns (HeadObjectResponse);
+  rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+  rpc InitiateMultipartUpload(InitiateMultipartRequest) returns (InitiateMultipartResponse);
+  rpc CompleteMultipartUpload(CompleteMultipartRequest) returns (CompleteMultipartResponse);
+}
+
+message PutObjectRequest {
+    oneof data {
+        ObjectMetadata metadata = 1;
+        bytes chunk = 2;
+    }
+}
+
+message ObjectMetadata {
+    string bucket_name = 1;
+    string object_key = 2;
+}
+
+message PutObjectResponse {
+    string etag = 1;
+    string version_id = 2;
+}
+
+message GetObjectRequest {
+    string bucket_name = 1;
+    string object_key = 2;
+    string version_id = 3; // Optional
+}
+
+message GetObjectResponse {
+    oneof data {
+        ObjectInfo metadata = 1;
+        bytes chunk = 2;
+    }
+}
+
+message ObjectInfo {
+    string content_type = 1;
+    int64 content_length = 2;
+}
+
+
+message DeleteObjectRequest {
+    string bucket_name = 1;
+    string object_key = 2;
+    string version_id = 3; // Optional
+}
+
+message DeleteObjectResponse {}
+
+message HeadObjectRequest {
+    string bucket_name = 1;
+    string object_key = 2;
+    string version_id = 3; // Optional
+}
+
+message HeadObjectResponse {
+    string etag = 1;
+    int64 size = 2;
+    string last_modified = 3;
+}
+
+message ListObjectsRequest {
+    string bucket_name = 1;
+    string prefix = 2;
+    string delimiter = 3;
+    string start_after = 4;
+    int32 max_keys = 5;
+}
+
+message ObjectSummary {
+    string key = 1;
+    int64 size = 2;
+    string etag = 3;
+    string last_modified = 4;
+}
+
+message ListObjectsResponse {
+    repeated ObjectSummary objects = 1;
+    repeated string common_prefixes = 2;
+}
+
+message InitiateMultipartRequest {
+    string bucket_name = 1;
+    string object_key = 2;
+}
+
+message InitiateMultipartResponse {
+    string upload_id = 1;
+}
+
+message CompleteMultipartRequest {
+    string bucket_name = 1;
+    string object_key = 2;
+    string upload_id = 3;
+}
+
+message CompleteMultipartResponse {
+    string etag = 1;
+    string version_id = 2;
+}
