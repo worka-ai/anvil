@@ -2,6 +2,8 @@
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 -- For hierarchical path queries
 CREATE EXTENSION IF NOT EXISTS ltree;
+-- For UUID generation
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 CREATE TABLE objects (
     id BIGSERIAL PRIMARY KEY,

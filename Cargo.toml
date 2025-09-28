@@ -33,7 +33,10 @@ tonic-prost = ["dep:tonic-prost"]
 [dependencies]
 anyhow = { version = "1" }
 blake3 = "1.8.2"
-sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "time", "uuid"] }
+deadpool-postgres = { version = "0.12.1", features = ["serde"] }
+refinery = { version = "0.8.12", features = ["tokio-postgres"] }
+refinery-macros = "0.8.12"
+tokio-postgres = { version = "0.7.11", features = ["with-time-0_3", "with-uuid-1", "with-serde_json-1"] }
 thiserror = { version = "2.0.16" }
 tokio = { version = "1.47.1", features = ["full"] }
 
