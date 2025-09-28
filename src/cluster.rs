@@ -141,24 +141,40 @@ pub async fn run_gossip(
             }
 
             event = swarm.select_next_some() => {
-                match event {
-                    SwarmEvent::NewListenAddr { address, .. } => {
-                        println!("[GOSSIP] Listening on {address}");
-                        let mut state = cluster_state.write().await;
-                        let info = state.entry(local_peer_id).or_insert_with(|| PeerInfo {
-                            p2p_addrs: Vec::new(),
-                            grpc_addr: grpc_addr.clone(),
-                        });
-                        let addr_string = address.to_string();
-                        if !info.p2p_addrs.contains(&addr_string) {
-                            info.p2p_addrs.push(addr_string);
-                        }
-                    }
-                    SwarmEvent::Behaviour(ClusterEvent::Gossipsub(gossipsub::Event::Message {
-                        message,
-                        ..
-                    })) => {
-                        if let Ok(cluster_message) = serde_json::from_slice::<ClusterMessage>(&message.data) {
+                                match event {
+                                    SwarmEvent::NewListenAddr { address, .. } => {
+                                        println!("[GOSSIP] Listening on {address}");
+                                        let mut state = cluster_state.write().await;
+                                        let info = state.entry(local_peer_id).or_insert_with(|| PeerInfo {
+                                            p2p_addrs: Vec::new(),
+                                            grpc_addr: grpc_addr.clone(),
+                                        });
+                                        let addr_string = address.to_string();
+                                        if !info.p2p_addrs.contains(&addr_string) {
+                                            info.p2p_addrs.push(addr_string);
+                                        }
+                                    }
+                                    SwarmEvent::Behaviour(ClusterEvent::Mdns(mdns::Event::Discovered(list))) => {
+                                        let mut state = cluster_state.write().await;
+                                        for (peer_id, multiaddr) in list {
+                                            println!("[GOSSIP] mDNS discovered: {peer_id}");
+                                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                                            // We don't know the gRPC port from mDNS, so we can't fully populate PeerInfo here.
+                                            // The subsequent gossip message from this peer will provide it.
+                                        }
+                                    }
+                                    SwarmEvent::Behaviour(ClusterEvent::Mdns(mdns::Event::Expired(list))) => {
+                                        for (peer_id, _multiaddr) in list {
+                                            println!("[GOSSIP] mDNS expired: {peer_id}");
+                                            swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                                            // Note: We don't remove from the cluster_state here, as the peer might just be temporarily offline.
+                                            // A proper implementation would have a timeout/liveness check.
+                                        }
+                                    }
+                                    SwarmEvent::Behaviour(ClusterEvent::Gossipsub(gossipsub::Event::Message {
+                                        message,
+                                        .. 
+                                    })) => {                        if let Ok(cluster_message) = serde_json::from_slice::<ClusterMessage>(&message.data) {
                             println!("[GOSSIP] Received cluster message from peer: {}", cluster_message.peer_id);
                             let mut state = cluster_state.write().await;
                             let info = state.entry(cluster_message.peer_id).or_insert_with(|| PeerInfo {

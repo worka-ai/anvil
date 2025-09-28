@@ -89,7 +89,7 @@ impl BucketService for AppState {
         let tenant_id = 1;
 
         self.db
-            .create_bucket(tenant_id, &req.bucket_name, "default-region")
+            .create_bucket(tenant_id, &req.bucket_name, &req.region)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 

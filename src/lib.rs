@@ -27,12 +27,12 @@ pub mod anvil_api {
     tonic::include_proto!("anvil");
 }
 
-mod migrations {
+pub mod migrations {
     use refinery_macros::embed_migrations;
     embed_migrations!("./migrations_global");
 }
 
-mod regional_migrations {
+pub mod regional_migrations {
     use refinery_macros::embed_migrations;
     embed_migrations!("./migrations_regional");
 }
@@ -113,7 +113,7 @@ pub async fn run(grpc_addr: SocketAddr) -> Result<()> {
     Ok(())
 }
 
-fn create_pool(db_url: &str) -> Result<Pool> {
+pub fn create_pool(db_url: &str) -> Result<Pool> {
     let pg_config = tokio_postgres::Config::from_str(db_url)?;
     let mgr_config = ManagerConfig {
         recycling_method: RecyclingMethod::Fast,
@@ -122,7 +122,7 @@ fn create_pool(db_url: &str) -> Result<Pool> {
     Pool::builder(mgr).build().map_err(Into::into)
 }
 
-async fn run_migrations(db_url: &str, mut runner: refinery::Runner, table_name: &str) -> Result<()> {
+pub async fn run_migrations(db_url: &str, mut runner: refinery::Runner, table_name: &str) -> Result<()> {
     let (mut client, connection) = tokio_postgres::connect(db_url, NoTls).await?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
