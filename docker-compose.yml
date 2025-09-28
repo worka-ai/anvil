@@ -1,0 +1,27 @@
+version: "3.9"
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: worka
+      POSTGRES_PASSWORD: worka
+      POSTGRES_DB: worka
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  anvil:
+    build: .
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgres://worka:worka@postgres:5432/worka
+      RUST_LOG: info
+    ports:
+      - "50051:50051"
+    volumes:
+      - workadata:/data
+
+volumes:
+  pgdata: {}
+  workadata: {}
