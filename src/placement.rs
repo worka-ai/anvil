@@ -40,6 +40,7 @@ impl PlacementManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::PeerInfo;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -54,7 +55,13 @@ mod tests {
         {
             let mut state = cluster_state.write().await;
             for peer in &peers {
-                state.insert(peer.clone(), vec![]);
+                state.insert(
+                    peer.clone(),
+                    PeerInfo {
+                        p2p_addrs: vec![],
+                        grpc_addr: String::new(),
+                    },
+                );
             }
         }
 

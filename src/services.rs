@@ -137,17 +137,13 @@ impl ObjectService for AppState {
             return Err(Status::unavailable("Not enough nodes to store object"));
         }
 
-        // This is a temporary hack for the test environment. In a real system,
-        // we would discover the gRPC address from the peer's metadata.
-        let node_grpc_addresses: Vec<String> = (0..nodes.len())
-            .map(|i| format!("http://127.0.0.1:{}", 50070 + i))
-            .collect();
-
         // 3. Create clients for each target node
         let mut clients = Vec::new();
-        for addr in &node_grpc_addresses {
-            let client = internal_anvil_service_client::InternalAnvilServiceClient::connect(addr.clone()).await
-                .map_err(|e| Status::internal(format!("Failed to connect to peer: {}", e)))?;
+        let cluster_map = self.cluster.read().await;
+        for peer_id in &nodes {
+            let peer_info = cluster_map.get(peer_id).ok_or_else(|| Status::internal("Placement selected a peer that is not in the cluster state"))?;
+            let client = internal_anvil_service_client::InternalAnvilServiceClient::connect(peer_info.grpc_addr.clone()).await
+                .map_err(|e| Status::internal(format!("Failed to connect to peer {}: {}", peer_id, e)))?;
             clients.push(client);
         }
 

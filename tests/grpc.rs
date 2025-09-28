@@ -86,13 +86,14 @@ async fn test_distributed_put_and_get() {
         let state = states.pop().unwrap();
         let swarm = swarms.pop().unwrap();
         let grpc_addr = format!("127.0.0.1:{}", base_grpc_port + i).parse().unwrap();
+        let grpc_addr_str = format!("http://127.0.0.1:{}", base_grpc_port + i);
         tokio::spawn(async move {
             let server = Server::builder()
                 .add_service(ObjectServiceServer::new(state.clone()))
                 .add_service(BucketServiceServer::new(state.clone()))
                 .add_service(InternalAnvilServiceServer::new(state.clone()))
                 .serve(grpc_addr);
-            let gossip = run_gossip(swarm, state.cluster);
+            let gossip = run_gossip(swarm, state.cluster, grpc_addr_str);
             let _ = tokio::try_join!(async { server.await.map_err(anyhow::Error::from) }, async {
                 gossip.await.map_err(anyhow::Error::from)
             },);

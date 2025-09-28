@@ -15,15 +15,23 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
+// Rich information about a peer in the cluster.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerInfo {
+    pub p2p_addrs: Vec<String>,
+    pub grpc_addr: String,
+}
+
 // The shared state of the cluster membership.
-pub type ClusterState = Arc<RwLock<HashMap<PeerId, Vec<String>>>>; // PeerId -> Multiaddrs
+pub type ClusterState = Arc<RwLock<HashMap<PeerId, PeerInfo>>>;
 
 // The message format for gossip-based cluster membership.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterMessage {
     #[serde(with = "serde_peer_id")]
     pub peer_id: PeerId,
-    pub addrs: Vec<String>,
+    pub p2p_addrs: Vec<String>,
+    pub grpc_addr: String,
 }
 
 // A module for custom PeerId serialization
@@ -100,7 +108,11 @@ pub async fn create_swarm() -> Result<Swarm<ClusterBehaviour>> {
 }
 
 // Function to configure and run the gossip service.
-pub async fn run_gossip(mut swarm: Swarm<ClusterBehaviour>, cluster_state: ClusterState) -> Result<()> {
+pub async fn run_gossip(
+    mut swarm: Swarm<ClusterBehaviour>,
+    cluster_state: ClusterState,
+    grpc_addr: String,
+) -> Result<()> {
     let topic = Topic::new("anvil-cluster");
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
@@ -110,14 +122,15 @@ pub async fn run_gossip(mut swarm: Swarm<ClusterBehaviour>, cluster_state: Clust
     loop {
         tokio::select! {
             _ = broadcast_interval.tick() => {
-                let listeners = swarm.listeners().map(|addr| addr.to_string()).collect::<Vec<_>>();
-                if listeners.is_empty() {
+                let p2p_addrs = swarm.listeners().map(|addr| addr.to_string()).collect::<Vec<_>>();
+                if p2p_addrs.is_empty() {
                     continue;
                 }
 
                 let message = ClusterMessage {
                     peer_id: local_peer_id,
-                    addrs: listeners,
+                    p2p_addrs: p2p_addrs.clone(),
+                    grpc_addr: grpc_addr.clone(),
                 };
 
                 if let Ok(encoded_message) = serde_json::to_vec(&message) {
@@ -132,30 +145,13 @@ pub async fn run_gossip(mut swarm: Swarm<ClusterBehaviour>, cluster_state: Clust
                     SwarmEvent::NewListenAddr { address, .. } => {
                         println!("[GOSSIP] Listening on {address}");
                         let mut state = cluster_state.write().await;
-                        let addrs = state.entry(local_peer_id).or_default();
+                        let info = state.entry(local_peer_id).or_insert_with(|| PeerInfo {
+                            p2p_addrs: Vec::new(),
+                            grpc_addr: grpc_addr.clone(),
+                        });
                         let addr_string = address.to_string();
-                        if !addrs.contains(&addr_string) {
-                            addrs.push(addr_string);
-                        }
-                    }
-                    SwarmEvent::Behaviour(ClusterEvent::Mdns(mdns::Event::Discovered(list))) => {
-                        let mut state = cluster_state.write().await;
-                        for (peer_id, multiaddr) in list {
-                            println!("[GOSSIP] mDNS discovered: {peer_id}");
-                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                            let addrs = state.entry(peer_id).or_default();
-                            let addr_string = multiaddr.to_string();
-                            if !addrs.contains(&addr_string) {
-                                addrs.push(addr_string);
-                            }
-                        }
-                    }
-                    SwarmEvent::Behaviour(ClusterEvent::Mdns(mdns::Event::Expired(list))) => {
-                        let mut state = cluster_state.write().await;
-                        for (peer_id, _multiaddr) in list {
-                            println!("[GOSSIP] mDNS expired: {peer_id}");
-                            swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
-                            state.remove(&peer_id);
+                        if !info.p2p_addrs.contains(&addr_string) {
+                            info.p2p_addrs.push(addr_string);
                         }
                     }
                     SwarmEvent::Behaviour(ClusterEvent::Gossipsub(gossipsub::Event::Message {
@@ -165,10 +161,13 @@ pub async fn run_gossip(mut swarm: Swarm<ClusterBehaviour>, cluster_state: Clust
                         if let Ok(cluster_message) = serde_json::from_slice::<ClusterMessage>(&message.data) {
                             println!("[GOSSIP] Received cluster message from peer: {}", cluster_message.peer_id);
                             let mut state = cluster_state.write().await;
-                            let addrs = state.entry(cluster_message.peer_id).or_default();
-                            for addr in cluster_message.addrs {
-                                if !addrs.contains(&addr) {
-                                    addrs.push(addr);
+                            let info = state.entry(cluster_message.peer_id).or_insert_with(|| PeerInfo {
+                                p2p_addrs: Vec::new(),
+                                grpc_addr: cluster_message.grpc_addr,
+                            });
+                            for addr in cluster_message.p2p_addrs {
+                                if !info.p2p_addrs.contains(&addr) {
+                                    info.p2p_addrs.push(addr);
                                 }
                             }
                         }
