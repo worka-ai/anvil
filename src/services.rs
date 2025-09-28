@@ -17,22 +17,35 @@ impl InternalAnvilService for AppState {
         request: Request<tonic::Streaming<PutShardRequest>>,
     ) -> Result<Response<PutShardResponse>, Status> {
         let mut stream = request.into_inner();
-        let mut object_hash = String::new();
+        let mut upload_id = String::new();
         let mut shard_index = 0;
         let mut data = Vec::new();
 
+        // In a real implementation, we would stream this to disk for large shards
         while let Some(Ok(chunk)) = stream.next().await {
-            object_hash = chunk.object_hash;
+            upload_id = chunk.upload_id;
             shard_index = chunk.shard_index;
             data.extend_from_slice(&chunk.data);
         }
 
         self.storage
-            .store_shard(&object_hash, shard_index, &data)
+            .store_temp_shard(&upload_id, shard_index, &data)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(PutShardResponse {}))
+    }
+
+    async fn commit_shard(
+        &self,
+        request: Request<CommitShardRequest>,
+    ) -> Result<Response<CommitShardResponse>, Status> {
+        let req = request.into_inner();
+        self.storage
+            .commit_shard(&req.upload_id, req.shard_index, &req.final_object_hash)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(CommitShardResponse {}))
     }
 
     async fn get_shard(
@@ -122,7 +135,7 @@ impl ObjectService for AppState {
     ) -> Result<Response<PutObjectResponse>, Status> {
         let mut stream = request.into_inner();
 
-        // 1. Get metadata
+        // 1. Get metadata and generate Upload ID
         let (bucket_name, object_key) = match stream.next().await {
             Some(Ok(chunk)) => match chunk.data {
                 Some(put_object_request::Data::Metadata(meta)) => (meta.bucket_name, meta.object_key),
@@ -130,6 +143,7 @@ impl ObjectService for AppState {
             },
             _ => return Err(Status::invalid_argument("Empty stream")),
         };
+        let upload_id = uuid::Uuid::new_v4().to_string();
 
         // 2. Determine placement
         let nodes = self.placer.calculate_placement(&object_key, &self.cluster, self.sharder.total_shards()).await;
@@ -147,7 +161,7 @@ impl ObjectService for AppState {
             clients.push(client);
         }
 
-        // 4. Stream data, shard it, and distribute it
+        // 4. Stream data, shard it, and distribute it to temporary locations
         let mut overall_hasher = blake3::Hasher::new();
         let mut total_bytes = 0;
         let stripe_size = 1024 * 64; // 64KB per shard in a stripe
@@ -163,13 +177,13 @@ impl ObjectService for AppState {
                 while buffer.len() >= stripe_size * data_shards_count {
                     let stripe_data = buffer.drain(..stripe_size * data_shards_count).collect::<Vec<_>>();
                     let mut shards: Vec<Vec<u8>> = stripe_data.chunks(stripe_size).map(|c| c.to_vec()).collect();
+                    shards.resize(self.sharder.total_shards(), vec![0; stripe_size]);
                     self.sharder.encode(&mut shards).map_err(|e| Status::internal(e.to_string()))?;
 
-                    let object_hash_for_shard = overall_hasher.finalize().to_hex().to_string();
                     let mut futures = Vec::new();
                     for (i, shard_data) in shards.into_iter().enumerate() {
                         let request = PutShardRequest {
-                            object_hash: object_hash_for_shard.clone(),
+                            upload_id: upload_id.clone(),
                             shard_index: i as u32,
                             data: shard_data,
                         };
@@ -182,14 +196,45 @@ impl ObjectService for AppState {
             }
         }
 
-        // Handle final partial stripe (simplified)
+        // Handle final partial stripe
         if !buffer.is_empty() {
-            // ... padding and final stripe distribution logic would go here ...
+            let final_stripe_size = stripe_size * data_shards_count;
+            buffer.resize(final_stripe_size, 0);
+
+            let mut shards: Vec<Vec<u8>> = buffer.chunks(stripe_size).map(|c| c.to_vec()).collect();
+            shards.resize(self.sharder.total_shards(), vec![0; stripe_size]);
+            self.sharder.encode(&mut shards).map_err(|e| Status::internal(e.to_string()))?;
+
+            let mut futures = Vec::new();
+            for (i, shard_data) in shards.into_iter().enumerate() {
+                let request = PutShardRequest {
+                    upload_id: upload_id.clone(),
+                    shard_index: i as u32,
+                    data: shard_data,
+                };
+                let mut client = clients[i].clone();
+                let request_stream = tokio_stream::iter(vec![request]);
+                futures.push(async move { client.put_shard(request_stream).await });
+            }
+            futures::future::try_join_all(futures).await.map_err(|e| Status::internal(format!("Failed to send final shard: {}", e)))?;
         }
 
         let content_hash = overall_hasher.finalize().to_hex().to_string();
 
-        // 5. Commit metadata to DB
+        // 5. Commit the shards
+        let mut futures = Vec::new();
+        for (i, client) in clients.into_iter().enumerate() {
+            let mut client = client.clone();
+            let request = CommitShardRequest {
+                upload_id: upload_id.clone(),
+                shard_index: i as u32,
+                final_object_hash: content_hash.clone(),
+            };
+            futures.push(async move { client.commit_shard(request).await });
+        }
+        futures::future::try_join_all(futures).await.map_err(|e| Status::internal(format!("Failed to commit shard: {}", e)))?;
+
+        // 6. Commit metadata to DB
         let bucket = self.db.get_bucket_by_name(1, &bucket_name).await.unwrap().unwrap();
         let object = self.db.create_object(bucket.id, &object_key, &content_hash, total_bytes as i64, &content_hash).await.unwrap();
 
@@ -224,7 +269,7 @@ impl ObjectService for AppState {
                 content_length: object.size,
             };
             if tx.send(Ok(GetObjectResponse { data: Some(get_object_response::Data::Metadata(info)) })).await.is_err() {
-                return;
+                return; // Client disconnected
             }
 
             // 3. On-the-fly reconstruction and streaming
@@ -236,22 +281,29 @@ impl ObjectService for AppState {
             }
 
             if app_state.sharder.reconstruct(&mut shards).is_ok() {
+                let mut full_data = Vec::new();
                 let data_shards = &shards[..app_state.sharder.data_shards()];
-                // This is simplified: we assume all shards have the same length
-                if let Some(Some(first_shard)) = data_shards.first() {
-                    let shard_len = first_shard.len();
-                    for i in 0..shard_len {
-                        let mut stripe = Vec::with_capacity(app_state.sharder.data_shards());
-                        for shard in data_shards {
-                            if let Some(shard_data) = shard {
-                                stripe.push(shard_data[i]);
-                            }
-                        }
-                        if tx.send(Ok(GetObjectResponse { data: Some(get_object_response::Data::Chunk(stripe)) })).await.is_err() {
-                            break;
-                        }
+                for data_shard_opt in data_shards {
+                    if let Some(shard_data) = data_shard_opt {
+                        full_data.extend_from_slice(shard_data);
+                    } else {
+                        let _ = tx.send(Err(Status::internal("Failed to reconstruct data: a data shard was missing after successful reconstruction call."))).await;
+                        return;
                     }
                 }
+
+                // Truncate to the original object size to remove padding
+                full_data.truncate(object.size as usize);
+
+                // Stream the result back in chunks
+                for chunk in full_data.chunks(1024 * 64) { // 64KB chunks
+                    if tx.send(Ok(GetObjectResponse { data: Some(get_object_response::Data::Chunk(chunk.to_vec())) })).await.is_err() {
+                        // Client disconnected
+                        break;
+                    }
+                }
+            } else {
+                let _ = tx.send(Err(Status::internal("Failed to reconstruct data from shards."))).await;
             }
         });
 

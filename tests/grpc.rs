@@ -150,6 +150,35 @@ async fn test_distributed_put_and_get() {
         .into_inner();
     let object_hash = response.etag;
 
+    // 2. Get the object back and verify its contents
+    println!("\n--- Getting object back ---\n");
+    let get_request = anvil_api::GetObjectRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: object_key.clone(),
+        version_id: response.version_id.clone(),
+    };
+
+    let mut response_stream = object_client
+        .get_object(get_request)
+        .await
+        .unwrap()
+        .into_inner();
+
+    let mut downloaded_data = Vec::new();
+    if let Some(Ok(first_chunk)) = response_stream.next().await {
+        if let Some(anvil_api::get_object_response::Data::Metadata(_)) = first_chunk.data {
+            // Metadata received, now get chunks
+            while let Some(Ok(chunk)) = response_stream.next().await {
+                if let Some(anvil_api::get_object_response::Data::Chunk(bytes)) = chunk.data {
+                    downloaded_data.extend_from_slice(&bytes);
+                }
+            }
+        }
+    }
+
+    assert_eq!(downloaded_data, data, "Downloaded data does not match original data");
+    println!("--- Object content verified successfully ---\n");
+
     tokio::time::sleep(std::time::Duration::from_secs(1)).await; // Give time for shards to be written
 
     let mut shards_found = 0;

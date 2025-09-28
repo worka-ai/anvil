@@ -161,15 +161,24 @@ message CompleteMultipartResponse {
 service InternalAnvilService {
   rpc PutShard(stream PutShardRequest) returns (PutShardResponse);
   rpc GetShard(GetShardRequest) returns (stream GetShardResponse);
+  rpc CommitShard(CommitShardRequest) returns (CommitShardResponse);
 }
 
 message PutShardRequest {
-    string object_hash = 1;
+    string upload_id = 1;
     uint32 shard_index = 2;
     bytes data = 3;
 }
 
 message PutShardResponse {}
+
+message CommitShardRequest {
+    string upload_id = 1;
+    uint32 shard_index = 2;
+    string final_object_hash = 3;
+}
+
+message CommitShardResponse {}
 
 message GetShardRequest {
     string object_hash = 1;
