@@ -31,15 +31,19 @@ impl AuthService for AppState {
             return Err(Status::unauthenticated("Invalid client secret"));
         }
 
-        let allowed_scopes = self.db.get_policies_for_app(app_details.id).await
+        let allowed_scopes = self
+            .db
+            .get_policies_for_app(app_details.id)
+            .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
         let approved_scopes = if req.scopes.is_empty() {
             allowed_scopes
         } else {
-            req.scopes.into_iter().filter(|requested_scope| {
-                auth::is_authorized(requested_scope, &allowed_scopes)
-            }).collect()
+            req.scopes
+                .into_iter()
+                .filter(|requested_scope| auth::is_authorized(requested_scope, &allowed_scopes))
+                .collect()
         };
 
         if approved_scopes.is_empty() {
@@ -47,9 +51,10 @@ impl AuthService for AppState {
         }
 
         // 3. Mint token
-        let token = self.jwt_manager.mint_token(app_details.id.to_string(), approved_scopes)
+        let token = self
+            .jwt_manager
+            .mint_token(app_details.id.to_string(), approved_scopes)
             .map_err(|e| Status::internal(e.to_string()))?;
-
 
         Ok(Response::new(GetAccessTokenResponse {
             access_token: token,
@@ -123,23 +128,34 @@ impl AuthService for AppState {
 
 #[tonic::async_trait]
 impl InternalAnvilService for AppState {
-    type GetShardStream = std::pin::Pin<
-        Box<dyn futures_core::Stream<Item = Result<GetShardResponse, Status>> + Send>,
-    >;
+    type GetShardStream =
+        std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<GetShardResponse, Status>> + Send>>;
 
     async fn put_shard(
         &self,
         request: Request<tonic::Streaming<PutShardRequest>>,
     ) -> Result<Response<PutShardResponse>, Status> {
-        let mut stream = request.into_inner();
-        let mut upload_id = String::new();
-        let mut shard_index = 0;
-        let mut data = Vec::new();
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?.clone();
 
-        // In a real implementation, we would stream this to disk for large shards
+        let mut stream = request.into_inner();
+
+        let (upload_id, shard_index, first_chunk_data) = if let Some(Ok(chunk)) = stream.next().await
+        {
+            (chunk.upload_id, chunk.shard_index, chunk.data)
+        } else {
+            return Err(Status::invalid_argument("Empty stream"));
+        };
+
+        let resource = format!("{}/{}", upload_id, shard_index);
+        if !auth::is_authorized(&format!("internal:put_shard:{}", resource), &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        let mut data = first_chunk_data;
         while let Some(Ok(chunk)) = stream.next().await {
-            upload_id = chunk.upload_id;
-            shard_index = chunk.shard_index;
             data.extend_from_slice(&chunk.data);
         }
 
@@ -155,7 +171,17 @@ impl InternalAnvilService for AppState {
         &self,
         request: Request<CommitShardRequest>,
     ) -> Result<Response<CommitShardResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?.clone();
         let req = request.into_inner();
+
+        let resource = format!("{}/{}", req.final_object_hash, req.shard_index);
+        if !auth::is_authorized(&format!("internal:commit_shard:{}", resource), &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
         self.storage
             .commit_shard(&req.upload_id, req.shard_index, &req.final_object_hash)
             .await
@@ -179,11 +205,9 @@ impl InternalAnvilService for AppState {
         tokio::spawn(async move {
             for chunk in data.chunks(1024 * 1024) {
                 // 1MB chunks
-                tx.send(Ok(GetShardResponse {
-                    data: chunk.to_vec(),
-                }))
-                .await
-                .unwrap();
+                tx.send(Ok(GetShardResponse { data: chunk.to_vec() }))
+                    .await
+                    .unwrap();
             }
         });
 
@@ -215,7 +239,8 @@ impl BucketService for AppState {
 
         let tenant_id = 1; // Placeholder
 
-        let db_result = self.db
+        let db_result = self
+            .db
             .create_bucket(tenant_id, &req.bucket_name, &req.region)
             .await;
 
@@ -257,27 +282,25 @@ impl BucketService for AppState {
 
 #[tonic::async_trait]
 impl ObjectService for AppState {
-    type GetObjectStream = std::pin::Pin<
-        Box<dyn futures_core::Stream<Item = Result<GetObjectResponse, Status>> + Send>,
-    >;
+    type GetObjectStream =
+        std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<GetObjectResponse, Status>> + Send>>;
 
     async fn put_object(
         &self,
-        mut request: Request<tonic::Streaming<PutObjectRequest>>,
+        request: Request<tonic::Streaming<PutObjectRequest>>,
     ) -> Result<Response<PutObjectResponse>, Status> {
         let claims = request
             .extensions()
             .get::<auth::Claims>()
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+
         let mut stream = request.into_inner();
 
         // 1. Get metadata and generate Upload ID
         let (bucket_name, object_key) = match stream.next().await {
             Some(Ok(chunk)) => match chunk.data {
-                Some(put_object_request::Data::Metadata(meta)) => {
-                    (meta.bucket_name, meta.object_key)
-                }
+                Some(put_object_request::Data::Metadata(meta)) => (meta.bucket_name, meta.object_key),
                 _ => return Err(Status::invalid_argument("First chunk must be metadata")),
             },
             _ => return Err(Status::invalid_argument("Empty stream")),
@@ -357,6 +380,12 @@ impl ObjectService for AppState {
 
                 let mut futures = Vec::new();
                 for (i, shard_data) in shards.into_iter().enumerate() {
+                    let scope = format!("internal:put_shard:{}/{}", upload_id, i);
+                    let token = self
+                        .jwt_manager
+                        .mint_token("internal".to_string(), vec![scope])
+                        .unwrap();
+
                     let request = PutShardRequest {
                         upload_id: upload_id.clone(),
                         shard_index: i as u32,
@@ -364,7 +393,10 @@ impl ObjectService for AppState {
                     };
                     let mut client = clients[i].clone();
                     let request_stream = tokio_stream::iter(vec![request]);
-                    futures.push(async move { client.put_shard(request_stream).await });
+                    let mut req = tonic::Request::new(request_stream);
+                    req.metadata_mut()
+                        .insert("authorization", format!("Bearer {}", token).parse().unwrap());
+                    futures.push(async move { client.put_shard(req).await });
                 }
                 futures::future::try_join_all(futures)
                     .await
@@ -387,6 +419,12 @@ impl ObjectService for AppState {
 
                 let mut futures = Vec::new();
                 for (i, shard_data) in shards.into_iter().enumerate() {
+                    let scope = format!("internal:put_shard:{}/{}", upload_id, i);
+                    let token = self
+                        .jwt_manager
+                        .mint_token("internal".to_string(), vec![scope])
+                        .unwrap();
+
                     let request = PutShardRequest {
                         upload_id: upload_id.clone(),
                         shard_index: i as u32,
@@ -394,7 +432,10 @@ impl ObjectService for AppState {
                     };
                     let mut client = clients[i].clone();
                     let request_stream = tokio_stream::iter(vec![request]);
-                    futures.push(async move { client.put_shard(request_stream).await });
+                    let mut req = tonic::Request::new(request_stream);
+                    req.metadata_mut()
+                        .insert("authorization", format!("Bearer {}", token).parse().unwrap());
+                    futures.push(async move { client.put_shard(req).await });
                 }
                 futures::future::try_join_all(futures)
                     .await
@@ -404,13 +445,22 @@ impl ObjectService for AppState {
             // Commit the shards
             let mut futures = Vec::new();
             for (i, client) in clients.into_iter().enumerate() {
+                let scope = format!("internal:commit_shard:{}/{}", content_hash, i);
+                let token = self
+                    .jwt_manager
+                    .mint_token("internal".to_string(), vec![scope])
+                    .unwrap();
+
                 let mut client = client.clone();
                 let request = CommitShardRequest {
                     upload_id: upload_id.clone(),
                     shard_index: i as u32,
                     final_object_hash: content_hash.clone(),
                 };
-                futures.push(async move { client.commit_shard(request).await });
+                let mut req = tonic::Request::new(request);
+                req.metadata_mut()
+                    .insert("authorization", format!("Bearer {}", token).parse().unwrap());
+                futures.push(async move { client.commit_shard(req).await });
             }
             futures::future::try_join_all(futures)
                 .await

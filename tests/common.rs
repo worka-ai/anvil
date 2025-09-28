@@ -1,13 +1,16 @@
 use anyhow::Result;
+use anvil::anvil_api::auth_service_client::AuthServiceClient;
+use anvil::anvil_api::GetAccessTokenRequest;
+use anvil::auth::JwtManager;
 use deadpool_postgres::{ManagerConfig, Pool, RecyclingMethod};
 use refinery::Runner;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::process::Command;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::NoTls;
-use anvil::auth::JwtManager;
 
 pub mod migrations {
     use refinery_macros::embed_migrations;
@@ -32,7 +35,8 @@ pub fn create_pool(db_url: &str) -> Result<Pool> {
 /// and guarantees they are cleaned up afterwards.
 #[allow(dead_code)]
 pub fn extract_credential(output: &str, key: &str) -> String {
-    output.lines()
+    output
+        .lines()
         .find(|line| line.contains(key))
         .map(|line| line.split(':').nth(1).unwrap().trim().to_string())
         .unwrap()
@@ -41,10 +45,11 @@ pub fn extract_credential(output: &str, key: &str) -> String {
 pub async fn with_test_dbs<F, Fut>(test_body: F)
 where
     F: FnOnce(String, String, String) -> Fut,
-    Fut: Future<Output = ()>+  Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
 {
     dotenvy::dotenv().ok();
-    let maint_db_url = std::env::var("MAINTENANCE_DATABASE_URL").expect("MAINTENANCE_DATABASE_URL must be set");
+    let maint_db_url =
+        std::env::var("MAINTENANCE_DATABASE_URL").expect("MAINTENANCE_DATABASE_URL must be set");
     let (maint_client, connection) = tokio_postgres::connect(&maint_db_url, NoTls)
         .await
         .expect("Failed to connect to maintenance database");
@@ -59,22 +64,53 @@ where
     let east_db_name = format!("test_east_{}", suffix);
     let west_db_name = format!("test_west_{}", suffix);
 
-    maint_client.execute(&format!("CREATE DATABASE \"{}\"", global_db_name), &[]).await.unwrap();
-    maint_client.execute(&format!("CREATE DATABASE \"{}\"", east_db_name), &[]).await.unwrap();
-    maint_client.execute(&format!("CREATE DATABASE \"{}\"", west_db_name), &[]).await.unwrap();
+    maint_client
+        .execute(&format!("CREATE DATABASE \"{}\"", global_db_name), &[])
+        .await
+        .unwrap();
+    maint_client
+        .execute(&format!("CREATE DATABASE \"{}\"", east_db_name), &[])
+        .await
+        .unwrap();
+    maint_client
+        .execute(&format!("CREATE DATABASE \"{}\"", west_db_name), &[])
+        .await
+        .unwrap();
 
     let base_db_url = "postgres://worka:worka@localhost:5432";
     let global_db_url = format!("{}/{}", base_db_url, global_db_name);
     let east_db_url = format!("{}/{}", base_db_url, east_db_name);
     let west_db_url = format!("{}/{}", base_db_url, west_db_name);
 
-    let test_future = test_body(global_db_url.clone(), east_db_url.clone(), west_db_url.clone());
+    let test_future = test_body(
+        global_db_url.clone(),
+        east_db_url.clone(),
+        west_db_url.clone(),
+    );
     let result = tokio::spawn(test_future).await;
 
     // Cleanup
-    maint_client.execute(&format!("DROP DATABASE \"{}\" WITH (FORCE)", global_db_name), &[]).await.unwrap();
-    maint_client.execute(&format!("DROP DATABASE \"{}\" WITH (FORCE)", east_db_name), &[]).await.unwrap();
-    maint_client.execute(&format!("DROP DATABASE \"{}\" WITH (FORCE)", west_db_name), &[]).await.unwrap();
+    maint_client
+        .execute(
+            &format!("DROP DATABASE \"{}\" WITH (FORCE)", global_db_name),
+            &[],
+        )
+        .await
+        .unwrap();
+    maint_client
+        .execute(
+            &format!("DROP DATABASE \"{}\" WITH (FORCE)", east_db_name),
+            &[],
+        )
+        .await
+        .unwrap();
+    maint_client
+        .execute(
+            &format!("DROP DATABASE \"{}\" WITH (FORCE)", west_db_name),
+            &[],
+        )
+        .await
+        .unwrap();
 
     if let Err(err) = result {
         if err.is_panic() {
@@ -112,7 +148,10 @@ pub async fn prepare_node_state(
 
     let mut regional_client = regional_pool.get().await?;
     regional_migrations::migrations::runner()
-        .set_migration_table_name(&format!("refinery_schema_history_{}", region_name.to_lowercase()))
+        .set_migration_table_name(&format!(
+            "refinery_schema_history_{}",
+            region_name.to_lowercase()
+        ))
         .run_async(&mut **regional_client)
         .await?;
 
@@ -146,4 +185,58 @@ pub async fn prepare_node_state(
     };
 
     Ok((state, swarm))
+}
+
+#[allow(dead_code)]
+pub async fn get_auth_token(global_db_url: &str, grpc_addr: &str) -> String {
+    let admin_args = &["run", "--bin", "admin", "--"];
+
+    // Create app
+    let app_output = Command::new("cargo")
+        .args(
+            admin_args
+                .iter()
+                .chain(&["apps", "create", "--tenant-name", "default", "--app-name", "test-app"]),
+        )
+        .env("GLOBAL_DATABASE_URL", global_db_url)
+        .output()
+        .unwrap();
+    assert!(app_output.status.success());
+    let creds = String::from_utf8(app_output.stdout).unwrap();
+    let client_id = extract_credential(&creds, "Client ID");
+    let client_secret = extract_credential(&creds, "Client Secret");
+
+    // Grant policy
+    let policy_args = &[
+        "policies",
+        "grant",
+        "--app-name",
+        "test-app",
+        "--action",
+        "*",
+        "--resource",
+        "*",
+    ];
+    let status = Command::new("cargo")
+        .args(admin_args.iter().chain(policy_args.iter()))
+        .env("GLOBAL_DATABASE_URL", global_db_url)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    // Get token
+    let mut auth_client = AuthServiceClient::connect(grpc_addr.to_string())
+        .await
+        .unwrap();
+    let token_res = auth_client
+        .get_access_token(GetAccessTokenRequest {
+            client_id,
+            client_secret,
+            scopes: vec![],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    token_res.access_token
 }

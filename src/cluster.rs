@@ -117,6 +117,16 @@ pub async fn run_gossip(
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
     let local_peer_id = *swarm.local_peer_id();
+
+    // Add self to the cluster state immediately
+    {
+        let mut state = cluster_state.write().await;
+        state.entry(local_peer_id).or_insert_with(|| PeerInfo {
+            p2p_addrs: Vec::new(),
+            grpc_addr: grpc_addr.clone(),
+        });
+    }
+
     let mut broadcast_interval = tokio::time::interval(Duration::from_secs(5));
 
     loop {

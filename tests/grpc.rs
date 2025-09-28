@@ -8,6 +8,7 @@ use anvil::anvil_api::{
     PutObjectRequest,
 };
 use anvil::cluster::run_gossip;
+use anvil::middleware;
 use futures_util::StreamExt;
 use libp2p::swarm::SwarmEvent;
 use std::collections::HashMap;
@@ -70,11 +71,27 @@ async fn test_distributed_put_and_get() {
             let grpc_addr_str = format!("127.0.0.1:{}", base_grpc_port + i);
             let grpc_addr = grpc_addr_str.parse().unwrap();
             let http_grpc_addr_str = format!("http://{}", grpc_addr_str);
+            let state_clone = state.clone();
+            let auth_interceptor = move |req| middleware::auth_interceptor(req, &state_clone);
             tokio::spawn(async move {
                 let server = Server::builder()
-                    .add_service(ObjectServiceServer::new(state.clone()))
-                    .add_service(BucketServiceServer::new(state.clone()))
-                    .add_service(InternalAnvilServiceServer::new(state.clone()))
+                    .add_service(
+                        anvil::anvil_api::auth_service_server::AuthServiceServer::new(
+                            state.clone(),
+                        ),
+                    )
+                    .add_service(ObjectServiceServer::with_interceptor(
+                        state.clone(),
+                        auth_interceptor.clone(),
+                    ))
+                    .add_service(BucketServiceServer::with_interceptor(
+                        state.clone(),
+                        auth_interceptor.clone(),
+                    ))
+                    .add_service(InternalAnvilServiceServer::with_interceptor(
+                        state.clone(),
+                        auth_interceptor,
+                    ))
                     .serve(grpc_addr);
                 let gossip = run_gossip(swarm, state.cluster, http_grpc_addr_str);
                 let _ =
@@ -93,16 +110,27 @@ async fn test_distributed_put_and_get() {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
 
+        let token = common::get_auth_token(
+            &global_db_url,
+            &format!("http://127.0.0.1:{}", base_grpc_port),
+        )
+        .await;
+
         let mut bucket_client =
             BucketServiceClient::connect(format!("http://127.0.0.1:{}", base_grpc_port))
                 .await
                 .unwrap();
         let bucket_name = format!("test-bucket-{}", uuid::Uuid::new_v4());
+        let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
+            bucket_name: bucket_name.clone(),
+            region: "US_EAST_1".to_string(),
+        });
+        create_bucket_req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
         bucket_client
-            .create_bucket(CreateBucketRequest {
-                bucket_name: bucket_name.clone(),
-                region: "US_EAST_1".to_string(),
-            })
+            .create_bucket(create_bucket_req)
             .await
             .unwrap();
 
@@ -127,8 +155,13 @@ async fn test_distributed_put_and_get() {
         }
 
         let request_stream = tokio_stream::iter(chunks);
+        let mut put_object_req = tonic::Request::new(request_stream);
+        put_object_req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
         let response = object_client
-            .put_object(request_stream)
+            .put_object(put_object_req)
             .await
             .unwrap()
             .into_inner();
@@ -139,8 +172,13 @@ async fn test_distributed_put_and_get() {
             object_key,
             version_id: response.version_id,
         };
+        let mut get_object_req = tonic::Request::new(get_request);
+        get_object_req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
         let mut response_stream = object_client
-            .get_object(get_request)
+            .get_object(get_object_req)
             .await
             .unwrap()
             .into_inner();
@@ -185,15 +223,29 @@ async fn test_single_node_put() {
             .unwrap();
         let cluster_state_clone = state.cluster.clone();
         let grpc_addr = "127.0.0.1:50200".parse().unwrap();
-        let http_grpc_addr = "http://127.0.0.1:50200".to_string();
+        let http_grpc_addr = "http://127.0.0.1:50200";
 
         tokio::spawn(async move {
+            let state_clone = state.clone();
+            let auth_interceptor = move |req| middleware::auth_interceptor(req, &state_clone);
             let server = Server::builder()
-                .add_service(ObjectServiceServer::new(state.clone()))
-                .add_service(BucketServiceServer::new(state.clone()))
-                .add_service(InternalAnvilServiceServer::new(state.clone()))
+                .add_service(
+                    anvil::anvil_api::auth_service_server::AuthServiceServer::new(state.clone()),
+                )
+                .add_service(ObjectServiceServer::with_interceptor(
+                    state.clone(),
+                    auth_interceptor.clone(),
+                ))
+                .add_service(BucketServiceServer::with_interceptor(
+                    state.clone(),
+                    auth_interceptor.clone(),
+                ))
+                .add_service(InternalAnvilServiceServer::with_interceptor(
+                    state.clone(),
+                    auth_interceptor,
+                ))
                 .serve(grpc_addr);
-            let gossip = run_gossip(swarm, state.cluster, http_grpc_addr);
+            let gossip = run_gossip(swarm, state.cluster, http_grpc_addr.to_string());
             let _ = tokio::try_join!(async { server.await.map_err(anyhow::Error::from) }, async {
                 gossip.await.map_err(anyhow::Error::from)
             });
@@ -206,19 +258,26 @@ async fn test_single_node_put() {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
 
-        let mut bucket_client = BucketServiceClient::connect("http://127.0.0.1:50200")
+        let token = common::get_auth_token(&global_db_url, http_grpc_addr).await;
+
+        let mut bucket_client = BucketServiceClient::connect(format!("{}", http_grpc_addr))
             .await
             .unwrap();
         let bucket_name = "single-node-bucket".to_string();
+        let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
+            bucket_name: bucket_name.clone(),
+            region: "US_EAST_1".to_string(),
+        });
+        create_bucket_req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
         bucket_client
-            .create_bucket(CreateBucketRequest {
-                bucket_name: bucket_name.clone(),
-                region: "US_EAST_1".to_string(),
-            })
+            .create_bucket(create_bucket_req)
             .await
             .unwrap();
 
-        let mut object_client = ObjectServiceClient::connect("http://127.0.0.1:50200")
+        let mut object_client = ObjectServiceClient::connect(format!("{}", http_grpc_addr))
             .await
             .unwrap();
         let object_key = "single-node-object".to_string();
@@ -239,7 +298,13 @@ async fn test_single_node_put() {
 
         let request_stream = tokio_stream::iter(chunks);
 
-        let result = object_client.put_object(request_stream).await;
+        let mut put_object_req = tonic::Request::new(request_stream);
+        put_object_req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+
+        let result = object_client.put_object(put_object_req).await;
         if let Err(e) = &result {
             eprintln!("\n[Single Node Test] 'put_object' failed with: {:?}\n", e);
         }
@@ -273,10 +338,26 @@ async fn test_multi_region_list_and_isolation() {
         tokio::spawn(async move {
             let cluster_state = Arc::new(RwLock::new(HashMap::new()));
             state_east.cluster = cluster_state.clone();
+            let state_clone = state_east.clone();
+            let auth_interceptor = move |req| middleware::auth_interceptor(req, &state_clone);
             let server = Server::builder()
-                .add_service(ObjectServiceServer::new(state_east.clone()))
-                .add_service(BucketServiceServer::new(state_east.clone()))
-                .add_service(InternalAnvilServiceServer::new(state_east.clone()))
+                .add_service(
+                    anvil::anvil_api::auth_service_server::AuthServiceServer::new(
+                        state_east.clone(),
+                    ),
+                )
+                .add_service(ObjectServiceServer::with_interceptor(
+                    state_east.clone(),
+                    auth_interceptor.clone(),
+                ))
+                .add_service(BucketServiceServer::with_interceptor(
+                    state_east.clone(),
+                    auth_interceptor.clone(),
+                ))
+                .add_service(InternalAnvilServiceServer::with_interceptor(
+                    state_east.clone(),
+                    auth_interceptor,
+                ))
                 .serve(grpc_addr_east);
             let gossip = run_gossip(
                 swarm_east,
@@ -291,10 +372,26 @@ async fn test_multi_region_list_and_isolation() {
         tokio::spawn(async move {
             let cluster_state = Arc::new(RwLock::new(HashMap::new()));
             state_west.cluster = cluster_state.clone();
+            let state_clone = state_west.clone();
+            let auth_interceptor = move |req| middleware::auth_interceptor(req, &state_clone);
             let server = Server::builder()
-                .add_service(ObjectServiceServer::new(state_west.clone()))
-                .add_service(BucketServiceServer::new(state_west.clone()))
-                .add_service(InternalAnvilServiceServer::new(state_west.clone()))
+                .add_service(
+                    anvil::anvil_api::auth_service_server::AuthServiceServer::new(
+                        state_west.clone(),
+                    ),
+                )
+                .add_service(ObjectServiceServer::with_interceptor(
+                    state_west.clone(),
+                    auth_interceptor.clone(),
+                ))
+                .add_service(BucketServiceServer::with_interceptor(
+                    state_west.clone(),
+                    auth_interceptor.clone(),
+                ))
+                .add_service(InternalAnvilServiceServer::with_interceptor(
+                    state_west.clone(),
+                    auth_interceptor,
+                ))
                 .serve(grpc_addr_west);
             let gossip = run_gossip(
                 swarm_west,
@@ -308,6 +405,8 @@ async fn test_multi_region_list_and_isolation() {
 
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
+        let token = common::get_auth_token(&global_db_url, "http://127.0.0.1:50201").await;
+
         let mut bucket_client_east = BucketServiceClient::connect("http://127.0.0.1:50201")
             .await
             .unwrap();
@@ -316,11 +415,16 @@ async fn test_multi_region_list_and_isolation() {
             .unwrap();
 
         let bucket_name = "regional-bucket".to_string();
+        let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
+            bucket_name: bucket_name.clone(),
+            region: "US_EAST_1".to_string(),
+        });
+        create_bucket_req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
         bucket_client_east
-            .create_bucket(CreateBucketRequest {
-                bucket_name: bucket_name.clone(),
-                region: "US_EAST_1".to_string(),
-            })
+            .create_bucket(create_bucket_req)
             .await
             .unwrap();
 
@@ -339,10 +443,12 @@ async fn test_multi_region_list_and_isolation() {
                 )),
             },
         ];
-        object_client_east
-            .put_object(tokio_stream::iter(chunks))
-            .await
-            .unwrap();
+        let mut put_object_req = tonic::Request::new(tokio_stream::iter(chunks));
+        put_object_req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+        object_client_east.put_object(put_object_req).await.unwrap();
 
         // Add a small delay to allow the database transaction to become visible
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -352,8 +458,13 @@ async fn test_multi_region_list_and_isolation() {
             bucket_name: bucket_name.clone(),
             ..Default::default()
         };
+        let mut list_req_east_auth = tonic::Request::new(list_req_east);
+        list_req_east_auth.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
         let list_resp_east = object_client_east
-            .list_objects(list_req_east)
+            .list_objects(list_req_east_auth)
             .await
             .unwrap()
             .into_inner();
@@ -367,7 +478,12 @@ async fn test_multi_region_list_and_isolation() {
             bucket_name: bucket_name.clone(),
             ..Default::default()
         };
-        let list_resp_west = object_client_west.list_objects(list_req_west).await;
+        let mut list_req_west_auth = tonic::Request::new(list_req_west);
+        list_req_west_auth.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+        let list_resp_west = object_client_west.list_objects(list_req_west_auth).await;
 
         assert!(list_resp_west.is_err());
         assert_eq!(list_resp_west.unwrap_err().code(), Code::NotFound);
