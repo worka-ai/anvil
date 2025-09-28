@@ -57,7 +57,8 @@ pub async fn run() -> Result<()> {
         .add_service(ObjectServiceServer::new(state))
         .serve(grpc_addr);
 
-    let gossip_service = cluster::run_gossip(cluster_state);
+    let swarm = cluster::create_swarm().await?;
+    let gossip_service = cluster::run_gossip(swarm, cluster_state);
 
     println!("Anvil gRPC server listening on {}", grpc_addr);
 

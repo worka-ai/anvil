@@ -41,13 +41,10 @@ impl From<mdns::Event> for ClusterEvent {
     }
 }
 
-// Function to configure and run the gossip service.
-pub async fn run_gossip(cluster_state: ClusterState) -> Result<()> {
+pub async fn create_swarm() -> Result<Swarm<ClusterBehaviour>> {
     let local_key = identity::Keypair::generate_ed25519();
-    let local_peer_id = PeerId::from(local_key.public());
-    println!("[GOSSIP] Local peer id: {local_peer_id}");
 
-    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
+    let swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
         .with_tokio()
         .with_tcp(
             Default::default(),
@@ -66,6 +63,11 @@ pub async fn run_gossip(cluster_state: ClusterState) -> Result<()> {
         .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(60)))
         .build();
 
+    Ok(swarm)
+}
+
+// Function to configure and run the gossip service.
+pub async fn run_gossip(mut swarm: Swarm<ClusterBehaviour>, cluster_state: ClusterState) -> Result<()> {
     let topic = Topic::new("anvil-cluster");
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
