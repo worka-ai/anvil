@@ -1,4 +1,4 @@
-use std::cmp::max;
+use crate::anvil_api::auth_service_server::AuthService;
 use crate::anvil_api::bucket_service_server::BucketService;
 use crate::anvil_api::internal_anvil_service_server::InternalAnvilService;
 use crate::anvil_api::object_service_server::ObjectService;
@@ -8,6 +8,118 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+
+use crate::auth;
+
+#[tonic::async_trait]
+impl AuthService for AppState {
+    async fn get_access_token(
+        &self,
+        request: Request<GetAccessTokenRequest>,
+    ) -> Result<Response<GetAccessTokenResponse>, Status> {
+        let req = request.into_inner();
+
+        // 1. Verify credentials
+        let app_details = self
+            .db
+            .get_app_by_client_id(&req.client_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::unauthenticated("Invalid client ID"))?;
+
+        if !auth::verify_secret(&req.client_secret, &app_details.client_secret_hash) {
+            return Err(Status::unauthenticated("Invalid client secret"));
+        }
+
+        let allowed_scopes = self.db.get_policies_for_app(app_details.id).await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let approved_scopes = if req.scopes.is_empty() {
+            allowed_scopes
+        } else {
+            req.scopes.into_iter().filter(|requested_scope| {
+                auth::is_authorized(requested_scope, &allowed_scopes)
+            }).collect()
+        };
+
+        if approved_scopes.is_empty() {
+            return Err(Status::permission_denied("App has no assigned policies"));
+        }
+
+        // 3. Mint token
+        let token = self.jwt_manager.mint_token(app_details.id.to_string(), approved_scopes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+
+        Ok(Response::new(GetAccessTokenResponse {
+            access_token: token,
+            expires_in: 3600,
+        }))
+    }
+
+    async fn grant_access(
+        &self,
+        request: Request<GrantAccessRequest>,
+    ) -> Result<Response<GrantAccessResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.get_ref();
+
+        if !auth::is_authorized(&format!("grant:{}", req.resource), &claims.scopes) {
+            return Err(Status::permission_denied(
+                "Permission denied to grant access to this resource",
+            ));
+        }
+
+        let app = self
+            .db
+            .get_app_by_name(&req.grantee_app_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Grantee app not found"))?;
+        self.db
+            .grant_policy(app.id, &req.resource, &req.action)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(GrantAccessResponse {}))
+    }
+
+    async fn revoke_access(
+        &self,
+        _request: Request<RevokeAccessRequest>,
+    ) -> Result<Response<RevokeAccessResponse>, Status> {
+        // Implementation would be similar to grant_access
+        todo!()
+    }
+
+    async fn set_public_access(
+        &self,
+        request: Request<SetPublicAccessRequest>,
+    ) -> Result<Response<SetPublicAccessResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.get_ref();
+
+        let resource = format!("bucket:{}", req.bucket);
+        if !auth::is_authorized(&format!("grant:{}", resource), &claims.scopes) {
+            return Err(Status::permission_denied(
+                "Permission denied to modify public access on this bucket",
+            ));
+        }
+
+        self.db
+            .set_bucket_public_access(&req.bucket, req.allow_public_read)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(SetPublicAccessResponse {}))
+    }
+}
 
 #[tonic::async_trait]
 impl InternalAnvilService for AppState {
@@ -88,16 +200,28 @@ impl BucketService for AppState {
         &self,
         request: Request<CreateBucketRequest>,
     ) -> Result<Response<CreateBucketResponse>, Status> {
-        let req = request.into_inner();
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.get_ref();
+
+        let resource = format!("bucket:{}", req.bucket_name);
+        if !auth::is_authorized(&format!("write:{}", resource), &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
         println!("gRPC - Create Bucket: {:?}", req);
 
-        // For now, we'll assume a single tenant.
-        let tenant_id = 1;
+        let tenant_id = 1; // Placeholder
 
-        self.db
+        let db_result = self.db
             .create_bucket(tenant_id, &req.bucket_name, &req.region)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .await;
+
+        println!("DB create_bucket result: {:?}", db_result);
+
+        db_result.map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(CreateBucketResponse {}))
     }
@@ -139,8 +263,13 @@ impl ObjectService for AppState {
 
     async fn put_object(
         &self,
-        request: Request<tonic::Streaming<PutObjectRequest>>,
+        mut request: Request<tonic::Streaming<PutObjectRequest>>,
     ) -> Result<Response<PutObjectResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let mut stream = request.into_inner();
 
         // 1. Get metadata and generate Upload ID
@@ -154,6 +283,11 @@ impl ObjectService for AppState {
             _ => return Err(Status::invalid_argument("Empty stream")),
         };
         let upload_id = uuid::Uuid::new_v4().to_string();
+
+        let resource = format!("bucket:{}/{}", bucket_name, object_key);
+        if !auth::is_authorized(&format!("write:{}", resource), &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
 
         // 2. Determine placement
         let nodes = self
@@ -312,6 +446,7 @@ impl ObjectService for AppState {
         &self,
         request: Request<GetObjectRequest>,
     ) -> Result<Response<Self::GetObjectStream>, Status> {
+        let claims = request.extensions().get::<auth::Claims>().cloned();
         let req = request.into_inner();
 
         // 1. Look up object metadata
@@ -322,6 +457,16 @@ impl ObjectService for AppState {
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
+
+        // 2. Authorization Check
+        if !bucket.is_public_read {
+            let claims = claims.ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+            let resource = format!("bucket:{}/{}", req.bucket_name, req.object_key);
+            if !auth::is_authorized(&format!("read:{}", resource), &claims.scopes) {
+                return Err(Status::permission_denied("Permission denied"));
+            }
+        }
+
         let object = self
             .db
             .get_object(bucket.id, &req.object_key)
@@ -350,7 +495,11 @@ impl ObjectService for AppState {
 
             // 3. On-the-fly reconstruction and streaming
             // Check if a whole object exists first (single-node case)
-            if let Ok(full_data) = app_state.storage.retrieve_whole_object(&object.content_hash).await {
+            if let Ok(full_data) = app_state
+                .storage
+                .retrieve_whole_object(&object.content_hash)
+                .await
+            {
                 // Stream the result back in chunks
                 for chunk in full_data.chunks(1024 * 64) {
                     if tx
@@ -451,7 +600,12 @@ impl ObjectService for AppState {
 
         let objects = self
             .db
-            .list_objects(bucket.id, &req.prefix, &req.start_after, max(req.max_keys,1))
+            .list_objects(
+                bucket.id,
+                &req.prefix,
+                &req.start_after,
+                std::cmp::max(req.max_keys, 1),
+            )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 

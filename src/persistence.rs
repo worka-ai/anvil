@@ -1,7 +1,7 @@
 use anyhow::Result;
 use deadpool_postgres::Pool;
-use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
+use serde_json::Value as JsonValue;
 use tokio_postgres::Row;
 
 #[derive(Debug, Clone)]
@@ -18,12 +18,20 @@ pub struct Tenant {
 }
 
 #[derive(Debug)]
+pub struct App {
+    pub id: i64,
+    pub name: String,
+    pub client_id: String,
+}
+
+#[derive(Debug)]
 pub struct Bucket {
     pub id: i64,
     pub tenant_id: i64,
     pub name: String,
     pub region: String,
     pub created_at: OffsetDateTime,
+    pub is_public_read: bool,
 }
 
 #[derive(Debug)]
@@ -46,10 +54,13 @@ pub struct Object {
 // Manual row-to-struct mapping
 impl From<Row> for Tenant {
     fn from(row: Row) -> Self {
-        Self {
-            id: row.get("id"),
-            name: row.get("name"),
-        }
+        Self { id: row.get("id"), name: row.get("name") }
+    }
+}
+
+impl From<Row> for App {
+    fn from(row: Row) -> Self {
+        Self { id: row.get("id"), name: row.get("name"), client_id: row.get("client_id") }
     }
 }
 
@@ -61,6 +72,7 @@ impl From<Row> for Bucket {
             name: row.get("name"),
             region: row.get("region"),
             created_at: row.get("created_at"),
+            is_public_read: row.get("is_public_read"),
         }
     }
 }
@@ -85,15 +97,41 @@ impl From<Row> for Object {
     }
 }
 
+pub struct AppDetails {
+    pub id: i64,
+    pub client_secret_hash: String,
+}
+
+impl From<Row> for AppDetails {
+    fn from(row: Row) -> Self {
+        Self { id: row.get("id"), client_secret_hash: row.get("client_secret_hash") }
+    }
+}
+
 impl Persistence {
     pub fn new(global_pool: Pool, regional_pool: Pool) -> Self {
-        Self {
-            global_pool,
-            regional_pool,
-        }
+        Self { global_pool, regional_pool }
     }
 
     // --- Global Methods ---
+
+    pub async fn get_tenant_by_name(&self, name: &str) -> Result<Option<Tenant>> {
+        let client = self.global_pool.get().await?;
+        let row = client.query_opt("SELECT id, name FROM tenants WHERE name = $1", &[&name]).await?;
+        Ok(row.map(Into::into))
+    }
+
+    pub async fn get_app_by_client_id(&self, client_id: &str) -> Result<Option<AppDetails>> {
+        let client = self.global_pool.get().await?;
+        let row = client.query_opt("SELECT id, client_secret_hash FROM apps WHERE client_id = $1", &[&client_id]).await?;
+        Ok(row.map(Into::into))
+    }
+
+    pub async fn get_policies_for_app(&self, app_id: i64) -> Result<Vec<String>> {
+        let client = self.global_pool.get().await?;
+        let rows = client.query("SELECT resource, action FROM policies WHERE app_id = $1", &[&app_id]).await?;
+        Ok(rows.into_iter().map(|row| format!("{}:{}", row.get::<_, String>("action"), row.get::<_, String>("resource"))).collect())
+    }
 
     pub async fn create_tenant(&self, name: &str, api_key: &str) -> Result<Tenant> {
         let client = self.global_pool.get().await?;
@@ -104,6 +142,34 @@ impl Persistence {
             )
             .await?;
         Ok(row.into())
+    }
+
+    pub async fn create_app(&self, tenant_id: i64, name: &str, client_id: &str, client_secret_hash: &str) -> Result<App> {
+        let client = self.global_pool.get().await?;
+        let row = client
+            .query_one(
+                "INSERT INTO apps (tenant_id, name, client_id, client_secret_hash) VALUES ($1, $2, $3, $4) RETURNING id, name, client_id",
+                &[&tenant_id, &name, &client_id, &client_secret_hash],
+            )
+            .await?;
+        Ok(row.into())
+    }
+
+    pub async fn get_app_by_name(&self, name: &str) -> Result<Option<App>> {
+        let client = self.global_pool.get().await?;
+        let row = client.query_opt("SELECT id, name, client_id FROM apps WHERE name = $1", &[&name]).await?;
+        Ok(row.map(Into::into))
+    }
+
+    pub async fn grant_policy(&self, app_id: i64, resource: &str, action: &str) -> Result<()> {
+        let client = self.global_pool.get().await?;
+        client
+            .execute(
+                "INSERT INTO policies (app_id, resource, action) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                &[&app_id, &resource, &action],
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn create_bucket(&self, tenant_id: i64, name: &str, region: &str) -> Result<Bucket> {
@@ -126,6 +192,17 @@ impl Persistence {
             )
             .await?;
         Ok(row.map(Into::into))
+    }
+
+    pub async fn set_bucket_public_access(&self, bucket_name: &str, is_public: bool) -> Result<()> {
+        let client = self.global_pool.get().await?;
+        client
+            .execute(
+                "UPDATE buckets SET is_public_read = $1 WHERE name = $2",
+                &[&is_public, &bucket_name],
+            )
+            .await?;
+        Ok(())
     }
 
     // --- Regional Methods ---
@@ -171,8 +248,8 @@ impl Persistence {
     pub async fn list_objects(
         &self,
         bucket_id: i64,
-        _prefix: &str,
-        _start_after: &str,
+        prefix: &str,
+        start_after: &str,
         limit: i32,
     ) -> Result<Vec<Object>> {
         let client = self.regional_pool.get().await?;
@@ -180,11 +257,11 @@ impl Persistence {
             .query(
                 r#"
             SELECT * FROM objects
-            WHERE bucket_id = $1
+            WHERE bucket_id = $1 AND key > $2 AND key LIKE $3
             ORDER BY key
-            LIMIT $2
+            LIMIT $4
             "#,
-                &[&bucket_id, &(limit as i64)],
+                &[&bucket_id, &start_after, &format!("{}%", prefix), &(limit as i64)],
             )
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())

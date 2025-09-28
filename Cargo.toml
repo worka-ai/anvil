@@ -83,6 +83,11 @@ libp2p = { version = "0.56.0", features = ["gossipsub", "mdns", "tcp", "tokio", 
 reed-solomon-erasure = "6.0.0"
 ahash = "0.8.12"
 futures.workspace = true
+jsonwebtoken = "9.3.1"
+argon2 = "0.5.3"
+chrono = { workspace = true, features = ["serde"] }
+clap = { version = "4.5.48", features = ["derive"] }
+rand_core = { version = "0.9.3", features = ["os_rng"] }
 
 [build-dependencies]
 tonic-prost-build = { version = "0.14.2" }

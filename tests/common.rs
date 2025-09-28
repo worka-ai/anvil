@@ -2,8 +2,12 @@ use anyhow::Result;
 use deadpool_postgres::{ManagerConfig, Pool, RecyclingMethod};
 use refinery::Runner;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio_postgres::NoTls;
+use anvil::auth::JwtManager;
 
 pub mod migrations {
     use refinery_macros::embed_migrations;
@@ -27,6 +31,13 @@ pub fn create_pool(db_url: &str) -> Result<Pool> {
 /// A test fixture that creates unique, isolated databases for a single test run
 /// and guarantees they are cleaned up afterwards.
 #[allow(dead_code)]
+pub fn extract_credential(output: &str, key: &str) -> String {
+    output.lines()
+        .find(|line| line.contains(key))
+        .map(|line| line.split(':').nth(1).unwrap().trim().to_string())
+        .unwrap()
+}
+
 pub async fn with_test_dbs<F, Fut>(test_body: F)
 where
     F: FnOnce(String, String, String) -> Fut,
@@ -70,6 +81,17 @@ where
             std::panic::resume_unwind(err.into_panic());
         }
     }
+}
+
+pub async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
 }
 
 /// Connects to databases, runs migrations, and returns a fully configured AppState and Swarm.
@@ -119,6 +141,7 @@ pub async fn prepare_node_state(
         cluster: cluster_state.clone(),
         sharder: anvil::sharding::ShardManager::new(),
         placer: anvil::placement::PlacementManager::default(),
+        jwt_manager: Arc::new(JwtManager::new("secret".to_string())),
         region: region_name.to_string(),
     };
 
