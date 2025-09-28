@@ -327,9 +327,33 @@ impl ObjectService for AppState {
 
     async fn list_objects(
         &self,
-        _request: Request<ListObjectsRequest>,
+        request: Request<ListObjectsRequest>,
     ) -> Result<Response<ListObjectsResponse>, Status> {
-        todo!()
+        let req = request.into_inner();
+
+        let tenant_id = 1; // Placeholder
+        let bucket = self.db.get_bucket_by_name(tenant_id, &req.bucket_name).await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Bucket not found"))?;
+
+        let objects = self.db.list_objects(
+            bucket.id,
+            &req.prefix,
+            &req.start_after,
+            req.max_keys,
+        ).await.map_err(|e| Status::internal(e.to_string()))?;
+
+        let summaries = objects.into_iter().map(|o| ObjectSummary {
+            key: o.key,
+            size: o.size,
+            etag: o.etag,
+            last_modified: o.created_at.to_string(),
+        }).collect();
+
+        Ok(Response::new(ListObjectsResponse {
+            objects: summaries,
+            common_prefixes: vec![], // Delimiter logic not yet implemented
+        }))
     }
 
     async fn initiate_multipart_upload(

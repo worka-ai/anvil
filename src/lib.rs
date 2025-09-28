@@ -37,13 +37,21 @@ pub struct AppState {
 
 pub async fn run(grpc_addr: SocketAddr) -> Result<()> {
     // --- Database ---
-    let db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let pool = PgPool::connect(&db_url).await?;
-    sqlx::migrate!().run(&pool).await?;
+    let region = env::var("REGION").expect("REGION must be set");
+    let regional_db_url = env::var(format!("DATABASE_URL_REGION_{}", region.to_uppercase()))
+        .expect("Regional DATABASE_URL must be set");
+    let global_db_url = env::var("GLOBAL_DATABASE_URL").expect("Global DATABASE_URL must be set");
+
+    let regional_pool = PgPool::connect(&regional_db_url).await?;
+    let global_pool = PgPool::connect(&global_db_url).await?;
+
+    // Run migrations on both databases
+    sqlx::migrate!("./migrations_regional").set_locking(false).run(&regional_pool).await?;
+    sqlx::migrate!("./migrations_global").set_locking(false).run(&global_pool).await?;
 
     // Create a default tenant for testing if it doesn't exist
     sqlx::query("INSERT INTO tenants (id, name, api_key) VALUES (1, 'default', 'default-key') ON CONFLICT (id) DO NOTHING")
-        .execute(&pool)
+        .execute(&global_pool)
         .await?;
 
 
@@ -51,7 +59,7 @@ pub async fn run(grpc_addr: SocketAddr) -> Result<()> {
     let storage = storage::Storage::new().await?;
     let cluster_state = Arc::new(RwLock::new(HashMap::new()));
     let state = AppState {
-        db: persistence::Persistence::new(pool),
+        db: persistence::Persistence::new(global_pool, regional_pool),
         storage,
         cluster: cluster_state.clone(),
         sharder: sharding::ShardManager::new(),

@@ -3,28 +3,11 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 -- For hierarchical path queries
 CREATE EXTENSION IF NOT EXISTS ltree;
 
-CREATE TABLE tenants (
-    id BIGSERIAL PRIMARY KEY,
-    name TEXT UNIQUE NOT NULL,
-    api_key TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE buckets (
-    id BIGSERIAL PRIMARY KEY,
-    tenant_id BIGINT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    name TEXT NOT NULL,
-    -- In a multi-region setup, this would point to a regions table
-    -- For now, it's just a string.
-    region TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    -- Each bucket name must be unique for a given tenant
-    UNIQUE(tenant_id, name)
-);
-
 CREATE TABLE objects (
     id BIGSERIAL PRIMARY KEY,
-    bucket_id BIGINT NOT NULL REFERENCES buckets(id) ON DELETE CASCADE,
+    -- This is a reference to a bucket in the global database.
+    -- There is no foreign key constraint as it crosses databases.
+    bucket_id BIGINT NOT NULL,
     
     key TEXT NOT NULL,
     key_ltree LTREE,
@@ -46,7 +29,6 @@ CREATE TABLE objects (
     user_meta JSONB,
     
     -- In a distributed setup, this would map shards to peers
-    -- For now, it's unused but good to have in the schema.
     shard_map JSONB,
     
     checksum BYTEA,
@@ -59,7 +41,7 @@ CREATE TABLE objects (
 CREATE OR REPLACE FUNCTION update_key_ltree()
 RETURNS TRIGGER AS $$
 BEGIN
-    -- Replace slashes with dots and underscores with underscores for ltree compatibility
+    -- Replace slashes with dots for ltree compatibility
     NEW.key_ltree = text2ltree(REPLACE(NEW.key, '/', '.'));
     RETURN NEW;
 END;
