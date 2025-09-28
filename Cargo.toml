@@ -77,7 +77,9 @@ reqwest.workspace = true
 trust-dns-resolver = "0.23.2"
 async-trait.workspace = true
 libp2p = { version = "0.56.0", features = ["gossipsub", "mdns", "tcp", "tokio", "macros", "noise", "yamux"] }
-
+reed-solomon-erasure = "6.0.0"
+ahash = "0.8.12"
+futures.workspace = true
 
 [build-dependencies]
 tonic-prost-build = { version = "0.14.2" }
@@ -85,6 +87,6 @@ tonic-prost-build = { version = "0.14.2" }
 [dev-dependencies]
 anvil = { path = "." }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-tonic = { version = "0.14.2", features = ["transport"] }
+
 uuid = { version = "1.18.1", features = ["v4"] }
 tokio-stream = "0.1"

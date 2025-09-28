@@ -5,15 +5,47 @@ use libp2p::{
     identity,
     mdns,
     swarm::{NetworkBehaviour, SwarmEvent},
+    Multiaddr,
     PeerId,
     Swarm,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 // The shared state of the cluster membership.
 pub type ClusterState = Arc<RwLock<HashMap<PeerId, Vec<String>>>>; // PeerId -> Multiaddrs
+
+// The message format for gossip-based cluster membership.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterMessage {
+    #[serde(with = "serde_peer_id")]
+    pub peer_id: PeerId,
+    pub addrs: Vec<String>,
+}
+
+// A module for custom PeerId serialization
+mod serde_peer_id {
+    use libp2p::PeerId;
+    use serde::{de::Error, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(peer_id: &PeerId, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&peer_id.to_base58())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<PeerId, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(Error::custom)
+    }
+}
 
 // The network behaviour that combines gossip and mDNS.
 #[derive(NetworkBehaviour)]
@@ -57,7 +89,8 @@ pub async fn create_swarm() -> Result<Swarm<ClusterBehaviour>> {
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
                 gossipsub_config,
             )?;
-            let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
+            let mdns =
+                mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
             Ok(ClusterBehaviour { gossipsub, mdns })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(60)))
@@ -71,41 +104,78 @@ pub async fn run_gossip(mut swarm: Swarm<ClusterBehaviour>, cluster_state: Clust
     let topic = Topic::new("anvil-cluster");
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
-    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+    let local_peer_id = *swarm.local_peer_id();
+    let mut broadcast_interval = tokio::time::interval(Duration::from_secs(5));
 
     loop {
-        match swarm.select_next_some().await {
-            SwarmEvent::NewListenAddr { address, .. } => {
-                println!("[GOSSIP] Listening on {address}");
-            }
-            SwarmEvent::Behaviour(ClusterEvent::Mdns(mdns::Event::Discovered(list))) => {
-                for (peer_id, multiaddr) in list {
-                    println!("[GOSSIP] mDNS discovered: {peer_id}");
-                    swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                    let mut state = cluster_state.write().await;
-                    let addrs = state.entry(peer_id).or_default();
-                    addrs.push(multiaddr.to_string());
+        tokio::select! {
+            _ = broadcast_interval.tick() => {
+                let listeners = swarm.listeners().map(|addr| addr.to_string()).collect::<Vec<_>>();
+                if listeners.is_empty() {
+                    continue;
+                }
+
+                let message = ClusterMessage {
+                    peer_id: local_peer_id,
+                    addrs: listeners,
+                };
+
+                if let Ok(encoded_message) = serde_json::to_vec(&message) {
+                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), encoded_message) {
+                        println!("[GOSSIP] Failed to publish gossip message: {:?}", e);
+                    }
                 }
             }
-            SwarmEvent::Behaviour(ClusterEvent::Mdns(mdns::Event::Expired(list))) => {
-                for (peer_id, _multiaddr) in list {
-                    println!("[GOSSIP] mDNS expired: {peer_id}");
-                    swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
-                    let mut state = cluster_state.write().await;
-                    state.remove(&peer_id);
+
+            event = swarm.select_next_some() => {
+                match event {
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        println!("[GOSSIP] Listening on {address}");
+                        let mut state = cluster_state.write().await;
+                        let addrs = state.entry(local_peer_id).or_default();
+                        let addr_string = address.to_string();
+                        if !addrs.contains(&addr_string) {
+                            addrs.push(addr_string);
+                        }
+                    }
+                    SwarmEvent::Behaviour(ClusterEvent::Mdns(mdns::Event::Discovered(list))) => {
+                        let mut state = cluster_state.write().await;
+                        for (peer_id, multiaddr) in list {
+                            println!("[GOSSIP] mDNS discovered: {peer_id}");
+                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                            let addrs = state.entry(peer_id).or_default();
+                            let addr_string = multiaddr.to_string();
+                            if !addrs.contains(&addr_string) {
+                                addrs.push(addr_string);
+                            }
+                        }
+                    }
+                    SwarmEvent::Behaviour(ClusterEvent::Mdns(mdns::Event::Expired(list))) => {
+                        let mut state = cluster_state.write().await;
+                        for (peer_id, _multiaddr) in list {
+                            println!("[GOSSIP] mDNS expired: {peer_id}");
+                            swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                            state.remove(&peer_id);
+                        }
+                    }
+                    SwarmEvent::Behaviour(ClusterEvent::Gossipsub(gossipsub::Event::Message {
+                        message,
+                        ..
+                    })) => {
+                        if let Ok(cluster_message) = serde_json::from_slice::<ClusterMessage>(&message.data) {
+                            println!("[GOSSIP] Received cluster message from peer: {}", cluster_message.peer_id);
+                            let mut state = cluster_state.write().await;
+                            let addrs = state.entry(cluster_message.peer_id).or_default();
+                            for addr in cluster_message.addrs {
+                                if !addrs.contains(&addr) {
+                                    addrs.push(addr);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
-            SwarmEvent::Behaviour(ClusterEvent::Gossipsub(gossipsub::Event::Message {
-                propagation_source: peer_id,
-                message_id: id,
-                message,
-            })) => {
-                println!(
-                    "[GOSSIP] Got message: '{}' with id: {id} from peer: {peer_id}",
-                    String::from_utf8_lossy(&message.data),
-                );
-            }
-            _ => {}
         }
     }
 }

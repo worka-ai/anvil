@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 
 const STORAGE_DIR: &str = "anvil-data";
 
@@ -16,18 +17,19 @@ impl Storage {
         Ok(Self { storage_path })
     }
 
-    pub async fn store(&self, data: &[u8]) -> Result<String> {
-        let hash = blake3::hash(data);
-        let hex_hash = hash.to_hex().to_string();
-        let file_path = self.storage_path.join(&hex_hash);
-
-        fs::write(file_path, data).await?;
-
-        Ok(hex_hash)
+    fn get_shard_path(&self, object_hash: &str, shard_index: u32) -> PathBuf {
+        self.storage_path.join(format!("{}-{:02}", object_hash, shard_index))
     }
 
-    pub async fn retrieve(&self, hash: &str) -> Result<Vec<u8>> {
-        let file_path = self.storage_path.join(hash);
+    pub async fn store_shard(&self, object_hash: &str, shard_index: u32, data: &[u8]) -> Result<()> {
+        let file_path = self.get_shard_path(object_hash, shard_index);
+        let mut file = fs::File::create(file_path).await?;
+        file.write_all(data).await?;
+        Ok(())
+    }
+
+    pub async fn retrieve_shard(&self, object_hash: &str, shard_index: u32) -> Result<Vec<u8>> {
+        let file_path = self.get_shard_path(object_hash, shard_index);
         let data = fs::read(file_path).await?;
         Ok(data)
     }
@@ -38,19 +40,21 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_store_and_retrieve() {
+    async fn test_store_and_retrieve_shard() {
         let storage = Storage::new().await.unwrap();
+        let object_hash = "test-hash";
+        let shard_index = 0;
         let data = b"hello world";
 
-        // Store the data
-        let hash = storage.store(data).await.unwrap();
+        // Store the shard
+        storage.store_shard(object_hash, shard_index, data).await.unwrap();
 
-        // Retrieve the data
-        let retrieved_data = storage.retrieve(&hash).await.unwrap();
+        // Retrieve the shard
+        let retrieved_data = storage.retrieve_shard(object_hash, shard_index).await.unwrap();
 
         assert_eq!(data.as_ref(), retrieved_data.as_slice());
 
         // Clean up the test file
-        fs::remove_file(storage.storage_path.join(hash)).await.unwrap();
+        fs::remove_file(storage.get_shard_path(object_hash, shard_index)).await.unwrap();
     }
 }

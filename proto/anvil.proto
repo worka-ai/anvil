@@ -156,3 +156,26 @@ message CompleteMultipartResponse {
     string etag = 1;
     string version_id = 2;
 }
+
+// Internal Service for node-to-node communication
+service InternalAnvilService {
+  rpc PutShard(stream PutShardRequest) returns (PutShardResponse);
+  rpc GetShard(GetShardRequest) returns (stream GetShardResponse);
+}
+
+message PutShardRequest {
+    string object_hash = 1;
+    uint32 shard_index = 2;
+    bytes data = 3;
+}
+
+message PutShardResponse {}
+
+message GetShardRequest {
+    string object_hash = 1;
+    uint32 shard_index = 2;
+}
+
+message GetShardResponse {
+    bytes data = 1;
+}
