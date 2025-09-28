@@ -1,7 +1,7 @@
 use anyhow::Result;
 use deadpool_postgres::Pool;
-use time::OffsetDateTime;
 use serde_json::Value as JsonValue;
+use time::OffsetDateTime;
 use tokio_postgres::Row;
 
 #[derive(Debug, Clone)]
@@ -46,7 +46,10 @@ pub struct Object {
 // Manual row-to-struct mapping
 impl From<Row> for Tenant {
     fn from(row: Row) -> Self {
-        Self { id: row.get("id"), name: row.get("name") }
+        Self {
+            id: row.get("id"),
+            name: row.get("name"),
+        }
     }
 }
 
@@ -84,7 +87,10 @@ impl From<Row> for Object {
 
 impl Persistence {
     pub fn new(global_pool: Pool, regional_pool: Pool) -> Self {
-        Self { global_pool, regional_pool }
+        Self {
+            global_pool,
+            regional_pool,
+        }
     }
 
     // --- Global Methods ---
@@ -111,12 +117,12 @@ impl Persistence {
         Ok(row.into())
     }
 
-    pub async fn get_bucket_by_name(&self, tenant_id: i64, name: &str) -> Result<Option<Bucket>> {
+    pub async fn get_bucket_by_name(&self, tenant_id: i64, name: &str, region: &str) -> Result<Option<Bucket>> {
         let client = self.global_pool.get().await?;
         let row = client
             .query_opt(
-                "SELECT * FROM buckets WHERE tenant_id = $1 AND name = $2",
-                &[&tenant_id, &name],
+                "SELECT * FROM buckets WHERE tenant_id = $1 AND name = $2 AND region = $3",
+                &[&tenant_id, &name, &region],
             )
             .await?;
         Ok(row.map(Into::into))
@@ -138,7 +144,7 @@ impl Persistence {
                 r#"
             INSERT INTO objects (bucket_id, key, content_hash, size, etag, version_id)
             VALUES ($1, $2, $3, $4, $5, gen_random_uuid())
-            RETURNING *; 
+            RETURNING *;
             "#,
                 &[&bucket_id, &key, &content_hash, &size, &etag],
             )
@@ -151,9 +157,9 @@ impl Persistence {
         let row = client
             .query_opt(
                 r#"
-            SELECT * 
-            FROM objects 
-            WHERE bucket_id = $1 AND key = $2 
+            SELECT *
+            FROM objects
+            WHERE bucket_id = $1 AND key = $2
             ORDER BY created_at DESC LIMIT 1
             "#,
                 &[&bucket_id, &key],
@@ -165,8 +171,8 @@ impl Persistence {
     pub async fn list_objects(
         &self,
         bucket_id: i64,
-        prefix: &str,
-        start_after: &str,
+        _prefix: &str,
+        _start_after: &str,
         limit: i32,
     ) -> Result<Vec<Object>> {
         let client = self.regional_pool.get().await?;
@@ -174,11 +180,11 @@ impl Persistence {
             .query(
                 r#"
             SELECT * FROM objects
-            WHERE bucket_id = $1 AND key > $2 AND key LIKE $3
+            WHERE bucket_id = $1
             ORDER BY key
-            LIMIT $4
+            LIMIT $2
             "#,
-                &[&bucket_id, &start_after, &format!("{}%", prefix), &(limit as i64)],
+                &[&bucket_id, &(limit as i64)],
             )
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())

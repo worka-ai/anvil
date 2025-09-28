@@ -19,6 +19,11 @@ impl ShardManager {
         Self { codec }
     }
 
+    pub fn new_with_config(data_shards: usize, parity_shards: usize) -> Self {
+        let codec = ReedSolomon::new(data_shards, parity_shards).unwrap();
+        Self { codec }
+    }
+
     /// Encodes a single data stripe into data + parity shards.
     pub fn encode(&self, stripe: &mut [Vec<u8>]) -> Result<(), Error> {
         self.codec.encode(stripe)

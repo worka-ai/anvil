@@ -25,6 +25,17 @@ impl Storage {
         self.storage_path.join(format!("{}-{:02}", object_hash, shard_index))
     }
 
+    fn get_whole_object_path(&self, object_hash: &str) -> PathBuf {
+        self.storage_path.join(object_hash)
+    }
+
+    pub async fn store_whole_object(&self, object_hash: &str, data: &[u8]) -> Result<()> {
+        let file_path = self.get_whole_object_path(object_hash);
+        let mut file = fs::File::create(file_path).await?;
+        file.write_all(data).await?;
+        Ok(())
+    }
+
     fn get_temp_shard_path(&self, upload_id: &str, shard_index: u32) -> PathBuf {
         self.temp_path.join(format!("{}-{:02}", upload_id, shard_index))
     }
@@ -49,6 +60,12 @@ impl Storage {
 
     pub async fn retrieve_shard(&self, object_hash: &str, shard_index: u32) -> Result<Vec<u8>> {
         let file_path = self.get_shard_path(object_hash, shard_index);
+        let data = fs::read(file_path).await?;
+        Ok(data)
+    }
+
+    pub async fn retrieve_whole_object(&self, object_hash: &str) -> Result<Vec<u8>> {
+        let file_path = self.get_whole_object_path(object_hash);
         let data = fs::read(file_path).await?;
         Ok(data)
     }

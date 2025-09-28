@@ -45,6 +45,7 @@ pub struct AppState {
     pub cluster: ClusterState,
     pub sharder: sharding::ShardManager,
     pub placer: placement::PlacementManager,
+    pub region: String,
 }
 
 pub async fn run(grpc_addr: SocketAddr) -> Result<()> {
@@ -90,6 +91,7 @@ pub async fn run(grpc_addr: SocketAddr) -> Result<()> {
         cluster: cluster_state.clone(),
         sharder: sharding::ShardManager::new(),
         placer: placement::PlacementManager::default(),
+        region,
     };
 
     // --- Services ---
