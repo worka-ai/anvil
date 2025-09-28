@@ -1,11 +1,18 @@
 use crate::anvil_api::bucket_service_server::BucketServiceServer;
 use crate::anvil_api::object_service_server::ObjectServiceServer;
 use anyhow::Result;
+use cluster::ClusterState;
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::env;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tonic::transport::Server;
 
 // The modules we've created
+pub mod cluster;
+pub mod discovery;
 pub mod persistence;
 pub mod services;
 pub mod storage;
@@ -20,33 +27,45 @@ pub mod anvil_api {
 pub struct AppState {
     pub db: persistence::Persistence,
     pub storage: storage::Storage,
+    pub cluster: ClusterState,
 }
 
 pub async fn run() -> Result<()> {
     // Load .env file
     dotenvy::dotenv().ok();
 
+    // --- Configuration ---
+    let grpc_addr: SocketAddr = "[::1]:50051".parse()?;
+
+    // --- Database ---
     let db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let pool = PgPool::connect(&db_url).await?;
-
-    // Run migrations
     sqlx::migrate!().run(&pool).await?;
 
+    // --- State ---
     let storage = storage::Storage::new().await?;
-
+    let cluster_state = Arc::new(RwLock::new(HashMap::new()));
     let state = AppState {
         db: persistence::Persistence::new(pool),
         storage,
+        cluster: cluster_state.clone(),
     };
 
-    let addr = "[::1]:50051".parse().unwrap();
-    println!("Anvil server listening on {}", addr);
-
-    Server::builder()
+    // --- Services ---
+    let grpc_server = Server::builder()
         .add_service(BucketServiceServer::new(state.clone()))
         .add_service(ObjectServiceServer::new(state))
-        .serve(addr)
-        .await?;
+        .serve(grpc_addr);
+
+    let gossip_service = cluster::run_gossip(cluster_state);
+
+    println!("Anvil gRPC server listening on {}", grpc_addr);
+
+    // --- Run ---
+    tokio::try_join!(
+        async { grpc_server.await.map_err(anyhow::Error::from) },
+        async { gossip_service.await.map_err(anyhow::Error::from) },
+    )?;
 
     Ok(())
 }
