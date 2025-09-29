@@ -83,12 +83,7 @@ pub async fn run(
     regional_db_url: String,
     jwt_secret: String,
 ) -> Result<()> {
-    // --- Database ---
-    // Create connection pools
-    let regional_pool = create_pool(&regional_db_url)?;
-    let global_pool = create_pool(&global_db_url)?;
-
-    // Run migrations on both databases
+    // Run migrations first
     run_migrations(
         &global_db_url,
         migrations::migrations::runner(),
@@ -101,6 +96,28 @@ pub async fn run(
         "refinery_schema_history_regional",
     )
     .await?;
+
+    // Then start the node
+    start_node(
+        listener,
+        region,
+        global_db_url,
+        regional_db_url,
+        jwt_secret,
+    )
+    .await
+}
+
+pub async fn start_node(
+    listener: tokio::net::TcpListener,
+    region: String,
+    global_db_url: String,
+    regional_db_url: String,
+    jwt_secret: String,
+) -> Result<()> {
+    // --- Database ---
+    let regional_pool = create_pool(&regional_db_url)?;
+    let global_pool = create_pool(&global_db_url)?;
 
     // Create a default tenant for testing if it doesn't exist
     let client = global_pool.get().await?;

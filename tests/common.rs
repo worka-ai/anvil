@@ -425,71 +425,98 @@ async fn create_isolated_dbs() -> (String, String) {
     (global_db_url, regional_db_url)
 }
 
-// Starts a cluster of nodes for testing.
-pub async fn start_cluster(
-    global_db_url: &str,
-    regional_db_url: &str,
-    num_nodes: usize,
-) -> (Vec<JoinHandle<()>>, Vec<String>, String) {
-    let cluster_state = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let mut nodes = Vec::new();
-    let mut grpc_addrs = Vec::new();
+pub struct TestCluster {
+    pub nodes: Vec<JoinHandle<()>>,
+    pub grpc_addrs: Vec<String>,
+    pub token: String,
+    pub global_db_url: String,
+    pub regional_db_url: String,
+}
 
-    for _ in 0..num_nodes {
-        let global_pool = create_pool(global_db_url).unwrap();
-        let regional_pool = create_pool(regional_db_url).unwrap();
+impl TestCluster {
+    pub async fn new(num_nodes: usize) -> Self {
+        let (global_db_url, regional_db_url) = create_isolated_dbs().await;
 
-        let mut state = AppState::new(
-            global_pool,
-            regional_pool,
-            "TEST_REGION".to_string(),
-            "test-secret".to_string(),
+        // Run migrations once before starting any nodes
+        anvil::run_migrations(
+            &global_db_url,
+            migrations::migrations::runner(),
+            "refinery_schema_history_global",
         )
         .await
         .unwrap();
-        state.cluster = cluster_state.clone();
+        anvil::run_migrations(
+            &regional_db_url,
+            regional_migrations::migrations::runner(),
+            "refinery_schema_history_regional",
+        )
+        .await
+        .unwrap();
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let http_addr = format!("http://{}", addr);
-        grpc_addrs.push(http_addr);
+        let mut nodes = Vec::new();
+        let mut grpc_addrs = Vec::new();
 
-        let server_state = state.clone();
-        let regional_db_url_clone = regional_db_url.to_string();
-        let global_db_url_clone = global_db_url.to_string();
-        let region_clone = server_state.region.clone();
-        let jwt_secret_clone = "test-secret".to_string();
+        for _ in 0..num_nodes {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let http_addr = format!("http://{}", addr);
+            grpc_addrs.push(http_addr);
 
-        let node_handle = tokio::spawn(async move {
-            anvil::run(
-                listener,
-                region_clone,
-                global_db_url_clone,
-                regional_db_url_clone,
-                jwt_secret_clone,
-            )
-            .await
-            .unwrap();
-        });
-        nodes.push(node_handle);
-    }
+            let regional_db_url_clone = regional_db_url.to_string();
+            let global_db_url_clone = global_db_url.to_string();
 
-    // Wait for cluster to form
-    loop {
-        let state = cluster_state.read().await;
-        if state.len() >= num_nodes {
-            tokio::time::sleep(Duration::from_secs(2)).await; // allow for stabilization
-            break;
+            let node_handle = tokio::spawn(async move {
+                anvil::start_node(
+                    listener,
+                    "TEST_REGION".to_string(),
+                    global_db_url_clone,
+                    regional_db_url_clone,
+                    "test-secret".to_string(),
+                )
+                .await
+                .unwrap();
+            });
+            nodes.push(node_handle);
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Wait for all nodes to start
+        for addr in &grpc_addrs {
+            let socket_addr = addr.replace("http://", "").parse().unwrap();
+            assert!(
+                wait_for_port(socket_addr, Duration::from_secs(5)).await,
+                "Server did not start in time"
+            );
+        }
+
+        let token = get_auth_token(&global_db_url, &grpc_addrs[0]).await;
+
+        Self {
+            nodes,
+            grpc_addrs,
+            token,
+            global_db_url,
+            regional_db_url,
+        }
     }
-
-    let token = get_auth_token(global_db_url, &grpc_addrs[0]).await;
-
-    (nodes, grpc_addrs, token)
 }
 // Starts a single node server for testing and returns its state and address.
 pub async fn start_test_server(global_db_url: &str, regional_db_url: &str) -> (AppState, String) {
+    // Run migrations once before starting the server.
+    anvil::run_migrations(
+        global_db_url,
+        migrations::migrations::runner(),
+        "refinery_schema_history_global",
+    )
+    .await
+    .unwrap();
+    anvil::run_migrations(
+        regional_db_url,
+        regional_migrations::migrations::runner(),
+        "refinery_schema_history_regional",
+    )
+    .await
+    .unwrap();
+
     let global_pool = create_pool(global_db_url).unwrap();
     let regional_pool = create_pool(regional_db_url).unwrap();
     let region = "TEST_REGION".to_string();
@@ -511,7 +538,7 @@ pub async fn start_test_server(global_db_url: &str, regional_db_url: &str) -> (A
     let regional_db_url_clone = regional_db_url.to_string();
 
     let handle = tokio::spawn(async move {
-        match anvil::run(
+        match anvil::start_node(
             listener,
             region,
             global_db_url_clone,

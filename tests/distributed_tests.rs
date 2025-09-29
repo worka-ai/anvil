@@ -13,14 +13,14 @@ async fn test_distributed_reconstruction_on_node_failure() {
     common::with_test_dbs(|global_db_url, regional_db_url, _|
         async move {
             let num_nodes = 6;
-            let (nodes, grpc_addrs, token) = common::start_cluster(&global_db_url, &regional_db_url, num_nodes).await;
+            let mut cluster = common::TestCluster::new(num_nodes).await;
 
-            let primary_addr = grpc_addrs[0].clone();
+            let primary_addr = cluster.grpc_addrs[0].clone();
             let mut bucket_client = BucketServiceClient::connect(primary_addr.clone()).await.unwrap();
             let mut object_client = ObjectServiceClient::connect(primary_addr.clone()).await.unwrap();
 
             let bucket_name = "reconstruction-bucket".to_string();
-            common::create_test_bucket(&primary_addr, &bucket_name, &token).await;
+            common::create_test_bucket(&primary_addr, &bucket_name, &cluster.token).await;
 
             let object_key = "reconstruction-object".to_string();
             let content = (0..1024 * 256).map(|i| (i % 256) as u8).collect::<Vec<_>>();
@@ -32,20 +32,20 @@ async fn test_distributed_reconstruction_on_node_failure() {
                 chunks.push(PutObjectRequest { data: Some(anvil::anvil_api::put_object_request::Data::Chunk(chunk.to_vec())) });
             }
             let mut put_req = Request::new(tokio_stream::iter(chunks));
-            put_req.metadata_mut().insert("authorization", format!("Bearer {}", token).parse().unwrap());
+            put_req.metadata_mut().insert("authorization", format!("Bearer {}", cluster.token).parse().unwrap());
             object_client.put_object(put_req).await.unwrap();
 
             // 2. Stop one of the nodes
-            nodes[1].abort();
+            cluster.nodes.remove(1).abort();
             // Wait a moment for the node to die and for gossip to propagate
             tokio::time::sleep(Duration::from_secs(5)).await;
 
             // 3. Connect to a *different*, live node
-            let mut recovery_client = ObjectServiceClient::connect(grpc_addrs[2].clone()).await.unwrap();
+            let mut recovery_client = ObjectServiceClient::connect(cluster.grpc_addrs[2].clone()).await.unwrap();
 
             // 4. Get the object and verify its content
             let mut get_req = Request::new(GetObjectRequest { bucket_name: bucket_name.clone(), object_key: object_key.clone(), version_id: None });
-            get_req.metadata_mut().insert("authorization", format!("Bearer {}", token).parse().unwrap());
+            get_req.metadata_mut().insert("authorization", format!("Bearer {}", cluster.token).parse().unwrap());
             
             let mut stream = timeout(Duration::from_secs(10), recovery_client.get_object(get_req)).await
                 .expect("get_object timed out")
