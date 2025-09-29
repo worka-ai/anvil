@@ -1,7 +1,7 @@
 use anyhow::Result;
 use deadpool_postgres::Pool;
-use time::OffsetDateTime;
 use serde_json::Value as JsonValue;
+use time::OffsetDateTime;
 use tokio_postgres::Row;
 
 #[derive(Debug, Clone)]
@@ -55,13 +55,20 @@ pub struct Object {
 // Manual row-to-struct mapping
 impl From<Row> for Tenant {
     fn from(row: Row) -> Self {
-        Self { id: row.get("id"), name: row.get("name") }
+        Self {
+            id: row.get("id"),
+            name: row.get("name"),
+        }
     }
 }
 
 impl From<Row> for App {
     fn from(row: Row) -> Self {
-        Self { id: row.get("id"), name: row.get("name"), client_id: row.get("client_id") }
+        Self {
+            id: row.get("id"),
+            name: row.get("name"),
+            client_id: row.get("client_id"),
+        }
     }
 }
 
@@ -117,7 +124,10 @@ impl From<Row> for AppDetails {
 
 impl Persistence {
     pub fn new(global_pool: Pool, regional_pool: Pool) -> Self {
-        Self { global_pool, regional_pool }
+        Self {
+            global_pool,
+            regional_pool,
+        }
     }
 
     pub fn get_global_pool(&self) -> &Pool {
@@ -128,20 +138,41 @@ impl Persistence {
 
     pub async fn get_tenant_by_name(&self, name: &str) -> Result<Option<Tenant>> {
         let client = self.global_pool.get().await?;
-        let row = client.query_opt("SELECT id, name FROM tenants WHERE name = $1", &[&name]).await?;
+        let row = client
+            .query_opt("SELECT id, name FROM tenants WHERE name = $1", &[&name])
+            .await?;
         Ok(row.map(Into::into))
     }
 
     pub async fn get_app_by_client_id(&self, client_id: &str) -> Result<Option<AppDetails>> {
         let client = self.global_pool.get().await?;
-        let row = client.query_opt("SELECT id, client_secret_hash, tenant_id FROM apps WHERE client_id = $1", &[&client_id]).await?;
+        let row = client
+            .query_opt(
+                "SELECT id, client_secret_hash, tenant_id FROM apps WHERE client_id = $1",
+                &[&client_id],
+            )
+            .await?;
         Ok(row.map(Into::into))
     }
 
     pub async fn get_policies_for_app(&self, app_id: i64) -> Result<Vec<String>> {
         let client = self.global_pool.get().await?;
-        let rows = client.query("SELECT resource, action FROM policies WHERE app_id = $1", &[&app_id]).await?;
-        Ok(rows.into_iter().map(|row| format!("{}:{}", row.get::<_, String>("action"), row.get::<_, String>("resource"))).collect())
+        let rows = client
+            .query(
+                "SELECT resource, action FROM policies WHERE app_id = $1",
+                &[&app_id],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                format!(
+                    "{}:{}",
+                    row.get::<_, String>("action"),
+                    row.get::<_, String>("resource")
+                )
+            })
+            .collect())
     }
 
     pub async fn create_tenant(&self, name: &str, api_key: &str) -> Result<Tenant> {
@@ -155,7 +186,13 @@ impl Persistence {
         Ok(row.into())
     }
 
-    pub async fn create_app(&self, tenant_id: i64, name: &str, client_id: &str, client_secret_hash: &str) -> Result<App> {
+    pub async fn create_app(
+        &self,
+        tenant_id: i64,
+        name: &str,
+        client_id: &str,
+        client_secret_hash: &str,
+    ) -> Result<App> {
         let client = self.global_pool.get().await?;
         let row = client
             .query_one(
@@ -168,7 +205,12 @@ impl Persistence {
 
     pub async fn get_app_by_name(&self, name: &str) -> Result<Option<App>> {
         let client = self.global_pool.get().await?;
-        let row = client.query_opt("SELECT id, name, client_id FROM apps WHERE name = $1", &[&name]).await?;
+        let row = client
+            .query_opt(
+                "SELECT id, name, client_id FROM apps WHERE name = $1",
+                &[&name],
+            )
+            .await?;
         Ok(row.map(Into::into))
     }
 
@@ -205,12 +247,28 @@ impl Persistence {
         Ok(row.into())
     }
 
-    pub async fn get_bucket_by_name(&self, tenant_id: i64, name: &str, region: &str) -> Result<Option<Bucket>> {
+    pub async fn get_bucket_by_name(
+        &self,
+        tenant_id: i64,
+        name: &str,
+        region: &str,
+    ) -> Result<Option<Bucket>> {
         let client = self.global_pool.get().await?;
         let row = client
             .query_opt(
             "SELECT id, name, region, created_at, is_public_read, tenant_id FROM buckets WHERE tenant_id = $1 AND name = $2 AND region = $3 AND deleted_at IS NULL",
                 &[&tenant_id, &name, &region],
+            )
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
+    pub async fn get_public_bucket_by_name(&self, name: &str) -> Result<Option<Bucket>> {
+        let client = self.global_pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT * FROM buckets WHERE name = $1 AND is_public_read = true AND deleted_at IS NULL",
+                &[&name],
             )
             .await?;
         Ok(row.map(Into::into))
@@ -306,7 +364,12 @@ impl Persistence {
             ORDER BY key
             LIMIT $4
             "#,
-                &[&bucket_id, &start_after, &format!("{}%", prefix), &(limit as i64)],
+                &[
+                    &bucket_id,
+                    &start_after,
+                    &format!("{}%", prefix),
+                    &(limit as i64),
+                ],
             )
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())
@@ -330,7 +393,12 @@ impl Persistence {
 
     // --- Task Queue Methods ---
 
-    pub async fn enqueue_task(&self, task_type: crate::tasks::TaskType, payload: JsonValue, priority: i32) -> Result<()> {
+    pub async fn enqueue_task(
+        &self,
+        task_type: crate::tasks::TaskType,
+        payload: JsonValue,
+        priority: i32,
+    ) -> Result<()> {
         let client = self.global_pool.get().await?;
         client
             .execute(

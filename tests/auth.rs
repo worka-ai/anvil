@@ -17,7 +17,7 @@ async fn test_auth_flow_with_wildcard_scopes() {
             ("REGION", "AUTH_TEST".to_string()),
             ("JWT_SECRET", "auth-test-secret".to_string()),
         ];
-
+        let server_env2 = server_env.clone();
         // 2. Start the server
         let grpc_addr = "127.0.0.1:50099".parse::<SocketAddr>().unwrap();
         let listener = tokio::net::TcpListener::bind(grpc_addr).await.unwrap();
@@ -38,7 +38,7 @@ async fn test_auth_flow_with_wildcard_scopes() {
         let admin_args = &["run", "--bin", "admin", "--"];
         let app_output = Command::new("cargo")
             .args(admin_args.iter().chain(&["apps", "create", "--tenant-name", "default", "--app-name", "auth-app"]))
-            .env("GLOBAL_DATABASE_URL", &global_db_url)
+            .envs(server_env2.clone())
             .output().unwrap();
         assert!(app_output.status.success());
         let creds = String::from_utf8(app_output.stdout).unwrap();
@@ -48,7 +48,7 @@ async fn test_auth_flow_with_wildcard_scopes() {
         let policy_args = &["policies", "grant", "--app-name", "auth-app", "--action", "write", "--resource", "bucket:auth-test-*"];
         let status = Command::new("cargo")
             .args(admin_args.iter().chain(policy_args.iter()))
-            .env("GLOBAL_DATABASE_URL", &global_db_url)
+            .envs(server_env2.clone())
             .status().unwrap();
         assert!(status.success());
 

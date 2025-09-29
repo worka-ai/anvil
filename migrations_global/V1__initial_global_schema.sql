@@ -14,12 +14,11 @@ CREATE TABLE tenants (
 CREATE TABLE buckets (
     id BIGSERIAL PRIMARY KEY,
     tenant_id BIGINT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    name TEXT NOT NULL,
+    name TEXT NOT NULL UNIQUE,
     region TEXT NOT NULL REFERENCES regions(name) ON DELETE CASCADE,
     is_public_read BOOLEAN NOT NULL DEFAULT false,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ,
-    UNIQUE(tenant_id, name)
+    deleted_at TIMESTAMPTZ
 );
 
 CREATE TABLE apps (

@@ -1,19 +1,18 @@
+use crate::anvil_api::internal_anvil_service_server::InternalAnvilService;
+use crate::anvil_api::object_service_server::ObjectService;
 use crate::anvil_api::*;
+use crate::tasks::TaskType;
 use crate::{auth, AppState};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use crate::anvil_api::auth_service_server::AuthService;
-use crate::anvil_api::bucket_service_server::BucketService;
-use crate::anvil_api::internal_anvil_service_server::InternalAnvilService;
-use crate::anvil_api::object_service_server::ObjectService;
-use crate::tasks::TaskType;
 
 #[tonic::async_trait]
 impl ObjectService for AppState {
-    type GetObjectStream =
-    std::pin::Pin<Box<dyn futures_core::Stream<Item=Result<GetObjectResponse, Status>> + Send>>;
+    type GetObjectStream = std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = Result<GetObjectResponse, Status>> + Send>,
+    >;
 
     async fn put_object(
         &self,
@@ -30,7 +29,9 @@ impl ObjectService for AppState {
         // 1. Get metadata and generate Upload ID
         let (bucket_name, object_key) = match stream.next().await {
             Some(Ok(chunk)) => match chunk.data {
-                Some(put_object_request::Data::Metadata(meta)) => (meta.bucket_name, meta.object_key),
+                Some(put_object_request::Data::Metadata(meta)) => {
+                    (meta.bucket_name, meta.object_key)
+                }
                 _ => return Err(Status::invalid_argument("First chunk must be metadata")),
             },
             _ => return Err(Status::invalid_argument("Empty stream")),
@@ -87,10 +88,10 @@ impl ObjectService for AppState {
                 let client = internal_anvil_service_client::InternalAnvilServiceClient::connect(
                     peer_info.grpc_addr.clone(),
                 )
-                    .await
-                    .map_err(|e| {
-                        Status::internal(format!("Failed to connect to peer {}: {}", peer_id, e))
-                    })?;
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("Failed to connect to peer {}: {}", peer_id, e))
+                })?;
                 clients.push(client);
             }
 
@@ -124,8 +125,10 @@ impl ObjectService for AppState {
                     let mut client = clients[i].clone();
                     let request_stream = tokio_stream::iter(vec![request]);
                     let mut req = tonic::Request::new(request_stream);
-                    req.metadata_mut()
-                        .insert("authorization", format!("Bearer {}", token).parse().unwrap());
+                    req.metadata_mut().insert(
+                        "authorization",
+                        format!("Bearer {}", token).parse().unwrap(),
+                    );
                     futures.push(async move { client.put_shard(req).await });
                 }
                 futures::future::try_join_all(futures)
@@ -163,8 +166,10 @@ impl ObjectService for AppState {
                     let mut client = clients[i].clone();
                     let request_stream = tokio_stream::iter(vec![request]);
                     let mut req = tonic::Request::new(request_stream);
-                    req.metadata_mut()
-                        .insert("authorization", format!("Bearer {}", token).parse().unwrap());
+                    req.metadata_mut().insert(
+                        "authorization",
+                        format!("Bearer {}", token).parse().unwrap(),
+                    );
                     futures.push(async move { client.put_shard(req).await });
                 }
                 futures::future::try_join_all(futures)
@@ -188,8 +193,10 @@ impl ObjectService for AppState {
                     final_object_hash: content_hash.clone(),
                 };
                 let mut req = tonic::Request::new(request);
-                req.metadata_mut()
-                    .insert("authorization", format!("Bearer {}", token).parse().unwrap());
+                req.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", token).parse().unwrap(),
+                );
                 futures.push(async move { client.commit_shard(req).await });
             }
             futures::future::try_join_all(futures)
@@ -230,18 +237,32 @@ impl ObjectService for AppState {
         let claims = request.extensions().get::<auth::Claims>().cloned();
         let req = request.into_inner();
 
-        // 1. Look up object metadata
-        let tenant_id = claims.as_ref().map(|c| c.tenant_id).unwrap_or(0);
-        let bucket = self
-            .db
-            .get_bucket_by_name(tenant_id, &req.bucket_name, &self.region)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Bucket not found"))?;
+        // 1. Look up bucket, handling anonymous vs authenticated access differently.
+        let bucket = match &claims {
+            Some(c) => {
+                // Authenticated user: look up bucket by tenant and name.
+                self.db
+                    .get_bucket_by_name(c.tenant_id, &req.bucket_name, &self.region)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .ok_or_else(|| Status::not_found("Bucket not found"))?
+            }
+            None => {
+                // Anonymous user: look for a bucket that is explicitly public.
+                self.db
+                    .get_public_bucket_by_name(&req.bucket_name)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .ok_or_else(|| Status::not_found("Bucket not found"))?
+            }
+        };
 
         // 2. Authorization Check
         if !bucket.is_public_read {
-            let claims = claims.ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+            let claims = claims.ok_or_else(|| {
+                //we know it is an authorisation error but best practice says we shouldn't reveal its existence at all
+                Status::not_found("Bucket not found")
+            })?;
             let resource = format!("bucket:{}/{}", req.bucket_name, req.object_key);
             if !auth::is_authorized(&format!("read:{}", resource), &claims.scopes) {
                 return Err(Status::permission_denied("Permission denied"));
@@ -359,7 +380,8 @@ impl ObjectService for AppState {
         let claims = request
             .extensions()
             .get::<auth::Claims>()
-            .ok_or_else(|| Status::unauthenticated("Missing claims"))?.clone();
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?
+            .clone();
         let req = request.into_inner();
 
         let resource = format!("bucket:{}/{}", req.bucket_name, req.object_key);
@@ -403,7 +425,8 @@ impl ObjectService for AppState {
         let claims = request
             .extensions()
             .get::<auth::Claims>()
-            .ok_or_else(|| Status::unauthenticated("Missing claims"))?.clone();
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?
+            .clone();
         let req = request.into_inner();
 
         let resource = format!("bucket:{}/{}", req.bucket_name, req.object_key);
@@ -432,7 +455,10 @@ impl ObjectService for AppState {
             last_modified: object.created_at.to_string(),
         }))
     }
-    async fn list_objects(&self, request: Request<ListObjectsRequest>) -> Result<Response<ListObjectsResponse>, Status> {
+    async fn list_objects(
+        &self,
+        request: Request<ListObjectsRequest>,
+    ) -> Result<Response<ListObjectsResponse>, Status> {
         let claims = request
             .extensions()
             .get::<auth::Claims>()
@@ -458,7 +484,11 @@ impl ObjectService for AppState {
                 bucket.id,
                 &req.prefix,
                 &req.start_after,
-                if req.max_keys == 0 { 1000 } else { req.max_keys },
+                if req.max_keys == 0 {
+                    1000
+                } else {
+                    req.max_keys
+                },
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -473,14 +503,23 @@ impl ObjectService for AppState {
             })
             .collect();
 
-        Ok(Response::new(ListObjectsResponse { objects: response_objects, common_prefixes: vec![] }))
+        Ok(Response::new(ListObjectsResponse {
+            objects: response_objects,
+            common_prefixes: vec![],
+        }))
     }
 
-    async fn initiate_multipart_upload(&self, request: Request<InitiateMultipartRequest>) -> Result<Response<InitiateMultipartResponse>, Status> {
+    async fn initiate_multipart_upload(
+        &self,
+        request: Request<InitiateMultipartRequest>,
+    ) -> Result<Response<InitiateMultipartResponse>, Status> {
         todo!()
     }
 
-    async fn complete_multipart_upload(&self, request: Request<CompleteMultipartRequest>) -> Result<Response<CompleteMultipartResponse>, Status> {
+    async fn complete_multipart_upload(
+        &self,
+        request: Request<CompleteMultipartRequest>,
+    ) -> Result<Response<CompleteMultipartResponse>, Status> {
         todo!()
     }
 }

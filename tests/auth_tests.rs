@@ -72,8 +72,8 @@ async fn test_set_public_access_and_get() {
 
     // Get object without auth
     let get_req = Request::new(GetObjectRequest { bucket_name: bucket_name.clone(), object_key: object_key.clone(), version_id: None });
-    let res = object_client.get_object(get_req).await;
-    assert!(res.is_ok());
+    let res = object_client.get_object(get_req).await.unwrap();
+    //assert!(res.is_ok());
 
     // Set bucket to private
     let mut private_req = Request::new(SetPublicAccessRequest { bucket: bucket_name.clone(), allow_public_read: false });

@@ -10,3 +10,16 @@ pub enum TaskType {
     #[postgres(name = "REBALANCE_SHARD")]
     RebalanceShard,
 }
+
+#[derive(Debug, ToSql, FromSql, PartialEq,Eq,)]
+#[postgres(name = "task_status")]
+pub enum TaskStatus {
+    #[postgres(name = "pending")]
+    Pending,
+    #[postgres(name = "running")]
+    Running,
+    #[postgres(name = "completed")]
+    Completed,
+    #[postgres(name = "failed")]
+    Failed,
+}
