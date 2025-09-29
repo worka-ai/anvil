@@ -37,6 +37,7 @@ pub struct Bucket {
 #[derive(Debug)]
 pub struct Object {
     pub id: i64,
+    pub tenant_id: i64,
     pub bucket_id: i64,
     pub key: String,
     pub content_hash: String,
@@ -81,6 +82,7 @@ impl From<Row> for Object {
     fn from(row: Row) -> Self {
         Self {
             id: row.get("id"),
+            tenant_id: row.get("tenant_id"),
             bucket_id: row.get("bucket_id"),
             key: row.get("key"),
             content_hash: row.get("content_hash"),
@@ -100,11 +102,16 @@ impl From<Row> for Object {
 pub struct AppDetails {
     pub id: i64,
     pub client_secret_hash: String,
+    pub tenant_id: i64,
 }
 
 impl From<Row> for AppDetails {
     fn from(row: Row) -> Self {
-        Self { id: row.get("id"), client_secret_hash: row.get("client_secret_hash") }
+        Self {
+            id: row.get("id"),
+            client_secret_hash: row.get("client_secret_hash"),
+            tenant_id: row.get("tenant_id"),
+        }
     }
 }
 
@@ -127,7 +134,7 @@ impl Persistence {
 
     pub async fn get_app_by_client_id(&self, client_id: &str) -> Result<Option<AppDetails>> {
         let client = self.global_pool.get().await?;
-        let row = client.query_opt("SELECT id, client_secret_hash FROM apps WHERE client_id = $1", &[&client_id]).await?;
+        let row = client.query_opt("SELECT id, client_secret_hash, tenant_id FROM apps WHERE client_id = $1", &[&client_id]).await?;
         Ok(row.map(Into::into))
     }
 
@@ -246,6 +253,7 @@ impl Persistence {
 
     pub async fn create_object(
         &self,
+        tenant_id: i64,
         bucket_id: i64,
         key: &str,
         content_hash: &str,
@@ -256,11 +264,11 @@ impl Persistence {
         let row = client
             .query_one(
                 r#"
-            INSERT INTO objects (bucket_id, key, content_hash, size, etag, version_id)
-            VALUES ($1, $2, $3, $4, $5, gen_random_uuid())
+            INSERT INTO objects (tenant_id, bucket_id, key, content_hash, size, etag, version_id)
+            VALUES ($1, $2, $3, $4, $5, $6, gen_random_uuid())
             RETURNING *;
             "#,
-                &[&bucket_id, &key, &content_hash, &size, &etag],
+                &[&tenant_id, &bucket_id, &key, &content_hash, &size, &etag],
             )
             .await?;
         Ok(row.into())

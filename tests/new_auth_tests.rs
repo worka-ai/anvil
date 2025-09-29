@@ -12,11 +12,8 @@ async fn test_grant_and_revoke_access() {
         async move {
             let (_state, grpc_addr) = common::start_test_server(&global_db_url, &regional_db_url).await;
             let mut auth_client = AuthServiceClient::connect(grpc_addr.clone()).await.unwrap();
-
-            // 1. Create a granter app and a grantee app
             let granter_token = common::get_auth_token_for_app(&global_db_url, &grpc_addr, "granter-app", "*", "*").await;
-            let grantee_client_id = common::create_app(&global_db_url, "grantee-app").0;
-            let grantee_client_secret = common::create_app(&global_db_url, "grantee-app").1;
+            let (grantee_client_id, grantee_client_secret) = common::create_app(&global_db_url, "grantee-app");
 
             let bucket_name = "grant-test-bucket".to_string();
             let resource = format!("bucket:{}", bucket_name);

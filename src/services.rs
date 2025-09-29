@@ -51,7 +51,11 @@ impl AuthService for AppState {
         // 3. Mint token
         let token = self
             .jwt_manager
-            .mint_token(app_details.id.to_string(), approved_scopes)
+            .mint_token(
+                app_details.id.to_string(),
+                approved_scopes,
+                app_details.tenant_id,
+            )
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(GetAccessTokenResponse {
@@ -281,7 +285,7 @@ impl BucketService for AppState {
 
         println!("gRPC - Create Bucket: {:?}", req);
 
-        let tenant_id = 1; // Placeholder
+        let tenant_id = claims.tenant_id;
 
         let db_result = self
             .db
@@ -338,8 +342,7 @@ impl BucketService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
 
         // For now, we assume the tenant is derived from the app, which is linked to the claims.
-        // A more robust implementation would fetch app details from the DB using claims.app_id.
-        let tenant_id = 1; // Placeholder
+        let tenant_id = claims.tenant_id;
 
         if !auth::is_authorized("read:bucket:*", &claims.scopes) {
             return Err(Status::permission_denied("Permission denied to list buckets"));
@@ -480,7 +483,7 @@ impl ObjectService for AppState {
                     let scope = format!("internal:put_shard:{}/{}", upload_id, i);
                     let token = self
                         .jwt_manager
-                        .mint_token("internal".to_string(), vec![scope])
+                        .mint_token("internal".to_string(), vec![scope], 0)
                         .unwrap();
 
                     let request = PutShardRequest {
@@ -519,7 +522,7 @@ impl ObjectService for AppState {
                     let scope = format!("internal:put_shard:{}/{}", upload_id, i);
                     let token = self
                         .jwt_manager
-                        .mint_token("internal".to_string(), vec![scope])
+                        .mint_token("internal".to_string(), vec![scope], 0)
                         .unwrap();
 
                     let request = PutShardRequest {
@@ -545,7 +548,7 @@ impl ObjectService for AppState {
                 let scope = format!("internal:commit_shard:{}/{}", content_hash, i);
                 let token = self
                     .jwt_manager
-                    .mint_token("internal".to_string(), vec![scope])
+                    .mint_token("internal".to_string(), vec![scope], 0)
                     .unwrap();
 
                 let mut client = client.clone();
@@ -567,13 +570,14 @@ impl ObjectService for AppState {
         // Commit metadata to DB
         let bucket = self
             .db
-            .get_bucket_by_name(1, &bucket_name, &self.region)
+            .get_bucket_by_name(claims.tenant_id, &bucket_name, &self.region)
             .await
             .unwrap()
             .unwrap();
         let object = self
             .db
             .create_object(
+                claims.tenant_id,
                 bucket.id,
                 &object_key,
                 &content_hash,
@@ -597,7 +601,7 @@ impl ObjectService for AppState {
         let req = request.into_inner();
 
         // 1. Look up object metadata
-        let tenant_id = 1; // Placeholder
+        let tenant_id = claims.as_ref().map(|c| c.tenant_id).unwrap_or(0);
         let bucket = self
             .db
             .get_bucket_by_name(tenant_id, &req.bucket_name, &self.region)
@@ -733,7 +737,7 @@ impl ObjectService for AppState {
             return Err(Status::permission_denied("Permission denied"));
         }
 
-        let tenant_id = 1; // Placeholder
+        let tenant_id = claims.tenant_id;
         let bucket = self
             .db
             .get_bucket_by_name(tenant_id, &req.bucket_name, &self.region)
@@ -777,7 +781,7 @@ impl ObjectService for AppState {
              return Err(Status::permission_denied("Permission denied"));
          }
 
-         let tenant_id = 1; // Placeholder
+         let tenant_id = claims.tenant_id;
          let bucket = self
              .db
              .get_bucket_by_name(tenant_id, &req.bucket_name, &self.region)
@@ -799,7 +803,47 @@ impl ObjectService for AppState {
          }))
      }
     async fn list_objects(&self, request: Request<ListObjectsRequest>) -> Result<Response<ListObjectsResponse>, Status> {
-        todo!()
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+
+        let resource = format!("bucket:{}", req.bucket_name);
+        if !auth::is_authorized(&format!("read:{}", resource), &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        let bucket = self
+            .db
+            .get_bucket_by_name(claims.tenant_id, &req.bucket_name, &self.region)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Bucket not found"))?;
+
+        let objects = self
+            .db
+            .list_objects(
+                bucket.id,
+                &req.prefix,
+                &req.start_after,
+                if req.max_keys == 0 { 1000 } else { req.max_keys },
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let response_objects = objects
+            .into_iter()
+            .map(|o| crate::anvil_api::ObjectSummary {
+                key: o.key,
+                size: o.size,
+                last_modified: o.created_at.to_string(),
+                etag: o.etag,
+            })
+            .collect();
+
+        Ok(Response::new(ListObjectsResponse { objects: response_objects, common_prefixes: vec![] }))
     }
 
     async fn initiate_multipart_upload(&self, request: Request<InitiateMultipartRequest>) -> Result<Response<InitiateMultipartResponse>, Status> {

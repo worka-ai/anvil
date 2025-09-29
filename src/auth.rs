@@ -8,6 +8,7 @@ pub struct Claims {
     pub sub: String, // Subject (e.g., app_id)
     pub exp: usize,  // Expiration time
     pub scopes: Vec<String>,
+    pub tenant_id: i64,
 }
 
 pub struct JwtManager {
@@ -19,7 +20,7 @@ impl JwtManager {
         Self { secret }
     }
 
-    pub fn mint_token(&self, app_id: String, scopes: Vec<String>) -> Result<String> {
+    pub fn mint_token(&self, app_id: String, scopes: Vec<String>, tenant_id: i64) -> Result<String> {
         let expiration = chrono::Utc::now()
             .checked_add_signed(chrono::Duration::hours(1))
             .expect("valid timestamp")
@@ -29,6 +30,7 @@ impl JwtManager {
             sub: app_id,
             exp: expiration as usize,
             scopes,
+            tenant_id,
         };
 
         encode(
@@ -59,43 +61,30 @@ pub fn verify_secret(secret: &str, hash: &str) -> bool {
 /// Checks if a required scope is satisfied by the scopes present in a token.
 /// Supports wildcards.
 pub fn is_authorized(required_scope: &str, token_scopes: &[String]) -> bool {
-    println!("--- Checking authorization ---");
-    println!("Required scope: {}", required_scope);
-    println!("Token scopes: {:?}", token_scopes);
 
     let required_parts: Vec<&str> = required_scope.splitn(2, ':').collect();
     if required_parts.len() != 2 {
-        println!("Invalid required scope format");
         return false;
     }
     let required_action = required_parts[0];
     let required_resource = required_parts[1];
-    println!("Required action: {}, Required resource: {}", required_action, required_resource);
 
     for scope in token_scopes {
-        println!("Checking against token scope: {}", scope);
         let parts: Vec<&str> = scope.splitn(2, ':').collect();
         if parts.len() != 2 {
-            println!("Invalid token scope format");
             continue;
         }
         let action = parts[0];
         let resource = parts[1];
-        println!("Token action: {}, Token resource: {}", action, resource);
 
         if action == required_action || action == "*" {
             let matches = resource_matches(required_resource, resource);
-            println!("Action matches. Resource match result: {}", matches);
             if matches {
-                println!("--- Authorization GRANTED ---");
                 return true;
             }
-        } else {
-            println!("Action does not match.");
         }
     }
 
-    println!("--- Authorization DENIED ---");
     false
 }
 
