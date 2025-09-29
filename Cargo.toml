@@ -102,6 +102,7 @@ tonic-prost-build = { version = "0.14.2" }
 anvil = { path = "." }
 # serial_test = "3.0.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+memchr = "2.7.6"
 
 uuid = { version = "1.18.1", features = ["v4"] }
 tokio-stream = "0.1"

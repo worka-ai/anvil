@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::{CreateBucketRequest, GetAccessTokenRequest};
@@ -18,12 +19,18 @@ async fn test_auth_flow_with_wildcard_scopes() {
         ];
 
         // 2. Start the server
-        let grpc_addr = "127.0.0.1:50099".parse().unwrap();
+        let grpc_addr = "127.0.0.1:50099".parse::<SocketAddr>().unwrap();
+        let listener = tokio::net::TcpListener::bind(grpc_addr).await.unwrap();
         tokio::spawn(async move {
-            for (key, val) in server_env {
-                unsafe { std::env::set_var(key, val); }
-            }
-            anvil::run(grpc_addr).await.unwrap();
+            anvil::run(
+                listener,
+                server_env[2].1.clone(), // region
+                server_env[0].1.clone(), // global_db_url
+                server_env[1].1.clone(), // regional_db_url
+                server_env[3].1.clone(), // jwt_secret
+            )
+            .await
+            .unwrap();
         });
         assert!(common::wait_for_port(grpc_addr, std::time::Duration::from_secs(5)).await, "Server did not start in time");
 

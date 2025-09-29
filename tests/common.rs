@@ -4,13 +4,17 @@ use anvil::auth::JwtManager;
 use anyhow::Result;
 use deadpool_postgres::{ManagerConfig, Pool, RecyclingMethod};
 use std::future::Future;
-use std::net::SocketAddr;
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio_postgres::NoTls;
 
+use std::{net::SocketAddr, time::{Duration, Instant}};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    time,
+};
 pub mod migrations {
     use refinery_macros::embed_migrations;
     embed_migrations!("migrations_global");
@@ -81,6 +85,12 @@ where
     let east_db_url = format!("{}/{}", base_db_url, east_db_name);
     let west_db_url = format!("{}/{}", base_db_url, west_db_name);
 
+    // Wait for the new databases to be ready
+    let db_timeout = Duration::from_secs(5);
+    wait_for_db(&global_db_url, db_timeout).await;
+    wait_for_db(&east_db_url, db_timeout).await;
+    wait_for_db(&west_db_url, db_timeout).await;
+
     let test_future = test_body(
         global_db_url.clone(),
         east_db_url.clone(),
@@ -118,17 +128,116 @@ where
     }
 }
 
-pub async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> bool {
+pub async fn wait_for_db(db_url: &str, timeout: Duration) {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return true;
+        if tokio_postgres::connect(db_url, NoTls).await.is_ok() {
+            return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    false
+    panic!("Database {} did not become available in time", db_url);
 }
 
+/// Poll `addr` until an HTTP response is observed or `timeout` elapses.
+/// Returns true if an HTTP response was read (status line or headers), false on timeout.
+pub async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    let per_try_cap = Duration::from_millis(500); // cap any single step
+
+    loop {
+        // stop if we've run out of time
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let step_budget = remaining.min(per_try_cap);
+
+        // 1) connect with a small timeout
+        let stream = match time::timeout(step_budget, TcpStream::connect(addr)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(_e)) => {
+                // refused or other connect error — try again shortly
+                time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            Err(_elapsed) => {
+                // connect attempt took too long — try again
+                time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+
+        // 2) send a minimal HTTP/1.1 request (ask server to close to avoid hanging)
+        let mut stream = stream;
+        let req = format!(
+            "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            addr
+        );
+        if let Err(_e) = time::timeout(step_budget, stream.write_all(req.as_bytes())).await {
+            // write stalled — try again
+            let _ = stream.shutdown().await;
+            time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+
+        // 3) read until we see the end of headers or we time out
+        let mut buf = Vec::with_capacity(1024);
+        let mut tmp = [0u8; 512];
+
+        let read_deadline = Instant::now() + step_budget;
+        let success = loop {
+            // abort this inner loop if this attempt exceeds its budget
+            if Instant::now() >= read_deadline {
+                break false;
+            }
+            let left = read_deadline.saturating_duration_since(Instant::now());
+            match time::timeout(left, stream.read(&mut tmp)).await {
+                Ok(Ok(0)) => {
+                    // EOF. Check whatever we got.
+                    break looks_like_http(&buf);
+                }
+                Ok(Ok(n)) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if looks_like_http(&buf) {
+                        break true;
+                    }
+                    // keep reading a bit more until headers complete or budget ends
+                    continue;
+                }
+                Ok(Err(_e)) => break false,  // read error on this attempt
+                Err(_elapsed) => break false, // per-try read timeout
+            }
+        };
+
+        let _ = stream.shutdown().await;
+
+        if success {
+            // Optionally: print what we saw (trim to avoid huge spam in tests)
+            #[cfg(test)]
+            {
+                let s = String::from_utf8_lossy(&buf);
+                println!("Got response from {}:\n{}", addr, s);
+            }
+            return true;
+        }
+
+        // Back off briefly before the next attempt.
+        time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Heuristic: if the buffer starts with "HTTP/" or contains "\r\n\r\n",
+/// we consider it an HTTP response (status line or completed headers).
+fn looks_like_http(buf: &[u8]) -> bool {
+    if buf.starts_with(b"HTTP/") {
+        return true;
+    }
+    // Some servers might send a TLS alert / redirect; but for a plain TCP HTTP probe
+    // we accept end-of-headers as a good enough signal.
+    memchr::memmem::find(buf, b"\r\n\r\n").is_some()
+}
 /// Connects to databases, runs migrations, and returns a fully configured AppState and Swarm.
 pub async fn prepare_node_state(
     global_db_url: &str,
@@ -252,6 +361,70 @@ use anvil::AppState;
 use tokio::task::JoinHandle;
 use tonic::Request;
 
+// The new, preferred test architecture.
+
+pub struct TestWorld {
+    pub state: AppState,
+    pub grpc_addr: String,
+    pub global_db_url: String,
+    pub regional_db_url: String,
+}
+
+impl TestWorld {
+    pub async fn new() -> Self {
+        let (global_db_url, regional_db_url) = create_isolated_dbs().await;
+
+        wait_for_db(&global_db_url, Duration::from_secs(5)).await;
+        wait_for_db(&regional_db_url, Duration::from_secs(5)).await;
+
+        let (state, grpc_addr) = start_test_server(&global_db_url, &regional_db_url).await;
+
+        Self {
+            state,
+            grpc_addr,
+            global_db_url,
+            regional_db_url,
+        }
+    }
+}
+
+async fn create_isolated_dbs() -> (String, String) {
+    dotenvy::dotenv().ok();
+    let maint_db_url =
+        std::env::var("MAINTENANCE_DATABASE_URL").expect("MAINTENANCE_DATABASE_URL must be set");
+    let (maint_client, connection) = tokio_postgres::connect(&maint_db_url, NoTls)
+        .await
+        .expect("Failed to connect to maintenance database");
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("maintenance connection error: {}", e);
+        }
+    });
+
+    let suffix = uuid::Uuid::new_v4().to_string().replace('-', "");
+    let global_db_name = format!("test_global_{}", suffix);
+    let regional_db_name = format!("test_regional_{}", suffix);
+
+    maint_client
+        .execute(&format!("CREATE DATABASE \"{}\"", global_db_name), &[])
+        .await
+        .unwrap();
+    maint_client
+        .execute(&format!("CREATE DATABASE \"{}\"", regional_db_name), &[])
+        .await
+        .unwrap();
+
+    let base_db_url = "postgres://worka:worka@localhost:5432";
+    let global_db_url = format!("{}/{}", base_db_url, global_db_name);
+    let regional_db_url = format!("{}/{}", base_db_url, regional_db_name);
+
+    // We don't cleanup here. The test runner will kill the process, and we can
+    // manually clean up databases if needed. A more robust solution could involve
+    // a separate cleanup script or a test runner that supports async drop.
+
+    (global_db_url, regional_db_url)
+}
+
 // Starts a cluster of nodes for testing.
 pub async fn start_cluster(
     global_db_url: &str,
@@ -282,8 +455,21 @@ pub async fn start_cluster(
         grpc_addrs.push(http_addr);
 
         let server_state = state.clone();
+        let regional_db_url_clone = regional_db_url.to_string();
+        let global_db_url_clone = global_db_url.to_string();
+        let region_clone = server_state.region.clone();
+        let jwt_secret_clone = "test-secret".to_string();
+
         let node_handle = tokio::spawn(async move {
-            anvil::run(addr).await.unwrap();
+            anvil::run(
+                listener,
+                region_clone,
+                global_db_url_clone,
+                regional_db_url_clone,
+                jwt_secret_clone,
+            )
+            .await
+            .unwrap();
         });
         nodes.push(node_handle);
     }
@@ -306,23 +492,72 @@ pub async fn start_cluster(
 pub async fn start_test_server(global_db_url: &str, regional_db_url: &str) -> (AppState, String) {
     let global_pool = create_pool(global_db_url).unwrap();
     let regional_pool = create_pool(regional_db_url).unwrap();
+    let region = "TEST_REGION".to_string();
+    let jwt_secret = "test-secret".to_string();
     let state = AppState::new(
         global_pool,
         regional_pool,
-        "TEST_REGION".to_string(),
-        "test-secret".to_string(),
+        region.clone(),
+        jwt_secret.clone(),
     )
     .await
     .unwrap();
-    let grpc_addr = "127.0.0.1:0".parse::<SocketAddr>().unwrap(); // Use port 0 for random port
+    let grpc_addr = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
 
     let listener = tokio::net::TcpListener::bind(grpc_addr).await.unwrap();
     let actual_addr = listener.local_addr().unwrap();
 
-    tokio::spawn(async move {
-        anvil::run(actual_addr).await.unwrap();
-    });
+    let global_db_url_clone = global_db_url.to_string();
+    let regional_db_url_clone = regional_db_url.to_string();
 
+    let handle = tokio::spawn(async move {
+        match anvil::run(
+            listener,
+            region,
+            global_db_url_clone,
+            regional_db_url_clone,
+            jwt_secret,
+        )
+        .await
+        {
+            Ok(_) => {
+                eprintln!("Test server exited unexpectedly with no error.")
+            }
+            Err(e) => {
+                eprintln!("Test server exited unexpectedly. {:?}", e);
+            }
+        };
+    });
+    assert!(
+        wait_for_port(actual_addr, Duration::from_secs(5)).await,
+        "Server did not start in time"
+    );
+    if handle.is_finished() {
+        // Awaiting here will not block because it’s already finished.
+        match handle.await {
+            Ok(val) => {
+                // Task returned successfully (val is whatever your task returns).
+                panic!("Task unexpectedly finished early: {:?}", val);
+            }
+            Err(e) => {
+                // Task panicked or was cancelled.
+                // Distinguish reasons:
+                if e.is_panic() {
+                    // You could inspect the panic payload with e.into_panic()
+                    panic!("Task panicked: {:?}", e);
+                } else if e.is_cancelled() {
+                    panic!("Task was cancelled: {:?}", e);
+                } else {
+                    panic!("Task failed: {:?}", e);
+                }
+            }
+        }
+    } else {
+        println!(
+            "Test server port started accepted a connection so presuming it is ready for us to use...{}",
+            actual_addr
+        );
+    }
     (state, format!("http://{}", actual_addr))
 }
 

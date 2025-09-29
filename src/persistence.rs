@@ -334,7 +334,7 @@ impl Persistence {
         let client = self.global_pool.get().await?;
         client
             .execute(
-                "INSERT INTO tasks (task_type, payload, priority) VALUES ($1, $2, $3)",
+                "INSERT INTO tasks (task_type, payload, priority) VALUES ($1::task_type, $2, $3)",
                 &[&task_type, &payload, &priority],
             )
             .await?;
@@ -346,8 +346,8 @@ impl Persistence {
         let rows = client
             .query(
                 r#"
-            SELECT id, task_type, payload, attempts FROM tasks
-            WHERE status = 'pending' AND scheduled_at <= now()
+            SELECT id, task_type::text, payload, attempts FROM tasks
+            WHERE status = 'pending'::task_status AND scheduled_at <= now()
             ORDER BY priority ASC, created_at ASC
             LIMIT $1
             FOR UPDATE SKIP LOCKED
@@ -362,7 +362,7 @@ impl Persistence {
         let client = self.global_pool.get().await?;
         client
             .execute(
-                "UPDATE tasks SET status = $1, updated_at = now() WHERE id = $2",
+                "UPDATE tasks SET status = $1::task_status, updated_at = now() WHERE id = $2",
                 &[&status, &task_id],
             )
             .await?;

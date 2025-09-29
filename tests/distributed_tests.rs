@@ -1,6 +1,6 @@
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
-use anvil::anvil_api::{CreateBucketRequest, GetObjectRequest, ObjectMetadata, PutObjectRequest};
+use anvil::anvil_api::{GetObjectRequest, ObjectMetadata, PutObjectRequest};
 use futures::stream::StreamExt;
 use std::time::Duration;
 use tokio::time::timeout;
