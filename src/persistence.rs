@@ -202,7 +202,7 @@ impl Persistence {
         let client = self.global_pool.get().await?;
         let row = client
             .query_opt(
-            "SELECT id, name, region, created_at, is_public_read FROM buckets WHERE tenant_id = $1 AND name = $2 AND region = $3 AND deleted_at IS NULL",
+            "SELECT id, name, region, created_at, is_public_read, tenant_id FROM buckets WHERE tenant_id = $1 AND name = $2 AND region = $3 AND deleted_at IS NULL",
                 &[&tenant_id, &name, &region],
             )
             .await?;
