@@ -94,6 +94,7 @@ sha2 = "0.10.9"
 hex = "0.4.3"
 hmac = "0.12.1"
 axum-extra = { version = "0.10.2", features = ["typed-header"] }
+postgres-types = {version =  "0.2.10", features = ["derive"] }
 
 [build-dependencies]
 tonic-prost-build = { version = "0.14.2" }

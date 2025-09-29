@@ -36,9 +36,9 @@ async fn test_delete_bucket_soft_deletes_and_enqueues_task() {
             let global_pool = state.db.get_global_pool();
             let client = global_pool.get().await.unwrap();
             let row = client.query_one("SELECT task_type, status FROM tasks WHERE payload->>'bucket_id' IS NOT NULL", &[]).await.unwrap();
-            let task_type: &str = row.get("task_type");
+            let task_type: anvil::tasks::TaskType = row.get("task_type");
             let status: &str = row.get("status");
-            assert_eq!(task_type, "DELETE_BUCKET");
+            assert!(matches!(task_type, anvil::tasks::TaskType::DeleteBucket));
             assert_eq!(status, "pending");
         }
     ).await;

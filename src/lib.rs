@@ -19,6 +19,7 @@ pub mod auth;
 pub mod cluster;
 pub mod discovery;
 pub mod middleware;
+pub mod tasks;
 pub mod persistence;
 pub mod placement;
 pub mod s3_auth;
@@ -131,11 +132,8 @@ pub async fn run(
     let auth_interceptor = move |req| middleware::auth_interceptor(req, &state_clone);
 
     // Create the gRPC router, applying the interceptor to each protected service.
-    let grpc_router = tonic::service::Routes::new(AuthServiceServer::new(state.clone()))
-        .add_service(ObjectServiceServer::with_interceptor(
-            state.clone(),
-            auth_interceptor.clone(),
-        ))
+    let grpc_router = tonic::service::Routes::new(AuthServiceServer::with_interceptor(state.clone(), auth_interceptor.clone()))
+        .add_service(ObjectServiceServer::with_interceptor(state.clone(), auth_interceptor.clone()))
         .add_service(BucketServiceServer::with_interceptor(
             state.clone(),
             auth_interceptor.clone(),
@@ -146,7 +144,14 @@ pub async fn run(
         ));
 
     // Create the Axum router for S3 and merge the gRPC router into it.
-    let app = s3_gateway::app(state.clone()).merge(grpc_router.into_axum_router());
+    let app = s3_gateway::app(state.clone()).merge(
+        grpc_router.into_axum_router()
+            //layer runs on the HTTP request *before* tonic’s gRPC handling
+            //This is necessary for the interceptor to get access to the URI because newer tonic versions do not provide a way to get it in the interceptor
+            //later after the interceptor it is available via req.extensions().get::<tonic::GrpcMethod>()
+            .route_layer(axum::middleware::from_fn(middleware::save_uri_mw))
+
+    );
 
     let addr = listener.local_addr()?;
     println!("Anvil server (gRPC & S3) listening on {}", addr);

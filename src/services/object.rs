@@ -8,377 +8,7 @@ use crate::anvil_api::auth_service_server::AuthService;
 use crate::anvil_api::bucket_service_server::BucketService;
 use crate::anvil_api::internal_anvil_service_server::InternalAnvilService;
 use crate::anvil_api::object_service_server::ObjectService;
-
-#[tonic::async_trait]
-impl AuthService for AppState {
-    async fn get_access_token(
-        &self,
-        request: Request<GetAccessTokenRequest>,
-    ) -> Result<Response<GetAccessTokenResponse>, Status> {
-        let req = request.into_inner();
-
-        // 1. Verify credentials
-        let app_details = self
-            .db
-            .get_app_by_client_id(&req.client_id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::unauthenticated("Invalid client ID"))?;
-
-        if !auth::verify_secret(&req.client_secret, &app_details.client_secret_hash) {
-            return Err(Status::unauthenticated("Invalid client secret"));
-        }
-
-        let allowed_scopes = self
-            .db
-            .get_policies_for_app(app_details.id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        let approved_scopes = if req.scopes.is_empty() {
-            allowed_scopes
-        } else {
-            req.scopes
-                .into_iter()
-                .filter(|requested_scope| auth::is_authorized(requested_scope, &allowed_scopes))
-                .collect()
-        };
-
-        if approved_scopes.is_empty() {
-            return Err(Status::permission_denied("App has no assigned policies"));
-        }
-
-        // 3. Mint token
-        let token = self
-            .jwt_manager
-            .mint_token(
-                app_details.id.to_string(),
-                approved_scopes,
-                app_details.tenant_id,
-            )
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        Ok(Response::new(GetAccessTokenResponse {
-            access_token: token,
-            expires_in: 3600,
-        }))
-    }
-
-    async fn grant_access(
-        &self,
-        request: Request<GrantAccessRequest>,
-    ) -> Result<Response<GrantAccessResponse>, Status> {
-        let claims = request
-            .extensions()
-            .get::<auth::Claims>()
-            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
-        let req = request.get_ref();
-
-        if !auth::is_authorized(&format!("grant:{}", req.resource), &claims.scopes) {
-            return Err(Status::permission_denied(
-                "Permission denied to grant access to this resource",
-            ));
-        }
-
-        let app = self
-            .db
-            .get_app_by_name(&req.grantee_app_id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Grantee app not found"))?;
-        self.db
-            .grant_policy(app.id, &req.resource, &req.action)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        Ok(Response::new(GrantAccessResponse {}))
-    }
-
-    async fn revoke_access(
-        &self,
-        request: Request<RevokeAccessRequest>,
-    ) -> Result<Response<RevokeAccessResponse>, Status> {
-        let claims = request
-            .extensions()
-            .get::<auth::Claims>()
-            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
-        let req = request.get_ref();
-
-        if !auth::is_authorized(&format!("grant:{}", req.resource), &claims.scopes) {
-            return Err(Status::permission_denied(
-                "Permission denied to revoke access to this resource",
-            ));
-        }
-
-        let app = self
-            .db
-            .get_app_by_name(&req.grantee_app_id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Grantee app not found"))?;
-
-        self.db
-            .revoke_policy(app.id, &req.resource, &req.action)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        Ok(Response::new(RevokeAccessResponse {}))
-    }
-
-    async fn set_public_access(
-        &self,
-        request: Request<SetPublicAccessRequest>,
-    ) -> Result<Response<SetPublicAccessResponse>, Status> {
-        let claims = request
-            .extensions()
-            .get::<auth::Claims>()
-            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
-        let req = request.get_ref();
-
-        let resource = format!("bucket:{}", req.bucket);
-        if !auth::is_authorized(&format!("grant:{}", resource), &claims.scopes) {
-            return Err(Status::permission_denied(
-                "Permission denied to modify public access on this bucket",
-            ));
-        }
-
-        self.db
-            .set_bucket_public_access(&req.bucket, req.allow_public_read)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        Ok(Response::new(SetPublicAccessResponse {}))
-    }
-}
-
-#[tonic::async_trait]
-impl InternalAnvilService for AppState {
-    type GetShardStream =
-        std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<GetShardResponse, Status>> + Send>>;
-
-    async fn put_shard(
-        &self,
-        request: Request<tonic::Streaming<PutShardRequest>>,
-    ) -> Result<Response<PutShardResponse>, Status> {
-        let claims = request
-            .extensions()
-            .get::<auth::Claims>()
-            .ok_or_else(|| Status::unauthenticated("Missing claims"))?.clone();
-
-        let mut stream = request.into_inner();
-
-        let (upload_id, shard_index, first_chunk_data) = if let Some(Ok(chunk)) = stream.next().await
-        {
-            (chunk.upload_id, chunk.shard_index, chunk.data)
-        } else {
-            return Err(Status::invalid_argument("Empty stream"));
-        };
-
-        let resource = format!("{}/{}", upload_id, shard_index);
-        if !auth::is_authorized(&format!("internal:put_shard:{}", resource), &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
-
-        let mut data = first_chunk_data;
-        while let Some(Ok(chunk)) = stream.next().await {
-            data.extend_from_slice(&chunk.data);
-        }
-
-        self.storage
-            .store_temp_shard(&upload_id, shard_index, &data)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        Ok(Response::new(PutShardResponse {}))
-    }
-
-    async fn commit_shard(
-        &self,
-        request: Request<CommitShardRequest>,
-    ) -> Result<Response<CommitShardResponse>, Status> {
-        let claims = request
-            .extensions()
-            .get::<auth::Claims>()
-            .ok_or_else(|| Status::unauthenticated("Missing claims"))?.clone();
-        let req = request.into_inner();
-
-        let resource = format!("{}/{}", req.final_object_hash, req.shard_index);
-        if !auth::is_authorized(&format!("internal:commit_shard:{}", resource), &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
-
-        self.storage
-            .commit_shard(&req.upload_id, req.shard_index, &req.final_object_hash)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(CommitShardResponse {}))
-    }
-
-    async fn get_shard(
-        &self,
-        request: Request<GetShardRequest>,
-    ) -> Result<Response<Self::GetShardStream>, Status> {
-        let req = request.into_inner();
-        let data = self
-            .storage
-            .retrieve_shard(&req.object_hash, req.shard_index)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        let (tx, rx) = mpsc::channel(4);
-
-        tokio::spawn(async move {
-            for chunk in data.chunks(1024 * 1024) {
-                // 1MB chunks
-                tx.send(Ok(GetShardResponse { data: chunk.to_vec() }))
-                    .await
-                    .unwrap();
-            }
-        });
-
-        let output_stream = ReceiverStream::new(rx);
-        Ok(Response::new(
-            Box::pin(output_stream) as Self::GetShardStream
-        ))
-    }
-
-    async fn delete_shard(
-        &self,
-        request: Request<DeleteShardRequest>,
-    ) -> Result<Response<DeleteShardResponse>, Status> {
-        let claims = request
-            .extensions()
-            .get::<auth::Claims>()
-            .ok_or_else(|| Status::unauthenticated("Missing claims"))?.clone();
-        let req = request.into_inner();
-
-        let resource = format!("internal:delete_shard:{}/{}", req.object_hash, req.shard_index);
-        if !auth::is_authorized(&resource, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
-
-        self.storage
-            .delete_shard(&req.object_hash, req.shard_index)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        Ok(Response::new(DeleteShardResponse {}))
-    }
-}
-
-#[tonic::async_trait]
-impl BucketService for AppState {
-    async fn create_bucket(
-        &self,
-        request: Request<CreateBucketRequest>,
-    ) -> Result<Response<CreateBucketResponse>, Status> {
-        let claims = request
-            .extensions()
-            .get::<auth::Claims>()
-            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
-        let req = request.get_ref();
-
-        let resource = format!("bucket:{}", req.bucket_name);
-        if !auth::is_authorized(&format!("write:{}", resource), &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
-
-        println!("gRPC - Create Bucket: {:?}", req);
-
-        let tenant_id = claims.tenant_id;
-
-        let db_result = self
-            .db
-            .create_bucket(tenant_id, &req.bucket_name, &req.region)
-            .await;
-
-        println!("DB create_bucket result: {:?}", db_result);
-
-        db_result.map_err(|e| Status::internal(e.to_string()))?;
-
-        Ok(Response::new(CreateBucketResponse {}))
-    }
-
-    async fn delete_bucket(
-        &self,
-        request: Request<DeleteBucketRequest>,
-    ) -> Result<Response<DeleteBucketResponse>, Status> {
-        let claims = request
-            .extensions()
-            .get::<auth::Claims>()
-            .ok_or_else(|| Status::unauthenticated("Missing claims"))?.clone();
-        let req = request.into_inner();
-
-        let resource = format!("bucket:{}", req.bucket_name);
-        if !auth::is_authorized(&format!("write:{}", resource), &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
-
-        // Soft-delete the bucket
-        let bucket = self
-            .db
-            .soft_delete_bucket(&req.bucket_name)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Bucket not found"))?;
-
-        // Enqueue a task for physical deletion
-        let payload = serde_json::json!({ "bucket_id": bucket.id });
-        self.db
-            .enqueue_task("DELETE_BUCKET", payload, 100)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        Ok(Response::new(DeleteBucketResponse {}))
-    }
-
-    async fn list_buckets(
-        &self,
-        request: Request<ListBucketsRequest>,
-    ) -> Result<Response<ListBucketsResponse>, Status> {
-        let claims = request
-            .extensions()
-            .get::<auth::Claims>()
-            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
-
-        // For now, we assume the tenant is derived from the app, which is linked to the claims.
-        let tenant_id = claims.tenant_id;
-
-        if !auth::is_authorized("read:bucket:*", &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied to list buckets"));
-        }
-
-        let buckets = self
-            .db
-            .list_buckets_for_tenant(tenant_id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        let response_buckets = buckets
-            .into_iter()
-            .map(|b| crate::anvil_api::Bucket {
-                name: b.name,
-                creation_date: b.created_at.to_string(),
-            })
-            .collect();
-
-        Ok(Response::new(ListBucketsResponse { buckets: response_buckets }))
-    }
-
-    async fn get_bucket_policy(
-        &self,
-        _request: Request<GetBucketPolicyRequest>,
-    ) -> Result<Response<GetBucketPolicyResponse>, Status> {
-        todo!()
-    }
-
-    async fn put_bucket_policy(
-        &self,
-        _request: Request<PutBucketPolicyRequest>,
-    ) -> Result<Response<PutBucketPolicyResponse>, Status> {
-        todo!()
-    }
-}
+use crate::tasks::TaskType;
 
 #[tonic::async_trait]
 impl ObjectService for AppState {
@@ -760,48 +390,48 @@ impl ObjectService for AppState {
             "shard_map": object.shard_map,
         });
         self.db
-            .enqueue_task("DELETE_OBJECT", payload, 100)
+            .enqueue_task(TaskType::DeleteObject, payload, 100)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(DeleteObjectResponse {}))
     }
-     async fn head_object(
-         &self,
-         request: Request<HeadObjectRequest>,
-     ) -> Result<Response<HeadObjectResponse>, Status> {
-         let claims = request
-             .extensions()
-             .get::<auth::Claims>()
-             .ok_or_else(|| Status::unauthenticated("Missing claims"))?.clone();
-         let req = request.into_inner();
-         
-         let resource = format!("bucket:{}/{}", req.bucket_name, req.object_key);
-         if !auth::is_authorized(&format!("read:{}", resource), &claims.scopes) {
-             return Err(Status::permission_denied("Permission denied"));
-         }
+    async fn head_object(
+        &self,
+        request: Request<HeadObjectRequest>,
+    ) -> Result<Response<HeadObjectResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?.clone();
+        let req = request.into_inner();
 
-         let tenant_id = claims.tenant_id;
-         let bucket = self
-             .db
-             .get_bucket_by_name(tenant_id, &req.bucket_name, &self.region)
-             .await
-             .map_err(|e| Status::internal(e.to_string()))?
-             .ok_or_else(|| Status::not_found("Bucket not found"))?;
+        let resource = format!("bucket:{}/{}", req.bucket_name, req.object_key);
+        if !auth::is_authorized(&format!("read:{}", resource), &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
 
-         let object = self
-             .db
-             .get_object(bucket.id, &req.object_key)
-             .await
-             .map_err(|e| Status::internal(e.to_string()))?
-             .ok_or_else(|| Status::not_found("Object not found"))?;
+        let tenant_id = claims.tenant_id;
+        let bucket = self
+            .db
+            .get_bucket_by_name(tenant_id, &req.bucket_name, &self.region)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Bucket not found"))?;
 
-         Ok(Response::new(HeadObjectResponse {
-             etag: object.etag,
-             size: object.size,
-             last_modified: object.created_at.to_string(),
-         }))
-     }
+        let object = self
+            .db
+            .get_object(bucket.id, &req.object_key)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Object not found"))?;
+
+        Ok(Response::new(HeadObjectResponse {
+            etag: object.etag,
+            size: object.size,
+            last_modified: object.created_at.to_string(),
+        }))
+    }
     async fn list_objects(&self, request: Request<ListObjectsRequest>) -> Result<Response<ListObjectsResponse>, Status> {
         let claims = request
             .extensions()

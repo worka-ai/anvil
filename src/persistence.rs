@@ -330,11 +330,11 @@ impl Persistence {
 
     // --- Task Queue Methods ---
 
-    pub async fn enqueue_task(&self, task_type: &str, payload: JsonValue, priority: i32) -> Result<()> {
+    pub async fn enqueue_task(&self, task_type: crate::tasks::TaskType, payload: JsonValue, priority: i32) -> Result<()> {
         let client = self.global_pool.get().await?;
         client
             .execute(
-                "INSERT INTO tasks (task_type, payload, priority) VALUES ($1::task_type, $2, $3)",
+                "INSERT INTO tasks (task_type, payload, priority) VALUES ($1, $2, $3)",
                 &[&task_type, &payload, &priority],
             )
             .await?;
