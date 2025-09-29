@@ -1,4 +1,5 @@
 use crate::s3_auth::sigv4_auth;
+use crate::AppState;
 use axum::{
     extract::{Path, State},
     middleware,
@@ -7,7 +8,7 @@ use axum::{
     Router,
 };
 
-pub fn app(state: crate::AppState) -> Router {
+pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/{bucket}", put(create_bucket).get(list_objects))
         .route("/{bucket}/{*path}", get(get_object).put(put_object))
@@ -16,30 +17,29 @@ pub fn app(state: crate::AppState) -> Router {
 }
 
 async fn create_bucket(
-    State(_state): State<crate::AppState>,
+    State(_state): State<AppState>,
     Path(_bucket): Path<String>,
 ) -> Response {
     (axum::http::StatusCode::OK, "").into_response()
 }
 
 async fn list_objects(
-    State(_state): State<crate::AppState>,
+    State(_state): State<AppState>,
     Path(_bucket): Path<String>,
 ) -> Response {
     (axum::http::StatusCode::OK, "").into_response()
 }
 
 async fn get_object(
-    State(_state): State<crate::AppState>,
+    State(_state): State<AppState>,
     Path((_bucket, _key)): Path<(String, String)>,
 ) -> Response {
     (axum::http::StatusCode::OK, "").into_response()
 }
 
 async fn put_object(
-    State(_state): State<crate::AppState>,
+    State(_state): State<AppState>,
     Path((_bucket, _key)): Path<(String, String)>,
 ) -> Response {
     (axum::http::StatusCode::OK, "").into_response()
 }
-

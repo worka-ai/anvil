@@ -113,6 +113,10 @@ impl Persistence {
         Self { global_pool, regional_pool }
     }
 
+    pub fn get_global_pool(&self) -> &Pool {
+        &self.global_pool
+    }
+
     // --- Global Methods ---
 
     pub async fn get_tenant_by_name(&self, name: &str) -> Result<Option<Tenant>> {
@@ -172,6 +176,17 @@ impl Persistence {
         Ok(())
     }
 
+    pub async fn revoke_policy(&self, app_id: i64, resource: &str, action: &str) -> Result<()> {
+        let client = self.global_pool.get().await?;
+        client
+            .execute(
+                "DELETE FROM policies WHERE app_id = $1 AND resource = $2 AND action = $3",
+                &[&app_id, &resource, &action],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn create_bucket(&self, tenant_id: i64, name: &str, region: &str) -> Result<Bucket> {
         let client = self.global_pool.get().await?;
         let row = client
@@ -187,7 +202,7 @@ impl Persistence {
         let client = self.global_pool.get().await?;
         let row = client
             .query_opt(
-                "SELECT * FROM buckets WHERE tenant_id = $1 AND name = $2 AND region = $3",
+            "SELECT id, name, region, created_at, is_public_read FROM buckets WHERE tenant_id = $1 AND name = $2 AND region = $3 AND deleted_at IS NULL",
                 &[&tenant_id, &name, &region],
             )
             .await?;
@@ -203,6 +218,28 @@ impl Persistence {
             )
             .await?;
         Ok(())
+    }
+
+    pub async fn soft_delete_bucket(&self, bucket_name: &str) -> Result<Option<Bucket>> {
+        let client = self.global_pool.get().await?;
+        let row = client
+            .query_opt(
+                "UPDATE buckets SET deleted_at = now() WHERE name = $1 AND deleted_at IS NULL RETURNING *",
+                &[&bucket_name],
+            )
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
+    pub async fn list_buckets_for_tenant(&self, tenant_id: i64) -> Result<Vec<Bucket>> {
+        let client = self.global_pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT * FROM buckets WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY name",
+                &[&tenant_id],
+            )
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     // --- Regional Methods ---
@@ -236,7 +273,7 @@ impl Persistence {
                 r#"
             SELECT *
             FROM objects
-            WHERE bucket_id = $1 AND key = $2
+            WHERE bucket_id = $1 AND key = $2 AND deleted_at IS NULL
             ORDER BY created_at DESC LIMIT 1
             "#,
                 &[&bucket_id, &key],
@@ -257,7 +294,7 @@ impl Persistence {
             .query(
                 r#"
             SELECT * FROM objects
-            WHERE bucket_id = $1 AND key > $2 AND key LIKE $3
+            WHERE bucket_id = $1 AND key > $2 AND key LIKE $3 AND deleted_at IS NULL
             ORDER BY key
             LIMIT $4
             "#,
@@ -265,5 +302,83 @@ impl Persistence {
             )
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn soft_delete_object(&self, bucket_id: i64, key: &str) -> Result<Option<Object>> {
+        let client = self.regional_pool.get().await?;
+        let row = client
+            .query_opt(
+                r#"
+            UPDATE objects
+            SET deleted_at = now()
+            WHERE bucket_id = $1 AND key = $2 AND deleted_at IS NULL
+            RETURNING *
+            "#,
+                &[&bucket_id, &key],
+            )
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
+    // --- Task Queue Methods ---
+
+    pub async fn enqueue_task(&self, task_type: &str, payload: JsonValue, priority: i32) -> Result<()> {
+        let client = self.global_pool.get().await?;
+        client
+            .execute(
+                "INSERT INTO tasks (task_type, payload, priority) VALUES ($1, $2, $3)",
+                &[&task_type, &payload, &priority],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn fetch_pending_tasks_for_update(&self, limit: i64) -> Result<Vec<Row>> {
+        let client = self.global_pool.get().await?;
+        let rows = client
+            .query(
+                r#"
+            SELECT id, task_type, payload, attempts FROM tasks
+            WHERE status = 'pending' AND scheduled_at <= now()
+            ORDER BY priority ASC, created_at ASC
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+            "#,
+                &[&limit],
+            )
+            .await?;
+        Ok(rows)
+    }
+
+    pub async fn update_task_status(&self, task_id: i64, status: &str) -> Result<()> {
+        let client = self.global_pool.get().await?;
+        client
+            .execute(
+                "UPDATE tasks SET status = $1, updated_at = now() WHERE id = $2",
+                &[&status, &task_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn fail_task(&self, task_id: i64, error: &str) -> Result<()> {
+        let client = self.global_pool.get().await?;
+        client
+            .execute(
+                r#"
+            UPDATE tasks
+            SET
+                status = 'failed',
+                last_error = $1,
+                attempts = attempts + 1,
+                -- Exponential backoff: 10s, 40s, 90s, etc.
+                scheduled_at = now() + (attempts * attempts * 10 * interval '1 second'),
+                updated_at = now()
+            WHERE id = $2
+            "#,
+                &[&error, &task_id],
+            )
+            .await?;
+        Ok(())
     }
 }

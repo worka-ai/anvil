@@ -69,6 +69,12 @@ impl Storage {
         let data = fs::read(file_path).await?;
         Ok(data)
     }
+
+    pub async fn delete_shard(&self, object_hash: &str, shard_index: u32) -> Result<()> {
+        let file_path = self.get_shard_path(object_hash, shard_index);
+        fs::remove_file(file_path).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -1,15 +1,13 @@
-use crate::anvil_api::auth_service_server::AuthService;
-use crate::anvil_api::bucket_service_server::BucketService;
-use crate::anvil_api::internal_anvil_service_server::InternalAnvilService;
-use crate::anvil_api::object_service_server::ObjectService;
 use crate::anvil_api::*;
-use crate::AppState;
+use crate::{auth, AppState};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-
-use crate::auth;
+use crate::anvil_api::auth_service_server::AuthService;
+use crate::anvil_api::bucket_service_server::BucketService;
+use crate::anvil_api::internal_anvil_service_server::InternalAnvilService;
+use crate::anvil_api::object_service_server::ObjectService;
 
 #[tonic::async_trait]
 impl AuthService for AppState {
@@ -94,10 +92,33 @@ impl AuthService for AppState {
 
     async fn revoke_access(
         &self,
-        _request: Request<RevokeAccessRequest>,
+        request: Request<RevokeAccessRequest>,
     ) -> Result<Response<RevokeAccessResponse>, Status> {
-        // Implementation would be similar to grant_access
-        todo!()
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.get_ref();
+
+        if !auth::is_authorized(&format!("grant:{}", req.resource), &claims.scopes) {
+            return Err(Status::permission_denied(
+                "Permission denied to revoke access to this resource",
+            ));
+        }
+
+        let app = self
+            .db
+            .get_app_by_name(&req.grantee_app_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Grantee app not found"))?;
+
+        self.db
+            .revoke_policy(app.id, &req.resource, &req.action)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(RevokeAccessResponse {}))
     }
 
     async fn set_public_access(
@@ -216,6 +237,29 @@ impl InternalAnvilService for AppState {
             Box::pin(output_stream) as Self::GetShardStream
         ))
     }
+
+    async fn delete_shard(
+        &self,
+        request: Request<DeleteShardRequest>,
+    ) -> Result<Response<DeleteShardResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?.clone();
+        let req = request.into_inner();
+
+        let resource = format!("internal:delete_shard:{}/{}", req.object_hash, req.shard_index);
+        if !auth::is_authorized(&resource, &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        self.storage
+            .delete_shard(&req.object_hash, req.shard_index)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(DeleteShardResponse {}))
+    }
 }
 
 #[tonic::async_trait]
@@ -253,16 +297,69 @@ impl BucketService for AppState {
 
     async fn delete_bucket(
         &self,
-        _request: Request<DeleteBucketRequest>,
+        request: Request<DeleteBucketRequest>,
     ) -> Result<Response<DeleteBucketResponse>, Status> {
-        todo!()
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?.clone();
+        let req = request.into_inner();
+
+        let resource = format!("bucket:{}", req.bucket_name);
+        if !auth::is_authorized(&format!("write:{}", resource), &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        // Soft-delete the bucket
+        let bucket = self
+            .db
+            .soft_delete_bucket(&req.bucket_name)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Bucket not found"))?;
+
+        // Enqueue a task for physical deletion
+        let payload = serde_json::json!({ "bucket_id": bucket.id });
+        self.db
+            .enqueue_task("DELETE_BUCKET", payload, 100)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(DeleteBucketResponse {}))
     }
 
     async fn list_buckets(
         &self,
-        _request: Request<ListBucketsRequest>,
+        request: Request<ListBucketsRequest>,
     ) -> Result<Response<ListBucketsResponse>, Status> {
-        todo!()
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+
+        // For now, we assume the tenant is derived from the app, which is linked to the claims.
+        // A more robust implementation would fetch app details from the DB using claims.app_id.
+        let tenant_id = 1; // Placeholder
+
+        if !auth::is_authorized("read:bucket:*", &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied to list buckets"));
+        }
+
+        let buckets = self
+            .db
+            .list_buckets_for_tenant(tenant_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let response_buckets = buckets
+            .into_iter()
+            .map(|b| crate::anvil_api::Bucket {
+                name: b.name,
+                creation_date: b.created_at.to_string(),
+            })
+            .collect();
+
+        Ok(Response::new(ListBucketsResponse { buckets: response_buckets }))
     }
 
     async fn get_bucket_policy(
@@ -283,7 +380,7 @@ impl BucketService for AppState {
 #[tonic::async_trait]
 impl ObjectService for AppState {
     type GetObjectStream =
-        std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<GetObjectResponse, Status>> + Send>>;
+    std::pin::Pin<Box<dyn futures_core::Stream<Item=Result<GetObjectResponse, Status>> + Send>>;
 
     async fn put_object(
         &self,
@@ -357,10 +454,10 @@ impl ObjectService for AppState {
                 let client = internal_anvil_service_client::InternalAnvilServiceClient::connect(
                     peer_info.grpc_addr.clone(),
                 )
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("Failed to connect to peer {}: {}", peer_id, e))
-                })?;
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!("Failed to connect to peer {}: {}", peer_id, e))
+                    })?;
                 clients.push(client);
             }
 
@@ -623,24 +720,20 @@ impl ObjectService for AppState {
 
     async fn delete_object(
         &self,
-        _request: Request<DeleteObjectRequest>,
+        request: Request<DeleteObjectRequest>,
     ) -> Result<Response<DeleteObjectResponse>, Status> {
-        todo!()
-    }
-
-    async fn head_object(
-        &self,
-        _request: Request<HeadObjectRequest>,
-    ) -> Result<Response<HeadObjectResponse>, Status> {
-        todo!()
-    }
-    async fn list_objects(
-        &self,
-        request: Request<ListObjectsRequest>,
-    ) -> Result<Response<ListObjectsResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?.clone();
         let req = request.into_inner();
-        let tenant_id = 1; // Placeholder
 
+        let resource = format!("bucket:{}/{}", req.bucket_name, req.object_key);
+        if !auth::is_authorized(&format!("write:{}", resource), &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        let tenant_id = 1; // Placeholder
         let bucket = self
             .db
             .get_bucket_by_name(tenant_id, &req.bucket_name, &self.region)
@@ -648,44 +741,72 @@ impl ObjectService for AppState {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
 
-        let objects = self
+        // Soft-delete the object
+        let object = self
             .db
-            .list_objects(
-                bucket.id,
-                &req.prefix,
-                &req.start_after,
-                std::cmp::max(req.max_keys, 1),
-            )
+            .soft_delete_object(bucket.id, &req.object_key)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Object not found"))?;
+
+        // Enqueue a task for physical deletion
+        let payload = serde_json::json!({
+            "content_hash": object.content_hash,
+            "region": self.region,
+            "shard_map": object.shard_map,
+        });
+        self.db
+            .enqueue_task("DELETE_OBJECT", payload, 100)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let summaries = objects
-            .into_iter()
-            .map(|o| ObjectSummary {
-                key: o.key,
-                size: o.size,
-                etag: o.etag,
-                last_modified: o.created_at.to_string(),
-            })
-            .collect();
-
-        Ok(Response::new(ListObjectsResponse {
-            objects: summaries,
-            common_prefixes: vec![], // Delimiter logic not yet implemented
-        }))
+        Ok(Response::new(DeleteObjectResponse {}))
     }
+     async fn head_object(
+         &self,
+         request: Request<HeadObjectRequest>,
+     ) -> Result<Response<HeadObjectResponse>, Status> {
+         let claims = request
+             .extensions()
+             .get::<auth::Claims>()
+             .ok_or_else(|| Status::unauthenticated("Missing claims"))?.clone();
+         let req = request.into_inner();
+         
+         let resource = format!("bucket:{}/{}", req.bucket_name, req.object_key);
+         if !auth::is_authorized(&format!("read:{}", resource), &claims.scopes) {
+             return Err(Status::permission_denied("Permission denied"));
+         }
 
-    async fn initiate_multipart_upload(
-        &self,
-        _request: Request<InitiateMultipartRequest>,
-    ) -> Result<Response<InitiateMultipartResponse>, Status> {
+         let tenant_id = 1; // Placeholder
+         let bucket = self
+             .db
+             .get_bucket_by_name(tenant_id, &req.bucket_name, &self.region)
+             .await
+             .map_err(|e| Status::internal(e.to_string()))?
+             .ok_or_else(|| Status::not_found("Bucket not found"))?;
+
+         let object = self
+             .db
+             .get_object(bucket.id, &req.object_key)
+             .await
+             .map_err(|e| Status::internal(e.to_string()))?
+             .ok_or_else(|| Status::not_found("Object not found"))?;
+
+         Ok(Response::new(HeadObjectResponse {
+             etag: object.etag,
+             size: object.size,
+             last_modified: object.created_at.to_string(),
+         }))
+     }
+    async fn list_objects(&self, request: Request<ListObjectsRequest>) -> Result<Response<ListObjectsResponse>, Status> {
         todo!()
     }
 
-    async fn complete_multipart_upload(
-        &self,
-        _request: Request<CompleteMultipartRequest>,
-    ) -> Result<Response<CompleteMultipartResponse>, Status> {
+    async fn initiate_multipart_upload(&self, request: Request<InitiateMultipartRequest>) -> Result<Response<InitiateMultipartResponse>, Status> {
+        todo!()
+    }
+
+    async fn complete_multipart_upload(&self, request: Request<CompleteMultipartRequest>) -> Result<Response<CompleteMultipartResponse>, Status> {
         todo!()
     }
 }
