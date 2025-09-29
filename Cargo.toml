@@ -88,6 +88,12 @@ argon2 = "0.5.3"
 chrono = { workspace = true, features = ["serde"] }
 clap = { version = "4.5.48", features = ["derive"] }
 rand_core = { version = "0.9.3", features = ["os_rng"] }
+axum = { version = "0.8.5", features = ["http1"] }
+quick-xml = { version = "0.38.3", features = ["serialize"] }
+sha2 = "0.10.9"
+hex = "0.4.3"
+hmac = "0.12.1"
+axum-extra = { version = "0.10.2", features = ["typed-header"] }
 
 [build-dependencies]
 tonic-prost-build = { version = "0.14.2" }

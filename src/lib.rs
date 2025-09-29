@@ -11,9 +11,11 @@ use std::env;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use axum::handler::Handler;
 use tokio::sync::RwLock;
 use tokio_postgres::NoTls;
 use tonic::transport::Server;
+use tower::MakeService;
 
 // The modules we've created
 pub mod auth;
@@ -21,6 +23,8 @@ pub mod cluster;
 pub mod discovery;
 pub mod persistence;
 pub mod placement;
+pub mod s3_auth;
+pub mod s3_gateway;
 pub mod services;
 pub mod sharding;
 pub mod storage;
@@ -113,32 +117,27 @@ pub async fn run(grpc_addr: SocketAddr) -> Result<()> {
     let state_clone = state.clone();
     let auth_interceptor = move |req| middleware::auth_interceptor(req, &state_clone);
 
-    let grpc_server = Server::builder()
-        .add_service(AuthServiceServer::new(state.clone()))
-        .add_service(ObjectServiceServer::with_interceptor(
-            state.clone(),
-            auth_interceptor.clone(),
-        ))
-        .add_service(BucketServiceServer::with_interceptor(
-            state.clone(),
-            auth_interceptor.clone(),
-        ))
-        .add_service(InternalAnvilServiceServer::with_interceptor(
-            state,
-            auth_interceptor,
-        ))
-        .serve(grpc_addr);
+    // Create the gRPC router, applying the interceptor to each protected service.
+    let grpc_router = tonic::service::Routes::new(AuthServiceServer::new(state.clone()))
+        .add_service(ObjectServiceServer::with_interceptor(state.clone(), auth_interceptor.clone()))
+        .add_service(BucketServiceServer::with_interceptor(state.clone(), auth_interceptor.clone()))
+        .add_service(InternalAnvilServiceServer::with_interceptor(state.clone(), auth_interceptor));
 
-    let swarm = cluster::create_swarm().await?;
-    let gossip_service = cluster::run_gossip(swarm, cluster_state, format!("http://{}", grpc_addr));
+    // Create the Axum router for S3 and merge the gRPC router into it.
+    let app = s3_gateway::app(state.clone()).merge(grpc_router.into_axum_router());
 
-    println!("Anvil gRPC server listening on {}", grpc_addr);
+    // Create the listener and serve the combined application.
+    let listener = tokio::net::TcpListener::bind(grpc_addr).await?;
+    println!("Anvil server (gRPC & S3) listening on {}", grpc_addr);
 
-    // --- Run ---
-    tokio::try_join!(
-        async { grpc_server.await.map_err(anyhow::Error::from) },
-        async { gossip_service.await.map_err(anyhow::Error::from) },
-    )?;
+    // Spawn the gossip service to run in the background.
+    let gossip_task = tokio::spawn(cluster::run_gossip(cluster::create_swarm().await?, state.cluster, format!("http://{}", grpc_addr)));
+    let server_task = tokio::spawn(async move { axum::serve(listener, app.into_make_service()).await });
+
+    // Run both tasks concurrently.
+    let (server_result, gossip_result) = tokio::join!(server_task, gossip_task);
+    server_result??;
+    gossip_result??;
 
     Ok(())
 }
