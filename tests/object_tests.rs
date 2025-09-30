@@ -113,7 +113,10 @@ async fn test_list_objects_with_delimiter() {
 
             let keys = vec!["a/b.txt", "a/c.txt", "d.txt"];
             for key in keys {
-                let metadata = ObjectMetadata { bucket_name: bucket_name.clone(), object_key: key.to_string() };
+                let metadata = ObjectMetadata {
+                    bucket_name: bucket_name.clone(),
+                    object_key: key.to_string(),
+                };
                 let chunks = vec![
                     PutObjectRequest { data: Some(anvil::anvil_api::put_object_request::Data::Metadata(metadata)) },
                     PutObjectRequest { data: Some(anvil::anvil_api::put_object_request::Data::Chunk(b"...".to_vec())) },
@@ -123,7 +126,7 @@ async fn test_list_objects_with_delimiter() {
                 object_client.put_object(put_req).await.unwrap();
             }
 
-            // Test listing with prefix and delimiter
+            // Listing with prefix and delimiter should return first-level files under a/ and no common prefixes
             let mut list_req = Request::new(ListObjectsRequest {
                 bucket_name: bucket_name.clone(),
                 prefix: "a/".to_string(),
@@ -133,11 +136,12 @@ async fn test_list_objects_with_delimiter() {
             list_req.metadata_mut().insert("authorization", format!("Bearer {}", token).parse().unwrap());
             let list_res = object_client.list_objects(list_req).await.unwrap().into_inner();
 
-            // Should not return any objects, but one common prefix
-            assert!(list_res.objects.is_empty());
-            assert_eq!(list_res.common_prefixes, vec!["a/"]);
+            assert_eq!(list_res.objects.len(), 2);
+            let got_under_a: Vec<&str> = list_res.objects.iter().map(|o| o.key.as_str()).collect();
+            assert_eq!(got_under_a, vec!["a/b.txt", "a/c.txt"]);
+            assert!(list_res.common_prefixes.is_empty());
 
-            // Test listing with just a delimiter
+            // Listing with just a delimiter (no prefix) should return top-level file and one common prefix
             let mut list_req_2 = Request::new(ListObjectsRequest {
                 bucket_name: bucket_name.clone(),
                 delimiter: "/".to_string(),
@@ -146,8 +150,8 @@ async fn test_list_objects_with_delimiter() {
             list_req_2.metadata_mut().insert("authorization", format!("Bearer {}", token).parse().unwrap());
             let list_res_2 = object_client.list_objects(list_req_2).await.unwrap().into_inner();
 
-            assert_eq!(list_res_2.objects.len(), 1);
-            assert_eq!(list_res_2.objects[0].key, "d.txt");
+            let top_level_objects: Vec<&str> = list_res_2.objects.iter().map(|o| o.key.as_str()).collect();
+            assert_eq!(top_level_objects, vec!["d.txt"]);
             assert_eq!(list_res_2.common_prefixes, vec!["a/"]);
         }
     ).await;
