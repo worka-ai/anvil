@@ -119,23 +119,24 @@ pub async fn run(
     )
     .await?;
 
+    let regional_pool = create_pool(&regional_db_url)?;
+    let global_pool = create_pool(&global_db_url)?;
+    let state = AppState::new(global_pool, regional_pool, region, jwt_secret).await?;
+    let swarm = cluster::create_swarm().await?;
+
     // Then start the node
-    start_node(listener, region, global_db_url, regional_db_url, jwt_secret).await
+    start_node(listener, state, swarm, None).await
 }
 
 pub async fn start_node(
     listener: tokio::net::TcpListener,
-    region: String,
-    global_db_url: String,
-    regional_db_url: String,
-    jwt_secret: String,
+    state: AppState,
+    mut swarm: libp2p::Swarm<cluster::ClusterBehaviour>,
+    bootstrap_addr: Option<libp2p::Multiaddr>,
 ) -> Result<()> {
-    // --- Database ---
-    let regional_pool = create_pool(&regional_db_url)?;
-    let global_pool = create_pool(&global_db_url)?;
-
-    // --- State ---
-    let state = AppState::new(global_pool, regional_pool, region, jwt_secret).await?;
+    if let Some(addr) = bootstrap_addr {
+        swarm.dial(addr)?;
+    }
 
     let worker_state = state.clone();
     tokio::spawn(async move {
@@ -181,7 +182,7 @@ pub async fn start_node(
 
     // Spawn the gossip service to run in the background.
     let gossip_task = tokio::spawn(cluster::run_gossip(
-        cluster::create_swarm().await?,
+        swarm, // Use the passed-in swarm
         state.cluster.clone(),
         format!("http://{}", addr),
     ));
