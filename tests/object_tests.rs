@@ -54,15 +54,16 @@ async fn test_delete_object_soft_deletes_and_enqueues_task() {
             let global_pool = state.db.get_global_pool();
             let client = global_pool.get().await.unwrap();
             let row = client.query_one("SELECT task_type, status FROM tasks WHERE payload->>'content_hash' IS NOT NULL", &[]).await.unwrap();
-            let task_type: &str = row.get("task_type");
-            let status: &str = row.get("status");
-            assert_eq!(task_type, "DELETE_OBJECT");
-            assert_eq!(status, "pending");
+            let task_type:TaskType = row.get("task_type");
+            let status: TaskStatus = row.get("status");
+            assert_eq!(task_type, TaskType::DeleteObject);
+            assert_eq!(status, TaskStatus::Pending);
         }
     ).await;
 }
 
 use anvil::anvil_api::HeadObjectRequest;
+use anvil::tasks::{TaskStatus, TaskType};
 
 #[tokio::test]
 async fn test_head_object() {

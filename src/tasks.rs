@@ -1,6 +1,6 @@
 use postgres_types::{FromSql, ToSql};
 
-#[derive(Debug, ToSql, FromSql)]
+#[derive(Debug, ToSql, FromSql, PartialEq, Eq)]
 #[postgres(name = "task_type")]
 pub enum TaskType {
     #[postgres(name = "DELETE_OBJECT")]
@@ -11,7 +11,7 @@ pub enum TaskType {
     RebalanceShard,
 }
 
-#[derive(Debug, ToSql, FromSql, PartialEq,Eq,)]
+#[derive(Debug, ToSql, FromSql, PartialEq, Eq)]
 #[postgres(name = "task_status")]
 pub enum TaskStatus {
     #[postgres(name = "pending")]

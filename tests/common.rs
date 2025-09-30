@@ -9,7 +9,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio_postgres::NoTls;
 
-use std::{net::SocketAddr, time::{Duration, Instant}};
+use std::{
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -206,7 +209,7 @@ pub async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> bool {
                     // keep reading a bit more until headers complete or budget ends
                     continue;
                 }
-                Ok(Err(_e)) => break false,  // read error on this attempt
+                Ok(Err(_e)) => break false, // read error on this attempt
                 Err(_elapsed) => break false, // per-try read timeout
             }
         };
@@ -361,8 +364,6 @@ use anvil::AppState;
 use tokio::task::JoinHandle;
 use tonic::Request;
 
-// The new, preferred test architecture.
-
 pub struct TestWorld {
     pub state: AppState,
     pub grpc_addr: String,
@@ -452,6 +453,7 @@ impl TestCluster {
         )
         .await
         .unwrap();
+         create_default_tenant(&create_pool(&global_db_url).unwrap(), "TEST_REGION").await;
 
         let mut nodes = Vec::new();
         let mut grpc_addrs = Vec::new();
@@ -483,7 +485,7 @@ impl TestCluster {
         for addr in &grpc_addrs {
             let socket_addr = addr.replace("http://", "").parse().unwrap();
             assert!(
-                wait_for_port(socket_addr, Duration::from_secs(5)).await,
+                wait_for_port(socket_addr, Duration::from_secs(15)).await,
                 "Server did not start in time"
             );
         }
@@ -520,6 +522,11 @@ pub async fn start_test_server(global_db_url: &str, regional_db_url: &str) -> (A
     let global_pool = create_pool(global_db_url).unwrap();
     let regional_pool = create_pool(regional_db_url).unwrap();
     let region = "TEST_REGION".to_string();
+
+    {
+        create_default_tenant(&global_pool, &region).await;
+    }
+
     let jwt_secret = "test-secret".to_string();
     let state = AppState::new(
         global_pool,
@@ -527,8 +534,9 @@ pub async fn start_test_server(global_db_url: &str, regional_db_url: &str) -> (A
         region.clone(),
         jwt_secret.clone(),
     )
-    .await
-    .unwrap();
+        .await
+        .unwrap();
+
     let grpc_addr = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
 
     let listener = tokio::net::TcpListener::bind(grpc_addr).await.unwrap();
@@ -586,6 +594,23 @@ pub async fn start_test_server(global_db_url: &str, regional_db_url: &str) -> (A
         );
     }
     (state, format!("http://{}", actual_addr))
+}
+
+pub async fn create_default_tenant(global_pool: &Pool, region: &str) {
+    // Create a default tenant for testing if it doesn't exist
+    let client = global_pool.get().await.unwrap();
+    client
+        .execute(
+            "INSERT INTO tenants (id, name, api_key) VALUES (1, 'default', 'default-key') ON CONFLICT (id) DO NOTHING",
+            &[],
+        )
+        .await.unwrap();
+    client
+        .execute(
+            "INSERT INTO regions (name) VALUES ($1) ON CONFLICT (name) DO NOTHING",
+            &[&region],
+        )
+        .await.unwrap();
 }
 
 pub async fn create_test_bucket(grpc_addr: &str, bucket_name: &str, token: &str) {

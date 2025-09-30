@@ -4,6 +4,7 @@ use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::{CreateBucketRequest, GetAccessTokenRequest};
 use std::process::Command;
 use tonic::Request;
+use crate::common::create_pool;
 
 mod common;
 
@@ -33,6 +34,7 @@ async fn test_auth_flow_with_wildcard_scopes() {
             .unwrap();
         });
         assert!(common::wait_for_port(grpc_addr, std::time::Duration::from_secs(5)).await, "Server did not start in time");
+        common::create_default_tenant(&create_pool(&global_db_url).unwrap(), "AUTH_TEST").await;
 
         // 3. Use the admin CLI to create app and grant policy (which now runs against a clean DB)
         let admin_args = &["run", "--bin", "admin", "--"];

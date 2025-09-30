@@ -478,7 +478,7 @@ impl ObjectService for AppState {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
 
-        let objects = self
+        let (objects, common_prefixes) = self
             .db
             .list_objects(
                 bucket.id,
@@ -489,6 +489,7 @@ impl ObjectService for AppState {
                 } else {
                     req.max_keys
                 },
+                &req.delimiter,
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -505,7 +506,7 @@ impl ObjectService for AppState {
 
         Ok(Response::new(ListObjectsResponse {
             objects: response_objects,
-            common_prefixes: vec![],
+            common_prefixes,
         }))
     }
 

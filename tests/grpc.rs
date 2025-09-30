@@ -12,12 +12,14 @@ use anvil::middleware;
 use futures_util::StreamExt;
 use libp2p::swarm::SwarmEvent;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::RwLock;
 use tonic::transport::Server;
 use tonic::Code;
+use anvil::anvil_api::auth_service_server::AuthServiceServer;
 
 mod common;
 
@@ -69,30 +71,35 @@ async fn test_distributed_put_and_get() {
             let state = states.pop().unwrap();
             let swarm = swarms.pop().unwrap();
             let grpc_addr_str = format!("127.0.0.1:{}", base_grpc_port + i);
-            let grpc_addr = grpc_addr_str.parse().unwrap();
+            let grpc_addr = grpc_addr_str.parse::<SocketAddr>().unwrap();
             let http_grpc_addr_str = format!("http://{}", grpc_addr_str);
-            let state_clone = state.clone();
-            let auth_interceptor = move |req| middleware::auth_interceptor(req, &state_clone);
+
             tokio::spawn(async move {
-                let server = Server::builder()
-                    .add_service(
-                        anvil::anvil_api::auth_service_server::AuthServiceServer::new(
-                            state.clone(),
-                        ),
-                    )
-                    .add_service(ObjectServiceServer::with_interceptor(
-                        state.clone(),
-                        auth_interceptor.clone(),
-                    ))
-                    .add_service(BucketServiceServer::with_interceptor(
-                        state.clone(),
-                        auth_interceptor.clone(),
-                    ))
-                    .add_service(InternalAnvilServiceServer::with_interceptor(
-                        state.clone(),
-                        auth_interceptor,
-                    ))
-                    .serve(grpc_addr);
+                // let auth_interceptor = move |req| middleware::auth_interceptor(req, &state);
+                let state_clone = state.clone();
+                let auth_interceptor = move |req| middleware::auth_interceptor(req, &state_clone);
+
+                let grpc_router = tonic::service::Routes::new(AuthServiceServer::with_interceptor(
+                    state.clone(),
+                    auth_interceptor.clone(),
+                ))
+                .add_service(ObjectServiceServer::with_interceptor(
+                    state.clone(),
+                    auth_interceptor.clone(),
+                ))
+                .add_service(BucketServiceServer::with_interceptor(
+                    state.clone(),
+                    auth_interceptor.clone(),
+                ))
+                .add_service(InternalAnvilServiceServer::with_interceptor(
+                    state.clone(),
+                    auth_interceptor,
+                ));
+
+                let app = anvil::s3_gateway::app(state.clone()).merge(grpc_router.into_axum_router()).layer(axum::middleware::from_fn(crate::middleware::save_uri_mw));
+
+                let server = axum::serve(tokio::net::TcpListener::bind(grpc_addr).await.unwrap(), app.into_make_service());
+
                 let gossip = run_gossip(swarm, state.cluster, http_grpc_addr_str);
                 let _ =
                     tokio::try_join!(async { server.await.map_err(anyhow::Error::from) }, async {
@@ -222,29 +229,34 @@ async fn test_single_node_put() {
             .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
             .unwrap();
         let cluster_state_clone = state.cluster.clone();
-        let grpc_addr = "127.0.0.1:50200".parse().unwrap();
+        let grpc_addr = "127.0.0.1:50200".parse::<SocketAddr>().unwrap();
         let http_grpc_addr = "http://127.0.0.1:50200";
 
         tokio::spawn(async move {
             let state_clone = state.clone();
             let auth_interceptor = move |req| middleware::auth_interceptor(req, &state_clone);
-            let server = Server::builder()
-                .add_service(
-                    anvil::anvil_api::auth_service_server::AuthServiceServer::new(state.clone()),
-                )
-                .add_service(ObjectServiceServer::with_interceptor(
-                    state.clone(),
-                    auth_interceptor.clone(),
-                ))
-                .add_service(BucketServiceServer::with_interceptor(
-                    state.clone(),
-                    auth_interceptor.clone(),
-                ))
-                .add_service(InternalAnvilServiceServer::with_interceptor(
-                    state.clone(),
-                    auth_interceptor,
-                ))
-                .serve(grpc_addr);
+
+            let grpc_router = tonic::service::Routes::new(AuthServiceServer::with_interceptor(
+                state.clone(),
+                auth_interceptor.clone(),
+            ))
+            .add_service(ObjectServiceServer::with_interceptor(
+                state.clone(),
+                auth_interceptor.clone(),
+            ))
+            .add_service(BucketServiceServer::with_interceptor(
+                state.clone(),
+                auth_interceptor.clone(),
+            ))
+            .add_service(InternalAnvilServiceServer::with_interceptor(
+                state.clone(),
+                auth_interceptor,
+            ));
+
+            let app = anvil::s3_gateway::app(state.clone()).merge(grpc_router.into_axum_router()).layer(axum::middleware::from_fn(crate::middleware::save_uri_mw));
+
+            let server = axum::serve(tokio::net::TcpListener::bind(grpc_addr).await.unwrap(), app.into_make_service());
+
             let gossip = run_gossip(swarm, state.cluster, http_grpc_addr.to_string());
             let _ = tokio::try_join!(async { server.await.map_err(anyhow::Error::from) }, async {
                 gossip.await.map_err(anyhow::Error::from)
@@ -332,36 +344,38 @@ async fn test_multi_region_list_and_isolation() {
             .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
             .unwrap();
 
-        let grpc_addr_east = "127.0.0.1:50201".parse().unwrap();
-        let grpc_addr_west = "127.0.0.1:50202".parse().unwrap();
+        let grpc_addr_east = "127.0.0.1:50201".parse::<SocketAddr>().unwrap();
+        let grpc_addr_west = "127.0.0.1:50202".parse::<SocketAddr>().unwrap();
 
         tokio::spawn(async move {
-            let cluster_state = Arc::new(RwLock::new(HashMap::new()));
-            state_east.cluster = cluster_state.clone();
+            state_east.cluster = Arc::new(RwLock::new(HashMap::new()));
             let state_clone = state_east.clone();
             let auth_interceptor = move |req| middleware::auth_interceptor(req, &state_clone);
-            let server = Server::builder()
-                .add_service(
-                    anvil::anvil_api::auth_service_server::AuthServiceServer::new(
-                        state_east.clone(),
-                    ),
-                )
-                .add_service(ObjectServiceServer::with_interceptor(
-                    state_east.clone(),
-                    auth_interceptor.clone(),
-                ))
-                .add_service(BucketServiceServer::with_interceptor(
-                    state_east.clone(),
-                    auth_interceptor.clone(),
-                ))
-                .add_service(InternalAnvilServiceServer::with_interceptor(
-                    state_east.clone(),
-                    auth_interceptor,
-                ))
-                .serve(grpc_addr_east);
+
+            let grpc_router = tonic::service::Routes::new(AuthServiceServer::with_interceptor(
+                state_east.clone(),
+                auth_interceptor.clone(),
+            ))
+            .add_service(ObjectServiceServer::with_interceptor(
+                state_east.clone(),
+                auth_interceptor.clone(),
+            ))
+            .add_service(BucketServiceServer::with_interceptor(
+                state_east.clone(),
+                auth_interceptor.clone(),
+            ))
+            .add_service(InternalAnvilServiceServer::with_interceptor(
+                state_east.clone(),
+                auth_interceptor,
+            ));
+
+            let app = anvil::s3_gateway::app(state_east.clone()).merge(grpc_router.into_axum_router()).layer(axum::middleware::from_fn(crate::middleware::save_uri_mw));
+
+            let server = axum::serve(tokio::net::TcpListener::bind(grpc_addr_east).await.unwrap(), app.into_make_service());
+
             let gossip = run_gossip(
                 swarm_east,
-                cluster_state,
+                state_east.cluster.clone(),
                 "http://127.0.0.1:50201".to_string(),
             );
             let _ = tokio::try_join!(async { server.await.map_err(anyhow::Error::from) }, async {
@@ -370,32 +384,35 @@ async fn test_multi_region_list_and_isolation() {
         });
 
         tokio::spawn(async move {
-            let cluster_state = Arc::new(RwLock::new(HashMap::new()));
-            state_west.cluster = cluster_state.clone();
+            state_west.cluster = Arc::new(RwLock::new(HashMap::new()));
+            // let auth_interceptor = move |req| middleware::auth_interceptor(req, &state_west);
             let state_clone = state_west.clone();
             let auth_interceptor = move |req| middleware::auth_interceptor(req, &state_clone);
-            let server = Server::builder()
-                .add_service(
-                    anvil::anvil_api::auth_service_server::AuthServiceServer::new(
-                        state_west.clone(),
-                    ),
-                )
-                .add_service(ObjectServiceServer::with_interceptor(
-                    state_west.clone(),
-                    auth_interceptor.clone(),
-                ))
-                .add_service(BucketServiceServer::with_interceptor(
-                    state_west.clone(),
-                    auth_interceptor.clone(),
-                ))
-                .add_service(InternalAnvilServiceServer::with_interceptor(
-                    state_west.clone(),
-                    auth_interceptor,
-                ))
-                .serve(grpc_addr_west);
+
+            let grpc_router = tonic::service::Routes::new(AuthServiceServer::with_interceptor(
+                state_west.clone(),
+                auth_interceptor.clone(),
+            ))
+            .add_service(ObjectServiceServer::with_interceptor(
+                state_west.clone(),
+                auth_interceptor.clone(),
+            ))
+            .add_service(BucketServiceServer::with_interceptor(
+                state_west.clone(),
+                auth_interceptor.clone(),
+            ))
+            .add_service(InternalAnvilServiceServer::with_interceptor(
+                state_west.clone(),
+                auth_interceptor,
+            ));
+
+            let app = anvil::s3_gateway::app(state_west.clone()).merge(grpc_router.into_axum_router()).layer(axum::middleware::from_fn(crate::middleware::save_uri_mw));
+
+            let server = axum::serve(tokio::net::TcpListener::bind(grpc_addr_west).await.unwrap(), app.into_make_service());
+
             let gossip = run_gossip(
                 swarm_west,
-                cluster_state,
+                state_west.cluster.clone(),
                 "http://127.0.0.1:50202".to_string(),
             );
             let _ = tokio::try_join!(async { server.await.map_err(anyhow::Error::from) }, async {

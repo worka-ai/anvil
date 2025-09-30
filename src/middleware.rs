@@ -43,7 +43,7 @@ pub fn auth_interceptor<T>(mut req: Request<T>, state: &AppState) -> Result<Requ
 }
 
 // This runs on the raw HTTP request before Tonic handles it.
-pub(crate) async fn save_uri_mw(
+pub async fn save_uri_mw(
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {

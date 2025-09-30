@@ -39,25 +39,65 @@ CREATE TABLE objects (
     UNIQUE(bucket_id, key, version_id)
 );
 
--- Create a trigger to automatically generate the ltree path from the key
+-- One-time helper to turn a TEXT key into a safe ltree
+CREATE OR REPLACE FUNCTION make_key_ltree(p_key text)
+    RETURNS ltree
+    LANGUAGE sql
+    IMMUTABLE
+AS $$
+WITH cleaned AS (
+    SELECT regexp_replace(trim(both '/' from coalesce(p_key, '')), '/+', '/', 'g') AS k
+),
+     segs AS (
+         SELECT unnest(string_to_array(k, '/')) AS seg
+         FROM cleaned
+     ),
+     norm AS (
+         SELECT
+             -- keep only letters/digits/underscore, lowercased
+             lower(regexp_replace(seg, '[^A-Za-z0-9_]', '_', 'g')) AS s
+         FROM segs
+         WHERE seg <> ''                         -- drop empties
+     ),
+     head_fixed AS (
+         SELECT
+             CASE
+                 WHEN s ~ '^[a-z]' THEN s            -- starts with a letter already
+                 WHEN s = '' THEN 'x'                -- degenerate -> x
+                 ELSE 'x' || s                       -- make it start with a letter
+                 END AS lbl
+         FROM norm
+     ),
+     joined AS (
+         SELECT array_to_string(array_agg(lbl), '.') AS dot
+         FROM head_fixed
+     )
+SELECT CASE
+           WHEN dot IS NULL OR dot = '' THEN NULL
+           ELSE text2ltree(dot)
+           END
+FROM joined;
+$$;
+
+-- Use the helper in your trigger
 CREATE OR REPLACE FUNCTION update_key_ltree()
-RETURNS TRIGGER AS $$
+    RETURNS TRIGGER AS $$
 BEGIN
-    -- Replace slashes with dots for ltree compatibility
-    NEW.key_ltree = text2ltree(REPLACE(NEW.key, '/', '.'));
+    NEW.key_ltree := make_key_ltree(NEW.key);
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS objects_update_key_ltree_trigger ON objects;
 CREATE TRIGGER objects_update_key_ltree_trigger
-BEFORE INSERT OR UPDATE ON objects
-FOR EACH ROW
+    BEFORE INSERT OR UPDATE ON objects
+    FOR EACH ROW
 EXECUTE FUNCTION update_key_ltree();
-
 
 -- Indexes for efficient querying
 CREATE INDEX idx_objects_bucket_key ON objects(bucket_id, key);
 CREATE INDEX idx_objects_ltree ON objects USING GIST(key_ltree);
 CREATE INDEX idx_objects_trgm ON objects USING GIN(key gin_trgm_ops);
 CREATE INDEX idx_objects_created_at ON objects USING BRIN(created_at);
+
 CREATE INDEX idx_objects_not_deleted ON objects (bucket_id, key) WHERE deleted_at IS NULL;

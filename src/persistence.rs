@@ -46,6 +46,7 @@ pub struct Object {
     pub content_type: Option<String>,
     pub version_id: uuid::Uuid,
     pub created_at: OffsetDateTime,
+    pub deleted_at: Option<OffsetDateTime>,
     pub storage_class: Option<i16>,
     pub user_meta: Option<JsonValue>,
     pub shard_map: Option<JsonValue>,
@@ -98,6 +99,7 @@ impl From<Row> for Object {
             content_type: row.get("content_type"),
             version_id: row.get("version_id"),
             created_at: row.get("created_at"),
+            deleted_at: row.get("deleted_at"),
             storage_class: row.get("storage_class"),
             user_meta: row.get("user_meta"),
             shard_map: row.get("shard_map"),
@@ -348,32 +350,248 @@ impl Persistence {
         Ok(row.map(Into::into))
     }
 
+    /// List objects and (optionally) "common prefixes" (aka pseudo-folders).
+    ///
+    /// - When `delimiter` is empty: returns up to `limit` objects whose `key`
+    ///   starts with `prefix` and are lexicographically `> start_after`.
+    /// - When `delimiter` is non-empty: returns up to `limit` entries across the
+    ///   **merged, lexicographic** stream of:
+    ///     • objects that are the first-level children under `prefix` (no further delimiter),
+    ///     • common prefixes representing deeper descendants at that first level.
+    ///   The function still returns `(objects, common_prefixes)` separately, but the
+    ///   single `limit` applies to the merged stream (i.e., total returned =
+    ///   `objects.len() + common_prefixes.len() <= limit`).
+    ///
+    /// Notes:
+    /// - Avoids `ltree` cast errors by trimming/cleaning trailing slashes/dots,
+    ///   removing empty segments, and mapping invalid label characters.
+    /// - Uses `key_ltree <@ prefix_ltree` for proper descendant matching.
+    /// - Orders deterministically, and applies `LIMIT` after interleaving.
+    /// - Objects fetched by key are re-ordered by `key`.
     pub async fn list_objects(
         &self,
         bucket_id: i64,
         prefix: &str,
         start_after: &str,
         limit: i32,
-    ) -> Result<Vec<Object>> {
+        delimiter: &str,
+    ) -> Result<(Vec<Object>, Vec<String>)> {
+        use regex::Regex;
+
+        // Helper: map an arbitrary key segment to a valid ltree label.
+        // Must mirror whatever you used when populating `objects.key_ltree`.
+        // Here we use a conservative mapping: A-Za-z0-9_ only; others -> '_'.
+        fn ltree_labelize(seg: &str) -> String {
+            // If your ingestion uses a different normalization, replace this to match it.
+            let mut out = String::with_capacity(seg.len());
+            for (i, ch) in seg.chars().enumerate() {
+                let valid = ch.is_ascii_alphanumeric() || ch == '_';
+                if i == 0 {
+                    // label must start with alpha (ltree requirement). If not, prefix with 'x'
+                    if ch.is_ascii_alphabetic() {
+                        out.push(ch.to_ascii_lowercase());
+                    } else if valid {
+                        out.push('x');
+                        out.push(ch.to_ascii_lowercase());
+                    } else {
+                        out.push('x');
+                        out.push('_');
+                    }
+                } else {
+                    out.push(if valid { ch.to_ascii_lowercase() } else { '_' });
+                }
+            }
+            if out.is_empty() {
+                "x".to_owned()
+            } else {
+                out
+            }
+        }
+
+        // Normalize `prefix` into an ltree dot-path that is safe to cast.
+        // - trim leading/trailing delimiters ('/')
+        // - collapse multiple slashes
+        // - drop empty segments
+        // - ltree-labelize each segment
+        // IMPORTANT: this must match how you built `key_ltree` at write time.
+        let slash_re = Regex::new(r"/+").unwrap();
+        let cleaned_prefix_slash = slash_re
+            .replace_all(prefix.trim_matches('/'), "/")
+            .to_string();
+
+        let prefix_segments: Vec<String> = cleaned_prefix_slash
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(ltree_labelize)
+            .collect();
+
+        let prefix_dot = prefix_segments.join(".");
+
+        // Fast path: no delimiter => simple ordered list of objects.
+        if delimiter.is_empty() {
+            let client = self.regional_pool.get().await?;
+            let rows = client
+                .query(
+                    r#"
+                SELECT
+                id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
+                FROM objects
+                WHERE bucket_id = $1
+                  AND deleted_at IS NULL
+                  AND key > $2
+                  AND key LIKE $3
+                ORDER BY key
+                LIMIT $4
+                "#,
+                    &[
+                        &bucket_id,
+                        &start_after,
+                        &format!("{}%", prefix),
+                        &(limit as i64),
+                    ],
+                )
+                .await?;
+            let objects = rows.into_iter().map(Into::into).collect();
+            return Ok((objects, vec![]));
+        }
+
+        // Delimiter path: interleave first-level objects and prefixes and apply a single LIMIT.
         let client = self.regional_pool.get().await?;
+
+        // We keep $4 as TEXT; cast to ltree with NULLIF in SQL to avoid "Unexpected end of input".
+        // When empty, treat as the root (nlevel = 0) and skip the <@ check.
         let rows = client
             .query(
                 r#"
-            SELECT * FROM objects
-            WHERE bucket_id = $1 AND key > $2 AND key LIKE $3 AND deleted_at IS NULL
-            ORDER BY key
-            LIMIT $4
+            WITH
+            params AS (
+              SELECT
+                $1::bigint AS bucket_id,
+                $2::text   AS start_after,
+                $3::int8   AS lim,
+                NULLIF($4::text, '')::ltree AS prefix_ltree
+            ),
+            lvl AS (
+              SELECT COALESCE(nlevel(prefix_ltree), 0) AS p FROM params
+            ),
+            relevant AS (
+              SELECT o.key, o.key_ltree
+              FROM objects o, params p
+              WHERE o.bucket_id = p.bucket_id
+                AND o.deleted_at IS NULL
+                AND o.key > p.start_after
+                AND (p.prefix_ltree IS NULL OR o.key_ltree <@ p.prefix_ltree)
+            ),
+            children AS (
+              SELECT
+                key,
+                key_ltree,
+                subpath(
+                  key_ltree,
+                  0,
+                  (SELECT p FROM lvl) + 1
+                ) AS child_path,
+                nlevel(key_ltree) AS lvl
+              FROM relevant
+            ),
+            grouped AS (
+              SELECT
+                child_path,
+                MIN(key) AS min_key,
+                BOOL_OR(nlevel(key_ltree) > nlevel(child_path)) AS has_descendants_below,
+                COUNT(*) FILTER (WHERE key_ltree = child_path) AS exact_object_count
+              FROM children
+              GROUP BY child_path
+            ),
+            -- Build a unified, lexicographically sorted stream of rows, then LIMIT.
+            stream AS (
+              -- Common prefixes: return only those whose first visible key is > start_after
+              SELECT
+                ltree2text(g.child_path) AS sort_key,
+                NULL::text               AS object_key,
+                TRUE                     AS is_prefix
+              FROM grouped g, params p
+              WHERE g.has_descendants_below
+                AND g.min_key > p.start_after
+
+              UNION ALL
+
+              -- Objects that are exactly first-level children (no deeper slash beyond prefix)
+              SELECT
+                ltree2text(c.child_path) AS sort_key,
+                c.key                    AS object_key,
+                FALSE                    AS is_prefix
+              FROM children c
+              WHERE c.key_ltree = c.child_path
+            )
+            SELECT sort_key, object_key, is_prefix
+            FROM stream
+            ORDER BY sort_key, is_prefix DESC  -- object (false) before prefix (true) for same sort_key
+            LIMIT (SELECT lim FROM params)
             "#,
-                &[
-                    &bucket_id,
-                    &start_after,
-                    &format!("{}%", prefix),
-                    &(limit as i64),
-                ],
+                &[&bucket_id, &start_after, &(limit as i64), &prefix_dot],
             )
             .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+
+        // Split the unified stream into object keys vs prefixes (preserving order).
+        let mut object_keys: Vec<String> = Vec::new();
+        let mut common_prefixes: Vec<String> = Vec::new();
+
+        for row in &rows {
+            let sort_key: String = row.get("sort_key"); // dot path
+            let is_prefix: bool = row.get("is_prefix");
+            let slash_path = sort_key.replace('.', "/");
+
+            if is_prefix {
+                // Convert to caller's delimiter at the very end.
+                let mut pref = if delimiter == "/" {
+                    format!("{}/", slash_path)
+                } else {
+                    // Replace slashes with requested delimiter and append delimiter once.
+                    let replaced = if slash_path.is_empty() {
+                        String::new()
+                    } else {
+                        slash_path.replace('/', delimiter)
+                    };
+                    format!("{}{}", replaced, delimiter)
+                };
+                // Ensure it still starts with the provided (string) prefix for nice UX
+                // (only when using non-'/' delimiters this might differ). This is optional:
+                if !prefix.is_empty() && !pref.starts_with(prefix) && delimiter == "/" {
+                    // For safety; usually unnecessary if keys are consistent.
+                    pref = format!("{}/", prefix.trim_end_matches('/'));
+                }
+                common_prefixes.push(pref);
+            } else {
+                let key: String = row.get("object_key");
+                object_keys.push(key);
+            }
+        }
+
+        // Fetch object rows (if any) with deterministic ordering.
+        let objects = if !object_keys.is_empty() {
+            let rows = client
+                .query(
+                    r#"
+                SELECT
+                    id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
+                FROM objects
+                WHERE bucket_id = $1
+                  AND deleted_at IS NULL
+                  AND key = ANY($2)
+                ORDER BY key
+                "#,
+                    &[&bucket_id, &object_keys],
+                )
+                .await?;
+            rows.into_iter().map(Into::into).collect()
+        } else {
+            Vec::new()
+        };
+
+        Ok((objects, common_prefixes))
     }
+
 
     pub async fn soft_delete_object(&self, bucket_id: i64, key: &str) -> Result<Option<Object>> {
         let client = self.regional_pool.get().await?;
