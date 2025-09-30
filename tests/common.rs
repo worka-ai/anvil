@@ -107,7 +107,8 @@ pub struct TestCluster {
 
 impl TestCluster {
     #[allow(dead_code)]
-    pub async fn new(num_nodes: usize) -> Self {
+    pub async fn new(regions: Vec<&str>) -> Self {
+        let num_nodes = regions.len();
         let (global_db_url, regional_db_urls, _maint_client) = create_isolated_dbs(num_nodes).await;
 
         run_migrations(
@@ -126,7 +127,11 @@ impl TestCluster {
             .await
             .unwrap();
         }
-        create_default_tenant(&create_pool(&global_db_url).unwrap(), "TEST_REGION").await;
+        
+        let global_pool = create_pool(&global_db_url).unwrap();
+        for region in &regions {
+            create_default_tenant(&global_pool, region).await;
+        }
 
         let mut states = Vec::new();
         for i in 0..num_nodes {
@@ -135,7 +140,7 @@ impl TestCluster {
             let state = AppState::new(
                 global_pool,
                 regional_pool,
-                "TEST_REGION".to_string(),
+                regions[i].to_string(),
                 "test-secret".to_string(),
             )
             .await
