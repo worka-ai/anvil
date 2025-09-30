@@ -1,3 +1,4 @@
+use anvil::crypto;
 use anvil::persistence::Persistence;
 use anvil::{create_pool, migrations, run_migrations};
 use clap::{Parser, Subcommand};
@@ -58,20 +59,6 @@ enum PolicyCommands {
     },
 }
 
-use argon2::{
-    Argon2,
-    password_hash::{PasswordHasher, SaltString, rand_core::OsRng},
-};
-
-fn hash_secret(secret: &str) -> String {
-    let salt = SaltString::generate(&mut OsRng);
-    let argon2 = Argon2::default();
-    argon2
-        .hash_password(secret.as_bytes(), &salt)
-        .unwrap()
-        .to_string()
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -115,10 +102,11 @@ async fn main() -> anyhow::Result<()> {
                 let client_secret = rand::random::<[u8; 32]>()
                     .map(|b| format!("{:02x}", b))
                     .join("");
-                let secret_hash = hash_secret(&client_secret);
+
+                let encrypted_secret = crypto::encrypt(client_secret.as_bytes())?;
 
                 let app = persistence
-                    .create_app(tenant.id, app_name, &client_id, &secret_hash)
+                    .create_app(tenant.id, app_name, &client_id, &encrypted_secret)
                     .await?;
                 println!("Created app: {} (ID: {})", app.name, app.id);
                 println!("  Client ID: {}", client_id);

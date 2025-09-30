@@ -292,14 +292,32 @@ pub async fn prepare_node_state(
         std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let swarm = anvil::cluster::create_swarm().await?;
 
+    let sharder = anvil::sharding::ShardManager::new();
+    let placer = anvil::placement::PlacementManager::default();
+    let jwt_manager = Arc::new(JwtManager::new("secret".to_string()));
+    let db = anvil::persistence::Persistence::new(global_pool, regional_pool);
+
+    let bucket_manager = anvil::bucket_manager::BucketManager::new(db.clone());
+    let object_manager = anvil::object_manager::ObjectManager::new(
+        db.clone(),
+        placer.clone(),
+        cluster_state.clone(),
+        sharder.clone(),
+        storage.clone(),
+        region_name.to_string(),
+        jwt_manager.clone(),
+    );
+
     let state = anvil::AppState {
-        db: anvil::persistence::Persistence::new(global_pool, regional_pool),
+        db,
         storage,
         cluster: cluster_state.clone(),
-        sharder: anvil::sharding::ShardManager::new(),
-        placer: anvil::placement::PlacementManager::default(),
-        jwt_manager: Arc::new(JwtManager::new("secret".to_string())),
+        sharder,
+        placer,
+        jwt_manager,
         region: region_name.to_string(),
+        bucket_manager,
+        object_manager,
     };
 
     Ok((state, swarm))
@@ -651,13 +669,20 @@ pub fn create_app(global_db_url: &str, app_name: &str) -> (String, String) {
             app_name,
         ]))
         .env("GLOBAL_DATABASE_URL", global_db_url)
+        .env("WORKA_SECRET_ENCRYPTION_KEY", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         .output()
         .unwrap();
-    assert!(app_output.status.success());
-    let creds = String::from_utf8(app_output.stdout).unwrap();
-    let client_id = extract_credential(&creds, "Client ID");
-    let client_secret = extract_credential(&creds, "Client Secret");
-    (client_id, client_secret)
+    if !app_output.status.success() {
+        let out =  String::from_utf8(app_output.stdout).unwrap();
+        let err =  String::from_utf8(app_output.stderr).unwrap();
+        panic!("Failed to create app: {} {}", out, err);
+    }else {
+        assert!(app_output.status.success());
+        let creds = String::from_utf8(app_output.stdout).unwrap();
+        let client_id = extract_credential(&creds, "Client ID");
+        let client_secret = extract_credential(&creds, "Client Secret");
+        (client_id, client_secret)
+    }
 }
 
 #[allow(dead_code)]

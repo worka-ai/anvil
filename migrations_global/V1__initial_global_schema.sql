@@ -25,9 +25,8 @@ CREATE TABLE apps (
                       id BIGSERIAL PRIMARY KEY,
                       tenant_id BIGINT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
                       name TEXT NOT NULL,
-                      client_id TEXT UNIQUE NOT NULL,
-                      client_secret_hash TEXT NOT NULL,
-                      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                          client_id TEXT UNIQUE NOT NULL,
+                          client_secret_encrypted BYTEA NOT NULL,                      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                       UNIQUE(tenant_id, name)
 );
 

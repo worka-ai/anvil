@@ -14,9 +14,12 @@ use tokio_postgres::NoTls;
 
 // The modules we've created
 pub mod auth;
+pub mod bucket_manager;
 pub mod cluster;
+pub mod crypto;
 pub mod discovery;
 pub mod middleware;
+pub mod object_manager;
 pub mod persistence;
 pub mod placement;
 pub mod s3_auth;
@@ -52,6 +55,8 @@ pub struct AppState {
     pub placer: placement::PlacementManager,
     pub jwt_manager: Arc<JwtManager>,
     pub region: String,
+    pub bucket_manager: bucket_manager::BucketManager,
+    pub object_manager: object_manager::ObjectManager,
 }
 
 impl AppState {
@@ -64,14 +69,31 @@ impl AppState {
         let jwt_manager = Arc::new(JwtManager::new(jwt_secret));
         let storage = storage::Storage::new().await?;
         let cluster_state = Arc::new(RwLock::new(HashMap::new()));
+        let db = persistence::Persistence::new(global_pool, regional_pool);
+        let sharder = sharding::ShardManager::new();
+        let placer = placement::PlacementManager::default();
+
+        let bucket_manager = bucket_manager::BucketManager::new(db.clone());
+        let object_manager = object_manager::ObjectManager::new(
+            db.clone(),
+            placer.clone(),
+            cluster_state.clone(),
+            sharder.clone(),
+            storage.clone(),
+            region.clone(),
+            jwt_manager.clone(),
+        );
+
         Ok(Self {
-            db: persistence::Persistence::new(global_pool, regional_pool),
+            db,
             storage,
-            cluster: cluster_state.clone(),
-            sharder: sharding::ShardManager::new(),
-            placer: placement::PlacementManager::default(),
+            cluster: cluster_state,
+            sharder,
+            placer,
             jwt_manager,
-            region: region.clone(),
+            region,
+            bucket_manager,
+            object_manager,
         })
     }
 }

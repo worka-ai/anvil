@@ -1,0 +1,79 @@
+use crate::{
+    auth,
+    persistence::{Bucket, Persistence},
+    tasks::TaskType,
+};
+use tonic::Status;
+
+#[derive(Debug, Clone)]
+pub struct BucketManager {
+    db: Persistence,
+}
+
+impl BucketManager {
+    pub fn new(db: Persistence) -> Self {
+        Self { db }
+    }
+
+    pub async fn create_bucket(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        region: &str,
+        scopes: &[String],
+    ) -> Result<(), Status> {
+        let resource = format!("bucket:{}", bucket_name);
+        if !auth::is_authorized(&format!("write:{}", resource), scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        self.db
+            .create_bucket(tenant_id, bucket_name, region)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(())
+    }
+
+    pub async fn delete_bucket(&self, bucket_name: &str, scopes: &[String]) -> Result<(), Status> {
+        let resource = format!("bucket:{}", bucket_name);
+        if !auth::is_authorized(&format!("write:{}", resource), scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        // Soft-delete the bucket
+        let bucket = self
+            .db
+            .soft_delete_bucket(bucket_name)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Bucket not found"))?;
+
+        // Enqueue a task for physical deletion
+        let payload = serde_json::json!({ "bucket_id": bucket.id });
+        self.db
+            .enqueue_task(TaskType::DeleteBucket, payload, 100)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(())
+    }
+
+    pub async fn list_buckets(
+        &self,
+        tenant_id: i64,
+        scopes: &[String],
+    ) -> Result<Vec<Bucket>, Status> {
+        if !auth::is_authorized("read:bucket:*", scopes) {
+            return Err(Status::permission_denied("Permission denied to list buckets"));
+        }
+
+        let buckets = self
+            .db
+            .list_buckets_for_tenant(tenant_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(buckets)
+    }
+}

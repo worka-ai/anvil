@@ -1,9 +1,5 @@
 use anyhow::Result;
-use argon2::{
-    Argon2,
-    password_hash::{PasswordHash, PasswordVerifier},
-};
-use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -60,11 +56,6 @@ impl JwtManager {
     }
 }
 
-pub fn verify_secret(secret: &str, hash: &str) -> bool {
-    PasswordHash::new(hash)
-        .and_then(|parsed_hash| Argon2::default().verify_password(secret.as_bytes(), &parsed_hash))
-        .is_ok()
-}
 
 /// Checks if a required scope is satisfied by the scopes present in a token.
 /// Supports wildcards.
