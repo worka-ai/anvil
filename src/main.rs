@@ -13,13 +13,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let global_db_url = env::var("GLOBAL_DATABASE_URL").expect("Global DATABASE_URL must be set");
     let jwt_secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
 
-    run(
-        listener,
-        region,
-        global_db_url,
-        regional_db_url,
-        jwt_secret,
-    )
-    .await?;
+    run(listener, region, global_db_url, regional_db_url, jwt_secret).await?;
     Ok(())
 }

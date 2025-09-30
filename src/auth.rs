@@ -1,6 +1,9 @@
-use argon2::{Argon2, password_hash::{PasswordHash, PasswordVerifier}};
 use anyhow::Result;
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHash, PasswordVerifier},
+};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -20,7 +23,12 @@ impl JwtManager {
         Self { secret }
     }
 
-    pub fn mint_token(&self, app_id: String, scopes: Vec<String>, tenant_id: i64) -> Result<String> {
+    pub fn mint_token(
+        &self,
+        app_id: String,
+        scopes: Vec<String>,
+        tenant_id: i64,
+    ) -> Result<String> {
         let expiration = chrono::Utc::now()
             .checked_add_signed(chrono::Duration::hours(1))
             .expect("valid timestamp")
@@ -61,7 +69,6 @@ pub fn verify_secret(secret: &str, hash: &str) -> bool {
 /// Checks if a required scope is satisfied by the scopes present in a token.
 /// Supports wildcards.
 pub fn is_authorized(required_scope: &str, token_scopes: &[String]) -> bool {
-
     let required_parts: Vec<&str> = required_scope.splitn(2, ':').collect();
     if required_parts.len() != 2 {
         return false;
@@ -112,18 +119,30 @@ mod tests {
         ];
 
         // Exact match
-        assert!(is_authorized("write:bucket/specific/file.txt", &token_scopes));
+        assert!(is_authorized(
+            "write:bucket/specific/file.txt",
+            &token_scopes
+        ));
 
         // Wildcard match
-        assert!(is_authorized("read:bucket/folder/sub/image.jpg", &token_scopes));
+        assert!(is_authorized(
+            "read:bucket/folder/sub/image.jpg",
+            &token_scopes
+        ));
 
         // Grant match
         assert!(is_authorized("grant:bucket/some/path", &token_scopes));
 
         // Mismatch action
-        assert!(!is_authorized("delete:bucket/folder/sub/image.jpg", &token_scopes));
+        assert!(!is_authorized(
+            "delete:bucket/folder/sub/image.jpg",
+            &token_scopes
+        ));
 
         // Mismatch resource
-        assert!(!is_authorized("read:another-bucket/folder/file.txt", &token_scopes));
+        assert!(!is_authorized(
+            "read:another-bucket/folder/file.txt",
+            &token_scopes
+        ));
     }
 }

@@ -33,7 +33,11 @@ impl PlacementManager {
         scores.sort_by(|a, b| b.0.cmp(&a.0));
 
         // Take the top `count` nodes
-        scores.into_iter().map(|(_, peer_id)| peer_id).take(count).collect()
+        scores
+            .into_iter()
+            .map(|(_, peer_id)| peer_id)
+            .take(count)
+            .collect()
     }
 }
 
@@ -69,18 +73,27 @@ mod tests {
         let object_key2 = "another-test-object";
 
         // Calculate placement twice for the same key
-        let placement1 = manager.calculate_placement(object_key1, &cluster_state, 3).await;
-        let placement2 = manager.calculate_placement(object_key1, &cluster_state, 3).await;
+        let placement1 = manager
+            .calculate_placement(object_key1, &cluster_state, 3)
+            .await;
+        let placement2 = manager
+            .calculate_placement(object_key1, &cluster_state, 3)
+            .await;
 
         // Assert that the placement is deterministic
         assert_eq!(placement1, placement2, "Placement should be deterministic");
         assert_eq!(placement1.len(), 3, "Should return 3 nodes");
 
         // Calculate placement for a different key
-        let placement3 = manager.calculate_placement(object_key2, &cluster_state, 3).await;
+        let placement3 = manager
+            .calculate_placement(object_key2, &cluster_state, 3)
+            .await;
         assert_eq!(placement3.len(), 3, "Should return 3 nodes");
 
         // Assert that the placement for a different key is different (highly likely)
-        assert_ne!(placement1, placement3, "Placement for different keys should be different");
+        assert_ne!(
+            placement1, placement3,
+            "Placement for different keys should be different"
+        );
     }
 }

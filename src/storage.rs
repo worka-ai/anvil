@@ -18,11 +18,15 @@ impl Storage {
         let temp_path = storage_path.join(TEMP_DIR);
         fs::create_dir_all(&storage_path).await?;
         fs::create_dir_all(&temp_path).await?;
-        Ok(Self { storage_path, temp_path })
+        Ok(Self {
+            storage_path,
+            temp_path,
+        })
     }
 
     fn get_shard_path(&self, object_hash: &str, shard_index: u32) -> PathBuf {
-        self.storage_path.join(format!("{}-{:02}", object_hash, shard_index))
+        self.storage_path
+            .join(format!("{}-{:02}", object_hash, shard_index))
     }
 
     fn get_whole_object_path(&self, object_hash: &str) -> PathBuf {
@@ -37,10 +41,16 @@ impl Storage {
     }
 
     fn get_temp_shard_path(&self, upload_id: &str, shard_index: u32) -> PathBuf {
-        self.temp_path.join(format!("{}-{:02}", upload_id, shard_index))
+        self.temp_path
+            .join(format!("{}-{:02}", upload_id, shard_index))
     }
 
-    pub async fn store_temp_shard(&self, upload_id: &str, shard_index: u32, data: &[u8]) -> Result<()> {
+    pub async fn store_temp_shard(
+        &self,
+        upload_id: &str,
+        shard_index: u32,
+        data: &[u8],
+    ) -> Result<()> {
         let file_path = self.get_temp_shard_path(upload_id, shard_index);
         let mut file = fs::OpenOptions::new()
             .create(true)
@@ -51,7 +61,12 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn commit_shard(&self, upload_id: &str, shard_index: u32, final_object_hash: &str) -> Result<()> {
+    pub async fn commit_shard(
+        &self,
+        upload_id: &str,
+        shard_index: u32,
+        final_object_hash: &str,
+    ) -> Result<()> {
         let temp_path = self.get_temp_shard_path(upload_id, shard_index);
         let final_path = self.get_shard_path(final_object_hash, shard_index);
         fs::rename(temp_path, final_path).await?;
@@ -90,17 +105,28 @@ mod tests {
         let data = b"hello world";
 
         // Store the shard to a temporary location
-        storage.store_temp_shard(upload_id, shard_index, data).await.unwrap();
+        storage
+            .store_temp_shard(upload_id, shard_index, data)
+            .await
+            .unwrap();
 
         // Commit the shard
-        storage.commit_shard(upload_id, shard_index, final_hash).await.unwrap();
+        storage
+            .commit_shard(upload_id, shard_index, final_hash)
+            .await
+            .unwrap();
 
         // Retrieve the shard from the final location
-        let retrieved_data = storage.retrieve_shard(final_hash, shard_index).await.unwrap();
+        let retrieved_data = storage
+            .retrieve_shard(final_hash, shard_index)
+            .await
+            .unwrap();
 
         assert_eq!(data.as_ref(), retrieved_data.as_slice());
 
         // Clean up the test file
-        fs::remove_file(storage.get_shard_path(final_hash, shard_index)).await.unwrap();
+        fs::remove_file(storage.get_shard_path(final_hash, shard_index))
+            .await
+            .unwrap();
     }
 }

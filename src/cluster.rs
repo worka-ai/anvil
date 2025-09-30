@@ -1,13 +1,10 @@
 use anyhow::Result;
 use futures_util::StreamExt;
 use libp2p::{
+    PeerId, Swarm,
     gossipsub::{self, IdentTopic as Topic},
-    identity,
-    mdns,
+    identity, mdns,
     swarm::{NetworkBehaviour, SwarmEvent},
-    Multiaddr,
-    PeerId,
-    Swarm,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -37,7 +34,7 @@ pub struct ClusterMessage {
 // A module for custom PeerId serialization
 mod serde_peer_id {
     use libp2p::PeerId;
-    use serde::{de::Error, Deserialize, Deserializer, Serializer};
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
 
     pub fn serialize<S>(peer_id: &PeerId, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -165,8 +162,8 @@ pub async fn run_gossip(
                                         }
                                     }
                                     SwarmEvent::Behaviour(ClusterEvent::Mdns(mdns::Event::Discovered(list))) => {
-                                        let mut state = cluster_state.write().await;
-                                        for (peer_id, multiaddr) in list {
+                                        let _state = cluster_state.write().await;
+                                        for (peer_id, _multiaddr) in list {
                                             println!("[GOSSIP] mDNS discovered: {peer_id}");
                                             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                                             // We don't know the gRPC port from mDNS, so we can't fully populate PeerInfo here.
@@ -183,7 +180,7 @@ pub async fn run_gossip(
                                     }
                                     SwarmEvent::Behaviour(ClusterEvent::Gossipsub(gossipsub::Event::Message {
                                         message,
-                                        .. 
+                                        ..
                                     })) => {                        if let Ok(cluster_message) = serde_json::from_slice::<ClusterMessage>(&message.data) {
                             println!("[GOSSIP] Received cluster message from peer: {}", cluster_message.peer_id);
                             let mut state = cluster_state.write().await;

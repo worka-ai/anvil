@@ -1,9 +1,6 @@
-use anvil::cluster::{create_swarm, ClusterBehaviour, ClusterEvent};
-use libp2p::{
-    gossipsub,
-    swarm::{Swarm, SwarmEvent},
-};
+use anvil::cluster::{ClusterEvent, create_swarm};
 use futures_util::StreamExt;
+use libp2p::{gossipsub, swarm::SwarmEvent};
 
 #[tokio::test]
 async fn test_cluster_gossip() {
@@ -16,7 +13,9 @@ async fn test_cluster_gossip() {
     swarm2.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
 
     // 2. Start listening on swarm1 and dial from swarm2
-    swarm1.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+    swarm1
+        .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .unwrap();
 
     let listen_addr = match swarm1.select_next_some().await {
         SwarmEvent::NewListenAddr { address, .. } => address,
@@ -61,7 +60,11 @@ async fn test_cluster_gossip() {
 
     // 5. Assert that swarm2 receives the message
     loop {
-        if let SwarmEvent::Behaviour(ClusterEvent::Gossipsub(gossipsub::Event::Message { message, .. })) = swarm2.select_next_some().await {
+        if let SwarmEvent::Behaviour(ClusterEvent::Gossipsub(gossipsub::Event::Message {
+            message,
+            ..
+        })) = swarm2.select_next_some().await
+        {
             assert_eq!(message.data, b"hello world");
             break;
         }

@@ -4,16 +4,13 @@ use crate::anvil_api::internal_anvil_service_server::InternalAnvilServiceServer;
 use crate::anvil_api::object_service_server::ObjectServiceServer;
 use crate::auth::JwtManager;
 use anyhow::Result;
-use axum::handler::Handler;
 use cluster::ClusterState;
 use deadpool_postgres::{ManagerConfig, Pool, RecyclingMethod};
 use std::collections::HashMap;
-use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_postgres::NoTls;
-use tower::MakeService;
 
 // The modules we've created
 pub mod auth;

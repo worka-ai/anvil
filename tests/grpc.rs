@@ -1,3 +1,4 @@
+use anvil::anvil_api::auth_service_server::AuthServiceServer;
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::bucket_service_server::BucketServiceServer;
 use anvil::anvil_api::internal_anvil_service_server::InternalAnvilServiceServer;
@@ -17,9 +18,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::RwLock;
-use tonic::transport::Server;
 use tonic::Code;
-use anvil::anvil_api::auth_service_server::AuthServiceServer;
 
 mod common;
 
@@ -96,9 +95,14 @@ async fn test_distributed_put_and_get() {
                     auth_interceptor,
                 ));
 
-                let app = anvil::s3_gateway::app(state.clone()).merge(grpc_router.into_axum_router()).layer(axum::middleware::from_fn(crate::middleware::save_uri_mw));
+                let app = anvil::s3_gateway::app(state.clone())
+                    .merge(grpc_router.into_axum_router())
+                    .layer(axum::middleware::from_fn(crate::middleware::save_uri_mw));
 
-                let server = axum::serve(tokio::net::TcpListener::bind(grpc_addr).await.unwrap(), app.into_make_service());
+                let server = axum::serve(
+                    tokio::net::TcpListener::bind(grpc_addr).await.unwrap(),
+                    app.into_make_service(),
+                );
 
                 let gossip = run_gossip(swarm, state.cluster, http_grpc_addr_str);
                 let _ =
@@ -253,9 +257,14 @@ async fn test_single_node_put() {
                 auth_interceptor,
             ));
 
-            let app = anvil::s3_gateway::app(state.clone()).merge(grpc_router.into_axum_router()).layer(axum::middleware::from_fn(crate::middleware::save_uri_mw));
+            let app = anvil::s3_gateway::app(state.clone())
+                .merge(grpc_router.into_axum_router())
+                .layer(axum::middleware::from_fn(crate::middleware::save_uri_mw));
 
-            let server = axum::serve(tokio::net::TcpListener::bind(grpc_addr).await.unwrap(), app.into_make_service());
+            let server = axum::serve(
+                tokio::net::TcpListener::bind(grpc_addr).await.unwrap(),
+                app.into_make_service(),
+            );
 
             let gossip = run_gossip(swarm, state.cluster, http_grpc_addr.to_string());
             let _ = tokio::try_join!(async { server.await.map_err(anyhow::Error::from) }, async {
@@ -369,9 +378,14 @@ async fn test_multi_region_list_and_isolation() {
                 auth_interceptor,
             ));
 
-            let app = anvil::s3_gateway::app(state_east.clone()).merge(grpc_router.into_axum_router()).layer(axum::middleware::from_fn(crate::middleware::save_uri_mw));
+            let app = anvil::s3_gateway::app(state_east.clone())
+                .merge(grpc_router.into_axum_router())
+                .layer(axum::middleware::from_fn(crate::middleware::save_uri_mw));
 
-            let server = axum::serve(tokio::net::TcpListener::bind(grpc_addr_east).await.unwrap(), app.into_make_service());
+            let server = axum::serve(
+                tokio::net::TcpListener::bind(grpc_addr_east).await.unwrap(),
+                app.into_make_service(),
+            );
 
             let gossip = run_gossip(
                 swarm_east,
@@ -406,9 +420,14 @@ async fn test_multi_region_list_and_isolation() {
                 auth_interceptor,
             ));
 
-            let app = anvil::s3_gateway::app(state_west.clone()).merge(grpc_router.into_axum_router()).layer(axum::middleware::from_fn(crate::middleware::save_uri_mw));
+            let app = anvil::s3_gateway::app(state_west.clone())
+                .merge(grpc_router.into_axum_router())
+                .layer(axum::middleware::from_fn(crate::middleware::save_uri_mw));
 
-            let server = axum::serve(tokio::net::TcpListener::bind(grpc_addr_west).await.unwrap(), app.into_make_service());
+            let server = axum::serve(
+                tokio::net::TcpListener::bind(grpc_addr_west).await.unwrap(),
+                app.into_make_service(),
+            );
 
             let gossip = run_gossip(
                 swarm_west,

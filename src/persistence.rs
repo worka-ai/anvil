@@ -401,11 +401,7 @@ impl Persistence {
                     out.push(if valid { ch.to_ascii_lowercase() } else { '_' });
                 }
             }
-            if out.is_empty() {
-                "x".to_owned()
-            } else {
-                out
-            }
+            if out.is_empty() { "x".to_owned() } else { out }
         }
 
         // Normalize `prefix` into an ltree dot-path that is safe to cast.
@@ -591,7 +587,6 @@ impl Persistence {
 
         Ok((objects, common_prefixes))
     }
-
 
     pub async fn soft_delete_object(&self, bucket_id: i64, key: &str) -> Result<Option<Object>> {
         let client = self.regional_pool.get().await?;

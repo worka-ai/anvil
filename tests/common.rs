@@ -48,6 +48,8 @@ pub fn extract_credential(output: &str, key: &str) -> String {
         .unwrap()
 }
 
+//it's used everywhere in the tests but cargo claims it is unused
+#[allow(dead_code)]
 pub async fn with_test_dbs<F, Fut>(test_body: F)
 where
     F: FnOnce(String, String, String) -> Fut,
@@ -242,6 +244,7 @@ fn looks_like_http(buf: &[u8]) -> bool {
     memchr::memmem::find(buf, b"\r\n\r\n").is_some()
 }
 /// Connects to databases, runs migrations, and returns a fully configured AppState and Swarm.
+#[allow(dead_code)] //it's used everywhere in the tests but cargo claims it is unused
 pub async fn prepare_node_state(
     global_db_url: &str,
     regional_db_url: &str,
@@ -359,11 +362,12 @@ pub async fn get_auth_token(global_db_url: &str, grpc_addr: &str) -> String {
     token_res.access_token
 }
 
-use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::AppState;
+use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use tokio::task::JoinHandle;
 use tonic::Request;
 
+#[allow(dead_code)] //it's used everywhere in the tests but cargo claims it is unused
 pub struct TestWorld {
     pub state: AppState,
     pub grpc_addr: String,
@@ -372,6 +376,7 @@ pub struct TestWorld {
 }
 
 impl TestWorld {
+    #[allow(dead_code)] //it's used everywhere in the tests but cargo claims it is unused
     pub async fn new() -> Self {
         let (global_db_url, regional_db_url) = create_isolated_dbs().await;
 
@@ -426,6 +431,7 @@ async fn create_isolated_dbs() -> (String, String) {
     (global_db_url, regional_db_url)
 }
 
+#[allow(dead_code)] //it's used everywhere in the tests but cargo claims it is unused
 pub struct TestCluster {
     pub nodes: Vec<JoinHandle<()>>,
     pub grpc_addrs: Vec<String>,
@@ -435,6 +441,7 @@ pub struct TestCluster {
 }
 
 impl TestCluster {
+    #[allow(dead_code)] //it's used everywhere in the tests but cargo claims it is unused
     pub async fn new(num_nodes: usize) -> Self {
         let (global_db_url, regional_db_url) = create_isolated_dbs().await;
 
@@ -453,7 +460,7 @@ impl TestCluster {
         )
         .await
         .unwrap();
-         create_default_tenant(&create_pool(&global_db_url).unwrap(), "TEST_REGION").await;
+        create_default_tenant(&create_pool(&global_db_url).unwrap(), "TEST_REGION").await;
 
         let mut nodes = Vec::new();
         let mut grpc_addrs = Vec::new();
@@ -534,8 +541,8 @@ pub async fn start_test_server(global_db_url: &str, regional_db_url: &str) -> (A
         region.clone(),
         jwt_secret.clone(),
     )
-        .await
-        .unwrap();
+    .await
+    .unwrap();
 
     let grpc_addr = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
 
@@ -610,9 +617,11 @@ pub async fn create_default_tenant(global_pool: &Pool, region: &str) {
             "INSERT INTO regions (name) VALUES ($1) ON CONFLICT (name) DO NOTHING",
             &[&region],
         )
-        .await.unwrap();
+        .await
+        .unwrap();
 }
 
+#[allow(dead_code)]
 pub async fn create_test_bucket(grpc_addr: &str, bucket_name: &str, token: &str) {
     let mut client = BucketServiceClient::connect(grpc_addr.to_string())
         .await
@@ -629,6 +638,7 @@ pub async fn create_test_bucket(grpc_addr: &str, bucket_name: &str, token: &str)
 }
 
 // Creates an app and returns its client_id and client_secret.
+#[allow(dead_code)] //it's used everywhere in the tests but cargo claims it is unused
 pub fn create_app(global_db_url: &str, app_name: &str) -> (String, String) {
     let admin_args = &["run", "--bin", "admin", "--"];
     let app_output = Command::new("cargo")
@@ -650,6 +660,7 @@ pub fn create_app(global_db_url: &str, app_name: &str) -> (String, String) {
     (client_id, client_secret)
 }
 
+#[allow(dead_code)]
 pub async fn get_auth_token_for_app(
     global_db_url: &str,
     grpc_addr: &str,

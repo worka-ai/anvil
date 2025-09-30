@@ -1,13 +1,7 @@
-use crate::anvil_api::*;
-use crate::{auth, AppState};
-use futures_util::StreamExt;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Request, Response, Status};
-use crate::anvil_api::auth_service_server::AuthService;
 use crate::anvil_api::bucket_service_server::BucketService;
-use crate::anvil_api::internal_anvil_service_server::InternalAnvilService;
-use crate::anvil_api::object_service_server::ObjectService;
+use crate::anvil_api::*;
+use crate::{AppState, auth};
+use tonic::{Request, Response, Status};
 
 #[tonic::async_trait]
 impl BucketService for AppState {
@@ -49,7 +43,8 @@ impl BucketService for AppState {
         let claims = request
             .extensions()
             .get::<auth::Claims>()
-            .ok_or_else(|| Status::unauthenticated("Missing claims"))?.clone();
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?
+            .clone();
         let req = request.into_inner();
 
         let resource = format!("bucket:{}", req.bucket_name);
@@ -67,7 +62,10 @@ impl BucketService for AppState {
 
         // Enqueue a task for physical deletion
         let payload = serde_json::json!({ "bucket_id": bucket.id });
-            self.db.enqueue_task(crate::tasks::TaskType::DeleteBucket, payload, 100).await.map_err(|e| Status::internal(e.to_string()))?;
+        self.db
+            .enqueue_task(crate::tasks::TaskType::DeleteBucket, payload, 100)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(DeleteBucketResponse {}))
     }
@@ -85,7 +83,9 @@ impl BucketService for AppState {
         let tenant_id = claims.tenant_id;
 
         if !auth::is_authorized("read:bucket:*", &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied to list buckets"));
+            return Err(Status::permission_denied(
+                "Permission denied to list buckets",
+            ));
         }
 
         let buckets = self
@@ -102,7 +102,9 @@ impl BucketService for AppState {
             })
             .collect();
 
-        Ok(Response::new(ListBucketsResponse { buckets: response_buckets }))
+        Ok(Response::new(ListBucketsResponse {
+            buckets: response_buckets,
+        }))
     }
 
     async fn get_bucket_policy(

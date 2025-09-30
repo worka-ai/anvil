@@ -56,13 +56,11 @@ impl CloudflareDiscovery {
     }
 
     async fn discover_dns(&self) -> Result<IpAddr> {
-        use trust_dns_resolver::config::*;
         use trust_dns_resolver::TokioAsyncResolver;
+        use trust_dns_resolver::config::*;
 
-        let resolver = TokioAsyncResolver::tokio(
-            ResolverConfig::cloudflare(),
-            ResolverOpts::default(),
-        );
+        let resolver =
+            TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default());
 
         let response = resolver.txt_lookup("whoami.cloudflare.").await?;
         let ip_str = response.iter().next().unwrap().to_string();
@@ -88,13 +86,10 @@ pub struct GoogleDiscovery;
 #[async_trait::async_trait]
 impl IpDiscovery for GoogleDiscovery {
     async fn discover_ip(&self) -> Result<IpAddr> {
-        use trust_dns_resolver::config::*;
         use trust_dns_resolver::TokioAsyncResolver;
+        use trust_dns_resolver::config::*;
 
-        let resolver = TokioAsyncResolver::tokio(
-            ResolverConfig::google(),
-            ResolverOpts::default(),
-        );
+        let resolver = TokioAsyncResolver::tokio(ResolverConfig::google(), ResolverOpts::default());
 
         let response = resolver.txt_lookup("o-o.myaddr.l.google.com.").await?;
         let ip_str = response.iter().next().unwrap().to_string();

@@ -1,6 +1,6 @@
-use std::time::Duration;
 use crate::persistence::Persistence;
 use anyhow::Result;
+use std::time::Duration;
 
 // TODO: Define a proper Task struct that maps to the DB table
 
@@ -23,7 +23,8 @@ pub async fn run(persistence: Persistence) -> Result<()> {
                 // p.update_task_status(task.id, "running").await;
 
                 // 3. Execute based on type
-                let result = match task.as_str() { // task.task_type
+                let result = match task.as_str() {
+                    // task.task_type
                     "DELETE_OBJECT" => handle_delete_object(&p, &task).await,
                     _ => Ok(()),
                 };
@@ -39,7 +40,7 @@ pub async fn run(persistence: Persistence) -> Result<()> {
     }
 }
 
-async fn handle_delete_object(persistence: &Persistence, task: &str) -> Result<()> {
+async fn handle_delete_object(_persistence: &Persistence, task: &str) -> Result<()> {
     // let payload = task.payload;
     // let content_hash = payload.get("content_hash").and_then(|v| v.as_str());
     // ... get other payload data

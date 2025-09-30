@@ -1,11 +1,11 @@
-use crate::s3_auth::sigv4_auth;
 use crate::AppState;
+use crate::s3_auth::sigv4_auth;
 use axum::{
+    Router,
     extract::{Path, State},
     middleware,
     response::{IntoResponse, Response},
     routing::{get, put},
-    Router,
 };
 
 pub fn app(state: AppState) -> Router {
@@ -16,17 +16,11 @@ pub fn app(state: AppState) -> Router {
         .route_layer(middleware::from_fn(sigv4_auth))
 }
 
-async fn create_bucket(
-    State(_state): State<AppState>,
-    Path(_bucket): Path<String>,
-) -> Response {
+async fn create_bucket(State(_state): State<AppState>, Path(_bucket): Path<String>) -> Response {
     (axum::http::StatusCode::OK, "").into_response()
 }
 
-async fn list_objects(
-    State(_state): State<AppState>,
-    Path(_bucket): Path<String>,
-) -> Response {
+async fn list_objects(State(_state): State<AppState>, Path(_bucket): Path<String>) -> Response {
     (axum::http::StatusCode::OK, "").into_response()
 }
 

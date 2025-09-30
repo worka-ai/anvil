@@ -1,7 +1,6 @@
 use crate::AppState;
 use http::Uri;
 use tonic::{Request, Status};
-use tower::Service;
 
 pub fn auth_interceptor<T>(mut req: Request<T>, state: &AppState) -> Result<Request<T>, Status> {
     let uri = if let Some(m) = req.extensions().get::<Uri>()

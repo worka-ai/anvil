@@ -1,8 +1,7 @@
-use crate::anvil_api::internal_anvil_service_server::InternalAnvilService;
 use crate::anvil_api::object_service_server::ObjectService;
 use crate::anvil_api::*;
 use crate::tasks::TaskType;
-use crate::{auth, AppState};
+use crate::{AppState, auth};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -36,7 +35,6 @@ impl ObjectService for AppState {
             },
             _ => return Err(Status::invalid_argument("Empty stream")),
         };
-        let upload_id = uuid::Uuid::new_v4().to_string();
 
         let resource = format!("bucket:{}/{}", bucket_name, object_key);
         if !auth::is_authorized(&format!("write:{}", resource), &claims.scopes) {
@@ -512,14 +510,14 @@ impl ObjectService for AppState {
 
     async fn initiate_multipart_upload(
         &self,
-        request: Request<InitiateMultipartRequest>,
+        _request: Request<InitiateMultipartRequest>,
     ) -> Result<Response<InitiateMultipartResponse>, Status> {
         todo!()
     }
 
     async fn complete_multipart_upload(
         &self,
-        request: Request<CompleteMultipartRequest>,
+        _request: Request<CompleteMultipartRequest>,
     ) -> Result<Response<CompleteMultipartResponse>, Status> {
         todo!()
     }
