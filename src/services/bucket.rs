@@ -15,23 +15,9 @@ impl BucketService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.get_ref();
 
-        let resource = format!("bucket:{}", req.bucket_name);
-        if !auth::is_authorized(&format!("write:{}", resource), &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
-
-        println!("gRPC - Create Bucket: {:?}", req);
-
-        let tenant_id = claims.tenant_id;
-
-        let db_result = self
-            .db
-            .create_bucket(tenant_id, &req.bucket_name, &req.region)
-            .await;
-
-        println!("DB create_bucket result: {:?}", db_result);
-
-        db_result.map_err(|e| Status::internal(e.to_string()))?;
+        self.bucket_manager
+            .create_bucket(claims.tenant_id, &req.bucket_name, &req.region, &claims.scopes)
+            .await?;
 
         Ok(Response::new(CreateBucketResponse {}))
     }
@@ -43,29 +29,12 @@ impl BucketService for AppState {
         let claims = request
             .extensions()
             .get::<auth::Claims>()
-            .ok_or_else(|| Status::unauthenticated("Missing claims"))?
-            .clone();
-        let req = request.into_inner();
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.get_ref();
 
-        let resource = format!("bucket:{}", req.bucket_name);
-        if !auth::is_authorized(&format!("write:{}", resource), &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
-
-        // Soft-delete the bucket
-        let bucket = self
-            .db
-            .soft_delete_bucket(&req.bucket_name)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Bucket not found"))?;
-
-        // Enqueue a task for physical deletion
-        let payload = serde_json::json!({ "bucket_id": bucket.id });
-        self.db
-            .enqueue_task(crate::tasks::TaskType::DeleteBucket, payload, 100)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        self.bucket_manager
+            .delete_bucket(&req.bucket_name, &claims.scopes)
+            .await?;
 
         Ok(Response::new(DeleteBucketResponse {}))
     }
@@ -79,20 +48,10 @@ impl BucketService for AppState {
             .get::<auth::Claims>()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
 
-        // For now, we assume the tenant is derived from the app, which is linked to the claims.
-        let tenant_id = claims.tenant_id;
-
-        if !auth::is_authorized("read:bucket:*", &claims.scopes) {
-            return Err(Status::permission_denied(
-                "Permission denied to list buckets",
-            ));
-        }
-
         let buckets = self
-            .db
-            .list_buckets_for_tenant(tenant_id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .bucket_manager
+            .list_buckets(claims.tenant_id, &claims.scopes)
+            .await?;
 
         let response_buckets = buckets
             .into_iter()

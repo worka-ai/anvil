@@ -1,6 +1,6 @@
 use crate::anvil_api::auth_service_server::AuthService;
 use crate::anvil_api::*;
-use crate::{AppState, auth};
+use crate::{auth, crypto, AppState};
 use tonic::{Request, Response, Status};
 
 #[tonic::async_trait]
@@ -19,7 +19,10 @@ impl AuthService for AppState {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::unauthenticated("Invalid client ID"))?;
 
-        if !auth::verify_secret(&req.client_secret, &app_details.client_secret_hash) {
+        let decrypted_secret = crypto::decrypt(&app_details.client_secret_encrypted)
+            .map_err(|_| Status::unauthenticated("Invalid client secret"))?;
+
+        if !constant_time_eq::constant_time_eq(decrypted_secret.as_slice(), req.client_secret.as_bytes()) {
             return Err(Status::unauthenticated("Invalid client secret"));
         }
 
@@ -29,7 +32,7 @@ impl AuthService for AppState {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let approved_scopes = if req.scopes.is_empty() {
+        let approved_scopes = if req.scopes.is_empty() || req.scopes == vec!["*"] {
             allowed_scopes
         } else {
             req.scopes

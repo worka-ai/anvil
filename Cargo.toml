@@ -96,6 +96,14 @@ hmac = "0.12.1"
 axum-extra = { version = "0.10.2", features = ["typed-header"] }
 postgres-types = {version =  "0.2.10", features = ["derive"] }
 regex = "1.11.3"
+aws-sigv4 = { version = "1", features = ["sign-http", "http1"] }
+aws-credential-types = "1"   # for Credentials
+aws-smithy-runtime-api = "1" # for Identity
+
+aes-gcm = "0.10.3"
+constant_time_eq = "0.4.2"
+http-body-util = "0.1.1"
+subtle = "2.6.1"
 
 [build-dependencies]
 tonic-prost-build = { version = "0.14.2" }

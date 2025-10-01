@@ -34,7 +34,7 @@ pub struct Bucket {
     pub is_public_read: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Object {
     pub id: i64,
     pub tenant_id: i64,
@@ -110,7 +110,7 @@ impl From<Row> for Object {
 
 pub struct AppDetails {
     pub id: i64,
-    pub client_secret_hash: String,
+    pub client_secret_encrypted: Vec<u8>,
     pub tenant_id: i64,
 }
 
@@ -118,7 +118,7 @@ impl From<Row> for AppDetails {
     fn from(row: Row) -> Self {
         Self {
             id: row.get("id"),
-            client_secret_hash: row.get("client_secret_hash"),
+            client_secret_encrypted: row.get("client_secret_encrypted"),
             tenant_id: row.get("tenant_id"),
         }
     }
@@ -150,7 +150,7 @@ impl Persistence {
         let client = self.global_pool.get().await?;
         let row = client
             .query_opt(
-                "SELECT id, client_secret_hash, tenant_id FROM apps WHERE client_id = $1",
+                "SELECT id, client_secret_encrypted, tenant_id FROM apps WHERE client_id = $1",
                 &[&client_id],
             )
             .await?;
@@ -193,13 +193,13 @@ impl Persistence {
         tenant_id: i64,
         name: &str,
         client_id: &str,
-        client_secret_hash: &str,
+        client_secret_encrypted: &[u8],
     ) -> Result<App> {
         let client = self.global_pool.get().await?;
         let row = client
             .query_one(
-                "INSERT INTO apps (tenant_id, name, client_id, client_secret_hash) VALUES ($1, $2, $3, $4) RETURNING id, name, client_id",
-                &[&tenant_id, &name, &client_id, &client_secret_hash],
+                "INSERT INTO apps (tenant_id, name, client_id, client_secret_encrypted) VALUES ($1, $2, $3, $4) RETURNING id, name, client_id",
+                &[&tenant_id, &name, &client_id, &client_secret_encrypted],
             )
             .await?;
         Ok(row.into())
