@@ -25,6 +25,7 @@ use subtle::ConstantTimeEq;
 use time::{Date, Month, PrimitiveDateTime, Time as Tm};
 
 use crate::{auth::Claims, crypto, AppState};
+use tracing::{debug, info, warn};
 
 pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let (parts, body) = req.into_parts();
@@ -33,6 +34,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
     let body_bytes = match body.collect().await {
         Ok(b) => b.to_bytes(),
         Err(e) => {
+            warn!(error = %e, "Failed to read body in SigV4 middleware");
             return Response::builder()
                 .status(400)
                 .body(Body::from(format!("Failed to read body: {e}")))
@@ -50,13 +52,17 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         .and_then(|h| h.to_str().ok())
     {
         Some(h) if h.starts_with("AWS4-HMAC-SHA256 ") => h,
-        _ => return next.run(req).await,
+        _ => {
+            debug!("No SigV4 header found, passing as anonymous");
+            return next.run(req).await;
+        }
     };
 
     // Parse Authorization header (credential scope, signed headers, signature)
     let parsed = match parse_auth_header(auth_header) {
         Ok(p) => p,
         Err(e) => {
+            warn!(error = %e, "Failed to parse SigV4 Authorization header");
             return Response::builder()
                 .status(400)
                 .body(Body::from(format!("Invalid Authorization header: {e}")))
@@ -68,6 +74,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
     let app_details = match state.db.get_app_by_client_id(&parsed.access_key_id).await {
         Ok(Some(d)) => d,
         _ => {
+            warn!(access_key_id = %parsed.access_key_id, "SigV4 auth failed: Invalid access key");
             return Response::builder()
                 .status(403)
                 .body(Body::from("Invalid access key"))
@@ -78,6 +85,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
     let secret_bytes = match crypto::decrypt(&app_details.client_secret_encrypted) {
         Ok(s) => s,
         Err(_) => {
+            warn!(access_key_id = %parsed.access_key_id, "Failed to decrypt secret for SigV4 auth");
             return Response::builder()
                 .status(500)
                 .body(Body::from("Failed to decrypt secret"))
@@ -87,6 +95,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
     let secret = match String::from_utf8(secret_bytes) {
         Ok(s) => s,
         Err(_) => {
+            warn!(access_key_id = %parsed.access_key_id, "Decrypted secret is not valid UTF-8");
             return Response::builder()
                 .status(500)
                 .body(Body::from("Decrypted secret is not valid UTF-8"))
@@ -111,6 +120,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
             match parse_scope_yyyymmdd(&parsed.date) {
                 Some(t) => t,
                 None => {
+                    warn!(access_key_id = %parsed.access_key_id, "Missing or invalid X-Amz-Date for SigV4");
                     return Response::builder()
                         .status(400)
                         .body(Body::from("Missing or invalid X-Amz-Date"))
@@ -186,6 +196,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
     ) {
         Ok(s) => s,
         Err(e) => {
+            warn!(error = %e, access_key_id = %parsed.access_key_id, "Bad request for signing");
             return Response::builder()
                 .status(400)
                 .body(Body::from(format!("Bad request for signing: {e}")))
@@ -193,21 +204,11 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         }
     };
 
-    // --- Optional debugging ---
-    println!("--- SERVER-SIDE SIGNING COMPONENTS ---");
-    println!("Method: {}", parts.method.as_str());
-    println!("Absolute URL: {}", absolute_url);
-    println!("Region: {}", parsed.region);
-    println!("Service: {}", parsed.service);
-    println!("Time: {:?}", signing_time);
-    println!("x-amz-content-sha256: {}", payload_hash);
-    println!("SignedHeaders (client): {}", parsed.signed_headers.join(";"));
-    println!("--- END SERVER-SIDE SIGNING COMPONENTS ---");
-
     // Compute signature for THIS request exactly as the client would have
     let out = match sign(signable_req, &signing_params) {
         Ok(o) => o,
         Err(_) => {
+            warn!(access_key_id = %parsed.access_key_id, "SigV4 signature computation failed");
             return Response::builder()
                 .status(403)
                 .body(Body::from("Signature verification failed"))
@@ -217,16 +218,20 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
     let (_instr, computed_sig) = out.into_parts();
 
     if !constant_time_eq_str(computed_sig.as_str(), &parsed.signature) {
+        warn!(access_key_id = %parsed.access_key_id, "SigV4 signature mismatch");
         return Response::builder()
             .status(403)
             .body(Body::from("Signature verification failed"))
             .unwrap();
     }
 
+    info!(access_key_id = %parsed.access_key_id, "SigV4 authentication successful");
+
     // Attach claims and continue
     let scopes = match state.db.get_policies_for_app(app_details.id).await {
         Ok(s) => s,
-        Err(_) => {
+        Err(e) => {
+            warn!(error = %e, access_key_id = %parsed.access_key_id, "Failed to fetch policies for app");
             return Response::builder()
                 .status(500)
                 .body(Body::from("Failed to fetch policies"))
@@ -238,7 +243,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         sub: parsed.access_key_id,
         tenant_id: app_details.tenant_id,
         scopes,
-        exp: 0,
+        exp: 0, // SigV4 has its own expiry mechanism
     };
     req.extensions_mut().insert(claims);
 

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
+use tracing::{debug, warn};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
@@ -46,13 +47,22 @@ impl JwtManager {
     }
 
     pub fn verify_token(&self, token: &str) -> Result<Claims> {
-        decode::<Claims>(
+        let result = decode::<Claims>(
             token,
             &DecodingKey::from_secret(self.secret.as_ref()),
             &Validation::default(),
-        )
-        .map(|data| data.claims)
-        .map_err(Into::into)
+        );
+
+        match result {
+            Ok(token_data) => {
+                debug!(subject = %token_data.claims.sub, "JWT verified successfully");
+                Ok(token_data.claims)
+            }
+            Err(e) => {
+                warn!(error = %e, "JWT verification failed");
+                Err(e.into())
+            }
+        }
     }
 }
 
@@ -60,8 +70,11 @@ impl JwtManager {
 /// Checks if a required scope is satisfied by the scopes present in a token.
 /// Supports wildcards.
 pub fn is_authorized(required_scope: &str, token_scopes: &[String]) -> bool {
+    debug!(%required_scope, ?token_scopes, "Checking authorization");
+
     let required_parts: Vec<&str> = required_scope.splitn(2, ':').collect();
     if required_parts.len() != 2 {
+        warn!(%required_scope, "Malformed required scope");
         return false;
     }
     let required_action = required_parts[0];
@@ -76,13 +89,14 @@ pub fn is_authorized(required_scope: &str, token_scopes: &[String]) -> bool {
         let resource = parts[1];
 
         if action == required_action || action == "*" {
-            let matches = resource_matches(required_resource, resource);
-            if matches {
+            if resource_matches(required_resource, resource) {
+                debug!(%required_scope, matched_scope = %scope, "Authorization successful");
                 return true;
             }
         }
     }
 
+    debug!(%required_scope, "Authorization failed");
     false
 }
 

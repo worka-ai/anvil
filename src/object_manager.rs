@@ -7,6 +7,7 @@ use crate::{
     sharding::ShardManager,
     storage::Storage,
     tasks::TaskType,
+    validation,
 };
 use futures_util::{Stream, StreamExt};
 use std::pin::Pin;
@@ -56,6 +57,13 @@ impl ObjectManager {
         scopes: &[String],
         mut data_stream: impl Stream<Item = Result<Vec<u8>, Status>> + Unpin,
     ) -> Result<Object, Status> {
+        if !validation::is_valid_bucket_name(bucket_name) {
+            return Err(Status::invalid_argument("Invalid bucket name"));
+        }
+        if !validation::is_valid_object_key(object_key) {
+            return Err(Status::invalid_argument("Invalid object key"));
+        }
+
         let resource = format!("bucket:{}/{}", bucket_name, object_key);
         if !auth::is_authorized(&format!("write:{}", resource), scopes) {
             return Err(Status::permission_denied("Permission denied"));
@@ -314,6 +322,13 @@ impl ObjectManager {
         object_key: &str,
         scopes: &[String],
     ) -> Result<(), Status> {
+        if !validation::is_valid_bucket_name(bucket_name) {
+            return Err(Status::invalid_argument("Invalid bucket name"));
+        }
+        if !validation::is_valid_object_key(object_key) {
+            return Err(Status::invalid_argument("Invalid object key"));
+        }
+
         let resource = format!("bucket:{}/{}", bucket_name, object_key);
         if !auth::is_authorized(&format!("write:{}", resource), scopes) {
             return Err(Status::permission_denied("Permission denied"));
@@ -350,6 +365,13 @@ impl ObjectManager {
         object_key: &str,
         scopes: &[String],
     ) -> Result<Object, Status> {
+        if !validation::is_valid_bucket_name(bucket_name) {
+            return Err(Status::invalid_argument("Invalid bucket name"));
+        }
+        if !validation::is_valid_object_key(object_key) {
+            return Err(Status::invalid_argument("Invalid object key"));
+        }
+
         let resource = format!("bucket:{}/{}", bucket_name, object_key);
         if !auth::is_authorized(&format!("read:{}", resource), scopes) {
             return Err(Status::permission_denied("Permission denied"));
@@ -377,6 +399,10 @@ impl ObjectManager {
         delimiter: &str,
         scopes: &[String],
     ) -> Result<(Vec<Object>, Vec<String>), Status> {
+        if !validation::is_valid_bucket_name(bucket_name) {
+            return Err(Status::invalid_argument("Invalid bucket name"));
+        }
+
         let resource = format!("bucket:{}", bucket_name);
         if !auth::is_authorized(&format!("read:{}", resource), scopes) {
             return Err(Status::permission_denied("Permission denied"));

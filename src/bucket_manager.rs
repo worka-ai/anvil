@@ -2,6 +2,7 @@ use crate::{
     auth,
     persistence::{Bucket, Persistence},
     tasks::TaskType,
+    validation,
 };
 use tonic::Status;
 
@@ -22,6 +23,9 @@ impl BucketManager {
         region: &str,
         scopes: &[String],
     ) -> Result<(), Status> {
+        if !validation::is_valid_bucket_name(bucket_name) {
+            return Err(Status::invalid_argument("Invalid bucket name"));
+        }
         let resource = format!("bucket:{}", bucket_name);
         if !auth::is_authorized(&format!("write:{}", resource), scopes) {
             return Err(Status::permission_denied("Permission denied"));
