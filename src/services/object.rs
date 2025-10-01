@@ -1,7 +1,7 @@
 use crate::anvil_api::object_service_server::ObjectService;
 use crate::anvil_api::*;
-use crate::{AppState, auth};
-use futures_util::{StreamExt, TryStreamExt};
+use crate::{auth, AppState};
+use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};

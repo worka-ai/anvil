@@ -32,7 +32,7 @@ impl AuthService for AppState {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let approved_scopes = if req.scopes.is_empty() {
+        let approved_scopes = if req.scopes.is_empty() || req.scopes == vec!["*"] {
             allowed_scopes
         } else {
             req.scopes

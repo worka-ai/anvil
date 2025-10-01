@@ -15,7 +15,7 @@ mod common;
 #[tokio::test]
 async fn test_distributed_put_and_get() {
     let num_nodes = 6;
-    let mut cluster = common::TestCluster::new(vec!["TEST_REGION"; num_nodes]).await;
+    let mut cluster = common::TestCluster::new(&["TEST_REGION"; 6]).await;
     cluster.start_and_converge(Duration::from_secs(20)).await;
 
     let token = cluster.token.clone();
@@ -108,7 +108,7 @@ async fn test_distributed_put_and_get() {
 
 #[tokio::test]
 async fn test_single_node_put() {
-    let mut cluster = common::TestCluster::new(vec!["TEST_REGION"]).await;
+    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let token = cluster.token.clone();
@@ -158,14 +158,13 @@ async fn test_single_node_put() {
 
 #[tokio::test]
 async fn test_multi_region_list_and_isolation() {
-    // Create two separate, single-node clusters, one for each region.
-    let mut cluster_east = common::TestCluster::new(vec!["US_EAST_1"]).await;
+    let mut cluster_east = common::TestCluster::new(&["US_EAST_1"]).await;
     cluster_east.start_and_converge(Duration::from_secs(5)).await;
 
-    let mut cluster_west = common::TestCluster::new(vec!["EU_WEST_1"]).await;
+    let mut cluster_west = common::TestCluster::new(&["EU_WEST_1"]).await;
     cluster_west.start_and_converge(Duration::from_secs(5)).await;
 
-    let token = cluster_east.token.clone(); // Token is global
+    let token = cluster_east.token.clone();
     let east_client_addr = cluster_east.grpc_addrs[0].clone();
     let west_client_addr = cluster_west.grpc_addrs[0].clone();
 

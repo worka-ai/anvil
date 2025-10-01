@@ -4,13 +4,12 @@ use anvil::{run_migrations, AppState};
 use anyhow::Result;
 use deadpool_postgres::{ManagerConfig, Pool, RecyclingMethod};
 use futures_util::StreamExt;
-use libp2p::Multiaddr;
 use std::process::Command;
 use std::str::FromStr;
 use tokio::task::JoinHandle;
 use tokio_postgres::NoTls;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 pub mod migrations {
@@ -46,11 +45,14 @@ pub async fn get_auth_token(global_db_url: &str, grpc_addr: &str) -> String {
     let admin_args = &["run", "--bin", "admin", "--"];
 
     let app_output = Command::new("cargo")
-        .args(
-            admin_args
-                .iter()
-                .chain(&["apps", "create", "--tenant-name", "default", "--app-name", "test-app"]),
-        )
+        .args(admin_args.iter().chain(&[
+            "apps",
+            "create",
+            "--tenant-name",
+            "default",
+            "--app-name",
+            "test-app",
+        ]))
         .env("GLOBAL_DATABASE_URL", global_db_url)
         .output()
         .unwrap();
@@ -101,16 +103,25 @@ pub struct TestCluster {
     pub states: Vec<AppState>,
     pub grpc_addrs: Vec<String>,
     pub token: String,
-    _global_db_url: String,
-    _regional_db_urls: Vec<String>,
+    pub global_db_url: String,
+    pub regional_db_urls: Vec<String>,
 }
 
 impl TestCluster {
     #[allow(dead_code)]
-    pub async fn new(regions: Vec<&str>) -> Self {
-        let num_nodes = regions.len();
-        let (global_db_url, regional_db_urls, _maint_client) = create_isolated_dbs(num_nodes).await;
+    pub async fn new(regions: &[&str]) -> Self {
+        // 1. Determine unique regions needed
+        let unique_regions: HashSet<String> = regions.iter().map(|s| s.to_string()).collect();
 
+        // 2. Create one DB for global and one for each unique region
+        let (global_db_url, regional_dbs, _maint_client) =
+            create_isolated_dbs(unique_regions.len()).await;
+        let regional_db_map = regional_dbs
+            .into_iter()
+            .enumerate()
+            .map(|(i, db_url)| (unique_regions.iter().nth(i).unwrap().to_string(), db_url))
+            .collect::<HashMap<String, String>>();
+        // 3. Run migrations on all created databases
         run_migrations(
             &global_db_url,
             migrations::migrations::runner(),
@@ -118,7 +129,7 @@ impl TestCluster {
         )
         .await
         .unwrap();
-        for db_url in &regional_db_urls {
+        for (_,db_url) in regional_db_map.iter() {
             run_migrations(
                 db_url,
                 regional_migrations::migrations::runner(),
@@ -127,20 +138,26 @@ impl TestCluster {
             .await
             .unwrap();
         }
-        
+
+        // 4. Create one connection pool for each unique regional database
+        let mut regional_pools = HashMap::new();
+        for (region_name, db_url) in regional_db_map.iter() {
+            regional_pools.insert(region_name.clone(), create_pool(db_url).unwrap());
+        }
+
+        // 5. Create AppState for each node, sharing pools based on region
         let global_pool = create_pool(&global_db_url).unwrap();
-        for region in &regions {
+        for region in &unique_regions {
             create_default_tenant(&global_pool, region).await;
         }
 
         let mut states = Vec::new();
-        for i in 0..num_nodes {
-            let regional_pool = create_pool(&regional_db_urls[i]).unwrap();
-            let global_pool = create_pool(&global_db_url).unwrap();
+        for region_name in regions {
+            let regional_pool = regional_pools.get(*region_name).unwrap().clone();
             let state = AppState::new(
-                global_pool,
+                global_pool.clone(),
                 regional_pool,
-                regions[i].to_string(),
+                region_name.to_string(),
                 "test-secret".to_string(),
             )
             .await
@@ -148,13 +165,14 @@ impl TestCluster {
             states.push(state);
         }
 
+        // 6. Return the TestCluster, ready to be started
         Self {
             nodes: Vec::new(),
             states,
             grpc_addrs: Vec::new(),
             token: String::new(),
-            _global_db_url: global_db_url,
-            _regional_db_urls: regional_db_urls,
+            global_db_url,
+            regional_db_urls: regional_db_map.values().cloned().collect(),
         }
     }
 
@@ -166,17 +184,25 @@ impl TestCluster {
 
         let mut listen_addrs = Vec::new();
         for swarm in &mut swarms {
-            swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+            swarm
+                .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+                .unwrap();
             if let Some(event) = swarm.next().await {
                 if let libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } = event {
                     listen_addrs.push(address);
-                } else { panic!("Expected NewListenAddr event"); }
-            } else { panic!("Swarm stream ended unexpectedly"); }
+                } else {
+                    panic!("Expected NewListenAddr event");
+                }
+            } else {
+                panic!("Swarm stream ended unexpectedly");
+            }
         }
 
         for i in 0..swarms.len() {
             for j in 0..listen_addrs.len() {
-                if i == j { continue; }
+                if i == j {
+                    continue;
+                }
                 swarms[i].dial(listen_addrs[j].clone()).unwrap();
             }
         }
@@ -185,15 +211,18 @@ impl TestCluster {
             let state = self.states[i].clone();
             let swarm = swarms.remove(0);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            self.grpc_addrs.push(format!("http://{}", listener.local_addr().unwrap()));
-            
+            self.grpc_addrs
+                .push(format!("http://{}", listener.local_addr().unwrap()));
+
             let handle = tokio::spawn(async move {
-                anvil::start_node(listener, state, swarm, None).await.unwrap();
+                anvil::start_node(listener, state, swarm, None)
+                    .await
+                    .unwrap();
             });
             self.nodes.push(handle);
         }
 
-        self.token = get_auth_token(&self._global_db_url, &self.grpc_addrs[0]).await;
+        self.token = get_auth_token(&self.global_db_url, &self.grpc_addrs[0]).await;
 
         let start = Instant::now();
         while start.elapsed() < timeout {
