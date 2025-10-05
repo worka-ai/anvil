@@ -19,7 +19,9 @@ impl AuthService for AppState {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::unauthenticated("Invalid client ID"))?;
 
-        let decrypted_secret = crypto::decrypt(&app_details.client_secret_encrypted)
+        let encryption_key = hex::decode(&self.config.worka_secret_encryption_key)
+            .map_err(|_| Status::internal("Invalid encryption key format"))?;
+        let decrypted_secret = crypto::decrypt(&app_details.client_secret_encrypted, &encryption_key)
             .map_err(|_| Status::unauthenticated("Invalid client secret"))?;
 
         if !constant_time_eq::constant_time_eq(decrypted_secret.as_slice(), req.client_secret.as_bytes()) {

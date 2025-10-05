@@ -78,28 +78,41 @@ impl From<mdns::Event> for ClusterEvent {
     }
 }
 
-pub async fn create_swarm() -> Result<Swarm<ClusterBehaviour>> {
+pub async fn create_swarm(config: Arc<crate::config::Config>) -> Result<Swarm<ClusterBehaviour>> {
     let local_key = identity::Keypair::generate_ed25519();
 
-    let swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
+    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
         .with_tokio()
-        .with_tcp(
-            Default::default(),
-            libp2p::noise::Config::new,
-            libp2p::yamux::Config::default,
-        )?
+        .with_quic()
         .with_behaviour(|key| {
             let gossipsub_config = gossipsub::Config::default();
             let gossipsub = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
                 gossipsub_config,
-            )?;
-            let mdns =
-                mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
+            )
+            .unwrap();
+            // Conditionally enable mDNS
+            let mdns = if config.enable_mdns {
+                mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?
+            } else {
+                // If mDNS is disabled, create a disabled behaviour with a long query interval and short TTL
+                mdns::tokio::Behaviour::new(
+                    mdns::Config {
+                        ttl: std::time::Duration::from_secs(0),
+                        query_interval: std::time::Duration::from_secs(3600),
+                        ..mdns::Config::default()
+                    },
+                    key.public().to_peer_id(),
+                )?
+            };
             Ok(ClusterBehaviour { gossipsub, mdns })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(60)))
         .build();
+
+    // Parse the QUIC bind address from config
+    let quic_bind_addr: libp2p::Multiaddr = config.quic_bind_addr.parse()?;
+    swarm.listen_on(quic_bind_addr)?;
 
     Ok(swarm)
 }

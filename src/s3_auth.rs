@@ -82,7 +82,9 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         }
     };
 
-    let secret_bytes = match crypto::decrypt(&app_details.client_secret_encrypted) {
+    let encryption_key = hex::decode(&state.config.worka_secret_encryption_key)
+        .expect("WORKA_SECRET_ENCRYPTION_KEY must be a valid hex string");
+    let secret_bytes = match crypto::decrypt(&app_details.client_secret_encrypted, &encryption_key) {
         Ok(s) => s,
         Err(_) => {
             warn!(access_key_id = %parsed.access_key_id, "Failed to decrypt secret for SigV4 auth");

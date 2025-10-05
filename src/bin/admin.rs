@@ -3,11 +3,26 @@ use anvil::persistence::Persistence;
 use anvil::{create_pool, migrations, run_migrations};
 use clap::{Parser, Subcommand};
 
+// Import the shared config
+
+
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
 struct Cli {
     #[clap(subcommand)]
     command: Commands,
+
+    #[clap(flatten)]
+    config: SharedConfig,
+}
+
+#[derive(Parser, Debug)]
+struct SharedConfig {
+    #[arg(long, env)]
+    pub global_database_url: String,
+
+    #[arg(long, env)]
+    pub worka_secret_encryption_key: String,
 }
 
 #[derive(Subcommand)]
@@ -61,21 +76,22 @@ enum PolicyCommands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenvy::dotenv().ok();
     let cli = Cli::parse();
+    let config = cli.config;
 
-    let global_db_url = std::env::var("GLOBAL_DATABASE_URL")?;
-    let global_pool = create_pool(&global_db_url)?;
-    let regional_pool = create_pool(&global_db_url)?; // Placeholder
+    let global_pool = create_pool(&config.global_database_url)?;
+    // The admin tool only interacts with the global DB, so we can use it as a placeholder for the regional pool.
+    let regional_pool = create_pool(&config.global_database_url)?;
 
     run_migrations(
-        &global_db_url,
+        &config.global_database_url,
         migrations::migrations::runner(),
         "refinery_schema_history_global",
     )
     .await?;
 
     let persistence = Persistence::new(global_pool, regional_pool);
+    let encryption_key = hex::decode(config.worka_secret_encryption_key)?;
 
     match &cli.command {
         Commands::Tenants { command } => match command {
@@ -103,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
                     .map(|b| format!("{:02x}", b))
                     .join("");
 
-                let encrypted_secret = crypto::encrypt(client_secret.as_bytes())?;
+                let encrypted_secret = crypto::encrypt(client_secret.as_bytes(), &encryption_key)?;
 
                 let app = persistence
                     .create_app(tenant.id, app_name, &client_id, &encrypted_secret)

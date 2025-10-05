@@ -25,6 +25,7 @@ pub struct ObjectManager {
     storage: Storage,
     region: String,
     jwt_manager: Arc<auth::JwtManager>,
+    encryption_key: Vec<u8>,
 }
 
 impl ObjectManager {
@@ -37,7 +38,9 @@ impl ObjectManager {
         storage: Storage,
         region: String,
         jwt_manager: Arc<auth::JwtManager>,
+        worka_secret_encryption_key: String,
     ) -> Self {
+        let encryption_key = hex::decode(worka_secret_encryption_key).expect("WORKA_SECRET_ENCRYPTION_KEY must be a valid hex string");
         Self {
             db,
             placer,
@@ -46,6 +49,7 @@ impl ObjectManager {
             storage,
             region,
             jwt_manager,
+            encryption_key,
         }
     }
 
@@ -106,7 +110,7 @@ impl ObjectManager {
                 let client = internal_anvil_service_client::InternalAnvilServiceClient::connect(
                     peer_info.grpc_addr.clone(),
                 )
-                .await.map_err(|e| Status::internal(e.to_string()))?;
+                .await.map_err(|e| Status::unavailable(e.to_string()))?;
                 clients.push(client);
             }
 
@@ -120,7 +124,7 @@ impl ObjectManager {
                     .map(|c| c.to_vec())
                     .collect();
                 shards.resize(self.sharder.total_shards(), vec![0; stripe_size]);
-                self.sharder.encode(&mut shards).map_err(|e| Status::internal(e.to_string()))?;
+                self.sharder.encode(&mut shards, &self.encryption_key).map_err(|e| Status::internal(e.to_string()))?;
 
                 let mut futures = Vec::new();
                 for (i, shard_data) in shards.into_iter().enumerate() {
@@ -156,7 +160,7 @@ impl ObjectManager {
                     .map(|c| c.to_vec())
                     .collect();
                 shards.resize(self.sharder.total_shards(), vec![0; stripe_size]);
-                self.sharder.encode(&mut shards).map_err(|e| Status::internal(e.to_string()))?;
+                self.sharder.encode(&mut shards, &self.encryption_key).map_err(|e| Status::internal(e.to_string()))?;
 
                 let mut futures = Vec::new();
                 for (i, shard_data) in shards.into_iter().enumerate() {
@@ -281,7 +285,10 @@ impl ObjectManager {
                     shards.push(shard_data);
                 }
 
-                if app_state.sharder.reconstruct(&mut shards).is_ok() {
+                // TODO: Fetch missing shards from other peers.
+                // The current implementation only tries to reconstruct from local shards.
+
+                if app_state.sharder.reconstruct(&mut shards, &app_state.encryption_key).is_ok() {
                     let mut full_data = Vec::new();
                     let data_shards = &shards[..app_state.sharder.data_shards()];
                     for data_shard_opt in data_shards {

@@ -1,27 +1,118 @@
-version: "3.9"
+version: "3.8"
+
+networks:
+  anvilnet:
+    driver: bridge
+
 services:
-  postgres:
-    image: postgres:18-alpine
+  postgres-global:
+    image: postgres:18
     environment:
       POSTGRES_USER: worka
       POSTGRES_PASSWORD: worka
-      POSTGRES_DB: worka
-    ports: ["5432:5432"]
+      POSTGRES_DB: anvil_global
+    ports:
+      - "5433:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - postgres_global_data:/var/lib/postgresql/data
+    networks: [anvilnet]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U worka -d anvil_global"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
-  anvil:
+  postgres-regional:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: worka
+      POSTGRES_PASSWORD: worka
+      POSTGRES_DB: anvil_regional_docker
+    volumes:
+      - postgres_regional_data:/var/lib/postgresql/data
+    networks: [anvilnet]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U worka -d anvil_regional_docker"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  anvil1:
     build: .
     depends_on:
-      - postgres
+      postgres-global:
+        condition: service_healthy
+      postgres-regional:
+        condition: service_healthy
     environment:
-      DATABASE_URL: postgres://worka:worka@postgres:5432/worka
-      RUST_LOG: info
+      - RUST_LOG=info
+      - GLOBAL_DATABASE_URL=postgres://worka:worka@postgres-global:5432/anvil_global
+      - REGIONAL_DATABASE_URL=postgres://worka:worka@postgres-regional:5432/anvil_regional_docker
+      - REGION=DOCKER_TEST
+      - JWT_SECRET=docker-test-secret
+      - WORKA_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - HTTP_BIND_ADDR=0.0.0.0:9000
+      - QUIC_BIND_ADDR=/ip4/0.0.0.0/udp/7443/quic-v1
+      - PUBLIC_ADDRS=/dns4/anvil1/udp/7443/quic-v1
+      - PUBLIC_GRPC_ADDR=http://anvil1:9001
+      - ENABLE_MDNS=false
+    command: ["anvil", "--init-cluster"]
     ports:
-      - "50051:50051"
-    volumes:
-      - workadata:/data
+      - "9001:9000"
+      - "7443:7443/udp"
+    networks: [anvilnet]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  anvil2:
+    build: .
+    depends_on:
+      anvil1:
+        condition: service_started
+    environment:
+      - RUST_LOG=info
+      - GLOBAL_DATABASE_URL=postgres://worka:worka@postgres-global:5432/anvil_global
+      - REGIONAL_DATABASE_URL=postgres://worka:worka@postgres-regional:5432/anvil_regional_docker
+      - REGION=DOCKER_TEST
+      - JWT_SECRET=docker-test-secret
+      - WORKA_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - HTTP_BIND_ADDR=0.0.0.0:9000
+      - QUIC_BIND_ADDR=/ip4/0.0.0.0/udp/7444/quic-v1
+      - PUBLIC_ADDRS=/dns4/anvil2/udp/7444/quic-v1
+      - PUBLIC_GRPC_ADDR=http://anvil2:9002
+      - ENABLE_MDNS=false
+      - BOOTSTRAP_ADDRS=/dns4/anvil1/udp/7443/quic-v1
+    ports:
+      - "9002:9000"
+      - "7444:7443/udp"
+    networks: [anvilnet]
+
+  anvil3:
+    build: .
+    depends_on:
+      anvil1:
+        condition: service_started
+    environment:
+      - RUST_LOG=info
+      - GLOBAL_DATABASE_URL=postgres://worka:worka@postgres-global:5432/anvil_global
+      - REGIONAL_DATABASE_URL=postgres://worka:worka@postgres-regional:5432/anvil_regional_docker
+      - REGION=DOCKER_TEST
+      - JWT_SECRET=docker-test-secret
+      - WORKA_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - HTTP_BIND_ADDR=0.0.0.0:9000
+      - QUIC_BIND_ADDR=/ip4/0.0.0.0/udp/7445/quic-v1
+      - PUBLIC_ADDRS=/dns4/anvil3/udp/7445/quic-v1
+      - PUBLIC_GRPC_ADDR=http://anvil3:9003
+      - ENABLE_MDNS=false
+      - BOOTSTRAP_ADDRS=/dns4/anvil1/udp/7443/quic-v1
+    ports:
+      - "9003:9000"
+      - "7445:7443/udp"
+    networks: [anvilnet]
 
 volumes:
-  pgdata: {}
-  workadata: {}
+  postgres_global_data:
+  postgres_regional_data:
