@@ -13,10 +13,15 @@ use futures_util::stream::StreamExt;
 
 pub fn app(state: AppState) -> Router {
     Router::new()
+        .route("/", get(health_check))
         .route("/{bucket}", put(create_bucket).get(list_objects))
         .route("/{bucket}/{*path}", get(get_object).put(put_object))
         .with_state(state.clone())
         .route_layer(middleware::from_fn_with_state(state.clone(), sigv4_auth))
+}
+
+async fn health_check() -> impl IntoResponse {
+    (axum::http::StatusCode::OK, "OK")
 }
 
 async fn create_bucket(_state: State<AppState>, _bucket: Path<String>) -> Response {

@@ -28,22 +28,34 @@ use crate::{auth::Claims, crypto, AppState};
 use tracing::{debug, info, warn};
 
 pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
 
-    // Read entire body (needed for verification and to forward)
-    let body_bytes = match body.collect().await {
-        Ok(b) => b.to_bytes(),
-        Err(e) => {
-            warn!(error = %e, "Failed to read body in SigV4 middleware");
-            return Response::builder()
-                .status(400)
-                .body(Body::from(format!("Failed to read body: {e}")))
-                .unwrap();
-        }
+    let content_sha256 = parts
+        .headers
+        .get("x-amz-content-sha256")
+        .and_then(|h| h.to_str().ok());
+
+    let is_streaming = content_sha256 == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
+
+    // If it's not a streaming upload, we must buffer the body to verify its hash.
+    // If it IS a streaming upload, we leave the body as-is to be handled by the downstream service.
+    let (body_bytes, reconstituted_body) = if !is_streaming {
+        let bytes = match body.collect().await {
+            Ok(b) => b.to_bytes(),
+            Err(e) => {
+                warn!(error = %e, "Failed to read body in SigV4 middleware");
+                return Response::builder()
+                    .status(400)
+                    .body(Body::from(format!("Failed to read body: {e}")))
+                    .unwrap();
+            }
+        };
+        (Some(bytes.clone()), Body::from(bytes))
+    } else {
+        (None, body)
     };
 
-    // Rebuild request to pass downstream either way
-    let mut req = Request::from_parts(parts.clone(), Body::from(body_bytes.clone()));
+    let mut req = Request::from_parts(parts.clone(), reconstituted_body);
 
     // If no AWS SigV4 auth, pass through as anonymous
     let auth_header = match parts
@@ -164,12 +176,13 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         .expect("valid signing params")
         .into();
 
-    // Use the exact payload hash the client signed (from x-amz-content-sha256), or compute it.
-    let payload_hash = parts
-        .headers
-        .get("x-amz-content-sha256")
-        .and_then(|h| h.to_str().ok().map(|s| s.to_string()))
-        .unwrap_or_else(|| sha256_hex(&body_bytes));
+    let payload_hash = if is_streaming {
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".to_string()
+    } else {
+        content_sha256
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| sha256_hex(&body_bytes.unwrap()))
+    };
 
     // Only include headers that the client actually signed (from SignedHeaders=...)
     let signed_set: HashSet<&str> = parsed

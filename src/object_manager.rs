@@ -78,29 +78,37 @@ impl ObjectManager {
             .calculate_placement(object_key, &self.cluster, self.sharder.total_shards())
             .await;
 
-        let mut overall_hasher = blake3::Hasher::new();
-        let mut buffer = Vec::new();
-
-        while let Some(Ok(chunk)) = data_stream.next().await {
-            buffer.extend_from_slice(&chunk);
-            overall_hasher.update(&chunk);
-        }
-        let total_bytes = buffer.len();
-        let content_hash = overall_hasher.finalize().to_hex().to_string();
+        let total_bytes; 
+        let content_hash;
 
         if nodes.len() < self.sharder.total_shards() {
             if nodes.len() == 1 {
+                // Single-node case: stream to a whole file.
+                let (temp_path, bytes, hash) = self
+                    .storage
+                    .stream_to_temp_file(data_stream)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                total_bytes = bytes;
+                content_hash = hash;
                 self.storage
-                    .store_whole_object(&content_hash, &buffer)
-                    .await.map_err(|e| Status::internal(e.to_string()))?;
+                    .commit_whole_object(&temp_path, &content_hash)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
             } else {
-                return Err(Status::unavailable("Not enough nodes to store object"));
+                return Err(Status::unavailable("Not enough nodes to store object with durability"));
             }
         } else {
+            // Distributed case: stream and erasure code stripes.
+            let mut overall_hasher = blake3::Hasher::new();
+            let mut bytes_so_far = 0;
             let upload_id = uuid::Uuid::new_v4().to_string();
+    
             let stripe_size = 1024 * 64; // 64KB per shard in a stripe
             let data_shards_count = self.sharder.data_shards();
-
+            let stripe_buffer_size = stripe_size * data_shards_count;
+            let mut stripe_buffer = Vec::with_capacity(stripe_buffer_size);
+    
             let mut clients = Vec::new();
             let cluster_map = self.cluster.read().await;
             for peer_id in &nodes {
@@ -110,83 +118,31 @@ impl ObjectManager {
                 let client = internal_anvil_service_client::InternalAnvilServiceClient::connect(
                     peer_info.grpc_addr.clone(),
                 )
-                .await.map_err(|e| Status::unavailable(e.to_string()))?;
+                .await
+                .map_err(|e| Status::unavailable(e.to_string()))?;
                 clients.push(client);
             }
-
-            let mut temp_buffer = buffer.clone();
-            while temp_buffer.len() >= stripe_size * data_shards_count {
-                let stripe_data = temp_buffer
-                    .drain(..stripe_size * data_shards_count)
-                    .collect::<Vec<_>>();
-                let mut shards: Vec<Vec<u8>> = stripe_data
-                    .chunks(stripe_size)
-                    .map(|c| c.to_vec())
-                    .collect();
-                shards.resize(self.sharder.total_shards(), vec![0; stripe_size]);
-                self.sharder.encode(&mut shards, &self.encryption_key).map_err(|e| Status::internal(e.to_string()))?;
-
-                let mut futures = Vec::new();
-                for (i, shard_data) in shards.into_iter().enumerate() {
-                    let scope = format!("internal:put_shard:{}/{}", upload_id, i);
-                    let token = self
-                        .jwt_manager
-                        .mint_token("internal".to_string(), vec![scope], 0)
-                        .map_err(|e| Status::internal(e.to_string()))?;
-
-                    let request = PutShardRequest {
-                        upload_id: upload_id.clone(),
-                        shard_index: i as u32,
-                        data: shard_data,
-                    };
-                    let mut client = clients[i].clone();
-                    let request_stream = tokio_stream::iter(vec![request]);
-                    let mut req = tonic::Request::new(request_stream);
-                    req.metadata_mut().insert(
-                        "authorization",
-                        format!("Bearer {}", token).parse().unwrap(),
-                    );
-                    futures.push(async move { client.put_shard(req).await });
+    
+            while let Some(chunk_result) = data_stream.next().await {
+                let chunk = chunk_result?;
+                overall_hasher.update(&chunk);
+                bytes_so_far += chunk.len();
+                stripe_buffer.extend_from_slice(&chunk);
+    
+                while stripe_buffer.len() >= stripe_buffer_size {
+                    let stripe_data = stripe_buffer.drain(..stripe_buffer_size).collect::<Vec<_>>();
+                    self.send_stripe(&clients, &upload_id, stripe_data, stripe_size).await?;
                 }
-                futures::future::try_join_all(futures).await.map_err(|e| Status::internal(e.to_string()))?;
             }
-
-            if !temp_buffer.is_empty() {
-                let final_stripe_size = stripe_size * data_shards_count;
-                temp_buffer.resize(final_stripe_size, 0);
-
-                let mut shards: Vec<Vec<u8>> = temp_buffer
-                    .chunks(stripe_size)
-                    .map(|c| c.to_vec())
-                    .collect();
-                shards.resize(self.sharder.total_shards(), vec![0; stripe_size]);
-                self.sharder.encode(&mut shards, &self.encryption_key).map_err(|e| Status::internal(e.to_string()))?;
-
-                let mut futures = Vec::new();
-                for (i, shard_data) in shards.into_iter().enumerate() {
-                    let scope = format!("internal:put_shard:{}/{}", upload_id, i);
-                    let token = self
-                        .jwt_manager
-                        .mint_token("internal".to_string(), vec![scope], 0)
-                        .map_err(|e| Status::internal(e.to_string()))?;
-
-                    let request = PutShardRequest {
-                        upload_id: upload_id.clone(),
-                        shard_index: i as u32,
-                        data: shard_data,
-                    };
-                    let mut client = clients[i].clone();
-                    let request_stream = tokio_stream::iter(vec![request]);
-                    let mut req = tonic::Request::new(request_stream);
-                    req.metadata_mut().insert(
-                        "authorization",
-                        format!("Bearer {}", token).parse().unwrap(),
-                    );
-                    futures.push(async move { client.put_shard(req).await });
-                }
-                futures::future::try_join_all(futures).await.map_err(|e| Status::internal(e.to_string()))?;
+    
+            if !stripe_buffer.is_empty() {
+                stripe_buffer.resize(stripe_buffer_size, 0);
+                self.send_stripe(&clients, &upload_id, stripe_buffer, stripe_size).await?;
             }
-
+    
+            total_bytes = bytes_so_far as i64;
+            content_hash = overall_hasher.finalize().to_hex().to_string();
+    
             let mut futures = Vec::new();
             for (i, client) in clients.into_iter().enumerate() {
                 let scope = format!("internal:commit_shard:{}/{}", content_hash, i);
@@ -194,7 +150,7 @@ impl ObjectManager {
                     .jwt_manager
                     .mint_token("internal".to_string(), vec![scope], 0)
                     .map_err(|e| Status::internal(e.to_string()))?;
-
+    
                 let mut client = client.clone();
                 let request = CommitShardRequest {
                     upload_id: upload_id.clone(),
@@ -202,13 +158,13 @@ impl ObjectManager {
                     final_object_hash: content_hash.clone(),
                 };
                 let mut req = tonic::Request::new(request);
-                req.metadata_mut().insert(
-                    "authorization",
-                    format!("Bearer {}", token).parse().unwrap(),
-                );
+                req.metadata_mut()
+                    .insert("authorization", format!("Bearer {}", token).parse().unwrap());
                 futures.push(async move { client.commit_shard(req).await });
             }
-            futures::future::try_join_all(futures).await.map_err(|e| Status::internal(e.to_string()))?;
+            futures::future::try_join_all(futures)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
         }
 
         let bucket = self
@@ -216,6 +172,13 @@ impl ObjectManager {
             .get_bucket_by_name(tenant_id, bucket_name, &self.region)
             .await.map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
+        let shard_map_json = if nodes.len() > 1 {
+            let peer_ids: Vec<String> = nodes.iter().map(|p| p.to_base58()).collect();
+            Some(serde_json::json!(peer_ids))
+        } else {
+            None
+        };
+
         let object = self
             .db
             .create_object(
@@ -225,10 +188,57 @@ impl ObjectManager {
                 &content_hash,
                 total_bytes as i64,
                 &content_hash,
+                shard_map_json,
             )
             .await.map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(object)
+    }
+
+    async fn send_stripe(
+        &self,
+        clients: &[internal_anvil_service_client::InternalAnvilServiceClient<tonic::transport::Channel>],
+        upload_id: &str,
+        stripe_data: Vec<u8>,
+        stripe_size: usize,
+    ) -> Result<(), Status> {
+        let mut shards: Vec<Vec<u8>> = stripe_data
+            .chunks(stripe_size)
+            .map(|c| c.to_vec())
+            .collect();
+        shards.resize(self.sharder.total_shards(), vec![0; stripe_size]);
+        self.sharder
+            .encode(&mut shards, &self.encryption_key)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let mut futures = Vec::new();
+        for (i, shard_data) in shards.into_iter().enumerate() {
+            let scope = format!("internal:put_shard:{}/{}", upload_id, i);
+            let token = self
+                .jwt_manager
+                .mint_token("internal".to_string(), vec![scope], 0)
+                .map_err(|e| Status::internal(e.to_string()))?;
+
+            let request = PutShardRequest {
+                upload_id: upload_id.to_string(),
+                shard_index: i as u32,
+                data: shard_data,
+            };
+
+            let mut client = clients[i].clone();
+            let request_stream = tokio_stream::iter(vec![request]);
+            let mut req = tonic::Request::new(request_stream);
+            req.metadata_mut()
+                .insert("authorization", format!("Bearer {}", token).parse().unwrap());
+
+            futures.push(async move { client.put_shard(req).await });
+        }
+
+        futures::future::try_join_all(futures)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(())
     }
 
     pub async fn get_object(
@@ -285,7 +295,59 @@ impl ObjectManager {
                     shards.push(shard_data);
                 }
 
-                // TODO: Fetch missing shards from other peers.
+                let placement = app_state
+                    .placer
+                    .calculate_placement(&object_clone.key, &app_state.cluster, total_shards)
+                    .await;
+
+                let mut missing_shards_futures = Vec::new();
+
+                for i in 0..total_shards {
+                    if shards[i].is_none() {
+                        let peer_id = placement.get(i).ok_or_else(|| {
+                            Status::internal("Placement did not return enough peers for reconstruction")
+                        })?;
+
+                        let cluster_map = app_state.cluster.read().await;
+                        if let Some(peer_info) = cluster_map.get(peer_id) {
+                            let grpc_addr = peer_info.grpc_addr.clone();
+                            let object_hash = object_clone.content_hash.clone();
+                            let jwt_manager = app_state.jwt_manager.clone();
+
+                            missing_shards_futures.push(async move {
+                                let mut client = internal_anvil_service_client::InternalAnvilServiceClient::connect(grpc_addr)
+                                    .await
+                                    .map_err(|e| Status::internal(format!("Failed to connect to peer: {}", e)))?;
+
+                                let scope = format!("internal:get_shard:{}/{}", object_hash, i);
+                                let token = jwt_manager.mint_token("internal".to_string(), vec![scope], 0)
+                                    .map_err(|e| Status::internal(e.to_string()))?;
+
+                                let mut req = tonic::Request::new(GetShardRequest {
+                                    object_hash: object_hash.clone(),
+                                    shard_index: i as u32,
+                                });
+                                req.metadata_mut().insert("authorization", format!("Bearer {}", token).parse().unwrap());
+
+                                let mut stream = client.get_shard(req).await?.into_inner();
+                                let mut shard_data = Vec::new();
+                                while let Some(Ok(chunk)) = stream.next().await {
+                                    shard_data.extend_from_slice(&chunk.data);
+                                }
+
+                                Ok((i, shard_data))
+                            });
+                        }
+                    }
+                }
+
+                let results = futures::future::join_all(missing_shards_futures).await;
+                for result in results {
+                    if let Ok(Ok((index, data))) = result {
+                        shards[index] = Some(data);
+                    }
+                }
+
                 // The current implementation only tries to reconstruct from local shards.
 
                 if app_state.sharder.reconstruct(&mut shards, &app_state.encryption_key).is_ok() {
@@ -354,6 +416,7 @@ impl ObjectManager {
             .ok_or_else(|| Status::not_found("Object not found"))?;
 
         let payload = serde_json::json!({
+            "object_id": object.id,
             "content_hash": object.content_hash,
             "region": self.region,
             "shard_map": object.shard_map,

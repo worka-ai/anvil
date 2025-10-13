@@ -136,7 +136,13 @@ pub async fn start_node(
 
     let worker_state = state.clone();
     tokio::spawn(async move {
-        if let Err(e) = worker::run(worker_state.db.clone()).await {
+        if let Err(e) = worker::run(
+            worker_state.db.clone(),
+            worker_state.cluster.clone(),
+            worker_state.jwt_manager.clone(),
+        )
+        .await
+        {
             eprintln!("Worker process failed: {}", e);
         }
     });

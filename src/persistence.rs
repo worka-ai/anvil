@@ -319,16 +319,17 @@ impl Persistence {
         content_hash: &str,
         size: i64,
         etag: &str,
+        shard_map: Option<JsonValue>,
     ) -> Result<Object> {
         let client = self.regional_pool.get().await?;
         let row = client
             .query_one(
                 r#"
-            INSERT INTO objects (tenant_id, bucket_id, key, content_hash, size, etag, version_id)
-            VALUES ($1, $2, $3, $4, $5, $6, gen_random_uuid())
+            INSERT INTO objects (tenant_id, bucket_id, key, content_hash, size, etag, version_id, shard_map)
+            VALUES ($1, $2, $3, $4, $5, $6, gen_random_uuid(), $7)
             RETURNING *;
             "#,
-                &[&tenant_id, &bucket_id, &key, &content_hash, &size, &etag],
+                &[&tenant_id, &bucket_id, &key, &content_hash, &size, &etag, &shard_map],
             )
             .await?;
         Ok(row.into())
@@ -602,6 +603,14 @@ impl Persistence {
             )
             .await?;
         Ok(row.map(Into::into))
+    }
+
+    pub async fn hard_delete_object(&self, object_id: i64) -> Result<()> {
+        let client = self.regional_pool.get().await?;
+        client
+            .execute("DELETE FROM objects WHERE id = $1", &[&object_id])
+            .await?;
+        Ok(())
     }
 
     // --- Task Queue Methods ---
