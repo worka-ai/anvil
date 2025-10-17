@@ -28,7 +28,7 @@ use crate::{auth::Claims, crypto, AppState};
 use tracing::{debug, info, warn};
 
 pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    let (mut parts, body) = req.into_parts();
+    let (parts, body) = req.into_parts();
 
     let content_sha256 = parts
         .headers

@@ -10,6 +10,7 @@ use serde_json::Value as JsonValue;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::Row;
+use tonic::Status;
 
 #[derive(Debug)]
 struct Task {
@@ -132,7 +133,7 @@ async fn handle_delete_object(
                 )?;
 
                 futures.push(async move {
-                    let mut client = InternalAnvilServiceClient::connect(grpc_addr).await?;
+                    let mut client = InternalAnvilServiceClient::connect(grpc_addr).await.map_err(|e| Status::internal(e.to_string()))?;
                     let mut req = tonic::Request::new(DeleteShardRequest {
                         object_hash: content_hash,
                         shard_index: i as u32,

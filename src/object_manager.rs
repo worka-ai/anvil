@@ -1,5 +1,5 @@
 use crate::{
-    anvil_api::{internal_anvil_service_client, CommitShardRequest, PutShardRequest},
+    anvil_api::{internal_anvil_service_client, CommitShardRequest, PutShardRequest, GetShardRequest},
     auth,
     cluster::ClusterState,
     persistence::{Bucket, Object, Persistence},
@@ -304,9 +304,13 @@ impl ObjectManager {
 
                 for i in 0..total_shards {
                     if shards[i].is_none() {
-                        let peer_id = placement.get(i).ok_or_else(|| {
-                            Status::internal("Placement did not return enough peers for reconstruction")
-                        })?;
+                        let peer_id = match placement.get(i) {
+                            Some(p) => p,
+                            None => {
+                                let _ = tx.send(Err(Status::internal("Placement did not return enough peers for reconstruction"))).await;
+                                return;
+                            }
+                        };
 
                         let cluster_map = app_state.cluster.read().await;
                         if let Some(peer_info) = cluster_map.get(peer_id) {
@@ -331,7 +335,8 @@ impl ObjectManager {
 
                                 let mut stream = client.get_shard(req).await?.into_inner();
                                 let mut shard_data = Vec::new();
-                                while let Some(Ok(chunk)) = stream.next().await {
+                                while let Some(chunk_res) = stream.next().await {
+                                    let chunk = chunk_res?;
                                     shard_data.extend_from_slice(&chunk.data);
                                 }
 
@@ -341,14 +346,12 @@ impl ObjectManager {
                     }
                 }
 
-                let results = futures::future::join_all(missing_shards_futures).await;
+                let results: Vec<Result<(usize, Vec<u8>), Status>> = futures::future::join_all(missing_shards_futures).await;
                 for result in results {
-                    if let Ok(Ok((index, data))) = result {
+                    if let Ok((index, data)) = result {
                         shards[index] = Some(data);
                     }
                 }
-
-                // The current implementation only tries to reconstruct from local shards.
 
                 if app_state.sharder.reconstruct(&mut shards, &app_state.encryption_key).is_ok() {
                     let mut full_data = Vec::new();
