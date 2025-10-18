@@ -239,7 +239,7 @@ impl TestCluster {
             let swarm = swarms.remove(0);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             self.grpc_addrs
-                .push(format!("http://{}", listener.local_addr().unwrap()));
+                .push(format!("http://{}/grpc", listener.local_addr().unwrap()));
 
             let handle = tokio::spawn(async move {
                 anvil::start_node(listener, state, swarm).await.unwrap();

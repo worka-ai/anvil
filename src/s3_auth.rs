@@ -57,7 +57,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
 
     let mut req = Request::from_parts(parts.clone(), reconstituted_body);
 
-    // If no AWS SigV4 auth, pass through as anonymous
+    // If no AWS SigV4 auth, decide if we can allow anonymous (GET/HEAD) and defer auth to handlers
     let auth_header = match parts
         .headers
         .get(http::header::AUTHORIZATION)
@@ -65,8 +65,16 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
     {
         Some(h) if h.starts_with("AWS4-HMAC-SHA256 ") => h,
         _ => {
-            debug!("No SigV4 header found, passing as anonymous");
-            return next.run(req).await;
+            let method = parts.method.clone();
+            if method == http::Method::GET || method == http::Method::HEAD {
+                // Allow anonymous GET/HEAD; handlers will enforce bucket-level public access
+                debug!("No SigV4 for GET/HEAD, deferring auth to handler");
+                return next.run(req).await;
+            }
+            return Response::builder()
+                .status(401)
+                .body(Body::from("Missing Authorization"))
+                .unwrap();
         }
     };
 

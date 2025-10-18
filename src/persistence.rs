@@ -138,6 +138,17 @@ impl Persistence {
 
     // --- Global Methods ---
 
+    pub async fn create_region(&self, name: &str) -> Result<bool> {
+        let client = self.global_pool.get().await?;
+        let n = client
+            .execute(
+                "INSERT INTO regions (name) VALUES ($1) ON CONFLICT (name) DO NOTHING",
+                &[&name],
+            )
+            .await?;
+        Ok(n == 1)
+    }
+
     pub async fn get_tenant_by_name(&self, name: &str) -> Result<Option<Tenant>> {
         let client = self.global_pool.get().await?;
         let row = client

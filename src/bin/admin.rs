@@ -42,6 +42,11 @@ enum Commands {
         #[clap(subcommand)]
         command: PolicyCommands,
     },
+    /// Manage regions
+    Regions {
+        #[clap(subcommand)]
+        command: RegionCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -72,6 +77,12 @@ enum PolicyCommands {
         #[clap(long)]
         resource: String,
     },
+}
+
+#[derive(Subcommand)]
+enum RegionCommands {
+    /// Create a region (idempotent)
+    Create { name: String },
 }
 
 #[tokio::main]
@@ -144,6 +155,16 @@ async fn main() -> anyhow::Result<()> {
                     "Granted action '{}' on resource '{}' to app '{}'",
                     action, resource, app_name
                 );
+            }
+        },
+        Commands::Regions { command } => match command {
+            RegionCommands::Create { name } => {
+                let created = persistence.create_region(name).await?;
+                if created {
+                    println!("Created region: {}", name);
+                } else {
+                    println!("Region already exists: {}", name);
+                }
             }
         },
     }

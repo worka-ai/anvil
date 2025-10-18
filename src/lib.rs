@@ -169,21 +169,28 @@ pub async fn start_node(
         auth_interceptor,
     ));
 
-    // Create the Axum router for S3 and merge the gRPC router into it.
-    let app = s3_gateway::app(state.clone()).merge(
-        grpc_router
-            .into_axum_router()
-            //layer runs on the HTTP request *before* tonic’s gRPC handling
-            //This is necessary for the interceptor to get access to the URI because newer tonic versions do not provide a way to get it in the interceptor
-            //later after the interceptor it is available via req.extensions().get::<tonic::GrpcMethod>()
-            .route_layer(axum::middleware::from_fn(middleware::save_uri_mw)),
-    );
+    // Create the Axum router for S3 and mount the gRPC router under /grpc to avoid route conflicts.
+    let grpc_routes = grpc_router
+        .into_axum_router()
+        // layer runs on the HTTP request *before* tonic’s gRPC handling
+        // This is necessary for the interceptor to get access to the URI because newer tonic versions do not provide a way to get it in the interceptor
+        // later after the interceptor it is available via req.extensions().get::<tonic::GrpcMethod>()
+        .route_layer(axum::middleware::from_fn(middleware::save_uri_mw));
+
+    let app = s3_gateway::app(state.clone())
+        .nest("/grpc", grpc_routes);
 
     let addr = listener.local_addr()?;
     println!("Anvil server (gRPC & S3) listening on {}", addr);
 
     // Spawn the gossip service to run in the background.
-    let gossip_task = tokio::spawn(cluster::run_gossip(swarm, state.cluster.clone(), state.config.public_grpc_addr.clone()));
+    // Derive advertised gRPC addr if not provided
+    let advertised_grpc = if state.config.public_grpc_addr.is_empty() {
+        format!("http://{}", addr)
+    } else {
+        state.config.public_grpc_addr.clone()
+    };
+    let gossip_task = tokio::spawn(cluster::run_gossip(swarm, state.cluster.clone(), advertised_grpc));
     let server_task =
         tokio::spawn(async move { axum::serve(listener, app.into_make_service()).await });
 
