@@ -30,6 +30,14 @@ use tracing::{debug, info, warn};
 pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let (parts, body) = req.into_parts();
 
+    // Skip SigV4 for gRPC requests to avoid interfering with tonic
+    if let Some(ct) = parts.headers.get(http::header::CONTENT_TYPE).and_then(|h| h.to_str().ok()) {
+        if ct.starts_with("application/grpc") {
+            let req = Request::from_parts(parts, body);
+            return next.run(req).await;
+        }
+    }
+
     let content_sha256 = parts
         .headers
         .get("x-amz-content-sha256")

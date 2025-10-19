@@ -20,7 +20,7 @@ pub fn app(state: AppState) -> Router {
 
     let s3_routes = Router::new()
         .route("/{bucket}", put(create_bucket).get(list_objects))
-        .route("/{bucket}/{*path}", get(get_object).put(put_object))
+        .route("/{bucket}/{*path}", get(get_object).put(put_object).head(head_object))
         .with_state(state.clone())
         .route_layer(middleware::from_fn_with_state(state.clone(), sigv4_auth));
 
@@ -198,7 +198,14 @@ async fn get_object(
         }
         Err(status) => {
             let (code, message) = match status.code() {
-                tonic::Code::NotFound => (axum::http::StatusCode::NOT_FOUND, status.message()),
+                tonic::Code::NotFound => {
+                    // For anonymous requests, avoid oracle: map to 403
+                    if req.extensions().get::<Claims>().is_none() {
+                        (axum::http::StatusCode::FORBIDDEN, status.message())
+                    } else {
+                        (axum::http::StatusCode::NOT_FOUND, status.message())
+                    }
+                }
                 tonic::Code::PermissionDenied => {
                     (axum::http::StatusCode::FORBIDDEN, status.message())
                 }
@@ -217,11 +224,12 @@ async fn put_object(
     Path((bucket, key)): Path<(String, String)>,
     req: Request,
 ) -> Response {
-    let claims = req
-        .extensions()
-        .get::<Claims>()
-        .cloned()
-        .expect("SigV4 middleware should have inserted claims");
+    let claims = match req.extensions().get::<Claims>().cloned() {
+        Some(c) => c,
+        None => {
+            return (axum::http::StatusCode::UNAUTHORIZED, "Missing credentials").into_response();
+        }
+    };
 
     let body_stream = req.into_body().into_data_stream().map(|r| {
         r.map(|chunk| chunk.to_vec())
@@ -244,6 +252,44 @@ async fn put_object(
                 tonic::Code::PermissionDenied => {
                     (axum::http::StatusCode::FORBIDDEN, status.message())
                 }
+                _ => (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    status.message(),
+                ),
+            };
+            (code, message.to_string()).into_response()
+        }
+    }
+}
+
+async fn head_object(
+    State(state): State<AppState>,
+    Path((bucket, key)): Path<(String, String)>,
+    req: Request,
+) -> Response {
+    let claims = req.extensions().get::<Claims>().cloned();
+
+    match state.object_manager.head_object(claims, &bucket, &key).await {
+        Ok(object) => Response::builder()
+            .status(200)
+            .header("Content-Type", object.content_type.unwrap_or_default())
+            .header("Content-Length", object.size)
+            .header("ETag", object.etag)
+            .body(Body::empty())
+            .unwrap(),
+        Err(status) => {
+            let (code, message) = match status.code() {
+                tonic::Code::NotFound => {
+                    if req.extensions().get::<Claims>().is_none() {
+                        (axum::http::StatusCode::FORBIDDEN, status.message())
+                    } else {
+                        (axum::http::StatusCode::NOT_FOUND, status.message())
+                    }
+                }
+                tonic::Code::PermissionDenied => (
+                    axum::http::StatusCode::FORBIDDEN,
+                    status.message(),
+                ),
                 _ => (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                     status.message(),
