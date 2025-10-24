@@ -1,6 +1,6 @@
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 // Encrypts data using AES-256-GCM.
 // The nonce is prepended to the ciphertext.

@@ -50,8 +50,8 @@ services:
       - REGIONAL_DATABASE_URL=postgres://worka:worka@postgres-regional:5432/anvil_regional_docker
       - REGION=DOCKER_TEST
       - JWT_SECRET=docker-test-secret
-      - WORKA_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      - WORKA_CLUSTER_SECRET=docker-cluster-secret
+      - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - ANVIL_CLUSTER_SECRET=docker-cluster-secret
       - HTTP_BIND_ADDR=0.0.0.0:9000
       - GRPC_BIND_ADDR=0.0.0.0:50051
       - QUIC_BIND_ADDR=/ip4/0.0.0.0/udp/7443/quic-v1
@@ -81,8 +81,8 @@ services:
       - REGIONAL_DATABASE_URL=postgres://worka:worka@postgres-regional:5432/anvil_regional_docker
       - REGION=DOCKER_TEST
       - JWT_SECRET=docker-test-secret
-      - WORKA_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      - WORKA_CLUSTER_SECRET=docker-cluster-secret
+      - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - ANVIL_CLUSTER_SECRET=docker-cluster-secret
       - HTTP_BIND_ADDR=0.0.0.0:9000
       - GRPC_BIND_ADDR=0.0.0.0:50052
       - QUIC_BIND_ADDR=/ip4/0.0.0.0/udp/7444/quic-v1
@@ -107,8 +107,8 @@ services:
       - REGIONAL_DATABASE_URL=postgres://worka:worka@postgres-regional:5432/anvil_regional_docker
       - REGION=DOCKER_TEST
       - JWT_SECRET=docker-test-secret
-      - WORKA_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      - WORKA_CLUSTER_SECRET=docker-cluster-secret
+      - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - ANVIL_CLUSTER_SECRET=docker-cluster-secret
       - HTTP_BIND_ADDR=0.0.0.0:9000
       - GRPC_BIND_ADDR=0.0.0.0:50053
       - QUIC_BIND_ADDR=/ip4/0.0.0.0/udp/7445/quic-v1

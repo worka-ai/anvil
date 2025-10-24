@@ -11,7 +11,8 @@ async fn test_cluster_gossip() {
         global_database_url: "".to_string(),
         regional_database_url: "".to_string(),
         jwt_secret: "test-secret".to_string(),
-        worka_secret_encryption_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        anvil_secret_encryption_key:
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         http_bind_addr: "127.0.0.1:0".to_string(),
         quic_bind_addr: "/ip4/127.0.0.1/udp/0/quic-v1".to_string(),
         public_addrs: vec![],
@@ -108,7 +109,8 @@ async fn test_cluster_gossip_invalid_secret() {
         global_database_url: "".to_string(),
         regional_database_url: "".to_string(),
         jwt_secret: "test-secret".to_string(),
-        worka_secret_encryption_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        anvil_secret_encryption_key:
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         http_bind_addr: "127.0.0.1:0".to_string(),
         quic_bind_addr: "/ip4/127.0.0.1/udp/0/quic-v1".to_string(),
         public_addrs: vec![],
@@ -124,7 +126,8 @@ async fn test_cluster_gossip_invalid_secret() {
         global_database_url: "".to_string(),
         regional_database_url: "".to_string(),
         jwt_secret: "test-secret".to_string(),
-        worka_secret_encryption_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        anvil_secret_encryption_key:
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         http_bind_addr: "127.0.0.1:0".to_string(),
         quic_bind_addr: "/ip4/127.0.0.1/udp/0/quic-v1".to_string(),
         public_addrs: vec![],
@@ -163,7 +166,9 @@ async fn test_cluster_gossip_invalid_secret() {
                 _ = swarm2.select_next_some() => {},
             }
         }
-    }).await.err();
+    })
+    .await
+    .err();
 
     // Publish a message from swarm1
     let mut message = ClusterMessage {

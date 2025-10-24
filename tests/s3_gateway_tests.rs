@@ -1,7 +1,7 @@
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::{GetAccessTokenRequest, SetPublicAccessRequest};
-use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
+use aws_sdk_s3::primitives::ByteStream;
 use std::time::Duration;
 
 mod common;
@@ -10,11 +10,18 @@ mod common;
 fn create_app(global_db_url: &str, app_name: &str) -> (String, String) {
     let admin_args = &["run", "--bin", "admin", "--"];
     let app_output = std::process::Command::new("cargo")
-        .args(
-            admin_args
-                .iter()
-                .chain(&["--global-database-url", global_db_url, "--worka-secret-encryption-key", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "apps", "create", "--tenant-name", "default", "--app-name",app_name]),
-        )
+        .args(admin_args.iter().chain(&[
+            "--global-database-url",
+            global_db_url,
+            "--anvil-secret-encryption-key",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "apps",
+            "create",
+            "--tenant-name",
+            "default",
+            "--app-name",
+            app_name,
+        ]))
         .output()
         .unwrap();
     assert!(app_output.status.success());
@@ -46,7 +53,6 @@ async fn get_token_for_scopes(
         .access_token
 }
 
-
 #[tokio::test]
 async fn test_s3_public_and_private_access() {
     let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
@@ -67,7 +73,17 @@ async fn test_s3_public_and_private_access() {
         "*",
     ];
     let status = std::process::Command::new("cargo")
-        .args(admin_args.iter().chain(&["--global-database-url", &cluster.global_db_url, "--worka-secret-encryption-key", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]).chain(policy_args.iter()))
+        .args(
+            admin_args
+                .iter()
+                .chain(&[
+                    "--global-database-url",
+                    &cluster.global_db_url,
+                    "--anvil-secret-encryption-key",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ])
+                .chain(policy_args.iter()),
+        )
         .status()
         .unwrap();
     assert!(status.success());
@@ -79,7 +95,11 @@ async fn test_s3_public_and_private_access() {
         &cluster.grpc_addrs[0],
         &client_id,
         &client_secret,
-        vec!["read:*".to_string(), "write:*".to_string(), "grant:*".to_string()],
+        vec![
+            "read:*".to_string(),
+            "write:*".to_string(),
+            "grant:*".to_string(),
+        ],
     )
     .await;
 
@@ -87,30 +107,43 @@ async fn test_s3_public_and_private_access() {
     let private_bucket = "private-s3-bucket".to_string();
     let public_bucket = "public-s3-bucket".to_string();
 
-    let mut bucket_client = anvil::anvil_api::bucket_service_client::BucketServiceClient::connect(cluster.grpc_addrs[0].clone()).await.unwrap();
+    let mut bucket_client = anvil::anvil_api::bucket_service_client::BucketServiceClient::connect(
+        cluster.grpc_addrs[0].clone(),
+    )
+    .await
+    .unwrap();
     let mut req = tonic::Request::new(anvil::anvil_api::CreateBucketRequest {
         bucket_name: private_bucket.clone(),
         region: "TEST_REGION".to_string(),
     });
-    req.metadata_mut().insert("authorization", format!("Bearer {}", token).parse().unwrap());
+    req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
     bucket_client.create_bucket(req).await.unwrap();
 
     let mut req = tonic::Request::new(anvil::anvil_api::CreateBucketRequest {
         bucket_name: public_bucket.clone(),
         region: "TEST_REGION".to_string(),
     });
-    req.metadata_mut().insert("authorization", format!("Bearer {}", token).parse().unwrap());
+    req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
     bucket_client.create_bucket(req).await.unwrap();
 
     // 2. Set the public bucket to be public
-    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone()).await.unwrap();
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
     let mut public_req = tonic::Request::new(SetPublicAccessRequest {
         bucket: public_bucket.clone(),
         allow_public_read: true,
     });
-    public_req
-        .metadata_mut()
-        .insert("authorization", format!("Bearer {}", token).parse().unwrap());
+    public_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
     auth_client.set_public_access(public_req).await.unwrap();
 
     // 3. Configure AWS S3 client to talk to our local server

@@ -83,7 +83,7 @@ impl AppState {
             storage.clone(),
             arc_config.region.clone(),
             jwt_manager.clone(),
-            arc_config.worka_secret_encryption_key.clone(),
+            arc_config.anvil_secret_encryption_key.clone(),
         );
 
         Ok(Self {
@@ -177,18 +177,20 @@ pub async fn start_node(
     let grpc_axum = grpc_router
         .into_axum_router()
         .route_layer(axum::middleware::from_fn(middleware::save_uri_mw))
-        .route_layer(axum::middleware::from_fn(|req:axum::extract::Request, next:axum::middleware::Next| async move {
-            if req.method() == axum::http::Method::POST {
-                next.run(req).await
-            } else {
-                // Not a gRPC method; let S3 router handle it by returning 405 here
-                // The overall app has S3 merged first, so typical S3 routes match earlier.
-                axum::response::Response::builder()
-                    .status(axum::http::StatusCode::METHOD_NOT_ALLOWED)
-                    .body(axum::body::Body::empty())
-                    .unwrap()
-            }
-        }));
+        .route_layer(axum::middleware::from_fn(
+            |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                if req.method() == axum::http::Method::POST {
+                    next.run(req).await
+                } else {
+                    // Not a gRPC method; let S3 router handle it by returning 405 here
+                    // The overall app has S3 merged first, so typical S3 routes match earlier.
+                    axum::response::Response::builder()
+                        .status(axum::http::StatusCode::METHOD_NOT_ALLOWED)
+                        .body(axum::body::Body::empty())
+                        .unwrap()
+                }
+            },
+        ));
 
     let app = axum::Router::new()
         .merge(s3_gateway::app(state.clone()))

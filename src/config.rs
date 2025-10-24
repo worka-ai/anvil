@@ -18,7 +18,7 @@ pub struct Config {
 
     /// The secret key used for encrypting data at rest.
     #[arg(long, env)]
-    pub worka_secret_encryption_key: String,
+    pub anvil_secret_encryption_key: String,
 
     /// The address to bind the S3-compatible HTTP gateway to.
     #[arg(long, env, default_value = "0.0.0.0:9000")]
@@ -61,8 +61,8 @@ pub struct Config {
     pub cluster_secret: Option<String>,
 }
 impl Config {
-    pub fn from_ref(args:&Self) -> Self {
-        let mut me  = Self::default();
+    pub fn from_ref(args: &Self) -> Self {
+        let mut me = Self::default();
         args.clone_into(&mut me);
         me
     }

@@ -21,7 +21,7 @@ PG_PORT="5432"
 export DATABASE_URL="postgres://${PG_USER}:${PG_PASSWORD}@localhost:${PG_PORT}/${PG_DB}"
 
 # Generate a shared secret for the cluster
-export WORKA_CLUSTER_SECRET=$(head -c 32 /dev/urandom | base64)
+export ANVIL_CLUSTER_SECRET=$(head -c 32 /dev/urandom | base64)
 
 NODE_COUNT=3
 STORAGE_BASE_DIR="$(pwd)/.anvil-local-data"
@@ -78,22 +78,22 @@ for i in $(seq 1 ${NODE_COUNT}); do
   NODE_STORAGE_DIR="${STORAGE_BASE_DIR}/node-${i}"
   mkdir -p "${NODE_STORAGE_DIR}"
 
-  export WORKA_BIND_QUIC="127.0.0.1:${QUIC_PORT}"
-  export WORKA_BIND_HTTP="127.0.0.1:${HTTP_PORT}"
-  export WORKA_BIND_GRPC="127.0.0.1:${GRPC_PORT}"
-  export WORKA_STORAGE_PATH="${NODE_STORAGE_DIR}"
-  export WORKA_ENABLE_MDNS="false"
+  export ANVIL_BIND_QUIC="127.0.0.1:${QUIC_PORT}"
+  export ANVIL_BIND_HTTP="127.0.0.1:${HTTP_PORT}"
+  export ANVIL_BIND_GRPC="127.0.0.1:${GRPC_PORT}"
+  export ANVIL_STORAGE_PATH="${NODE_STORAGE_DIR}"
+  export ANVIL_ENABLE_MDNS="false"
   export RUST_LOG="info,anvil=debug"
 
   if [ "$i" -eq 1 ]; then
-    export WORKA_INIT_CLUSTER="true"
+    export ANVIL_INIT_CLUSTER="true"
   else
-    export WORKA_INIT_CLUSTER="false"
-    export WORKA_BOOTSTRAP_NODES="${BOOTSTRAP_QUIC_ADDR}"
+    export ANVIL_INIT_CLUSTER="false"
+    export ANVIL_BOOTSTRAP_NODES="${BOOTSTRAP_QUIC_ADDR}"
   fi
 
   echo "Starting Node ${i} (QUIC: ${QUIC_PORT}, HTTP: ${HTTP_PORT}, gRPC: ${GRPC_PORT})"
-#  cargo run --release -- --global-database-url "${DATABASE_URL}" --regional-database-url "${DATABASE_URL}" --jwt-secret "local-jwt-secret" --worka-secret-encryption-key "a-very-secret-key-that-is-32-bytes" --public-grpc-addr "127.0.0.1:${GRPC_PORT}" --region "local" &
+#  cargo run --release -- --global-database-url "${DATABASE_URL}" --regional-database-url "${DATABASE_URL}" --jwt-secret "local-jwt-secret" --anvil-secret-encryption-key "a-very-secret-key-that-is-32-bytes" --public-grpc-addr "127.0.0.1:${GRPC_PORT}" --region "local" &
   ../target/debug/anvil &
   PIDS="$PIDS $!"
   sleep 1 # Stagger startup
@@ -115,16 +115,16 @@ To start the 4th node with your debugger, create a run configuration
 in your IDE with the following environment variables and run it:
 
 export RUST_LOG="info,anvil=debug"
-export WORKA_DB_DSN="${DATABASE_URL}"
-export WORKA_BIND_QUIC="127.0.0.1:${DEBUG_QUIC_PORT}"
-export WORKA_BIND_HTTP="127.0.0.1:${DEBUG_HTTP_PORT}"
-export WORKA_BIND_GRPC="127.0.0.1:${DEBUG_GRPC_PORT}"
-export WORKA_STORAGE_PATH="${DEBUG_STORAGE_DIR}"
-export WORKA_ENABLE_MDNS="false"
-export WORKA_INIT_CLUSTER="false"
-export WORKA_BOOTSTRAP_NODES="${BOOTSTRAP_QUIC_ADDR}"
+export ANVIL_DB_DSN="${DATABASE_URL}"
+export ANVIL_BIND_QUIC="127.0.0.1:${DEBUG_QUIC_PORT}"
+export ANVIL_BIND_HTTP="127.0.0.1:${DEBUG_HTTP_PORT}"
+export ANVIL_BIND_GRPC="127.0.0.1:${DEBUG_GRPC_PORT}"
+export ANVIL_STORAGE_PATH="${DEBUG_STORAGE_DIR}"
+export ANVIL_ENABLE_MDNS="false"
+export ANVIL_INIT_CLUSTER="false"
+export ANVIL_BOOTSTRAP_NODES="${BOOTSTRAP_QUIC_ADDR}"
 
-The command to run is simply: cargo run --release -- --global-database-url "${DATABASE_URL}" --regional-database-url "${DATABASE_URL}" --jwt-secret "local-jwt-secret" --worka-secret-encryption-key "a-very-secret-key-that-is-32-bytes" --public-grpc-addr "127.0.0.1:${DEBUG_GRPC_PORT}" --region "local" --bootstrap-nodes "${BOOTSTRAP_QUIC_ADDR}"
+The command to run is simply: cargo run --release -- --global-database-url "${DATABASE_URL}" --regional-database-url "${DATABASE_URL}" --jwt-secret "local-jwt-secret" --anvil-secret-encryption-key "a-very-secret-key-that-is-32-bytes" --public-grpc-addr "127.0.0.1:${DEBUG_GRPC_PORT}" --region "local" --bootstrap-nodes "${BOOTSTRAP_QUIC_ADDR}"
 --------------------------------------------------------------------
 
 EOF

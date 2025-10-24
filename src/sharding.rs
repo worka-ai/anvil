@@ -105,6 +105,9 @@ mod tests {
 
         // Verify that the lost data shard was reconstructed and decrypted correctly
         let reconstructed_shard = shards[0].as_ref().unwrap();
-        assert_eq!(*reconstructed_shard, original_data[0], "Reconstructed data does not match");
+        assert_eq!(
+            *reconstructed_shard, original_data[0],
+            "Reconstructed data does not match"
+        );
     }
 }

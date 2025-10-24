@@ -1,10 +1,10 @@
-use crate::anvil_api::internal_anvil_service_client::InternalAnvilServiceClient;
 use crate::anvil_api::DeleteShardRequest;
+use crate::anvil_api::internal_anvil_service_client::InternalAnvilServiceClient;
 use crate::auth::JwtManager;
 use crate::cluster::ClusterState;
 use crate::persistence::Persistence;
 use crate::tasks::TaskType;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
@@ -56,7 +56,10 @@ pub async fn run(
 ) -> Result<()> {
     loop {
         let tasks = match persistence.fetch_pending_tasks_for_update(10).await {
-            Ok(rows) => rows.into_iter().map(Task::try_from).collect::<Result<Vec<_>>>()?,
+            Ok(rows) => rows
+                .into_iter()
+                .map(Task::try_from)
+                .collect::<Result<Vec<_>>>()?,
             Err(e) => {
                 error!("Failed to fetch tasks: {}", e);
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -96,8 +99,7 @@ pub async fn run(
                     if let Err(complete_err) = p.update_task_status(task.id, "completed").await {
                         error!(
                             "Failed to mark task {} as completed: {}",
-                            task.id,
-                            complete_err
+                            task.id, complete_err
                         );
                     }
                 }
@@ -125,22 +127,22 @@ async fn handle_delete_object(
                 let content_hash = payload.content_hash.clone();
                 let token = jwt_manager.mint_token(
                     "internal-worker".to_string(),
-                    vec![format!(
-                        "internal:delete_shard:{}/{}",
-                        content_hash,
-                        i
-                    )],
+                    vec![format!("internal:delete_shard:{}/{}", content_hash, i)],
                     0, // System-level task, no tenant
                 )?;
 
                 futures.push(async move {
-                    let mut client = InternalAnvilServiceClient::connect(grpc_addr).await.map_err(|e| Status::internal(e.to_string()))?;
+                    let mut client = InternalAnvilServiceClient::connect(grpc_addr)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?;
                     let mut req = tonic::Request::new(DeleteShardRequest {
                         object_hash: content_hash,
                         shard_index: i as u32,
                     });
-                    req.metadata_mut()
-                        .insert("authorization", format!("Bearer {}", token).parse().unwrap());
+                    req.metadata_mut().insert(
+                        "authorization",
+                        format!("Bearer {}", token).parse().unwrap(),
+                    );
                     client.delete_shard(req).await
                 });
             }
@@ -153,6 +155,9 @@ async fn handle_delete_object(
     // Finally, hard delete the object from the database.
     persistence.hard_delete_object(payload.object_id).await?;
 
-    info!("Successfully processed DeleteObject task for object {}", payload.object_id);
+    info!(
+        "Successfully processed DeleteObject task for object {}",
+        payload.object_id
+    );
     Ok(())
 }

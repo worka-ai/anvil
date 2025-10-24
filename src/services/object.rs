@@ -1,6 +1,6 @@
 use crate::anvil_api::object_service_server::ObjectService;
 use crate::anvil_api::*;
-use crate::{auth, AppState};
+use crate::{AppState, auth};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -141,11 +141,7 @@ impl ObjectService for AppState {
 
         let object = self
             .object_manager
-            .head_object(
-                Some(claims.clone()),
-                &req.bucket_name,
-                &req.object_key,
-            )
+            .head_object(Some(claims.clone()), &req.bucket_name, &req.object_key)
             .await?;
 
         Ok(Response::new(HeadObjectResponse {

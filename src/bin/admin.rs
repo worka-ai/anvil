@@ -5,7 +5,6 @@ use clap::{Parser, Subcommand};
 use tracing::info;
 // Import the shared config
 
-
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
 struct Cli {
@@ -22,7 +21,7 @@ struct SharedConfig {
     pub global_database_url: String,
 
     #[arg(long, env)]
-    pub worka_secret_encryption_key: String,
+    pub anvil_secret_encryption_key: String,
 }
 
 #[derive(Subcommand)]
@@ -102,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     let persistence = Persistence::new(global_pool, regional_pool);
-    let encryption_key = hex::decode(config.worka_secret_encryption_key)?;
+    let encryption_key = hex::decode(config.anvil_secret_encryption_key)?;
 
     match &cli.command {
         Commands::Tenants { command } => match command {

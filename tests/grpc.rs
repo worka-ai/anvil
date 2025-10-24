@@ -21,15 +21,18 @@ async fn test_distributed_put_and_get() {
     let token = cluster.token.clone();
     let client_addr = cluster.grpc_addrs[0].clone();
 
-    let mut bucket_client = BucketServiceClient::connect(client_addr.clone()).await.unwrap();
+    let mut bucket_client = BucketServiceClient::connect(client_addr.clone())
+        .await
+        .unwrap();
     let bucket_name = format!("test-bucket-{}", uuid::Uuid::new_v4());
     let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
         region: "TEST_REGION".to_string(),
     });
-    create_bucket_req
-        .metadata_mut()
-        .insert("authorization", format!("Bearer {}", token).parse().unwrap());
+    create_bucket_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
     bucket_client
         .create_bucket(create_bucket_req)
         .await
@@ -54,10 +57,11 @@ async fn test_distributed_put_and_get() {
 
     let request_stream = tokio_stream::iter(chunks);
     let mut put_object_req = tonic::Request::new(request_stream);
-    put_object_req
-        .metadata_mut()
-        .insert("authorization", format!("Bearer {}", token).parse().unwrap());
-    
+    put_object_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+
     let response = object_client
         .put_object(put_object_req)
         .await
@@ -71,9 +75,10 @@ async fn test_distributed_put_and_get() {
         version_id: Some(response.version_id),
     };
     let mut get_object_req = tonic::Request::new(get_request);
-    get_object_req
-        .metadata_mut()
-        .insert("authorization", format!("Bearer {}", token).parse().unwrap());
+    get_object_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
     let mut response_stream = object_client
         .get_object(get_object_req)
         .await
@@ -114,15 +119,18 @@ async fn test_single_node_put() {
     let token = cluster.token.clone();
     let client_addr = cluster.grpc_addrs[0].clone();
 
-    let mut bucket_client = BucketServiceClient::connect(client_addr.clone()).await.unwrap();
+    let mut bucket_client = BucketServiceClient::connect(client_addr.clone())
+        .await
+        .unwrap();
     let bucket_name = "single-node-bucket".to_string();
     let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
         region: "TEST_REGION".to_string(),
     });
-    create_bucket_req
-        .metadata_mut()
-        .insert("authorization", format!("Bearer {}", token).parse().unwrap());
+    create_bucket_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
     bucket_client
         .create_bucket(create_bucket_req)
         .await
@@ -148,9 +156,10 @@ async fn test_single_node_put() {
     let request_stream = tokio_stream::iter(chunks);
 
     let mut put_object_req = tonic::Request::new(request_stream);
-    put_object_req
-        .metadata_mut()
-        .insert("authorization", format!("Bearer {}", token).parse().unwrap());
+    put_object_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
 
     let result = object_client.put_object(put_object_req).await;
     assert!(result.is_ok());
@@ -159,18 +168,28 @@ async fn test_single_node_put() {
 #[tokio::test]
 async fn test_multi_region_list_and_isolation() {
     let mut cluster_east = common::TestCluster::new(&["US_EAST_1"]).await;
-    cluster_east.start_and_converge(Duration::from_secs(5)).await;
+    cluster_east
+        .start_and_converge(Duration::from_secs(5))
+        .await;
 
     let mut cluster_west = common::TestCluster::new(&["EU_WEST_1"]).await;
-    cluster_west.start_and_converge(Duration::from_secs(5)).await;
+    cluster_west
+        .start_and_converge(Duration::from_secs(5))
+        .await;
 
     let token = cluster_east.token.clone();
     let east_client_addr = cluster_east.grpc_addrs[0].clone();
     let west_client_addr = cluster_west.grpc_addrs[0].clone();
 
-    let mut bucket_client_east = BucketServiceClient::connect(east_client_addr.clone()).await.unwrap();
-    let mut object_client_east = ObjectServiceClient::connect(east_client_addr).await.unwrap();
-    let mut object_client_west = ObjectServiceClient::connect(west_client_addr).await.unwrap();
+    let mut bucket_client_east = BucketServiceClient::connect(east_client_addr.clone())
+        .await
+        .unwrap();
+    let mut object_client_east = ObjectServiceClient::connect(east_client_addr)
+        .await
+        .unwrap();
+    let mut object_client_west = ObjectServiceClient::connect(west_client_addr)
+        .await
+        .unwrap();
 
     let bucket_name = "regional-bucket".to_string();
     let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
