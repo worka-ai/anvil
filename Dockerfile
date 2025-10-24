@@ -1,21 +1,30 @@
-# Use the official Rust image as a builder
-FROM rust:1.77 as builder
+# Stage 1: Build the binaries
+FROM rust:latest AS builder
 
-# Create a new empty shell project
+# Install build dependencies
+RUN apt-get update && apt-get install -y build-essential pkg-config libssl-dev protobuf-compiler
+
 WORKDIR /usr/src/anvil
+
+# Copy the entire project
 COPY . .
 
-# Build the project. This will also cache dependencies.
-RUN cargo build --release
+# Build the anvil server and the admin CLI in release mode
+RUN cargo build --release --bin anvil --bin admin
 
-# The final, smaller image for the runtime
-FROM debian:bullseye-slim
+# Stage 2: Create the final, minimal image
+FROM debian:bookworm-slim
 
-# Copy the built binary from the builder stage
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y libssl3 && rm -rf /var/lib/apt/lists/*
+
+# Copy the compiled binaries from the builder stage
 COPY --from=builder /usr/src/anvil/target/release/anvil /usr/local/bin/anvil
+COPY --from=builder /usr/src/anvil/target/release/admin /usr/local/bin/admin
 
-# Expose the gRPC port that the server will listen on
-EXPOSE 50051
+# Expose the default gRPC/S3 port and a potential swarm port
+EXPOSE 9000
+EXPOSE 7443
 
-# Set the binary as the entrypoint
+# Set the default command to run the anvil server
 CMD ["anvil"]

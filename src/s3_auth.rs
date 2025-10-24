@@ -30,22 +30,42 @@ use tracing::{debug, info, warn};
 pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let (parts, body) = req.into_parts();
 
-    // Read entire body (needed for verification and to forward)
-    let body_bytes = match body.collect().await {
-        Ok(b) => b.to_bytes(),
-        Err(e) => {
-            warn!(error = %e, "Failed to read body in SigV4 middleware");
-            return Response::builder()
-                .status(400)
-                .body(Body::from(format!("Failed to read body: {e}")))
-                .unwrap();
+    // Skip SigV4 for gRPC requests to avoid interfering with tonic
+    if let Some(ct) = parts.headers.get(http::header::CONTENT_TYPE).and_then(|h| h.to_str().ok()) {
+        if ct.starts_with("application/grpc") {
+            let req = Request::from_parts(parts, body);
+            return next.run(req).await;
         }
+    }
+
+    let content_sha256 = parts
+        .headers
+        .get("x-amz-content-sha256")
+        .and_then(|h| h.to_str().ok());
+
+    let is_streaming = content_sha256 == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
+
+    // If it's not a streaming upload, we must buffer the body to verify its hash.
+    // If it IS a streaming upload, we leave the body as-is to be handled by the downstream service.
+    let (body_bytes, reconstituted_body) = if !is_streaming {
+        let bytes = match body.collect().await {
+            Ok(b) => b.to_bytes(),
+            Err(e) => {
+                warn!(error = %e, "Failed to read body in SigV4 middleware");
+                return Response::builder()
+                    .status(400)
+                    .body(Body::from(format!("Failed to read body: {e}")))
+                    .unwrap();
+            }
+        };
+        (Some(bytes.clone()), Body::from(bytes))
+    } else {
+        (None, body)
     };
 
-    // Rebuild request to pass downstream either way
-    let mut req = Request::from_parts(parts.clone(), Body::from(body_bytes.clone()));
+    let mut req = Request::from_parts(parts.clone(), reconstituted_body);
 
-    // If no AWS SigV4 auth, pass through as anonymous
+    // If no AWS SigV4 auth, decide if we can allow anonymous (GET/HEAD) and defer auth to handlers
     let auth_header = match parts
         .headers
         .get(http::header::AUTHORIZATION)
@@ -53,8 +73,16 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
     {
         Some(h) if h.starts_with("AWS4-HMAC-SHA256 ") => h,
         _ => {
-            debug!("No SigV4 header found, passing as anonymous");
-            return next.run(req).await;
+            let method = parts.method.clone();
+            if method == http::Method::GET || method == http::Method::HEAD {
+                // Allow anonymous GET/HEAD; handlers will enforce bucket-level public access
+                debug!("No SigV4 for GET/HEAD, deferring auth to handler");
+                return next.run(req).await;
+            }
+            return Response::builder()
+                .status(401)
+                .body(Body::from("Missing Authorization"))
+                .unwrap();
         }
     };
 
@@ -82,7 +110,9 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         }
     };
 
-    let secret_bytes = match crypto::decrypt(&app_details.client_secret_encrypted) {
+    let encryption_key = hex::decode(&state.config.worka_secret_encryption_key)
+        .expect("WORKA_SECRET_ENCRYPTION_KEY must be a valid hex string");
+    let secret_bytes = match crypto::decrypt(&app_details.client_secret_encrypted, &encryption_key) {
         Ok(s) => s,
         Err(_) => {
             warn!(access_key_id = %parsed.access_key_id, "Failed to decrypt secret for SigV4 auth");
@@ -162,12 +192,13 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         .expect("valid signing params")
         .into();
 
-    // Use the exact payload hash the client signed (from x-amz-content-sha256), or compute it.
-    let payload_hash = parts
-        .headers
-        .get("x-amz-content-sha256")
-        .and_then(|h| h.to_str().ok().map(|s| s.to_string()))
-        .unwrap_or_else(|| sha256_hex(&body_bytes));
+    let payload_hash = if is_streaming {
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".to_string()
+    } else {
+        content_sha256
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| sha256_hex(&body_bytes.unwrap()))
+    };
 
     // Only include headers that the client actually signed (from SignedHeaders=...)
     let signed_set: HashSet<&str> = parsed

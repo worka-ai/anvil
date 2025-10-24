@@ -14,7 +14,7 @@ async fn test_distributed_reconstruction_on_node_failure() {
     let mut cluster = common::TestCluster::new(&["TEST_REGION"; 6]).await;
     cluster.start_and_converge(Duration::from_secs(20)).await;
 
-    let primary_addr = cluster.grpc_addrs[0].clone();
+    let primary_addr = cluster.grpc_addrs[0].clone(); // already includes /grpc
     let mut object_client = ObjectServiceClient::connect(primary_addr.clone()).await.unwrap();
     let mut bucket_client = BucketServiceClient::connect(primary_addr.clone()).await.unwrap();
 
@@ -58,10 +58,21 @@ async fn test_distributed_reconstruction_on_node_failure() {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // 3. Connect to a *different*, live node
-    let mut recovery_client = ObjectServiceClient::connect(cluster.grpc_addrs[2].clone())
-        .await
-        .unwrap();
+    // Recover client on a different node; allow brief retry for readiness
+    let mut recovery_client = loop {
+        match ObjectServiceClient::connect(cluster.grpc_addrs[2].clone()).await {
+            Ok(c) => break c,
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                continue;
+            }
+        }
+    };
 
+
+    let mut stream = {
+        let mut attempt = 0;
+        loop {
     // 4. Get the object and verify its content
     let mut get_req = Request::new(GetObjectRequest {
         bucket_name: bucket_name.clone(),
@@ -72,12 +83,17 @@ async fn test_distributed_reconstruction_on_node_failure() {
         "authorization",
         format!("Bearer {}", cluster.token).parse().unwrap(),
     );
-
-    let mut stream = timeout(Duration::from_secs(10), recovery_client.get_object(get_req))
-        .await
-        .expect("get_object timed out")
-        .unwrap()
-        .into_inner();
+            match timeout(Duration::from_secs(10), recovery_client.get_object(get_req)).await {
+                Ok(Ok(resp)) => break resp.into_inner(),
+                _ => {
+                    attempt += 1;
+                    if attempt > 8 { panic!("get_object timed out or unavailable"); }
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    continue;
+                }
+            }
+        }
+    };
 
     let mut downloaded_data = Vec::new();
     if let Some(Ok(first_chunk)) = stream.next().await {

@@ -18,6 +18,8 @@ async fn test_auth_flow_with_wildcard_scopes() {
     let admin_args = &["run", "--bin", "admin", "--"];
     let app_output = Command::new("cargo")
         .args(admin_args.iter().chain(&[
+            "--global-database-url", &global_db_url,
+            "--worka-secret-encryption-key", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "apps",
             "create",
             "--tenant-name",
@@ -25,7 +27,6 @@ async fn test_auth_flow_with_wildcard_scopes() {
             "--app-name",
             "auth-app",
         ]))
-        .env("GLOBAL_DATABASE_URL", &global_db_url)
         .output()
         .unwrap();
     assert!(app_output.status.success());
@@ -44,8 +45,10 @@ async fn test_auth_flow_with_wildcard_scopes() {
         "bucket:auth-test-*",
     ];
     let status = Command::new("cargo")
-        .args(admin_args.iter().chain(policy_args.iter()))
-        .env("GLOBAL_DATABASE_URL", &global_db_url)
+        .args(admin_args.iter().chain(&[
+            "--global-database-url", &global_db_url,
+            "--worka-secret-encryption-key", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ]).chain(policy_args.iter()))
         .status()
         .unwrap();
     assert!(status.success());

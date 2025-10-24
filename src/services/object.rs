@@ -142,10 +142,9 @@ impl ObjectService for AppState {
         let object = self
             .object_manager
             .head_object(
-                claims.tenant_id,
+                Some(claims.clone()),
                 &req.bucket_name,
                 &req.object_key,
-                &claims.scopes,
             )
             .await?;
 
@@ -169,13 +168,12 @@ impl ObjectService for AppState {
         let (objects, common_prefixes) = self
             .object_manager
             .list_objects(
-                claims.tenant_id,
+                Some(claims.clone()),
                 &req.bucket_name,
                 &req.prefix,
                 &req.start_after,
                 req.max_keys,
                 &req.delimiter,
-                &claims.scopes,
             )
             .await?;
 

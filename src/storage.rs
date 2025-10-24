@@ -1,4 +1,5 @@
 use anyhow::Result;
+use futures_util::StreamExt;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -88,6 +89,38 @@ impl Storage {
     pub async fn delete_shard(&self, object_hash: &str, shard_index: u32) -> Result<()> {
         let file_path = self.get_shard_path(object_hash, shard_index);
         fs::remove_file(file_path).await?;
+        Ok(())
+    }
+
+    fn get_temp_whole_object_path(&self, upload_id: &str) -> PathBuf {
+        self.temp_path.join(upload_id)
+    }
+
+    pub async fn stream_to_temp_file(
+        &self,
+        mut data_stream: impl futures_util::Stream<Item = Result<Vec<u8>, tonic::Status>> + Unpin,
+    ) -> Result<(PathBuf, i64, String)> {
+        let upload_id = uuid::Uuid::new_v4().to_string();
+        let temp_path = self.get_temp_whole_object_path(&upload_id);
+        let mut file = fs::File::create(&temp_path).await?;
+
+        let mut overall_hasher = blake3::Hasher::new();
+        let mut total_bytes = 0;
+
+        while let Some(chunk_result) = data_stream.next().await {
+            let chunk = chunk_result.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            file.write_all(&chunk).await?;
+            overall_hasher.update(&chunk);
+            total_bytes += chunk.len() as i64;
+        }
+
+        let content_hash = overall_hasher.finalize().to_hex().to_string();
+        Ok((temp_path, total_bytes, content_hash))
+    }
+
+    pub async fn commit_whole_object(&self, temp_path: &Path, final_object_hash: &str) -> Result<()> {
+        let final_path = self.get_whole_object_path(final_object_hash);
+        fs::rename(temp_path, final_path).await?;
         Ok(())
     }
 }

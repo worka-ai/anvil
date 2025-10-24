@@ -14,9 +14,8 @@ fn create_app(global_db_url: &str, app_name: &str) -> (String, String) {
         .args(
             admin_args
                 .iter()
-                .chain(&["apps", "create", "--tenant-name", "default", "--app-name", app_name]),
+                .chain(&["--global-database-url", global_db_url, "--worka-secret-encryption-key", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "apps", "create", "--tenant-name", "default", "--app-name", app_name]),
         )
-        .env("GLOBAL_DATABASE_URL", global_db_url)
         .output()
         .unwrap();
     assert!(app_output.status.success());
@@ -81,8 +80,7 @@ async fn test_grant_and_revoke_access() {
         "*",
     ];
     let status = std::process::Command::new("cargo")
-        .args(admin_args.iter().chain(policy_args.iter()))
-        .env("GLOBAL_DATABASE_URL", &cluster.global_db_url)
+        .args(admin_args.iter().chain(&["--global-database-url", &cluster.global_db_url, "--worka-secret-encryption-key", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]).chain(policy_args.iter()))
         .status()
         .unwrap();
     assert!(status.success());

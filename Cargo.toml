@@ -36,7 +36,7 @@ blake3 = "1.8.2"
 deadpool-postgres = { version = "0.12.1", features = ["serde"] }
 refinery = { version = "0.8.12", features = ["tokio-postgres"] }
 refinery-macros = "0.8.12"
-tokio-postgres = { version = "0.7.11", features = ["with-time-0_3", "with-uuid-1", "with-serde_json-1"] }
+tokio-postgres = { version = "0.7.11", features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
 thiserror = { version = "2.0.16" }
 tokio = { version = "1.47.1", features = ["full"] }
 
@@ -71,22 +71,22 @@ hyper-rustls = { version = "0.27.0", features = ["http2", "ring", "tls12"], opti
 tower-http = { version = "0.6", optional = true }
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
 dotenvy = "0.15.7"
-futures-core.workspace = true
+futures-core = "0.3.31"
 time = "0.3.44"
 futures-util = "0.3.31"
 
 local-ip-address = "0.6.5"
-reqwest.workspace = true
+reqwest = "0.12.23"
 trust-dns-resolver = "0.23.2"
-async-trait.workspace = true
-libp2p = { version = "0.56.0", features = ["gossipsub", "mdns", "tcp", "tokio", "macros", "noise", "yamux"] }
+async-trait = "0.1.89"
+libp2p = { version = "0.56.0", features = ["gossipsub", "mdns", "tcp", "tokio", "macros", "noise", "yamux", "quic"] }
 reed-solomon-erasure = "6.0.0"
 ahash = "0.8.12"
-futures.workspace = true
+futures ="0.3.31"
 jsonwebtoken = "9.3.1"
 argon2 = "0.5.3"
-chrono = { workspace = true, features = ["serde"] }
-clap = { version = "4.5.48", features = ["derive"] }
+chrono = { version = "0.4.42", features = ["serde"] }
+clap = { version = "4.5.48", features = ["derive", "env"] }
 rand_core = { version = "0.9.3", features = ["os_rng"] }
 axum = { version = "0.8.5", features = ["http1"] }
 quick-xml = { version = "0.38.3", features = ["serialize"] }
