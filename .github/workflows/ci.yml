@@ -32,10 +32,9 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Set up Rust
-      uses: actions/setup-rust-toolchain@v1
-      with:
-        toolchain: stable
+    - name: Setup Rust
+      if: env.SKIP_PACKS != 'true' && steps.pack_plan.outputs.needs_build == 'true'
+      uses: dtolnay/rust-toolchain@stable
 
     - name: Cache Cargo dependencies
       uses: actions/cache@v4
