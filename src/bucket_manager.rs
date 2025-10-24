@@ -69,7 +69,9 @@ impl BucketManager {
         scopes: &[String],
     ) -> Result<Vec<Bucket>, Status> {
         if !auth::is_authorized("read:bucket:*", scopes) {
-            return Err(Status::permission_denied("Permission denied to list buckets"));
+            return Err(Status::permission_denied(
+                "Permission denied to list buckets",
+            ));
         }
 
         let buckets = self

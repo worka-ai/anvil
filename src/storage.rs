@@ -118,7 +118,11 @@ impl Storage {
         Ok((temp_path, total_bytes, content_hash))
     }
 
-    pub async fn commit_whole_object(&self, temp_path: &Path, final_object_hash: &str) -> Result<()> {
+    pub async fn commit_whole_object(
+        &self,
+        temp_path: &Path,
+        final_object_hash: &str,
+    ) -> Result<()> {
         let final_path = self.get_whole_object_path(final_object_hash);
         fs::rename(temp_path, final_path).await?;
         Ok(())

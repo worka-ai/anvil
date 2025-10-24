@@ -1,5 +1,7 @@
 use crate::{
-    anvil_api::{internal_anvil_service_client, CommitShardRequest, PutShardRequest, GetShardRequest},
+    anvil_api::{
+        CommitShardRequest, GetShardRequest, PutShardRequest, internal_anvil_service_client,
+    },
     auth,
     cluster::ClusterState,
     persistence::{Bucket, Object, Persistence},
@@ -38,9 +40,10 @@ impl ObjectManager {
         storage: Storage,
         region: String,
         jwt_manager: Arc<auth::JwtManager>,
-        worka_secret_encryption_key: String,
+        anvil_secret_encryption_key: String,
     ) -> Self {
-        let encryption_key = hex::decode(worka_secret_encryption_key).expect("WORKA_SECRET_ENCRYPTION_KEY must be a valid hex string");
+        let encryption_key = hex::decode(anvil_secret_encryption_key)
+            .expect("ANVIL_SECRET_ENCRYPTION_KEY must be a valid hex string");
         Self {
             db,
             placer,
@@ -78,7 +81,7 @@ impl ObjectManager {
             .calculate_placement(object_key, &self.cluster, self.sharder.total_shards())
             .await;
 
-        let total_bytes; 
+        let total_bytes;
         let content_hash;
 
         if nodes.len() < self.sharder.total_shards() {
@@ -114,12 +117,12 @@ impl ObjectManager {
             let mut overall_hasher = blake3::Hasher::new();
             let mut bytes_so_far = 0;
             let upload_id = uuid::Uuid::new_v4().to_string();
-    
+
             let stripe_size = 1024 * 64; // 64KB per shard in a stripe
             let data_shards_count = self.sharder.data_shards();
             let stripe_buffer_size = stripe_size * data_shards_count;
             let mut stripe_buffer = Vec::with_capacity(stripe_buffer_size);
-    
+
             let mut clients = Vec::new();
             let cluster_map = self.cluster.read().await;
             for peer_id in &nodes {
@@ -133,27 +136,31 @@ impl ObjectManager {
                 .map_err(|e| Status::unavailable(e.to_string()))?;
                 clients.push(client);
             }
-    
+
             while let Some(chunk_result) = data_stream.next().await {
                 let chunk = chunk_result?;
                 overall_hasher.update(&chunk);
                 bytes_so_far += chunk.len();
                 stripe_buffer.extend_from_slice(&chunk);
-    
+
                 while stripe_buffer.len() >= stripe_buffer_size {
-                    let stripe_data = stripe_buffer.drain(..stripe_buffer_size).collect::<Vec<_>>();
-                    self.send_stripe(&clients, &upload_id, stripe_data, stripe_size).await?;
+                    let stripe_data = stripe_buffer
+                        .drain(..stripe_buffer_size)
+                        .collect::<Vec<_>>();
+                    self.send_stripe(&clients, &upload_id, stripe_data, stripe_size)
+                        .await?;
                 }
             }
-    
+
             if !stripe_buffer.is_empty() {
                 stripe_buffer.resize(stripe_buffer_size, 0);
-                self.send_stripe(&clients, &upload_id, stripe_buffer, stripe_size).await?;
+                self.send_stripe(&clients, &upload_id, stripe_buffer, stripe_size)
+                    .await?;
             }
-    
+
             total_bytes = bytes_so_far as i64;
             content_hash = overall_hasher.finalize().to_hex().to_string();
-    
+
             let mut futures = Vec::new();
             for (i, client) in clients.into_iter().enumerate() {
                 let scope = format!("internal:commit_shard:{}/{}", content_hash, i);
@@ -161,7 +168,7 @@ impl ObjectManager {
                     .jwt_manager
                     .mint_token("internal".to_string(), vec![scope], 0)
                     .map_err(|e| Status::internal(e.to_string()))?;
-    
+
                 let mut client = client.clone();
                 let request = CommitShardRequest {
                     upload_id: upload_id.clone(),
@@ -169,8 +176,10 @@ impl ObjectManager {
                     final_object_hash: content_hash.clone(),
                 };
                 let mut req = tonic::Request::new(request);
-                req.metadata_mut()
-                    .insert("authorization", format!("Bearer {}", token).parse().unwrap());
+                req.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", token).parse().unwrap(),
+                );
                 futures.push(async move { client.commit_shard(req).await });
             }
             futures::future::try_join_all(futures)
@@ -181,7 +190,8 @@ impl ObjectManager {
         let bucket = self
             .db
             .get_bucket_by_name(tenant_id, bucket_name, &self.region)
-            .await.map_err(|e| Status::internal(e.to_string()))?
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
         let shard_map_json = if nodes.len() > 1 {
             let peer_ids: Vec<String> = nodes.iter().map(|p| p.to_base58()).collect();
@@ -201,14 +211,17 @@ impl ObjectManager {
                 &content_hash,
                 shard_map_json,
             )
-            .await.map_err(|e| Status::internal(e.to_string()))?;
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(object)
     }
 
     async fn send_stripe(
         &self,
-        clients: &[internal_anvil_service_client::InternalAnvilServiceClient<tonic::transport::Channel>],
+        clients: &[internal_anvil_service_client::InternalAnvilServiceClient<
+            tonic::transport::Channel,
+        >],
         upload_id: &str,
         stripe_data: Vec<u8>,
         stripe_size: usize,
@@ -239,8 +252,10 @@ impl ObjectManager {
             let mut client = clients[i].clone();
             let request_stream = tokio_stream::iter(vec![request]);
             let mut req = tonic::Request::new(request_stream);
-            req.metadata_mut()
-                .insert("authorization", format!("Bearer {}", token).parse().unwrap());
+            req.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", token).parse().unwrap(),
+            );
 
             futures.push(async move { client.put_shard(req).await });
         }
@@ -257,10 +272,13 @@ impl ObjectManager {
         claims: Option<auth::Claims>,
         bucket_name: String,
         object_key: String,
-    ) -> Result<(
-        Object,
-        Pin<Box<dyn Stream<Item = Result<Vec<u8>, Status>> + Send + 'static>>,
-    ), Status> {
+    ) -> Result<
+        (
+            Object,
+            Pin<Box<dyn Stream<Item = Result<Vec<u8>, Status>> + Send + 'static>>,
+        ),
+        Status,
+    > {
         let bucket = self
             .get_authorized_bucket(claims.as_ref(), &bucket_name)
             .await?;
@@ -276,7 +294,8 @@ impl ObjectManager {
         let object = self
             .db
             .get_object(bucket.id, &object_key)
-            .await.map_err(|e| Status::internal(e.to_string()))?
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Object not found"))?;
 
         let (tx, rx) = mpsc::channel(4);
@@ -303,23 +322,56 @@ impl ObjectManager {
                 Some(map_json) => {
                     let peer_strs: Vec<String> = match serde_json::from_value(map_json.clone()) {
                         Ok(v) => v,
-                        Err(_) => { let _ = tx.send(Err(Status::not_found("Object data unavailable: invalid shard map"))).await; return; }
+                        Err(_) => {
+                            let _ = tx
+                                .send(Err(Status::not_found(
+                                    "Object data unavailable: invalid shard map",
+                                )))
+                                .await;
+                            return;
+                        }
                     };
                     let mut ids = Vec::with_capacity(peer_strs.len());
                     for s in peer_strs {
-                        match s.parse() { Ok(pid) => ids.push(pid), Err(_) => { let _ = tx.send(Err(Status::not_found("Object data unavailable: bad peer id in shard map"))).await; return; } }
+                        match s.parse() {
+                            Ok(pid) => ids.push(pid),
+                            Err(_) => {
+                                let _ = tx
+                                    .send(Err(Status::not_found(
+                                        "Object data unavailable: bad peer id in shard map",
+                                    )))
+                                    .await;
+                                return;
+                            }
+                        }
                     }
                     ids
                 }
-                None => { let _ = tx.send(Err(Status::not_found("Object data unavailable"))).await; return; }
+                None => {
+                    let _ = tx
+                        .send(Err(Status::not_found("Object data unavailable")))
+                        .await;
+                    return;
+                }
             };
 
             let total_shards = app_state.sharder.total_shards();
-            if shard_map_peer_ids.len() < total_shards { let _ = tx.send(Err(Status::not_found("Object data unavailable: incomplete shard map"))).await; return; }
+            if shard_map_peer_ids.len() < total_shards {
+                let _ = tx
+                    .send(Err(Status::not_found(
+                        "Object data unavailable: incomplete shard map",
+                    )))
+                    .await;
+                return;
+            }
 
             let mut shards = Vec::with_capacity(total_shards);
             for i in 0..total_shards {
-                let shard_data = app_state.storage.retrieve_shard(&object_clone.content_hash, i as u32).await.ok();
+                let shard_data = app_state
+                    .storage
+                    .retrieve_shard(&object_clone.content_hash, i as u32)
+                    .await
+                    .ok();
                 shards.push(shard_data);
             }
 
@@ -333,34 +385,87 @@ impl ObjectManager {
                         let object_hash = object_clone.content_hash.clone();
                         let jwt_manager = app_state.jwt_manager.clone();
                         missing_shards_futures.push(async move {
-                            let mut client = internal_anvil_service_client::InternalAnvilServiceClient::connect(grpc_addr).await
-                                .map_err(|e| Status::internal(format!("Failed to connect to peer: {}", e)))?;
+                            let mut client =
+                                internal_anvil_service_client::InternalAnvilServiceClient::connect(
+                                    grpc_addr,
+                                )
+                                .await
+                                .map_err(|e| {
+                                    Status::internal(format!("Failed to connect to peer: {}", e))
+                                })?;
                             let scope = format!("internal:get_shard:{}/{}", object_hash, i);
-                            let token = jwt_manager.mint_token("internal".to_string(), vec![scope], 0).map_err(|e| Status::internal(e.to_string()))?;
-                            let mut req = tonic::Request::new(GetShardRequest { object_hash: object_hash.clone(), shard_index: i as u32 });
-                            req.metadata_mut().insert("authorization", format!("Bearer {}", token).parse().unwrap());
+                            let token = jwt_manager
+                                .mint_token("internal".to_string(), vec![scope], 0)
+                                .map_err(|e| Status::internal(e.to_string()))?;
+                            let mut req = tonic::Request::new(GetShardRequest {
+                                object_hash: object_hash.clone(),
+                                shard_index: i as u32,
+                            });
+                            req.metadata_mut().insert(
+                                "authorization",
+                                format!("Bearer {}", token).parse().unwrap(),
+                            );
                             let mut stream = client.get_shard(req).await?.into_inner();
                             let mut shard_data = Vec::new();
-                            while let Some(chunk_res) = stream.next().await { let chunk = chunk_res?; shard_data.extend_from_slice(&chunk.data); }
+                            while let Some(chunk_res) = stream.next().await {
+                                let chunk = chunk_res?;
+                                shard_data.extend_from_slice(&chunk.data);
+                            }
                             Ok((i, shard_data))
                         });
-                    } else { let _ = tx.send(Err(Status::not_found("Object data unavailable: peer missing from cluster"))).await; return; }
+                    } else {
+                        let _ = tx
+                            .send(Err(Status::not_found(
+                                "Object data unavailable: peer missing from cluster",
+                            )))
+                            .await;
+                        return;
+                    }
                 }
             }
 
-            let results: Vec<Result<(usize, Vec<u8>), Status>> = futures::future::join_all(missing_shards_futures).await;
-            for result in results { match result { Ok((index, data)) => shards[index] = Some(data), Err(e) => { let _ = tx.send(Err(e)).await; return; } } }
+            let results: Vec<Result<(usize, Vec<u8>), Status>> =
+                futures::future::join_all(missing_shards_futures).await;
+            for result in results {
+                match result {
+                    Ok((index, data)) => shards[index] = Some(data),
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                }
+            }
 
-            if app_state.sharder.reconstruct(&mut shards, &app_state.encryption_key).is_err() { let _ = tx.send(Err(Status::internal("Failed to reconstruct object data"))).await; return; }
+            if app_state
+                .sharder
+                .reconstruct(&mut shards, &app_state.encryption_key)
+                .is_err()
+            {
+                let _ = tx
+                    .send(Err(Status::internal("Failed to reconstruct object data")))
+                    .await;
+                return;
+            }
 
             // Stream reconstructed data in 64KB chunks
             let mut full_data = Vec::new();
             let data_shards = &shards[..app_state.sharder.data_shards()];
             for data_shard_opt in data_shards {
-                if let Some(sd) = data_shard_opt { full_data.extend_from_slice(sd); } else { let _ = tx.send(Err(Status::internal("Failed to reconstruct data"))).await; return; }
+                if let Some(sd) = data_shard_opt {
+                    full_data.extend_from_slice(sd);
+                } else {
+                    let _ = tx
+                        .send(Err(Status::internal("Failed to reconstruct data")))
+                        .await;
+                    return;
+                }
             }
             full_data.truncate(object_clone.size as usize);
-            for chunk in full_data.chunks(1024 * 64) { if tx.send(Ok(chunk.to_vec())).await.is_err() { break; } }
+            for chunk in full_data.chunks(1024 * 64) {
+                if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                    break;
+                }
+            }
         });
 
         Ok((object, Box::pin(ReceiverStream::new(rx))))
@@ -388,13 +493,15 @@ impl ObjectManager {
         let bucket = self
             .db
             .get_bucket_by_name(tenant_id, bucket_name, &self.region)
-            .await.map_err(|e| Status::internal(e.to_string()))?
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
 
         let object = self
             .db
             .soft_delete_object(bucket.id, object_key)
-            .await.map_err(|e| Status::internal(e.to_string()))?
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Object not found"))?;
 
         let payload = serde_json::json!({
@@ -405,7 +512,8 @@ impl ObjectManager {
         });
         self.db
             .enqueue_task(TaskType::DeleteObject, payload, 100)
-            .await.map_err(|e| Status::internal(e.to_string()))?;
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(())
     }
@@ -424,7 +532,9 @@ impl ObjectManager {
         }
 
         // Allow public buckets to bypass auth; otherwise require appropriate scope
-        let bucket = self.get_authorized_bucket(claims.as_ref(), bucket_name).await?;
+        let bucket = self
+            .get_authorized_bucket(claims.as_ref(), bucket_name)
+            .await?;
         if !bucket.is_public_read {
             let claims = claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
             let resource = format!("bucket:{}/{}", bucket_name, object_key);
@@ -435,7 +545,8 @@ impl ObjectManager {
 
         self.db
             .get_object(bucket.id, object_key)
-            .await.map_err(|e| Status::internal(e.to_string()))?
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Object not found"))
     }
 
@@ -453,7 +564,9 @@ impl ObjectManager {
         }
 
         // Allow public buckets to bypass auth; otherwise require appropriate scope
-        let bucket = self.get_authorized_bucket(claims.as_ref(), bucket_name).await?;
+        let bucket = self
+            .get_authorized_bucket(claims.as_ref(), bucket_name)
+            .await?;
         if !bucket.is_public_read {
             let claims = claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
             let resource = format!("bucket:{}", bucket_name);
@@ -470,7 +583,8 @@ impl ObjectManager {
                 if limit == 0 { 1000 } else { limit },
                 delimiter,
             )
-            .await.map_err(|e| Status::internal(e.to_string()))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))
     }
 
     async fn get_authorized_bucket(
@@ -482,12 +596,14 @@ impl ObjectManager {
             Some(c) => self
                 .db
                 .get_bucket_by_name(c.tenant_id, bucket_name, &self.region)
-                .await.map_err(|e| Status::internal(e.to_string()))?
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
                 .ok_or_else(|| Status::not_found("Bucket not found for this tenant")),
             None => self
                 .db
                 .get_public_bucket_by_name(bucket_name)
-                .await.map_err(|e| Status::internal(e.to_string()))?
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
                 .ok_or_else(|| Status::not_found("Public bucket not found")),
         }
     }

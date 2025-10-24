@@ -1,13 +1,13 @@
+use crate::AppState;
 use crate::auth::Claims;
 use crate::s3_auth::sigv4_auth;
-use crate::AppState;
 use axum::{
+    Router,
     body::Body,
     extract::{Path, Query, Request, State},
     middleware,
     response::{IntoResponse, Response},
     routing::{get, put},
-    Router,
 };
 use futures_util::stream::StreamExt;
 use std::collections::HashMap;
@@ -31,14 +31,19 @@ pub fn app(state: AppState) -> Router {
         .with_state(state.clone());
 
     let s3_routes = Router::new()
-        .route("/{bucket}", put(create_bucket).head(head_bucket).get(list_objects))
+        .route(
+            "/{bucket}",
+            put(create_bucket).head(head_bucket).get(list_objects),
+        )
         .route("/{bucket}/", get(list_objects))
-        .route("/{bucket}/{*path}", get(get_object).put(put_object).head(head_object))
+        .route(
+            "/{bucket}/{*path}",
+            get(get_object).put(put_object).head(head_object),
+        )
         .with_state(state.clone())
         .route_layer(middleware::from_fn_with_state(state.clone(), sigv4_auth));
 
     public.merge(s3_routes)
-
 }
 async fn health_check() -> impl IntoResponse {
     (axum::http::StatusCode::OK, "OK")
@@ -58,7 +63,11 @@ async fn create_bucket(
     let claims = match claims {
         Some(c) => c,
         None => {
-            return s3_error("AccessDenied", "Missing credentials", axum::http::StatusCode::FORBIDDEN);
+            return s3_error(
+                "AccessDenied",
+                "Missing credentials",
+                axum::http::StatusCode::FORBIDDEN,
+            );
         }
     };
     match state
@@ -68,10 +77,26 @@ async fn create_bucket(
     {
         Ok(_) => (axum::http::StatusCode::OK, "").into_response(),
         Err(status) => match status.code() {
-            tonic::Code::AlreadyExists => s3_error("BucketAlreadyExists", status.message(), axum::http::StatusCode::CONFLICT),
-            tonic::Code::PermissionDenied => s3_error("AccessDenied", status.message(), axum::http::StatusCode::FORBIDDEN),
-            tonic::Code::InvalidArgument => s3_error("InvalidArgument", status.message(), axum::http::StatusCode::BAD_REQUEST),
-            _ => s3_error("InternalError", status.message(), axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+            tonic::Code::AlreadyExists => s3_error(
+                "BucketAlreadyExists",
+                status.message(),
+                axum::http::StatusCode::CONFLICT,
+            ),
+            tonic::Code::PermissionDenied => s3_error(
+                "AccessDenied",
+                status.message(),
+                axum::http::StatusCode::FORBIDDEN,
+            ),
+            tonic::Code::InvalidArgument => s3_error(
+                "InvalidArgument",
+                status.message(),
+                axum::http::StatusCode::BAD_REQUEST,
+            ),
+            _ => s3_error(
+                "InternalError",
+                status.message(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ),
         },
     }
 }
@@ -91,12 +116,16 @@ async fn head_bucket(
     {
         Ok(_) => (axum::http::StatusCode::OK, "").into_response(),
         Err(status) => match status.code() {
-            tonic::Code::NotFound => {
-                s3_error("NoSuchBucket", status.message(), axum::http::StatusCode::NOT_FOUND)
-            }
-            tonic::Code::PermissionDenied => {
-                s3_error("AccessDenied", status.message(), axum::http::StatusCode::FORBIDDEN)
-            }
+            tonic::Code::NotFound => s3_error(
+                "NoSuchBucket",
+                status.message(),
+                axum::http::StatusCode::NOT_FOUND,
+            ),
+            tonic::Code::PermissionDenied => s3_error(
+                "AccessDenied",
+                status.message(),
+                axum::http::StatusCode::FORBIDDEN,
+            ),
             _ => s3_error(
                 "InternalError",
                 status.message(),
@@ -175,13 +204,29 @@ async fn list_objects(
         Err(status) => match status.code() {
             tonic::Code::NotFound => {
                 if req.extensions().get::<Claims>().is_none() {
-                    s3_error("AccessDenied", status.message(), axum::http::StatusCode::FORBIDDEN)
+                    s3_error(
+                        "AccessDenied",
+                        status.message(),
+                        axum::http::StatusCode::FORBIDDEN,
+                    )
                 } else {
-                    s3_error("NoSuchBucket", status.message(), axum::http::StatusCode::NOT_FOUND)
+                    s3_error(
+                        "NoSuchBucket",
+                        status.message(),
+                        axum::http::StatusCode::NOT_FOUND,
+                    )
                 }
             }
-            tonic::Code::PermissionDenied => s3_error("AccessDenied", status.message(), axum::http::StatusCode::FORBIDDEN),
-            _ => s3_error("InternalError", status.message(), axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+            tonic::Code::PermissionDenied => s3_error(
+                "AccessDenied",
+                status.message(),
+                axum::http::StatusCode::FORBIDDEN,
+            ),
+            _ => s3_error(
+                "InternalError",
+                status.message(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ),
         },
     }
 }
@@ -229,13 +274,29 @@ async fn get_object(
         Err(status) => match status.code() {
             tonic::Code::NotFound => {
                 if req.extensions().get::<Claims>().is_none() {
-                    s3_error("AccessDenied", status.message(), axum::http::StatusCode::FORBIDDEN)
+                    s3_error(
+                        "AccessDenied",
+                        status.message(),
+                        axum::http::StatusCode::FORBIDDEN,
+                    )
                 } else {
-                    s3_error("NoSuchKey", status.message(), axum::http::StatusCode::NOT_FOUND)
+                    s3_error(
+                        "NoSuchKey",
+                        status.message(),
+                        axum::http::StatusCode::NOT_FOUND,
+                    )
                 }
             }
-            tonic::Code::PermissionDenied => s3_error("AccessDenied", status.message(), axum::http::StatusCode::FORBIDDEN),
-            _ => s3_error("InternalError", status.message(), axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+            tonic::Code::PermissionDenied => s3_error(
+                "AccessDenied",
+                status.message(),
+                axum::http::StatusCode::FORBIDDEN,
+            ),
+            _ => s3_error(
+                "InternalError",
+                status.message(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ),
         },
     }
 }
@@ -248,7 +309,11 @@ async fn put_object(
     let claims = match req.extensions().get::<Claims>().cloned() {
         Some(c) => c,
         None => {
-            return s3_error("AccessDenied", "Missing credentials", axum::http::StatusCode::FORBIDDEN);
+            return s3_error(
+                "AccessDenied",
+                "Missing credentials",
+                axum::http::StatusCode::FORBIDDEN,
+            );
         }
     };
 
@@ -268,9 +333,21 @@ async fn put_object(
             .body(Body::empty())
             .unwrap(),
         Err(status) => match status.code() {
-            tonic::Code::NotFound => s3_error("NoSuchBucket", status.message(), axum::http::StatusCode::NOT_FOUND),
-            tonic::Code::PermissionDenied => s3_error("AccessDenied", status.message(), axum::http::StatusCode::FORBIDDEN),
-            _ => s3_error("InternalError", status.message(), axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+            tonic::Code::NotFound => s3_error(
+                "NoSuchBucket",
+                status.message(),
+                axum::http::StatusCode::NOT_FOUND,
+            ),
+            tonic::Code::PermissionDenied => s3_error(
+                "AccessDenied",
+                status.message(),
+                axum::http::StatusCode::FORBIDDEN,
+            ),
+            _ => s3_error(
+                "InternalError",
+                status.message(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ),
         },
     }
 }
@@ -282,7 +359,11 @@ async fn head_object(
 ) -> Response {
     let claims = req.extensions().get::<Claims>().cloned();
 
-    match state.object_manager.head_object(claims, &bucket, &key).await {
+    match state
+        .object_manager
+        .head_object(claims, &bucket, &key)
+        .await
+    {
         Ok(object) => Response::builder()
             .status(200)
             .header("Content-Type", object.content_type.unwrap_or_default())
@@ -293,13 +374,29 @@ async fn head_object(
         Err(status) => match status.code() {
             tonic::Code::NotFound => {
                 if req.extensions().get::<Claims>().is_none() {
-                    s3_error("AccessDenied", status.message(), axum::http::StatusCode::FORBIDDEN)
+                    s3_error(
+                        "AccessDenied",
+                        status.message(),
+                        axum::http::StatusCode::FORBIDDEN,
+                    )
                 } else {
-                    s3_error("NoSuchKey", status.message(), axum::http::StatusCode::NOT_FOUND)
+                    s3_error(
+                        "NoSuchKey",
+                        status.message(),
+                        axum::http::StatusCode::NOT_FOUND,
+                    )
                 }
             }
-            tonic::Code::PermissionDenied => s3_error("AccessDenied", status.message(), axum::http::StatusCode::FORBIDDEN),
-            _ => s3_error("InternalError", status.message(), axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+            tonic::Code::PermissionDenied => s3_error(
+                "AccessDenied",
+                status.message(),
+                axum::http::StatusCode::FORBIDDEN,
+            ),
+            _ => s3_error(
+                "InternalError",
+                status.message(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ),
         },
     }
 }

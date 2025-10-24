@@ -15,8 +15,12 @@ async fn test_distributed_reconstruction_on_node_failure() {
     cluster.start_and_converge(Duration::from_secs(20)).await;
 
     let primary_addr = cluster.grpc_addrs[0].clone(); // already includes /grpc
-    let mut object_client = ObjectServiceClient::connect(primary_addr.clone()).await.unwrap();
-    let mut bucket_client = BucketServiceClient::connect(primary_addr.clone()).await.unwrap();
+    let mut object_client = ObjectServiceClient::connect(primary_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(primary_addr.clone())
+        .await
+        .unwrap();
 
     let bucket_name = "reconstruction-bucket".to_string();
     let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
@@ -27,7 +31,10 @@ async fn test_distributed_reconstruction_on_node_failure() {
         "authorization",
         format!("Bearer {}", cluster.token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_bucket_req).await.unwrap();
+    bucket_client
+        .create_bucket(create_bucket_req)
+        .await
+        .unwrap();
 
     let object_key = "reconstruction-object".to_string();
     let content = (0..1024 * 256).map(|i| (i % 256) as u8).collect::<Vec<_>>();
@@ -38,11 +45,15 @@ async fn test_distributed_reconstruction_on_node_failure() {
         object_key: object_key.clone(),
     };
     let mut chunks = vec![PutObjectRequest {
-        data: Some(anvil::anvil_api::put_object_request::Data::Metadata(metadata)),
+        data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+            metadata,
+        )),
     }];
     for chunk in content.chunks(1024 * 64) {
         chunks.push(PutObjectRequest {
-            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(chunk.to_vec())),
+            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                chunk.to_vec(),
+            )),
         });
     }
     let mut put_req = Request::new(tokio_stream::iter(chunks));
@@ -69,25 +80,26 @@ async fn test_distributed_reconstruction_on_node_failure() {
         }
     };
 
-
     let mut stream = {
         let mut attempt = 0;
         loop {
-    // 4. Get the object and verify its content
-    let mut get_req = Request::new(GetObjectRequest {
-        bucket_name: bucket_name.clone(),
-        object_key: object_key.clone(),
-        version_id: None,
-    });
-    get_req.metadata_mut().insert(
-        "authorization",
-        format!("Bearer {}", cluster.token).parse().unwrap(),
-    );
+            // 4. Get the object and verify its content
+            let mut get_req = Request::new(GetObjectRequest {
+                bucket_name: bucket_name.clone(),
+                object_key: object_key.clone(),
+                version_id: None,
+            });
+            get_req.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", cluster.token).parse().unwrap(),
+            );
             match timeout(Duration::from_secs(10), recovery_client.get_object(get_req)).await {
                 Ok(Ok(resp)) => break resp.into_inner(),
                 _ => {
                     attempt += 1;
-                    if attempt > 8 { panic!("get_object timed out or unavailable"); }
+                    if attempt > 8 {
+                        panic!("get_object timed out or unavailable");
+                    }
                     tokio::time::sleep(Duration::from_millis(150)).await;
                     continue;
                 }
@@ -97,11 +109,9 @@ async fn test_distributed_reconstruction_on_node_failure() {
 
     let mut downloaded_data = Vec::new();
     if let Some(Ok(first_chunk)) = stream.next().await {
-        if let Some(anvil::anvil_api::get_object_response::Data::Metadata(_)) = first_chunk.data
-        {
+        if let Some(anvil::anvil_api::get_object_response::Data::Metadata(_)) = first_chunk.data {
             while let Some(Ok(chunk)) = stream.next().await {
-                if let Some(anvil::anvil_api::get_object_response::Data::Chunk(bytes)) =
-                    chunk.data
+                if let Some(anvil::anvil_api::get_object_response::Data::Chunk(bytes)) = chunk.data
                 {
                     downloaded_data.extend_from_slice(&bytes);
                 }

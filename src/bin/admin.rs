@@ -2,9 +2,8 @@ use anvil::crypto;
 use anvil::persistence::Persistence;
 use anvil::{create_pool, migrations, run_migrations};
 use clap::{Parser, Subcommand};
-
+use tracing::info;
 // Import the shared config
-
 
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
@@ -22,7 +21,7 @@ struct SharedConfig {
     pub global_database_url: String,
 
     #[arg(long, env)]
-    pub worka_secret_encryption_key: String,
+    pub anvil_secret_encryption_key: String,
 }
 
 #[derive(Subcommand)]
@@ -102,13 +101,13 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     let persistence = Persistence::new(global_pool, regional_pool);
-    let encryption_key = hex::decode(config.worka_secret_encryption_key)?;
+    let encryption_key = hex::decode(config.anvil_secret_encryption_key)?;
 
     match &cli.command {
         Commands::Tenants { command } => match command {
             TenantCommands::Create { name } => {
                 let tenant = persistence.create_tenant(name, "admin-created-key").await?;
-                println!("Created tenant: {} (ID: {})", tenant.name, tenant.id);
+                info!("Created tenant: {} (ID: {})", tenant.name, tenant.id);
             }
         },
         Commands::Apps { command } => match command {
@@ -136,8 +135,8 @@ async fn main() -> anyhow::Result<()> {
                     .create_app(tenant.id, app_name, &client_id, &encrypted_secret)
                     .await?;
                 println!("Created app: {} (ID: {})", app.name, app.id);
-                println!("  Client ID: {}", client_id);
-                println!("  Client Secret: {}", client_secret);
+                println!("Client ID: {}", client_id);
+                println!("Client Secret: {}", client_secret);
             }
         },
         Commands::Policies { command } => match command {
@@ -151,7 +150,7 @@ async fn main() -> anyhow::Result<()> {
                     .await?
                     .expect("App not found");
                 persistence.grant_policy(app.id, resource, action).await?;
-                println!(
+                info!(
                     "Granted action '{}' on resource '{}' to app '{}'",
                     action, resource, app_name
                 );
@@ -161,9 +160,9 @@ async fn main() -> anyhow::Result<()> {
             RegionCommands::Create { name } => {
                 let created = persistence.create_region(name).await?;
                 if created {
-                    println!("Created region: {}", name);
+                    info!("Created region: {}", name);
                 } else {
-                    println!("Region already exists: {}", name);
+                    info!("Region already exists: {}", name);
                 }
             }
         },

@@ -16,7 +16,12 @@ impl BucketService for AppState {
         let req = request.get_ref();
 
         self.bucket_manager
-            .create_bucket(claims.tenant_id, &req.bucket_name, &req.region, &claims.scopes)
+            .create_bucket(
+                claims.tenant_id,
+                &req.bucket_name,
+                &req.region,
+                &claims.scopes,
+            )
             .await?;
 
         Ok(Response::new(CreateBucketResponse {}))

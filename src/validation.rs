@@ -1,6 +1,5 @@
-
-use regex::Regex;
 use lazy_static::lazy_static;
+use regex::Regex;
 
 lazy_static! {
     // Restrictive regex for bucket names. Allows only lowercase letters, numbers, hyphens and dots.

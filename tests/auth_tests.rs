@@ -1,7 +1,10 @@
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
-use anvil::anvil_api::{CreateBucketRequest, GetAccessTokenRequest, GetObjectRequest, GrantAccessRequest, ObjectMetadata, PutObjectRequest, RevokeAccessRequest, SetPublicAccessRequest};
+use anvil::anvil_api::{
+    CreateBucketRequest, GetAccessTokenRequest, GetObjectRequest, GrantAccessRequest,
+    ObjectMetadata, PutObjectRequest, RevokeAccessRequest, SetPublicAccessRequest,
+};
 use std::time::Duration;
 use tonic::Request;
 
@@ -11,11 +14,18 @@ mod common;
 fn create_app(global_db_url: &str, app_name: &str) -> (String, String) {
     let admin_args = &["run", "--bin", "admin", "--"];
     let app_output = std::process::Command::new("cargo")
-        .args(
-            admin_args
-                .iter()
-                .chain(&["--global-database-url", global_db_url, "--worka-secret-encryption-key", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "apps", "create", "--tenant-name", "default", "--app-name", app_name]),
-        )
+        .args(admin_args.iter().chain(&[
+            "--global-database-url",
+            global_db_url,
+            "--anvil-secret-encryption-key",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "apps",
+            "create",
+            "--tenant-name",
+            "default",
+            "--app-name",
+            app_name,
+        ]))
         .output()
         .unwrap();
     assert!(app_output.status.success());
@@ -56,7 +66,6 @@ async fn try_get_token_for_scopes(
         .map(|r| r.into_inner().access_token)
 }
 
-
 #[tokio::test]
 async fn test_grant_and_revoke_access() {
     let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
@@ -65,8 +74,9 @@ async fn test_grant_and_revoke_access() {
     let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
         .await
         .unwrap();
-    
-    let (granter_client_id, granter_client_secret) = create_app(&cluster.global_db_url, "granter-app");
+
+    let (granter_client_id, granter_client_secret) =
+        create_app(&cluster.global_db_url, "granter-app");
 
     let admin_args = &["run", "--bin", "admin", "--"];
     let policy_args = &[
@@ -80,14 +90,30 @@ async fn test_grant_and_revoke_access() {
         "*",
     ];
     let status = std::process::Command::new("cargo")
-        .args(admin_args.iter().chain(&["--global-database-url", &cluster.global_db_url, "--worka-secret-encryption-key", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]).chain(policy_args.iter()))
+        .args(
+            admin_args
+                .iter()
+                .chain(&[
+                    "--global-database-url",
+                    &cluster.global_db_url,
+                    "--anvil-secret-encryption-key",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ])
+                .chain(policy_args.iter()),
+        )
         .status()
         .unwrap();
     assert!(status.success());
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let granter_token = get_token_for_scopes(&cluster.grpc_addrs[0], &granter_client_id, &granter_client_secret, vec!["*".to_string()]).await;
+    let granter_token = get_token_for_scopes(
+        &cluster.grpc_addrs[0],
+        &granter_client_id,
+        &granter_client_secret,
+        vec!["*".to_string()],
+    )
+    .await;
 
     let (grantee_client_id, grantee_client_secret) =
         create_app(&cluster.global_db_url, "grantee-app");
@@ -151,12 +177,14 @@ async fn test_set_public_access_and_get() {
     let mut object_client = ObjectServiceClient::connect(cluster.grpc_addrs[0].clone())
         .await
         .unwrap();
-    let mut bucket_client = BucketServiceClient::connect(cluster.grpc_addrs[0].clone()).await.unwrap();
+    let mut bucket_client = BucketServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
 
     let token = cluster.token.clone();
     let bucket_name = "public-access-bucket".to_string();
     let object_key = "public-object".to_string();
-    
+
     let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
         region: "TEST_REGION".to_string(),
@@ -165,7 +193,10 @@ async fn test_set_public_access_and_get() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_bucket_req).await.unwrap();
+    bucket_client
+        .create_bucket(create_bucket_req)
+        .await
+        .unwrap();
 
     // Put an object
     let metadata = ObjectMetadata {

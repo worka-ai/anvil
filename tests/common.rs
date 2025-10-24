@@ -1,6 +1,6 @@
-use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::GetAccessTokenRequest;
-use anvil::{run_migrations, AppState};
+use anvil::anvil_api::auth_service_client::AuthServiceClient;
+use anvil::{AppState, run_migrations};
 use anyhow::Result;
 use deadpool_postgres::{ManagerConfig, Pool, RecyclingMethod};
 use futures_util::StreamExt;
@@ -54,7 +54,7 @@ pub async fn get_auth_token(global_db_url: &str, grpc_addr: &str) -> String {
             "--global-database-url",
             global_db_url,
             // Provide a dummy key since the admin tool now requires it.
-            "--worka-secret-encryption-key",
+            "--anvil-secret-encryption-key",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "apps",
             "create",
@@ -73,7 +73,7 @@ pub async fn get_auth_token(global_db_url: &str, grpc_addr: &str) -> String {
     let policy_args = &[
         "--global-database-url",
         global_db_url,
-        "--worka-secret-encryption-key",
+        "--anvil-secret-encryption-key",
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "policies",
         "grant",
@@ -94,10 +94,12 @@ pub async fn get_auth_token(global_db_url: &str, grpc_addr: &str) -> String {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Ensure auth client uses gRPC path under /grpc
-    let grpc_url = if grpc_addr.ends_with("/grpc") { grpc_addr.to_string() } else { format!("{}/grpc", grpc_addr.trim_end_matches('/')) };
-    let mut auth_client = AuthServiceClient::connect(grpc_url)
-        .await
-        .unwrap();
+    let grpc_url = if grpc_addr.ends_with("/grpc") {
+        grpc_addr.to_string()
+    } else {
+        format!("{}/grpc", grpc_addr.trim_end_matches('/'))
+    };
+    let mut auth_client = AuthServiceClient::connect(grpc_url).await.unwrap();
     let token_res = auth_client
         .get_access_token(GetAccessTokenRequest {
             client_id,
@@ -129,8 +131,10 @@ impl TestCluster {
         let config = Arc::new(Config {
             global_database_url: "".to_string(), // Will be replaced by create_isolated_dbs
             regional_database_url: "".to_string(), // Will be replaced by create_isolated_dbs
+            cluster_secret: Some("test-cluster-secret".to_string()),
             jwt_secret: "test-secret".to_string(),
-            worka_secret_encryption_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            anvil_secret_encryption_key:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             http_bind_addr: "127.0.0.1:0".to_string(),
             quic_bind_addr: "/ip4/127.0.0.1/udp/0/quic-v1".to_string(),
             public_addrs: vec![],
@@ -208,7 +212,11 @@ impl TestCluster {
     pub async fn start_and_converge(&mut self, timeout: Duration) {
         let mut swarms = Vec::new();
         for _ in 0..self.states.len() {
-            swarms.push(anvil::cluster::create_swarm(self.config.clone()).await.unwrap());
+            swarms.push(
+                anvil::cluster::create_swarm(self.config.clone())
+                    .await
+                    .unwrap(),
+            );
         }
 
         let mut listen_addrs = Vec::new();

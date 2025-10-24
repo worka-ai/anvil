@@ -13,25 +13,29 @@ use axum::{
 use http_body_util::BodyExt;
 
 use aws_credential_types::Credentials;
-use aws_smithy_runtime_api::client::identity::Identity;
 use aws_sigv4::http_request::{
-    sign, PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SignatureLocation,
-    SigningParams, SigningSettings, UriPathNormalizationMode,
+    PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SignatureLocation,
+    SigningParams, SigningSettings, UriPathNormalizationMode, sign,
 };
 use aws_sigv4::sign::v4;
+use aws_smithy_runtime_api::client::identity::Identity;
 
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use time::{Date, Month, PrimitiveDateTime, Time as Tm};
 
-use crate::{auth::Claims, crypto, AppState};
+use crate::{AppState, auth::Claims, crypto};
 use tracing::{debug, info, warn};
 
 pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let (parts, body) = req.into_parts();
 
     // Skip SigV4 for gRPC requests to avoid interfering with tonic
-    if let Some(ct) = parts.headers.get(http::header::CONTENT_TYPE).and_then(|h| h.to_str().ok()) {
+    if let Some(ct) = parts
+        .headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+    {
         if ct.starts_with("application/grpc") {
             let req = Request::from_parts(parts, body);
             return next.run(req).await;
@@ -94,7 +98,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
             return Response::builder()
                 .status(400)
                 .body(Body::from(format!("Invalid Authorization header: {e}")))
-                .unwrap()
+                .unwrap();
         }
     };
 
@@ -106,20 +110,21 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
             return Response::builder()
                 .status(403)
                 .body(Body::from("Invalid access key"))
-                .unwrap()
+                .unwrap();
         }
     };
 
-    let encryption_key = hex::decode(&state.config.worka_secret_encryption_key)
-        .expect("WORKA_SECRET_ENCRYPTION_KEY must be a valid hex string");
-    let secret_bytes = match crypto::decrypt(&app_details.client_secret_encrypted, &encryption_key) {
+    let encryption_key = hex::decode(&state.config.anvil_secret_encryption_key)
+        .expect("ANVIL_SECRET_ENCRYPTION_KEY must be a valid hex string");
+    let secret_bytes = match crypto::decrypt(&app_details.client_secret_encrypted, &encryption_key)
+    {
         Ok(s) => s,
         Err(_) => {
             warn!(access_key_id = %parsed.access_key_id, "Failed to decrypt secret for SigV4 auth");
             return Response::builder()
                 .status(500)
                 .body(Body::from("Failed to decrypt secret"))
-                .unwrap()
+                .unwrap();
         }
     };
     let secret = match String::from_utf8(secret_bytes) {
@@ -129,7 +134,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
             return Response::builder()
                 .status(500)
                 .body(Body::from("Decrypted secret is not valid UTF-8"))
-                .unwrap()
+                .unwrap();
         }
     };
 
@@ -154,7 +159,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
                     return Response::builder()
                         .status(400)
                         .body(Body::from("Missing or invalid X-Amz-Date"))
-                        .unwrap()
+                        .unwrap();
                 }
             }
         }
@@ -167,7 +172,11 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("localhost");
     let scheme = detect_scheme(&parts.headers);
-    let path_q = parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let path_q = parts
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
     let absolute_url = format!("{scheme}://{host}{path_q}");
 
     // S3 canonicalization settings
@@ -201,11 +210,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
     };
 
     // Only include headers that the client actually signed (from SignedHeaders=...)
-    let signed_set: HashSet<&str> = parsed
-        .signed_headers
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
+    let signed_set: HashSet<&str> = parsed.signed_headers.iter().map(|s| s.as_str()).collect();
 
     let headers_iter = parts.headers.iter().filter_map(|(k, v)| {
         let name = k.as_str();
@@ -231,7 +236,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
             return Response::builder()
                 .status(400)
                 .body(Body::from(format!("Bad request for signing: {e}")))
-                .unwrap()
+                .unwrap();
         }
     };
 
@@ -243,7 +248,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
             return Response::builder()
                 .status(403)
                 .body(Body::from("Signature verification failed"))
-                .unwrap()
+                .unwrap();
         }
     };
     let (_instr, computed_sig) = out.into_parts();
@@ -266,7 +271,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
             return Response::builder()
                 .status(500)
                 .body(Body::from("Failed to fetch policies"))
-                .unwrap()
+                .unwrap();
         }
     };
 
@@ -294,7 +299,9 @@ struct ParsedAuth {
 
 // Parse: AWS4-HMAC-SHA256 Credential=AKID/DATE/REGION/SERVICE/aws4_request, SignedHeaders=..., Signature=...
 fn parse_auth_header(h: &str) -> Result<ParsedAuth, &'static str> {
-    let after = h.strip_prefix("AWS4-HMAC-SHA256 ").ok_or("missing prefix")?;
+    let after = h
+        .strip_prefix("AWS4-HMAC-SHA256 ")
+        .ok_or("missing prefix")?;
     let mut credential = None;
     let mut signature = None;
     let mut signed_headers = None;

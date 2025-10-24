@@ -1,6 +1,9 @@
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
-use anvil::anvil_api::{CreateBucketRequest, DeleteObjectRequest, HeadObjectRequest, ListObjectsRequest, ObjectMetadata, PutObjectRequest};
+use anvil::anvil_api::{
+    CreateBucketRequest, DeleteObjectRequest, HeadObjectRequest, ListObjectsRequest,
+    ObjectMetadata, PutObjectRequest,
+};
 use anvil::tasks::{TaskStatus, TaskType};
 use std::time::Duration;
 use tonic::Request;
@@ -14,12 +17,16 @@ async fn test_delete_object_soft_deletes_and_enqueues_task() {
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
-    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone()).await.unwrap();
-    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone()).await.unwrap();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
 
     let bucket_name = "test-delete-bucket".to_string();
     let object_key = "test-delete-object".to_string();
-    
+
     let mut create_req = Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
         region: "TEST_REGION".to_string(),
@@ -37,10 +44,14 @@ async fn test_delete_object_soft_deletes_and_enqueues_task() {
     };
     let chunks = vec![
         PutObjectRequest {
-            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(metadata)),
+            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                metadata,
+            )),
         },
         PutObjectRequest {
-            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(b"delete me".to_vec())),
+            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                b"delete me".to_vec(),
+            )),
         },
     ];
     let mut put_req = Request::new(tokio_stream::iter(chunks));
@@ -59,7 +70,11 @@ async fn test_delete_object_soft_deletes_and_enqueues_task() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    let list_res = object_client.list_objects(list_req).await.unwrap().into_inner();
+    let list_res = object_client
+        .list_objects(list_req)
+        .await
+        .unwrap()
+        .into_inner();
     assert_eq!(list_res.objects.len(), 1);
 
     // 3. Delete the object
@@ -113,13 +128,17 @@ async fn test_head_object() {
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
-    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone()).await.unwrap();
-    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone()).await.unwrap();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
 
     let bucket_name = "test-head-bucket".to_string();
     let object_key = "test-head-object".to_string();
     let content = b"hello head";
-    
+
     let mut create_req = Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
         region: "TEST_REGION".to_string(),
@@ -137,10 +156,14 @@ async fn test_head_object() {
     };
     let chunks = vec![
         PutObjectRequest {
-            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(metadata)),
+            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                metadata,
+            )),
         },
         PutObjectRequest {
-            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(content.to_vec())),
+            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                content.to_vec(),
+            )),
         },
     ];
     let mut put_req = Request::new(tokio_stream::iter(chunks));
@@ -148,7 +171,11 @@ async fn test_head_object() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    let put_res = object_client.put_object(put_req).await.unwrap().into_inner();
+    let put_res = object_client
+        .put_object(put_req)
+        .await
+        .unwrap()
+        .into_inner();
 
     // 2. Head the object
     let mut head_req = Request::new(HeadObjectRequest {
@@ -160,7 +187,11 @@ async fn test_head_object() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    let head_res = object_client.head_object(head_req).await.unwrap().into_inner();
+    let head_res = object_client
+        .head_object(head_req)
+        .await
+        .unwrap()
+        .into_inner();
 
     // 3. Assert metadata is correct
     assert_eq!(head_res.etag, put_res.etag);
@@ -174,8 +205,12 @@ async fn test_list_objects_with_delimiter() {
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
-    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone()).await.unwrap();
-    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone()).await.unwrap();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
 
     let bucket_name = "test-delimiter-bucket".to_string();
     let mut create_req = Request::new(CreateBucketRequest {
@@ -196,10 +231,14 @@ async fn test_list_objects_with_delimiter() {
         };
         let chunks = vec![
             PutObjectRequest {
-                data: Some(anvil::anvil_api::put_object_request::Data::Metadata(metadata)),
+                data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                    metadata,
+                )),
             },
             PutObjectRequest {
-                data: Some(anvil::anvil_api::put_object_request::Data::Chunk(b"...".to_vec())),
+                data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                    b"...".to_vec(),
+                )),
             },
         ];
         let mut put_req = Request::new(tokio_stream::iter(chunks));
@@ -221,7 +260,11 @@ async fn test_list_objects_with_delimiter() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    let list_res = object_client.list_objects(list_req).await.unwrap().into_inner();
+    let list_res = object_client
+        .list_objects(list_req)
+        .await
+        .unwrap()
+        .into_inner();
 
     assert_eq!(list_res.objects.len(), 2);
     let got_under_a: Vec<&str> = list_res.objects.iter().map(|o| o.key.as_str()).collect();
@@ -238,7 +281,11 @@ async fn test_list_objects_with_delimiter() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    let list_res_2 = object_client.list_objects(list_req_2).await.unwrap().into_inner();
+    let list_res_2 = object_client
+        .list_objects(list_req_2)
+        .await
+        .unwrap()
+        .into_inner();
 
     let top_level_objects: Vec<&str> = list_res_2.objects.iter().map(|o| o.key.as_str()).collect();
     assert_eq!(top_level_objects, vec!["d.txt"]);

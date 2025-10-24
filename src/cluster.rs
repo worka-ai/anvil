@@ -1,5 +1,7 @@
 use anyhow::Result;
+use chrono::Utc;
 use futures_util::StreamExt;
+use hmac::{Hmac, Mac};
 use libp2p::{
     PeerId, Swarm,
     gossipsub::{self, IdentTopic as Topic},
@@ -7,10 +9,12 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
 };
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use tracing::info;
 
 // Rich information about a peer in the cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +33,33 @@ pub struct ClusterMessage {
     pub peer_id: PeerId,
     pub p2p_addrs: Vec<String>,
     pub grpc_addr: String,
+    pub timestamp: i64,
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+}
+
+impl ClusterMessage {
+    // Sign the message with the given secret.
+    pub fn sign(&mut self, secret: &str) -> Result<()> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())?;
+        mac.update(&self.peer_id.to_bytes());
+        mac.update(self.p2p_addrs.join(",").as_bytes());
+        mac.update(self.grpc_addr.as_bytes());
+        mac.update(&self.timestamp.to_le_bytes());
+        self.signature = mac.finalize().into_bytes().to_vec();
+        Ok(())
+    }
+
+    // Verify the message's signature.
+    pub fn verify(&self, secret: &str) -> Result<()> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())?;
+        mac.update(&self.peer_id.to_bytes());
+        mac.update(self.p2p_addrs.join(",").as_bytes());
+        mac.update(self.grpc_addr.as_bytes());
+        mac.update(&self.timestamp.to_le_bytes());
+        mac.verify_slice(&self.signature)?;
+        Ok(())
+    }
 }
 
 // A module for custom PeerId serialization
@@ -49,6 +80,26 @@ mod serde_peer_id {
     {
         let s = String::deserialize(deserializer)?;
         s.parse().map_err(Error::custom)
+    }
+}
+
+// A module for custom byte array serialization
+mod serde_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        hex::decode(s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -122,6 +173,7 @@ pub async fn run_gossip(
     mut swarm: Swarm<ClusterBehaviour>,
     cluster_state: ClusterState,
     grpc_addr: String,
+    cluster_secret: Option<String>,
 ) -> Result<()> {
     let topic = Topic::new("anvil-cluster");
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
@@ -147,37 +199,46 @@ pub async fn run_gossip(
                     continue;
                 }
 
-                let message = ClusterMessage {
+                let mut message = ClusterMessage {
                     peer_id: local_peer_id,
                     p2p_addrs: p2p_addrs.clone(),
                     grpc_addr: grpc_addr.clone(),
+                    timestamp: Utc::now().timestamp(),
+                    signature: Vec::new(),
                 };
+
+                if let Some(secret) = &cluster_secret {
+                    if let Err(e) = message.sign(secret) {
+                        info!("[GOSSIP] Failed to sign gossip message: {:?}", e);
+                        continue;
+                    }
+                }
 
                 if let Ok(encoded_message) = serde_json::to_vec(&message) {
                     if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), encoded_message) {
-                        println!("[GOSSIP] Failed to publish gossip message: {:?}", e);
+                        info!("[GOSSIP] Failed to publish gossip message: {:?}", e);
                     }
                 }
             }
 
             event = swarm.select_next_some() => {
-                handle_swarm_event(event, &mut swarm, &cluster_state, &grpc_addr).await;
+                handle_swarm_event(event, &mut swarm, &cluster_state, &grpc_addr, &cluster_secret).await;
             }
         }
     }
 }
-
 
 pub async fn handle_swarm_event(
     event: SwarmEvent<ClusterEvent>,
     swarm: &mut Swarm<ClusterBehaviour>,
     cluster_state: &ClusterState,
     grpc_addr: &str,
+    cluster_secret: &Option<String>,
 ) {
     let local_peer_id = *swarm.local_peer_id();
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
-            println!("[GOSSIP] Listening on {address}");
+            info!("[GOSSIP] Listening on {address}");
             let mut state = cluster_state.write().await;
             let info = state.entry(local_peer_id).or_insert_with(|| PeerInfo {
                 p2p_addrs: Vec::new(),
@@ -189,19 +250,22 @@ pub async fn handle_swarm_event(
             }
         }
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-            println!("[GOSSIP] Connection established with: {peer_id}");
+            info!("[GOSSIP] Connection established with: {peer_id}");
             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
         }
         SwarmEvent::Behaviour(ClusterEvent::Mdns(mdns::Event::Discovered(list))) => {
             for (peer_id, _multiaddr) in list {
-                println!("[GOSSIP] mDNS discovered: {peer_id}");
+                info!("[GOSSIP] mDNS discovered: {peer_id}");
                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
             }
         }
         SwarmEvent::Behaviour(ClusterEvent::Mdns(mdns::Event::Expired(list))) => {
             for (peer_id, _multiaddr) in list {
-                println!("[GOSSIP] mDNS expired: {peer_id}");
-                swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                info!("[GOSSIP] mDNS expired: {peer_id}");
+                swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .remove_explicit_peer(&peer_id);
             }
         }
         SwarmEvent::Behaviour(ClusterEvent::Gossipsub(gossipsub::Event::Message {
@@ -209,12 +273,36 @@ pub async fn handle_swarm_event(
             ..
         })) => {
             if let Ok(cluster_message) = serde_json::from_slice::<ClusterMessage>(&message.data) {
-                println!("[GOSSIP] Received cluster message from peer: {}", cluster_message.peer_id);
+                if let Some(secret) = cluster_secret {
+                    if let Err(e) = cluster_message.verify(secret) {
+                        info!(
+                            "[GOSSIP] Invalid signature from peer: {}, error: {:?}",
+                            cluster_message.peer_id, e
+                        );
+                        return;
+                    }
+                    // Check timestamp to prevent replay attacks
+                    let now = Utc::now().timestamp();
+                    if (now - cluster_message.timestamp).abs() > 60 {
+                        info!(
+                            "[GOSSIP] Stale message from peer: {}, timestamp: {}",
+                            cluster_message.peer_id, cluster_message.timestamp
+                        );
+                        return;
+                    }
+                }
+
+                info!(
+                    "[GOSSIP] Received cluster message from peer: {}",
+                    cluster_message.peer_id
+                );
                 let mut state = cluster_state.write().await;
-                let info = state.entry(cluster_message.peer_id).or_insert_with(|| PeerInfo {
-                    p2p_addrs: Vec::new(),
-                    grpc_addr: cluster_message.grpc_addr,
-                });
+                let info = state
+                    .entry(cluster_message.peer_id)
+                    .or_insert_with(|| PeerInfo {
+                        p2p_addrs: Vec::new(),
+                        grpc_addr: cluster_message.grpc_addr,
+                    });
                 for addr in cluster_message.p2p_addrs {
                     if !info.p2p_addrs.contains(&addr) {
                         info.p2p_addrs.push(addr);

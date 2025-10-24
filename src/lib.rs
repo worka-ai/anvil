@@ -12,6 +12,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_postgres::NoTls;
+use tracing::{error, info};
 
 // The modules we've created
 pub mod auth;
@@ -82,7 +83,7 @@ impl AppState {
             storage.clone(),
             arc_config.region.clone(),
             jwt_manager.clone(),
-            arc_config.worka_secret_encryption_key.clone(),
+            arc_config.anvil_secret_encryption_key.clone(),
         );
 
         Ok(Self {
@@ -143,7 +144,7 @@ pub async fn start_node(
         )
         .await
         {
-            eprintln!("Worker process failed: {}", e);
+            error!("Worker process failed: {}", e);
         }
     });
 
@@ -176,18 +177,20 @@ pub async fn start_node(
     let grpc_axum = grpc_router
         .into_axum_router()
         .route_layer(axum::middleware::from_fn(middleware::save_uri_mw))
-        .route_layer(axum::middleware::from_fn(|req:axum::extract::Request, next:axum::middleware::Next| async move {
-            if req.method() == axum::http::Method::POST {
-                next.run(req).await
-            } else {
-                // Not a gRPC method; let S3 router handle it by returning 405 here
-                // The overall app has S3 merged first, so typical S3 routes match earlier.
-                axum::response::Response::builder()
-                    .status(axum::http::StatusCode::METHOD_NOT_ALLOWED)
-                    .body(axum::body::Body::empty())
-                    .unwrap()
-            }
-        }));
+        .route_layer(axum::middleware::from_fn(
+            |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                if req.method() == axum::http::Method::POST {
+                    next.run(req).await
+                } else {
+                    // Not a gRPC method; let S3 router handle it by returning 405 here
+                    // The overall app has S3 merged first, so typical S3 routes match earlier.
+                    axum::response::Response::builder()
+                        .status(axum::http::StatusCode::METHOD_NOT_ALLOWED)
+                        .body(axum::body::Body::empty())
+                        .unwrap()
+                }
+            },
+        ));
 
     let app = axum::Router::new()
         .merge(s3_gateway::app(state.clone()))
@@ -196,13 +199,14 @@ pub async fn start_node(
         .nest("/grpc", grpc_axum);
 
     let addr = listener.local_addr()?;
-    println!("Anvil server (gRPC & S3) listening on {}", addr);
+    info!("Anvil server (gRPC & S3) listening on {}", addr);
 
     // Spawn the gossip service to run in the background.
     let gossip_task = tokio::spawn(cluster::run_gossip(
         swarm,
         state.cluster.clone(),
         state.config.public_grpc_addr.clone(),
+        state.config.cluster_secret.clone(),
     ));
     let server_task =
         tokio::spawn(async move { axum::serve(listener, app.into_make_service()).await });
@@ -232,7 +236,7 @@ pub async fn run_migrations(
     let (mut client, connection) = tokio_postgres::connect(db_url, NoTls).await?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            eprintln!("connection error: {}", e);
+            error!("connection error: {}", e);
         }
     });
     runner

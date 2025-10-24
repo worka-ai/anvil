@@ -13,7 +13,9 @@ async fn test_delete_bucket_soft_deletes_and_enqueues_task() {
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
-    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone()).await.unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
 
     let bucket_name = "test-delete-bucket".to_string();
     let mut create_req = Request::new(CreateBucketRequest {
@@ -32,7 +34,11 @@ async fn test_delete_bucket_soft_deletes_and_enqueues_task() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    let list_res = bucket_client.list_buckets(list_req).await.unwrap().into_inner();
+    let list_res = bucket_client
+        .list_buckets(list_req)
+        .await
+        .unwrap()
+        .into_inner();
     assert_eq!(list_res.buckets.len(), 1);
 
     // 2. Delete the bucket
@@ -81,7 +87,9 @@ async fn test_list_buckets() {
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
-    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone()).await.unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
 
     let bucket_name1 = "list-bucket-1".to_string();
     let bucket_name2 = "list-bucket-2".to_string();
@@ -111,7 +119,11 @@ async fn test_list_buckets() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    let list_res = bucket_client.list_buckets(list_req).await.unwrap().into_inner();
+    let list_res = bucket_client
+        .list_buckets(list_req)
+        .await
+        .unwrap()
+        .into_inner();
 
     assert_eq!(list_res.buckets.len(), 2);
     assert!(list_res.buckets.iter().any(|b| b.name == bucket_name1));

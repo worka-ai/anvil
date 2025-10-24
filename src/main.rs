@@ -1,6 +1,7 @@
 use anvil::run;
 use clap::Parser;
 use std::net::SocketAddr;
+use tracing::info;
 
 mod config;
 use anvil::config::Config;
@@ -17,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("Invalid gRPC bind address");
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    println!("Anvil server (gRPC & S3) listening on {}", addr);
+    info!("Anvil server (gRPC & S3) listening on {}", addr);
 
     run(listener, config).await?;
     Ok(())

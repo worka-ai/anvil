@@ -18,8 +18,10 @@ async fn test_auth_flow_with_wildcard_scopes() {
     let admin_args = &["run", "--bin", "admin", "--"];
     let app_output = Command::new("cargo")
         .args(admin_args.iter().chain(&[
-            "--global-database-url", &global_db_url,
-            "--worka-secret-encryption-key", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--global-database-url",
+            &global_db_url,
+            "--anvil-secret-encryption-key",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "apps",
             "create",
             "--tenant-name",
@@ -45,10 +47,17 @@ async fn test_auth_flow_with_wildcard_scopes() {
         "bucket:auth-test-*",
     ];
     let status = Command::new("cargo")
-        .args(admin_args.iter().chain(&[
-            "--global-database-url", &global_db_url,
-            "--worka-secret-encryption-key", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        ]).chain(policy_args.iter()))
+        .args(
+            admin_args
+                .iter()
+                .chain(&[
+                    "--global-database-url",
+                    &global_db_url,
+                    "--anvil-secret-encryption-key",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ])
+                .chain(policy_args.iter()),
+        )
         .status()
         .unwrap();
     assert!(status.success());
@@ -67,7 +76,9 @@ async fn test_auth_flow_with_wildcard_scopes() {
     let token = token_res.access_token;
 
     // Use the token to create a bucket that MATCHES the wildcard policy
-    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone()).await.unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
     let mut req_good = tonic::Request::new(CreateBucketRequest {
         bucket_name: "auth-test-bucket".to_string(),
         region: "AUTH_TEST".to_string(),
