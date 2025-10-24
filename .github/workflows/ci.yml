@@ -36,6 +36,11 @@ jobs:
       if: env.SKIP_PACKS != 'true' && steps.pack_plan.outputs.needs_build == 'true'
       uses: dtolnay/rust-toolchain@stable
 
+    - name: Install Protoc
+      uses: arduino/setup-protoc@v2
+      with:
+        version: "25.x"
+
     - name: Cache Cargo dependencies
       uses: actions/cache@v4
       with:
