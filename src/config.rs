@@ -1,7 +1,7 @@
 use clap::Parser;
 
 /// A distributed storage and compute system.
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug, Clone, Default)]
 #[command(version, about, long_about = None)]
 pub struct Config {
     /// The connection URL for the global metadata database.
@@ -55,4 +55,11 @@ pub struct Config {
     /// Enable mDNS for local peer discovery.
     #[arg(long, env, default_value_t = true)]
     pub enable_mdns: bool,
+}
+impl Config {
+    pub fn from_ref(args:&Self) -> Self {
+        let mut me  = Self::default();
+        args.clone_into(&mut me);
+        me
+    }
 }

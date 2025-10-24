@@ -111,7 +111,7 @@ async fn docker_cluster_end_to_end() {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Get token via gRPC
-    let mut auth_client = anvil::anvil_api::auth_service_client::AuthServiceClient::connect("http://localhost:50051/grpc".to_string()).await.unwrap();
+    let mut auth_client = anvil::anvil_api::auth_service_client::AuthServiceClient::connect("http://localhost:50051".to_string()).await.unwrap();
     let token = auth_client
         .get_access_token(anvil::anvil_api::GetAccessTokenRequest { client_id: client_id.clone(), client_secret: client_secret.clone(), scopes: vec!["read:*".into(), "write:*".into(), "grant:*".into()] })
         .await
@@ -120,7 +120,7 @@ async fn docker_cluster_end_to_end() {
         .access_token;
 
     // Create buckets via gRPC
-    let mut bucket_client = anvil::anvil_api::bucket_service_client::BucketServiceClient::connect("http://localhost:50051/grpc".to_string()).await.unwrap();
+    let mut bucket_client = anvil::anvil_api::bucket_service_client::BucketServiceClient::connect("http://localhost:50051".to_string()).await.unwrap();
     let suffix = uuid::Uuid::new_v4().to_string();
     let private_bucket = format!("e2e-private-{}", suffix);
     let public_bucket = format!("e2e-public-{}", suffix);
@@ -134,7 +134,7 @@ async fn docker_cluster_end_to_end() {
     if let Err(e) = bucket_client.create_bucket(req).await { panic!("create public bucket failed: {:?}", e); }
 
     // Make public bucket public
-    let mut auth_client = anvil::anvil_api::auth_service_client::AuthServiceClient::connect("http://localhost:50051/grpc".to_string()).await.unwrap();
+    let mut auth_client = anvil::anvil_api::auth_service_client::AuthServiceClient::connect("http://localhost:50051".to_string()).await.unwrap();
     let mut public_req = tonic::Request::new(anvil::anvil_api::SetPublicAccessRequest { bucket: public_bucket.clone(), allow_public_read: true });
     public_req.metadata_mut().insert("authorization", format!("Bearer {}", token).parse().unwrap());
     if let Err(e) = auth_client.set_public_access(public_req).await { panic!("set public access failed: {:?}", e); }

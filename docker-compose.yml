@@ -6,7 +6,7 @@ networks:
 
 services:
   postgres-global:
-    image: postgres:18
+    image: postgres:17-alpine
     environment:
       POSTGRES_USER: worka
       POSTGRES_PASSWORD: worka
@@ -23,7 +23,7 @@ services:
       retries: 5
 
   postgres-regional:
-    image: postgres:18
+    image: postgres:17-alpine
     environment:
       POSTGRES_USER: worka
       POSTGRES_PASSWORD: worka
@@ -51,13 +51,15 @@ services:
       - REGION=DOCKER_TEST
       - JWT_SECRET=docker-test-secret
       - WORKA_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      - HTTP_BIND_ADDR=0.0.0.0:50051
+      - HTTP_BIND_ADDR=0.0.0.0:9000
+      - GRPC_BIND_ADDR=0.0.0.0:50051
       - QUIC_BIND_ADDR=/ip4/0.0.0.0/udp/7443/quic-v1
       - PUBLIC_ADDRS=/dns4/anvil1/udp/7443/quic-v1
       - PUBLIC_GRPC_ADDR=http://anvil1:50051
       - ENABLE_MDNS=false
     command: ["anvil", "--init-cluster"]
     ports:
+      - "9000:9000"
       - "50051:50051"
       - "7443:7443/udp"
     networks: [anvilnet]
@@ -79,14 +81,16 @@ services:
       - REGION=DOCKER_TEST
       - JWT_SECRET=docker-test-secret
       - WORKA_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      - HTTP_BIND_ADDR=0.0.0.0:50051
+      - HTTP_BIND_ADDR=0.0.0.0:9000
+      - GRPC_BIND_ADDR=0.0.0.0:50052
       - QUIC_BIND_ADDR=/ip4/0.0.0.0/udp/7444/quic-v1
       - PUBLIC_ADDRS=/dns4/anvil2/udp/7444/quic-v1
-      - PUBLIC_GRPC_ADDR=http://anvil2:50051
+      - PUBLIC_GRPC_ADDR=http://anvil2:50052
       - ENABLE_MDNS=false
       - BOOTSTRAP_ADDRS=/dns4/anvil1/udp/7443/quic-v1
     ports:
-      - "50052:50051"
+      - "9001:9000"
+      - "50052:50052"
       - "7444:7443/udp"
     networks: [anvilnet]
 
@@ -102,14 +106,16 @@ services:
       - REGION=DOCKER_TEST
       - JWT_SECRET=docker-test-secret
       - WORKA_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      - HTTP_BIND_ADDR=0.0.0.0:50051
+      - HTTP_BIND_ADDR=0.0.0.0:9000
+      - GRPC_BIND_ADDR=0.0.0.0:50053
       - QUIC_BIND_ADDR=/ip4/0.0.0.0/udp/7445/quic-v1
       - PUBLIC_ADDRS=/dns4/anvil3/udp/7445/quic-v1
-      - PUBLIC_GRPC_ADDR=http://anvil3:50051
+      - PUBLIC_GRPC_ADDR=http://anvil3:50053
       - ENABLE_MDNS=false
       - BOOTSTRAP_ADDRS=/dns4/anvil1/udp/7443/quic-v1
     ports:
-      - "50053:50051"
+      - "9002:9000"
+      - "50053:50053"
       - "7445:7443/udp"
     networks: [anvilnet]
 

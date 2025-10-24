@@ -122,10 +122,12 @@ async fn test_s3_public_and_private_access() {
         "static",
     );
 
+    // TestCluster stores gRPC base at /grpc; S3 must hit HTTP root.
+    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
     let config = aws_sdk_s3::Config::builder()
         .credentials_provider(credentials)
         .region(aws_sdk_s3::config::Region::new("test-region"))
-        .endpoint_url(&cluster.grpc_addrs[0])
+        .endpoint_url(http_base)
         .behavior_version_latest()
         .build();
     let client = Client::from_conf(config);
@@ -168,7 +170,7 @@ async fn test_s3_public_and_private_access() {
     assert_eq!(data.as_ref(), private_content);
 
     // 6. Test Public Access (Success): Use reqwest (no auth) to get from public bucket
-    let public_url = format!("{}/{}/{}", cluster.grpc_addrs[0], public_bucket, public_key);
+    let public_url = format!("{}/{}/{}", http_base, public_bucket, public_key);
     let public_resp = reqwest::get(&public_url)
         .await
         .expect("Failed to make public request");
@@ -177,7 +179,7 @@ async fn test_s3_public_and_private_access() {
     assert_eq!(public_data.as_ref(), public_content);
 
     // 7. Test Private Access (Failure): Use reqwest (no auth) to get from private bucket
-    let private_url = format!("{}/{}/{}", cluster.grpc_addrs[0], private_bucket, private_key);
+    let private_url = format!("{}/{}/{}", http_base, private_bucket, private_key);
     let private_resp = reqwest::get(&private_url).await.unwrap();
     assert!(
         private_resp.status() == 403 || private_resp.status() == 404,

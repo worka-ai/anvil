@@ -93,7 +93,9 @@ pub async fn get_auth_token(global_db_url: &str, grpc_addr: &str) -> String {
     // Wait a moment for the server to be ready before connecting.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let mut auth_client = AuthServiceClient::connect(grpc_addr.to_string())
+    // Ensure auth client uses gRPC path under /grpc
+    let grpc_url = if grpc_addr.ends_with("/grpc") { grpc_addr.to_string() } else { format!("{}/grpc", grpc_addr.trim_end_matches('/')) };
+    let mut auth_client = AuthServiceClient::connect(grpc_url)
         .await
         .unwrap();
     let token_res = auth_client
@@ -211,18 +213,16 @@ impl TestCluster {
 
         let mut listen_addrs = Vec::new();
         for swarm in &mut swarms {
-            swarm
-                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
-                .unwrap();
-            if let Some(event) = swarm.next().await {
-                if let libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } = event {
-                    listen_addrs.push(address);
+            let address = loop {
+                if let Some(event) = swarm.next().await {
+                    if let libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } = event {
+                        break address;
+                    }
                 } else {
-                    panic!("Expected NewListenAddr event");
+                    panic!("Swarm stream ended before a listener was established");
                 }
-            } else {
-                panic!("Swarm stream ended unexpectedly");
-            }
+            };
+            listen_addrs.push(address);
         }
 
         for i in 0..swarms.len() {
@@ -235,11 +235,16 @@ impl TestCluster {
         }
 
         for i in 0..self.states.len() {
-            let state = self.states[i].clone();
+            let mut state = self.states[i].clone();
             let swarm = swarms.remove(0);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            self.grpc_addrs
-                .push(format!("http://{}/grpc", listener.local_addr().unwrap()));
+            let addr = listener.local_addr().unwrap();
+            self.grpc_addrs.push(format!("http://{}", addr));
+
+            let cfg = &state.config.deref();
+            let mut cfg = anvil::config::Config::from_ref(cfg);
+            cfg.public_grpc_addr = format!("http://{}", addr);
+            state.config = Arc::new(cfg);
 
             let handle = tokio::spawn(async move {
                 anvil::start_node(listener, state, swarm).await.unwrap();

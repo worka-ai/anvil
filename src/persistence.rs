@@ -1,7 +1,7 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use serde_json::Value as JsonValue;
-use time::OffsetDateTime;
 use tokio_postgres::Row;
 
 #[derive(Debug, Clone)]
@@ -30,7 +30,7 @@ pub struct Bucket {
     pub tenant_id: i64,
     pub name: String,
     pub region: String,
-    pub created_at: OffsetDateTime,
+    pub created_at: DateTime<Utc>,
     pub is_public_read: bool,
 }
 
@@ -45,8 +45,8 @@ pub struct Object {
     pub etag: String,
     pub content_type: Option<String>,
     pub version_id: uuid::Uuid,
-    pub created_at: OffsetDateTime,
-    pub deleted_at: Option<OffsetDateTime>,
+    pub created_at: DateTime<Utc>,
+    pub deleted_at: Option<DateTime<Utc>>,
     pub storage_class: Option<i16>,
     pub user_meta: Option<JsonValue>,
     pub shard_map: Option<JsonValue>,
