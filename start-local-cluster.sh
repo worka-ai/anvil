@@ -20,6 +20,9 @@ PG_DB="worka"
 PG_PORT="5432"
 export DATABASE_URL="postgres://${PG_USER}:${PG_PASSWORD}@localhost:${PG_PORT}/${PG_DB}"
 
+# Generate a shared secret for the cluster
+export WORKA_CLUSTER_SECRET=$(head -c 32 /dev/urandom | base64)
+
 NODE_COUNT=3
 STORAGE_BASE_DIR="$(pwd)/.anvil-local-data"
 

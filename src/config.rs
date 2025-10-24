@@ -55,6 +55,10 @@ pub struct Config {
     /// Enable mDNS for local peer discovery.
     #[arg(long, env, default_value_t = true)]
     pub enable_mdns: bool,
+
+    /// The shared secret for cluster authentication.
+    #[arg(long, env)]
+    pub cluster_secret: Option<String>,
 }
 impl Config {
     pub fn from_ref(args:&Self) -> Self {

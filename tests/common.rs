@@ -129,6 +129,7 @@ impl TestCluster {
         let config = Arc::new(Config {
             global_database_url: "".to_string(), // Will be replaced by create_isolated_dbs
             regional_database_url: "".to_string(), // Will be replaced by create_isolated_dbs
+            cluster_secret: Some("test-cluster-secret".to_string()),
             jwt_secret: "test-secret".to_string(),
             worka_secret_encryption_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             http_bind_addr: "127.0.0.1:0".to_string(),

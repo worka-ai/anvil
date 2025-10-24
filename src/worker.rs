@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::Row;
 use tonic::Status;
+use tracing::{error, info};
 
 #[derive(Debug)]
 struct Task {
@@ -57,7 +58,7 @@ pub async fn run(
         let tasks = match persistence.fetch_pending_tasks_for_update(10).await {
             Ok(rows) => rows.into_iter().map(Task::try_from).collect::<Result<Vec<_>>>()?,
             Err(e) => {
-                eprintln!("Failed to fetch tasks: {}", e);
+                error!("Failed to fetch tasks: {}", e);
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
@@ -74,26 +75,26 @@ pub async fn run(
             let jm = jwt_manager.clone();
             tokio::spawn(async move {
                 if let Err(e) = p.update_task_status(task.id, "running").await {
-                    eprintln!("Failed to mark task {} as running: {}", task.id, e);
+                    error!("Failed to mark task {} as running: {}", task.id, e);
                     return;
                 }
 
                 let result = match task.task_type {
                     TaskType::DeleteObject => handle_delete_object(&p, &cs, &jm, &task).await,
                     _ => {
-                        println!("Unhandled task type: {:?}", task.task_type);
+                        info!("Unhandled task type: {:?}", task.task_type);
                         Ok(())
                     }
                 };
 
                 if let Err(e) = result {
-                    eprintln!("Task {} failed: {}", task.id, e);
+                    error!("Task {} failed: {}", task.id, e);
                     if let Err(fail_err) = p.fail_task(task.id, &e.to_string()).await {
-                        eprintln!("Failed to mark task {} as failed: {}", task.id, fail_err);
+                        error!("Failed to mark task {} as failed: {}", task.id, fail_err);
                     }
                 } else {
                     if let Err(complete_err) = p.update_task_status(task.id, "completed").await {
-                        eprintln!(
+                        error!(
                             "Failed to mark task {} as completed: {}",
                             task.id,
                             complete_err
@@ -152,6 +153,6 @@ async fn handle_delete_object(
     // Finally, hard delete the object from the database.
     persistence.hard_delete_object(payload.object_id).await?;
 
-    println!("Successfully processed DeleteObject task for object {}", payload.object_id);
+    info!("Successfully processed DeleteObject task for object {}", payload.object_id);
     Ok(())
 }

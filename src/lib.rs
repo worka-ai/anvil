@@ -12,6 +12,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_postgres::NoTls;
+use tracing::{error, info};
 
 // The modules we've created
 pub mod auth;
@@ -143,7 +144,7 @@ pub async fn start_node(
         )
         .await
         {
-            eprintln!("Worker process failed: {}", e);
+            error!("Worker process failed: {}", e);
         }
     });
 
@@ -196,13 +197,14 @@ pub async fn start_node(
         .nest("/grpc", grpc_axum);
 
     let addr = listener.local_addr()?;
-    println!("Anvil server (gRPC & S3) listening on {}", addr);
+    info!("Anvil server (gRPC & S3) listening on {}", addr);
 
     // Spawn the gossip service to run in the background.
     let gossip_task = tokio::spawn(cluster::run_gossip(
         swarm,
         state.cluster.clone(),
         state.config.public_grpc_addr.clone(),
+        state.config.cluster_secret.clone(),
     ));
     let server_task =
         tokio::spawn(async move { axum::serve(listener, app.into_make_service()).await });
@@ -232,7 +234,7 @@ pub async fn run_migrations(
     let (mut client, connection) = tokio_postgres::connect(db_url, NoTls).await?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            eprintln!("connection error: {}", e);
+            error!("connection error: {}", e);
         }
     });
     runner
