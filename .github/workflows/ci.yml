@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: write
+  packages: write
+
 jobs:
   build-and-test:
     runs-on: worka-l1
@@ -90,3 +94,25 @@ jobs:
         platforms: linux/amd64,linux/arm64
         cache-from: type=gha
         cache-to: type=gha,mode=max
+
+    - name: Create GitHub Release
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: softprops/action-gh-release@v1
+      with:
+        generate_release_notes: true
+        body: |
+          ## Docker Image
+
+          You can pull the latest image using the following command:
+
+          ```sh
+          docker pull ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}
+          ```
+
+          To run the container:
+
+          ```sh
+          docker run -d -p 9000:9000 -p 7443:7443/udp ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}
+          ```
+
+          ---
