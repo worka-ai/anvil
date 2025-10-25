@@ -32,7 +32,7 @@ services:
     image: postgres:17-alpine
     environment:
       POSTGRES_USER: worka
-      POSTGRES_PASSWORD: worka
+      POSTGRES_PASSWORD: "a-secure-password" # <-- Change this in production
       POSTGRES_DB: anvil_global
     ports:
       - "5433:5432"
@@ -49,40 +49,42 @@ services:
     image: postgres:17-alpine
     environment:
       POSTGRES_USER: worka
-      POSTGRES_PASSWORD: worka
-      POSTGRES_DB: anvil_regional_docker
+      POSTGRES_PASSWORD: "a-secure-password" # <-- Change this in production
+      POSTGRES_DB: anvil_regional_europe
     volumes:
       - postgres_regional_data:/var/lib/postgresql/data
     networks: [anvilnet]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U worka -d anvil_regional_docker"]
+      test: ["CMD-SHELL", "pg_isready -U worka -d anvil_regional_europe"]
       interval: 5s
       timeout: 5s
       retries: 5
 
   anvil1:
-    image: ghcr.io/worka-ai/anvil:main # Or build from source
-    # build: . # Uncomment to build from a local Dockerfile
+    image: ghcr.io/worka-ai/anvil:main
     depends_on:
       postgres-global:
         condition: service_healthy
       postgres-regional:
         condition: service_healthy
     environment:
-      - RUST_LOG=info
-      - GLOBAL_DATABASE_URL=postgres://worka:worka@postgres-global:5432/anvil_global
-      - REGIONAL_DATABASE_URL=postgres://worka:worka@postgres-regional:5432/anvil_regional_docker
-      - REGION=DOCKER_TEST
-      - JWT_SECRET=docker-test-secret
-      - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      - ANVIL_CLUSTER_SECRET=docker-cluster-secret
-      - HTTP_BIND_ADDR=0.0.0.0:9000
-      - GRPC_BIND_ADDR=0.0.0.0:50051
-      - QUIC_BIND_ADDR=/ip4/0.0.0.0/udp/7443/quic-v1
-      - PUBLIC_ADDRS=/dns4/anvil1/udp/7443/quic-v1
-      - PUBLIC_GRPC_ADDR=http://anvil1:50051
-      - ENABLE_MDNS=false
-      - BOOTSTRAP_ADDRS= # Empty for a single node
+      RUST_LOG: "info"
+      # Use a URL-encoded password if it contains special characters
+      GLOBAL_DATABASE_URL: "postgres://worka:a-secure-password@postgres-global:5432/anvil_global"
+      REGIONAL_DATABASE_URL: "postgres://worka:a-secure-password@postgres-regional:5432/anvil_regional_europe"
+      REGION: "europe-west-1"
+      # --- CRITICAL: SET THESE TO SECURE, RANDOMLY GENERATED VALUES ---
+      JWT_SECRET: "must-be-a-long-and-random-secret-for-signing-jwts"
+      ANVIL_SECRET_ENCRYPTION_KEY: "must-be-a-64-character-hex-string-generate-with-openssl-rand-hex-32"
+      ANVIL_CLUSTER_SECRET: "must-be-a-long-and-random-secret-for-cluster-gossip"
+      # --- Networking Configuration ---
+      HTTP_BIND_ADDR: "0.0.0.0:9000"
+      GRPC_BIND_ADDR: "0.0.0.0:50051"
+      QUIC_BIND_ADDR: "/ip4/0.0.0.0/udp/7443/quic-v1"
+      PUBLIC_ADDRS: "/dns4/anvil1/udp/7443/quic-v1"
+      PUBLIC_GRPC_ADDR: "http://anvil1:50051"
+      ENABLE_MDNS: "false"
+      BOOTSTRAP_ADDRS: "" # Empty for a single node
     command: ["anvil", "--init-cluster"]
     ports:
       - "9000:9000"      # S3 HTTP Port
@@ -116,7 +118,7 @@ First, create a default tenant and a region for it to use:
 
 ```bash
 # Create the region
-docker-compose exec anvil1 anvil admin regions create --name DOCKER_TEST
+docker-compose exec anvil1 anvil admin regions create --name europe-west-1
 
 # Create the tenant
 docker-compose exec anvil1 anvil admin tenants create --name my-first-tenant
@@ -146,7 +148,7 @@ Replace `YOUR_CLIENT_ID` and `YOUR_CLIENT_SECRET` with the values you saved in t
 ```bash
 export AWS_ACCESS_KEY_ID=YOUR_CLIENT_ID
 export AWS_SECRET_ACCESS_KEY=YOUR_CLIENT_SECRET
-export AWS_DEFAULT_REGION=DOCKER_TEST
+export AWS_DEFAULT_REGION=europe-west-1
 
 # The Anvil S3 endpoint
 ANVIL_ENDPOINT="http://localhost:9000"
@@ -157,7 +159,7 @@ Now, create a bucket. Bucket names must be globally unique.
 ```bash
 aws s3api create-bucket \
     --bucket my-first-anvil-bucket \
-    --region DOCKER_TEST \
+    --region europe-west-1 \
     --endpoint-url $ANVIL_ENDPOINT
 ```
 

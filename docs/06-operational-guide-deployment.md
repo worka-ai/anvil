@@ -64,7 +64,7 @@ Anvil is configured entirely through environment variables. The following is a r
 | `REGIONAL_DATABASE_URL`         | **Required.** Connection URL for the regional Postgres database.            |
 | `REGION`                        | **Required.** The name of the region this node belongs to.                  |
 | `JWT_SECRET`                    | **Required.** Secret key for minting and verifying JWTs.                    |
-| `ANVIL_SECRET_ENCRYPTION_KEY`   | **Required.** 64-character hex-encoded key for data encryption.             |
+| `ANVIL_SECRET_ENCRYPTION_KEY`   | **Required.** A 64-character hex-encoded string for AES-256 encryption. <br/><br/> **CRITICAL:** This key is used to encrypt sensitive data at rest. It **MUST** be a cryptographically secure, 64-character hexadecimal string (representing 32 bytes). Loss of this key will result in permanent data loss. <br/><br/> Generate a secure key with: <br/> `openssl rand -hex 32` |
 | `ANVIL_CLUSTER_SECRET`          | A shared secret to authenticate and encrypt inter-node gossip messages.     |
 | `HTTP_BIND_ADDR`                | The local IP and port for the S3 gateway (e.g., `0.0.0.0:9000`).             |
 | `GRPC_BIND_ADDR`                | The local IP and port for the gRPC service (e.g., `0.0.0.0:50051`).           |
