@@ -54,6 +54,49 @@ environment:
 
 When this second node starts, it will connect to `anvil1`, join the cluster, and begin discovering all other peers through the gossip protocol.
 
+### Firewall Configuration
+
+If your Anvil nodes are running on hosts with a firewall, you must open the necessary ports to allow traffic. By default, Anvil uses the following ports:
+
+-   **9000/tcp:** The S3-compatible HTTP gateway.
+-   **50051/tcp:** The gRPC API service.
+-   **7443/udp:** The QUIC endpoint for peer-to-peer gossip and data transfer.
+
+These ports can be changed via their respective environment variables.
+
+#### UFW (Ubuntu/Debian)
+
+```bash
+# Allow S3 Gateway traffic
+sudo ufw allow 9000/tcp
+
+# Allow gRPC traffic
+sudo ufw allow 50051/tcp
+
+# Allow QUIC peer-to-peer traffic
+sudo ufw allow 7443/udp
+
+# Apply the rules
+sudo ufw enable
+sudo ufw reload
+```
+
+#### firewalld (RHEL/CentOS/Fedora)
+
+```bash
+# Allow S3 Gateway traffic
+sudo firewall-cmd --zone=public --add-port=9000/tcp --permanent
+
+# Allow gRPC traffic
+sudo firewall-cmd --zone=public --add-port=50051/tcp --permanent
+
+# Allow QUIC peer-to-peer traffic
+sudo firewall-cmd --zone=public --add-port=7443/udp --permanent
+
+# Apply the rules
+sudo firewall-cmd --reload
+```
+
 ### 6.3. Configuration Reference
 
 Anvil is configured entirely through environment variables. The following is a reference for the most important variables, defined in `src/config.rs`.

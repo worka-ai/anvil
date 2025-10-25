@@ -78,11 +78,13 @@ services:
       ANVIL_SECRET_ENCRYPTION_KEY: "must-be-a-64-character-hex-string-generate-with-openssl-rand-hex-32"
       ANVIL_CLUSTER_SECRET: "must-be-a-long-and-random-secret-for-cluster-gossip"
       # --- Networking Configuration ---
+      # For local testing, `localhost` is acceptable. In a real deployment, 
+      # you would replace this with the node's public IP address.
       HTTP_BIND_ADDR: "0.0.0.0:9000"
       GRPC_BIND_ADDR: "0.0.0.0:50051"
       QUIC_BIND_ADDR: "/ip4/0.0.0.0/udp/7443/quic-v1"
-      PUBLIC_ADDRS: "/dns4/anvil1/udp/7443/quic-v1"
-      PUBLIC_GRPC_ADDR: "http://anvil1:50051"
+      PUBLIC_ADDRS: "/ip4/127.0.0.1/udp/7443/quic-v1"
+      PUBLIC_GRPC_ADDR: "http://localhost:50051"
       ENABLE_MDNS: "false"
       BOOTSTRAP_ADDRS: "" # Empty for a single node
     command: ["anvil", "--init-cluster"]

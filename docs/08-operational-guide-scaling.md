@@ -11,35 +11,94 @@ tags: [operational-guide, scaling, cluster, high-availability, multi-region]
 
 Anvil is designed to scale from a single node to a large, distributed cluster. This chapter covers the concepts and procedures for scaling your Anvil deployment.
 
-### 8.1. Adding a Node to an Existing Cluster
+### 8.1. Tutorial: Adding a New Node to a Cluster
 
-Scaling an Anvil cluster horizontally is straightforward. The process involves launching a new Anvil peer and pointing it to at least one existing member of the cluster.
+This tutorial provides a concrete, step-by-step example of how to scale an Anvil cluster from one node to two, with each node running on a separate host machine. This directly answers the question: *"How do I have a subsequent node join the cluster?"*
 
-**Steps to Add a New Node:**
+**The Scenario:**
 
-1.  **Provision a New Host:** Set up a new server (or container) for the Anvil peer.
-2.  **Configure the Node:** Configure the new node using the same environment variables as the existing cluster members, with two key differences:
-    *   Ensure it connects to the **same `GLOBAL_DATABASE_URL`** and the correct **`REGIONAL_DATABASE_URL`** for the region it will operate in.
-    *   **Do not** use the `--init-cluster` flag.
-    *   Set the `BOOTSTRAP_ADDRS` environment variable to the QUIC address of one or more existing nodes.
+-   **Host A (IP: `203.0.113.1`):** Runs the initial Anvil node (`anvil1`), the global Postgres database, and the regional Postgres database.
+-   **Host B (IP: `203.0.113.2`):** Will run our new Anvil node (`anvil2`).
 
-**Example Configuration for a New Node:**
+#### Step 1: Initial Setup on Host A
 
+On Host A, you have your initial `docker-compose.yml` file, similar to the one in the Getting Started guide. The databases are running, and `anvil1` is configured with its public IP.
+
+*Key `anvil1` environment variables on Host A:*
 ```yaml
-# In your docker-compose.yml or other deployment configuration
 environment:
-  # ... (same database URLs, secrets, region, etc. as the main cluster)
-
-  # Point to the first node to join the cluster
-  - BOOTSTRAP_ADDRS=/dns4/anvil1/udp/7443/quic-v1
-
-  # Ensure each node has a unique gRPC and QUIC port if running on the same host
-  - GRPC_BIND_ADDR=0.0.0.0:50052
-  - QUIC_BIND_ADDR=/ip4/0.0.0.0/udp/7444/quic-v1
-  - PUBLIC_ADDRS=/dns4/anvil2/udp/7444/quic-v1
+  # ... other config
+  REGION: "europe-west-1"
+  # This node is the first in the cluster
+  command: ["anvil", "--init-cluster"]
+  # --- Networking Configuration ---
+  PUBLIC_ADDRS: "/ip4/203.0.113.1/udp/7443/quic-v1"
+  PUBLIC_GRPC_ADDR: "http://203.0.113.1:50051"
 ```
 
-Once launched, the new node will contact the bootstrap peer, join the cluster, and automatically discover all other members via the gossip protocol. It will then begin participating in object storage and retrieval.
+#### Step 2: Prepare Host B
+
+On Host B, you will create a new, much simpler Docker Compose file. Let's call it `docker-compose.node.yml`.
+
+> **Important Note on `docker-compose`:** `docker-compose` is designed for single-host applications. The following example is a conceptual guide showing how you would configure a second node. For true multi-host production deployments, you should use an orchestration tool like **Kubernetes**, **Docker Swarm**, or **Nomad**. However, the Anvil configuration principles remain the same.
+
+Create the following `docker-compose.node.yml` on **Host B**:
+
+```yaml
+# docker-compose.node.yml (for Host B)
+version: "3.8"
+
+services:
+  anvil2:
+    image: ghcr.io/worka-ai/anvil:main
+    # We don't run databases here; we point to the ones on Host A
+    environment:
+      RUST_LOG: "info"
+      # --- CRITICAL: Point to the existing databases on Host A ---
+      # The password must be URL-encoded if it contains special characters.
+      GLOBAL_DATABASE_URL: "postgres://worka:a-secure-password@203.0.113.1:5433/anvil_global"
+      REGIONAL_DATABASE_URL: "postgres://worka:a-secure-password@203.0.113.1:5432/anvil_regional_europe"
+      REGION: "europe-west-1"
+
+      # --- Use the SAME secrets as the rest of the cluster ---
+      JWT_SECRET: "must-be-a-long-and-random-secret-for-signing-jwts"
+      ANVIL_SECRET_ENCRYPTION_KEY: "must-be-a-64-character-hex-string-generate-with-openssl-rand-hex-32"
+      ANVIL_CLUSTER_SECRET: "must-be-a-long-and-random-secret-for-cluster-gossip"
+
+      # --- Networking for Host B ---
+      HTTP_BIND_ADDR: "0.0.0.0:9000"
+      GRPC_BIND_ADDR: "0.0.0.0:50051"
+      QUIC_BIND_ADDR: "/ip4/0.0.0.0/udp/7443/quic-v1"
+      PUBLIC_ADDRS: "/ip4/203.0.113.2/udp/7443/quic-v1"
+      PUBLIC_GRPC_ADDR: "http://203.0.113.2:50051"
+      ENABLE_MDNS: "false"
+
+      # --- BOOTSTRAP from Host A ---
+      BOOTSTRAP_ADDRS: "/ip4/203.0.113.1/udp/7443/quic-v1"
+    # Note: No `command` is needed, as we are NOT initializing a cluster
+    ports:
+      - "9000:9000"
+      - "50051:50051"
+      - "7443:7443/udp"
+```
+
+#### Step 3: Launch the New Node
+
+On **Host B**, run the following command:
+
+```bash
+docker-compose -f docker-compose.node.yml up -d
+```
+
+#### What Happens Next?
+
+1.  `anvil2` starts up on Host B.
+2.  It reads its `BOOTSTRAP_ADDRS` and connects to `anvil1` on `203.0.113.1:7443/udp`.
+3.  `anvil1` accepts the connection. The two nodes exchange information via the gossip protocol.
+4.  `anvil2` learns about all other nodes `anvil1` knows about (if any), and vice-versa.
+5.  Within seconds, `anvil2` is a fully integrated member of the cluster and will be considered by the `PlacementManager` for storing new object shards.
+
+This process can be repeated for `anvil3`, `anvil4`, and so on, allowing you to scale your cluster horizontally across many machines.
 
 ### 8.2. Multi-Region Deployments
 

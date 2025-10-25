@@ -72,11 +72,13 @@ services:
       ANVIL_SECRET_ENCRYPTION_KEY: "must-be-a-64-character-hex-string-generate-with-openssl-rand-hex-32"
       ANVIL_CLUSTER_SECRET: "must-be-a-long-and-random-secret-for-cluster-gossip"
       # --- Networking Configuration ---
+      # These addresses MUST be reachable by other nodes and clients.
+      # In a real deployment, replace 203.0.113.1 with the node's public IP address.
       HTTP_BIND_ADDR: "0.0.0.0:9000"
       GRPC_BIND_ADDR: "0.0.0.0:50051"
       QUIC_BIND_ADDR: "/ip4/0.0.0.0/udp/7443/quic-v1"
-      PUBLIC_ADDRS: "/dns4/anvil1/udp/7443/quic-v1"
-      PUBLIC_GRPC_ADDR: "http://anvil1:50051"
+      PUBLIC_ADDRS: "/ip4/203.0.113.1/udp/7443/quic-v1"
+      PUBLIC_GRPC_ADDR: "http://203.0.113.1:50051"
       ENABLE_MDNS: "false"
     command: ["anvil", "--init-cluster"]
     ports:
@@ -106,10 +108,10 @@ services:
       HTTP_BIND_ADDR: "0.0.0.0:9000"
       GRPC_BIND_ADDR: "0.0.0.0:50052"
       QUIC_BIND_ADDR: "/ip4/0.0.0.0/udp/7444/quic-v1"
-      PUBLIC_ADDRS: "/dns4/anvil2/udp/7444/quic-v1"
-      PUBLIC_GRPC_ADDR: "http://anvil2:50052"
+      PUBLIC_ADDRS: "/ip4/203.0.113.2/udp/7444/quic-v1"
+      PUBLIC_GRPC_ADDR: "http://203.0.113.2:50052"
       ENABLE_MDNS: "false"
-      BOOTSTRAP_ADDRS: "/dns4/anvil1/udp/7443/quic-v1"
+      BOOTSTRAP_ADDRS: "/ip4/203.0.113.1/udp/7443/quic-v1"
     ports:
       - "9001:9000"
       - "50052:50052"
@@ -132,10 +134,10 @@ services:
       HTTP_BIND_ADDR: "0.0.0.0:9000"
       GRPC_BIND_ADDR: "0.0.0.0:50053"
       QUIC_BIND_ADDR: "/ip4/0.0.0.0/udp/7445/quic-v1"
-      PUBLIC_ADDRS: "/dns4/anvil3/udp/7445/quic-v1"
-      PUBLIC_GRPC_ADDR: "http://anvil3:50053"
+      PUBLIC_ADDRS: "/ip4/203.0.113.3/udp/7445/quic-v1"
+      PUBLIC_GRPC_ADDR: "http://203.0.113.3:50053"
       ENABLE_MDNS: "false"
-      BOOTSTRAP_ADDRS: "/dns4/anvil1/udp/7443/quic-v1"
+      BOOTSTRAP_ADDRS: "/ip4/203.0.113.1/udp/7443/quic-v1"
     ports:
       - "9002:9000"
       - "50053:50053"
