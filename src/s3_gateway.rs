@@ -26,11 +26,11 @@ fn s3_error(code: &str, message: &str, status: axum::http::StatusCode) -> Respon
 }
 pub fn app(state: AppState) -> Router {
     let public = Router::new()
-        .route("/", get(health_check))
         .route("/ready", get(readiness_check))
         .with_state(state.clone());
 
     let s3_routes = Router::new()
+        .route("/", get(list_buckets)) // ListBuckets
         .route(
             "/{bucket}",
             put(create_bucket).head(head_bucket).get(list_objects),
@@ -45,8 +45,55 @@ pub fn app(state: AppState) -> Router {
 
     public.merge(s3_routes)
 }
-async fn health_check() -> impl IntoResponse {
-    (axum::http::StatusCode::OK, "OK")
+
+async fn list_buckets(State(state): State<AppState>, req: Request) -> Response {
+    let claims = match req.extensions().get::<Claims>().cloned() {
+        Some(c) => c,
+        None => {
+            // return s3_error(
+            //     "AccessDenied",
+            //     "Missing credentials",
+            //     axum::http::StatusCode::FORBIDDEN,
+            // );
+            return (axum::http::StatusCode::OK, "OK").into_response();
+        }
+    };
+
+    match state.bucket_manager.list_buckets(claims.tenant_id,claims.scopes.as_slice()).await {
+        Ok(buckets) => {
+            let mut xml = String::from(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n",
+            );
+            xml.push_str("  <Owner>\n");
+            xml.push_str(&format!("    <ID>{}</ID>\n", claims.tenant_id));
+            // DisplayName is not stored, so we'll use tenant_id for now.
+            xml.push_str(&format!("    <DisplayName>{}</DisplayName>\n", claims.tenant_id));
+            xml.push_str("  </Owner>\n");
+            xml.push_str("  <Buckets>\n");
+            for b in buckets {
+                xml.push_str("    <Bucket>\n");
+                xml.push_str(&format!("      <Name>{}</Name>\n", xml_escape(&b.name)));
+                xml.push_str(&format!(
+                    "      <CreationDate>{}</CreationDate>\n",
+                    b.created_at.to_rfc3339()
+                ));
+                xml.push_str("    </Bucket>\n");
+            }
+            xml.push_str("  </Buckets>\n");
+            xml.push_str("</ListAllMyBucketsResult>\n");
+
+            Response::builder()
+                .status(200)
+                .header("Content-Type", "application/xml")
+                .body(Body::from(xml))
+                .unwrap()
+        }
+        Err(status) => s3_error(
+            "InternalError",
+            status.message(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
 }
 
 async fn create_bucket(

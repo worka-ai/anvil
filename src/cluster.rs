@@ -162,8 +162,8 @@ pub async fn create_swarm(config: Arc<crate::config::Config>) -> Result<Swarm<Cl
         .build();
 
     // Parse the QUIC bind address from config
-    let quic_bind_addr: libp2p::Multiaddr = config.quic_bind_addr.parse()?;
-    swarm.listen_on(quic_bind_addr)?;
+    let cluster_listen_addr: libp2p::Multiaddr = config.cluster_listen_addr.parse()?;
+    swarm.listen_on(cluster_listen_addr)?;
 
     Ok(swarm)
 }

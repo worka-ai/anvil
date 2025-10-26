@@ -74,20 +74,18 @@ services:
       # --- Networking Configuration ---
       # These addresses MUST be reachable by other nodes and clients.
       # In a real deployment, replace 203.0.113.1 with the node's public IP address.
-      HTTP_BIND_ADDR: "0.0.0.0:9000"
-      GRPC_BIND_ADDR: "0.0.0.0:50051"
-      QUIC_BIND_ADDR: "/ip4/0.0.0.0/udp/7443/quic-v1"
-      PUBLIC_ADDRS: "/ip4/203.0.113.1/udp/7443/quic-v1"
-      PUBLIC_GRPC_ADDR: "http://203.0.113.1:50051"
+      API_LISTEN_ADDR: "0.0.0.0:50051"
+      CLUSTER_LISTEN_ADDR: "/ip4/0.0.0.0/udp/7443/quic-v1"
+      PUBLIC_CLUSTER_ADDRS: "/ip4/203.0.113.1/udp/7443/quic-v1"
+      PUBLIC_API_ADDR: "http://203.0.113.1:50051"
       ENABLE_MDNS: "false"
     command: ["anvil", "--init-cluster"]
     ports:
-      - "9000:9000"
       - "50051:50051"
       - "7443:7443/udp"
     networks: [anvilnet]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/ready"]
+      test: ["CMD", "curl", "-f", "http://localhost:50051/ready"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -105,16 +103,14 @@ services:
       JWT_SECRET: "must-be-a-long-and-random-secret-for-signing-jwts"
       ANVIL_SECRET_ENCRYPTION_KEY: "must-be-a-64-character-hex-string-generate-with-openssl-rand-hex-32"
       ANVIL_CLUSTER_SECRET: "must-be-a-long-and-random-secret-for-cluster-gossip"
-      HTTP_BIND_ADDR: "0.0.0.0:9000"
-      GRPC_BIND_ADDR: "0.0.0.0:50052"
-      QUIC_BIND_ADDR: "/ip4/0.0.0.0/udp/7444/quic-v1"
-      PUBLIC_ADDRS: "/ip4/203.0.113.2/udp/7444/quic-v1"
-      PUBLIC_GRPC_ADDR: "http://203.0.113.2:50052"
+      API_LISTEN_ADDR: "0.0.0.0:50051"
+      CLUSTER_LISTEN_ADDR: "/ip4/0.0.0.0/udp/7444/quic-v1"
+      PUBLIC_CLUSTER_ADDRS: "/ip4/203.0.113.2/udp/7444/quic-v1"
+      PUBLIC_API_ADDR: "http://203.0.113.2:50051"
       ENABLE_MDNS: "false"
       BOOTSTRAP_ADDRS: "/ip4/203.0.113.1/udp/7443/quic-v1"
     ports:
-      - "9001:9000"
-      - "50052:50052"
+      - "50052:50051"
       - "7444:7443/udp"
     networks: [anvilnet]
 
@@ -131,16 +127,14 @@ services:
       JWT_SECRET: "must-be-a-long-and-random-secret-for-signing-jwts"
       ANVIL_SECRET_ENCRYPTION_KEY: "must-be-a-64-character-hex-string-generate-with-openssl-rand-hex-32"
       ANVIL_CLUSTER_SECRET: "must-be-a-long-and-random-secret-for-cluster-gossip"
-      HTTP_BIND_ADDR: "0.0.0.0:9000"
-      GRPC_BIND_ADDR: "0.0.0.0:50053"
-      QUIC_BIND_ADDR: "/ip4/0.0.0.0/udp/7445/quic-v1"
-      PUBLIC_ADDRS: "/ip4/203.0.113.3/udp/7445/quic-v1"
-      PUBLIC_GRPC_ADDR: "http://203.0.113.3:50053"
+      API_LISTEN_ADDR: "0.0.0.0:50051"
+      CLUSTER_LISTEN_ADDR: "/ip4/0.0.0.0/udp/7445/quic-v1"
+      PUBLIC_CLUSTER_ADDRS: "/ip4/203.0.113.3/udp/7445/quic-v1"
+      PUBLIC_API_ADDR: "http://203.0.113.3:50051"
       ENABLE_MDNS: "false"
       BOOTSTRAP_ADDRS: "/ip4/203.0.113.1/udp/7443/quic-v1"
     ports:
-      - "9002:9000"
-      - "50053:50053"
+      - "50053:50051"
       - "7445:7443/udp"
     networks: [anvilnet]
 

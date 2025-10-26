@@ -7,109 +7,75 @@ tags: [operational-guide, networking, reverse-proxy, tls, ssl, caddy, nginx]
 
 # Bonus Chapter: Configuring a Reverse Proxy
 
-For any production deployment of Anvil, you should not expose the S3 and gRPC ports directly to the internet. Instead, you should place a reverse proxy in front of your Anvil cluster. 
+For any production deployment of Anvil, you should place a reverse proxy in front of your cluster. This allows you to use a custom domain, terminate TLS/SSL, and add a layer of security.
 
-**Benefits of a Reverse Proxy:**
+### The Multiplexed Port
 
--   **TLS/SSL Termination:** The proxy can handle HTTPS and terminate the encrypted connection, passing plain HTTP traffic to Anvil on the internal network. This centralizes certificate management.
--   **Custom Domains:** You can serve Anvil under a custom domain name (e.g., `s3.mycompany.com`).
--   **Load Balancing:** The proxy can distribute traffic across multiple Anvil nodes.
--   **Security:** It provides an additional layer of security, hiding the internal topology of your cluster.
+Anvil is designed for simplicity and performance. It serves both S3 (HTTP/1.1) and gRPC (HTTP/2) traffic from the **same network port** (port `50051` by default). This means you only need to configure your reverse proxy to forward traffic for your domain to this single upstream port.
 
-This guide provides example configurations for two popular reverse proxies: Caddy and Nginx.
+This guide provides examples for a single domain: `anvil.mycompany.com`.
 
-## Anvil Services to Proxy
+### Caddy Configuration (Recommended)
 
-You need to proxy two main services:
+Caddy is a modern web server that automatically handles TLS certificates. Its configuration is extremely simple because it intelligently handles proxying both HTTP/1.1 and HTTP/2 traffic to the same backend.
 
-1.  **The S3 Gateway:** A standard HTTP service, running on port `9000` by default.
-2.  **The gRPC Service:** An HTTP/2-based service, running on port `50051` by default.
-
-## Caddy Configuration
-
-Caddy is a modern web server known for its simplicity and automatic HTTPS. The following `Caddyfile` configuration will proxy both S3 and gRPC traffic to a single Anvil node, with automatic TLS certificate acquisition from Let's Encrypt.
+This is the recommended approach.
 
 ```caddy
 # Caddyfile
-
-s3.your-domain.com {
-    # Proxy the S3 HTTP Gateway
-    reverse_proxy http://<anvil-node-ip>:9000
-}
-
-grpc.your-domain.com {
-    # Proxy the gRPC service, enabling HTTP/2
-    reverse_proxy h2c://<anvil-node-ip>:50051 {
-        transport http {
-            versions h2c 2
-        }
-    }
+anvil.mycompany.com {
+    # Reverse proxy all traffic (S3 and gRPC) to the single multiplexed port.
+    # Caddy will automatically handle TLS and forward both HTTP/1.1 and HTTP/2.
+    reverse_proxy h2c://<anvil-node-ip>:50051
 }
 ```
 
 **Key Points:**
 
--   Replace `<anvil-node-ip>` with the internal IP address of your Anvil node.
--   We use `h2c` (HTTP/2 over cleartext) for the gRPC backend because we are terminating TLS at the proxy.
--   Caddy automatically handles acquiring and renewing TLS certificates for `s3.your-domain.com` and `grpc.your-domain.com`.
+-   Replace `<anvil-node-ip>` with the internal IP of your Anvil node (or `anvil1` if Caddy is in the same Docker network).
+-   `h2c://` tells Caddy that the backend service speaks HTTP/2 over a cleartext (unencrypted) connection. This is crucial for gRPC to work.
 
-## Nginx Configuration
+### Nginx Configuration
 
-Nginx is a powerful and widely-used reverse proxy. The configuration is more verbose but offers fine-grained control.
-
-This example assumes you have already obtained a TLS certificate (e.g., using Certbot) and are running Nginx 1.13.10 or later for gRPC support.
+Configuring Nginx to handle both gRPC and standard HTTP traffic on the same path is more complex than with Caddy. The following configuration provides a starting point.
 
 ```nginx
 # /etc/nginx/nginx.conf
 
-# Upstream for the S3 gateway
-upstream anvil_s3 {
-    server <anvil-node-ip>:9000;
-    # Add more nodes here for load balancing
-    # server <anvil-node-2-ip>:9000;
-}
-
-# Upstream for the gRPC service
-upstream anvil_grpc {
+# Upstream for the combined S3 and gRPC service
+upstream anvil_backend {
     server <anvil-node-ip>:50051;
+    # For load balancing, add more Anvil nodes here
     # server <anvil-node-2-ip>:50051;
 }
 
 server {
     listen 443 ssl http2;
-    server_name s3.your-domain.com;
+    server_name anvil.mycompany.com;
 
     # Your TLS certificate
     ssl_certificate /path/to/your/fullchain.pem;
     ssl_certificate_key /path/to/your/privkey.pem;
 
+    # It is critical to allow large body sizes for S3 uploads
+    client_max_body_size 0; # 0 means unlimited
+
     location / {
-        proxy_pass http://anvil_s3;
+        # This will proxy both HTTP/1.1 and gRPC (HTTP/2) traffic.
+        # Nginx will upgrade the connection to HTTP/2 if the client requests it.
+        proxy_pass http://anvil_backend;
+        proxy_http_version 1.1; # Required for keep-alives and headers
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
-
-server {
-    listen 443 ssl http2;
-    server_name grpc.your-domain.com;
-
-    ssl_certificate /path/to/your/fullchain.pem;
-    ssl_certificate_key /path/to/your/privkey.pem;
-
-    location / {
-        # Use grpc_pass for gRPC services
-        grpc_pass grpc://anvil_grpc;
-        grpc_set_header Host $host;
-    }
-}
 ```
 
 **Key Points:**
 
--   Replace `<anvil-node-ip>` with the internal IP of your Anvil node.
--   The `http2` flag on the `listen` directive is crucial for enabling gRPC.
--   We define `upstream` blocks, which makes it easy to add more Anvil nodes for load balancing later.
--   `grpc_pass` is used instead of `proxy_pass` for the gRPC service to ensure Nginx handles the protocol correctly.
+-   The `http2` flag on the `listen` directive is essential.
+-   This configuration uses a single `proxy_pass`. While this works for many gRPC use cases, some advanced gRPC features or client libraries may behave better when using Nginx's dedicated `grpc_pass` directive, which would require a more complex configuration to split the traffic (e.g., using a `map` on the `$content_type`). For most S3 and gRPC client use cases, the above configuration is sufficient.

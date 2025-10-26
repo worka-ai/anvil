@@ -80,21 +80,19 @@ services:
       # --- Networking Configuration ---
       # For local testing, `localhost` is acceptable. In a real deployment, 
       # you would replace this with the node's public IP address.
-      HTTP_BIND_ADDR: "0.0.0.0:9000"
-      GRPC_BIND_ADDR: "0.0.0.0:50051"
-      QUIC_BIND_ADDR: "/ip4/0.0.0.0/udp/7443/quic-v1"
-      PUBLIC_ADDRS: "/ip4/127.0.0.1/udp/7443/quic-v1"
-      PUBLIC_GRPC_ADDR: "http://localhost:50051"
+      API_LISTEN_ADDR: "0.0.0.0:50051"
+      CLUSTER_LISTEN_ADDR: "/ip4/0.0.0.0/udp/7443/quic-v1"
+      PUBLIC_CLUSTER_ADDRS: "/ip4/127.0.0.1/udp/7443/quic-v1"
+      PUBLIC_API_ADDR: "http://localhost:50051"
       ENABLE_MDNS: "false"
       BOOTSTRAP_ADDRS: "" # Empty for a single node
     command: ["anvil", "--init-cluster"]
     ports:
-      - "9000:9000"      # S3 HTTP Port
-      - "50051:50051"    # gRPC Port
+      - "50051:50051"    # Unified S3 & gRPC Port
       - "7443:7443/udp"  # QUIC P2P Port
     networks: [anvilnet]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/ready"]
+      test: ["CMD", "curl", "-f", "http://localhost:50051/ready"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -114,31 +112,38 @@ This command will download the necessary images and start the Anvil and Postgres
 
 ### 1.3. Creating Your First Tenant and API Key
 
-Anvil is a multi-tenant system. Before you can create buckets, you need a **Tenant** and an **App** with an API key. You can create these using the `anvil admin` CLI, which we will run inside the running Docker container.
+Anvil is a multi-tenant system. Before you can create buckets, you need a **Tenant** and an **App** with an API key. You can create these using the `admin` CLI, which we will run inside the running Docker container.
 
-First, create a default tenant and a region for it to use:
+**Step 1: Create the Region and Tenant**
 
 ```bash
-# Create the region
-docker-compose exec anvil1 anvil admin regions create --name europe-west-1
+# Create the region (uses a positional argument)
+docker compose exec anvil1 admin regions create europe-west-1
 
-# Create the tenant
-docker-compose exec anvil1 anvil admin tenants create --name my-first-tenant
+# Create the tenant (uses a positional argument)
+docker compose exec anvil1 admin tenants create my-first-tenant
 ```
 
-Next, create an App for this tenant. This will give you the credentials needed to interact with the S3 API.
+**Step 2: Create an App**
+
+Next, create an App for this tenant. This will generate the credentials needed to interact with the S3 API.
 
 ```bash
-# Create an app and get its credentials
-docker-compose exec anvil1 anvil admin apps create --tenant-name my-first-tenant --app-name my-s3-app
+# Create an app and get its credentials (uses named flags)
+docker compose exec anvil1 admin apps create --tenant-name my-first-tenant --app-name my-s3-app
 ```
 
 This command will output a **Client ID** and a **Client Secret**. **Save these securely!** They are your S3 access credentials.
 
-Finally, grant your new app permission to perform all actions on all resources. For a production setup, you would use more restrictive policies.
+**Step 3: Grant Permissions**
+
+By default, a new app has **no permissions**. You must explicitly grant it the rights to perform actions. For this guide, we will grant it full admin-like permissions.
+
+> **IMPORTANT:** This is the critical step that allows your app to create buckets and upload objects.
 
 ```bash
-docker-compose exec anvil1 anvil admin policies grant --app-name my-s3-app --action "*" --resource "*"
+# Grant the app full permissions on all resources
+docker compose exec anvil1 admin policies grant --app-name my-s3-app --action "*" --resource "*"
 ```
 
 ### 1.4. Using an S3 Client to Create a Bucket
@@ -149,11 +154,11 @@ Replace `YOUR_CLIENT_ID` and `YOUR_CLIENT_SECRET` with the values you saved in t
 
 ```bash
 export AWS_ACCESS_KEY_ID=YOUR_CLIENT_ID
-export AWS_SECRET_ACCESS_KEY=YOUR_CLIENT_SECRET
+export AWS_SECRET_ACCESS_KEY=YOUR_SECRET_ACCESS_KEY
 export AWS_DEFAULT_REGION=europe-west-1
 
-# The Anvil S3 endpoint
-ANVIL_ENDPOINT="http://localhost:9000"
+# The Anvil S3 endpoint (note the port)
+ANVIL_ENDPOINT="http://localhost:50051"
 ```
 
 Now, create a bucket. Bucket names must be globally unique.

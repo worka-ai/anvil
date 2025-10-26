@@ -70,13 +70,12 @@ services:
       JWT_SECRET: "YOUR_SECURE_JWT_SECRET"
       ANVIL_SECRET_ENCRYPTION_KEY: "YOUR_64_CHAR_HEX_KEY"
       ANVIL_CLUSTER_SECRET: "YOUR_SECURE_CLUSTER_SECRET"
-      HTTP_BIND_ADDR: "0.0.0.0:9000"
-      GRPC_BIND_ADDR: "0.0.0.0:50051"
-      QUIC_BIND_ADDR: "/ip4/0.0.0.0/udp/7443/quic-v1"
-      PUBLIC_ADDRS: "/ip4/203.0.113.1/udp/7443/quic-v1"
-      PUBLIC_GRPC_ADDR: "http://203.0.113.1:50051"
+      API_LISTEN_ADDR: "0.0.0.0:50051"
+      CLUSTER_LISTEN_ADDR: "/ip4/0.0.0.0/udp/7443/quic-v1"
+      PUBLIC_CLUSTER_ADDRS: "/ip4/203.0.113.1/udp/7443/quic-v1"
+      PUBLIC_API_ADDR: "https://anvil.mycompany.com" # Your single public domain
     command: ["anvil", "--init-cluster"]
-    ports: ["9000:9000", "50051:50051", "7443:7443/udp"]
+    ports: ["50051:50051", "7443:7443/udp"]
 ```
 
 -   Launch this node on its host: `docker-compose -f docker-compose.us-east-1.yml up -d`.
@@ -97,12 +96,12 @@ services:
       # ... Same DB URLs and Secrets as anvil-us-1 ...
       REGION: "us-east-1"
       # --- Networking for this specific node ---
-      PUBLIC_ADDRS: "/ip4/203.0.113.2/udp/7443/quic-v1"
-      PUBLIC_GRPC_ADDR: "http://203.0.113.2:50051"
+      PUBLIC_CLUSTER_ADDRS: "/ip4/203.0.113.2/udp/7443/quic-v1"
+      PUBLIC_API_ADDR: "https://anvil.mycompany.com"
       # --- BOOTSTRAP from the first node in this region ---
       BOOTSTRAP_ADDRS: "/ip4/203.0.113.1/udp/7443/quic-v1"
     # NO --init-cluster command!
-    ports: ["9000:9000", "50051:50051", "7443:7443/udp"]
+    ports: ["50051:50051", "7443:7443/udp"]
 ```
 
 -   Launch this node on its host.
@@ -113,12 +112,23 @@ services:
 After a few moments, the gossip protocol will ensure all nodes are discovered. You can verify the cluster health by:
 
 1.  **Checking Logs:** The logs for each node should show messages about discovered peers.
-2.  **Using the API:** Connect an S3 or gRPC client to any node in any region.
-3.  **Create Buckets:** Use the `anvil admin` CLI to create buckets in each of your three regions.
+
+2.  **Create Admin Resources:** Use the `admin` CLI on any node to set up your tenant and an app for testing. Remember to save the Client ID and Secret.
     ```bash
-    anvil admin buckets create --name my-us-bucket --region us-east-1
-    anvil admin buckets create --name my-eu-bucket --region europe-west-1
+    # Run on any Anvil host
+    docker compose exec <anvil_service_name> admin tenants create my-company
+    docker compose exec <anvil_service_name> admin apps create --tenant-name my-company --app-name ci-runner
+    docker compose exec <anvil_service_name> admin policies grant --app-name ci-runner --action "*" --resource "*"
     ```
-4.  **Upload Data:** Connect to a node in a specific region (e.g., `anvil-eu-1`) and upload an object to a bucket in that same region (`my-eu-bucket`). The data will be sharded and stored only on the nodes within the `europe-west-1` region.
+
+3.  **Configure S3 Client:** Configure your `aws-cli` with the credentials from the previous step and point it to the public S3 endpoint of one of your regions (e.g., `https://s3.mycompany.com`).
+
+4.  **Create Buckets:** Use the S3 client to create buckets in each of your three regions. The `--region` parameter is critical.
+    ```bash
+    aws s3api create-bucket --bucket my-us-bucket --region us-east-1 --endpoint-url https://s3.mycompany.com
+    aws s3api create-bucket --bucket my-eu-bucket --region europe-west-1 --endpoint-url https://s3.mycompany.com
+    ```
+
+5.  **Upload Data:** Connect to a node in a specific region (e.g., by pointing your S3 client to the IP of `anvil-eu-1`) and upload an object to a bucket in that same region (`my-eu-bucket`). The data will be sharded and stored only on the nodes within the `europe-west-1` region.
 
 Congratulations! You now have a fully functional, geographically distributed storage and compute cloud.

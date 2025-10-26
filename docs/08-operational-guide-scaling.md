@@ -32,8 +32,8 @@ environment:
   # This node is the first in the cluster
   command: ["anvil", "--init-cluster"]
   # --- Networking Configuration ---
-  PUBLIC_ADDRS: "/ip4/203.0.113.1/udp/7443/quic-v1"
-  PUBLIC_GRPC_ADDR: "http://203.0.113.1:50051"
+  PUBLIC_CLUSTER_ADDRS: "/ip4/203.0.113.1/udp/7443/quic-v1"
+  PUBLIC_API_ADDR: "http://203.0.113.1:50051"
 ```
 
 #### Step 2: Prepare Host B
@@ -66,18 +66,16 @@ services:
       ANVIL_CLUSTER_SECRET: "must-be-a-long-and-random-secret-for-cluster-gossip"
 
       # --- Networking for Host B ---
-      HTTP_BIND_ADDR: "0.0.0.0:9000"
-      GRPC_BIND_ADDR: "0.0.0.0:50051"
-      QUIC_BIND_ADDR: "/ip4/0.0.0.0/udp/7443/quic-v1"
-      PUBLIC_ADDRS: "/ip4/203.0.113.2/udp/7443/quic-v1"
-      PUBLIC_GRPC_ADDR: "http://203.0.113.2:50051"
+      API_LISTEN_ADDR: "0.0.0.0:50051"
+      CLUSTER_LISTEN_ADDR: "/ip4/0.0.0.0/udp/7443/quic-v1"
+      PUBLIC_CLUSTER_ADDRS: "/ip4/203.0.113.2/udp/7443/quic-v1"
+      PUBLIC_API_ADDR: "http://203.0.113.2:50051"
       ENABLE_MDNS: "false"
 
       # --- BOOTSTRAP from Host A ---
       BOOTSTRAP_ADDRS: "/ip4/203.0.113.1/udp/7443/quic-v1"
     # Note: No `command` is needed, as we are NOT initializing a cluster
     ports:
-      - "9000:9000"
       - "50051:50051"
       - "7443:7443/udp"
 ```

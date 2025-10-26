@@ -51,7 +51,7 @@ When a node receives a valid `ClusterMessage`, it updates this map with the info
 
 1.  **Startup:** An Anvil node initializes its `libp2p` swarm, which includes the `ClusterBehaviour`.
 
-2.  **Listening:** The node starts listening for incoming QUIC connections on the address specified by `QUIC_BIND_ADDR`.
+2.  **Listening:** The node starts listening for incoming QUIC connections on the address specified by `CLUSTER_LISTEN_ADDR`.
 
 3.  **Bootstrapping:**
     *   If `BOOTSTRAP_ADDRS` is provided, the node immediately attempts to dial one of the specified peers.

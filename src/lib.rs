@@ -205,7 +205,7 @@ pub async fn start_node(
     let gossip_task = tokio::spawn(cluster::run_gossip(
         swarm,
         state.cluster.clone(),
-        state.config.public_grpc_addr.clone(),
+        state.config.public_api_addr.clone(),
         state.config.cluster_secret.clone(),
     ));
     let server_task =

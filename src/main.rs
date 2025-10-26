@@ -13,7 +13,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::parse();
 
     let addr = config
-        .grpc_bind_addr
+        .api_listen_addr
         .parse::<SocketAddr>()
         .expect("Invalid gRPC bind address");
     let listener = tokio::net::TcpListener::bind(addr).await?;

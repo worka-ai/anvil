@@ -63,6 +63,11 @@ enum AppCommands {
         #[clap(long)]
         app_name: String,
     },
+    /// Reset the client secret for an existing app
+    ResetSecret {
+        #[clap(long)]
+        app_name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -137,6 +142,27 @@ async fn main() -> anyhow::Result<()> {
                 println!("Created app: {} (ID: {})", app.name, app.id);
                 println!("Client ID: {}", client_id);
                 println!("Client Secret: {}", client_secret);
+            }
+            AppCommands::ResetSecret { app_name } => {
+                let app = persistence
+                    .get_app_by_name(app_name)
+                    .await?
+                    .expect("App not found");
+
+                let new_client_secret = rand::random::<[u8; 32]>()
+                    .map(|b| format!("{:02x}", b))
+                    .join("");
+
+                let new_encrypted_secret =
+                    crypto::encrypt(new_client_secret.as_bytes(), &encryption_key)?;
+
+                persistence
+                    .update_app_secret(app.id, &new_encrypted_secret)
+                    .await?;
+
+                println!("Successfully reset secret for app: {}", app.name);
+                println!("Client ID: {}", app.client_id);
+                println!("Client Secret: {}", new_client_secret);
             }
         },
         Commands::Policies { command } => match command {

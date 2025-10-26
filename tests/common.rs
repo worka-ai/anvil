@@ -1,21 +1,21 @@
-use anvil::anvil_api::GetAccessTokenRequest;
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
-use anvil::{AppState, run_migrations};
+use anvil::anvil_api::GetAccessTokenRequest;
+use anvil::{run_migrations, AppState};
 use anyhow::Result;
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::config::Credentials;
+use aws_sdk_s3::Client as S3Client;
 use deadpool_postgres::{ManagerConfig, Pool, RecyclingMethod};
 use futures_util::StreamExt;
-use std::process::Command;
-use std::str::FromStr;
-use tokio::task::JoinHandle;
-use tokio_postgres::NoTls;
-
-use anvil::config::Config;
-
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::ops::Deref;
+use std::process::Command;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::task::JoinHandle;
+use tokio_postgres::NoTls;
 
 pub mod migrations {
     use refinery_macros::embed_migrations;
@@ -121,25 +121,24 @@ pub struct TestCluster {
     pub token: String,
     pub global_db_url: String,
     pub regional_db_urls: Vec<String>,
-    pub config: Arc<Config>,
+    pub config: Arc<anvil::config::Config>,
 }
 
 impl TestCluster {
     #[allow(dead_code)]
     pub async fn new(regions: &[&str]) -> Self {
         // Programmatically create config for tests instead of parsing args
-        let config = Arc::new(Config {
+        let config = Arc::new(anvil::config::Config {
             global_database_url: "".to_string(), // Will be replaced by create_isolated_dbs
             regional_database_url: "".to_string(), // Will be replaced by create_isolated_dbs
             cluster_secret: Some("test-cluster-secret".to_string()),
             jwt_secret: "test-secret".to_string(),
             anvil_secret_encryption_key:
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            http_bind_addr: "127.0.0.1:0".to_string(),
-            quic_bind_addr: "/ip4/127.0.0.1/udp/0/quic-v1".to_string(),
-            public_addrs: vec![],
-            public_grpc_addr: "".to_string(), // Will be set dynamically
-            grpc_bind_addr: "127.0.0.1:0".to_string(),
+            cluster_listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".to_string(),
+            public_cluster_addrs: vec![],
+            public_api_addr: "".to_string(), // Will be set dynamically
+            api_listen_addr: "127.0.0.1:0".to_string(),
             region: "".to_string(), // Will be set per-node
             bootstrap_addrs: vec![],
             init_cluster: false,
@@ -210,6 +209,10 @@ impl TestCluster {
     }
 
     pub async fn start_and_converge(&mut self, timeout: Duration) {
+        self.start_and_converge_no_new_token(timeout,true).await
+    }
+
+    pub async fn start_and_converge_no_new_token(&mut self, timeout: Duration, get_new_token: bool) {
         let mut swarms = Vec::new();
         for _ in 0..self.states.len() {
             swarms.push(
@@ -251,7 +254,7 @@ impl TestCluster {
 
             let cfg = &state.config.deref();
             let mut cfg = anvil::config::Config::from_ref(cfg);
-            cfg.public_grpc_addr = format!("http://{}", addr);
+            cfg.public_api_addr = format!("http://{}", addr);
             state.config = Arc::new(cfg);
 
             let handle = tokio::spawn(async move {
@@ -260,7 +263,9 @@ impl TestCluster {
             self.nodes.push(handle);
         }
 
-        self.token = get_auth_token(&self.global_db_url, &self.grpc_addrs[0]).await;
+        if get_new_token {
+            self.token = get_auth_token(&self.global_db_url, &self.grpc_addrs[0]).await;
+        }
 
         let start = Instant::now();
         while start.elapsed() < timeout {
@@ -279,6 +284,29 @@ impl TestCluster {
             }
         }
         panic!("Cluster did not converge in time");
+    }
+
+    pub async fn get_s3_client(&self,region:&str, access_key: &str, secret_key: &str) -> S3Client {
+        let credentials =
+            Credentials::new(access_key, secret_key, None, None, "static");
+
+        let config = aws_sdk_s3::Config::builder()
+            .credentials_provider(credentials)
+            .region(aws_sdk_s3::config::Region::new(region.to_string()))
+            .endpoint_url(&self.grpc_addrs[0]) // Point to the test server
+            .force_path_style(true)
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+
+        S3Client::from_conf(config)
+    }
+
+    pub async fn restart(&mut self, timeout: Duration) {
+        for node in self.nodes.drain(..) {
+            node.abort();
+        }
+        self.grpc_addrs.clear();
+        self.start_and_converge(timeout).await;
     }
 }
 

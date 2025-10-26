@@ -20,25 +20,21 @@ pub struct Config {
     #[arg(long, env)]
     pub anvil_secret_encryption_key: String,
 
-    /// The address to bind the S3-compatible HTTP gateway to.
-    #[arg(long, env, default_value = "0.0.0.0:9000")]
-    pub http_bind_addr: String,
-
     /// The address to bind the QUIC peer-to-peer endpoint to.
     #[arg(long, env, default_value = "/ip4/0.0.0.0/udp/7443/quic-v1")]
-    pub quic_bind_addr: String,
+    pub cluster_listen_addr: String,
 
     /// The publicly reachable addresses for this node.
     #[arg(long, env, use_value_delimiter = true, value_delimiter = ',')]
-    pub public_addrs: Vec<String>,
+    pub public_cluster_addrs: Vec<String>,
 
     /// The publicly reachable gRPC address for this node.
     #[arg(long, env)]
-    pub public_grpc_addr: String,
+    pub public_api_addr: String,
 
     /// The address to bind the main gRPC service to.
     #[arg(long, env, default_value = "0.0.0.0:50051")]
-    pub grpc_bind_addr: String,
+    pub api_listen_addr: String,
 
     /// The current region this node is operating in.
     #[arg(long, env)]

@@ -227,6 +227,17 @@ impl Persistence {
         Ok(row.map(Into::into))
     }
 
+    pub async fn update_app_secret(&self, app_id: i64, new_encrypted_secret: &[u8]) -> Result<()> {
+        let client = self.global_pool.get().await?;
+        client
+            .execute(
+                "UPDATE apps SET client_secret_encrypted = $1 WHERE id = $2",
+                &[&new_encrypted_secret, &app_id],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn grant_policy(&self, app_id: i64, resource: &str, action: &str) -> Result<()> {
         let client = self.global_pool.get().await?;
         client

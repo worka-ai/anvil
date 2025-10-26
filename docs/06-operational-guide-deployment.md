@@ -24,7 +24,7 @@ See the `docker-compose.yml` in the [Getting Started](/docs/anvil/getting-starte
 -   `REGION`: The name of the region this node operates in.
 -   `JWT_SECRET`: A secret key for signing JWTs.
 -   `ANVIL_SECRET_ENCRYPTION_KEY`: A secret key for encrypting sensitive data at rest.
--   `HTTP_BIND_ADDR`, `GRPC_BIND_ADDR`, `QUIC_BIND_ADDR`: The local addresses and ports for the various services.
+-   `API_LISTEN_ADDR`, `CLUSTER_LISTEN_ADDR`: The local addresses and ports for the various services.
 -   `command: ["anvil", "--init-cluster"]`: The `--init-cluster` flag tells this node that it is the first node and should not try to bootstrap from another peer.
 
 ### 6.2. Multi-Node Cluster Deployment
@@ -58,8 +58,7 @@ When this second node starts, it will connect to `anvil1`, join the cluster, and
 
 If your Anvil nodes are running on hosts with a firewall, you must open the necessary ports to allow traffic. By default, Anvil uses the following ports:
 
--   **9000/tcp:** The S3-compatible HTTP gateway.
--   **50051/tcp:** The gRPC API service.
+-   **50051/tcp:** The unified API endpoint for both the S3-compatible HTTP gateway and the gRPC service.
 -   **7443/udp:** The QUIC endpoint for peer-to-peer gossip and data transfer.
 
 These ports can be changed via their respective environment variables.
@@ -67,10 +66,7 @@ These ports can be changed via their respective environment variables.
 #### UFW (Ubuntu/Debian)
 
 ```bash
-# Allow S3 Gateway traffic
-sudo ufw allow 9000/tcp
-
-# Allow gRPC traffic
+# Allow S3 Gateway and gRPC traffic
 sudo ufw allow 50051/tcp
 
 # Allow QUIC peer-to-peer traffic
@@ -84,10 +80,7 @@ sudo ufw reload
 #### firewalld (RHEL/CentOS/Fedora)
 
 ```bash
-# Allow S3 Gateway traffic
-sudo firewall-cmd --zone=public --add-port=9000/tcp --permanent
-
-# Allow gRPC traffic
+# Allow S3 Gateway and gRPC traffic
 sudo firewall-cmd --zone=public --add-port=50051/tcp --permanent
 
 # Allow QUIC peer-to-peer traffic
@@ -109,11 +102,10 @@ Anvil is configured entirely through environment variables. The following is a r
 | `JWT_SECRET`                    | **Required.** Secret key for minting and verifying JWTs.                    |
 | `ANVIL_SECRET_ENCRYPTION_KEY`   | **Required.** A 64-character hex-encoded string for AES-256 encryption. <br/><br/> **CRITICAL:** This key is used to encrypt sensitive data at rest. It **MUST** be a cryptographically secure, 64-character hexadecimal string (representing 32 bytes). Loss of this key will result in permanent data loss. <br/><br/> Generate a secure key with: <br/> `openssl rand -hex 32` |
 | `ANVIL_CLUSTER_SECRET`          | A shared secret to authenticate and encrypt inter-node gossip messages.     |
-| `HTTP_BIND_ADDR`                | The local IP and port for the S3 gateway (e.g., `0.0.0.0:9000`).             |
-| `GRPC_BIND_ADDR`                | The local IP and port for the gRPC service (e.g., `0.0.0.0:50051`).           |
-| `QUIC_BIND_ADDR`                | The local multiaddress for the QUIC P2P listener.                           |
-| `PUBLIC_ADDRS`                  | Comma-separated list of public-facing multiaddresses for this node.         |
-| `PUBLIC_GRPC_ADDR`              | The public-facing address for the gRPC service.                             |
+| `API_LISTEN_ADDR`               | The local IP and port for the unified S3 Gateway and gRPC service (e.g., `0.0.0.0:50051`). |
+| `CLUSTER_LISTEN_ADDR`           | The local multiaddress for the QUIC P2P listener.                           |
+| `PUBLIC_CLUSTER_ADDRS`          | Comma-separated list of public-facing multiaddresses for this node.         |
+| `PUBLIC_API_ADDR`               | The public-facing address for the gRPC service.                             |
 | `BOOTSTRAP_ADDRS`               | Comma-separated list of bootstrap peer addresses for joining a cluster.     |
 | `INIT_CLUSTER`                  | Set to `true` for the first node in a cluster. Defaults to `false`.         |
 | `ENABLE_MDNS`                   | Set to `true` to enable local peer discovery via mDNS. Defaults to `true`.  |

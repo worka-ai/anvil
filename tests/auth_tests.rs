@@ -261,3 +261,88 @@ async fn test_set_public_access_and_get() {
     let res_2 = object_client.get_object(get_req_2).await;
     assert!(res_2.is_err());
 }
+
+#[tokio::test]
+async fn test_reset_app_secret() {
+    let mut cluster = common::TestCluster::new(&["eu1"]).await;
+    cluster
+        .start_and_converge_no_new_token(Duration::from_secs(5), false)
+        .await;
+
+    let app_name = "app-to-reset";
+
+    // 1. Create an app and get original credentials
+    let (client_id, original_secret) = create_app(&cluster.global_db_url, app_name);
+
+    // Grant it permissions
+    let admin_args = &["run", "--bin", "admin", "--"];
+    let policy_args = &[
+        "policies",
+        "grant",
+        "--app-name",
+        app_name,
+        "--action",
+        "*",
+        "--resource",
+        "*",
+    ];
+    let grant_status = std::process::Command::new("cargo")
+        .args(
+            admin_args
+                .iter()
+                .chain(&[
+                    "--global-database-url",
+                    &cluster.global_db_url,
+                    "--anvil-secret-encryption-key",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ])
+                .chain(policy_args.iter()),
+        )
+        .status()
+        .unwrap();
+    assert!(grant_status.success());
+
+    // 2. Reset the secret using the new admin command
+    let reset_output = std::process::Command::new("cargo")
+        .args(admin_args.iter().chain(&[
+            "--global-database-url",
+            &cluster.global_db_url,
+            "--anvil-secret-encryption-key",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "apps",
+            "reset-secret",
+            "--app-name",
+            app_name,
+        ]))
+        .output()
+        .unwrap();
+
+    assert!(reset_output.status.success());
+    let reset_creds = String::from_utf8(reset_output.stdout).unwrap();
+    let new_secret = common::extract_credential(&reset_creds, "Client Secret");
+
+    // 3. Verify the secret has changed
+    assert_ne!(original_secret, new_secret);
+
+    // 4. Restart the cluster to ensure it picks up the new secret, clearing any cache.
+    cluster.restart(Duration::from_secs(10)).await;
+
+    // 5. Verify the NEW secret works against the restarted node
+    let s3_client_new = cluster.get_s3_client("eu1", &client_id, &new_secret).await;
+    match s3_client_new.list_buckets().send().await {
+        Ok(_list_bucket_output) => {}
+        Err(e) => {
+            panic!("List buckets failed with the new secret: {:?}", e);
+        }
+    }
+
+    // 6. Verify the OLD secret fails
+    let s3_client_old = cluster
+        .get_s3_client("eu1", &client_id, &original_secret)
+        .await;
+    let list_buckets_old = s3_client_old.list_buckets().send().await;
+    assert!(
+        list_buckets_old.is_err(),
+        "List buckets should fail with the old secret"
+    );
+}

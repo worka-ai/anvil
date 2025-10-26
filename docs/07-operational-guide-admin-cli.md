@@ -13,13 +13,13 @@ Anvil includes a powerful command-line interface (CLI) for performing essential 
 
 ### Running the Admin CLI
 
-When running Anvil via Docker Compose, you can execute the admin CLI using `docker-compose exec`.
+When running Anvil via Docker Compose, you can execute the admin CLI using `docker-compose exec`. Note that the command is `admin`, not `anvil admin`.
 
 ```bash
-docker-compose exec anvil1 anvil admin <COMMAND>
+docker compose exec anvil1 admin <COMMAND>
 ```
 
-All admin commands require the `GLOBAL_DATABASE_URL` and `ANVIL_SECRET_ENCRYPTION_KEY` to be set, which is typically handled by the environment variables in the `docker-compose.yml` file.
+All admin commands will automatically use the environment variables (`GLOBAL_DATABASE_URL`, etc.) set in your `docker-compose.yml` file.
 
 ### Command Reference
 
@@ -29,13 +29,12 @@ Regions must be created before you can assign buckets to them.
 
 **Create a Region**
 
-This command is idempotent; it will do nothing if the region already exists.
+This command is idempotent and uses a positional argument for the name.
 
 ```bash
-anvil admin regions create --name <REGION_NAME>
+# Usage: admin regions create <NAME>
+docker compose exec anvil1 admin regions create us-east-1
 ```
-
-*   `--name`: The name of the new region (e.g., `us-east-1`, `DOCKER_TEST`).
 
 #### Managing Tenants
 
@@ -43,11 +42,12 @@ Tenants are the top-level organizational unit in Anvil.
 
 **Create a Tenant**
 
-```bash
-anvil admin tenants create --name <TENANT_NAME>
-```
+This command also uses a positional argument for the name.
 
-*   `--name`: The unique name for the new tenant (e.g., `my-organization`).
+```bash
+# Usage: admin tenants create <NAME>
+docker compose exec anvil1 admin tenants create my-organization
+```
 
 #### Managing Apps
 
@@ -55,14 +55,14 @@ Apps are entities within a tenant that are granted API credentials.
 
 **Create an App**
 
-This command creates an app and outputs its `Client ID` and `Client Secret`, which are used for S3 and gRPC authentication.
+This command uses named flags for the tenant and app names.
 
 ```bash
-anvil admin apps create --tenant-name <TENANT_NAME> --app-name <APP_NAME>
+docker compose exec anvil1 admin apps create --tenant-name <TENANT_NAME> --app-name <APP_NAME>
 ```
 
 *   `--tenant-name`: The name of the tenant that will own the app.
-*   `--app-name`: A descriptive name for the app (e.g., `backup-script`, `web-frontend`).
+*   `--app-name`: A descriptive name for the app (e.g., `backup-script`).
 
 > **Security Note:** The `Client Secret` is only displayed once upon creation. You must save it in a secure location.
 
@@ -72,10 +72,10 @@ Policies grant permissions to apps.
 
 **Grant a Policy**
 
-This command gives an app specific permissions for an action on a resource.
+This command uses named flags.
 
 ```bash
-anvil admin policies grant \
+docker compose exec anvil1 admin policies grant \
     --app-name <APP_NAME> \
     --action <ACTION> \
     --resource <RESOURCE>
@@ -89,7 +89,7 @@ anvil admin policies grant \
 
 ```bash
 # Allow the 'web-frontend' app to read objects from the 'public-assets' bucket
-anvil admin policies grant \
+docker compose exec anvil1 admin policies grant \
     --app-name web-frontend \
     --action "read" \
     --resource "bucket:public-assets/*"

@@ -16,14 +16,14 @@ RUN cargo build --release --bin anvil --bin admin
 FROM debian:bookworm-slim
 
 # Install runtime dependencies
-RUN apt-get update && apt-get install -y libssl3 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y libssl3 curl && rm -rf /var/lib/apt/lists/*
 
 # Copy the compiled binaries from the builder stage
 COPY --from=builder /usr/src/anvil/target/release/anvil /usr/local/bin/anvil
 COPY --from=builder /usr/src/anvil/target/release/admin /usr/local/bin/admin
 
 # Expose the default gRPC/S3 port and a potential swarm port
-EXPOSE 9000
+EXPOSE 50051
 EXPOSE 7443
 
 # Set the default command to run the anvil server
