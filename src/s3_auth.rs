@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -49,8 +49,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
 
     let is_streaming = content_sha256 == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
 
-    // If it's not a streaming upload, we must buffer the body to verify its hash.
-    // If it IS a streaming upload, we leave the body as-is to be handled by the downstream service.
+    // Buffer non-streaming bodies so we can hash them for verification
     let (body_bytes, reconstituted_body) = if !is_streaming {
         let bytes = match body.collect().await {
             Ok(b) => b.to_bytes(),
@@ -69,7 +68,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
 
     let mut req = Request::from_parts(parts.clone(), reconstituted_body);
 
-    // If no AWS SigV4 auth, decide if we can allow anonymous (GET/HEAD) and defer auth to handlers
+    // Require AWS4-HMAC-SHA256 (except allow anonymous GET/HEAD)
     let auth_header = match parts
         .headers
         .get(http::header::AUTHORIZATION)
@@ -79,7 +78,6 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         _ => {
             let method = parts.method.clone();
             if method == http::Method::GET || method == http::Method::HEAD {
-                // Allow anonymous GET/HEAD; handlers will enforce bucket-level public access
                 debug!("No SigV4 for GET/HEAD, deferring auth to handler");
                 return next.run(req).await;
             }
@@ -90,7 +88,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         }
     };
 
-    // Parse Authorization header (credential scope, signed headers, signature)
+    // Parse Authorization header
     let parsed = match parse_auth_header(auth_header) {
         Ok(p) => p,
         Err(e) => {
@@ -116,8 +114,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
 
     let encryption_key = hex::decode(&state.config.anvil_secret_encryption_key)
         .expect("ANVIL_SECRET_ENCRYPTION_KEY must be a valid hex string");
-    let secret_bytes = match crypto::decrypt(&app_details.client_secret_encrypted, &encryption_key)
-    {
+    let secret_bytes = match crypto::decrypt(&app_details.client_secret_encrypted, &encryption_key) {
         Ok(s) => s,
         Err(_) => {
             warn!(access_key_id = %parsed.access_key_id, "Failed to decrypt secret for SigV4 auth");
@@ -151,7 +148,6 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
     {
         Some(t) => t,
         None => {
-            // Fallback to date in credential scope (midnight UTC) if header missing
             match parse_scope_yyyymmdd(&parsed.date) {
                 Some(t) => t,
                 None => {
@@ -165,36 +161,31 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         }
     };
 
-    // Build absolute URL (scheme://host/path?query)
-    let host = parts
-        .headers
-        .get(http::header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("localhost");
-    let scheme = detect_scheme(&parts.headers);
-    let path_q = parts
-        .uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
+    // === CRUCIAL: build absolute URL & header set exactly like the client ===
+    // Robust authority (works for h2/h2c where Host header may be absent)
+    // Necessary for reverse proxy setups i.e. behind nginx or Caddy etc
+    let host = effective_host(&parts);
+
+    // Prefer X-Forwarded-Proto (from Caddy), then URI scheme, then default to https
+    let scheme = detect_scheme(&parts.headers, &parts);
+
+    let path_q = parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     let absolute_url = format!("{scheme}://{host}{path_q}");
 
     // S3 canonicalization settings
     let mut settings = SigningSettings::default();
     settings.signature_location = SignatureLocation::Headers;
-    settings.percent_encoding_mode = PercentEncodingMode::Single; // no double-encode
-    settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled; // no path normalization
-    settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256; // use x-amz-content-sha256
+    settings.percent_encoding_mode = PercentEncodingMode::Single;
+    settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+    settings.payload_checksum_kind = aws_sigv4::http_request::PayloadChecksumKind::XAmzSha256;
     settings.expires_in = None;
-
-    // Exclude Authorization (never signed). We will also filter headers to exactly SignedHeaders.
     settings.excluded_headers = Some(vec![Cow::Borrowed("authorization")]);
 
     // Build signing params (region & service from credential scope)
     let signing_params: SigningParams = v4::SigningParams::builder()
         .identity(&identity)
         .region(&parsed.region)
-        .name(&parsed.service) // "s3"
+        .name(&parsed.service) // "s3" for S3-compatible
         .time(signing_time)
         .settings(settings)
         .build()
@@ -206,23 +197,30 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
     } else {
         content_sha256
             .map(|s| s.to_string())
-            .unwrap_or_else(|| sha256_hex(&body_bytes.unwrap()))
+            .unwrap_or_else(|| sha256_hex(&body_bytes.as_ref().unwrap()))
     };
+
+    // Collect headers, lowercased, first value only (SigV4 uses comma-joined if multiple;
+    // typical S3 clients send a single value for signed headers)
+    let mut hdrs: HashMap<String, String> = HashMap::new();
+    for (k, v) in parts.headers.iter() {
+        if let Ok(val) = v.to_str() {
+            hdrs.insert(k.as_str().to_ascii_lowercase(), val.to_string());
+        }
+    }
 
     // Only include headers that the client actually signed (from SignedHeaders=...)
     let signed_set: HashSet<&str> = parsed.signed_headers.iter().map(|s| s.as_str()).collect();
 
-    let headers_iter = parts.headers.iter().filter_map(|(k, v)| {
-        let name = k.as_str();
-        if name.eq_ignore_ascii_case("authorization") {
-            return None;
-        }
-        // Header names in SignedHeaders are lowercase; compare case-insensitively.
-        if !signed_set.contains(&name.to_ascii_lowercase().as_str()) {
-            return None;
-        }
-        v.to_str().ok().map(|vs| (name, vs))
-    });
+    // If client signed "host" but it's missing (common over h2c), synthesize from authority we derived
+    if signed_set.contains("host") && !hdrs.contains_key("host") {
+        hdrs.insert("host".to_string(), host.clone());
+    }
+
+    let headers_iter = hdrs
+        .iter()
+        .filter(|(name, _)| signed_set.contains(name.as_str()))
+        .map(|(name, val)| (name.as_str(), val.as_str()));
 
     let signable_req = match SignableRequest::new(
         parts.method.as_str(),
@@ -295,6 +293,35 @@ struct ParsedAuth {
     service: String,
     signed_headers: Vec<String>, // lowercase, in order
     signature: String,
+}
+
+fn effective_host(parts: &http::request::Parts) -> String {
+    // 1) HTTP/2 authority from URI, if present
+    if let Some(auth) = parts.uri.authority() {
+        return auth.as_str().to_string();
+    }
+    // 2) Host header
+    if let Some(h) = parts.headers.get(http::header::HOST).and_then(|h| h.to_str().ok()) {
+        return h.to_string();
+    }
+    // 3) Forwarded host from proxy
+    if let Some(h) = parts.headers.get("x-forwarded-host").and_then(|h| h.to_str().ok()) {
+        return h.to_string();
+    }
+    "localhost".to_string()
+}
+
+// prefer XFP, then URI scheme, then https (since client talked TLS to Caddy)
+fn detect_scheme(headers: &HeaderMap, parts: &http::request::Parts) -> &'static str {
+    if let Some(v) = headers.get("x-forwarded-proto").and_then(|h| h.to_str().ok()) {
+        if v.eq_ignore_ascii_case("https") { return "https"; }
+        if v.eq_ignore_ascii_case("http")  { return "http";  }
+    }
+    if let Some(s) = parts.uri.scheme_str() {
+        if s.eq_ignore_ascii_case("https") { return "https"; }
+        if s.eq_ignore_ascii_case("http")  { return "http";  }
+    }
+    "https"
 }
 
 // Parse: AWS4-HMAC-SHA256 Credential=AKID/DATE/REGION/SERVICE/aws4_request, SignedHeaders=..., Signature=...
@@ -376,18 +403,6 @@ fn parse_scope_yyyymmdd(s: &str) -> Option<SystemTime> {
     let time = Tm::from_hms(0, 0, 0).ok()?;
     let odt = PrimitiveDateTime::new(date, time).assume_utc();
     Some(UNIX_EPOCH + Duration::from_secs(odt.unix_timestamp() as u64))
-}
-
-fn detect_scheme(headers: &HeaderMap) -> &'static str {
-    if let Some(v) = headers
-        .get("x-forwarded-proto")
-        .and_then(|h| h.to_str().ok())
-    {
-        if v.eq_ignore_ascii_case("https") {
-            return "https";
-        }
-    }
-    "http"
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
