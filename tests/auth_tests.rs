@@ -346,3 +346,87 @@ async fn test_reset_app_secret() {
         "List buckets should fail with the old secret"
     );
 }
+
+#[tokio::test]
+async fn test_admin_cli_set_public_access() {
+    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let mut bucket_client = BucketServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut object_client = ObjectServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    let token = cluster.token.clone();
+    let bucket_name = "cli-public-bucket".to_string();
+    let object_key = "cli-public-object".to_string();
+
+    // 1. Create a bucket and upload an object to it.
+    let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "TEST_REGION".to_string(),
+    });
+    create_bucket_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client
+        .create_bucket(create_bucket_req)
+        .await
+        .unwrap();
+
+    let metadata = ObjectMetadata {
+        bucket_name: bucket_name.clone(),
+        object_key: object_key.clone(),
+    };
+    let chunks = vec![
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                metadata,
+            )),
+        },
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                b"public data from cli test".to_vec(),
+            )),
+        },
+    ];
+    let mut put_req = Request::new(tokio_stream::iter(chunks));
+    put_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    object_client.put_object(put_req).await.unwrap();
+
+    // 2. Verify the object is NOT public yet.
+    let object_url = format!("{}/{}/{}", cluster.grpc_addrs[0], bucket_name, object_key);
+    let http_client = reqwest::Client::new();
+    let resp_before = http_client.get(&object_url).send().await.unwrap();
+    assert_eq!(resp_before.status(), 403, "Object should be private initially");
+
+    // 3. Use the admin CLI to make the bucket public.
+    let admin_args = &["run", "--bin", "admin", "--"];
+    let set_public_status = std::process::Command::new("cargo")
+        .args(admin_args.iter().chain(&[
+            "--global-database-url",
+            &cluster.global_db_url,
+            "--anvil-secret-encryption-key",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "buckets",
+            "set-public-access",
+            "--bucket",
+            &bucket_name,
+            "--allow",
+        ]))
+        .status()
+        .unwrap();
+    assert!(set_public_status.success());
+
+    // 4. Verify the object IS public now.
+    let resp_after = http_client.get(&object_url).send().await.unwrap();
+    assert_eq!(resp_after.status(), 200, "Object should be public after CLI command");
+    let body = resp_after.text().await.unwrap();
+    assert_eq!(body, "public data from cli test");
+}

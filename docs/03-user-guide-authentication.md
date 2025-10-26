@@ -29,7 +29,7 @@ You create an App using the `anvil admin` CLI (as shown in the Getting Started g
 
 ```bash
 # This command is run by an administrator
-docker-compose exec anvil1 anvil admin apps create \
+docker compose exec anvil1 admin apps create \
     --tenant-name my-first-tenant \
     --app-name my-application
 ```
@@ -53,12 +53,12 @@ A policy is granted using the admin CLI:
 
 ```bash
 # Grant the app permission to read and write objects in 'my-data-bucket'
-docker-compose exec anvil1 anvil admin policies grant \
+docker compose exec anvil1 admin policies grant \
     --app-name my-application \
     --action "write" \
     --resource "bucket:my-data-bucket/*"
 
-docker-compose exec anvil1 anvil admin policies grant \
+docker compose exec anvil1 admin policies grant \
     --app-name my-application \
     --action "read" \
     --resource "bucket:my-data-bucket/*"
@@ -79,7 +79,5 @@ You can set a bucket's public status using the `anvil admin` CLI or the gRPC API
 
 ```bash
 # Make a bucket public (requires 'grant' permission on the bucket)
-docker-compose exec anvil1 anvil admin buckets set-public-access \
-    --bucket my-public-assets \
-    --allow true
+docker compose exec anvil1 admin buckets set-public-access --bucket my-public-assets --allow
 ```

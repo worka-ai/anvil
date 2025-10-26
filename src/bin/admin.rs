@@ -46,12 +46,28 @@ enum Commands {
         #[clap(subcommand)]
         command: RegionCommands,
     },
+    /// Manage buckets
+    Buckets {
+        #[clap(subcommand)]
+        command: BucketCommands,
+    },
 }
 
 #[derive(Subcommand)]
 enum TenantCommands {
     /// Create a new tenant
     Create { name: String },
+}
+
+#[derive(Subcommand)]
+enum BucketCommands {
+    /// Set the public access status for a bucket
+    SetPublicAccess {
+        #[clap(long)]
+        bucket: String,
+        #[clap(long)]
+        allow: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -190,6 +206,17 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     info!("Region already exists: {}", name);
                 }
+            }
+        },
+        Commands::Buckets { command } => match command {
+            BucketCommands::SetPublicAccess { bucket, allow } => {
+                persistence
+                    .set_bucket_public_access(bucket, *allow)
+                    .await?;
+                info!(
+                    "Set public read access for bucket '{}' to {}",
+                    bucket, allow
+                );
             }
         },
     }

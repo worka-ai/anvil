@@ -260,15 +260,35 @@ impl Persistence {
         Ok(())
     }
 
-    pub async fn create_bucket(&self, tenant_id: i64, name: &str, region: &str) -> Result<Bucket> {
-        let client = self.global_pool.get().await?;
-        let row = client
+    pub async fn create_bucket(
+        &self,
+        tenant_id: i64,
+        name: &str,
+        region: &str,
+    ) -> Result<Bucket, tonic::Status> {
+        let client = self.global_pool.get().await.map_err(|e| {
+            tonic::Status::internal(format!("Failed to get DB client: {}", e))
+        })?;
+        let result = client
             .query_one(
                 "INSERT INTO buckets (tenant_id, name, region) VALUES ($1, $2, $3) RETURNING *",
                 &[&tenant_id, &name, &region],
             )
-            .await?;
-        Ok(row.into())
+            .await;
+
+        match result {
+            Ok(row) => Ok(row.into()),
+            Err(e) => {
+                if let Some(db_err) = e.as_db_error() {
+                    if db_err.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION {
+                        return Err(tonic::Status::already_exists(
+                            "A bucket with that name already exists.",
+                        ));
+                    }
+                }
+                Err(tonic::Status::internal(e.to_string()))
+            }
+        }
     }
 
     pub async fn get_bucket_by_name(
