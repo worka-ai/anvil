@@ -3,6 +3,15 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::{auth::Claims, crypto, AppState};
+use anyhow::anyhow;
+use aws_credential_types::Credentials;
+use aws_sigv4::http_request::{
+    sign, PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest,
+    SignatureLocation, SigningParams, SigningSettings, UriPathNormalizationMode,
+};
+use aws_sigv4::sign::v4;
+use aws_smithy_runtime_api::client::identity::Identity;
 use axum::{
     body::Body,
     extract::{Request, State},
@@ -10,21 +19,11 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+
 use http_body_util::BodyExt;
-
-use aws_credential_types::Credentials;
-use aws_sigv4::http_request::{
-    PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SignatureLocation,
-    SigningParams, SigningSettings, UriPathNormalizationMode, sign,
-};
-use aws_sigv4::sign::v4;
-use aws_smithy_runtime_api::client::identity::Identity;
-
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use time::{Date, Month, PrimitiveDateTime, Time as Tm};
-
-use crate::{AppState, auth::Claims, crypto};
 use tracing::{debug, info, warn};
 
 pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
@@ -42,13 +41,17 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         }
     }
 
-    let content_sha256 = parts
+    let content_sha256:Option<&str> = parts
         .headers
-        .get("x-amz-content-sha256")
+        //.get("x-amz-content-sha256")
+        //"content-encoding": "aws-chunked",
+        .get("content-encoding")
         .and_then(|h| h.to_str().ok());
 
-    let is_streaming = content_sha256 == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
-
+    //let is_streaming = content_sha256 == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
+    let is_streaming = content_sha256 == Some("aws-chunked");
+    println!("is_streaming: {:?}, {:?}", is_streaming, content_sha256);
+    println!("HEADERS: {:?}",parts.headers);
     // Buffer non-streaming bodies so we can hash them for verification
     let (body_bytes, reconstituted_body) = if !is_streaming {
         let bytes = match body.collect().await {
@@ -63,7 +66,20 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         };
         (Some(bytes.clone()), Body::from(bytes))
     } else {
-        (None, body)
+        // For streaming, decode the whole body in memory. This is not ideal for huge
+        // files, but it correctly handles the aws-chunked format and is safer.
+        match decode_aws_chunked_body(body).await {
+            Ok(decoded_bytes) => (None, Body::from(decoded_bytes)),
+            Err(e) => {
+                warn!(error = %e, "Failed to decode aws-chunked body");
+                return Response::builder()
+                    .status(400)
+                    .body(Body::from(format!(
+                        "Failed to decode aws-chunked body: {e}"
+                    )))
+                    .unwrap();
+            }
+        }
     };
 
     let mut req = Request::from_parts(parts.clone(), reconstituted_body);
@@ -114,7 +130,8 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
 
     let encryption_key = hex::decode(&state.config.anvil_secret_encryption_key)
         .expect("ANVIL_SECRET_ENCRYPTION_KEY must be a valid hex string");
-    let secret_bytes = match crypto::decrypt(&app_details.client_secret_encrypted, &encryption_key) {
+    let secret_bytes = match crypto::decrypt(&app_details.client_secret_encrypted, &encryption_key)
+    {
         Ok(s) => s,
         Err(_) => {
             warn!(access_key_id = %parsed.access_key_id, "Failed to decrypt secret for SigV4 auth");
@@ -147,18 +164,16 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         .and_then(parse_x_amz_date)
     {
         Some(t) => t,
-        None => {
-            match parse_scope_yyyymmdd(&parsed.date) {
-                Some(t) => t,
-                None => {
-                    warn!(access_key_id = %parsed.access_key_id, "Missing or invalid X-Amz-Date for SigV4");
-                    return Response::builder()
-                        .status(400)
-                        .body(Body::from("Missing or invalid X-Amz-Date"))
-                        .unwrap();
-                }
+        None => match parse_scope_yyyymmdd(&parsed.date) {
+            Some(t) => t,
+            None => {
+                warn!(access_key_id = %parsed.access_key_id, "Missing or invalid X-Amz-Date for SigV4");
+                return Response::builder()
+                    .status(400)
+                    .body(Body::from("Missing or invalid X-Amz-Date"))
+                    .unwrap();
             }
-        }
+        },
     };
 
     // === CRUCIAL: build absolute URL & header set exactly like the client ===
@@ -169,7 +184,11 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
     // Prefer X-Forwarded-Proto (from Caddy), then URI scheme, then default to https
     let scheme = detect_scheme(&parts.headers, &parts);
 
-    let path_q = parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let path_q = parts
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
     let absolute_url = format!("{scheme}://{host}{path_q}");
 
     // S3 canonicalization settings
@@ -286,6 +305,68 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
 
 // ----------------- helpers -----------------
 
+/// A simple, in-memory decoder for `aws-chunked` content encoding.
+/// NOTE: This buffers the entire body and does not verify chunk signatures.
+/// A production implementation should be a true `Stream` and verify signatures.
+async fn decode_aws_chunked_body(body: Body) -> anyhow::Result<bytes::Bytes> {
+    use bytes::{Buf, BytesMut};
+
+    // 1. Collect the entire raw body into a single contiguous buffer.
+    let mut buffer = BytesMut::from(body.collect().await?.to_bytes());
+
+    // 2. Now parse the buffered data.
+    let mut decoded = BytesMut::new();
+    loop {
+        if buffer.is_empty() {
+            break;
+        }
+
+        // Find header line
+        let header_end = buffer
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or_else(|| anyhow::anyhow!("Malformed chunk: no header ending found"))?;
+
+        // Parse hex size
+        let header_line = &buffer[..header_end];
+        let hex_size_str = std::str::from_utf8(header_line)?
+            .split(';')
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Malformed chunk header"))?;
+        let chunk_size = usize::from_str_radix(hex_size_str, 16)?;
+
+        // Advance buffer past the header line and its CRLF
+        buffer.advance(header_end + 2);
+
+        if chunk_size == 0 {
+            // End of stream
+            break;
+        }
+
+        // Ensure we have enough data for the chunk payload and its trailing CRLF
+        if buffer.len() < chunk_size + 2 {
+            return Err(anyhow::anyhow!(
+                "Incomplete chunk data: needed {}, have {}",
+                chunk_size + 2,
+                buffer.len()
+            ));
+        }
+
+        // Copy the payload to our decoded buffer
+        decoded.extend_from_slice(&buffer[..chunk_size]);
+
+        // Verify the trailing CRLF
+        if &buffer[chunk_size..chunk_size + 2] != b"\r\n" {
+            return Err(anyhow::anyhow!("Malformed chunk: missing trailing CRLF"));
+        }
+
+        // Advance the buffer past the payload and its CRLF
+        buffer.advance(chunk_size + 2);
+    }
+
+    Ok(decoded.freeze())
+}
+
 struct ParsedAuth {
     access_key_id: String,
     date: String, // YYYYMMDD
@@ -301,11 +382,19 @@ fn effective_host(parts: &http::request::Parts) -> String {
         return auth.as_str().to_string();
     }
     // 2) Host header
-    if let Some(h) = parts.headers.get(http::header::HOST).and_then(|h| h.to_str().ok()) {
+    if let Some(h) = parts
+        .headers
+        .get(http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+    {
         return h.to_string();
     }
     // 3) Forwarded host from proxy
-    if let Some(h) = parts.headers.get("x-forwarded-host").and_then(|h| h.to_str().ok()) {
+    if let Some(h) = parts
+        .headers
+        .get("x-forwarded-host")
+        .and_then(|h| h.to_str().ok())
+    {
         return h.to_string();
     }
     "localhost".to_string()
@@ -313,13 +402,24 @@ fn effective_host(parts: &http::request::Parts) -> String {
 
 // prefer XFP, then URI scheme, then https (since client talked TLS to Caddy)
 fn detect_scheme(headers: &HeaderMap, parts: &http::request::Parts) -> &'static str {
-    if let Some(v) = headers.get("x-forwarded-proto").and_then(|h| h.to_str().ok()) {
-        if v.eq_ignore_ascii_case("https") { return "https"; }
-        if v.eq_ignore_ascii_case("http")  { return "http";  }
+    if let Some(v) = headers
+        .get("x-forwarded-proto")
+        .and_then(|h| h.to_str().ok())
+    {
+        if v.eq_ignore_ascii_case("https") {
+            return "https";
+        }
+        if v.eq_ignore_ascii_case("http") {
+            return "http";
+        }
     }
     if let Some(s) = parts.uri.scheme_str() {
-        if s.eq_ignore_ascii_case("https") { return "https"; }
-        if s.eq_ignore_ascii_case("http")  { return "http";  }
+        if s.eq_ignore_ascii_case("https") {
+            return "https";
+        }
+        if s.eq_ignore_ascii_case("http") {
+            return "http";
+        }
     }
     "https"
 }

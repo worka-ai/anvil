@@ -96,7 +96,7 @@ hmac = "0.12.1"
 axum-extra = { version = "0.10.2", features = ["typed-header"] }
 postgres-types = {version =  "0.2.10", features = ["derive"] }
 regex = "1.11.3"
-aws-sigv4 = { version = "1", features = ["sign-http", "http1"] }
+aws-sigv4 = { version = "1", features = ["sign-http", "http1", "sign-eventstream"] }
 aws-credential-types = "1"   # for Credentials
 aws-smithy-runtime-api = "1" # for Identity
 

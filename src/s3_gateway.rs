@@ -35,7 +35,10 @@ pub fn app(state: AppState) -> Router {
             "/{bucket}",
             put(create_bucket).head(head_bucket).get(list_objects),
         )
-        .route("/{bucket}/", get(list_objects))
+        .route(
+            "/{bucket}/",
+            get(list_objects).put(create_bucket).head(head_bucket),
+        )
         .route(
             "/{bucket}/{*path}",
             get(get_object).put(put_object).head(head_object),
@@ -98,13 +101,13 @@ async fn list_buckets(State(state): State<AppState>, req: Request) -> Response {
 
 async fn create_bucket(
     State(state): State<AppState>,
-    bucket: Path<String>,
+    Path(bucket): Path<String>,
     req: Request,
 ) -> Response {
-    // For S3 `CreateBucket`, the region is in the XML body, which we are not parsing here.
-    // We will use the node's default region.
-    // Also, we need to extract the tenant from the request extensions, set by SigV4.
-    // This is a simplified version.
+    // The S3 `CreateBucket` operation can contain an XML body with the location
+    // constraint. We must consume the body for the handler to be matched correctly,
+    // even if we don't use the content for now.
+
     // Claims may be absent for anonymous; handler will enforce bucket public access
     let claims = req.extensions().get::<Claims>().cloned();
     let claims = match claims {
@@ -117,6 +120,12 @@ async fn create_bucket(
             );
         }
     };
+    //let _ = body.collect().await;
+    // let body_stream = req.into_body().into_data_stream().map(|r| {
+    //     r.map(|chunk| chunk.to_vec())
+    //         .map_err(|e| tonic::Status::internal(e.to_string()))
+    // }).collect::<Vec<_>>();
+    // println!("{:?}", body_stream);
     match state
         .bucket_manager
         .create_bucket(claims.tenant_id, &bucket, &state.region, &claims.scopes)
@@ -150,35 +159,36 @@ async fn create_bucket(
 
 async fn head_bucket(
     State(state): State<AppState>,
-    Path(bucket): Path<String>,
+    Path(bucket_name): Path<String>,
     req: Request,
 ) -> Response {
-    let claims = req.extensions().get::<Claims>().cloned();
+    let claims = match req.extensions().get::<Claims>().cloned() {
+        Some(c) => c,
+        None => {
+            return s3_error(
+                "AccessDenied",
+                "Missing credentials for HEAD request",
+                axum::http::StatusCode::FORBIDDEN,
+            );
+        }
+    };
 
-    // We can treat HEAD as a lightweight LIST with 0 max keys to check for existence and permissions.
     match state
-        .object_manager
-        .list_objects(claims, &bucket, "", "", 0, "")
+        .db
+        .get_bucket_by_name(claims.tenant_id, &bucket_name, &state.region)
         .await
     {
-        Ok(_) => (axum::http::StatusCode::OK, "").into_response(),
-        Err(status) => match status.code() {
-            tonic::Code::NotFound => s3_error(
-                "NoSuchBucket",
-                status.message(),
-                axum::http::StatusCode::NOT_FOUND,
-            ),
-            tonic::Code::PermissionDenied => s3_error(
-                "AccessDenied",
-                status.message(),
-                axum::http::StatusCode::FORBIDDEN,
-            ),
-            _ => s3_error(
-                "InternalError",
-                status.message(),
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            ),
-        },
+        Ok(Some(_)) => (axum::http::StatusCode::OK, "").into_response(),
+        Ok(None) => s3_error(
+            "NoSuchBucket",
+            "The specified bucket does not exist",
+            axum::http::StatusCode::NOT_FOUND,
+        ),
+        Err(e) => s3_error(
+            "InternalError",
+            &e.to_string(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
