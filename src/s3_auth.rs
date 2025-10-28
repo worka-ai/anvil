@@ -26,6 +26,46 @@ use subtle::ConstantTimeEq;
 use time::{Date, Month, PrimitiveDateTime, Time as Tm};
 use tracing::{debug, info, warn};
 
+/// Middleware (Stage 2) to decode an `aws-chunked` request body.
+/// This runs AFTER `sigv4_auth`.
+pub async fn aws_chunked_decoder(req: Request, next: Next) -> Response {
+    let (mut parts, body) = req.into_parts();
+
+    let is_streaming =
+        if let Some(encoding) = parts.headers.get("content-encoding") {
+            encoding.to_str().unwrap_or("") == "aws-chunked"
+        } else {
+            false
+        };
+
+    if is_streaming {
+        match decode_aws_chunked_body(body).await {
+            Ok(decoded_bytes) => {
+                // Remove the chunked encoding header as it's no longer accurate
+                parts.headers.remove("content-encoding");
+                // Create a new request with the clean body
+                let new_req = Request::from_parts(parts, Body::from(decoded_bytes));
+                next.run(new_req).await
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to decode aws-chunked body");
+                Response::builder()
+                    .status(400)
+                    .body(Body::from(format!(
+                        "Failed to decode aws-chunked body: {e}"
+                    )))
+                    .unwrap()
+            }
+        }
+    } else {
+        // Not a streaming request, pass it through unmodified.
+        let req = Request::from_parts(parts, body);
+        next.run(req).await
+    }
+}
+
+/// Middleware (Stage 1) to perform SigV4 authentication.
+/// This must run BEFORE the `aws_chunked_decoder`.
 pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let (parts, body) = req.into_parts();
 
@@ -41,18 +81,15 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         }
     }
 
-    let content_sha256:Option<&str> = parts
-        .headers
-        //.get("x-amz-content-sha256")
-        //"content-encoding": "aws-chunked",
-        .get("content-encoding")
-        .and_then(|h| h.to_str().ok());
+    // Your correct detection logic.
+    let is_streaming = if let Some(encoding) = parts.headers.get("content-encoding") {
+        encoding.to_str().unwrap_or("") == "aws-chunked"
+    } else {
+        false
+    };
 
-    //let is_streaming = content_sha256 == Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
-    let is_streaming = content_sha256 == Some("aws-chunked");
-    println!("is_streaming: {:?}, {:?}", is_streaming, content_sha256);
-    println!("HEADERS: {:?}",parts.headers);
-    // Buffer non-streaming bodies so we can hash them for verification
+    // We need to buffer the body for hashing ONLY if it's NOT a streaming request.
+    // For streaming requests, the body is passed through untouched for later decoding.
     let (body_bytes, reconstituted_body) = if !is_streaming {
         let bytes = match body.collect().await {
             Ok(b) => b.to_bytes(),
@@ -66,25 +103,11 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         };
         (Some(bytes.clone()), Body::from(bytes))
     } else {
-        // For streaming, decode the whole body in memory. This is not ideal for huge
-        // files, but it correctly handles the aws-chunked format and is safer.
-        match decode_aws_chunked_body(body).await {
-            Ok(decoded_bytes) => (None, Body::from(decoded_bytes)),
-            Err(e) => {
-                warn!(error = %e, "Failed to decode aws-chunked body");
-                return Response::builder()
-                    .status(400)
-                    .body(Body::from(format!(
-                        "Failed to decode aws-chunked body: {e}"
-                    )))
-                    .unwrap();
-            }
-        }
+        (None, body)
     };
 
     let mut req = Request::from_parts(parts.clone(), reconstituted_body);
 
-    // Require AWS4-HMAC-SHA256 (except allow anonymous GET/HEAD)
     let auth_header = match parts
         .headers
         .get(http::header::AUTHORIZATION)
@@ -104,7 +127,6 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         }
     };
 
-    // Parse Authorization header
     let parsed = match parse_auth_header(auth_header) {
         Ok(p) => p,
         Err(e) => {
@@ -116,7 +138,6 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         }
     };
 
-    // Look up app / secret by access key id
     let app_details = match state.db.get_app_by_client_id(&parsed.access_key_id).await {
         Ok(Some(d)) => d,
         _ => {
@@ -152,11 +173,9 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         }
     };
 
-    // Identity used by the signer
     let identity: Identity =
         Credentials::new(&parsed.access_key_id, &secret, None, None, "sigv4-verify").into();
 
-    // Use EXACT X-Amz-Date (required for matching signature)
     let signing_time = match parts
         .headers
         .get("x-amz-date")
@@ -176,14 +195,8 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         },
     };
 
-    // === CRUCIAL: build absolute URL & header set exactly like the client ===
-    // Robust authority (works for h2/h2c where Host header may be absent)
-    // Necessary for reverse proxy setups i.e. behind nginx or Caddy etc
     let host = effective_host(&parts);
-
-    // Prefer X-Forwarded-Proto (from Caddy), then URI scheme, then default to https
     let scheme = detect_scheme(&parts.headers, &parts);
-
     let path_q = parts
         .uri
         .path_and_query()
@@ -191,7 +204,6 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         .unwrap_or("/");
     let absolute_url = format!("{scheme}://{host}{path_q}");
 
-    // S3 canonicalization settings
     let mut settings = SigningSettings::default();
     settings.signature_location = SignatureLocation::Headers;
     settings.percent_encoding_mode = PercentEncodingMode::Single;
@@ -200,27 +212,31 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
     settings.expires_in = None;
     settings.excluded_headers = Some(vec![Cow::Borrowed("authorization")]);
 
-    // Build signing params (region & service from credential scope)
     let signing_params: SigningParams = v4::SigningParams::builder()
         .identity(&identity)
         .region(&parsed.region)
-        .name(&parsed.service) // "s3" for S3-compatible
+        .name(&parsed.service)
         .time(signing_time)
         .settings(settings)
         .build()
         .expect("valid signing params")
         .into();
 
-    let payload_hash = if is_streaming {
-        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".to_string()
-    } else {
-        content_sha256
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| sha256_hex(&body_bytes.as_ref().unwrap()))
-    };
+    // IMPORTANT: use exactly what the client signed, if provided.
+    let payload_hash = parts
+        .headers
+        .get("x-amz-content-sha256")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            if is_streaming {
+                // extremely rare path: streaming but no header present
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".to_string()
+            } else {
+                sha256_hex(body_bytes.as_ref().expect("non-streaming body bytes present"))
+            }
+        });
 
-    // Collect headers, lowercased, first value only (SigV4 uses comma-joined if multiple;
-    // typical S3 clients send a single value for signed headers)
     let mut hdrs: HashMap<String, String> = HashMap::new();
     for (k, v) in parts.headers.iter() {
         if let Ok(val) = v.to_str() {
@@ -228,10 +244,8 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         }
     }
 
-    // Only include headers that the client actually signed (from SignedHeaders=...)
     let signed_set: HashSet<&str> = parsed.signed_headers.iter().map(|s| s.as_str()).collect();
 
-    // If client signed "host" but it's missing (common over h2c), synthesize from authority we derived
     if signed_set.contains("host") && !hdrs.contains_key("host") {
         hdrs.insert("host".to_string(), host.clone());
     }
@@ -339,17 +353,14 @@ async fn decode_aws_chunked_body(body: Body) -> anyhow::Result<bytes::Bytes> {
         buffer.advance(header_end + 2);
 
         if chunk_size == 0 {
-            // End of stream
-            break;
+            break; // End of stream
         }
 
         // Ensure we have enough data for the chunk payload and its trailing CRLF
         if buffer.len() < chunk_size + 2 {
             return Err(anyhow::anyhow!(
-                "Incomplete chunk data: needed {}, have {}",
-                chunk_size + 2,
-                buffer.len()
-            ));
+                "Incomplete chunk data: needed {}, have {}"
+            , chunk_size + 2, buffer.len()));
         }
 
         // Copy the payload to our decoded buffer

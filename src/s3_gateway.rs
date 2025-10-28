@@ -1,6 +1,6 @@
 use crate::AppState;
 use crate::auth::Claims;
-use crate::s3_auth::sigv4_auth;
+use crate::s3_auth::{aws_chunked_decoder, sigv4_auth};
 use axum::{
     Router,
     body::Body,
@@ -44,6 +44,7 @@ pub fn app(state: AppState) -> Router {
             get(get_object).put(put_object).head(head_object),
         )
         .with_state(state.clone())
+        .route_layer(middleware::from_fn(aws_chunked_decoder))
         .route_layer(middleware::from_fn_with_state(state.clone(), sigv4_auth));
 
     public.merge(s3_routes)
