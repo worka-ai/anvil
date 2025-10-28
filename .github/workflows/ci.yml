@@ -77,6 +77,10 @@ jobs:
     - name: Run tests
       run: cargo test --workspace
 
+    - name: Build Linux Binaries
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      run: cargo build --release --target=x86_64-unknown-linux-gnu --bin anvil --bin admin
+
     - name: Extract metadata for Docker
       id: meta
       uses: docker/metadata-action@v5

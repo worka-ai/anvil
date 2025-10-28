@@ -1,8 +1,9 @@
-use std::process::Command;
+use std::process::{exit, Command};
 use std::time::{Duration, Instant};
 
 fn run(cmd: &str, args: &[&str]) {
     let status = Command::new(cmd)
+        .current_dir(format!("{}", std::env::var("CARGO_MANIFEST_DIR").unwrap()))
         .args(args)
         .status()
         .expect("failed to run command");
@@ -43,7 +44,10 @@ impl Drop for ComposeGuard {
 
 #[tokio::test]
 async fn docker_cluster_end_to_end() {
-    // Bring up the cluster
+    // First, build the release binaries on the host so Docker can copy them.
+    run("cargo", &["build", "--bin", "anvil", "--bin", "admin"]);
+
+    // Now, build the simple runtime image and bring up the cluster.
     run("docker", &["compose", "build"]);
     run("docker", &["compose", "up", "-d"]);
     let _guard = ComposeGuard;
