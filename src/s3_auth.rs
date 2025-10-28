@@ -3,12 +3,11 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::{auth::Claims, crypto, AppState};
-use anyhow::anyhow;
+use crate::{AppState, auth::Claims, crypto};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
-    sign, PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest,
-    SignatureLocation, SigningParams, SigningSettings, UriPathNormalizationMode,
+    PercentEncodingMode, SignableBody, SignableRequest, SignatureLocation,
+    SigningParams, SigningSettings, UriPathNormalizationMode, sign,
 };
 use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
@@ -31,12 +30,11 @@ use tracing::{debug, info, warn};
 pub async fn aws_chunked_decoder(req: Request, next: Next) -> Response {
     let (mut parts, body) = req.into_parts();
 
-    let is_streaming =
-        if let Some(encoding) = parts.headers.get("content-encoding") {
-            encoding.to_str().unwrap_or("") == "aws-chunked"
-        } else {
-            false
-        };
+    let is_streaming = if let Some(encoding) = parts.headers.get("content-encoding") {
+        encoding.to_str().unwrap_or("") == "aws-chunked"
+    } else {
+        false
+    };
 
     if is_streaming {
         match decode_aws_chunked_body(body).await {
@@ -233,7 +231,11 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
                 // extremely rare path: streaming but no header present
                 "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".to_string()
             } else {
-                sha256_hex(body_bytes.as_ref().expect("non-streaming body bytes present"))
+                sha256_hex(
+                    body_bytes
+                        .as_ref()
+                        .expect("non-streaming body bytes present"),
+                )
             }
         });
 
@@ -359,8 +361,10 @@ async fn decode_aws_chunked_body(body: Body) -> anyhow::Result<bytes::Bytes> {
         // Ensure we have enough data for the chunk payload and its trailing CRLF
         if buffer.len() < chunk_size + 2 {
             return Err(anyhow::anyhow!(
-                "Incomplete chunk data: needed {}, have {}"
-            , chunk_size + 2, buffer.len()));
+                "Incomplete chunk data: needed {}, have {}",
+                chunk_size + 2,
+                buffer.len()
+            ));
         }
 
         // Copy the payload to our decoded buffer

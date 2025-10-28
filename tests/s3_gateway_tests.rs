@@ -1,20 +1,20 @@
 #![feature(vec_into_chunks)]
 
-use std::convert::Infallible;
-use std::env::temp_dir;
-use std::path::PathBuf;
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::{GetAccessTokenRequest, SetPublicAccessRequest};
-use aws_sdk_s3::primitives::{ByteStream, SdkBody};
 use aws_sdk_s3::Client;
+use aws_sdk_s3::primitives::{ByteStream, SdkBody};
 use bytes::Bytes;
 use http_body_util::StreamBody;
 use hyper::body::Frame;
-use std::time::Duration;
 use rand::random;
+use std::convert::Infallible;
+use std::env::temp_dir;
+use std::path::PathBuf;
+use std::time::Duration;
 use tokio::fs;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 
 mod common;
 
@@ -305,13 +305,10 @@ async fn test_streaming_upload_decoding() {
     // // turn the receiver into a Body that yields http-body 1.0 Frames
     // let stream = ReceiverStream::new(rx).map(|b| Ok::<hyper::body::Frame<bytes::Bytes>, Infallible>(Frame::data(b)));
     // let body = StreamBody::new(stream);
-    let mut file =PathBuf::new();
+    let mut file = PathBuf::new();
     file.push(temp_dir());
-    file.push(format!("worka-test-streaming-{}",random::<i32>()));
-    fs::write(
-        file.as_path(),
-        original_content,
-    ).await.unwrap();
+    file.push(format!("worka-test-streaming-{}", random::<i32>()));
+    fs::write(file.as_path(), original_content).await.unwrap();
     let bytestream = ByteStream::read_from()
         .path(file.as_path())
         // Specify the size of the buffer used to read the file (in bytes, default is 4096)

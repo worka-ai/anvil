@@ -266,9 +266,11 @@ impl Persistence {
         name: &str,
         region: &str,
     ) -> Result<Bucket, tonic::Status> {
-        let client = self.global_pool.get().await.map_err(|e| {
-            tonic::Status::internal(format!("Failed to get DB client: {}", e))
-        })?;
+        let client = self
+            .global_pool
+            .get()
+            .await
+            .map_err(|e| tonic::Status::internal(format!("Failed to get DB client: {}", e)))?;
         let result = client
             .query_one(
                 "INSERT INTO buckets (tenant_id, name, region) VALUES ($1, $2, $3) RETURNING *",

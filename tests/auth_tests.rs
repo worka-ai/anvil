@@ -404,7 +404,11 @@ async fn test_admin_cli_set_public_access() {
     let object_url = format!("{}/{}/{}", cluster.grpc_addrs[0], bucket_name, object_key);
     let http_client = reqwest::Client::new();
     let resp_before = http_client.get(&object_url).send().await.unwrap();
-    assert_eq!(resp_before.status(), 403, "Object should be private initially");
+    assert_eq!(
+        resp_before.status(),
+        403,
+        "Object should be private initially"
+    );
 
     // 3. Use the admin CLI to make the bucket public.
     let admin_args = &["run", "--bin", "admin", "--"];
@@ -426,7 +430,11 @@ async fn test_admin_cli_set_public_access() {
 
     // 4. Verify the object IS public now.
     let resp_after = http_client.get(&object_url).send().await.unwrap();
-    assert_eq!(resp_after.status(), 200, "Object should be public after CLI command");
+    assert_eq!(
+        resp_after.status(),
+        200,
+        "Object should be public after CLI command"
+    );
     let body = resp_after.text().await.unwrap();
     assert_eq!(body, "public data from cli test");
 }

@@ -63,7 +63,11 @@ async fn list_buckets(State(state): State<AppState>, req: Request) -> Response {
         }
     };
 
-    match state.bucket_manager.list_buckets(claims.tenant_id,claims.scopes.as_slice()).await {
+    match state
+        .bucket_manager
+        .list_buckets(claims.tenant_id, claims.scopes.as_slice())
+        .await
+    {
         Ok(buckets) => {
             let mut xml = String::from(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n",
@@ -71,7 +75,10 @@ async fn list_buckets(State(state): State<AppState>, req: Request) -> Response {
             xml.push_str("  <Owner>\n");
             xml.push_str(&format!("    <ID>{}</ID>\n", claims.tenant_id));
             // DisplayName is not stored, so we'll use tenant_id for now.
-            xml.push_str(&format!("    <DisplayName>{}</DisplayName>\n", claims.tenant_id));
+            xml.push_str(&format!(
+                "    <DisplayName>{}</DisplayName>\n",
+                claims.tenant_id
+            ));
             xml.push_str("  </Owner>\n");
             xml.push_str("  <Buckets>\n");
             for b in buckets {

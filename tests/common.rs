@@ -1,10 +1,10 @@
-use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::GetAccessTokenRequest;
-use anvil::{run_migrations, AppState};
+use anvil::anvil_api::auth_service_client::AuthServiceClient;
+use anvil::{AppState, run_migrations};
 use anyhow::Result;
 use aws_config::BehaviorVersion;
-use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::config::Credentials;
 use deadpool_postgres::{ManagerConfig, Pool, RecyclingMethod};
 use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -209,10 +209,14 @@ impl TestCluster {
     }
 
     pub async fn start_and_converge(&mut self, timeout: Duration) {
-        self.start_and_converge_no_new_token(timeout,true).await
+        self.start_and_converge_no_new_token(timeout, true).await
     }
 
-    pub async fn start_and_converge_no_new_token(&mut self, timeout: Duration, get_new_token: bool) {
+    pub async fn start_and_converge_no_new_token(
+        &mut self,
+        timeout: Duration,
+        get_new_token: bool,
+    ) {
         let mut swarms = Vec::new();
         for _ in 0..self.states.len() {
             swarms.push(
@@ -286,9 +290,13 @@ impl TestCluster {
         panic!("Cluster did not converge in time");
     }
 
-    pub async fn get_s3_client(&self,region:&str, access_key: &str, secret_key: &str) -> S3Client {
-        let credentials =
-            Credentials::new(access_key, secret_key, None, None, "static");
+    pub async fn get_s3_client(
+        &self,
+        region: &str,
+        access_key: &str,
+        secret_key: &str,
+    ) -> S3Client {
+        let credentials = Credentials::new(access_key, secret_key, None, None, "static");
 
         let config = aws_sdk_s3::Config::builder()
             .credentials_provider(credentials)

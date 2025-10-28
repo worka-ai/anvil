@@ -210,9 +210,7 @@ async fn main() -> anyhow::Result<()> {
         },
         Commands::Buckets { command } => match command {
             BucketCommands::SetPublicAccess { bucket, allow } => {
-                persistence
-                    .set_bucket_public_access(bucket, *allow)
-                    .await?;
+                persistence.set_bucket_public_access(bucket, *allow).await?;
                 info!(
                     "Set public read access for bucket '{}' to {}",
                     bucket, allow
