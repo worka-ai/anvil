@@ -1,5 +1,3 @@
-#![feature(vec_into_chunks)]
-
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::{GetAccessTokenRequest, SetPublicAccessRequest};
 use aws_sdk_s3::Client;
