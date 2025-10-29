@@ -43,12 +43,26 @@ impl Drop for ComposeGuard {
 }
 
 #[tokio::test]
+#[cfg(target_os = "linux")]
 async fn docker_cluster_end_to_end() {
-    // First, build the release binaries on the host so Docker can copy them.
-    run("cargo", &["build", "--bin", "anvil", "--bin", "admin"]);
+    // First, cross-compile the debug binaries for Linux so Docker can copy them.
+    let target = "x86_64-unknown-linux-gnu";
+    run(
+        "cargo",
+        &["build", "--bin", "anvil", "--bin", "admin", "--target", target],
+    );
 
-    // Now, build the simple runtime image and bring up the cluster.
-    run("docker", &["compose", "build"]);
+    // Now, build the simple runtime image, passing the correct binary path as a build argument.
+    let binary_path = format!("./target/{}/debug", target);
+    run(
+        "docker",
+        &[
+            "compose",
+            "build",
+            "--build-arg",
+            &format!("BINARY_PATH={}", binary_path),
+        ],
+    );
     run("docker", &["compose", "up", "-d"]);
     let _guard = ComposeGuard;
 

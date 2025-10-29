@@ -41,6 +41,8 @@ services:
     build:
       context: ..
       dockerfile: anvil/Dockerfile
+      args:
+        - BINARY_PATH=./target/release
     depends_on:
       postgres-global:
         condition: service_healthy
@@ -74,6 +76,8 @@ services:
     build:
       context: ..
       dockerfile: anvil/Dockerfile
+      args:
+        - BINARY_PATH=./target/release
     depends_on:
       anvil1:
         condition: service_started
@@ -100,6 +104,8 @@ services:
     build:
       context: ..
       dockerfile: anvil/Dockerfile
+      args:
+        - BINARY_PATH=./target/release
     depends_on:
       anvil1:
         condition: service_started
