@@ -33,114 +33,114 @@ jobs:
       MAINTENANCE_DATABASE_URL: postgres://worka:worka@localhost:5432/worka
 
     steps:
-        - name: Checkout repository
-          uses: actions/checkout@v4
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-        - name: Setup Rust
-          uses: dtolnay/rust-toolchain@stable
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
 
-        - name: Install Protoc
-          uses: arduino/setup-protoc@v2
-          with:
-            version: "25.x"
+    - name: Install Protoc
+      uses: arduino/setup-protoc@v2
+      with:
+        version: "25.x"
 
-        - name: Cache Cargo dependencies
-          uses: actions/cache@v4
-          with:
-            path: |
-              ~/.cargo/bin/
-              ~/.cargo/registry/index/
-              ~/.cargo/registry/cache/
-              ~/.cargo/git/db/
-              target/
-            key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+    - name: Cache Cargo dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-        - name: Run Unit & Integration Tests (non-Docker)
-          run: cargo test --workspace --exclude docker_cluster_test
+    - name: Install Zigbuild
+      run: cargo install cargo-zigbuild
 
-        - name: Install Zigbuild
-          run: cargo install cargo-zigbuild
+    - name: Build Linux Binaries w/ Zigbuild
+      run: cargo zigbuild --release --target=x86_64-unknown-linux-gnu --workspace
 
-        - name: Build Linux Binaries w/ Zigbuild
-          run: cargo zigbuild --release --target=x86_64-unknown-linux-gnu --workspace
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
 
-        - name: Set up Docker Buildx
-          uses: docker/setup-buildx-action@v3
+    - name: Build Docker Image for Testing
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: anvil/Dockerfile
+        load: true
+        push: false
+        tags: anvil:test
+        platforms: linux/amd64
+        build-args: |
+          BINARY_PATH=./target/x86_64-unknown-linux-gnu/release
 
-        - name: Build Docker Image for E2E Testing
-          uses: docker/build-push-action@v5
-          with:
-            context: .
-            file: anvil/Dockerfile
-            load: true
-            push: false
-            tags: anvil:test
-            platforms: linux/amd64
-            build-args: |
-              BINARY_PATH=./target/x86_64-unknown-linux-gnu/release
+    - name: Wait for PostgreSQL to be ready
+      run: |
+        until pg_isready -h localhost -p 5432 -U postgres; do
+          echo "Waiting for PostgreSQL..."
+          sleep 2
+        done
+        echo "PostgreSQL is ready."
 
-        - name: Wait for PostgreSQL to be ready
-          run: |
-            until pg_isready -h localhost -p 5432 -U postgres; do
-              echo "Waiting for PostgreSQL..."
-              sleep 2
-            done
-            echo "PostgreSQL is ready."
+    - name: Run All Tests
+      env:
+        ANVIL_IMAGE: anvil:test
+      run: cargo test --workspace -- --nocapture
 
-        - name: Run Docker E2E Test
-          env:
-            ANVIL_IMAGE: anvil:test
-          run: cargo test --workspace --test docker_cluster_test -- --nocapture
+    # --- Release Steps --- 
+    # These steps will only run on a successful push to the main branch.
 
-        - name: Log in to GitHub Container Registry
-          if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-          uses: docker/login-action@v3
-          with:
-            registry: ghcr.io
-            username: ${{ github.actor }}
-            password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Log in to GitHub Container Registry
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
-        - name: Generate release tag
-          if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-          id: tag
-          run: echo "tag_name=v$(date +'%Y.%m.%d-%H%M%S')" >> $GITHUB_OUTPUT
+    - name: Generate release tag
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      id: tag
+      run: echo "tag_name=v$(date +'%Y.%m.%d-%H%M%S')" >> $GITHUB_OUTPUT
 
-        - name: Extract metadata for Docker
-          if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-          id: meta
-          uses: docker/metadata-action@v5
-          with:
-            images: ghcr.io/${{ github.repository }}
-            tags: |
-              type=raw,value=${{ steps.tag.outputs.tag_name }}
-              type=raw,value=latest,enable={{is_default_branch}}
+    - name: Extract metadata for Docker
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ghcr.io/${{ github.repository }}
+        tags: |
+          type=raw,value=${{ steps.tag.outputs.tag_name }}
+          type=raw,value=latest,enable={{is_default_branch}}
 
-        - name: Build and Push Final Docker Image
-          if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-          uses: docker/build-push-action@v5
-          with:
-            context: .
-            file: anvil/Dockerfile
-            push: true
-            tags: ${{ steps.meta.outputs.tags }}
-            labels: ${{ steps.meta.outputs.labels }}
-            platforms: linux/amd64,linux/arm64
-            build-args: |
-              BINARY_PATH=./target/x86_64-unknown-linux-gnu/release
-            cache-from: type=gha
-            cache-to: type=gha,mode=max
+    - name: Build and Push Final Docker Image
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: anvil/Dockerfile
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        platforms: linux/amd64 # For now, we only build and push one platform
+        build-args: |
+          BINARY_PATH=./target/x86_64-unknown-linux-gnu/release
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
 
-        - name: Create GitHub Release
-          if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-          uses: softprops/action-gh-release@v1
-          with:
-            tag_name: ${{ steps.tag.outputs.tag_name }}
-            generate_release_notes: true
-            body: |
-              ## Docker Image
-    
-              You can pull the latest image using the following command:
-    
-              ```sh
-              docker pull ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.tag_name }}
-              ```
+    - name: Create GitHub Release
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.tag.outputs.tag_name }}
+        generate_release_notes: true
+        body: |
+          ## Docker Image
+
+          You can pull the latest image using the following command:
+
+          ```sh
+          docker pull ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.tag_name }}
+          ```
