@@ -44,12 +44,24 @@ impl Drop for ComposeGuard {
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn docker_cluster_end_to_end() {
-    // This test now assumes that the Docker image has been pre-built and tagged
-    // appropriately, and that the ANVIL_IMAGE environment variable is set.
+    // This test now assumes that the Docker image has been pre-built by a previous CI step
+    // and that the ANVIL_IMAGE environment variable is set to the correct image tag.
     // The CI workflow is responsible for this setup.
+
+    // Construct an absolute path to the test compose file to avoid CWD issues.
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let compose_file_path = std::path::Path::new(&manifest_dir)
+        .join("tests/docker-compose.test.yml");
+
     run(
         "docker",
-        &["compose", "-f", "anvil/tests/docker-compose.test.yml", "up", "-d"],
+        &[
+            "compose",
+            "-f",
+            compose_file_path.to_str().unwrap(),
+            "up",
+            "-d",
+        ],
     );
     let _guard = ComposeGuard;
 
