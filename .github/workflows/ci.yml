@@ -14,6 +14,9 @@ jobs:
   build-and-test:
     runs-on: worka-l1
 
+    env:
+      ANVIL_IMAGE: ghcr.io/${{ github.repository }}:latest
+
     services:
       postgres:
         image: postgres:17-alpine
@@ -112,8 +115,6 @@ jobs:
         echo "PostgreSQL is ready."
 
     - name: Run Docker E2E Test
-      env:
-        ANVIL_IMAGE: ghcr.io/${{ github.repository }}:latest
       run: cargo test --workspace --test docker_cluster_test -- --nocapture
 
     - name: Create GitHub Release
