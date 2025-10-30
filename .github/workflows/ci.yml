@@ -90,15 +90,13 @@ jobs:
           type=raw,value=${{ steps.tag.outputs.tag_name }},enable=${{ github.ref == 'refs/heads/main' }}
           type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
-    - name: Build and Load Docker Image
+    - name: Build and Load Docker Image for Testing
       uses: docker/build-push-action@v5
       with:
         context: .
-        load: true
-        push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-        tags: ${{ steps.meta.outputs.tags }}
-        labels: ${{ steps.meta.outputs.labels }}
-        platforms: linux/amd64,linux/arm64
+        load: true # Load the image into the runner's docker daemon
+        push: false # Do not push this tag
+        tags: anvil:latest
         build-args: |
           BINARY_PATH=./target/x86_64-unknown-linux-gnu/release
         cache-from: type=gha
@@ -113,6 +111,8 @@ jobs:
         echo "PostgreSQL is ready."
 
     - name: Run Docker E2E Test
+      env:
+        ANVIL_IMAGE: anvil:latest
       run: cargo test --workspace --test docker_cluster_test -- --nocapture
 
     - name: Create GitHub Release
