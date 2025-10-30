@@ -31,7 +31,6 @@ jobs:
 
     env:
       MAINTENANCE_DATABASE_URL: postgres://worka:worka@localhost:5432/worka
-      ANVIL_IMAGE: ghcr.io/${{ github.repository }}:latest
 
     steps:
     - name: Checkout repository
@@ -88,6 +87,8 @@ jobs:
         echo "PostgreSQL is ready."
 
     - name: Run Unit & Integration Tests (non-Docker)
+      env:
+        ANVIL_IMAGE: ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.tag_name }}
       run: cargo test -- --nocapture
 
     - name: Build Linux Binaries for Release
