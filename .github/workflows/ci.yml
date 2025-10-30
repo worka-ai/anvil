@@ -14,9 +14,6 @@ jobs:
   build-and-test:
     runs-on: worka-l1
 
-    env:
-      ANVIL_IMAGE: ghcr.io/${{ github.repository }}:latest
-
     services:
       postgres:
         image: postgres:17-alpine
@@ -34,6 +31,7 @@ jobs:
 
     env:
       MAINTENANCE_DATABASE_URL: postgres://worka:worka@localhost:5432/worka
+      ANVIL_IMAGE: ghcr.io/${{ github.repository }}:latest
 
     steps:
     - name: Checkout repository
