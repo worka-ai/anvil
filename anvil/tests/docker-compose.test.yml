@@ -41,7 +41,7 @@ services:
 
   anvil1:
     image: ${ANVIL_IMAGE}
-    pull_policy: if_not_present
+    pull_policy: never
     depends_on:
       postgres-global:
         condition: service_healthy
@@ -73,7 +73,7 @@ services:
 
   anvil2:
     image: ${ANVIL_IMAGE}
-    pull_policy: if_not_present
+    pull_policy: never
     depends_on:
       anvil1:
         condition: service_started
@@ -98,7 +98,7 @@ services:
 
   anvil3:
     image: ${ANVIL_IMAGE}
-    pull_policy: if_not_present
+    pull_policy: never
     depends_on:
       anvil1:
         condition: service_started
