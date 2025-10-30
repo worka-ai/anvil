@@ -19,9 +19,18 @@ RUN apt-get update \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the pre-compiled binaries from the build context into the image.
-COPY ${BINARY_PATH}/anvil /usr/local/bin/anvil
-COPY ${BINARY_PATH}/admin /usr/local/bin/admin
+# Stash pre-compiled artifacts from the build context, then locate executables robustly.
+COPY ${BINARY_PATH}/ /tmp/build/
+
+# Find the actual executable files named 'anvil' and 'admin' within the copied tree
+# and place them at fixed paths in the runtime image.
+RUN set -eux; \
+    anvil_src=$(find /tmp/build -maxdepth 2 -type f -name anvil -perm -111 | head -n1); \
+    admin_src=$(find /tmp/build -maxdepth 2 -type f -name admin -perm -111 | head -n1); \
+    test -n "$anvil_src" && test -n "$admin_src"; \
+    install -m 0755 "$anvil_src" /usr/local/bin/anvil; \
+    install -m 0755 "$admin_src" /usr/local/bin/admin; \
+    rm -rf /tmp/build
 
 # Expose the default gRPC/S3 port and the QUIC P2P port
 EXPOSE 50051
