@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   build-and-test:
-    runs-on: worka-l1
+    runs-on: ubuntu-latest
 
     services:
       postgres:
@@ -55,28 +55,22 @@ jobs:
           target/
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-
-    - name: Generate release tag
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-      id: tag
-      run: echo "tag_name=v$(date +'%Y.%m.%d-%H%M%S')" >> $GITHUB_OUTPUT
-
-    - name: Install Linux Cross-Compilation Toolchain
-      run: sudo apt-get update && sudo apt-get install -y gcc-x86-64-linux-gnu
+    - name: Build Release Binaries (Native Linux)
+      run: cargo build --release --workspace
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
-    - name: Build Local Docker Image for Testing
+    - name: Build Docker Image for Testing
       uses: docker/build-push-action@v5
       with:
         context: .
         file: anvil/Dockerfile
-        load: true # Load the image into the runner's docker daemon
-        push: false # Do not push this test-only tag
-        tags: ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.tag_name }}
+        load: true
+        push: false
+        tags: anvil:test
         build-args: |
-          BINARY_PATH=./target/x86_64-unknown-linux-gnu/release
+          BINARY_PATH=./target/release
 
     - name: Wait for PostgreSQL to be ready
       run: |
@@ -86,15 +80,13 @@ jobs:
         done
         echo "PostgreSQL is ready."
 
-    - name: Run Unit & Integration Tests (non-Docker)
+    - name: Run All Tests
       env:
-        ANVIL_IMAGE: ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.tag_name }}
-      run: cargo test -- --nocapture
+        ANVIL_IMAGE: anvil:test
+      run: cargo test --workspace -- --nocapture
 
-    - name: Build Linux Binaries for Release
-      run: |
-        cargo build --release --target=x86_64-unknown-linux-gnu --bin anvil --bin admin
-        cargo build --release --target=x86_64-unknown-linux-gnu -p anvil-cli
+    # --- Release Steps --- 
+    # These steps will only run on a successful push to the main branch.
 
     - name: Log in to GitHub Container Registry
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -103,6 +95,11 @@ jobs:
         registry: ghcr.io
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Generate release tag
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      id: tag
+      run: echo "tag_name=v$(date +'%Y.%m.%d-%H%M%S')" >> $GITHUB_OUTPUT
 
     - name: Extract metadata for Docker
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -119,12 +116,13 @@ jobs:
       uses: docker/build-push-action@v5
       with:
         context: .
+        file: anvil/Dockerfile
         push: true
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
         platforms: linux/amd64,linux/arm64
         build-args: |
-          BINARY_PATH=./target/x86_64-unknown-linux-gnu/release
+          BINARY_PATH=./target/release # Note: This assumes single arch build. For multi-arch, this gets more complex.
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
