@@ -45,25 +45,13 @@ impl Drop for ComposeGuard {
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn docker_cluster_end_to_end() {
-    // First, cross-compile the debug binaries for Linux so Docker can copy them.
-    let target = "x86_64-unknown-linux-gnu";
-    run(
-        "cargo",
-        &["build", "--bin", "anvil", "--bin", "admin", "--target", target],
-    );
-
-    // Now, build the simple runtime image, passing the correct binary path as a build argument.
-    let binary_path = format!("./target/{}/debug", target);
+    // This test now assumes that the Docker image has been pre-built and tagged
+    // appropriately, and that the ANVIL_IMAGE environment variable is set.
+    // The CI workflow is responsible for this setup.
     run(
         "docker",
-        &[
-            "compose",
-            "build",
-            "--build-arg",
-            &format!("BINARY_PATH={}", binary_path),
-        ],
+        &["compose", "-f", "anvil/tests/docker-compose.test.yml", "up", "-d"],
     );
-    run("docker", &["compose", "up", "-d"]);
     let _guard = ComposeGuard;
 
     // Wait for nodes to be ready

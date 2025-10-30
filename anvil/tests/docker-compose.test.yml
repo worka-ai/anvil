@@ -1,3 +1,5 @@
+# This Docker Compose file is exclusively for the end-to-end test.
+# It uses an environment variable to dynamically set the image to test against.
 version: "3.8"
 
 networks:
@@ -38,7 +40,7 @@ services:
       retries: 5
 
   anvil1:
-    image: ghcr.io/worka-ai/anvil:latest
+    image: ${ANVIL_IMAGE}
     depends_on:
       postgres-global:
         condition: service_healthy
@@ -69,7 +71,7 @@ services:
       retries: 5
 
   anvil2:
-    image: ghcr.io/worka-ai/anvil:latest
+    image: ${ANVIL_IMAGE}
     depends_on:
       anvil1:
         condition: service_started
@@ -93,7 +95,7 @@ services:
     networks: [anvilnet]
 
   anvil3:
-    image: ghcr.io/worka-ai/anvil:latest
+    image: ${ANVIL_IMAGE}
     depends_on:
       anvil1:
         condition: service_started
