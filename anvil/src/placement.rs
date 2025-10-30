@@ -1,7 +1,6 @@
 use crate::cluster::ClusterState;
-use ahash::AHasher;
+use blake3::Hasher;
 use libp2p::PeerId;
-use std::hash::{Hash, Hasher};
 
 #[derive(Default, Clone)]
 pub struct PlacementManager;
@@ -19,17 +18,18 @@ impl PlacementManager {
             return vec![];
         }
 
-        let mut scores: Vec<(u64, PeerId)> = nodes
+        let mut scores: Vec<([u8; 32], PeerId)> = nodes
             .keys()
             .map(|peer_id| {
-                let mut hasher = AHasher::default();
-                object_key.hash(&mut hasher);
-                peer_id.hash(&mut hasher);
-                (hasher.finish(), peer_id.clone())
+                let mut hasher = Hasher::new();
+                // Hash both the object key and the peer id to get a unique score
+                hasher.update(object_key.as_bytes());
+                hasher.update(&peer_id.to_bytes());
+                (hasher.finalize().into(), peer_id.clone())
             })
             .collect();
 
-        // Sort by score in descending order
+        // Sort by score in descending order. The hash bytes are compared lexicographically.
         scores.sort_by(|a, b| b.0.cmp(&a.0));
 
         // Take the top `count` nodes
@@ -69,15 +69,15 @@ mod tests {
             }
         }
 
-        let object_key1 = "my-test-object";
-        let object_key2 = "another-test-object";
+        let object_key1 = uuid::Uuid::new_v4().to_string();
+        let object_key2 = uuid::Uuid::new_v4().to_string();
 
         // Calculate placement twice for the same key
         let placement1 = manager
-            .calculate_placement(object_key1, &cluster_state, 3)
+            .calculate_placement(&object_key1, &cluster_state, 3)
             .await;
         let placement2 = manager
-            .calculate_placement(object_key1, &cluster_state, 3)
+            .calculate_placement(&object_key1, &cluster_state, 3)
             .await;
 
         // Assert that the placement is deterministic
@@ -86,11 +86,11 @@ mod tests {
 
         // Calculate placement for a different key
         let placement3 = manager
-            .calculate_placement(object_key2, &cluster_state, 3)
+            .calculate_placement(&object_key2, &cluster_state, 3)
             .await;
         assert_eq!(placement3.len(), 3, "Should return 3 nodes");
 
-        // Assert that the placement for a different key is different (highly likely)
+        // Assert that the placement for a different key is different
         assert_ne!(
             placement1, placement3,
             "Placement for different keys should be different"

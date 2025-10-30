@@ -3,7 +3,6 @@ use std::time::{Duration, Instant};
 
 fn run(cmd: &str, args: &[&str]) {
     let status = Command::new(cmd)
-        .current_dir(format!("{}", std::env::var("CARGO_MANIFEST_DIR").unwrap()))
         .args(args)
         .status()
         .expect("failed to run command");
@@ -50,7 +49,7 @@ async fn docker_cluster_end_to_end() {
     // The CI workflow is responsible for this setup.
     run(
         "docker",
-        &["compose", "-f", "tests/docker-compose.test.yml", "up", "-d"],
+        &["compose", "-f", "anvil/tests/docker-compose.test.yml", "up", "-d"],
     );
     let _guard = ComposeGuard;
 
