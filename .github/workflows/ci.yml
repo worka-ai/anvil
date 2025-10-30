@@ -72,6 +72,7 @@ jobs:
       uses: docker/build-push-action@v5
       with:
         context: .
+        file: anvil/Dockerfile
         load: true # Load the image into the runner's docker daemon
         push: false # Do not push this test-only tag
         tags: ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.tag_name }}
