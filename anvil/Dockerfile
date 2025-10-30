@@ -1,9 +1,8 @@
 # This Dockerfile is for the runtime image only.
 # It expects that the binaries have already been compiled on the host.
 # The path to the binaries can be passed in via the BINARY_PATH build argument.
-ARG BINARY_PATH=./target/release
-
 FROM debian:bookworm-slim
+ARG BINARY_PATH=./target/release
 
 # Install runtime dependencies required by the host-built binaries and tests
 # - libssl3: OpenSSL 3 (TLS)
@@ -25,8 +24,8 @@ COPY ${BINARY_PATH}/ /tmp/build/
 # Find the actual executable files named 'anvil' and 'admin' within the copied tree
 # and place them at fixed paths in the runtime image.
 RUN set -eux; \
-    anvil_src=$(find /tmp/build -maxdepth 2 -type f -name anvil -perm -111 | head -n1); \
-    admin_src=$(find /tmp/build -maxdepth 2 -type f -name admin -perm -111 | head -n1); \
+    anvil_src=$(find /tmp/build -type f -name anvil -perm -111 | head -n1); \
+    admin_src=$(find /tmp/build -type f -name admin -perm -111 | head -n1); \
     test -n "$anvil_src" && test -n "$admin_src"; \
     install -m 0755 "$anvil_src" /usr/local/bin/anvil; \
     install -m 0755 "$admin_src" /usr/local/bin/admin; \
