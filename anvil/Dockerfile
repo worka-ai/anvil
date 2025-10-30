@@ -5,8 +5,19 @@ ARG BINARY_PATH=./target/release
 
 FROM debian:bookworm-slim
 
-# Install runtime dependencies (e.g., OpenSSL)
-RUN apt-get update && apt-get install -y libssl3 && rm -rf /var/lib/apt/lists/*
+# Install runtime dependencies required by the host-built binaries and tests
+# - libssl3: OpenSSL 3 (TLS)
+# - libgcc-s1, libstdc++6: C++ runtime and GCC support libs used by glibc-linked Rust binaries
+# - ca-certificates: TLS roots for outbound HTTPS in tests/clients
+# - curl: used by the container healthcheck in docker-compose.test.yml
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libssl3 \
+        libgcc-s1 \
+        libstdc++6 \
+        ca-certificates \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy the pre-compiled binaries from the build context into the image.
 COPY ${BINARY_PATH}/anvil /usr/local/bin/anvil
