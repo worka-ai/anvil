@@ -1,6 +1,7 @@
 use crate::anvil_api::DeleteShardRequest;
 use crate::anvil_api::internal_anvil_service_client::InternalAnvilServiceClient;
 use crate::auth::JwtManager;
+use crate::object_manager::ObjectManager;
 use crate::cluster::ClusterState;
 use crate::persistence::Persistence;
 use crate::tasks::TaskType;
@@ -53,6 +54,7 @@ pub async fn run(
     persistence: Persistence,
     cluster_state: ClusterState,
     jwt_manager: Arc<JwtManager>,
+    object_manager: ObjectManager,
 ) -> Result<()> {
     loop {
         let tasks = match persistence.fetch_pending_tasks_for_update(10).await {
@@ -76,6 +78,7 @@ pub async fn run(
             let p = persistence.clone();
             let cs = cluster_state.clone();
             let jm = jwt_manager.clone();
+            let om = object_manager.clone();
             tokio::spawn(async move {
                 if let Err(e) = p.update_task_status(task.id, "running").await {
                     error!("Failed to mark task {} as running: {}", task.id, e);
@@ -84,10 +87,8 @@ pub async fn run(
 
                 let result = match task.task_type {
                     TaskType::DeleteObject => handle_delete_object(&p, &cs, &jm, &task).await,
-                    _ => {
-                        info!("Unhandled task type: {:?}", task.task_type);
-                        Ok(())
-                    }
+                    TaskType::HFIngestion => handle_hf_ingestion(&p, &om, &task).await,
+                    _ => { info!("Unhandled task type: {:?}", task.task_type); Ok(()) }
                 };
 
                 if let Err(e) = result {
@@ -106,6 +107,138 @@ pub async fn run(
             });
         }
     }
+}
+
+async fn handle_hf_ingestion(persistence: &Persistence, object_manager: &ObjectManager, task: &Task) -> anyhow::Result<()> {
+    use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
+    use globset::{Glob, GlobSetBuilder};
+    use std::fs::File;
+    use std::io::Read;
+
+    let ingestion_id: i64 = task
+        .payload
+        .get("ingestion_id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| anyhow!("missing ingestion_id"))?;
+
+    persistence
+        .hf_update_ingestion_state(ingestion_id, "running", None)
+        .await?;
+
+    let client = persistence.get_global_pool().get().await?;
+    let job = client
+        .query_one(
+            "SELECT key_id, repo, COALESCE(revision,'main'), target_bucket, COALESCE(target_prefix,''), include_globs, exclude_globs FROM hf_ingestions WHERE id=$1",
+            &[&ingestion_id],
+        )
+        .await?;
+    let key_id: i64 = job.get(0);
+    let repo: String = job.get(1);
+    let revision: String = job.get(2);
+    let target_bucket: String = job.get(3);
+    let target_prefix: String = job.get(4);
+    let include_globs: Vec<String> = job.get(5);
+    let exclude_globs: Vec<String> = job.get(6);
+
+    let row = client
+        .query_one("SELECT token_encrypted FROM huggingface_keys WHERE id=$1", &[&key_id])
+        .await?;
+    let token_encrypted: Vec<u8> = row.get(0);
+    let enc_key = std::env::var("ANVIL_SECRET_ENCRYPTION_KEY").unwrap_or_default();
+    if enc_key.is_empty() {
+        persistence
+            .hf_update_ingestion_state(ingestion_id, "failed", Some("missing encryption key in worker"))
+            .await?;
+        anyhow::bail!("missing encryption key in worker");
+    }
+    let token_bytes = crate::crypto::decrypt(&token_encrypted, enc_key.as_bytes())?;
+    let token = String::from_utf8(token_bytes)?;
+
+    let api = ApiBuilder::new().with_token(Some(token)).build()?;
+    let repo = Repo::with_revision(repo, RepoType::Model, revision);
+    let repo_client = api.repo(repo);
+
+    let mut inc_builder = GlobSetBuilder::new();
+    if include_globs.is_empty() { inc_builder.add(Glob::new("**/*")?); } else { for g in include_globs { inc_builder.add(Glob::new(&g)?); } }
+    let include = inc_builder.build()?;
+    let mut exc_builder = GlobSetBuilder::new();
+    for g in exclude_globs { exc_builder.add(Glob::new(&g)?); }
+    let exclude = exc_builder.build()?;
+
+    // List files in repo (hf-hub 0.3): use repo_client.get on index and iterate entries via walk
+    let info = repo_client.info()?; // RepoInfo { siblings, sha }
+    'outer: for e in info.siblings {
+        let path = e.rfilename.clone();
+        let path = std::path::PathBuf::from(path);
+        if !include.is_match(path.as_path()) { continue; }
+        if exclude.is_match(path.as_path()) { continue; }
+        let size = None; // hf-hub RepoSibling does not include size; will be known after download
+        let item_id = persistence
+            .hf_add_item(ingestion_id, &path.to_string_lossy(), size, None)
+            .await?;
+        persistence
+            .hf_update_item_state(item_id, "downloading", None)
+            .await?;
+
+        // Skip if object exists with same key (size check not available here; best-effort skip)
+        // Use list with prefix == full key to detect existence
+        if let Ok(bucket_opt) = persistence.get_public_bucket_by_name(&target_bucket).await {
+            if let Some(bucket) = bucket_opt {
+                if let Ok(obj_opt) = persistence.get_object(bucket.id, &path.to_string_lossy()).await {
+                    if obj_opt.is_some() { continue 'outer; }
+                }
+            }
+        }
+
+        let local = repo_client.get(path.to_string_lossy().as_ref())?;
+        // Determine tenant and construct object key
+        let bucket = persistence
+            .get_public_bucket_by_name(&target_bucket)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("target bucket not found"))?;
+        let tenant_id = bucket.tenant_id;
+        let full_key = if target_prefix.is_empty() { path.to_string_lossy().to_string() } else { format!("{}/{}", target_prefix.trim_end_matches('/'), path.to_string_lossy()) };
+
+        // Build a stream from the local file
+        let file = tokio::fs::File::open(&local).await?;
+        use tokio_util::io::ReaderStream;
+        use futures_util::StreamExt as _;
+        let mut make_reader = || async {
+            let f = tokio::fs::File::open(&local).await;
+            f.map(|file| ReaderStream::new(file).map(|r: Result<bytes::Bytes, std::io::Error>| r.map(|b| b.to_vec()).map_err(|e| tonic::Status::internal(e.to_string()))))
+        };
+        let mut reader = make_reader().await?;
+        // Internal write scope: bypass external policy in worker context
+        let scopes = vec![format!("write:bucket:{}/{}", target_bucket, full_key)];
+        // Retry upload with simple backoff
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let res = object_manager
+                .put_object(tenant_id, &target_bucket, &full_key, &scopes, reader)
+                .await;
+            match res {
+                Ok(_obj) => break,
+                Err(e) if attempt < 3 => {
+                    // jittered backoff: 500ms * attempt + 0-200ms
+                    let jitter = (rand::random::<u64>() % 200) as u64;
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64 + jitter)).await;
+                    // Recreate reader for retry
+                    reader = make_reader().await?;
+                    continue;
+                }
+                Err(e) => return Err(anyhow::anyhow!(e.to_string())),
+            }
+        }
+        persistence
+            .hf_update_item_state(item_id, "stored", None)
+            .await?;
+    }
+
+    persistence
+        .hf_update_ingestion_state(ingestion_id, "completed", None)
+        .await?;
+    Ok(())
 }
 
 async fn handle_delete_object(

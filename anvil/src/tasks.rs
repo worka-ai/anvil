@@ -9,6 +9,8 @@ pub enum TaskType {
     DeleteBucket,
     #[postgres(name = "REBALANCE_SHARD")]
     RebalanceShard,
+    #[postgres(name = "HF_INGESTION")]
+    HFIngestion,
 }
 
 #[derive(Debug, ToSql, FromSql, PartialEq, Eq)]

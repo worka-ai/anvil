@@ -1,6 +1,8 @@
 use crate::anvil_api::auth_service_server::AuthServiceServer;
 use crate::anvil_api::bucket_service_server::BucketServiceServer;
 use crate::anvil_api::internal_anvil_service_server::InternalAnvilServiceServer;
+use crate::anvil_api::hugging_face_key_service_server::HuggingFaceKeyServiceServer;
+use crate::anvil_api::hf_ingestion_service_server::HfIngestionServiceServer;
 use crate::anvil_api::object_service_server::ObjectServiceServer;
 use crate::auth::JwtManager;
 use crate::config::Config;
@@ -141,6 +143,7 @@ pub async fn start_node(
             worker_state.db.clone(),
             worker_state.cluster.clone(),
             worker_state.jwt_manager.clone(),
+            worker_state.object_manager.clone(),
         )
         .await
         {
@@ -168,6 +171,12 @@ pub async fn start_node(
     .add_service(InternalAnvilServiceServer::with_interceptor(
         state.clone(),
         auth_interceptor,
+    ))
+    .add_service(HuggingFaceKeyServiceServer::new(
+        services::huggingface::HuggingFaceKeyServiceImpl,
+    ))
+    .add_service(HfIngestionServiceServer::new(
+        services::huggingface::HfIngestionServiceImpl,
     ));
 
     // Serve gRPC at root; tonic will handle only application/grpc requests.

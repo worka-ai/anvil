@@ -99,6 +99,21 @@ pub fn is_authorized(required_scope: &str, token_scopes: &[String]) -> bool {
     false
 }
 
+// Helper to extract scopes from AppState via current request context.
+// In this codebase, services are wrapped with an interceptor that sets claims in request extensions.
+// Here we provide a minimal helper to be invoked in services, where AppState is available.
+// Attempts to extract scopes from the request context previously attached by middleware.
+// For minimal impact, we expose a function that services can use to require scopes
+// and return PermissionDenied if missing. We do NOT modify the middleware here.
+pub fn try_get_scopes_from_extensions(ext: &http::Extensions) -> Option<Vec<String>> {
+    // If your middleware inserts Claims or a custom context into extensions,
+    // adapt these lookups. We first try our Claims type.
+    if let Some(claims) = ext.get::<crate::auth::Claims>() {
+        return Some(claims.scopes.clone());
+    }
+    None
+}
+
 fn resource_matches(required: &str, pattern: &str) -> bool {
     if pattern == "*" {
         return true;

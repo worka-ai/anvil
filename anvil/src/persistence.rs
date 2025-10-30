@@ -723,4 +723,198 @@ impl Persistence {
             .await?;
         Ok(())
     }
+
+    // ---- Hugging Face Keys ----
+    pub async fn hf_create_key(&self, name: &str, token_encrypted: &[u8], note: Option<&str>) -> Result<()> {
+        let client = self.global_pool.get().await?;
+        client
+            .execute(
+                "INSERT INTO huggingface_keys (name, token_encrypted, note) VALUES ($1,$2,$3)",
+                &[&name, &token_encrypted, &note],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn hf_delete_key(&self, name: &str) -> Result<u64> {
+        let client = self.global_pool.get().await?;
+        let n = client
+            .execute("DELETE FROM huggingface_keys WHERE name=$1", &[&name])
+            .await?;
+        Ok(n)
+    }
+
+    pub async fn hf_get_key_encrypted(&self, name: &str) -> Result<Option<(i64, Vec<u8>)>> {
+        let client = self.global_pool.get().await?;
+        if let Some(row) = client
+            .query_opt(
+                "SELECT id, token_encrypted FROM huggingface_keys WHERE name=$1",
+                &[&name],
+            )
+            .await?
+        {
+            let id: i64 = row.get(0);
+            let token: Vec<u8> = row.get(1);
+            Ok(Some((id, token)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn hf_list_keys(
+        &self,
+    ) -> Result<Vec<(String, Option<String>, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>> {
+        let client = self.global_pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT name, note, created_at, updated_at FROM huggingface_keys ORDER BY name",
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+            .collect())
+    }
+
+    // ---- HF Ingestion ----
+    pub async fn hf_create_ingestion(
+        &self,
+        key_id: i64,
+        requester: &str,
+        repo: &str,
+        revision: Option<&str>,
+        target_bucket: &str,
+        target_prefix: Option<&str>,
+        include_globs: &[String],
+        exclude_globs: &[String],
+    ) -> Result<i64> {
+        let client = self.global_pool.get().await?;
+        let row = client
+            .query_one(
+                "INSERT INTO hf_ingestions (key_id, requester, repo, revision, target_bucket, target_prefix, include_globs, exclude_globs) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id",
+                &[
+                    &key_id,
+                    &requester,
+                    &repo,
+                    &revision,
+                    &target_bucket,
+                    &target_prefix,
+                    &include_globs,
+                    &exclude_globs,
+                ],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+
+    pub async fn hf_update_ingestion_state(
+        &self,
+        id: i64,
+        state: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let client = self.global_pool.get().await?;
+        client
+            .execute(
+                "UPDATE hf_ingestions SET state=$2, error=$3, started_at=CASE WHEN $2='running' AND started_at IS NULL THEN now() ELSE started_at END, finished_at=CASE WHEN $2 IN ('completed','failed','canceled') THEN now() ELSE finished_at END WHERE id=$1",
+                &[&id, &state, &error],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn hf_cancel_ingestion(&self, id: i64) -> Result<u64> {
+        let client = self.global_pool.get().await?;
+        let n = client
+            .execute(
+                "UPDATE hf_ingestions SET state='canceled' WHERE id=$1 AND state IN ('queued','running')",
+                &[&id],
+            )
+            .await?;
+        Ok(n)
+    }
+
+    pub async fn hf_add_item(
+        &self,
+        ingestion_id: i64,
+        path: &str,
+        size: Option<i64>,
+        etag: Option<&str>,
+    ) -> Result<i64> {
+        let client = self.global_pool.get().await?;
+        let row = client
+            .query_one(
+                "INSERT INTO hf_ingestion_items (ingestion_id, path, size, etag) VALUES ($1,$2,$3,$4) RETURNING id",
+                &[&ingestion_id, &path, &size, &etag],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+
+    pub async fn hf_update_item_state(
+        &self,
+        id: i64,
+        state: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let client = self.global_pool.get().await?;
+        client
+            .execute(
+                "UPDATE hf_ingestion_items SET state=$2, error=$3, started_at=CASE WHEN $2='downloading' AND started_at IS NULL THEN now() ELSE started_at END, finished_at=CASE WHEN $2 IN ('stored','failed','skipped') THEN now() ELSE finished_at END WHERE id=$1",
+                &[&id, &state, &error],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn hf_status_summary(
+        &self,
+        id: i64,
+    ) -> Result<(
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+        Option<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        chrono::DateTime<chrono::Utc>,
+    )> {
+        let client = self.global_pool.get().await?;
+        let job = client
+            .query_one(
+                "SELECT state, error, created_at, started_at, finished_at FROM hf_ingestions WHERE id=$1",
+                &[&id],
+            )
+            .await?;
+        let state: String = job.get(0);
+        let err: Option<String> = job.get(1);
+        let created_at: chrono::DateTime<chrono::Utc> = job.get(2);
+        let started_at: Option<chrono::DateTime<chrono::Utc>> = job.get(3);
+        let finished_at: Option<chrono::DateTime<chrono::Utc>> = job.get(4);
+        let counts = client
+            .query_one(
+                "SELECT \
+                COUNT(*) FILTER (WHERE state='queued') AS queued, \
+                COUNT(*) FILTER (WHERE state='downloading') AS downloading, \
+                COUNT(*) FILTER (WHERE state='stored') AS stored, \
+                COUNT(*) FILTER (WHERE state='failed') AS failed \
+             FROM hf_ingestion_items WHERE ingestion_id=$1",
+                &[&id],
+            )
+            .await?;
+        Ok((
+            state,
+            counts.get(0),
+            counts.get(1),
+            counts.get(2),
+            counts.get(3),
+            err,
+            started_at,
+            finished_at,
+            created_at,
+        ))
+    }
 }
