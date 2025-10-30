@@ -31,7 +31,7 @@ jobs:
 
     env:
       MAINTENANCE_DATABASE_URL: postgres://worka:worka@localhost:5432/worka
-      ANVIL_IMAGE: ghcr.io/${{ github.repository }}:latest
+      ANVIL_IMAGE: anvil:test
 
     steps:
     - name: Checkout repository
