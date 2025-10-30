@@ -50,7 +50,7 @@ async fn docker_cluster_end_to_end() {
     // The CI workflow is responsible for this setup.
     run(
         "docker",
-        &["compose", "-f", "anvil/tests/docker-compose.test.yml", "up", "-d"],
+        &["compose", "-f", "tests/docker-compose.test.yml", "up", "-d"],
     );
     let _guard = ComposeGuard;
 
