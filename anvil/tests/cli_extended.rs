@@ -261,19 +261,19 @@ async fn test_cli_bucket_set_public() {
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
 
-    let bucket_name = "my-public-bucket";
-    let output = run_cli(&["bucket", "create", bucket_name, "test-region-1"], config_dir.path()).await;
+    let bucket_name = format!("my-public-bucket-{}", uuid::Uuid::new_v4());
+    let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
-    let output = run_cli(&["bucket", "set-public", bucket_name, "--allow", "true"], config_dir.path()).await;
+    let output = run_cli(&["bucket", "set-public", &bucket_name, "--allow", "true"], config_dir.path()).await;
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Public access for bucket my-public-bucket set to true"));
+    assert!(stdout.contains(&format!("Public access for bucket {} set to true", bucket_name)));
 
-    let output = run_cli(&["bucket", "set-public", bucket_name, "--allow", "false"], config_dir.path()).await;
+    let output = run_cli(&["bucket", "set-public", &bucket_name, "--allow", "false"], config_dir.path()).await;
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Public access for bucket my-public-bucket set to false"));
+    assert!(stdout.contains(&format!("Public access for bucket {} set to false", bucket_name)));
 }
 
 #[tokio::test]
@@ -283,11 +283,11 @@ async fn test_cli_object_rm() {
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
 
-    let bucket_name = "my-object-rm-bucket";
+    let bucket_name = format!("my-object-rm-bucket-{}", uuid::Uuid::new_v4());
     let object_key = "my-object-to-rm";
     let content = "hello from object rm test";
 
-    let output = run_cli(&["bucket", "create", bucket_name, "test-region-1"], config_dir.path()).await;
+    let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
     let temp_dir = tempdir().unwrap();
@@ -311,11 +311,11 @@ async fn test_cli_object_ls() {
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
 
-    let bucket_name = "my-object-ls-bucket";
+    let bucket_name = format!("my-object-ls-bucket-{}", uuid::Uuid::new_v4());
     let object_key = "my-object-to-ls";
     let content = "hello from object ls test";
 
-    let output = run_cli(&["bucket", "create", bucket_name, "test-region-1"], config_dir.path()).await;
+    let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
     let temp_dir = tempdir().unwrap();
@@ -339,11 +339,11 @@ async fn test_cli_object_get_to_file() {
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
 
-    let bucket_name = "my-object-get-bucket";
+    let bucket_name = format!("my-object-get-bucket-{}", uuid::Uuid::new_v4());
     let object_key = "my-object-to-get";
     let content = "hello from object get to file test";
 
-    let output = run_cli(&["bucket", "create", bucket_name, "test-region-1"], config_dir.path()).await;
+    let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
     let temp_dir = tempdir().unwrap();
@@ -404,15 +404,15 @@ async fn test_cli_hf_ingest_cancel() {
     let output = run_cli(&["hf", "key", "add", "--name", "test-key", "--token", "test-token"], config_dir.path()).await;
     assert!(output.status.success());
 
-    let bucket_name = "my-hf-ingest-cancel-bucket";
-    let output = run_cli(&["bucket", "create", bucket_name, "test-region-1"], config_dir.path()).await;
+    let bucket_name = format!("my-hf-ingest-cancel-bucket-{}", uuid::Uuid::new_v4());
+    let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
     let output = run_cli(&[
         "hf", "ingest", "start",
         "--key", "test-key",
         "--repo", "openai/gpt-oss-20b",
-        "--bucket", bucket_name,
+        "--bucket", &bucket_name,
         "--target-region", "test-region-1",
     ], config_dir.path()).await;
     assert!(output.status.success());
@@ -435,15 +435,15 @@ async fn test_cli_hf_ingest_start_with_options() {
     let output = run_cli(&["hf", "key", "add", "--name", "test-key", "--token", "test-token"], config_dir.path()).await;
     assert!(output.status.success());
 
-    let bucket_name = "my-hf-ingest-options-bucket";
-    let output = run_cli(&["bucket", "create", bucket_name, "test-region-1"], config_dir.path()).await;
+    let bucket_name = format!("hf-ingest-opts-{}", uuid::Uuid::new_v4());
+    let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
     let output = run_cli(&[
         "hf", "ingest", "start",
         "--key", "test-key",
         "--repo", "openai/gpt-oss-20b",
-        "--bucket", bucket_name,
+        "--bucket", &bucket_name,
         "--target-region", "test-region-1",
         "--revision", "main",
         "--prefix", "my-prefix",
