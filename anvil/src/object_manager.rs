@@ -129,11 +129,15 @@ impl ObjectManager {
                 let peer_info = cluster_map.get(peer_id).ok_or_else(|| {
                     Status::internal("Placement selected a peer that is not in the cluster state")
                 })?;
-                let client = internal_anvil_service_client::InternalAnvilServiceClient::connect(
-                    peer_info.grpc_addr.clone(),
-                )
-                .await
-                .map_err(|e| Status::unavailable(e.to_string()))?;
+                let addr = peer_info.grpc_addr.clone();
+                let endpoint = if addr.starts_with("http://") || addr.starts_with("https://") {
+                    addr
+                } else {
+                    format!("http://{}", addr)
+                };
+                let client = internal_anvil_service_client::InternalAnvilServiceClient::connect(endpoint)
+                    .await
+                    .map_err(|e| Status::unavailable(e.to_string()))?;
                 clients.push(client);
             }
 
@@ -385,9 +389,14 @@ impl ObjectManager {
                         let object_hash = object_clone.content_hash.clone();
                         let jwt_manager = app_state.jwt_manager.clone();
                         missing_shards_futures.push(async move {
+                            let endpoint = if grpc_addr.starts_with("http://") || grpc_addr.starts_with("https://") {
+                                grpc_addr
+                            } else {
+                                format!("http://{}", grpc_addr)
+                            };
                             let mut client =
                                 internal_anvil_service_client::InternalAnvilServiceClient::connect(
-                                    grpc_addr,
+                                    endpoint,
                                 )
                                 .await
                                 .map_err(|e| {

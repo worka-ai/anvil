@@ -692,11 +692,11 @@ impl Persistence {
         Ok(rows)
     }
 
-    pub async fn update_task_status(&self, task_id: i64, status: &str) -> Result<()> {
+    pub async fn update_task_status(&self, task_id: i64, status: crate::tasks::TaskStatus) -> Result<()> {
         let client = self.global_pool.get().await?;
         client
             .execute(
-                "UPDATE tasks SET status = $1::task_status, updated_at = now() WHERE id = $2",
+                "UPDATE tasks SET status = $1, updated_at = now() WHERE id = $2",
                 &[&status, &task_id],
             )
             .await?;
@@ -710,15 +710,15 @@ impl Persistence {
                 r#"
             UPDATE tasks
             SET
-                status = 'failed',
-                last_error = $1,
+                status = $1,
+                last_error = $2,
                 attempts = attempts + 1,
                 -- Exponential backoff: 10s, 40s, 90s, etc.
                 scheduled_at = now() + (attempts * attempts * 10 * interval '1 second'),
                 updated_at = now()
-            WHERE id = $2
+            WHERE id = $3
             "#,
-                &[&error, &task_id],
+                &[&crate::tasks::TaskStatus::Failed, &error, &task_id],
             )
             .await?;
         Ok(())
@@ -811,13 +811,13 @@ impl Persistence {
     pub async fn hf_update_ingestion_state(
         &self,
         id: i64,
-        state: &str,
+        state: crate::tasks::HFIngestionState,
         error: Option<&str>,
     ) -> Result<()> {
         let client = self.global_pool.get().await?;
         client
             .execute(
-                "UPDATE hf_ingestions SET state=$2, error=$3, started_at=CASE WHEN $2='running' AND started_at IS NULL THEN now() ELSE started_at END, finished_at=CASE WHEN $2 IN ('completed','failed','canceled') THEN now() ELSE finished_at END WHERE id=$1",
+                "UPDATE hf_ingestions SET state=$2, error=$3, started_at=CASE WHEN $2='running'::hf_ingestion_state AND started_at IS NULL THEN now() ELSE started_at END, finished_at=CASE WHEN $2 IN ('completed'::hf_ingestion_state,'failed'::hf_ingestion_state,'canceled'::hf_ingestion_state) THEN now() ELSE finished_at END WHERE id=$1",
                 &[&id, &state, &error],
             )
             .await?;
@@ -828,8 +828,8 @@ impl Persistence {
         let client = self.global_pool.get().await?;
         let n = client
             .execute(
-                "UPDATE hf_ingestions SET state='canceled' WHERE id=$1 AND state IN ('queued','running')",
-                &[&id],
+                "UPDATE hf_ingestions SET state=$2 WHERE id=$1 AND state IN ('queued'::hf_ingestion_state,'running'::hf_ingestion_state)",
+                &[&id, &crate::tasks::HFIngestionState::Canceled],
             )
             .await?;
         Ok(n)
@@ -845,7 +845,12 @@ impl Persistence {
         let client = self.global_pool.get().await?;
         let row = client
             .query_one(
-                "INSERT INTO hf_ingestion_items (ingestion_id, path, size, etag) VALUES ($1,$2,$3,$4) RETURNING id",
+                r#"
+            INSERT INTO hf_ingestion_items (ingestion_id, path, size, etag)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (ingestion_id, path) DO UPDATE SET size = EXCLUDED.size
+            RETURNING id
+            "#,
                 &[&ingestion_id, &path, &size, &etag],
             )
             .await?;
@@ -855,13 +860,13 @@ impl Persistence {
     pub async fn hf_update_item_state(
         &self,
         id: i64,
-        state: &str,
+        state: crate::tasks::HFIngestionItemState,
         error: Option<&str>,
     ) -> Result<()> {
         let client = self.global_pool.get().await?;
         client
             .execute(
-                "UPDATE hf_ingestion_items SET state=$2, error=$3, started_at=CASE WHEN $2='downloading' AND started_at IS NULL THEN now() ELSE started_at END, finished_at=CASE WHEN $2 IN ('stored','failed','skipped') THEN now() ELSE finished_at END WHERE id=$1",
+                "UPDATE hf_ingestion_items SET state=$2, error=$3, started_at=CASE WHEN $2='downloading'::hf_item_state AND started_at IS NULL THEN now() ELSE started_at END, finished_at=CASE WHEN $2 IN ('stored'::hf_item_state,'failed'::hf_item_state,'skipped'::hf_item_state) THEN now() ELSE finished_at END WHERE id=$1",
                 &[&id, &state, &error],
             )
             .await?;
@@ -885,7 +890,7 @@ impl Persistence {
         let client = self.global_pool.get().await?;
         let job = client
             .query_one(
-                "SELECT state, error, created_at, started_at, finished_at FROM hf_ingestions WHERE id=$1",
+                "SELECT state::text, error, created_at, started_at, finished_at FROM hf_ingestions WHERE id=$1",
                 &[&id],
             )
             .await?;

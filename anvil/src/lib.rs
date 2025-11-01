@@ -172,8 +172,14 @@ pub async fn start_node(
         state.clone(),
         auth_interceptor.clone(),
     ))
-    .add_service(HuggingFaceKeyServiceServer::new(state.clone()))
-    .add_service(HfIngestionServiceServer::new(state.clone()));
+    .add_service(HuggingFaceKeyServiceServer::with_interceptor(
+        state.clone(),
+        auth_interceptor.clone(),
+    ))
+    .add_service(HfIngestionServiceServer::with_interceptor(
+        state.clone(),
+        auth_interceptor.clone(),
+    ));
 
     // Serve gRPC at root; tonic will handle only application/grpc requests.
     // Merge S3 routes after so non-gRPC HTTP hits S3.

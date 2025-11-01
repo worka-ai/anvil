@@ -110,6 +110,7 @@ CREATE TABLE hf_ingestion_items (
     retries INT NOT NULL DEFAULT 0,
     error TEXT,
     started_at TIMESTAMPTZ,
-    finished_at TIMESTAMPTZ
+    finished_at TIMESTAMPTZ,
+    UNIQUE(ingestion_id, path)
 );
 CREATE INDEX idx_hf_ingestion_items_ingest ON hf_ingestion_items(ingestion_id);

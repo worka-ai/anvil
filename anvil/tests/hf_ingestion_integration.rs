@@ -9,6 +9,8 @@ async fn hf_ingestion_single_file_integration() {
     let mut cluster = TestCluster::new(&["TEST_REGION"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
 
+    let token = cluster.token.clone();
+
     // Create a bucket via gRPC
     let mut bucket_client = anvil::anvil_api::bucket_service_client::BucketServiceClient::connect(
         cluster.grpc_addrs[0].clone(),
@@ -21,7 +23,7 @@ async fn hf_ingestion_single_file_integration() {
     });
     req.metadata_mut().insert(
         "authorization",
-        format!("Bearer {}", cluster.token).parse().unwrap(),
+        format!("Bearer {}", token).parse().unwrap(),
     );
     let _ = bucket_client.create_bucket(req).await;
 
@@ -31,14 +33,15 @@ async fn hf_ingestion_single_file_integration() {
     )
     .await
     .unwrap();
+    let hf_api_key = std::env::var("HF_TOKEN").unwrap_or_default();
     let mut kreq = tonic::Request::new(anvil::anvil_api::CreateHfKeyRequest {
         name: "test".into(),
-        token: "".into(),
+        token: hf_api_key,
         note: "".into(),
     });
     kreq.metadata_mut().insert(
         "authorization",
-        format!("Bearer {}", cluster.token).parse().unwrap(),
+        format!("Bearer {}", token).parse().unwrap(),
     );
     key_client.create_key(kreq).await.unwrap();
 
@@ -59,7 +62,7 @@ async fn hf_ingestion_single_file_integration() {
     });
     sreq.metadata_mut().insert(
         "authorization",
-        format!("Bearer {}", cluster.token).parse().unwrap(),
+        format!("Bearer {}", token).parse().unwrap(),
     );
     let ing_id = ing_client
         .start_ingestion(sreq)
@@ -79,7 +82,7 @@ async fn hf_ingestion_single_file_integration() {
         });
         streq.metadata_mut().insert(
             "authorization",
-            format!("Bearer {}", cluster.token).parse().unwrap(),
+            format!("Bearer {}", token).parse().unwrap(),
         );
         let st = ing_client.get_ingestion_status(streq).await.unwrap().into_inner();
         if st.state == "completed" {
@@ -109,6 +112,12 @@ async fn hf_ingestion_permission_denied() {
     let mut cluster = TestCluster::new(&["TEST_REGION"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
 
+    let limited_token = cluster
+        .states[0]
+        .jwt_manager
+        .mint_token("test-app".into(), vec!["read:*".into()], 0)
+        .unwrap();
+
     // Create bucket
     let mut bucket_client = anvil::anvil_api::bucket_service_client::BucketServiceClient::connect(
         cluster.grpc_addrs[0].clone(),
@@ -121,7 +130,7 @@ async fn hf_ingestion_permission_denied() {
     });
     req.metadata_mut().insert(
         "authorization",
-        format!("Bearer {}", cluster.token).parse().unwrap(),
+        format!("Bearer {}", limited_token).parse().unwrap(),
     );
     let _ = bucket_client.create_bucket(req).await;
 
@@ -138,7 +147,7 @@ async fn hf_ingestion_permission_denied() {
     });
     kreq.metadata_mut().insert(
         "authorization",
-        format!("Bearer {}", cluster.token).parse().unwrap(),
+        format!("Bearer {}", limited_token).parse().unwrap(),
     );
     key_client.create_key(kreq).await.unwrap();
 

@@ -13,7 +13,7 @@ pub enum TaskType {
     HFIngestion,
 }
 
-#[derive(Debug, ToSql, FromSql, PartialEq, Eq)]
+#[derive(Debug, ToSql, FromSql, PartialEq, Eq, Clone, Copy)]
 #[postgres(name = "task_status")]
 pub enum TaskStatus {
     #[postgres(name = "pending")]
@@ -24,4 +24,34 @@ pub enum TaskStatus {
     Completed,
     #[postgres(name = "failed")]
     Failed,
+}
+
+#[derive(Debug, ToSql, FromSql, PartialEq, Eq, Clone, Copy)]
+#[postgres(name = "hf_ingestion_state")]
+pub enum HFIngestionState {
+    #[postgres(name = "queued")]
+    Queued,
+    #[postgres(name = "running")]
+    Running,
+    #[postgres(name = "completed")]
+    Completed,
+    #[postgres(name = "failed")]
+    Failed,
+    #[postgres(name = "canceled")]
+    Canceled,
+}
+
+#[derive(Debug, ToSql, FromSql, PartialEq, Eq, Clone, Copy)]
+#[postgres(name = "hf_item_state")]
+pub enum HFIngestionItemState {
+    #[postgres(name = "queued")]
+    Queued,
+    #[postgres(name = "downloading")]
+    Downloading,
+    #[postgres(name = "stored")]
+    Stored,
+    #[postgres(name = "failed")]
+    Failed,
+    #[postgres(name = "skipped")]
+    Skipped,
 }

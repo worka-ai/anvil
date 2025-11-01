@@ -71,7 +71,7 @@ dotenvy = "0.15.7"
 futures-core = "0.3.31"
 time = "0.3.44"
 futures-util = "0.3.31"
-hf-hub = "0.3"
+hf-hub = "0.4.3"
 globset = "0.4"
 
 local-ip-address = "0.6.5"
