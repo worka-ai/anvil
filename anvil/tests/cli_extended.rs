@@ -146,7 +146,7 @@ async fn setup_test_profile(cluster: &common::TestCluster, config_dir: &std::pat
 
 #[tokio::test]
 async fn test_cli_auth_get_token() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
     let config_dir = tempdir().unwrap();
     let (client_id, client_secret) = setup_test_profile(&cluster, config_dir.path()).await;
@@ -223,7 +223,7 @@ async fn create_app(cluster: &common::TestCluster, app_name: &str) -> (String, S
 
 #[tokio::test]
 async fn test_cli_auth_grant() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
@@ -238,7 +238,7 @@ async fn test_cli_auth_grant() {
 
 #[tokio::test]
 async fn test_cli_auth_revoke() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
@@ -256,13 +256,13 @@ async fn test_cli_auth_revoke() {
 
 #[tokio::test]
 async fn test_cli_bucket_set_public() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
 
     let bucket_name = "my-public-bucket";
-    let output = run_cli(&["bucket", "create", bucket_name, "TEST_REGION"], config_dir.path()).await;
+    let output = run_cli(&["bucket", "create", bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
     let output = run_cli(&["bucket", "set-public", bucket_name, "--allow", "true"], config_dir.path()).await;
@@ -278,7 +278,7 @@ async fn test_cli_bucket_set_public() {
 
 #[tokio::test]
 async fn test_cli_object_rm() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
@@ -287,7 +287,7 @@ async fn test_cli_object_rm() {
     let object_key = "my-object-to-rm";
     let content = "hello from object rm test";
 
-    let output = run_cli(&["bucket", "create", bucket_name, "TEST_REGION"], config_dir.path()).await;
+    let output = run_cli(&["bucket", "create", bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
     let temp_dir = tempdir().unwrap();
@@ -306,7 +306,7 @@ async fn test_cli_object_rm() {
 
 #[tokio::test]
 async fn test_cli_object_ls() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
@@ -315,7 +315,7 @@ async fn test_cli_object_ls() {
     let object_key = "my-object-to-ls";
     let content = "hello from object ls test";
 
-    let output = run_cli(&["bucket", "create", bucket_name, "TEST_REGION"], config_dir.path()).await;
+    let output = run_cli(&["bucket", "create", bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
     let temp_dir = tempdir().unwrap();
@@ -334,7 +334,7 @@ async fn test_cli_object_ls() {
 
 #[tokio::test]
 async fn test_cli_object_get_to_file() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
@@ -343,7 +343,7 @@ async fn test_cli_object_get_to_file() {
     let object_key = "my-object-to-get";
     let content = "hello from object get to file test";
 
-    let output = run_cli(&["bucket", "create", bucket_name, "TEST_REGION"], config_dir.path()).await;
+    let output = run_cli(&["bucket", "create", bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
     let temp_dir = tempdir().unwrap();
@@ -364,7 +364,7 @@ async fn test_cli_object_get_to_file() {
 
 #[tokio::test]
 async fn test_cli_hf_key_ls() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
@@ -380,7 +380,7 @@ async fn test_cli_hf_key_ls() {
 
 #[tokio::test]
 async fn test_cli_hf_key_rm() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
@@ -396,7 +396,7 @@ async fn test_cli_hf_key_rm() {
 
 #[tokio::test]
 async fn test_cli_hf_ingest_cancel() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
@@ -405,7 +405,7 @@ async fn test_cli_hf_ingest_cancel() {
     assert!(output.status.success());
 
     let bucket_name = "my-hf-ingest-cancel-bucket";
-    let output = run_cli(&["bucket", "create", bucket_name, "TEST_REGION"], config_dir.path()).await;
+    let output = run_cli(&["bucket", "create", bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
     let output = run_cli(&[
@@ -413,7 +413,7 @@ async fn test_cli_hf_ingest_cancel() {
         "--key", "test-key",
         "--repo", "openai/gpt-oss-20b",
         "--bucket", bucket_name,
-        "--target-region", "TEST_REGION",
+        "--target-region", "test-region-1",
     ], config_dir.path()).await;
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -427,7 +427,7 @@ async fn test_cli_hf_ingest_cancel() {
 
 #[tokio::test]
 async fn test_cli_hf_ingest_start_with_options() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
@@ -436,7 +436,7 @@ async fn test_cli_hf_ingest_start_with_options() {
     assert!(output.status.success());
 
     let bucket_name = "my-hf-ingest-options-bucket";
-    let output = run_cli(&["bucket", "create", bucket_name, "TEST_REGION"], config_dir.path()).await;
+    let output = run_cli(&["bucket", "create", bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
     let output = run_cli(&[
@@ -444,7 +444,7 @@ async fn test_cli_hf_ingest_start_with_options() {
         "--key", "test-key",
         "--repo", "openai/gpt-oss-20b",
         "--bucket", bucket_name,
-        "--target-region", "TEST_REGION",
+        "--target-region", "test-region-1",
         "--revision", "main",
         "--prefix", "my-prefix",
         "--exclude", "*.txt",

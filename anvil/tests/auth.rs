@@ -8,7 +8,7 @@ mod common;
 
 #[tokio::test]
 async fn test_auth_flow_with_wildcard_scopes() {
-    let mut cluster = common::TestCluster::new(&["AUTH_TEST"]).await;
+    let mut cluster = common::TestCluster::new(&["auth-test"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
@@ -81,7 +81,7 @@ async fn test_auth_flow_with_wildcard_scopes() {
         .unwrap();
     let mut req_good = tonic::Request::new(CreateBucketRequest {
         bucket_name: "auth-test-bucket".to_string(),
-        region: "AUTH_TEST".to_string(),
+        region: "auth-test".to_string(),
     });
     req_good.metadata_mut().insert(
         "authorization",
@@ -96,7 +96,7 @@ async fn test_auth_flow_with_wildcard_scopes() {
     // Use the SAME token to try creating a bucket that DOES NOT MATCH
     let mut req_bad = tonic::Request::new(CreateBucketRequest {
         bucket_name: "unauthorized-bucket".to_string(),
-        region: "AUTH_TEST".to_string(),
+        region: "auth-test".to_string(),
     });
     req_bad.metadata_mut().insert(
         "authorization",

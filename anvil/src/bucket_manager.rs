@@ -26,6 +26,9 @@ impl BucketManager {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
+        if !validation::is_valid_region_name(region) {
+            return Err(Status::invalid_argument("Invalid region name"));
+        }
         let resource = format!("bucket:{}", bucket_name);
         if !auth::is_authorized(&format!("write:{}", resource), scopes) {
             return Err(Status::permission_denied("Permission denied"));

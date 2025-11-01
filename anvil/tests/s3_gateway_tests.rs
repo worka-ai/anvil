@@ -59,7 +59,7 @@ async fn get_token_for_scopes(
 
 #[tokio::test]
 async fn test_s3_public_and_private_access() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let (client_id, client_secret) = create_app(&cluster.global_db_url, "s3-test-app");
@@ -118,7 +118,7 @@ async fn test_s3_public_and_private_access() {
     .unwrap();
     let mut req = tonic::Request::new(anvil::anvil_api::CreateBucketRequest {
         bucket_name: private_bucket.clone(),
-        region: "TEST_REGION".to_string(),
+        region: "test-region-1".to_string(),
     });
     req.metadata_mut().insert(
         "authorization",
@@ -128,7 +128,7 @@ async fn test_s3_public_and_private_access() {
 
     let mut req = tonic::Request::new(anvil::anvil_api::CreateBucketRequest {
         bucket_name: public_bucket.clone(),
-        region: "TEST_REGION".to_string(),
+        region: "test-region-1".to_string(),
     });
     req.metadata_mut().insert(
         "authorization",
@@ -226,7 +226,7 @@ async fn test_s3_public_and_private_access() {
 
 #[tokio::test]
 async fn test_streaming_upload_decoding() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let (client_id, client_secret) = create_app(&cluster.global_db_url, "streaming-decode-app");
@@ -267,7 +267,7 @@ async fn test_streaming_upload_decoding() {
     let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
     let config = aws_sdk_s3::Config::builder()
         .credentials_provider(credentials)
-        .region(aws_sdk_s3::config::Region::new("TEST_REGION"))
+        .region(aws_sdk_s3::config::Region::new("test-region-1"))
         .endpoint_url(http_base)
         .force_path_style(true)
         .behavior_version_latest()

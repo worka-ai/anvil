@@ -68,7 +68,7 @@ async fn try_get_token_for_scopes(
 
 #[tokio::test]
 async fn test_grant_and_revoke_access() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
@@ -168,7 +168,7 @@ async fn test_grant_and_revoke_access() {
 
 #[tokio::test]
 async fn test_set_public_access_and_get() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
@@ -187,7 +187,7 @@ async fn test_set_public_access_and_get() {
 
     let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
-        region: "TEST_REGION".to_string(),
+        region: "test-region-1".to_string(),
     });
     create_bucket_req.metadata_mut().insert(
         "authorization",
@@ -264,7 +264,7 @@ async fn test_set_public_access_and_get() {
 
 #[tokio::test]
 async fn test_reset_app_secret() {
-    let mut cluster = common::TestCluster::new(&["eu1"]).await;
+    let mut cluster = common::TestCluster::new(&["eu-west-1"]).await;
     cluster
         .start_and_converge_no_new_token(Duration::from_secs(5), false)
         .await;
@@ -328,7 +328,7 @@ async fn test_reset_app_secret() {
     cluster.restart(Duration::from_secs(10)).await;
 
     // 5. Verify the NEW secret works against the restarted node
-    let s3_client_new = cluster.get_s3_client("eu1", &client_id, &new_secret).await;
+    let s3_client_new = cluster.get_s3_client("eu-west-1", &client_id, &new_secret).await;
     match s3_client_new.list_buckets().send().await {
         Ok(_list_bucket_output) => {}
         Err(e) => {
@@ -338,7 +338,7 @@ async fn test_reset_app_secret() {
 
     // 6. Verify the OLD secret fails
     let s3_client_old = cluster
-        .get_s3_client("eu1", &client_id, &original_secret)
+        .get_s3_client("eu-west-1", &client_id, &original_secret)
         .await;
     let list_buckets_old = s3_client_old.list_buckets().send().await;
     assert!(
@@ -349,7 +349,7 @@ async fn test_reset_app_secret() {
 
 #[tokio::test]
 async fn test_admin_cli_set_public_access() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let mut bucket_client = BucketServiceClient::connect(cluster.grpc_addrs[0].clone())
@@ -366,7 +366,7 @@ async fn test_admin_cli_set_public_access() {
     // 1. Create a bucket and upload an object to it.
     let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
-        region: "TEST_REGION".to_string(),
+        region: "test-region-1".to_string(),
     });
     create_bucket_req.metadata_mut().insert(
         "authorization",

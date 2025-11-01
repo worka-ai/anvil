@@ -6,7 +6,7 @@ use std::time::Duration;
 async fn hf_ingestion_single_file_integration() {
     // Use the same harness patterns as other tests (common.rs handles dotenv + DB)
     // Spin up a single-node cluster with isolated DBs
-    let mut cluster = TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
 
     let token = cluster.token.clone();
@@ -19,7 +19,7 @@ async fn hf_ingestion_single_file_integration() {
     .unwrap();
     let mut req = tonic::Request::new(anvil::anvil_api::CreateBucketRequest {
         bucket_name: "models".into(),
-        region: "TEST_REGION".into(),
+        region: "test-region-1".into(),
     });
     req.metadata_mut().insert(
         "authorization",
@@ -35,10 +35,9 @@ async fn hf_ingestion_single_file_integration() {
     )
     .await
     .unwrap();
-    let hf_api_key = std::env::var("HF_TOKEN").unwrap_or_default();
     let mut kreq = tonic::Request::new(anvil::anvil_api::CreateHfKeyRequest {
         name: "test".into(),
-        token: hf_api_key,
+        token: "test-token".into(),
         note: "".into(),
     });
     kreq.metadata_mut().insert(
@@ -58,7 +57,7 @@ async fn hf_ingestion_single_file_integration() {
         repo: "openai/gpt-oss-20b".into(),
         revision: "main".into(),
         target_bucket: "models".into(),
-        target_region: "TEST_REGION".into(),
+        target_region: "test-region-1".into(),
         target_prefix: "gpt-oss-20b".into(),
         include_globs: vec!["config.json".into()],
         exclude_globs: vec![],
@@ -131,7 +130,7 @@ async fn hf_ingestion_single_file_integration() {
 async fn hf_ingestion_permission_denied() {
     // Harness handles dotenv + DB
     // Spin up cluster
-    let mut cluster = TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
 
     let limited_token = cluster
@@ -148,7 +147,7 @@ async fn hf_ingestion_permission_denied() {
     .unwrap();
     let mut req = tonic::Request::new(anvil::anvil_api::CreateBucketRequest {
         bucket_name: "models-denied".into(),
-        region: "TEST_REGION".into(),
+        region: "test-region-1".into(),
     });
     req.metadata_mut().insert(
         "authorization",
@@ -164,7 +163,7 @@ async fn hf_ingestion_permission_denied() {
     .unwrap();
     let mut kreq = tonic::Request::new(anvil::anvil_api::CreateHfKeyRequest {
         name: "pd-test".into(),
-        token: "".into(),
+        token: "test-token".into(),
         note: "".into(),
     });
     kreq.metadata_mut().insert(
@@ -184,7 +183,7 @@ async fn hf_ingestion_permission_denied() {
         repo: "openai/gpt-oss-20b".into(),
         revision: "main".into(),
         target_bucket: "models-denied".into(),
-        target_region: "TEST_REGION".into(),
+        target_region: "test-region-1".into(),
         target_prefix: "gpt-oss-20b".into(),
         include_globs: vec!["config.json".into()],
         exclude_globs: vec![],

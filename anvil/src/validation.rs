@@ -37,6 +37,16 @@ pub fn is_valid_object_key(key: &str) -> bool {
     OBJECT_KEY_REGEX.is_match(key)
 }
 
+pub fn is_valid_region_name(name: &str) -> bool {
+    lazy_static! {
+        static ref REGION_NAME_REGEX: Regex = Regex::new(r"^[a-z][a-z0-9_-]*[a-z0-9]$").unwrap();
+    }
+    if name.len() < 3 || name.len() > 63 {
+        return false;
+    }
+    REGION_NAME_REGEX.is_match(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,5 +88,23 @@ mod tests {
         assert!(!is_valid_object_key("my/../object"));
         assert!(!is_valid_object_key("my/./object"));
         assert!(!is_valid_object_key(r"my\object"));
+    }
+
+    #[test]
+    fn test_valid_region_names() {
+        assert!(is_valid_region_name("us-east-1"));
+        assert!(is_valid_region_name("eu-west-1"));
+        assert!(is_valid_region_name("ap-southeast-2"));
+        assert!(is_valid_region_name("us_east_1"));
+    }
+
+    #[test]
+    fn test_invalid_region_names() {
+        assert!(!is_valid_region_name("US-EAST-1"));
+        assert!(!is_valid_region_name("us-east-1-"));
+        assert!(!is_valid_region_name("-us-east-1"));
+        assert!(!is_valid_region_name("us..east-1"));
+        assert!(!is_valid_region_name("ue"));
+        assert!(!is_valid_region_name(&"a".repeat(64)));
     }
 }

@@ -145,13 +145,13 @@ async fn setup_test_profile(cluster: &common::TestCluster, config_dir: &std::pat
 
 #[tokio::test]
 async fn test_cli_configure_and_bucket_ls() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
     let config_dir = tempdir().unwrap();
     setup_test_profile(&cluster, config_dir.path()).await;
 
     let bucket_name = "my-cli-bucket";
-    let output = run_cli(&["bucket", "create", bucket_name, "TEST_REGION"], config_dir.path()).await;
+    let output = run_cli(&["bucket", "create", bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
     let output = run_cli(&["bucket", "ls"], config_dir.path()).await;
@@ -162,14 +162,14 @@ async fn test_cli_configure_and_bucket_ls() {
 
 #[tokio::test]
 async fn test_cli_bucket_create_and_rm() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
     let config_dir = tempdir().unwrap();
     setup_test_profile(&cluster, config_dir.path()).await;
 
     let bucket_name = "my-cli-bucket";
 
-    let output = run_cli(&["bucket", "create", bucket_name, "TEST_REGION"], config_dir.path()).await;
+    let output = run_cli(&["bucket", "create", bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
     let output = run_cli(&["bucket", "ls"], config_dir.path()).await;
@@ -186,7 +186,7 @@ async fn test_cli_bucket_create_and_rm() {
 
 #[tokio::test]
 async fn test_cli_object_put_and_get() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
     let config_dir = tempdir().unwrap();
     setup_test_profile(&cluster, config_dir.path()).await;
@@ -195,7 +195,7 @@ async fn test_cli_object_put_and_get() {
     let object_key = "my-cli-object";
     let content = "hello from cli object test";
 
-    let output = run_cli(&["bucket", "create", bucket_name, "TEST_REGION"], config_dir.path()).await;
+    let output = run_cli(&["bucket", "create", bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
     let temp_dir = tempdir().unwrap();
@@ -214,14 +214,15 @@ async fn test_cli_object_put_and_get() {
 
 #[tokio::test]
 async fn test_cli_hf_ingestion() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
     let config_dir = tempdir().unwrap();
     setup_test_profile(&cluster, config_dir.path()).await;
 
     let bucket_name = "my-cli-hf-bucket";
+    let object_key = "config.json";
 
-    let output = run_cli(&["bucket", "create", bucket_name, "TEST_REGION"], config_dir.path()).await;
+    let output = run_cli(&["bucket", "create", bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
     let hf_token = "test-token";
@@ -233,7 +234,7 @@ async fn test_cli_hf_ingestion() {
         "--key", "test-key",
         "--repo", "openai/gpt-oss-20b",
         "--bucket", bucket_name,
-        "--target-region", "TEST_REGION",
+        "--target-region", "test-region-1",
         "--include", "config.json",
     ], config_dir.path()).await;
     assert!(output.status.success());
@@ -256,7 +257,7 @@ async fn test_cli_hf_ingestion() {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    let dest = format!("s3://{}/config.json", bucket_name);
+    let dest = format!("s3://{}/{}", bucket_name, object_key);
     let output = run_cli(&["object", "head", &dest], config_dir.path()).await;
     assert!(output.status.success());
 }

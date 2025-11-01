@@ -11,7 +11,7 @@ mod common;
 #[tokio::test]
 async fn test_distributed_reconstruction_on_node_failure() {
     //let num_nodes = 6;
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"; 6]).await;
+    let mut cluster = common::TestCluster::new(&["test-region-1"; 6]).await;
     cluster.start_and_converge(Duration::from_secs(20)).await;
 
     let primary_addr = cluster.grpc_addrs[0].clone(); // already includes /grpc
@@ -25,7 +25,7 @@ async fn test_distributed_reconstruction_on_node_failure() {
     let bucket_name = "reconstruction-bucket".to_string();
     let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
-        region: "TEST_REGION".to_string(),
+        region: "test-region-1".to_string(),
     });
     create_bucket_req.metadata_mut().insert(
         "authorization",
