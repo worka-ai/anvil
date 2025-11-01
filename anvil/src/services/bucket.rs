@@ -80,8 +80,23 @@ impl BucketService for AppState {
 
     async fn put_bucket_policy(
         &self,
-        _request: Request<PutBucketPolicyRequest>,
+        request: Request<PutBucketPolicyRequest>,
     ) -> Result<Response<PutBucketPolicyResponse>, Status> {
-        todo!()
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.get_ref();
+
+        // A bit of a hack: we only support is_public_read for now.
+        let policy: serde_json::Value = serde_json::from_str(&req.policy_json)
+            .map_err(|e| Status::invalid_argument(format!("Invalid policy JSON: {}", e)))?;
+        let is_public_read = policy["is_public_read"].as_bool().unwrap_or(false);
+
+        self.bucket_manager
+            .set_bucket_public_access(&req.bucket_name, is_public_read, &claims.scopes)
+            .await?;
+
+        Ok(Response::new(PutBucketPolicyResponse {}))
     }
 }

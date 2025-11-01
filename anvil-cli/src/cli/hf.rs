@@ -85,7 +85,7 @@ pub async fn handle_hf_command(command: &HfCommands, ctx: &Context) -> anyhow::R
                     });
                     request.metadata_mut().insert(
                         "authorization",
-                        format!("Bearer {}", token).parse().unwrap(),
+                        format!("Bearer {}", ctx.get_bearer_token().await?).parse().unwrap(),
                     );
                     let resp = client.create_key(request).await?;
                     println!("created key: {}", resp.into_inner().name);

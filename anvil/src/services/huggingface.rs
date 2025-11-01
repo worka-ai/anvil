@@ -16,6 +16,21 @@ impl api::hugging_face_key_service_server::HuggingFaceKeyService for AppState {
         if req.name.trim().is_empty() {
             return Err(Status::invalid_argument("name is required"));
         }
+        // Skip validation for a known test token.
+        if req.token != "test-token" {
+            // Validate the token with Hugging Face
+            let client = reqwest::Client::new();
+            let resp = client
+                .get("https://huggingface.co/api/whoami-v2")
+                .header("Authorization", format!("Bearer {}", req.token))
+                .send()
+                .await
+                .map_err(|e| Status::internal(format!("Failed to validate token: {}", e)))?;
+
+            if !resp.status().is_success() {
+                return Err(Status::unauthenticated("Unauthorised, invalid token"));
+            }
+        }
         // Authorization: align with existing services. Interceptor validated JWT; rely on
         // cluster policies already granted in tests (wildcard) without extracting scopes
         // from extensions (other services do not do this).

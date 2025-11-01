@@ -14,7 +14,7 @@ pub enum BucketCommands {
     /// Set public access for a bucket
     SetPublic {
         name: String,
-        #[clap(long)]
+        #[clap(long, action = clap::ArgAction::Set)]
         allow: bool,
     },
 }

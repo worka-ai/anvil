@@ -17,7 +17,31 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Configure CLI profiles
-    Configure,
+    Configure {
+        #[clap(long)]
+        name: Option<String>,
+        #[clap(long)]
+        host: Option<String>,
+        #[clap(long)]
+        client_id: Option<String>,
+        #[clap(long)]
+        client_secret: Option<String>,
+        #[clap(long)]
+        default: bool,
+    },
+    /// Create a configuration file non-interactively
+    StaticConfig {
+        #[clap(long)]
+        name: String,
+        #[clap(long)]
+        host: String,
+        #[clap(long)]
+        client_id: String,
+        #[clap(long)]
+        client_secret: String,
+        #[clap(long)]
+        default: bool,
+    },
     /// Manage buckets
     Bucket {
         #[clap(subcommand)]
@@ -44,15 +68,20 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    if let Commands::Configure = &cli.command {
-        cli::configure::handle_configure_command()?;
+    if let Commands::Configure { name, host, client_id, client_secret, default } = &cli.command {
+        cli::configure::handle_configure_command(name.clone(), host.clone(), client_id.clone(), client_secret.clone(), *default)?;
+        return Ok(());
+    }
+    if let Commands::StaticConfig { name, host, client_id, client_secret, default } = &cli.command {
+        cli::configure::handle_static_config_command(name.clone(), host.clone(), client_id.clone(), client_secret.clone(), *default)?;
         return Ok(());
     }
 
     let ctx = Context::new(cli.profile)?;
 
     match &cli.command {
-        Commands::Configure => { /* handled above */ }
+        Commands::Configure { .. } => { /* handled above */ }
+        Commands::StaticConfig { .. } => { /* handled above */ }
         Commands::Bucket { command } => {
             cli::bucket::handle_bucket_command(command, &ctx).await?;
         }

@@ -82,4 +82,23 @@ impl BucketManager {
 
         Ok(buckets)
     }
+
+    pub async fn set_bucket_public_access(
+        &self,
+        bucket_name: &str,
+        is_public: bool,
+        scopes: &[String],
+    ) -> Result<(), Status> {
+        let resource = format!("bucket:{}", bucket_name);
+        if !auth::is_authorized(&format!("write:{}:policy", resource), scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        self.db
+            .set_bucket_public_access(bucket_name, is_public)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(())
+    }
 }

@@ -118,3 +118,4 @@ memchr = "2.7.6"
 
 uuid = { version = "1.18.1", features = ["v4"] }
 tokio-stream = "0.1"
+tempfile = "3.10.1"
