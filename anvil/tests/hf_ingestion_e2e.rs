@@ -1,11 +1,14 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+#[allow(unused)]
 fn run(cmd: &str, args: &[&str]) {
     let status = Command::new(cmd).args(args).status().expect("run");
     assert!(status.success(), "command failed: {} {:?}", cmd, args);
 }
 
+#[allow(dead_code)]
+#[allow(unused)]
 async fn wait_ready(url: &str, timeout: Duration) {
     let start = Instant::now();
     loop {
@@ -14,7 +17,10 @@ async fn wait_ready(url: &str, timeout: Duration) {
     }
 }
 
+#[allow(dead_code)]
+#[allow(unused)]
 struct ComposeGuard;
+
 impl Drop for ComposeGuard { fn drop(&mut self) { let _ = Command::new("docker").args(["compose","down","-v"]).status(); } }
 
 #[tokio::test]

@@ -1,9 +1,7 @@
 use tonic::{Request, Response, Status};
 use crate::crypto;
 use crate::AppState;
-use axum::extract::FromRef;
 use crate::tasks::TaskType;
-use globset::{Glob, GlobSetBuilder};
 use crate::auth;
 
 use crate::anvil_api as api;

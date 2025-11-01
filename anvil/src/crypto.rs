@@ -13,6 +13,7 @@ pub fn encrypt(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| anyhow!(e.to_string()))?;
 
     let mut result = Vec::with_capacity(nonce.len() + ciphertext.len());
+    #[allow(deprecated)]
     result.extend_from_slice(nonce.as_slice());
     result.extend_from_slice(&ciphertext);
 
@@ -26,6 +27,7 @@ pub fn decrypt(encrypted_data: &[u8], key: &[u8]) -> Result<Vec<u8>> {
         return Err(anyhow!("Invalid encrypted data length"));
     }
     let (nonce_bytes, ciphertext) = encrypted_data.split_at(12);
+    #[allow(deprecated)]
     let nonce = Nonce::from_slice(nonce_bytes);
 
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| anyhow!(e.to_string()))?;

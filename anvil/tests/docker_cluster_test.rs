@@ -1,6 +1,8 @@
-use std::process::{exit, Command};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
+#[allow(dead_code)]
+#[allow(unused)]
 fn run(cmd: &str, args: &[&str]) {
     let status = Command::new(cmd)
         .args(args)
@@ -9,15 +11,7 @@ fn run(cmd: &str, args: &[&str]) {
     assert!(status.success(), "command failed: {} {:?}", cmd, args);
 }
 
-fn output(cmd: &str, args: &[&str]) -> String {
-    let out = Command::new(cmd)
-        .args(args)
-        .output()
-        .expect("failed to run command");
-    assert!(out.status.success(), "command failed: {} {:?}", cmd, args);
-    String::from_utf8(out.stdout).expect("utf8")
-}
-
+#[allow(unused)]
 async fn wait_ready(url: &str, timeout: Duration) {
     let start = Instant::now();
     loop {
@@ -31,7 +25,10 @@ async fn wait_ready(url: &str, timeout: Duration) {
     }
 }
 
+#[allow(dead_code)]
+#[allow(unused)]
 struct ComposeGuard;
+
 impl Drop for ComposeGuard {
     fn drop(&mut self) {
         // best-effort teardown
@@ -50,8 +47,8 @@ async fn docker_cluster_end_to_end() {
 
     // Construct an absolute path to the test compose file to avoid CWD issues.
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let compose_file_path = std::path::Path::new(&manifest_dir)
-        .join("tests/docker-compose.test.yml");
+    let compose_file_path =
+        std::path::Path::new(&manifest_dir).join("tests/docker-compose.test.yml");
 
     run(
         "docker",

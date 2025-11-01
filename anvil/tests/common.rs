@@ -114,6 +114,7 @@ pub async fn get_auth_token(global_db_url: &str, grpc_addr: &str) -> String {
 }
 
 #[allow(dead_code)]
+#[allow(unused)]
 pub struct TestCluster {
     pub nodes: Vec<JoinHandle<()>>,
     pub states: Vec<AppState>,
@@ -290,6 +291,7 @@ impl TestCluster {
         panic!("Cluster did not converge in time");
     }
 
+    #[allow(unused)]
     pub async fn get_s3_client(
         &self,
         region: &str,
@@ -309,6 +311,7 @@ impl TestCluster {
         S3Client::from_conf(config)
     }
 
+    #[allow(unused)]
     pub async fn restart(&mut self, timeout: Duration) {
         for node in self.nodes.drain(..) {
             node.abort();

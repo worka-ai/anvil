@@ -57,6 +57,7 @@ pub struct Config {
     pub cluster_secret: Option<String>,
 }
 impl Config {
+    #[allow(unused)]
     pub fn from_ref(args: &Self) -> Self {
         let mut me = Self::default();
         args.clone_into(&mut me);

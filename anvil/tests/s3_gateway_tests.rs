@@ -1,18 +1,12 @@
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::{GetAccessTokenRequest, SetPublicAccessRequest};
 use aws_sdk_s3::Client;
-use aws_sdk_s3::primitives::{ByteStream, SdkBody};
-use bytes::Bytes;
-use http_body_util::StreamBody;
-use hyper::body::Frame;
+use aws_sdk_s3::primitives::ByteStream;
 use rand::random;
-use std::convert::Infallible;
 use std::env::temp_dir;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::fs;
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::ReceiverStream;
 
 mod common;
 
@@ -293,7 +287,7 @@ async fn test_streaming_upload_decoding() {
 
     // 1. Upload the object using a true stream, which forces aws-chunked encoding.
     let stream = original_content.as_bytes().to_vec();
-    let content_len = stream.len();
+    let _content_len = stream.len();
     // let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(16);
     // tokio::spawn(async move {
     //     for chunk in stream.into_chunks::<5>() {

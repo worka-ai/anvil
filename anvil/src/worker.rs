@@ -8,7 +8,6 @@ use crate::tasks::{HFIngestionItemState, HFIngestionState, TaskStatus, TaskType}
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
-use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::Row;
@@ -20,7 +19,7 @@ struct Task {
     id: i64,
     task_type: TaskType,
     payload: JsonValue,
-    attempts: i32,
+    _attempts: i32,
 }
 
 impl TryFrom<Row> for Task {
@@ -40,7 +39,7 @@ impl TryFrom<Row> for Task {
             id: row.get("id"),
             task_type,
             payload: row.get("payload"),
-            attempts: row.get("attempts"),
+            _attempts: row.get("attempts"),
         })
     }
 }
@@ -122,8 +121,6 @@ async fn handle_hf_ingestion(
 ) -> anyhow::Result<()> {
     use globset::{Glob, GlobSetBuilder};
     use hf_hub::{api::sync::Api, Repo, RepoType};
-    use std::fs::File;
-    use std::io::Read;
 
     let ingestion_id: i64 = task
         .payload
@@ -152,7 +149,7 @@ async fn handle_hf_ingestion(
                 .await?;
             let key_id: i64 = job.get(0);
             let tenant_id: i64 = job.get(1);
-            let requester_app_id: i64 = job.get(2);
+            let _requester_app_id: i64 = job.get(2);
             let repo_str: String = job.get(3);
             let revision: String = job.get(4);
             let target_bucket: String = job.get(5);
@@ -278,7 +275,7 @@ async fn handle_hf_ingestion(
                 debug!(path = ?local_path, "Downloaded to");
                 // --- End Blocking ---
 
-                let bucket = persistence
+                let _bucket = persistence
                     .get_bucket_by_name(tenant_id, &target_bucket, &target_region)
                     .await?
                     .ok_or_else(|| anyhow!("target bucket not found"))?;
@@ -297,7 +294,7 @@ async fn handle_hf_ingestion(
                     key = %full_key,
                     "Uploading to Anvil"
                 );
-                let mut make_reader = || async {
+                let make_reader = || async {
                     let f = tokio::fs::File::open(&local_path).await;
                     f.map(|file| {
                         use futures_util::StreamExt as _;
