@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 
-members = ["admin",
+members = [
     "anvil",
     "anvil-cli",
 ]
