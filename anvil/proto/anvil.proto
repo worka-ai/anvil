@@ -216,6 +216,7 @@ message StartHfIngestionRequest {
   string target_prefix = 5;
   repeated string include_globs = 6;
   repeated string exclude_globs = 7;
+  string target_region = 8;
 }
 message StartHfIngestionResponse { string ingestion_id = 1; }
 

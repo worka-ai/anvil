@@ -106,13 +106,26 @@ impl api::hf_ingestion_service_server::HfIngestionService for AppState {
         else {
             return Err(Status::not_found("key not found"));
         };
-        let requester = "public".to_string();
+        let claims = auth::try_get_claims_from_extensions(&extensions)
+            .ok_or_else(|| Status::unauthenticated("Missing authentication claims"))?;
+
+        let app_id = claims.sub.parse::<i64>().map_err(|_| Status::unauthenticated("Invalid app ID in token"))?;
+
+        let app = self
+            .db
+            .get_app_by_id(app_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::unauthenticated("Invalid app ID in token"))?;
+
         let ingestion_id = self.db.hf_create_ingestion(
             key_id,
-            &requester,
+            claims.tenant_id,
+            app.id,
             &req.repo,
             if req.revision.is_empty() { None } else { Some(req.revision.as_str()) },
             &req.target_bucket,
+            &req.target_region,
             if req.target_prefix.is_empty() { None } else { Some(req.target_prefix.as_str()) },
             &req.include_globs,
             &req.exclude_globs,

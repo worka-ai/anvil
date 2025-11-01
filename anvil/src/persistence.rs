@@ -216,6 +216,17 @@ impl Persistence {
         Ok(row.into())
     }
 
+    pub async fn get_app_by_id(&self, id: i64) -> Result<Option<App>> {
+        let client = self.global_pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT id, name, client_id FROM apps WHERE id = $1",
+                &[&id],
+            )
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
     pub async fn get_app_by_name(&self, name: &str) -> Result<Option<App>> {
         let client = self.global_pool.get().await?;
         let row = client
@@ -781,10 +792,12 @@ impl Persistence {
     pub async fn hf_create_ingestion(
         &self,
         key_id: i64,
-        requester: &str,
+        tenant_id: i64,
+        requester_app_id: i64,
         repo: &str,
         revision: Option<&str>,
         target_bucket: &str,
+        target_region: &str,
         target_prefix: Option<&str>,
         include_globs: &[String],
         exclude_globs: &[String],
@@ -792,13 +805,15 @@ impl Persistence {
         let client = self.global_pool.get().await?;
         let row = client
             .query_one(
-                "INSERT INTO hf_ingestions (key_id, requester, repo, revision, target_bucket, target_prefix, include_globs, exclude_globs) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id",
+                "INSERT INTO hf_ingestions (key_id, tenant_id, requester_app_id, repo, revision, target_bucket, target_region, target_prefix, include_globs, exclude_globs) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id",
                 &[
                     &key_id,
-                    &requester,
+                    &tenant_id,
+                    &requester_app_id,
                     &repo,
                     &revision,
                     &target_bucket,
+                    &target_region,
                     &target_prefix,
                     &include_globs,
                     &exclude_globs,

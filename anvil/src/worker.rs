@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::Row;
 use tonic::Status;
-use tracing::{error, info};
+use tracing::{error, info, debug, warn};
 
 #[derive(Debug)]
 struct Task {
@@ -65,7 +65,7 @@ pub async fn run(
                 .map(Task::try_from)
                 .collect::<Result<Vec<_>>>()?,
             Err(e) => {
-                println!("Failed to fetch tasks: {}", e);
+                error!("Failed to fetch tasks: {}", e);
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
@@ -83,7 +83,7 @@ pub async fn run(
             let om = object_manager.clone();
             tokio::spawn(async move {
                 if let Err(e) = p.update_task_status(task.id, TaskStatus::Running).await {
-                    println!("Failed to mark task {} as running: {}", task.id, e);
+                    error!("Failed to mark task {} as running: {}", task.id, e);
                     return;
                 }
 
@@ -91,25 +91,24 @@ pub async fn run(
                     TaskType::DeleteObject => handle_delete_object(&p, &cs, &jm, &task).await,
                     TaskType::HFIngestion => handle_hf_ingestion(&p, &om, &task).await,
                     _ => {
-                        println!("Unhandled task type: {:?}", task.task_type);
+                        warn!("Unhandled task type: {:?}", task.task_type);
                         Ok(())
                     }
                 };
 
                 if let Err(e) = result {
-                    println!("Task {} failed: {:?}", task.id, e);
+                    error!("Task {} failed: {:?}", task.id, e);
                     if let Err(fail_err) = p.fail_task(task.id, &e.to_string()).await {
-                        println!("Failed to mark task {} as failed: {:?}", task.id, fail_err);
+                        error!("Failed to mark task {} as failed: {:?}", task.id, fail_err);
                     }
                 } else {
-                    if let Err(complete_err) = 
-                        p.update_task_status(task.id, TaskStatus::Completed).await
-                    {
-                        println!(
-                            "Failed to mark task {} as completed: {}",
-                            task.id, complete_err
-                        );
-                    }
+                                        if let Err(complete_err) =
+                                            p.update_task_status(task.id, TaskStatus::Completed).await
+                                        {
+                                            error!(
+                                                "Failed to mark task {} as completed: {}",
+                                                task.id, complete_err
+                                            );                    }
                 }
             });
         }
@@ -135,9 +134,9 @@ async fn handle_hf_ingestion(
     // Wrap the main logic in a closure to ensure we can catch errors and update the final status.
     let result =
         async {
-            println!(
-                "[HF_INGESTION] Starting ingestion task for id: {}",
-                ingestion_id
+            info!(
+                ingestion_id,
+                "Starting ingestion task."
             );
 
             persistence
@@ -147,21 +146,24 @@ async fn handle_hf_ingestion(
             let client = persistence.get_global_pool().get().await?;
             let job = client
                 .query_one(
-                    "SELECT key_id, repo, COALESCE(revision,'main'), target_bucket, COALESCE(target_prefix,''), include_globs, exclude_globs FROM hf_ingestions WHERE id=$1",
+                    "SELECT key_id, tenant_id, requester_app_id, repo, COALESCE(revision,'main'), target_bucket, target_region, COALESCE(target_prefix,''), include_globs, exclude_globs FROM hf_ingestions WHERE id=$1",
                     &[&ingestion_id],
                 )
                 .await?;
             let key_id: i64 = job.get(0);
-            let repo_str: String = job.get(1);
-            let revision: String = job.get(2);
-            let target_bucket: String = job.get(3);
-            let target_prefix: String = job.get(4);
-            let include_globs: Vec<String> = job.get(5);
-            let exclude_globs: Vec<String> = job.get(6);
-            println!(
-                "[HF_INGESTION] Fetched job details for repo: {}, revision: {}",
-                repo_str,
-                revision
+            let tenant_id: i64 = job.get(1);
+            let requester_app_id: i64 = job.get(2);
+            let repo_str: String = job.get(3);
+            let revision: String = job.get(4);
+            let target_bucket: String = job.get(5);
+            let target_region: String = job.get(6);
+            let target_prefix: String = job.get(7);
+            let include_globs: Vec<String> = job.get(8);
+            let exclude_globs: Vec<String> = job.get(9);
+            info!(
+                repo = %repo_str,
+                revision = %revision,
+                "Fetched job details."
             );
 
             let row = client
@@ -178,7 +180,7 @@ async fn handle_hf_ingestion(
             let enc_key = hex::decode(enc_key_hex)?;
             let token_bytes = crate::crypto::decrypt(&token_encrypted, &enc_key)?;
             let token = String::from_utf8(token_bytes)?;
-            println!("[HF_INGESTION] Decrypted token.");
+            debug!("Decrypted token.");
 
             unsafe {
                 std::env::set_var("HF_TOKEN", token);
@@ -186,7 +188,7 @@ async fn handle_hf_ingestion(
             let api = Api::new()?;
 
             // --- Blocking File Listing ---
-            println!("[HF_INGESTION] Getting repo file list (blocking)...");
+            info!("Getting repo file list (blocking)...");
             let repo_details = (repo_str.clone(), revision.clone());
             let api_clone = api.clone();
             let siblings = tokio::task::spawn_blocking(move || {
@@ -195,9 +197,9 @@ async fn handle_hf_ingestion(
                 repo_client.info().map(|info| info.siblings)
             })
             .await??;
-            println!(
-                "[HF_INGESTION] Got {} files from repo.",
-                siblings.len()
+            info!(
+                num_files = siblings.len(),
+                "Got files from repo."
             );
             // --- End Blocking ---
 
@@ -218,7 +220,7 @@ async fn handle_hf_ingestion(
 
             'outer: for e in siblings {
                 let path = e.rfilename.clone();
-                println!("[HF_INGESTION] Processing file: {}", path);
+                debug!(path = %path, "Processing file");
                 let path_buf = std::path::PathBuf::from(path.clone());
                 if !include.is_match(path_buf.as_path()) {
                     continue;
@@ -233,15 +235,15 @@ async fn handle_hf_ingestion(
                 persistence
                     .hf_update_item_state(item_id, HFIngestionItemState::Downloading, None)
                     .await?;
-                println!("[HF_INGESTION] Item {} state set to downloading.", item_id);
+                debug!(item_id, "Item state set to downloading.");
 
                 if let Ok(bucket_opt) =
-                    persistence.get_public_bucket_by_name(&target_bucket).await
+                    persistence.get_bucket_by_name(tenant_id, &target_bucket, &target_region).await
                 {
                     if let Some(bucket) = bucket_opt {
                         if let Ok(obj_opt) = persistence.get_object(bucket.id, &path).await {
                             if obj_opt.is_some() {
-                                println!("[HF_INGESTION] Skipping existing file: {}", path);
+                                info!(path = %path, "Skipping existing file");
                                 persistence
                                     .hf_update_item_state(
                                         item_id,
@@ -256,9 +258,9 @@ async fn handle_hf_ingestion(
                 }
 
                 // --- Blocking File Download ---
-                println!(
-                    "[HF_INGESTION] Downloading file (blocking): {}",
-                    e.rfilename
+                info!(
+                    file = %e.rfilename,
+                    "Downloading file (blocking)..."
                 );
                 let repo_details_clone = (repo_str.clone(), revision.clone());
                 let api_clone_2 = api.clone();
@@ -273,14 +275,13 @@ async fn handle_hf_ingestion(
                     repo_client.get(&filename)
                 })
                 .await??;
-                println!("[HF_INGESTION] Downloaded to: {:?}", local_path);
+                debug!(path = ?local_path, "Downloaded to");
                 // --- End Blocking ---
 
                 let bucket = persistence
-                    .get_public_bucket_by_name(&target_bucket)
+                    .get_bucket_by_name(tenant_id, &target_bucket, &target_region)
                     .await?
                     .ok_or_else(|| anyhow!("target bucket not found"))?;
-                let tenant_id = bucket.tenant_id;
                 let full_key = if target_prefix.is_empty() {
                     path.clone()
                 } else {
@@ -291,10 +292,10 @@ async fn handle_hf_ingestion(
                     )
                 };
 
-                println!(
-                    "[HF_INGESTION] Uploading to Anvil: bucket={}, key={}",
-                    target_bucket,
-                    full_key
+                info!(
+                    bucket = %target_bucket,
+                    key = %full_key,
+                    "Uploading to Anvil"
                 );
                 let mut make_reader = || async {
                     let f = tokio::fs::File::open(&local_path).await;
@@ -318,13 +319,14 @@ async fn handle_hf_ingestion(
                         .await;
                     match res {
                         Ok(_obj) => {
-                            println!("[HF_INGESTION] Upload successful for key: {}", full_key);
+                            info!(key = %full_key, "Upload successful");
                             break;
                         }
                         Err(e) if attempt < 3 => {
-                            println!(
-                                "[HF_INGESTION] Upload attempt {} failed for key: {}. Retrying...",
-                                attempt, full_key
+                            warn!(
+                                attempt,
+                                key = %full_key,
+                                "Upload attempt failed. Retrying..."
                             );
                             let jitter = (rand::random::<u64>() % 200) as u64;
                             tokio::time::sleep(std::time::Duration::from_millis(
@@ -335,9 +337,10 @@ async fn handle_hf_ingestion(
                             continue;
                         }
                         Err(e) => {
-                            println!(
-                                "[HF_INGESTION] Upload failed permanently for key: {}. Error: {}",
-                                full_key, e
+                            error!(
+                                key = %full_key,
+                                error = %e,
+                                "Upload failed permanently"
                             );
                             return Err(anyhow::anyhow!(e.to_string()));
                         }
@@ -346,12 +349,12 @@ async fn handle_hf_ingestion(
                 persistence
                     .hf_update_item_state(item_id, HFIngestionItemState::Stored, None)
                     .await?;
-                println!("[HF_INGESTION] Item {} state set to stored.", item_id);
+                debug!(item_id, "Item state set to stored.");
             }
 
-            println!(
-                "[HF_INGESTION] Ingestion task {} completed successfully.",
-                ingestion_id
+            info!(
+                ingestion_id,
+                "Ingestion task completed successfully."
             );
             persistence
                 .hf_update_ingestion_state(ingestion_id, HFIngestionState::Completed, None)
@@ -361,10 +364,9 @@ async fn handle_hf_ingestion(
         }
         .await;
 
-    if let Err(e) = result {
-        panic!("[HF_INGESTION] Worker task failed with error: {:?}", e);
+    if let Err(e) = &result {
+        error!(ingestion_id, error = %e, "HF Ingestion task failed");
     }
-
     result
 }
 

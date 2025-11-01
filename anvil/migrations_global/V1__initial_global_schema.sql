@@ -83,10 +83,12 @@ CREATE TYPE hf_ingestion_state AS ENUM ('queued','running','completed','failed',
 CREATE TABLE hf_ingestions (
     id BIGSERIAL PRIMARY KEY,
     key_id BIGINT NOT NULL REFERENCES huggingface_keys(id) ON DELETE RESTRICT,
-    requester TEXT NOT NULL, -- subject/app id for auditing
+    tenant_id BIGINT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    requester_app_id BIGINT NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
     repo TEXT NOT NULL,
     revision TEXT,
     target_bucket TEXT NOT NULL,
+    target_region TEXT NOT NULL,
     target_prefix TEXT,
     include_globs TEXT[],
     exclude_globs TEXT[],

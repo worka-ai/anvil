@@ -25,7 +25,9 @@ async fn hf_ingestion_single_file_integration() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    let _ = bucket_client.create_bucket(req).await;
+    bucket_client.create_bucket(req).await.unwrap();
+
+
 
     // Create HF key with empty token (public repo)
     let mut key_client = anvil::anvil_api::hugging_face_key_service_client::HuggingFaceKeyServiceClient::connect(
@@ -56,6 +58,7 @@ async fn hf_ingestion_single_file_integration() {
         repo: "openai/gpt-oss-20b".into(),
         revision: "main".into(),
         target_bucket: "models".into(),
+        target_region: "TEST_REGION".into(),
         target_prefix: "gpt-oss-20b".into(),
         include_globs: vec!["config.json".into()],
         exclude_globs: vec![],
@@ -94,13 +97,32 @@ async fn hf_ingestion_single_file_integration() {
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
-    // Verify object via HTTP
-    // TestCluster stores gRPC base at /grpc; S3/HTTP hits root
+    // Verify object is not public initially
     let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
     let url = format!("{}/models/gpt-oss-20b/config.json", http_base);
-    let resp = reqwest::get(url).await.unwrap();
-    assert_eq!(resp.status(), 200);
-    let txt = resp.text().await.unwrap();
+    let resp_before = reqwest::get(&url).await.unwrap();
+    assert_eq!(resp_before.status(), 403, "Object should be private initially");
+
+    // Make the bucket public
+    let mut auth_client = anvil::anvil_api::auth_service_client::AuthServiceClient::connect(
+        cluster.grpc_addrs[0].clone(),
+    )
+    .await
+    .unwrap();
+    let mut req = tonic::Request::new(anvil::anvil_api::SetPublicAccessRequest {
+        bucket: "models".into(),
+        allow_public_read: true,
+    });
+    req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    auth_client.set_public_access(req).await.unwrap();
+
+    // Verify object is now public
+    let resp_after = reqwest::get(&url).await.unwrap();
+    assert_eq!(resp_after.status(), 200, "Object should be public after setting policy");
+    let txt = resp_after.text().await.unwrap();
     let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
     assert!(v.is_object());
 }
@@ -162,6 +184,7 @@ async fn hf_ingestion_permission_denied() {
         repo: "openai/gpt-oss-20b".into(),
         revision: "main".into(),
         target_bucket: "models-denied".into(),
+        target_region: "TEST_REGION".into(),
         target_prefix: "gpt-oss-20b".into(),
         include_globs: vec!["config.json".into()],
         exclude_globs: vec![],
