@@ -68,8 +68,15 @@ async fn hf_ingestion_config_json() {
 
     // Start ingestion for config.json only
     let mut ing_client = anvil::anvil_api::hf_ingestion_service_client::HfIngestionServiceClient::connect("http://localhost:50051".to_string()).await.unwrap();
-    let mut sreq = tonic::Request::new(anvil::anvil_api::StartHfIngestionRequest{
-        key_name: "test".into(), repo: "openai/gpt-oss-20b".into(), revision: "main".into(), target_bucket: "models".into(), target_prefix: "gpt-oss-20b".into(), include_globs: vec!["config.json".into()], exclude_globs: vec![]
+    let mut sreq = tonic::Request::new(anvil::anvil_api::StartHfIngestionRequest {
+        key_name: "test".into(),
+        repo: "openai/gpt-oss-20b".into(),
+        revision: "main".into(),
+        target_bucket: "models".into(),
+        target_prefix: "gpt-oss-20b".into(),
+        include_globs: vec!["config.json".into()],
+        exclude_globs: vec![],
+        target_region: "DOCKER_TEST".into(),
     });
     sreq.metadata_mut().insert("authorization", format!("Bearer {}", token).parse().unwrap());
     let ing_id = ing_client.start_ingestion(sreq).await.unwrap().into_inner().ingestion_id;
