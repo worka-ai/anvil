@@ -149,7 +149,6 @@ dependencies = [
  "ahash 0.8.12",
  "anvil",
  "anvil-core",
- "anvil-enterprise",
  "anvil-test-utils",
  "anyhow",
  "argon2",
@@ -319,26 +318,6 @@ dependencies = [
  "tracing-subscriber",
  "trust-dns-resolver",
  "uuid",
-]
-
-[[package]]
-name = "anvil-enterprise"
-version = "0.1.0"
-dependencies = [
- "anvil-core",
- "anyhow",
- "async-stream",
- "axum",
- "axum-extra",
- "clap",
- "futures",
- "futures-core",
- "log",
- "serde",
- "serde_json",
- "tokio",
- "tonic",
- "tracing",
 ]
 
 [[package]]

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-enterprise = ["dep:anvil-enterprise"]
+enterprise = []
 gcp = ["dep:prost-types", "tonic/tls-ring"]
 routeguide = ["dep:async-stream", "dep:tokio-stream", "dep:rand", "dep:serde", "dep:serde_json"]
 reflection = ["dep:tonic-reflection"]
@@ -30,7 +30,8 @@ tonic-prost = ["dep:tonic-prost"]
 
 [dependencies]
 anvil-core = { path = "../anvil-core" }
-anvil-enterprise = { path = "../../anvil-enterprise", optional = true }
+# Enterprise crate is private and not part of the OSS workspace.
+# Do not declare it here to keep OSS repo self-contained.
 anyhow = { version = "1" }
 blake3 = "1.8.2"
 deadpool-postgres = { version = "0.12.1", features = ["serde"] }

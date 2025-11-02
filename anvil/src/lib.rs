@@ -14,9 +14,6 @@ pub mod s3_gateway;
 
 pub mod s3_auth;
 
-#[cfg(feature = "enterprise")]
-use anvil_enterprise;
-
 pub mod migrations {
     use refinery_macros::embed_migrations;
     embed_migrations!("./migrations_global");
@@ -82,9 +79,20 @@ pub async fn start_node(
     let (mut grpc_router, auth_interceptor) = anvil_core::services::create_grpc_router(state.clone());
 
     // If the enterprise feature is enabled, add the enterprise services.
+    // Enterprise route extension is linked in enterprise workspace via feature flag.
     #[cfg(feature = "enterprise")]
     {
-        grpc_router = anvil_enterprise::extend_with_enterprise(grpc_router, state.clone(), auth_interceptor);
+        // In enterprise builds, this symbol is provided by the enterprise crate.
+        unsafe extern "Rust" {
+            fn __anvil_enterprise_extend(
+                routes: service::Routes,
+                state: anvil_core::AppState,
+                auth: anvil_core::services::AuthInterceptorFn,
+            ) -> service::Routes;
+        }
+        unsafe {
+            grpc_router = __anvil_enterprise_extend(grpc_router, state.clone(), auth_interceptor);
+        }
     }
 
     let grpc_axum = anvil_core::services::create_axum_router(grpc_router);
@@ -152,3 +160,4 @@ pub async fn run_migrations(
         .await?;
     Ok(())
 }
+use tonic::service;
