@@ -103,6 +103,7 @@ pub async fn start_node(
             if content_type.starts_with("application/grpc") {
                 grpc_router.oneshot(req).await
             } else {
+                tracing::info!("[gRPC Mux] Routing to S3 gateway for content-type: {}", content_type);
                 s3_router.oneshot(req).await
             }
         }

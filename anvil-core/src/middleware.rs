@@ -3,7 +3,7 @@ use http::Uri;
 use tonic::{Request, Status};
 
 pub fn auth_interceptor<T>(mut req: Request<T>, state: &AppState) -> Result<Request<T>, Status> {
-    tracing::info!("[auth_interceptor] INTERCEPTOR CALLED. Headers: {:?}", req.metadata());
+    let has_auth = req.metadata().get("authorization").is_some();
 
     let uri = if let Some(m) = req.extensions().get::<Uri>()
     /*req.extensions().get::<tonic::GrpcMethod>()*/
@@ -14,6 +14,11 @@ pub fn auth_interceptor<T>(mut req: Request<T>, state: &AppState) -> Result<Requ
             "Invalid gRPC request, extension not found",
         ));
     };
+    tracing::info!(
+        "[auth_interceptor] path={} auth_present={}",
+        uri,
+        has_auth
+    );
     // A list of public routes that do not require authentication.
     const PUBLIC_ROUTES: &[&str] = &["/anvil.AuthService/GetAccessToken"];
     if PUBLIC_ROUTES.contains(&uri.as_str()) {
