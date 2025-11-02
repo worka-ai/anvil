@@ -434,6 +434,12 @@ impl Persistence {
         name: &str,
         region: &str,
     ) -> Result<Bucket, tonic::Status> {
+        tracing::info!(
+            "[Persistence] Creating bucket: tenant_id={}, name={}, region={}",
+            tenant_id,
+            name,
+            region
+        );
         let client = self
             .global_pool
             .get()

@@ -14,71 +14,59 @@ use crate::anvil_api::{
 };
 use crate::{AppState, middleware};
 use tonic::service::Routes;
-
-// Public trait so other crates can accept and reuse the same interceptor.
-pub trait AuthInterceptor: Send + Sync + 'static {
-    fn call(&self, req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>;
-}
-
-impl<F> AuthInterceptor for F
-where
-    F: Fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Send + Sync + 'static,
-{
-    fn call(&self, req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-        (self)(req)
-    }
-}
+use tonic::{Request, Status};
 
 #[derive(Clone)]
-pub struct AuthInterceptorFn(std::sync::Arc<dyn AuthInterceptor>);
+pub struct AuthInterceptorFn {
+    f: std::sync::Arc<dyn Fn(Request<()>) -> Result<Request<()>, Status> + Send + Sync>,
+}
 
 impl AuthInterceptorFn {
     pub fn new<F>(f: F) -> Self
     where
-        F: Fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Send + Sync + 'static,
+        F: Fn(Request<()>) -> Result<Request<()>, Status> + Send + Sync + 'static,
     {
-        Self(std::sync::Arc::new(f))
+        Self { f: std::sync::Arc::new(f) }
     }
 
-    pub fn call(&self, req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-        self.0.call(req)
+    pub fn call(&self, req: Request<()>) -> Result<Request<()>, Status> {
+        (self.f)(req)
     }
 }
 
 pub fn create_grpc_router(
     state: AppState,
-) -> (Routes, AuthInterceptorFn) {
-    let state_clone = state.clone();
-    let auth_interceptor = move |req| middleware::auth_interceptor(req, &state_clone);
-
-    let grpc_router = tonic::service::Routes::new(AuthServiceServer::with_interceptor(
+    auth_interceptor: AuthInterceptorFn,
+) -> Routes {
+    // Adapt our handle to a closure Interceptor Tonic accepts
+    let auth_closure = {
+        let f = auth_interceptor.clone();
+        move |req| f.call(req)
+    };
+    tonic::service::Routes::new(AuthServiceServer::with_interceptor(
         state.clone(),
-        auth_interceptor.clone(),
+        auth_closure.clone(),
     ))
     .add_service(ObjectServiceServer::with_interceptor(
         state.clone(),
-        auth_interceptor.clone(),
+        auth_closure.clone(),
     ))
     .add_service(BucketServiceServer::with_interceptor(
         state.clone(),
-        auth_interceptor.clone(),
+        auth_closure.clone(),
     ))
     .add_service(InternalAnvilServiceServer::with_interceptor(
         state.clone(),
-        auth_interceptor.clone(),
+        auth_closure.clone(),
     ))
     .add_service(HuggingFaceKeyServiceServer::with_interceptor(
         state.clone(),
-        auth_interceptor.clone(),
+        auth_closure.clone(),
     ))
     .add_service(HfIngestionServiceServer::with_interceptor(
         state.clone(),
-        auth_interceptor,
-    ));
-
-    let auth_interceptor_clone = move |req| middleware::auth_interceptor(req, &state.clone());
-
-    (grpc_router, AuthInterceptorFn::new(auth_interceptor_clone))
+        auth_closure,
+    ))
 }
 
 pub fn create_axum_router(grpc_router: Routes) -> axum::Router {

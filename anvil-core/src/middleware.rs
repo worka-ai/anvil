@@ -3,6 +3,8 @@ use http::Uri;
 use tonic::{Request, Status};
 
 pub fn auth_interceptor<T>(mut req: Request<T>, state: &AppState) -> Result<Request<T>, Status> {
+    tracing::info!("[auth_interceptor] INTERCEPTOR CALLED. Headers: {:?}", req.metadata());
+
     let uri = if let Some(m) = req.extensions().get::<Uri>()
     /*req.extensions().get::<tonic::GrpcMethod>()*/
     {
@@ -46,6 +48,8 @@ pub async fn save_uri_mw(
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    tracing::info!("[axum_mw] Received request with headers: {:?}", req.headers());
+
     // Prefer the original (unstripped) URI if we’re nested
     let full_uri: Uri = req
         .extensions()

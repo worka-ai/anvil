@@ -9,10 +9,15 @@ impl BucketService for AppState {
         &self,
         request: Request<CreateBucketRequest>,
     ) -> Result<Response<CreateBucketResponse>, Status> {
+        tracing::info!("[BucketService] ENTERING create_bucket. Metadata: {:?}", request.metadata());
+
         let claims = request
             .extensions()
             .get::<auth::Claims>()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+
+        tracing::info!("[BucketService] Claims successfully extracted. Tenant ID: {}", claims.tenant_id);
+
         let req = request.get_ref();
 
         self.bucket_manager
