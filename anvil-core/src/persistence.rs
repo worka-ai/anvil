@@ -136,6 +136,163 @@ impl Persistence {
         &self.global_pool
     }
 
+    // --- Model Registry Methods ---
+
+    pub async fn create_model_artifact(
+        &self,
+        artifact_id: &str,
+        bucket_id: i64,
+        key: &str,
+        manifest: &crate::anvil_api::ModelManifest,
+    ) -> Result<()> {
+        let client = self.regional_pool.get().await?;
+        let manifest_json = serde_json::to_value(manifest)?;
+        client
+            .execute(
+                "INSERT INTO model_artifacts (artifact_id, bucket_id, key, manifest) VALUES ($1, $2, $3, $4)",
+                &[&artifact_id, &bucket_id, &key, &manifest_json],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn create_model_tensors(&self, artifact_id: &str, tensors: &[crate::anvil_api::TensorIndexRow]) -> Result<()> {
+        if tensors.is_empty() {
+            return Ok(());
+        }
+        let client = self.regional_pool.get().await?;
+        let sink = client.copy_in("COPY model_tensors (artifact_id, tensor_name, file_path, file_offset, byte_length, dtype, shape, layout, block_bytes, blocks) FROM STDIN").await?;
+
+        use bytes::Bytes;
+        use futures_util::SinkExt;
+        use std::pin::pin;
+
+        let mut writer = pin!(sink);
+
+        for tensor in tensors {
+            let shape_array = format!("{{{}}}", tensor.shape.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","));
+            let blocks_json = serde_json::to_string(&tensor.blocks)?;
+
+            let row_string = format!(
+                "{}	{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                artifact_id,
+                tensor.tensor_name,
+                tensor.file_path,
+                tensor.file_offset,
+                tensor.byte_length,
+                tensor.dtype,
+                shape_array,
+                tensor.layout,
+                tensor.block_bytes,
+                blocks_json
+            );
+            writer.send(Bytes::from(row_string)).await?;
+        }
+        writer.close().await?;
+        Ok(())
+    }
+
+    pub async fn list_tensors(&self, artifact_id: &str) -> Result<Vec<crate::anvil_api::TensorIndexRow>> {
+        let client = self.regional_pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT tensor_name, file_path, file_offset, byte_length, dtype, shape, layout, block_bytes, blocks FROM model_tensors WHERE artifact_id = $1 ORDER BY tensor_name",
+                &[&artifact_id],
+            )
+            .await?;
+
+        let tensors = rows
+            .into_iter()
+            .map(|row| {
+                let shape: Vec<i32> = row.get("shape");
+                let shape_u32: Vec<u32> = shape.into_iter().map(|i| i as u32).collect();
+                let file_offset: i64 = row.get("file_offset");
+                let byte_length: i64 = row.get("byte_length");
+                let dtype_str: String = row.get("dtype");
+                let block_bytes: i32 = row.get("block_bytes");
+                crate::anvil_api::TensorIndexRow {
+                    tensor_name: row.get("tensor_name"),
+                    file_path: row.get("file_path"),
+                    file_offset: file_offset as u64,
+                    byte_length: byte_length as u64,
+                    dtype: dtype_str.parse::<i32>().unwrap_or(0),
+                    shape: shape_u32,
+                    layout: row.get("layout"),
+                    block_bytes: block_bytes as u32,
+                    blocks: serde_json::from_value(row.get("blocks")).unwrap_or_default(),
+                }
+            })
+            .collect();
+        Ok(tensors)
+    }
+
+    pub async fn get_tensor_metadata(&self, artifact_id: &str, tensor_name: &str) -> Result<Option<crate::anvil_api::TensorIndexRow>> {
+        let client = self.regional_pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT tensor_name, file_path, file_offset, byte_length, dtype, shape, layout, block_bytes, blocks FROM model_tensors WHERE artifact_id = $1 AND tensor_name = $2",
+                &[&artifact_id, &tensor_name],
+            )
+            .await?;
+
+        Ok(row.map(|row| {
+            let shape: Vec<i32> = row.get("shape");
+            let shape_u32: Vec<u32> = shape.into_iter().map(|i| i as u32).collect();
+            let file_offset: i64 = row.get("file_offset");
+            let byte_length: i64 = row.get("byte_length");
+            let dtype_str: String = row.get("dtype");
+            let block_bytes: i32 = row.get("block_bytes");
+            crate::anvil_api::TensorIndexRow {
+                tensor_name: row.get("tensor_name"),
+                file_path: row.get("file_path"),
+                file_offset: file_offset as u64,
+                byte_length: byte_length as u64,
+                dtype: dtype_str.parse::<i32>().unwrap_or(0),
+                shape: shape_u32,
+                layout: row.get("layout"),
+                block_bytes: block_bytes as u32,
+                blocks: serde_json::from_value(row.get("blocks")).unwrap_or_default(),
+            }
+        }))
+    }
+
+    pub async fn get_model_artifact(&self, artifact_id: &str) -> Result<Option<crate::anvil_api::ModelManifest>> {
+        let client = self.regional_pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT manifest FROM model_artifacts WHERE artifact_id = $1",
+                &[&artifact_id],
+            )
+            .await?;
+
+        match row {
+            Some(row) => {
+                let manifest_json: serde_json::Value = row.get("manifest");
+                let manifest: crate::anvil_api::ModelManifest = serde_json::from_value(manifest_json)?;
+                Ok(Some(manifest))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_tensor_metadata_recursive(&self, artifact_id: &str, tensor_name: &str) -> Result<Option<crate::anvil_api::TensorIndexRow>> {
+        // 1. Try to find the tensor in the current artifact.
+        if let Some(tensor) = self.get_tensor_metadata(artifact_id, tensor_name).await? {
+            return Ok(Some(tensor));
+        }
+
+        // 2. If not found, get the current artifact's manifest to find its base.
+        if let Some(manifest) = self.get_model_artifact(artifact_id).await? {
+            if !manifest.base_artifact_id.is_empty() {
+                // 3. If it has a base, recurse.
+                return Box::pin(self.get_tensor_metadata_recursive(&manifest.base_artifact_id, tensor_name)).await;
+            }
+        }
+
+        // 4. If we've reached the end of the chain, it's not found.
+        Ok(None)
+    }
+
     // --- Global Methods ---
 
     pub async fn create_region(&self, name: &str) -> Result<bool> {

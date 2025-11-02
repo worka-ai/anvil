@@ -11,6 +11,7 @@ pub struct Claims {
     pub tenant_id: i64,
 }
 
+#[derive(Debug)]
 pub struct JwtManager {
     secret: String,
 }

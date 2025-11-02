@@ -14,6 +14,12 @@ pub struct Storage {
 }
 
 impl Storage {
+    pub async fn commit_whole_object_from_bytes(&self, data: &[u8], final_object_hash: &str) -> Result<()> {
+        let final_path = self.get_whole_object_path(final_object_hash);
+        let mut file = fs::File::create(&final_path).await?;
+        file.write_all(data).await?;
+        Ok(())
+    }
     pub async fn new() -> Result<Self> {
         let storage_path = Path::new(STORAGE_DIR).to_path_buf();
         let temp_path = storage_path.join(TEMP_DIR);

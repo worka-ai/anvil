@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ObjectManager {
     db: Persistence,
     placer: PlacementManager,

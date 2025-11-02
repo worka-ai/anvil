@@ -9,7 +9,7 @@ use reed_solomon_erasure::{Error, ReedSolomon};
 const DATA_SHARDS: usize = 4;
 const PARITY_SHARDS: usize = 2;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ShardManager {
     codec: ReedSolomon<Field>,
 }

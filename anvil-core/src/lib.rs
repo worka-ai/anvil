@@ -44,7 +44,7 @@ pub mod anvil_api {
 
 
 // Our application state, which will hold the persistence layer, storage engine, etc.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AppState {
     pub db: persistence::Persistence,
     pub storage: storage::Storage,

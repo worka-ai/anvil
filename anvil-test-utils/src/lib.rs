@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tokio_postgres::NoTls;
+use tracing_subscriber::{self, EnvFilter};
 
 pub mod migrations {
     use refinery_macros::embed_migrations;
@@ -124,8 +125,26 @@ pub struct TestCluster {
 }
 
 impl TestCluster {
+    pub async fn create_bucket(&self, bucket_name: &str, region: &str) {
+        let mut bucket_client =
+            anvil::anvil_api::bucket_service_client::BucketServiceClient::connect(self.grpc_addrs[0].clone())
+                .await
+                .unwrap();
+        let mut create_req = tonic::Request::new(anvil::anvil_api::CreateBucketRequest {
+            bucket_name: bucket_name.to_string(),
+            region: region.to_string(),
+        });
+        create_req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", self.token).parse().unwrap(),
+        );
+        bucket_client.create_bucket(create_req).await.unwrap();
+    }
     #[allow(dead_code)]
     pub async fn new(regions: &[&str]) -> Self {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
+            .try_init();
         let config = Arc::new(anvil_core::config::Config {
             global_database_url: "".to_string(),
             regional_database_url: "".to_string(),

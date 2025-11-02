@@ -8,6 +8,7 @@ fn main() {
         // .server_attribute("Echo", "#[derive(PartialEq)]")
         // .client_mod_attribute("attrs", "#[cfg(feature = \"client\")]")
         // .client_attribute("Echo", "#[derive(PartialEq)]")
+        .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
         .compile_protos(&["proto/anvil.proto"], &["proto"])
         .unwrap();
 }

@@ -2,7 +2,7 @@ use crate::cluster::ClusterState;
 use blake3::Hasher;
 use libp2p::PeerId;
 
-#[derive(Default, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PlacementManager;
 
 impl PlacementManager {
