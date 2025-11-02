@@ -15,7 +15,39 @@ use crate::anvil_api::{
 use crate::{AppState, middleware};
 use tonic::service::Routes;
 
-pub fn create_grpc_router(state: AppState) -> (Routes, impl Fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Clone) {
+// Public trait so other crates can accept and reuse the same interceptor.
+pub trait AuthInterceptor: Send + Sync + 'static {
+    fn call(&self, req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>;
+}
+
+impl<F> AuthInterceptor for F
+where
+    F: Fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Send + Sync + 'static,
+{
+    fn call(&self, req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        (self)(req)
+    }
+}
+
+#[derive(Clone)]
+pub struct AuthInterceptorFn(std::sync::Arc<dyn AuthInterceptor>);
+
+impl AuthInterceptorFn {
+    pub fn new<F>(f: F) -> Self
+    where
+        F: Fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Send + Sync + 'static,
+    {
+        Self(std::sync::Arc::new(f))
+    }
+
+    pub fn call(&self, req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        self.0.call(req)
+    }
+}
+
+pub fn create_grpc_router(
+    state: AppState,
+) -> (Routes, AuthInterceptorFn) {
     let state_clone = state.clone();
     let auth_interceptor = move |req| middleware::auth_interceptor(req, &state_clone);
 
@@ -46,23 +78,11 @@ pub fn create_grpc_router(state: AppState) -> (Routes, impl Fn(tonic::Request<()
 
     let auth_interceptor_clone = move |req| middleware::auth_interceptor(req, &state.clone());
 
-    (grpc_router, auth_interceptor_clone)
+    (grpc_router, AuthInterceptorFn::new(auth_interceptor_clone))
 }
 
 pub fn create_axum_router(grpc_router: Routes) -> axum::Router {
     grpc_router
         .into_axum_router()
         .route_layer(axum::middleware::from_fn(middleware::save_uri_mw))
-        .route_layer(axum::middleware::from_fn(
-            |req: axum::extract::Request, next: axum::middleware::Next| async move {
-                if req.method() == axum::http::Method::POST {
-                    next.run(req).await
-                } else {
-                    axum::response::Response::builder()
-                        .status(axum::http::StatusCode::METHOD_NOT_ALLOWED)
-                        .body(axum::body::Body::empty())
-                        .unwrap()
-                }
-            },
-        ))
 }

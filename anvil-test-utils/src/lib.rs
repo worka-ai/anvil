@@ -49,7 +49,7 @@ pub fn extract_credential(output: &str, key: &str) -> String {
 
 #[allow(dead_code)]
 pub async fn get_auth_token(global_db_url: &str, grpc_addr: &str) -> String {
-    let admin_args = &["run", "--bin", "admin", "--"];
+    let admin_args = &["run", "-p", "anvil", "--bin", "admin", "--"];
 
     let app_output = Command::new("cargo")
         .args(admin_args.iter().chain(&[
@@ -66,7 +66,13 @@ pub async fn get_auth_token(global_db_url: &str, grpc_addr: &str) -> String {
         ]))
         .output()
         .unwrap();
-    assert!(app_output.status.success());
+    if !app_output.status.success() {
+        panic!(
+            "Failed to create app via admin CLI:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&app_output.stdout),
+            String::from_utf8_lossy(&app_output.stderr)
+        );
+    }
     let creds = String::from_utf8(app_output.stdout).unwrap();
     let client_id = extract_credential(&creds, "Client ID");
     let client_secret = extract_credential(&creds, "Client Secret");

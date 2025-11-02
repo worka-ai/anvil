@@ -1,7 +1,9 @@
 use anyhow::Result;
+use axum::ServiceExt;
 use deadpool_postgres::{ManagerConfig, Pool, RecyclingMethod};
 use std::str::FromStr;
 use tokio_postgres::NoTls;
+use tower::ServiceExt as TowerServiceExt;
 use tracing::{error, info};
 
 // Re-export the core types for the binary and services to use.
@@ -74,21 +76,34 @@ pub async fn start_node(
     });
 
     // --- Services ---
-    let (mut grpc_router, _auth_interceptor) = anvil_core::services::create_grpc_router(state.clone());
+    let state_clone = state.clone();
+    let auth_interceptor = move |req: tonic::Request<()>| middleware::auth_interceptor(req, &state_clone);
+
+    let (mut grpc_router, auth_interceptor) = anvil_core::services::create_grpc_router(state.clone());
 
     // If the enterprise feature is enabled, add the enterprise services.
     #[cfg(feature = "enterprise")]
     {
-        grpc_router = anvil_enterprise::get_enterprise_router(grpc_router, state.clone());
+        grpc_router = anvil_enterprise::extend_with_enterprise(grpc_router, state.clone(), auth_interceptor);
     }
 
     let grpc_axum = anvil_core::services::create_axum_router(grpc_router);
+    let s3_app = s3_gateway::app(state.clone());
 
-    let app = axum::Router::new()
-        .merge(s3_gateway::app(state.clone()))
-        // Expose gRPC both at root (POST-only) and explicitly under /grpc
-        .merge(grpc_axum.clone())
-        .nest("/grpc", grpc_axum);
+    let app = tower::service_fn(move |req: axum::extract::Request| {
+        let grpc_router = grpc_axum.clone();
+        let s3_router = s3_app.clone();
+
+        async move {
+            let content_type = req.headers().get("content-type").map(|v| v.as_bytes());
+
+            if content_type == Some(b"application/grpc") {
+                grpc_router.oneshot(req).await
+            } else {
+                s3_router.oneshot(req).await
+            }
+        }
+    });
 
     let addr = listener.local_addr()?;
     info!("Anvil server (gRPC & S3) listening on {}", addr);

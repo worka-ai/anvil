@@ -328,6 +328,8 @@ dependencies = [
  "anvil-core",
  "anyhow",
  "async-stream",
+ "axum",
+ "axum-extra",
  "clap",
  "futures",
  "futures-core",
