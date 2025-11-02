@@ -49,7 +49,7 @@ pub fn extract_credential(output: &str, key: &str) -> String {
 
 #[allow(dead_code)]
 pub async fn get_auth_token(global_db_url: &str, grpc_addr: &str) -> String {
-    let admin_args = &["run", "-p", "anvil", "--bin", "admin", "--"];
+    let admin_args = &["run", "-p", "anvil", "--features", "anvil/enterprise", "--bin", "admin", "--"];
 
     let app_output = Command::new("cargo")
         .args(admin_args.iter().chain(&[
