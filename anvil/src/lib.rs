@@ -2,7 +2,8 @@ use anyhow::Result;
 use axum::ServiceExt;
 use deadpool_postgres::{ManagerConfig, Pool, RecyclingMethod};
 use std::str::FromStr;
-use axum::handler::Handler;
+use tonic::service;
+use once_cell::sync::OnceCell;
 use tokio_postgres::NoTls;
 use tower::ServiceExt as TowerServiceExt;
 use tracing::{error, info};
@@ -75,27 +76,14 @@ pub async fn start_node(
 
     // --- Services ---
     let state_clone = state.clone();
-    let auth_interceptor = services::AuthInterceptorFn::new(move |req: tonic::Request<()>| {
+    let auth_interceptor = anvil_core::services::AuthInterceptorFn::new(move |req: tonic::Request<()>| {
         middleware::auth_interceptor(req, &state_clone)
     });
 
     let mut grpc_router = anvil_core::services::create_grpc_router(state.clone(), auth_interceptor.clone());
 
-    // If the enterprise feature is enabled, add the enterprise services.
-    // Enterprise route extension is linked in enterprise workspace via feature flag.
-    #[cfg(feature = "enterprise")]
-    {
-        // In enterprise builds, this symbol is provided by the enterprise crate.
-        unsafe extern "Rust" {
-            fn __anvil_enterprise_extend(
-                routes: service::Routes,
-                state: anvil_core::AppState,
-                auth: anvil_core::services::AuthInterceptorFn,
-            ) -> service::Routes;
-        }
-        unsafe {
-            grpc_router = __anvil_enterprise_extend(grpc_router, state.clone(), auth_interceptor);
-        }
+    if let Some(ext) = ENTERPRISE_EXTENDER.get() {
+        grpc_router = ext(grpc_router, state.clone(), auth_interceptor);
     }
 
     let grpc_axum = anvil_core::services::create_axum_router(grpc_router);
@@ -113,48 +101,6 @@ pub async fn start_node(
                 .unwrap_or("");
 
             if content_type.starts_with("application/grpc") {
-                grpc_router.oneshot(req).await
-            } else {
-                s3_router.oneshot(req).await
-            }
-        }
-    });
-
-    // --- Services ---
-    let state_clone = state.clone();
-    let auth_interceptor = anvil_core::services::AuthInterceptorFn::new(
-        move |req: tonic::Request<()>| middleware::auth_interceptor(req, &state_clone),
-    );
-
-    let mut grpc_router = anvil_core::services::create_grpc_router(state.clone(), auth_interceptor.clone());
-
-    // If the enterprise feature is enabled, add the enterprise services.
-    #[cfg(feature = "enterprise")]
-    {
-        // In enterprise builds, this symbol is provided by the enterprise crate.
-        unsafe extern "Rust" {
-            fn __anvil_enterprise_extend(
-                routes: service::Routes,
-                state: anvil_core::AppState,
-                auth: anvil_core::services::AuthInterceptorFn,
-            ) -> service::Routes;
-        }
-        unsafe {
-            grpc_router = __anvil_enterprise_extend(grpc_router, state.clone(), auth_interceptor);
-        }
-    }
-
-    let grpc_axum = anvil_core::services::create_axum_router(grpc_router);
-    let s3_app = s3_gateway::app(state.clone());
-
-    let app = tower::service_fn(move |req: axum::extract::Request| {
-        let grpc_router = grpc_axum.clone();
-        let s3_router = s3_app.clone();
-
-        async move {
-            let content_type = req.headers().get("content-type").map(|v| v.as_bytes());
-
-            if content_type == Some(b"application/grpc") {
                 grpc_router.oneshot(req).await
             } else {
                 s3_router.oneshot(req).await
@@ -209,4 +155,12 @@ pub async fn run_migrations(
         .await?;
     Ok(())
 }
-use tonic::service;
+static ENTERPRISE_EXTENDER: OnceCell<
+    fn(service::Routes, anvil_core::AppState, anvil_core::services::AuthInterceptorFn) -> service::Routes,
+> = OnceCell::new();
+
+pub fn register_enterprise_extender(
+    f: fn(service::Routes, anvil_core::AppState, anvil_core::services::AuthInterceptorFn) -> service::Routes,
+) {
+    let _ = ENTERPRISE_EXTENDER.set(f);
+}

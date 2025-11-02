@@ -187,6 +187,7 @@ dependencies = [
  "listenfd",
  "local-ip-address",
  "memchr",
+ "once_cell",
  "postgres-types",
  "prost",
  "prost-types",
