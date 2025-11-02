@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anvil = { path = "../anvil" }
+# Ensure tests exercise the enterprise-extended server by enabling the feature.
+anvil = { path = "../anvil", features = ["enterprise"] }
 anvil-core = { path = "../anvil-core" }
 anyhow = "1"
 tokio = { version = "1.47.1", features = ["full"] }
