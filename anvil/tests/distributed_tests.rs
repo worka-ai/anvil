@@ -6,12 +6,12 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tonic::Request;
 
-mod common;
+use anvil_test_utils::*;
 
 #[tokio::test]
 async fn test_distributed_reconstruction_on_node_failure() {
     //let num_nodes = 6;
-    let mut cluster = common::TestCluster::new(&["test-region-1"; 6]).await;
+    let mut cluster = TestCluster::new(&["test-region-1"; 6]).await;
     cluster.start_and_converge(Duration::from_secs(20)).await;
 
     let primary_addr = cluster.grpc_addrs[0].clone(); // already includes /grpc

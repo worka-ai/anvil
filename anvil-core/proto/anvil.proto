@@ -302,3 +302,121 @@ message DeleteShardRequest {
 }
 
 message DeleteShardResponse {}
+
+// ---------- Model Service ----------
+service ModelService {
+  rpc PutModelManifest(PutModelManifestRequest) returns (PutModelManifestResponse);
+  rpc ListTensors(ListTensorsRequest) returns (ListTensorsResponse);
+  rpc GetTensor(GetTensorRequest) returns (stream GetTensorChunk);
+  rpc GetTensors(GetTensorsRequest) returns (stream GetTensorChunk);
+}
+
+message TenantScope {
+  string tenant_id = 1;
+  string region = 2;
+}
+
+message ObjectRef {
+  string bucket = 1;
+  string key = 2;
+  string version_id = 3;
+}
+
+enum DType {
+  DTYPE_UNSPECIFIED = 0;
+  F16 = 1;
+  BF16 = 2;
+  F32 = 3;
+  F64 = 4;
+  I8 = 5;
+  I16 = 6;
+  I32 = 7;
+  I64 = 8;
+  U8 = 9;
+}
+
+message ModelManifest {
+  string schema_version = 1;
+  string artifact_id = 2;
+  string name = 3;
+  string format = 4;
+
+  message Component {
+    string path = 1;
+    uint64 size = 2;
+    string hash = 3;
+  }
+  repeated Component components = 5;
+
+  string base_artifact_id = 6;
+  repeated string delta_artifact_ids = 7;
+
+  message Signature {
+    string authority = 1;
+    bytes sig = 2;
+  }
+  repeated Signature signatures = 8;
+
+  string merkle_root = 9;
+  map<string,string> meta = 10;
+}
+
+message TensorIndexRow {
+  string tensor_name = 1;
+  string file_path = 2;
+  uint64 file_offset = 3;
+  uint64 byte_length = 4;
+  DType dtype = 5;
+  repeated uint32 shape = 6;
+  string layout = 7;
+  uint32 block_bytes = 8;
+  bytes blocks = 9;
+}
+
+message PutModelManifestRequest {
+  TenantScope scope = 1;
+  ObjectRef object = 2;
+  ModelManifest manifest = 3;
+  repeated TensorIndexRow index = 4;
+}
+
+message PutModelManifestResponse {
+  string artifact_id = 1;
+  string status = 2;
+}
+
+message ListTensorsRequest {
+  TenantScope scope = 1;
+  ObjectRef object = 2;
+  string artifact_id = 3;
+  string prefix = 4;
+  uint32 limit = 5;
+  string page_token = 6;
+}
+
+message ListTensorsResponse {
+  repeated TensorIndexRow tensors = 1;
+  string next_page_token = 2;
+}
+
+message GetTensorRequest {
+  TenantScope scope = 1;
+  ObjectRef object = 2;
+  string artifact_id = 3;
+  string tensor_name = 4;
+  repeated uint32 slice_begin = 5;
+  repeated uint32 slice_extent = 6;
+}
+
+message GetTensorChunk {
+  bytes data = 1;
+  uint64 offset = 2;
+  bool eof = 3;
+}
+
+message GetTensorsRequest {
+  TenantScope scope = 1;
+  ObjectRef object = 2;
+  string artifact_id = 3;
+  repeated string tensor_names = 4;
+}

@@ -1,0 +1,22 @@
+[package]
+name = "anvil-test-utils"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anvil = { path = "../anvil" }
+anvil-core = { path = "../anvil-core" }
+anyhow = "1"
+tokio = { version = "1.47.1", features = ["full"] }
+tokio-postgres = { version = "0.7.11", features = ["with-chrono-0_4", "with-uuid-1"] }
+deadpool-postgres = { version = "0.12.1", features = ["serde"] }
+
+aws-config = "1.1.7"
+aws-sdk-s3 = "1.18.0"
+
+futures-util = "0.3.31"
+refinery = { version = "0.8.12", features = ["tokio-postgres"] }
+refinery-macros = "0.8.12"
+uuid = { version = "1.18.1", features = ["v4"] }
+dotenvy = "0.15.7"
+libp2p = { version = "0.56.0", features = ["gossipsub", "mdns", "tcp", "tokio", "macros", "noise", "yamux", "quic"] }

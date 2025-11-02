@@ -4,11 +4,11 @@ use anvil::tasks::TaskStatus;
 use std::time::Duration;
 use tonic::Request;
 
-mod common;
+use anvil_test_utils::*;
 
 #[tokio::test]
 async fn test_delete_bucket_soft_deletes_and_enqueues_task() {
-    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
@@ -82,7 +82,7 @@ async fn test_delete_bucket_soft_deletes_and_enqueues_task() {
 
 #[tokio::test]
 async fn test_list_buckets() {
-    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();

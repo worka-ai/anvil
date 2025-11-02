@@ -4,11 +4,11 @@ use anvil::anvil_api::{CreateBucketRequest, GetAccessTokenRequest};
 use std::process::Command;
 use std::time::Duration;
 
-mod common;
+use anvil_test_utils::*;
 
 #[tokio::test]
 async fn test_auth_flow_with_wildcard_scopes() {
-    let mut cluster = common::TestCluster::new(&["auth-test"]).await;
+    let mut cluster = TestCluster::new(&["auth-test"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
@@ -33,8 +33,8 @@ async fn test_auth_flow_with_wildcard_scopes() {
         .unwrap();
     assert!(app_output.status.success());
     let creds = String::from_utf8(app_output.stdout).unwrap();
-    let client_id = common::extract_credential(&creds, "Client ID");
-    let client_secret = common::extract_credential(&creds, "Client Secret");
+    let client_id = extract_credential(&creds, "Client ID");
+    let client_secret = extract_credential(&creds, "Client Secret");
 
     let policy_args = &[
         "policies",

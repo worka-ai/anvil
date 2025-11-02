@@ -1,10 +1,11 @@
 [package]
-name = "anvil"
+name = "anvil-core"
 version = "0.1.0"
 edition = "2024"
 
 [features]
-enterprise = ["dep:anvil-enterprise"]
+#Declare an enterprise feature, doesn't activate any depdendencies so leave it with an empty array
+enterprise = []
 gcp = ["dep:prost-types", "tonic/tls-ring"]
 routeguide = ["dep:async-stream", "dep:tokio-stream", "dep:rand", "dep:serde", "dep:serde_json"]
 reflection = ["dep:tonic-reflection"]
@@ -29,8 +30,6 @@ default = ["full"]
 tonic-prost = ["dep:tonic-prost"]
 
 [dependencies]
-anvil-core = { path = "../anvil-core" }
-anvil-enterprise = { path = "../../anvil-enterprise", optional = true }
 anyhow = { version = "1" }
 blake3 = "1.8.2"
 deadpool-postgres = { version = "0.12.1", features = ["serde"] }
@@ -109,17 +108,3 @@ subtle = "2.6.1"
 
 [build-dependencies]
 tonic-prost-build = { version = "0.14.2" }
-
-[dev-dependencies]
-anvil-test-utils = { path = "../anvil-test-utils" }
-aws-config = "1.1.7"
-aws-sdk-s3 = "1.18.0"
-http-body-util = "0.1.1"
-anvil = { path = "." }
-# serial_test = "3.0.0"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-memchr = "2.7.6"
-
-uuid = { version = "1.18.1", features = ["v4"] }
-tokio-stream = "0.1"
-tempfile = "3.10.1"

@@ -3,7 +3,7 @@ use clap::Parser;
 use std::net::SocketAddr;
 use tracing::info;
 
-mod config;
+use anvil_core::config;
 use anvil::config::Config;
 
 #[tokio::main]

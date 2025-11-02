@@ -1,10 +1,11 @@
-use anvil::anvil_api::GetAccessTokenRequest;
+use anvil::run_migrations;
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
-use anvil::{AppState, run_migrations};
+use anvil::anvil_api::GetAccessTokenRequest;
+use anvil_core::AppState;
 use anyhow::Result;
 use aws_config::BehaviorVersion;
-use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::Credentials;
+use aws_sdk_s3::Client as S3Client;
 use deadpool_postgres::{ManagerConfig, Pool, RecyclingMethod};
 use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -19,12 +20,12 @@ use tokio_postgres::NoTls;
 
 pub mod migrations {
     use refinery_macros::embed_migrations;
-    embed_migrations!("./migrations_global");
+    embed_migrations!("../anvil/migrations_global");
 }
 
 pub mod regional_migrations {
     use refinery_macros::embed_migrations;
-    embed_migrations!("./migrations_regional");
+    embed_migrations!("../anvil/migrations_regional");
 }
 
 pub fn create_pool(db_url: &str) -> Result<Pool> {
@@ -53,7 +54,6 @@ pub async fn get_auth_token(global_db_url: &str, grpc_addr: &str) -> String {
         .args(admin_args.iter().chain(&[
             "--global-database-url",
             global_db_url,
-            // Provide a dummy key since the admin tool now requires it.
             "--anvil-secret-encryption-key",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "apps",
@@ -90,10 +90,8 @@ pub async fn get_auth_token(global_db_url: &str, grpc_addr: &str) -> String {
         .unwrap();
     assert!(status.success());
 
-    // Wait a moment for the server to be ready before connecting.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Ensure auth client uses gRPC path under /grpc
     let grpc_url = if grpc_addr.ends_with("/grpc") {
         grpc_addr.to_string()
     } else {
@@ -122,33 +120,31 @@ pub struct TestCluster {
     pub token: String,
     pub global_db_url: String,
     pub regional_db_urls: Vec<String>,
-    pub config: Arc<anvil::config::Config>,
+    pub config: Arc<anvil_core::config::Config>,
 }
 
 impl TestCluster {
     #[allow(dead_code)]
     pub async fn new(regions: &[&str]) -> Self {
-        // Programmatically create config for tests instead of parsing args
-        let config = Arc::new(anvil::config::Config {
-            global_database_url: "".to_string(), // Will be replaced by create_isolated_dbs
-            regional_database_url: "".to_string(), // Will be replaced by create_isolated_dbs
+        let config = Arc::new(anvil_core::config::Config {
+            global_database_url: "".to_string(),
+            regional_database_url: "".to_string(),
             cluster_secret: Some("test-cluster-secret".to_string()),
             jwt_secret: "test-secret".to_string(),
             anvil_secret_encryption_key:
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             cluster_listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".to_string(),
             public_cluster_addrs: vec![],
-            public_api_addr: "".to_string(), // Will be set dynamically
+            public_api_addr: "".to_string(),
             api_listen_addr: "127.0.0.1:0".to_string(),
-            region: "".to_string(), // Will be set per-node
+            region: "".to_string(),
             bootstrap_addrs: vec![],
             init_cluster: false,
-            enable_mdns: false, // Disable for hermetic tests
+            enable_mdns: false,
         });
-        // 1. Determine unique regions needed
+
         let unique_regions: HashSet<String> = regions.iter().map(|s| s.to_string()).collect();
 
-        // 2. Create one DB for global and one for each unique region
         let (global_db_url, regional_dbs, _maint_client) =
             create_isolated_dbs(unique_regions.len()).await;
         let regional_db_map = regional_dbs
@@ -156,7 +152,7 @@ impl TestCluster {
             .enumerate()
             .map(|(i, db_url)| (unique_regions.iter().nth(i).unwrap().to_string(), db_url))
             .collect::<HashMap<String, String>>();
-        // 3. Run migrations on all created databases
+
         run_migrations(
             &global_db_url,
             migrations::migrations::runner(),
@@ -174,13 +170,11 @@ impl TestCluster {
             .unwrap();
         }
 
-        // 4. Create one connection pool for each unique regional database
         let mut regional_pools = HashMap::new();
         for (region_name, db_url) in regional_db_map.iter() {
             regional_pools.insert(region_name.clone(), create_pool(db_url).unwrap());
         }
 
-        // 5. Create AppState for each node, sharing pools based on region
         let global_pool = create_pool(&global_db_url).unwrap();
         for region in &unique_regions {
             create_default_tenant(&global_pool, region).await;
@@ -197,7 +191,6 @@ impl TestCluster {
             states.push(state);
         }
 
-        // 6. Return the TestCluster, ready to be started
         Self {
             nodes: Vec::new(),
             states,
@@ -219,9 +212,9 @@ impl TestCluster {
         get_new_token: bool,
     ) {
         let mut swarms = Vec::new();
-        for _ in 0..self.states.len() {
+        for state in &self.states {
             swarms.push(
-                anvil::cluster::create_swarm(self.config.clone())
+                anvil_core::cluster::create_swarm(state.config.clone())
                     .await
                     .unwrap(),
             );
@@ -258,7 +251,7 @@ impl TestCluster {
             self.grpc_addrs.push(format!("http://{}", addr));
 
             let cfg = &state.config.deref();
-            let mut cfg = anvil::config::Config::from_ref(cfg);
+            let mut cfg = anvil_core::config::Config::from_ref(cfg);
             cfg.public_api_addr = format!("http://{}", addr);
             state.config = Arc::new(cfg);
 

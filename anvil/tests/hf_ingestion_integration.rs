@@ -1,10 +1,9 @@
-mod common;
-use common::TestCluster;
+use anvil_test_utils::*;
 use std::time::Duration;
 
 #[tokio::test]
 async fn hf_ingestion_single_file_integration() {
-    // Use the same harness patterns as other tests (common.rs handles dotenv + DB)
+    // Use the same harness patterns as other tests (TestCluster handles dotenv + DB)
     // Spin up a single-node cluster with isolated DBs
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;

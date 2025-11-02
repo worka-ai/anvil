@@ -8,7 +8,7 @@ use anvil::anvil_api::{
 use std::time::Duration;
 use tonic::Request;
 
-mod common;
+use anvil_test_utils::*;
 
 // Helper function to create an app, since it's used in auth tests.
 fn create_app(global_db_url: &str, app_name: &str) -> (String, String) {
@@ -30,8 +30,8 @@ fn create_app(global_db_url: &str, app_name: &str) -> (String, String) {
         .unwrap();
     assert!(app_output.status.success());
     let creds = String::from_utf8(app_output.stdout).unwrap();
-    let client_id = common::extract_credential(&creds, "Client ID");
-    let client_secret = common::extract_credential(&creds, "Client Secret");
+    let client_id = extract_credential(&creds, "Client ID");
+    let client_secret = extract_credential(&creds, "Client Secret");
     (client_id, client_secret)
 }
 
@@ -68,7 +68,7 @@ async fn try_get_token_for_scopes(
 
 #[tokio::test]
 async fn test_grant_and_revoke_access() {
-    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
@@ -168,7 +168,7 @@ async fn test_grant_and_revoke_access() {
 
 #[tokio::test]
 async fn test_set_public_access_and_get() {
-    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
@@ -264,7 +264,7 @@ async fn test_set_public_access_and_get() {
 
 #[tokio::test]
 async fn test_reset_app_secret() {
-    let mut cluster = common::TestCluster::new(&["eu-west-1"]).await;
+    let mut cluster = TestCluster::new(&["eu-west-1"]).await;
     cluster
         .start_and_converge_no_new_token(Duration::from_secs(5), false)
         .await;
@@ -319,7 +319,7 @@ async fn test_reset_app_secret() {
 
     assert!(reset_output.status.success());
     let reset_creds = String::from_utf8(reset_output.stdout).unwrap();
-    let new_secret = common::extract_credential(&reset_creds, "Client Secret");
+    let new_secret = extract_credential(&reset_creds, "Client Secret");
 
     // 3. Verify the secret has changed
     assert_ne!(original_secret, new_secret);
@@ -349,7 +349,7 @@ async fn test_reset_app_secret() {
 
 #[tokio::test]
 async fn test_admin_cli_set_public_access() {
-    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let mut bucket_client = BucketServiceClient::connect(cluster.grpc_addrs[0].clone())

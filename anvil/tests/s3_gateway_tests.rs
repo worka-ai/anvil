@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::fs;
 
-mod common;
+use anvil_test_utils::*;
 
 // Helper function to create an app, since it's used in auth tests.
 fn create_app(global_db_url: &str, app_name: &str) -> (String, String) {
@@ -30,8 +30,8 @@ fn create_app(global_db_url: &str, app_name: &str) -> (String, String) {
         .unwrap();
     assert!(app_output.status.success());
     let creds = String::from_utf8(app_output.stdout).unwrap();
-    let client_id = common::extract_credential(&creds, "Client ID");
-    let client_secret = common::extract_credential(&creds, "Client Secret");
+    let client_id = extract_credential(&creds, "Client ID");
+    let client_secret = extract_credential(&creds, "Client Secret");
     (client_id, client_secret)
 }
 
@@ -59,7 +59,7 @@ async fn get_token_for_scopes(
 
 #[tokio::test]
 async fn test_s3_public_and_private_access() {
-    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let (client_id, client_secret) = create_app(&cluster.global_db_url, "s3-test-app");
@@ -226,7 +226,7 @@ async fn test_s3_public_and_private_access() {
 
 #[tokio::test]
 async fn test_streaming_upload_decoding() {
-    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let (client_id, client_secret) = create_app(&cluster.global_db_url, "streaming-decode-app");

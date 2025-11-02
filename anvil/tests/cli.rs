@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
-mod common;
+use anvil_test_utils::*;
 
 static CLI_PATH: OnceLock<String> = OnceLock::new();
 
@@ -61,7 +61,7 @@ async fn run_cli(args: &[&str], config_dir: &std::path::Path) -> std::process::O
     .unwrap()
 }
 
-async fn setup_test_profile(cluster: &common::TestCluster, config_dir: &std::path::Path) {
+async fn setup_test_profile(cluster: &TestCluster, config_dir: &std::path::Path) {
     let admin_args = &["run", "--bin", "admin", "--"];
     let global_db_url = cluster.global_db_url.clone();
     let app_name = "cli-test-app";
@@ -92,8 +92,8 @@ async fn setup_test_profile(cluster: &common::TestCluster, config_dir: &std::pat
 
     assert!(app_output.status.success());
     let creds = String::from_utf8(app_output.stdout).unwrap();
-    let client_id = common::extract_credential(&creds, "Client ID");
-    let client_secret = common::extract_credential(&creds, "Client Secret");
+    let client_id = extract_credential(&creds, "Client ID");
+    let client_secret = extract_credential(&creds, "Client Secret");
 
     // Grant policies to the app
     let grant_args: Vec<String> = admin_args
@@ -145,7 +145,7 @@ async fn setup_test_profile(cluster: &common::TestCluster, config_dir: &std::pat
 
 #[tokio::test]
 async fn test_cli_configure_and_bucket_ls() {
-    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
     let config_dir = tempdir().unwrap();
     setup_test_profile(&cluster, config_dir.path()).await;
@@ -162,7 +162,7 @@ async fn test_cli_configure_and_bucket_ls() {
 
 #[tokio::test]
 async fn test_cli_bucket_create_and_rm() {
-    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
     let config_dir = tempdir().unwrap();
     setup_test_profile(&cluster, config_dir.path()).await;
@@ -186,7 +186,7 @@ async fn test_cli_bucket_create_and_rm() {
 
 #[tokio::test]
 async fn test_cli_object_put_and_get() {
-    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
     let config_dir = tempdir().unwrap();
     setup_test_profile(&cluster, config_dir.path()).await;
@@ -214,7 +214,7 @@ async fn test_cli_object_put_and_get() {
 
 #[tokio::test]
 async fn test_cli_hf_ingestion() {
-    let mut cluster = common::TestCluster::new(&["test-region-1"]).await;
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
     let config_dir = tempdir().unwrap();
     setup_test_profile(&cluster, config_dir.path()).await;
