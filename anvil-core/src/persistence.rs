@@ -192,12 +192,17 @@ impl Persistence {
         Ok(())
     }
 
-    pub async fn list_tensors(&self, artifact_id: &str) -> Result<Vec<crate::anvil_api::TensorIndexRow>> {
+        pub async fn list_tensors(
+        &self,
+        artifact_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<crate::anvil_api::TensorIndexRow>> {
         let client = self.regional_pool.get().await?;
         let rows = client
             .query(
-                "SELECT tensor_name, file_path, file_offset, byte_length, dtype, shape, layout, block_bytes, blocks FROM model_tensors WHERE artifact_id = $1 ORDER BY tensor_name",
-                &[&artifact_id],
+                "SELECT tensor_name, file_path, file_offset, byte_length, dtype, shape, layout, block_bytes, blocks FROM model_tensors WHERE artifact_id = $1 ORDER BY tensor_name LIMIT $2 OFFSET $3",
+                &[&artifact_id, &limit, &offset],
             )
             .await?;
 

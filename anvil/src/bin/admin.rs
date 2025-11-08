@@ -136,6 +136,8 @@ async fn main() -> anyhow::Result<()> {
                 tenant_name,
                 app_name,
             } => {
+                println!("Creating app for tenant: {}", tenant_name);
+                println!("Admin received tenant_name: {}", tenant_name);
                 let tenant = persistence
                     .get_tenant_by_name(tenant_name)
                     .await?

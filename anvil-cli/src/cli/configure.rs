@@ -7,8 +7,12 @@ pub fn handle_configure_command(
     client_id: Option<String>,
     client_secret: Option<String>,
     default: bool,
+    config_path: Option<String>,
 ) -> anyhow::Result<()> {
-    let mut config: Config = confy::load("anvil-cli", None)?;
+    let mut config: Config = match &config_path {
+        Some(path) => confy::load_path(path).unwrap_or_default(),
+        None => confy::load("anvil-cli", None)?,
+    };
 
     let profile_name = match name {
         Some(n) => n,
@@ -55,7 +59,10 @@ pub fn handle_configure_command(
         config.default_profile = Some(profile_name.clone());
     }
 
-    confy::store("anvil-cli", None, config)?;
+    match &config_path {
+        Some(path) => confy::store_path(path, &config)?,
+        None => confy::store("anvil-cli", None, &config)?,
+    };
 
     println!("Profile '{}' saved.", profile_name);
 
@@ -68,8 +75,12 @@ pub fn handle_static_config_command(
     client_id: String,
     client_secret: String,
     default: bool,
+    config_path: Option<String>,
 ) -> anyhow::Result<()> {
-    let mut config: Config = confy::load("anvil-cli", None)?;
+    let mut config: Config = match &config_path {
+        Some(path) => confy::load_path(path).unwrap_or_default(),
+        None => confy::load("anvil-cli", None)?,
+    };
 
     let profile = Profile {
         name: name.clone(),
@@ -84,7 +95,14 @@ pub fn handle_static_config_command(
         config.default_profile = Some(name.clone());
     }
 
-    confy::store("anvil-cli", None, config)?;
+    match &config_path {
+        Some(path) => {
+            confy::store_path(path, &config)?
+        }
+        None => {
+            confy::store("anvil-cli", None, &config)?
+        }
+    };
 
     println!("Profile '{}' saved.", name);
 

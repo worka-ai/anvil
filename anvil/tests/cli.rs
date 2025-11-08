@@ -28,29 +28,31 @@ fn get_cli_path() -> &'static str {
 
 async fn run_cli(args: &[&str], config_dir: &std::path::Path) -> std::process::Output {
     let cli_path = get_cli_path().to_string();
-    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    let config_dir = config_dir.to_path_buf();
+    let config_path = config_dir.join("config.toml");
+    let mut all_args = vec!["--config".to_string(), config_path.to_str().unwrap().to_string()];
+    all_args.extend(args.iter().map(|s| s.to_string()));
+
+    let config_dir_path = config_dir.to_path_buf();
 
     tokio::task::spawn_blocking(move || {
         println!(
-            "Running CLI command: {} {} (HOME={})",
+            "Running CLI command: {} {}",
             cli_path,
-            args.join(" "),
-            config_dir.to_str().unwrap()
+            all_args.join(" "),
         );
         let output = Command::new(&cli_path)
-            .args(&args)
-            .env("HOME", &config_dir)
+            .args(&all_args)
+            .env("HOME", &config_dir_path)
             .output()
             .expect("Failed to run anvil-cli");
 
-        println!("CLI command finished: {:?}", args);
+        println!("CLI command finished: {:?}", all_args);
         println!("  Status: {}", output.status);
         println!("  Stdout: {}", String::from_utf8_lossy(&output.stdout));
         println!("  Stderr: {}", String::from_utf8_lossy(&output.stderr));
 
         if !output.status.success() {
-            eprintln!("CLI command failed: {:?}", args);
+            eprintln!("CLI command failed: {:?}", all_args);
             eprintln!("stdout: {}", String::from_utf8_lossy(&output.stdout));
             eprintln!("stderr: {}", String::from_utf8_lossy(&output.stderr));
         }

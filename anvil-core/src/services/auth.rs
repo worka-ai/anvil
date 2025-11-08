@@ -60,7 +60,7 @@ impl AuthService for AppState {
                 app_details.tenant_id,
             )
             .map_err(|e| Status::internal(e.to_string()))?;
-
+        tracing::info!("[AuthService] Returning access token for app_id={}", app_details.id);
         Ok(Response::new(GetAccessTokenResponse {
             access_token: token,
             expires_in: 3600,

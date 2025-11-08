@@ -171,7 +171,7 @@ impl TestCluster {
         let unique_regions: HashSet<String> = regions.iter().map(|s| s.to_string()).collect();
 
         let (global_db_url, regional_dbs, _maint_client) =
-            create_isolated_dbs(unique_regions.len()).await;
+            create_isolated_dbs(unique_regions.len()).await.unwrap();
         let regional_db_map = regional_dbs
             .into_iter()
             .enumerate()
@@ -347,7 +347,7 @@ impl Drop for TestCluster {
     }
 }
 
-async fn create_isolated_dbs(num_regional: usize) -> (String, Vec<String>, tokio_postgres::Client) {
+async fn create_isolated_dbs(num_regional: usize) -> Result<(String, Vec<String>, tokio_postgres::Client)> {
     dotenvy::dotenv().ok();
     let maint_db_url =
         std::env::var("MAINTENANCE_DATABASE_URL").expect("MAINTENANCE_DATABASE_URL must be set");
@@ -393,7 +393,7 @@ async fn create_isolated_dbs(num_regional: usize) -> (String, Vec<String>, tokio
 
     let global_db_url = format!("{}/{}", base_db_url, global_db_name);
 
-    (global_db_url, regional_db_urls, maint_client)
+    Ok((global_db_url, regional_db_urls, maint_client))
 }
 
 pub async fn create_default_tenant(global_pool: &Pool, region: &str) {

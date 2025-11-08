@@ -82,7 +82,7 @@ message PutObjectResponse {
 message GetObjectRequest {
     string bucket_name = 1;
     string object_key = 2;
-  optional   string version_id = 3;
+    optional string version_id = 3;
 }
 
 message GetObjectResponse {
@@ -101,7 +101,7 @@ message ObjectInfo {
 message DeleteObjectRequest {
     string bucket_name = 1;
     string object_key = 2;
-   optional string version_id = 3;
+    optional string version_id = 3;
 }
 
 message DeleteObjectResponse {}
@@ -109,7 +109,7 @@ message DeleteObjectResponse {}
 message HeadObjectRequest {
     string bucket_name = 1;
     string object_key = 2;
-  optional  string version_id = 3; 
+    optional string version_id = 3;
 }
 
 message HeadObjectResponse {
