@@ -114,10 +114,11 @@ pub struct AppDetails {
     pub tenant_id: i64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct AdminUser {
     pub id: i64,
     pub username: String,
+    pub email: String,
     pub password_hash: String,
 }
 
@@ -142,11 +143,12 @@ impl Persistence {
     pub async fn get_admin_user_by_username(&self, username: &str) -> Result<Option<AdminUser>> {
         let client = self.global_pool.get().await?;
         let row = client
-            .query_opt("SELECT id, username, password_hash FROM admin_users WHERE username = $1 AND is_active = true", &[&username])
+            .query_opt("SELECT id, username, email, password_hash FROM admin_users WHERE username = $1 AND is_active = true", &[&username])
             .await?;
         Ok(row.map(|r| AdminUser {
             id: r.get("id"),
             username: r.get("username"),
+            email: r.get("email"),
             password_hash: r.get("password_hash"),
         }))
     }
@@ -185,6 +187,35 @@ impl Persistence {
 
         tx.commit().await?;
         Ok(())
+    }
+
+    pub async fn list_admin_users(&self) -> Result<Vec<AdminUser>> {
+        let client = self.global_pool.get().await?;
+        let rows = client.query("SELECT id, username, email, password_hash FROM admin_users", &[]).await?;
+        Ok(rows.into_iter().map(|r| AdminUser {
+            id: r.get("id"),
+            username: r.get("username"),
+            email: r.get("email"),
+            password_hash: r.get("password_hash"),
+        }).collect())
+    }
+
+    pub async fn create_admin_role(&self, name: &str) -> Result<()> {
+        let client = self.global_pool.get().await?;
+        client.execute("INSERT INTO admin_roles (name) VALUES ($1)", &[&name]).await?;
+        Ok(())
+    }
+
+    pub async fn list_admin_roles(&self) -> Result<Vec<String>> {
+        let client = self.global_pool.get().await?;
+        let rows = client.query("SELECT name FROM admin_roles", &[]).await?;
+        Ok(rows.into_iter().map(|r| r.get("name")).collect())
+    }
+
+    pub async fn list_policies(&self) -> Result<Vec<String>> {
+        let client = self.global_pool.get().await?;
+        let rows = client.query("SELECT resource, action FROM policies", &[]).await?;
+        Ok(rows.into_iter().map(|r| format!("{}:{}", r.get::<_, String>("action"), r.get::<_, String>("resource"))).collect())
     }
 
     // --- Model Registry Methods ---
