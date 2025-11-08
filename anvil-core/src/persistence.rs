@@ -11,13 +11,13 @@ pub struct Persistence {
 }
 
 // Structs that map to our database tables
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct Tenant {
     pub id: i64,
     pub name: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct App {
     pub id: i64,
     pub name: String,
@@ -114,6 +114,13 @@ pub struct AppDetails {
     pub tenant_id: i64,
 }
 
+#[derive(Debug)]
+pub struct AdminUser {
+    pub id: i64,
+    pub username: String,
+    pub password_hash: String,
+}
+
 impl From<Row> for AppDetails {
     fn from(row: Row) -> Self {
         Self {
@@ -132,8 +139,52 @@ impl Persistence {
         }
     }
 
+    pub async fn get_admin_user_by_username(&self, username: &str) -> Result<Option<AdminUser>> {
+        let client = self.global_pool.get().await?;
+        let row = client
+            .query_opt("SELECT id, username, password_hash FROM admin_users WHERE username = $1 AND is_active = true", &[&username])
+            .await?;
+        Ok(row.map(|r| AdminUser {
+            id: r.get("id"),
+            username: r.get("username"),
+            password_hash: r.get("password_hash"),
+        }))
+    }
+
+    pub async fn get_roles_for_admin_user(&self, user_id: i64) -> Result<Vec<String>> {
+        let client = self.global_pool.get().await?;
+        let rows = client.query(
+            "SELECT r.name FROM admin_roles r JOIN admin_user_roles ur ON r.id = ur.role_id WHERE ur.user_id = $1",
+            &[&user_id],
+        ).await?;
+        Ok(rows.into_iter().map(|r| r.get("name")).collect())
+    }
+
     pub fn get_global_pool(&self) -> &Pool {
         &self.global_pool
+    }
+
+    pub async fn create_admin_user(&self, username: &str, email: &str, password_hash: &str, role: &str) -> Result<()> {
+        let mut client = self.global_pool.get().await?;
+        let tx = client.transaction().await?;
+
+        let user_id: i64 = tx.query_one(
+            "INSERT INTO admin_users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id",
+            &[&username, &email, &password_hash],
+        ).await?.get(0);
+
+        let role_id: i32 = tx.query_one(
+            "SELECT id FROM admin_roles WHERE name = $1",
+            &[&role],
+        ).await?.get(0);
+
+        tx.execute(
+            "INSERT INTO admin_user_roles (user_id, role_id) VALUES ($1, $2)",
+            &[&user_id, &role_id],
+        ).await?;
+
+        tx.commit().await?;
+        Ok(())
     }
 
     // --- Model Registry Methods ---
@@ -311,12 +362,24 @@ impl Persistence {
         Ok(n == 1)
     }
 
+    pub async fn list_regions(&self) -> Result<Vec<String>> {
+        let client = self.global_pool.get().await?;
+        let rows = client.query("SELECT name FROM regions ORDER BY name", &[]).await?;
+        Ok(rows.into_iter().map(|r| r.get("name")).collect())
+    }
+
     pub async fn get_tenant_by_name(&self, name: &str) -> Result<Option<Tenant>> {
         let client = self.global_pool.get().await?;
         let row = client
             .query_opt("SELECT id, name FROM tenants WHERE name = $1", &[&name])
             .await?;
         Ok(row.map(Into::into))
+    }
+
+    pub async fn list_tenants(&self) -> Result<Vec<Tenant>> {
+        let client = self.global_pool.get().await?;
+        let rows = client.query("SELECT id, name FROM tenants ORDER BY name", &[]).await?;
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     pub async fn get_app_by_client_id(&self, client_id: &str) -> Result<Option<AppDetails>> {
@@ -398,6 +461,12 @@ impl Persistence {
             )
             .await?;
         Ok(row.map(Into::into))
+    }
+
+    pub async fn list_apps_for_tenant(&self, tenant_id: i64) -> Result<Vec<App>> {
+        let client = self.global_pool.get().await?;
+        let rows = client.query("SELECT id, name, client_id FROM apps WHERE tenant_id = $1 ORDER BY name", &[&tenant_id]).await?;
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     pub async fn update_app_secret(&self, app_id: i64, new_encrypted_secret: &[u8]) -> Result<()> {

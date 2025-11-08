@@ -109,6 +109,7 @@ http-body-util = "0.1.1"
 subtle = "2.6.1"
 once_cell = "1.19"
 openssl = { version = "0.10", features = ["vendored"] }
+bcrypt = "0.15"
 
 [build-dependencies]
 tonic-prost-build = { version = "0.14.2" }
