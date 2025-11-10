@@ -120,6 +120,13 @@ pub struct AdminUser {
     pub username: String,
     pub email: String,
     pub password_hash: String,
+    pub is_active: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct AdminRole {
+    pub id: i32,
+    pub name: String,
 }
 
 impl From<Row> for AppDetails {
@@ -143,13 +150,28 @@ impl Persistence {
     pub async fn get_admin_user_by_username(&self, username: &str) -> Result<Option<AdminUser>> {
         let client = self.global_pool.get().await?;
         let row = client
-            .query_opt("SELECT id, username, email, password_hash FROM admin_users WHERE username = $1 AND is_active = true", &[&username])
+            .query_opt("SELECT id, username, email, password_hash, is_active FROM admin_users WHERE username = $1", &[&username])
             .await?;
         Ok(row.map(|r| AdminUser {
             id: r.get("id"),
             username: r.get("username"),
             email: r.get("email"),
             password_hash: r.get("password_hash"),
+            is_active: r.get("is_active"),
+        }))
+    }
+
+    pub async fn get_admin_user_by_id(&self, id: i64) -> Result<Option<AdminUser>> {
+        let client = self.global_pool.get().await?;
+        let row = client
+            .query_opt("SELECT id, username, email, password_hash, is_active FROM admin_users WHERE id = $1", &[&id])
+            .await?;
+        Ok(row.map(|r| AdminUser {
+            id: r.get("id"),
+            username: r.get("username"),
+            email: r.get("email"),
+            password_hash: r.get("password_hash"),
+            is_active: r.get("is_active"),
         }))
     }
 
@@ -189,14 +211,69 @@ impl Persistence {
         Ok(())
     }
 
+    pub async fn update_admin_user(
+        &self,
+        user_id: i64,
+        email: Option<String>,
+        password_hash: Option<String>,
+        role: Option<String>,
+        is_active: Option<bool>,
+    ) -> Result<()> {
+        let client = self.global_pool.get().await?;
+        let mut query_parts = Vec::new();
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        let mut param_idx = 1;
+
+        if let Some(e) = email {
+            query_parts.push(format!("email = ${}", param_idx));
+            params.push(Box::new(e));
+            param_idx += 1;
+        }
+        if let Some(p) = password_hash {
+            query_parts.push(format!("password_hash = ${}", param_idx));
+            params.push(Box::new(p));
+            param_idx += 1;
+        }
+        if let Some(a) = is_active {
+            query_parts.push(format!("is_active = ${}", param_idx));
+            params.push(Box::new(a));
+            param_idx += 1;
+        }
+
+        if query_parts.is_empty() {
+            // Nothing to update
+            return Ok(());
+        }
+
+        let query = format!("UPDATE admin_users SET {} WHERE id = ${}", query_parts.join(", "), param_idx);
+        params.push(Box::new(user_id));
+
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        client.execute(&query, &param_refs).await?;
+
+        if let Some(r) = role {
+            let role_id: i32 = client.query_one("SELECT id FROM admin_roles WHERE name = $1", &[&r]).await?.get(0);
+            client.execute("UPDATE admin_user_roles SET role_id = $1 WHERE user_id = $2", &[&role_id, &user_id]).await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn delete_admin_user(&self, user_id: i64) -> Result<()> {
+        let client = self.global_pool.get().await?;
+        client.execute("DELETE FROM admin_users WHERE id = $1", &[&user_id]).await?;
+        Ok(())
+    }
+
     pub async fn list_admin_users(&self) -> Result<Vec<AdminUser>> {
         let client = self.global_pool.get().await?;
-        let rows = client.query("SELECT id, username, email, password_hash FROM admin_users", &[]).await?;
+        let rows = client.query("SELECT id, username, email, password_hash, is_active FROM admin_users", &[]).await?;
         Ok(rows.into_iter().map(|r| AdminUser {
             id: r.get("id"),
             username: r.get("username"),
             email: r.get("email"),
             password_hash: r.get("password_hash"),
+            is_active: r.get("is_active"),
         }).collect())
     }
 
@@ -210,6 +287,29 @@ impl Persistence {
         let client = self.global_pool.get().await?;
         let rows = client.query("SELECT name FROM admin_roles", &[]).await?;
         Ok(rows.into_iter().map(|r| r.get("name")).collect())
+    }
+
+    pub async fn get_admin_role_by_id(&self, id: i32) -> Result<Option<AdminRole>> {
+        let client = self.global_pool.get().await?;
+        let row = client
+            .query_opt("SELECT id, name FROM admin_roles WHERE id = $1", &[&id])
+            .await?;
+        Ok(row.map(|r| AdminRole {
+            id: r.get("id"),
+            name: r.get("name"),
+        }))
+    }
+
+    pub async fn update_admin_role(&self, id: i32, name: &str) -> Result<()> {
+        let client = self.global_pool.get().await?;
+        client.execute("UPDATE admin_roles SET name = $1 WHERE id = $2", &[&name, &id]).await?;
+        Ok(())
+    }
+
+    pub async fn delete_admin_role(&self, id: i32) -> Result<()> {
+        let client = self.global_pool.get().await?;
+        client.execute("DELETE FROM admin_roles WHERE id = $1", &[&id]).await?;
+        Ok(())
     }
 
     pub async fn list_policies(&self) -> Result<Vec<String>> {
@@ -614,7 +714,7 @@ impl Persistence {
         let client = self.global_pool.get().await?;
         let row = client
             .query_opt(
-                "UPDATE buckets SET deleted_at = now() WHERE name = $1 AND deleted_at IS NULL RETURNING *",
+                r#"UPDATE buckets SET deleted_at = now() WHERE name = $1 AND deleted_at IS NULL RETURNING *"#,
                 &[&bucket_name],
             )
             .await?;
@@ -647,11 +747,7 @@ impl Persistence {
         let client = self.regional_pool.get().await?;
         let row = client
             .query_one(
-                r#"
-            INSERT INTO objects (tenant_id, bucket_id, key, content_hash, size, etag, version_id, shard_map)
-            VALUES ($1, $2, $3, $4, $5, $6, gen_random_uuid(), $7)
-            RETURNING *;
-            "#,
+                r#"INSERT INTO objects (tenant_id, bucket_id, key, content_hash, size, etag, version_id, shard_map) VALUES ($1, $2, $3, $4, $5, $6, gen_random_uuid(), $7) RETURNING *;"#,
                 &[&tenant_id, &bucket_id, &key, &content_hash, &size, &etag, &shard_map],
             )
             .await?;
@@ -662,12 +758,7 @@ impl Persistence {
         let client = self.regional_pool.get().await?;
         let row = client
             .query_opt(
-                r#"
-            SELECT *
-            FROM objects
-            WHERE bucket_id = $1 AND key = $2 AND deleted_at IS NULL
-            ORDER BY created_at DESC LIMIT 1
-            "#,
+                r#"SELECT * FROM objects WHERE bucket_id = $1 AND key = $2 AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1"#,
                 &[&bucket_id, &key],
             )
             .await?;
@@ -704,12 +795,12 @@ impl Persistence {
 
         // Helper: map an arbitrary key segment to a valid ltree label.
         // Must mirror whatever you used when populating `objects.key_ltree`.
-        // Here we use a conservative mapping: A-Za-z0-9_ only; others -> '_'.
+        // Here we use a conservative mapping: A-Za-z0-9_ only; others -> "_".
         fn ltree_labelize(seg: &str) -> String {
             // If your ingestion uses a different normalization, replace this to match it.
             let mut out = String::with_capacity(seg.len());
             for (i, ch) in seg.chars().enumerate() {
-                let valid = ch.is_ascii_alphanumeric() || ch == '_';
+                let valid = ch.is_ascii_alphanumeric() || ch == '_' ;
                 if i == 0 {
                     // label must start with alpha (ltree requirement). If not, prefix with 'x'
                     if ch.is_ascii_alphabetic() {
@@ -752,21 +843,11 @@ impl Persistence {
             let client = self.regional_pool.get().await?;
             let rows = client
                 .query(
-                    r#"
-                SELECT
-                id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
-                FROM objects
-                WHERE bucket_id = $1
-                  AND deleted_at IS NULL
-                  AND key > $2
-                  AND key LIKE $3
-                ORDER BY key
-                LIMIT $4
-                "#,
+                    r#"SELECT id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree FROM objects WHERE bucket_id = $1 AND deleted_at IS NULL AND key > $2 AND key LIKE $3 ORDER BY key LIMIT $4"#,
                     &[
                         &bucket_id,
                         &start_after,
-                        &format!("{}%", prefix),
+                        &format!(r#"{}%"#, prefix),
                         &(limit as i64),
                     ],
                 )
@@ -782,73 +863,7 @@ impl Persistence {
         // When empty, treat as the root (nlevel = 0) and skip the <@ check.
         let rows = client
             .query(
-                r#"
-            WITH
-            params AS (
-              SELECT
-                $1::bigint AS bucket_id,
-                $2::text   AS start_after,
-                $3::int8   AS lim,
-                NULLIF($4::text, '')::ltree AS prefix_ltree
-            ),
-            lvl AS (
-              SELECT COALESCE(nlevel(prefix_ltree), 0) AS p FROM params
-            ),
-            relevant AS (
-              SELECT o.key, o.key_ltree
-              FROM objects o, params p
-              WHERE o.bucket_id = p.bucket_id
-                AND o.deleted_at IS NULL
-                AND o.key > p.start_after
-                AND (p.prefix_ltree IS NULL OR o.key_ltree <@ p.prefix_ltree)
-            ),
-            children AS (
-              SELECT
-                key,
-                key_ltree,
-                subpath(
-                  key_ltree,
-                  0,
-                  (SELECT p FROM lvl) + 1
-                ) AS child_path,
-                nlevel(key_ltree) AS lvl
-              FROM relevant
-            ),
-            grouped AS (
-              SELECT
-                child_path,
-                MIN(key) AS min_key,
-                BOOL_OR(nlevel(key_ltree) > nlevel(child_path)) AS has_descendants_below,
-                COUNT(*) FILTER (WHERE key_ltree = child_path) AS exact_object_count
-              FROM children
-              GROUP BY child_path
-            ),
-            -- Build a unified, lexicographically sorted stream of rows, then LIMIT.
-            stream AS (
-              -- Common prefixes: return only those whose first visible key is > start_after
-              SELECT
-                ltree2text(g.child_path) AS sort_key,
-                NULL::text               AS object_key,
-                TRUE                     AS is_prefix
-              FROM grouped g, params p
-              WHERE g.has_descendants_below
-                AND g.min_key > p.start_after
-
-              UNION ALL
-
-              -- Objects that are exactly first-level children (no deeper slash beyond prefix)
-              SELECT
-                ltree2text(c.child_path) AS sort_key,
-                c.key                    AS object_key,
-                FALSE                    AS is_prefix
-              FROM children c
-              WHERE c.key_ltree = c.child_path
-            )
-            SELECT sort_key, object_key, is_prefix
-            FROM stream
-            ORDER BY sort_key, is_prefix DESC  -- object (false) before prefix (true) for same sort_key
-            LIMIT (SELECT lim FROM params)
-            "#,
+                r#"WITH params AS ( SELECT $1::bigint AS bucket_id, $2::text AS start_after, $3::int8 AS lim, NULLIF($4::text, "")::ltree AS prefix_ltree ), lvl AS ( SELECT COALESCE(nlevel(prefix_ltree), 0) AS p FROM params ), relevant AS ( SELECT o.key, o.key_ltree FROM objects o, params p WHERE o.bucket_id = p.bucket_id AND o.deleted_at IS NULL AND o.key > p.start_after AND (p.prefix_ltree IS NULL OR o.key_ltree <@ p.prefix_ltree) ), children AS ( SELECT key, key_ltree, subpath( key_ltree, 0, (SELECT p FROM lvl) + 1 ) AS child_path, nlevel(key_ltree) AS lvl FROM relevant ), grouped AS ( SELECT child_path, MIN(key) AS min_key, BOOL_OR(nlevel(key_ltree) > nlevel(child_path)) AS has_descendants_below, COUNT(*) FILTER (WHERE key_ltree = child_path) AS exact_object_count FROM children GROUP BY child_path ), stream AS ( SELECT ltree2text(g.child_path) AS sort_key, NULL::text AS object_key, TRUE AS is_prefix FROM grouped g, params p WHERE g.has_descendants_below AND g.min_key > p.start_after UNION ALL SELECT ltree2text(c.child_path) AS sort_key, c.key AS object_key, FALSE AS is_prefix FROM children c WHERE c.key_ltree = c.child_path ) SELECT sort_key, object_key, is_prefix FROM stream ORDER BY sort_key, is_prefix DESC LIMIT (SELECT lim FROM params)"#,
                 &[&bucket_id, &start_after, &(limit as i64), &prefix_dot],
             )
             .await?;
@@ -892,15 +907,7 @@ impl Persistence {
         let objects = if !object_keys.is_empty() {
             let rows = client
                 .query(
-                    r#"
-                SELECT
-                    id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
-                FROM objects
-                WHERE bucket_id = $1
-                  AND deleted_at IS NULL
-                  AND key = ANY($2)
-                ORDER BY key
-                "#,
+                    r#"SELECT id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree FROM objects WHERE bucket_id = $1 AND deleted_at IS NULL AND key = ANY($2) ORDER BY key"#,
                     &[&bucket_id, &object_keys],
                 )
                 .await?;
@@ -916,12 +923,7 @@ impl Persistence {
         let client = self.regional_pool.get().await?;
         let row = client
             .query_opt(
-                r#"
-            UPDATE objects
-            SET deleted_at = now()
-            WHERE bucket_id = $1 AND key = $2 AND deleted_at IS NULL
-            RETURNING *
-            "#,
+                r#"UPDATE objects SET deleted_at = now() WHERE bucket_id = $1 AND key = $2 AND deleted_at IS NULL RETURNING *"#,
                 &[&bucket_id, &key],
             )
             .await?;
@@ -958,13 +960,7 @@ impl Persistence {
         let client = self.global_pool.get().await?;
         let rows = client
             .query(
-                r#"
-            SELECT id, task_type::text, payload, attempts FROM tasks
-            WHERE status = 'pending'::task_status AND scheduled_at <= now()
-            ORDER BY priority ASC, created_at ASC
-            LIMIT $1
-            FOR UPDATE SKIP LOCKED
-            "#,
+                r#"SELECT id, task_type::text, payload, attempts FROM tasks WHERE status = 'pending'::task_status AND scheduled_at <= now() ORDER BY priority ASC, created_at ASC LIMIT $1 FOR UPDATE SKIP LOCKED"#,
                 &[&limit],
             )
             .await?;
@@ -986,17 +982,7 @@ impl Persistence {
         let client = self.global_pool.get().await?;
         client
             .execute(
-                r#"
-            UPDATE tasks
-            SET
-                status = $1,
-                last_error = $2,
-                attempts = attempts + 1,
-                -- Exponential backoff: 10s, 40s, 90s, etc.
-                scheduled_at = now() + (attempts * attempts * 10 * interval '1 second'),
-                updated_at = now()
-            WHERE id = $3
-            "#,
+                r#"UPDATE tasks SET status = $1, last_error = $2, attempts = attempts + 1, scheduled_at = now() + (attempts * attempts * 10 * interval '1 second'), updated_at = now() WHERE id = $3"#,
                 &[&crate::tasks::TaskStatus::Failed, &error, &task_id],
             )
             .await?;
@@ -1056,7 +1042,7 @@ impl Persistence {
             .collect())
     }
 
-    // ---- HF Ingestion ----
+    // ---- Hugging Face Ingestion ----
     pub async fn hf_create_ingestion(
         &self,
         key_id: i64,
@@ -1073,7 +1059,7 @@ impl Persistence {
         let client = self.global_pool.get().await?;
         let row = client
             .query_one(
-                "INSERT INTO hf_ingestions (key_id, tenant_id, requester_app_id, repo, revision, target_bucket, target_region, target_prefix, include_globs, exclude_globs) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id",
+                r#"INSERT INTO hf_ingestions (key_id, tenant_id, requester_app_id, repo, revision, target_bucket, target_region, target_prefix, include_globs, exclude_globs) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id"#,
                 &[
                     &key_id,
                     &tenant_id,
@@ -1100,7 +1086,7 @@ impl Persistence {
         let client = self.global_pool.get().await?;
         client
             .execute(
-                "UPDATE hf_ingestions SET state=$2, error=$3, started_at=CASE WHEN $2='running'::hf_ingestion_state AND started_at IS NULL THEN now() ELSE started_at END, finished_at=CASE WHEN $2 IN ('completed'::hf_ingestion_state,'failed'::hf_ingestion_state,'canceled'::hf_ingestion_state) THEN now() ELSE finished_at END WHERE id=$1",
+                r#"UPDATE hf_ingestions SET state=$2, error=$3, started_at=CASE WHEN $2='running'::hf_ingestion_state AND started_at IS NULL THEN now() ELSE started_at END, finished_at=CASE WHEN $2 IN ('completed'::hf_ingestion_state,'failed'::hf_ingestion_state,'canceled'::hf_ingestion_state) THEN now() ELSE finished_at END WHERE id=$1"#,
                 &[&id, &state, &error],
             )
             .await?;
@@ -1128,12 +1114,7 @@ impl Persistence {
         let client = self.global_pool.get().await?;
         let row = client
             .query_one(
-                r#"
-            INSERT INTO hf_ingestion_items (ingestion_id, path, size, etag)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (ingestion_id, path) DO UPDATE SET size = EXCLUDED.size
-            RETURNING id
-            "#,
+                r#"INSERT INTO hf_ingestion_items (ingestion_id, path, size, etag) VALUES ($1, $2, $3, $4) ON CONFLICT (ingestion_id, path) DO UPDATE SET size = EXCLUDED.size RETURNING id"#,
                 &[&ingestion_id, &path, &size, &etag],
             )
             .await?;
@@ -1149,7 +1130,7 @@ impl Persistence {
         let client = self.global_pool.get().await?;
         client
             .execute(
-                "UPDATE hf_ingestion_items SET state=$2, error=$3, started_at=CASE WHEN $2='downloading'::hf_item_state AND started_at IS NULL THEN now() ELSE started_at END, finished_at=CASE WHEN $2 IN ('stored'::hf_item_state,'failed'::hf_item_state,'skipped'::hf_item_state) THEN now() ELSE finished_at END WHERE id=$1",
+                r#"UPDATE hf_ingestions SET state=$2, error=$3, started_at=CASE WHEN $2='downloading'::hf_item_state AND started_at IS NULL THEN now() ELSE started_at END, finished_at=CASE WHEN $2 IN ('stored'::hf_item_state,'failed'::hf_item_state,'skipped'::hf_item_state) THEN now() ELSE finished_at END WHERE id=$1"#,
                 &[&id, &state, &error],
             )
             .await?;
@@ -1173,7 +1154,7 @@ impl Persistence {
         let client = self.global_pool.get().await?;
         let job = client
             .query_one(
-                "SELECT state::text, error, created_at, started_at, finished_at FROM hf_ingestions WHERE id=$1",
+                r#"SELECT state::text, error, created_at, started_at, finished_at FROM hf_ingestions WHERE id=$1"#,
                 &[&id],
             )
             .await?;
@@ -1184,12 +1165,7 @@ impl Persistence {
         let finished_at: Option<chrono::DateTime<chrono::Utc>> = job.get(4);
         let counts = client
             .query_one(
-                "SELECT \
-                COUNT(*) FILTER (WHERE state='queued') AS queued, \
-                COUNT(*) FILTER (WHERE state='downloading') AS downloading, \
-                COUNT(*) FILTER (WHERE state='stored') AS stored, \
-                COUNT(*) FILTER (WHERE state='failed') AS failed \
-             FROM hf_ingestion_items WHERE ingestion_id=$1",
+                r#"SELECT COUNT(*) FILTER (WHERE state='queued') AS queued, COUNT(*) FILTER (WHERE state='downloading') AS downloading, COUNT(*) FILTER (WHERE state='stored') AS stored, COUNT(*) FILTER (WHERE state='failed') AS failed FROM hf_ingestion_items WHERE ingestion_id=$1"#,
                 &[&id],
             )
             .await?;

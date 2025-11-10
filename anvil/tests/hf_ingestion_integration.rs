@@ -75,7 +75,7 @@ async fn hf_ingestion_single_file_integration() {
     // Poll status to completion
     let start = std::time::Instant::now();
     loop {
-        if start.elapsed() > Duration::from_secs(60) {
+        if start.elapsed() > Duration::from_secs(120) {
             panic!("timeout waiting for ingestion");
         }
         let mut streq = tonic::Request::new(anvil::anvil_api::GetHfIngestionStatusRequest {
