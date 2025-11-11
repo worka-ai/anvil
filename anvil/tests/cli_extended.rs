@@ -61,6 +61,29 @@ async fn run_cli(args: &[&str], config_dir: &std::path::Path) -> std::process::O
     .unwrap()
 }
 
+async fn wait_for_bucket(bucket_name: &str, config_dir: &std::path::Path) {
+    let start = Instant::now();
+    let timeout = Duration::from_secs(30);
+
+    loop {
+        if start.elapsed() > timeout {
+            panic!("Timeout waiting for bucket {} to be created", bucket_name);
+        }
+
+        let output = run_cli(&["bucket", "ls"], config_dir).await;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.contains(bucket_name) {
+                println!("Bucket {} found.", bucket_name);
+                return;
+            }
+        }
+
+        println!("Waiting for bucket {} to appear...", bucket_name);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 async fn setup_test_profile(cluster: &TestCluster, config_dir: &std::path::Path) -> (String, String) {
     let admin_args = &["run", "--bin", "admin", "--"];
     let global_db_url = cluster.global_db_url.clone();
@@ -150,8 +173,6 @@ async fn test_cli_auth_get_token() {
     cluster.start_and_converge(Duration::from_secs(10)).await;
     let config_dir = tempdir().unwrap();
     let (client_id, client_secret) = setup_test_profile(&cluster, config_dir.path()).await;
-
-    tokio::time::sleep(Duration::from_secs(1)).await; // Add sleep here
 
     let output = run_cli(&["auth", "get-token", "--client-id", &client_id, "--client-secret", &client_secret], config_dir.path()).await;
     assert!(output.status.success());
@@ -267,7 +288,7 @@ async fn test_cli_bucket_set_public() {
     let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
-    tokio::time::sleep(Duration::from_secs(1)).await; // Add sleep here
+    wait_for_bucket(&bucket_name, config_dir.path()).await;
 
     let output = run_cli(&["bucket", "set-public", &bucket_name, "--allow", "true"], config_dir.path()).await;
     assert!(output.status.success());
@@ -294,7 +315,7 @@ async fn test_cli_object_rm() {
     let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
-    tokio::time::sleep(Duration::from_secs(1)).await; // Add sleep here
+    wait_for_bucket(&bucket_name, config_dir.path()).await;
 
     let temp_dir = tempdir().unwrap();
     let file_path = temp_dir.path().join("test.txt");
@@ -303,8 +324,6 @@ async fn test_cli_object_rm() {
     let dest = format!("s3://{}/{}", bucket_name, object_key);
     let output = run_cli(&["object", "put", file_path.to_str().unwrap(), &dest], config_dir.path()).await;
     assert!(output.status.success());
-
-    tokio::time::sleep(Duration::from_secs(1)).await; // Add sleep here
 
     let output = run_cli(&["object", "rm", &dest], config_dir.path()).await;
     assert!(output.status.success());
@@ -326,7 +345,7 @@ async fn test_cli_object_ls() {
     let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
-    tokio::time::sleep(Duration::from_secs(1)).await; // Add sleep here
+    wait_for_bucket(&bucket_name, config_dir.path()).await;
 
     let temp_dir = tempdir().unwrap();
     let file_path = temp_dir.path().join("test.txt");
@@ -335,8 +354,6 @@ async fn test_cli_object_ls() {
     let dest = format!("s3://{}/{}", bucket_name, object_key);
     let output = run_cli(&["object", "put", file_path.to_str().unwrap(), &dest], config_dir.path()).await;
     assert!(output.status.success());
-
-    tokio::time::sleep(Duration::from_secs(1)).await; // Add sleep here
 
     let output = run_cli(&["object", "ls", &format!("s3://{}/", bucket_name)], config_dir.path()).await;
     assert!(output.status.success());
@@ -358,7 +375,7 @@ async fn test_cli_object_get_to_file() {
     let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
-    tokio::time::sleep(Duration::from_secs(1)).await; // Add sleep here
+    wait_for_bucket(&bucket_name, config_dir.path()).await;
 
     let temp_dir = tempdir().unwrap();
     let file_path = temp_dir.path().join("test.txt");
@@ -367,8 +384,6 @@ async fn test_cli_object_get_to_file() {
     let dest_s3 = format!("s3://{}/{}", bucket_name, object_key);
     let output = run_cli(&["object", "put", file_path.to_str().unwrap(), &dest_s3], config_dir.path()).await;
     assert!(output.status.success());
-
-    tokio::time::sleep(Duration::from_secs(1)).await; // Add sleep here
 
     let download_path = temp_dir.path().join("downloaded.txt");
     let output = run_cli(&["object", "get", &dest_s3, download_path.to_str().unwrap()], config_dir.path()).await;
@@ -388,8 +403,6 @@ async fn test_cli_hf_key_ls() {
     let output = run_cli(&["hf", "key", "add", "--name", "test-key", "--token", "test-token"], config_dir.path()).await;
     assert!(output.status.success());
 
-    tokio::time::sleep(Duration::from_secs(1)).await; // Add sleep here
-
     let output = run_cli(&["hf", "key", "ls"], config_dir.path()).await;
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -405,8 +418,6 @@ async fn test_cli_hf_key_rm() {
 
     let output = run_cli(&["hf", "key", "add", "--name", "test-key", "--token", "test-token"], config_dir.path()).await;
     assert!(output.status.success());
-
-    tokio::time::sleep(Duration::from_secs(1)).await; // Add sleep here
 
     let output = run_cli(&["hf", "key", "rm", "--name", "test-key"], config_dir.path()).await;
     assert!(output.status.success());
@@ -424,13 +435,11 @@ async fn test_cli_hf_ingest_cancel() {
     let output = run_cli(&["hf", "key", "add", "--name", "test-key", "--token", "test-token"], config_dir.path()).await;
     assert!(output.status.success());
 
-    tokio::time::sleep(Duration::from_secs(1)).await; // Add sleep here
-
     let bucket_name = format!("my-hf-ingest-cancel-bucket-{}", uuid::Uuid::new_v4());
     let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
-    tokio::time::sleep(Duration::from_secs(1)).await; // Add sleep here
+    wait_for_bucket(&bucket_name, config_dir.path()).await;
 
     let output = run_cli(&[
         "hf", "ingest", "start",
@@ -442,8 +451,6 @@ async fn test_cli_hf_ingest_cancel() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     let ingestion_id = stdout.split_whitespace().last().unwrap();
-
-    tokio::time::sleep(Duration::from_secs(1)).await; // Add sleep here
 
     let output = run_cli(&["hf", "ingest", "cancel", "--id", ingestion_id], config_dir.path()).await;
     assert!(output.status.success());
@@ -461,13 +468,11 @@ async fn test_cli_hf_ingest_start_with_options() {
     let output = run_cli(&["hf", "key", "add", "--name", "test-key", "--token", "test-token"], config_dir.path()).await;
     assert!(output.status.success());
 
-    tokio::time::sleep(Duration::from_secs(1)).await; // Add sleep here
-
     let bucket_name = format!("hf-ingest-opts-{}", uuid::Uuid::new_v4());
     let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
-    tokio::time::sleep(Duration::from_secs(1)).await; // Add sleep here
+    wait_for_bucket(&bucket_name, config_dir.path()).await;
 
     let output = run_cli(&[
         "hf", "ingest", "start",
