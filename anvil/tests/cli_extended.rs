@@ -87,7 +87,7 @@ async fn wait_for_bucket(bucket_name: &str, config_dir: &std::path::Path) {
 async fn setup_test_profile(cluster: &TestCluster, config_dir: &std::path::Path) -> (String, String) {
     let admin_args = &["run", "--bin", "admin", "--"];
     let global_db_url = cluster.global_db_url.clone();
-    let app_name = "cli-test-app";
+    let app_name = format!("cli-test-app-{}", uuid::Uuid::new_v4());
 
     // Create the app
     let create_args: Vec<String> = admin_args
@@ -251,9 +251,10 @@ async fn test_cli_auth_grant() {
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
 
-    let (_grantee_client_id, _) = create_app(&cluster, "grantee-app").await;
+    let grantee_app_name = format!("grantee-app-{}", uuid::Uuid::new_v4());
+    let (_grantee_client_id, _) = create_app(&cluster, &grantee_app_name).await;
 
-    let output = run_cli(&["auth", "grant", "grantee-app", "read", "bucket:my-bucket"], config_dir.path()).await;
+    let output = run_cli(&["auth", "grant", &grantee_app_name, "read", "bucket:my-bucket"], config_dir.path()).await;
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Permission granted."));
@@ -266,12 +267,13 @@ async fn test_cli_auth_revoke() {
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
 
-    let (_grantee_client_id, _) = create_app(&cluster, "grantee-app").await;
+    let grantee_app_name = format!("grantee-app-{}", uuid::Uuid::new_v4());
+    let (_grantee_client_id, _) = create_app(&cluster, &grantee_app_name).await;
 
-    let output = run_cli(&["auth", "grant", "grantee-app", "read", "bucket:my-bucket"], config_dir.path()).await;
+    let output = run_cli(&["auth", "grant", &grantee_app_name, "read", "bucket:my-bucket"], config_dir.path()).await;
     assert!(output.status.success());
 
-    let output = run_cli(&["auth", "revoke", "grantee-app", "read", "bucket:my-bucket"], config_dir.path()).await;
+    let output = run_cli(&["auth", "revoke", &grantee_app_name, "read", "bucket:my-bucket"], config_dir.path()).await;
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Permission revoked."));
