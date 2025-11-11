@@ -13,6 +13,7 @@ anyhow = "1"
 tokio = { version = "1.47.1", features = ["full"] }
 tokio-postgres = { version = "0.7.11", features = ["with-chrono-0_4", "with-uuid-1"] }
 deadpool-postgres = { version = "0.12.1", features = ["serde"] }
+lazy_static = "1.4.0"
 
 aws-config = "1.1.7"
 aws-sdk-s3 = "1.18.0"

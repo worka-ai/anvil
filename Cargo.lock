@@ -335,6 +335,7 @@ dependencies = [
  "deadpool-postgres",
  "dotenvy",
  "futures-util",
+ "lazy_static",
  "libp2p",
  "refinery",
  "refinery-macros",
