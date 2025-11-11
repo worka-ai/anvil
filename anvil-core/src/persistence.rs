@@ -863,7 +863,73 @@ impl Persistence {
         // When empty, treat as the root (nlevel = 0) and skip the <@ check.
         let rows = client
             .query(
-                r#"WITH params AS ( SELECT $1::bigint AS bucket_id, $2::text AS start_after, $3::int8 AS lim, NULLIF($4::text, "")::ltree AS prefix_ltree ), lvl AS ( SELECT COALESCE(nlevel(prefix_ltree), 0) AS p FROM params ), relevant AS ( SELECT o.key, o.key_ltree FROM objects o, params p WHERE o.bucket_id = p.bucket_id AND o.deleted_at IS NULL AND o.key > p.start_after AND (p.prefix_ltree IS NULL OR o.key_ltree <@ p.prefix_ltree) ), children AS ( SELECT key, key_ltree, subpath( key_ltree, 0, (SELECT p FROM lvl) + 1 ) AS child_path, nlevel(key_ltree) AS lvl FROM relevant ), grouped AS ( SELECT child_path, MIN(key) AS min_key, BOOL_OR(nlevel(key_ltree) > nlevel(child_path)) AS has_descendants_below, COUNT(*) FILTER (WHERE key_ltree = child_path) AS exact_object_count FROM children GROUP BY child_path ), stream AS ( SELECT ltree2text(g.child_path) AS sort_key, NULL::text AS object_key, TRUE AS is_prefix FROM grouped g, params p WHERE g.has_descendants_below AND g.min_key > p.start_after UNION ALL SELECT ltree2text(c.child_path) AS sort_key, c.key AS object_key, FALSE AS is_prefix FROM children c WHERE c.key_ltree = c.child_path ) SELECT sort_key, object_key, is_prefix FROM stream ORDER BY sort_key, is_prefix DESC LIMIT (SELECT lim FROM params)"#,
+                r#"
+            WITH
+            params AS (
+              SELECT
+                $1::bigint AS bucket_id,
+                $2::text   AS start_after,
+                $3::int8   AS lim,
+                NULLIF($4::text, '')::ltree AS prefix_ltree
+            ),
+            lvl AS (
+              SELECT COALESCE(nlevel(prefix_ltree), 0) AS p FROM params
+            ),
+            relevant AS (
+              SELECT o.key, o.key_ltree
+              FROM objects o, params p
+              WHERE o.bucket_id = p.bucket_id
+                AND o.deleted_at IS NULL
+                AND o.key > p.start_after
+                AND (p.prefix_ltree IS NULL OR o.key_ltree <@ p.prefix_ltree)
+            ),
+            children AS (
+              SELECT
+                key,
+                key_ltree,
+                subpath(
+                  key_ltree,
+                  0,
+                  (SELECT p FROM lvl) + 1
+                ) AS child_path,
+                nlevel(key_ltree) AS lvl
+              FROM relevant
+            ),
+            grouped AS (
+              SELECT
+                child_path,
+                MIN(key) AS min_key,
+                BOOL_OR(nlevel(key_ltree) > nlevel(child_path)) AS has_descendants_below,
+                COUNT(*) FILTER (WHERE key_ltree = child_path) AS exact_object_count
+              FROM children
+              GROUP BY child_path
+            ),
+            -- Build a unified, lexicographically sorted stream of rows, then LIMIT.
+            stream AS (
+              -- Common prefixes: return only those whose first visible key is > start_after
+              SELECT
+                ltree2text(g.child_path) AS sort_key,
+                NULL::text               AS object_key,
+                TRUE                     AS is_prefix
+              FROM grouped g, params p
+              WHERE g.has_descendants_below
+                AND g.min_key > p.start_after
+
+              UNION ALL
+
+              -- Objects that are exactly first-level children (no deeper slash beyond prefix)
+              SELECT
+                ltree2text(c.child_path) AS sort_key,
+                c.key                    AS object_key,
+                FALSE                    AS is_prefix
+              FROM children c
+              WHERE c.key_ltree = c.child_path
+            )
+            SELECT sort_key, object_key, is_prefix
+            FROM stream
+            ORDER BY sort_key, is_prefix DESC  -- object (false) before prefix (true) for same sort_key
+            LIMIT (SELECT lim FROM params)
+            "#,
                 &[&bucket_id, &start_after, &(limit as i64), &prefix_dot],
             )
             .await?;
@@ -1097,7 +1163,7 @@ impl Persistence {
         let client = self.global_pool.get().await?;
         let n = client
             .execute(
-                "UPDATE hf_ingestions SET state=$2 WHERE id=$1 AND state IN ('queued'::hf_ingestion_state,'running'::hf_ingestion_state)",
+                "UPDATE hf_ingestions SET state=$2::hf_ingestion_state WHERE id=$1 AND state IN ('queued'::hf_ingestion_state,'running'::hf_ingestion_state)",
                 &[&id, &crate::tasks::HFIngestionState::Canceled],
             )
             .await?;
@@ -1130,7 +1196,7 @@ impl Persistence {
         let client = self.global_pool.get().await?;
         client
             .execute(
-                r#"UPDATE hf_ingestions SET state=$2, error=$3, started_at=CASE WHEN $2='downloading'::hf_item_state AND started_at IS NULL THEN now() ELSE started_at END, finished_at=CASE WHEN $2 IN ('stored'::hf_item_state,'failed'::hf_item_state,'skipped'::hf_item_state) THEN now() ELSE finished_at END WHERE id=$1"#,
+                r#"UPDATE hf_ingestion_items SET state=$2, error=$3, started_at=CASE WHEN $2='downloading'::hf_item_state AND started_at IS NULL THEN now() ELSE started_at END, finished_at=CASE WHEN $2 IN ('stored'::hf_item_state,'failed'::hf_item_state,'skipped'::hf_item_state) THEN now() ELSE finished_at END WHERE id=$1"#,
                 &[&id, &state, &error],
             )
             .await?;
