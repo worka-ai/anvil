@@ -391,14 +391,14 @@ async fn test_cli_object_get_to_file() {
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
 
-            let bucket_name = format!("my-object-get-bucket-{}", uuid::Uuid::new_v4());
-            let object_key = "my-object-to-get";
-            let content = "hello from object get to file test";
-    
-            let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
-            assert!(output.status.success());
-    
-            wait_for_bucket(&bucket_name, &cluster).await;
+    let bucket_name = format!("my-object-get-bucket-{}", uuid::Uuid::new_v4());
+    let object_key = "my-object-to-get";
+    let content = "hello from object get to file test";
+
+    let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
+    assert!(output.status.success());
+
+    wait_for_bucket(&bucket_name, &cluster).await;
     let temp_dir = tempdir().unwrap();
     let file_path = temp_dir.path().join("test.txt");
     std::fs::write(&file_path, content).unwrap();

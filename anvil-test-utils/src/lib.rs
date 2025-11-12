@@ -8,7 +8,6 @@ use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::Client as S3Client;
 use deadpool_postgres::{ManagerConfig, Pool, RecyclingMethod};
 use futures_util::StreamExt;
-use lazy_static::lazy_static;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::ops::Deref;
@@ -16,15 +15,9 @@ use std::process::Command;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_postgres::NoTls;
 use tracing_subscriber::{self, EnvFilter};
-
-lazy_static! {
-    // Limit concurrent cluster creation to avoid resource exhaustion in CI.
-    static ref TEST_SEMAPHORE: Semaphore = Semaphore::new(4);
-}
 
 pub mod migrations {
     use refinery_macros::embed_migrations;
@@ -155,8 +148,6 @@ impl TestCluster {
     }
     #[allow(dead_code)]
     pub async fn new(regions: &[&str]) -> Self {
-        let _permit = TEST_SEMAPHORE.acquire().await.unwrap();
-
         let _ = tracing_subscriber::fmt()
             .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
             .try_init();
