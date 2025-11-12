@@ -303,6 +303,15 @@ impl TestCluster {
             }
             if all_converged {
                 println!("Cluster converged with {} nodes.", self.nodes.len());
+
+                // Also wait for all gRPC ports to be open.
+                for addr_str in &self.grpc_addrs {
+                    let addr: SocketAddr = addr_str.replace("http://", "").parse().unwrap();
+                    if !wait_for_port(addr, Duration::from_secs(5)).await {
+                        panic!("gRPC port {} did not open in time", addr);
+                    }
+                }
+
                 return;
             }
         }
