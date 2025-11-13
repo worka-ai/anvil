@@ -312,6 +312,9 @@ impl TestCluster {
                     }
                 }
 
+                // Give gossipsub a moment to connect.
+                tokio::time::sleep(Duration::from_secs(3)).await;
+
                 return;
             }
         }
