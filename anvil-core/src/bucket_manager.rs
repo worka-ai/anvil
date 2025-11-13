@@ -23,7 +23,7 @@ impl BucketManager {
         region: &str,
         scopes: &[String],
     ) -> Result<(), Status> {
-        println!("[manager] ENTERING create_bucket for bucket: {}", bucket_name);
+        tracing::debug!("[manager] ENTERING create_bucket for bucket: {}", bucket_name);
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
@@ -35,13 +35,13 @@ impl BucketManager {
             return Err(Status::permission_denied("Permission denied"));
         }
 
-        println!("[manager] Calling DB to create bucket: {}", bucket_name);
+        tracing::debug!("[manager] Calling DB to create bucket: {}", bucket_name);
         self.db
             .create_bucket(tenant_id, bucket_name, region)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        println!("[manager] EXITING create_bucket for bucket: {}", bucket_name);
+        tracing::debug!("[manager] EXITING create_bucket for bucket: {}", bucket_name);
         Ok(())
     }
 
@@ -74,21 +74,21 @@ impl BucketManager {
         tenant_id: i64,
         scopes: &[String],
     ) -> Result<Vec<Bucket>, Status> {
-        println!("[manager] ENTERING list_buckets for tenant: {}", tenant_id);
+        tracing::debug!("[manager] ENTERING list_buckets for tenant: {}", tenant_id);
         if !auth::is_authorized("read:bucket:*", scopes) {
             return Err(Status::permission_denied(
                 "Permission denied to list buckets",
             ));
         }
 
-        println!("[manager] Calling DB to list buckets for tenant: {}", tenant_id);
+        tracing::debug!("[manager] Calling DB to list buckets for tenant: {}", tenant_id);
         let buckets = self
             .db
             .list_buckets_for_tenant(tenant_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        println!("[manager] EXITING list_buckets, found {} buckets", buckets.len());
+        tracing::debug!("[manager] EXITING list_buckets, found {} buckets", buckets.len());
         Ok(buckets)
     }
 

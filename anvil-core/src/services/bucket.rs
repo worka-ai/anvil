@@ -9,7 +9,7 @@ impl BucketService for AppState {
         &self,
         request: Request<CreateBucketRequest>,
     ) -> Result<Response<CreateBucketResponse>, Status> {
-        println!("[service] ENTERING create_bucket");
+        tracing::debug!("[service] ENTERING create_bucket");
         let claims = request
             .extensions()
             .get::<auth::Claims>()
@@ -26,7 +26,7 @@ impl BucketService for AppState {
             )
             .await?;
 
-        println!("[service] EXITING create_bucket");
+        tracing::debug!("[service] EXITING create_bucket");
         Ok(Response::new(CreateBucketResponse {}))
     }
 
@@ -51,7 +51,7 @@ impl BucketService for AppState {
         &self,
         request: Request<ListBucketsRequest>,
     ) -> Result<Response<ListBucketsResponse>, Status> {
-        println!("[service] ENTERING list_buckets");
+        tracing::debug!("[service] ENTERING list_buckets");
         let claims = request
             .extensions()
             .get::<auth::Claims>()
@@ -70,7 +70,7 @@ impl BucketService for AppState {
             })
             .collect();
 
-        println!("[service] EXITING list_buckets, found {} buckets", response_buckets.len());
+        tracing::debug!("[service] EXITING list_buckets, found {} buckets", response_buckets.len());
         Ok(Response::new(ListBucketsResponse {
             buckets: response_buckets,
         }))

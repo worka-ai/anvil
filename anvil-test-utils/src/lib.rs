@@ -149,7 +149,9 @@ impl TestCluster {
     #[allow(dead_code)]
     pub async fn new(regions: &[&str]) -> Self {
         let _ = tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::new("warn,anvil=debug,anvil_core=debug"))
+            .with_env_filter(EnvFilter::new(
+                "warn,anvil=debug,anvil_core=debug,anvil_core::cluster=warn",
+            ))
             .try_init();
         let config = Arc::new(anvil_core::config::Config {
             global_database_url: "".to_string(),

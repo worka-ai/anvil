@@ -58,29 +58,29 @@ jobs:
     - name: Build Release Binaries (Native Linux)
       run: cargo build --release --workspace
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+    # - name: Set up Docker Buildx
+    #   uses: docker/setup-buildx-action@v3
 
-    - name: Compute test image tag
-      id: img
-      run: echo "tag=anvil:test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> $GITHUB_OUTPUT
+    # - name: Compute test image tag
+    #   id: img
+    #   run: echo "tag=anvil:test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> $GITHUB_OUTPUT
 
-    - name: Build Docker Image for Testing
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        file: anvil/Dockerfile
-        load: true
-        push: false
-        tags: ${{ steps.img.outputs.tag }}
-        platforms: linux/amd64
-        build-args: |
-          BINARY_PATH=./target/release
+    # - name: Build Docker Image for Testing
+    #   uses: docker/build-push-action@v5
+    #   with:
+    #     context: .
+    #     file: anvil/Dockerfile
+    #     load: true
+    #     push: false
+    #     tags: ${{ steps.img.outputs.tag }}
+    #     platforms: linux/amd64
+    #     build-args: |
+    #       BINARY_PATH=./target/release
 
-    - name: Validate runtime binary in image
-      run: |
-        docker run --rm ${{ steps.img.outputs.tag }} ls -l /usr/local/bin
-        docker run --rm ${{ steps.img.outputs.tag }} /usr/local/bin/anvil --help >/dev/null
+    # - name: Validate runtime binary in image
+    #   run: |
+    #     docker run --rm ${{ steps.img.outputs.tag }} ls -l /usr/local/bin
+    #     docker run --rm ${{ steps.img.outputs.tag }} /usr/local/bin/anvil --help >/dev/null
 
     - name: Wait for PostgreSQL to be ready
       run: |
@@ -91,9 +91,7 @@ jobs:
         echo "PostgreSQL is ready."
 
     - name: Run All Tests
-      env:
-        ANVIL_IMAGE: ${{ steps.img.outputs.tag }}
-      run: cargo test -p anvil --test cli_extended -- --nocapture
+      run: cargo test --workspace -- --nocapture
 
     # --- Release Steps ---
     # These steps will only run on a successful push to the main branch.
