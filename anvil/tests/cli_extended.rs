@@ -185,6 +185,16 @@ async fn setup_test_profile(cluster: &TestCluster, config_dir: &std::path::Path)
     )
     .await;
     assert!(output.status.success());
+
+    // Append the database URL to the config file.
+    let config_path = config_dir.join(".anvil").join("config.toml");
+    let mut config_content = std::fs::read_to_string(&config_path).unwrap();
+    config_content.push_str(&format!(
+        "\nglobal_database_url = \"{}\"\n",
+        cluster.global_db_url
+    ));
+    std::fs::write(&config_path, config_content).unwrap();
+
     (client_id, client_secret)
 }
 
