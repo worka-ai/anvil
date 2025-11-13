@@ -65,45 +65,7 @@ use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::ListBucketsRequest;
 use tonic::Request;
 
-async fn wait_for_bucket(bucket_name: &str, cluster: &TestCluster) {
-    let start = Instant::now();
-    let timeout = Duration::from_secs(30);
 
-    let mut bucket_client = BucketServiceClient::connect(cluster.grpc_addrs[0].clone())
-        .await
-        .expect("Failed to connect to bucket service");
-
-    loop {
-        if start.elapsed() > timeout {
-            panic!("Timeout waiting for bucket {} to be created", bucket_name);
-        }
-
-        let mut request = Request::new(ListBucketsRequest {});
-        request.metadata_mut().insert(
-            "authorization",
-            format!("Bearer {}", cluster.token).parse().unwrap(),
-        );
-
-        match bucket_client.list_buckets(request).await {
-            Ok(response) => {
-                let buckets = response.into_inner().buckets;
-                if buckets.iter().any(|b| b.name == bucket_name) {
-                    println!("Bucket {} found.", bucket_name);
-                    return;
-                }
-            }
-            Err(status) => {
-                println!(
-                    "Error listing buckets while waiting: {:?}. Retrying...",
-                    status
-                );
-            }
-        }
-
-        println!("Waiting for bucket {} to appear...", bucket_name);
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-}
 
 async fn setup_test_profile(cluster: &TestCluster, config_dir: &std::path::Path) -> (String, String) {
     let admin_args = &["run", "--bin", "admin", "--"];
@@ -185,16 +147,6 @@ async fn setup_test_profile(cluster: &TestCluster, config_dir: &std::path::Path)
     )
     .await;
     assert!(output.status.success());
-
-    // Append the database URL to the config file.
-    let config_path = config_dir.join(".anvil").join("config.toml");
-    let mut config_content = std::fs::read_to_string(&config_path).unwrap();
-    config_content.push_str(&format!(
-        "\nglobal_database_url = \"{}\"\n",
-        cluster.global_db_url
-    ));
-    std::fs::write(&config_path, config_content).unwrap();
-
     (client_id, client_secret)
 }
 
@@ -321,8 +273,6 @@ async fn test_cli_bucket_set_public() {
     let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
-    wait_for_bucket(&bucket_name, &cluster).await;
-
     let output = run_cli(&["bucket", "set-public", &bucket_name, "--allow", "true"], config_dir.path()).await;
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -347,8 +297,6 @@ async fn test_cli_object_rm() {
 
     let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
-
-    wait_for_bucket(&bucket_name, &cluster).await;
 
     let temp_dir = tempdir().unwrap();
     let file_path = temp_dir.path().join("test.txt");
@@ -378,8 +326,6 @@ async fn test_cli_object_ls() {
     let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
-    wait_for_bucket(&bucket_name, &cluster).await;
-
     let temp_dir = tempdir().unwrap();
     let file_path = temp_dir.path().join("test.txt");
     std::fs::write(&file_path, content).unwrap();
@@ -407,8 +353,6 @@ async fn test_cli_object_get_to_file() {
 
     let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
-
-    wait_for_bucket(&bucket_name, &cluster).await;
     let temp_dir = tempdir().unwrap();
     let file_path = temp_dir.path().join("test.txt");
     std::fs::write(&file_path, content).unwrap();
@@ -474,8 +418,6 @@ async fn test_cli_hf_ingest_cancel() {
     let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
 
-    wait_for_bucket(&bucket_name, &cluster).await;
-
     let output = run_cli(&[
         "hf", "ingest", "start",
         "--key", &key_name,
@@ -507,8 +449,6 @@ async fn test_cli_hf_ingest_start_with_options() {
     let bucket_name = format!("hf-ingest-opts-{}", uuid::Uuid::new_v4());
     let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
     assert!(output.status.success());
-
-    wait_for_bucket(&bucket_name, &cluster).await;
 
     let output = run_cli(&[
         "hf", "ingest", "start",
