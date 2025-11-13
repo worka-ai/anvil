@@ -152,7 +152,7 @@ impl TestCluster {
             .with_env_filter(EnvFilter::new(
                 "warn,anvil=debug,anvil_core=debug,anvil_core::cluster=warn",
             ))
-            .try_init();
+            .init();
         let config = Arc::new(anvil_core::config::Config {
             global_database_url: "".to_string(),
             regional_database_url: "".to_string(),
