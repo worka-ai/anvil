@@ -1,3 +1,7 @@
+use std::sync::Once;
+
+static INIT_LOGGER: Once = Once::new();
+
 use anvil::run_migrations;
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::GetAccessTokenRequest;
@@ -114,7 +118,6 @@ pub async fn get_auth_token(global_db_url: &str, grpc_addr: &str) -> String {
         .await
         .unwrap()
         .into_inner();
-
     token_res.access_token
 }
 
@@ -148,11 +151,14 @@ impl TestCluster {
     }
     #[allow(dead_code)]
     pub async fn new(regions: &[&str]) -> Self {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::new(
-                "warn,anvil=debug,anvil_core=debug,anvil_core::cluster=warn",
-            ))
-            .init();
+        INIT_LOGGER.call_once(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(EnvFilter::new(
+                    "warn,anvil=debug,anvil_core=debug,anvil_core::cluster=warn",
+                ))
+                .try_init();
+        });
+
         let config = Arc::new(anvil_core::config::Config {
             global_database_url: "".to_string(),
             regional_database_url: "".to_string(),
