@@ -1,9 +1,10 @@
 [package]
-name = "anvil"
+name = "anvil-core"
 version = "0.1.0"
 edition = "2024"
 
 [features]
+#Declare an enterprise feature, doesn't activate any depdendencies so leave it with an empty array
 enterprise = []
 gcp = ["dep:prost-types", "tonic/tls-ring"]
 routeguide = ["dep:async-stream", "dep:tokio-stream", "dep:rand", "dep:serde", "dep:serde_json"]
@@ -29,9 +30,6 @@ default = ["full"]
 tonic-prost = ["dep:tonic-prost"]
 
 [dependencies]
-anvil-core = { path = "../anvil-core" }
-# Enterprise crate is private and not part of the OSS workspace.
-# Do not declare it here to keep OSS repo self-contained.
 anyhow = { version = "1" }
 blake3 = "1.8.2"
 deadpool-postgres = { version = "0.12.1", features = ["serde"] }
@@ -69,7 +67,7 @@ bytes = { version = "1", optional = true }
 h2 = { version = "0.4", optional = true }
 tokio-rustls = { version = "0.26.1", optional = true, features = ["ring", "tls12"], default-features = false }
 hyper-rustls = { version = "0.27.0", features = ["http2", "ring", "tls12"], optional = true, default-features = false }
-tower-http = { version = "0.6", optional = true, features = ["sensitive-headers"] }
+tower-http = { version = "0.6", optional = true }
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
 dotenvy = "0.15.7"
 futures-core = "0.3.31"
@@ -107,23 +105,6 @@ aes-gcm = "0.10.3"
 constant_time_eq = "0.4.2"
 http-body-util = "0.1.1"
 subtle = "2.6.1"
-once_cell = "1.19"
-openssl = { version = "0.10", features = ["vendored"] }
-bcrypt = "0.15"
 
 [build-dependencies]
 tonic-prost-build = { version = "0.14.2" }
-
-[dev-dependencies]
-anvil-test-utils = { path = "../anvil-test-utils" }
-aws-config = "1.1.7"
-aws-sdk-s3 = "1.18.0"
-http-body-util = "0.1.1"
-# serial_test = "3.0.0"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-memchr = "2.7.6"
-
-uuid = { version = "1.18.1", features = ["v4", "serde"] }
-tokio-stream = "0.1"
-tempfile = "3.10.1"
-serde_json = "1.0"

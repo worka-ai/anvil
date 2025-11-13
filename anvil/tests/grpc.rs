@@ -10,12 +10,12 @@ use std::time::Duration;
 use tokio::fs;
 use tonic::Code;
 
-mod common;
+use anvil_test_utils::*;
 
 #[tokio::test]
 async fn test_distributed_put_and_get() {
     let num_nodes = 6;
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"; 6]).await;
+    let mut cluster = TestCluster::new(&["test-region-1"; 6]).await;
     cluster.start_and_converge(Duration::from_secs(20)).await;
 
     let token = cluster.token.clone();
@@ -27,7 +27,7 @@ async fn test_distributed_put_and_get() {
     let bucket_name = format!("test-bucket-{}", uuid::Uuid::new_v4());
     let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
-        region: "TEST_REGION".to_string(),
+        region: "test-region-1".to_string(),
     });
     create_bucket_req.metadata_mut().insert(
         "authorization",
@@ -113,7 +113,7 @@ async fn test_distributed_put_and_get() {
 
 #[tokio::test]
 async fn test_single_node_put() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let token = cluster.token.clone();
@@ -125,7 +125,7 @@ async fn test_single_node_put() {
     let bucket_name = "single-node-bucket".to_string();
     let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
-        region: "TEST_REGION".to_string(),
+        region: "test-region-1".to_string(),
     });
     create_bucket_req.metadata_mut().insert(
         "authorization",
@@ -167,12 +167,12 @@ async fn test_single_node_put() {
 
 #[tokio::test]
 async fn test_multi_region_list_and_isolation() {
-    let mut cluster_east = common::TestCluster::new(&["US_EAST_1"]).await;
+    let mut cluster_east = TestCluster::new(&["us-east-1"]).await;
     cluster_east
         .start_and_converge(Duration::from_secs(5))
         .await;
 
-    let mut cluster_west = common::TestCluster::new(&["EU_WEST_1"]).await;
+    let mut cluster_west = TestCluster::new(&["eu-west-1"]).await;
     cluster_west
         .start_and_converge(Duration::from_secs(5))
         .await;
@@ -194,7 +194,7 @@ async fn test_multi_region_list_and_isolation() {
     let bucket_name = "regional-bucket".to_string();
     let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
-        region: "US_EAST_1".to_string(),
+        region: "us-east-1".to_string(),
     });
     create_bucket_req.metadata_mut().insert(
         "authorization",

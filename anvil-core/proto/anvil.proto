@@ -1,0 +1,422 @@
+syntax = "proto3";
+
+package anvil;
+
+// Bucket Service
+service BucketService {
+  rpc CreateBucket(CreateBucketRequest) returns (CreateBucketResponse);
+  rpc DeleteBucket(DeleteBucketRequest) returns (DeleteBucketResponse);
+  rpc ListBuckets(ListBucketsRequest) returns (ListBucketsResponse);
+  rpc GetBucketPolicy(GetBucketPolicyRequest) returns (GetBucketPolicyResponse);
+  rpc PutBucketPolicy(PutBucketPolicyRequest) returns (PutBucketPolicyResponse);
+}
+
+message CreateBucketRequest {
+  string bucket_name = 1;
+  string region = 2;
+}
+
+message CreateBucketResponse {}
+
+message DeleteBucketRequest {
+  string bucket_name = 1;
+}
+
+message DeleteBucketResponse {}
+
+message ListBucketsRequest {}
+
+message Bucket {
+    string name = 1;
+    string creation_date = 2;
+}
+
+message ListBucketsResponse {
+    repeated Bucket buckets = 1;
+}
+
+message GetBucketPolicyRequest {
+    string bucket_name = 1;
+}
+
+message GetBucketPolicyResponse {
+    string policy_json = 1;
+}
+
+message PutBucketPolicyRequest {
+    string bucket_name = 1;
+    string policy_json = 2;
+}
+
+message PutBucketPolicyResponse {}
+
+
+// Object Service
+service ObjectService {
+  rpc PutObject(stream PutObjectRequest) returns (PutObjectResponse);
+  rpc GetObject(GetObjectRequest) returns (stream GetObjectResponse);
+  rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
+  rpc HeadObject(HeadObjectRequest) returns (HeadObjectResponse);
+  rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+  rpc InitiateMultipartUpload(InitiateMultipartRequest) returns (InitiateMultipartResponse);
+  rpc CompleteMultipartUpload(CompleteMultipartRequest) returns (CompleteMultipartResponse);
+}
+
+message PutObjectRequest {
+    oneof data {
+        ObjectMetadata metadata = 1;
+        bytes chunk = 2;
+    }
+}
+
+message ObjectMetadata {
+    string bucket_name = 1;
+    string object_key = 2;
+}
+
+message PutObjectResponse {
+    string etag = 1;
+    string version_id = 2;
+}
+
+message GetObjectRequest {
+    string bucket_name = 1;
+    string object_key = 2;
+    optional string version_id = 3;
+}
+
+message GetObjectResponse {
+    oneof data {
+        ObjectInfo metadata = 1;
+        bytes chunk = 2;
+    }
+}
+
+message ObjectInfo {
+    string content_type = 1;
+    int64 content_length = 2;
+}
+
+
+message DeleteObjectRequest {
+    string bucket_name = 1;
+    string object_key = 2;
+    optional string version_id = 3;
+}
+
+message DeleteObjectResponse {}
+
+message HeadObjectRequest {
+    string bucket_name = 1;
+    string object_key = 2;
+    optional string version_id = 3;
+}
+
+message HeadObjectResponse {
+    string etag = 1;
+    int64 size = 2;
+    string last_modified = 3;
+}
+
+message ListObjectsRequest {
+    string bucket_name = 1;
+    string prefix = 2;
+    string delimiter = 3;
+    string start_after = 4;
+    int32 max_keys = 5;
+}
+
+message ObjectSummary {
+    string key = 1;
+    int64 size = 2;
+    string etag = 3;
+    string last_modified = 4;
+}
+
+message ListObjectsResponse {
+    repeated ObjectSummary objects = 1;
+    repeated string common_prefixes = 2;
+}
+
+message InitiateMultipartRequest {
+    string bucket_name = 1;
+    string object_key = 2;
+}
+
+message InitiateMultipartResponse {
+    string upload_id = 1;
+}
+
+message CompleteMultipartRequest {
+    string bucket_name = 1;
+    string object_key = 2;
+    string upload_id = 3;
+}
+
+message CompleteMultipartResponse {
+    string etag = 1;
+    string version_id = 2;
+}
+
+// Internal Service for node-to-node communication
+service InternalAnvilService {
+  rpc PutShard(stream PutShardRequest) returns (PutShardResponse);
+  rpc GetShard(GetShardRequest) returns (stream GetShardResponse);
+  rpc CommitShard(CommitShardRequest) returns (CommitShardResponse);
+  rpc DeleteShard(DeleteShardRequest) returns (DeleteShardResponse);
+}
+
+service AuthService {
+  rpc GetAccessToken(GetAccessTokenRequest) returns (GetAccessTokenResponse);
+  rpc GrantAccess(GrantAccessRequest) returns (GrantAccessResponse);
+  rpc RevokeAccess(RevokeAccessRequest) returns (RevokeAccessResponse);
+  rpc SetPublicAccess(SetPublicAccessRequest) returns (SetPublicAccessResponse);
+}
+
+// Hugging Face Keys (public API, policy enforced)
+service HuggingFaceKeyService {
+  rpc CreateKey(CreateHfKeyRequest) returns (CreateHfKeyResponse);
+  rpc DeleteKey(DeleteHfKeyRequest) returns (DeleteHfKeyResponse);
+  rpc ListKeys(ListHfKeysRequest) returns (ListHfKeysResponse);
+}
+
+message CreateHfKeyRequest {
+  string name = 1;
+  string token = 2; // never returned back
+  string note = 3;
+}
+message CreateHfKeyResponse {
+  string name = 1;
+  string note = 2;
+  string created_at = 3;
+}
+message DeleteHfKeyRequest { string name = 1; }
+message DeleteHfKeyResponse {}
+message ListHfKeysRequest {}
+message HfKey {
+  string name = 1;
+  string note = 2;
+  string created_at = 3;
+  string updated_at = 4;
+}
+message ListHfKeysResponse { repeated HfKey keys = 1; }
+
+// Ingestion (public API, policy enforced)
+service HfIngestionService {
+  rpc StartIngestion(StartHfIngestionRequest) returns (StartHfIngestionResponse);
+  rpc GetIngestionStatus(GetHfIngestionStatusRequest) returns (GetHfIngestionStatusResponse);
+  rpc CancelIngestion(CancelHfIngestionRequest) returns (CancelHfIngestionResponse);
+}
+
+message StartHfIngestionRequest {
+  string key_name = 1;
+  string repo = 2;
+  string revision = 3;
+  string target_bucket = 4;
+  string target_prefix = 5;
+  repeated string include_globs = 6;
+  repeated string exclude_globs = 7;
+  string target_region = 8;
+}
+message StartHfIngestionResponse { string ingestion_id = 1; }
+
+message GetHfIngestionStatusRequest { string ingestion_id = 1; }
+message GetHfIngestionStatusResponse {
+  string state = 1;
+  uint64 queued = 2;
+  uint64 downloading = 3;
+  uint64 stored = 4;
+  uint64 failed = 5;
+  string error = 6;
+  string created_at = 7;
+  string started_at = 8;
+  string finished_at = 9;
+}
+
+message CancelHfIngestionRequest { string ingestion_id = 1; }
+message CancelHfIngestionResponse {}
+
+message GetAccessTokenRequest {
+  string client_id = 1;
+  string client_secret = 2;
+  repeated string scopes = 3;
+}
+
+message GetAccessTokenResponse {
+  string access_token = 1;
+  int64 expires_in = 2;
+}
+
+message GrantAccessRequest {
+  string grantee_app_id = 1;
+  string resource = 2;
+  string action = 3;
+}
+
+message GrantAccessResponse {}
+
+message RevokeAccessRequest {
+  string grantee_app_id = 1;
+  string resource = 2;
+  string action = 3;
+}
+
+message RevokeAccessResponse {}
+
+message SetPublicAccessRequest {
+  string bucket = 1;
+  bool allow_public_read = 2;
+}
+
+message SetPublicAccessResponse {}
+
+
+message PutShardRequest {
+    string upload_id = 1;
+    uint32 shard_index = 2;
+    bytes data = 3;
+}
+
+message PutShardResponse {}
+
+message CommitShardRequest {
+    string upload_id = 1;
+    uint32 shard_index = 2;
+    string final_object_hash = 3;
+}
+
+message CommitShardResponse {}
+
+message GetShardRequest {
+    string object_hash = 1;
+    uint32 shard_index = 2;
+}
+
+message GetShardResponse {
+    bytes data = 1;
+}
+
+message DeleteShardRequest {
+    string object_hash = 1;
+    uint32 shard_index = 2;
+}
+
+message DeleteShardResponse {}
+
+// ---------- Model Service ----------
+service ModelService {
+  rpc PutModelManifest(PutModelManifestRequest) returns (PutModelManifestResponse);
+  rpc ListTensors(ListTensorsRequest) returns (ListTensorsResponse);
+  rpc GetTensor(GetTensorRequest) returns (stream GetTensorChunk);
+  rpc GetTensors(GetTensorsRequest) returns (stream GetTensorChunk);
+}
+
+message TenantScope {
+  string tenant_id = 1;
+  string region = 2;
+}
+
+message ObjectRef {
+  string bucket = 1;
+  string key = 2;
+  string version_id = 3;
+}
+
+enum DType {
+  DTYPE_UNSPECIFIED = 0;
+  F16 = 1;
+  BF16 = 2;
+  F32 = 3;
+  F64 = 4;
+  I8 = 5;
+  I16 = 6;
+  I32 = 7;
+  I64 = 8;
+  U8 = 9;
+}
+
+message ModelManifest {
+  string schema_version = 1;
+  string artifact_id = 2;
+  string name = 3;
+  string format = 4;
+
+  message Component {
+    string path = 1;
+    uint64 size = 2;
+    string hash = 3;
+  }
+  repeated Component components = 5;
+
+  string base_artifact_id = 6;
+  repeated string delta_artifact_ids = 7;
+
+  message Signature {
+    string authority = 1;
+    bytes sig = 2;
+  }
+  repeated Signature signatures = 8;
+
+  string merkle_root = 9;
+  map<string,string> meta = 10;
+}
+
+message TensorIndexRow {
+  string tensor_name = 1;
+  string file_path = 2;
+  uint64 file_offset = 3;
+  uint64 byte_length = 4;
+  DType dtype = 5;
+  repeated uint32 shape = 6;
+  string layout = 7;
+  uint32 block_bytes = 8;
+  bytes blocks = 9;
+}
+
+message PutModelManifestRequest {
+  TenantScope scope = 1;
+  ObjectRef object = 2;
+  ModelManifest manifest = 3;
+  repeated TensorIndexRow index = 4;
+}
+
+message PutModelManifestResponse {
+  string artifact_id = 1;
+  string status = 2;
+}
+
+message ListTensorsRequest {
+  TenantScope scope = 1;
+  ObjectRef object = 2;
+  string artifact_id = 3;
+  string prefix = 4;
+  uint32 limit = 5;
+  string page_token = 6;
+}
+
+message ListTensorsResponse {
+  repeated TensorIndexRow tensors = 1;
+  string next_page_token = 2;
+}
+
+message GetTensorRequest {
+  TenantScope scope = 1;
+  ObjectRef object = 2;
+  string artifact_id = 3;
+  string tensor_name = 4;
+  repeated uint32 slice_begin = 5;
+  repeated uint32 slice_extent = 6;
+}
+
+message GetTensorChunk {
+  bytes data = 1;
+  uint64 offset = 2;
+  bool eof = 3;
+}
+
+message GetTensorsRequest {
+  TenantScope scope = 1;
+  ObjectRef object = 2;
+  string artifact_id = 3;
+  repeated string tensor_names = 4;
+}

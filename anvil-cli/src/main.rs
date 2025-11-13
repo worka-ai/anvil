@@ -1,3 +1,8 @@
+mod cli;
+mod config;
+mod context;
+
+use crate::context::Context;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -5,68 +10,94 @@ use clap::{Parser, Subcommand};
 struct Cli {
     #[clap(subcommand)]
     command: Commands,
+    #[clap(long, global = true)]
+    profile: Option<String>,
+    #[clap(long, global = true)]
+    config: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
     /// Configure CLI profiles
-    Configure,
+    Configure {
+        #[clap(long)]
+        name: Option<String>,
+        #[clap(long)]
+        host: Option<String>,
+        #[clap(long)]
+        client_id: Option<String>,
+        #[clap(long)]
+        client_secret: Option<String>,
+        #[clap(long)]
+        default: bool,
+    },
+    /// Create a configuration file non-interactively
+    StaticConfig {
+        #[clap(long)]
+        name: String,
+        #[clap(long)]
+        host: String,
+        #[clap(long)]
+        client_id: String,
+        #[clap(long)]
+        client_secret: String,
+        #[clap(long)]
+        default: bool,
+    },
     /// Manage buckets
-    Bucket { #[clap(subcommand)] command: BucketCommands },
+    Bucket {
+        #[clap(subcommand)]
+        command: cli::bucket::BucketCommands,
+    },
     /// Manage objects
-    Object { #[clap(subcommand)] command: ObjectCommands },
+    Object {
+        #[clap(subcommand)]
+        command: cli::object::ObjectCommands,
+    },
     /// Manage authentication and permissions
-    Auth { #[clap(subcommand)] command: AuthCommands },
-}
-
-#[derive(Subcommand)]
-enum BucketCommands {
-    /// Create a new bucket
-    Create { name: String },
-    /// Remove a bucket
-    Rm { name: String },
-    /// List buckets
-    Ls,
-    /// Set public access for a bucket
-    SetPublic { name: String, #[clap(long)] allow: bool },
-}
-
-#[derive(Subcommand)]
-enum ObjectCommands {
-    /// Upload a file to an object
-    Put { src: String, dest: String },
-    /// Download an object to a file or stdout
-    Get { src: String, dest: Option<String> },
-    /// Remove an object
-    Rm { path: String },
-    /// List objects in a bucket
-    Ls { path: String },
-    /// Show object metadata
-    Head { path: String },
-}
-
-#[derive(Subcommand)]
-enum AuthCommands {
-    /// Get a new access token
-    GetToken,
-    /// Grant a permission to another app
-    Grant { app: String, action: String, resource: String },
-    /// Revoke a permission from an app
-    Revoke { app: String, action: String, resource: String },
+    Auth {
+        #[clap(subcommand)]
+        command: cli::auth::AuthCommands,
+    },
+    /// Hugging Face integration
+    Hf {
+        #[clap(subcommand)]
+        command: cli::hf::HfCommands,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    eprintln!("[anvil-cli] starting v{}", env!("CARGO_PKG_VERSION"));
+    eprintln!("[anvil-cli] args: {:?}", std::env::args().collect::<Vec<_>>());
     let cli = Cli::parse();
 
+    if let Commands::Configure { name, host, client_id, client_secret, default } = &cli.command {
+        cli::configure::handle_configure_command(name.clone(), host.clone(), client_id.clone(), client_secret.clone(), *default, cli.config)?;
+        return Ok(());
+    }
+    if let Commands::StaticConfig { name, host, client_id, client_secret, default } = &cli.command {
+        cli::configure::handle_static_config_command(name.clone(), host.clone(), client_id.clone(), client_secret.clone(), *default, cli.config)?;
+        return Ok(());
+    }
+
+    let ctx = Context::new(cli.profile, cli.config)?;
+
     match &cli.command {
-        Commands::Configure => println!("Configure command not implemented yet."),
-        Commands::Bucket { command } => match command {
-            BucketCommands::Create { name } => println!("bucket create not implemented for {}", name),
-            _ => println!("This bucket command is not implemented yet."),
-        },
-        Commands::Object { .. } => println!("Object commands not implemented yet."),
-        Commands::Auth { .. } => println!("Auth commands not implemented yet."),
+        Commands::Configure { .. } => { /* handled above */ }
+        Commands::StaticConfig { .. } => { /* handled above */ }
+        Commands::Bucket { command } => {
+            cli::bucket::handle_bucket_command(command, &ctx).await?;
+        }
+        Commands::Object { command } => {
+            cli::object::handle_object_command(command, &ctx).await?;
+        }
+        Commands::Auth { command } => {
+            cli::auth::handle_auth_command(command, &ctx).await?;
+        }
+        Commands::Hf { command } => {
+            cli::hf::handle_hf_command(command, &ctx).await?;
+        }
     }
 
     Ok(())

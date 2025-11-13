@@ -4,11 +4,11 @@ use anvil::tasks::TaskStatus;
 use std::time::Duration;
 use tonic::Request;
 
-mod common;
+use anvil_test_utils::*;
 
 #[tokio::test]
 async fn test_delete_bucket_soft_deletes_and_enqueues_task() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
@@ -20,7 +20,7 @@ async fn test_delete_bucket_soft_deletes_and_enqueues_task() {
     let bucket_name = "test-delete-bucket".to_string();
     let mut create_req = Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
-        region: "TEST_REGION".to_string(),
+        region: "test-region-1".to_string(),
     });
     create_req.metadata_mut().insert(
         "authorization",
@@ -82,7 +82,7 @@ async fn test_delete_bucket_soft_deletes_and_enqueues_task() {
 
 #[tokio::test]
 async fn test_list_buckets() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
@@ -96,7 +96,7 @@ async fn test_list_buckets() {
 
     let mut create_req1 = Request::new(CreateBucketRequest {
         bucket_name: bucket_name1.clone(),
-        region: "TEST_REGION".to_string(),
+        region: "test-region-1".to_string(),
     });
     create_req1.metadata_mut().insert(
         "authorization",
@@ -106,7 +106,7 @@ async fn test_list_buckets() {
 
     let mut create_req2 = Request::new(CreateBucketRequest {
         bucket_name: bucket_name2.clone(),
-        region: "TEST_REGION".to_string(),
+        region: "test-region-1".to_string(),
     });
     create_req2.metadata_mut().insert(
         "authorization",

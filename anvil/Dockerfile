@@ -1,39 +1,33 @@
-# This Dockerfile is for the runtime image only.
-# It expects that the binaries have already been compiled on the host.
-# The path to the binaries can be passed in via the BINARY_PATH build argument.
-FROM debian:bookworm-slim
-ARG BINARY_PATH=./target/release
+# Stage 1: Build the binaries
+FROM rust:latest AS builder
 
-# Install runtime dependencies required by the host-built binaries and tests
-# - libssl3: OpenSSL 3 (TLS)
-# - libgcc-s1, libstdc++6: C++ runtime and GCC support libs used by glibc-linked Rust binaries
-# - ca-certificates: TLS roots for outbound HTTPS in tests/clients
-# - curl: used by the container healthcheck in docker-compose.test.yml
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        libssl3 \
-        libgcc-s1 \
-        libstdc++6 \
-        ca-certificates \
-        curl \
-    && rm -rf /var/lib/apt/lists/*
+# Install build dependencies
+RUN apt-get update && apt-get install -y build-essential pkg-config libssl-dev protobuf-compiler
 
-# Stash pre-compiled artifacts from the build context, then locate executables robustly.
-COPY ${BINARY_PATH}/ /tmp/build/
+WORKDIR /usr/src/anvil
 
-# Find the actual executable files named 'anvil' and 'admin' within the copied tree
-# and place them at fixed paths in the runtime image.
-RUN set -eux; \
-    anvil_src=$(find /tmp/build -type f -name anvil -perm -111 | head -n1); \
-    admin_src=$(find /tmp/build -type f -name admin -perm -111 | head -n1); \
-    test -n "$anvil_src" && test -n "$admin_src"; \
-    install -m 0755 "$anvil_src" /usr/local/bin/anvil; \
-    install -m 0755 "$admin_src" /usr/local/bin/admin; \
-    rm -rf /tmp/build
+# Copy the entire project
+COPY . .
 
-# Expose the default gRPC/S3 port and the QUIC P2P port
+# Build the anvil server and the admin CLI in release mode
+RUN cargo build --release --bin anvil --bin admin
+
+# Stage 2: Create the final, minimal image
+FROM rust:latest
+
+# Remove build dependencies and clean up apt caches
+RUN apt-get update && apt-get purge -y build-essential pkg-config libssl-dev protobuf-compiler && \
+    apt-get autoremove -y && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy the compiled binaries from the builder stage
+COPY --from=builder /usr/src/anvil/target/release/anvil /usr/local/bin/anvil
+COPY --from=builder /usr/src/anvil/target/release/admin /usr/local/bin/admin
+
+# Expose the default gRPC/S3 port and a potential swarm port
 EXPOSE 50051
-EXPOSE 7443/udp
+EXPOSE 7443
 
 # Set the default command to run the anvil server
 CMD ["anvil"]

@@ -1,20 +1,14 @@
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::{GetAccessTokenRequest, SetPublicAccessRequest};
 use aws_sdk_s3::Client;
-use aws_sdk_s3::primitives::{ByteStream, SdkBody};
-use bytes::Bytes;
-use http_body_util::StreamBody;
-use hyper::body::Frame;
+use aws_sdk_s3::primitives::ByteStream;
 use rand::random;
-use std::convert::Infallible;
 use std::env::temp_dir;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::fs;
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::ReceiverStream;
 
-mod common;
+use anvil_test_utils::*;
 
 // Helper function to create an app, since it's used in auth tests.
 fn create_app(global_db_url: &str, app_name: &str) -> (String, String) {
@@ -36,8 +30,8 @@ fn create_app(global_db_url: &str, app_name: &str) -> (String, String) {
         .unwrap();
     assert!(app_output.status.success());
     let creds = String::from_utf8(app_output.stdout).unwrap();
-    let client_id = common::extract_credential(&creds, "Client ID");
-    let client_secret = common::extract_credential(&creds, "Client Secret");
+    let client_id = extract_credential(&creds, "Client ID");
+    let client_secret = extract_credential(&creds, "Client Secret");
     (client_id, client_secret)
 }
 
@@ -65,7 +59,7 @@ async fn get_token_for_scopes(
 
 #[tokio::test]
 async fn test_s3_public_and_private_access() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let (client_id, client_secret) = create_app(&cluster.global_db_url, "s3-test-app");
@@ -124,7 +118,7 @@ async fn test_s3_public_and_private_access() {
     .unwrap();
     let mut req = tonic::Request::new(anvil::anvil_api::CreateBucketRequest {
         bucket_name: private_bucket.clone(),
-        region: "TEST_REGION".to_string(),
+        region: "test-region-1".to_string(),
     });
     req.metadata_mut().insert(
         "authorization",
@@ -134,7 +128,7 @@ async fn test_s3_public_and_private_access() {
 
     let mut req = tonic::Request::new(anvil::anvil_api::CreateBucketRequest {
         bucket_name: public_bucket.clone(),
-        region: "TEST_REGION".to_string(),
+        region: "test-region-1".to_string(),
     });
     req.metadata_mut().insert(
         "authorization",
@@ -232,7 +226,7 @@ async fn test_s3_public_and_private_access() {
 
 #[tokio::test]
 async fn test_streaming_upload_decoding() {
-    let mut cluster = common::TestCluster::new(&["TEST_REGION"]).await;
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let (client_id, client_secret) = create_app(&cluster.global_db_url, "streaming-decode-app");
@@ -273,7 +267,7 @@ async fn test_streaming_upload_decoding() {
     let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
     let config = aws_sdk_s3::Config::builder()
         .credentials_provider(credentials)
-        .region(aws_sdk_s3::config::Region::new("TEST_REGION"))
+        .region(aws_sdk_s3::config::Region::new("test-region-1"))
         .endpoint_url(http_base)
         .force_path_style(true)
         .behavior_version_latest()
@@ -293,7 +287,7 @@ async fn test_streaming_upload_decoding() {
 
     // 1. Upload the object using a true stream, which forces aws-chunked encoding.
     let stream = original_content.as_bytes().to_vec();
-    let content_len = stream.len();
+    let _content_len = stream.len();
     // let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(16);
     // tokio::spawn(async move {
     //     for chunk in stream.into_chunks::<5>() {

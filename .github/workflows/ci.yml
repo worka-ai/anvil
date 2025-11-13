@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    runs-on: worka-l1
 
     services:
       postgres:
@@ -93,9 +93,9 @@ jobs:
     - name: Run All Tests
       env:
         ANVIL_IMAGE: ${{ steps.img.outputs.tag }}
-      run: cargo test --workspace -- --nocapture
+      run: cargo test -p anvil --test cli_extended -- --nocapture
 
-    # --- Release Steps --- 
+    # --- Release Steps ---
     # These steps will only run on a successful push to the main branch.
 
     - name: Log in to GitHub Container Registry

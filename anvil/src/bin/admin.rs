@@ -51,12 +51,32 @@ enum Commands {
         #[clap(subcommand)]
         command: BucketCommands,
     },
+    /// Manage admin users
+    Users {
+        #[clap(subcommand)]
+        command: UserCommands,
+    },
 }
 
 #[derive(Subcommand)]
 enum TenantCommands {
     /// Create a new tenant
     Create { name: String },
+}
+
+#[derive(Subcommand)]
+enum UserCommands {
+    /// Create a new admin user
+    Create {
+        #[clap(long)]
+        username: String,
+        #[clap(long)]
+        email: String,
+        #[clap(long)]
+        password: String,
+        #[clap(long)]
+        role: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -136,6 +156,8 @@ async fn main() -> anyhow::Result<()> {
                 tenant_name,
                 app_name,
             } => {
+                println!("Creating app for tenant: {}", tenant_name);
+                println!("Admin received tenant_name: {}", tenant_name);
                 let tenant = persistence
                     .get_tenant_by_name(tenant_name)
                     .await?
@@ -215,6 +237,13 @@ async fn main() -> anyhow::Result<()> {
                     "Set public read access for bucket '{}' to {}",
                     bucket, allow
                 );
+            }
+        },
+        Commands::Users { command } => match command {
+            UserCommands::Create { username, email, password, role } => {
+                let hashed_password = bcrypt::hash(password, bcrypt::DEFAULT_COST)?;
+                persistence.create_admin_user(username, email, &hashed_password, role).await?;
+                info!("Created admin user: {}", username);
             }
         },
     }
