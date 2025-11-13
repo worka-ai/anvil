@@ -422,13 +422,14 @@ async fn test_cli_hf_key_ls() {
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
 
-    let output = run_cli(&["hf", "key", "add", "--name", "test-key", "--token", "test-token"], config_dir.path()).await;
+    let key_name = format!("test-key-{}", uuid::Uuid::new_v4());
+    let output = run_cli(&["hf", "key", "add", "--name", &key_name, "--token", "test-token"], config_dir.path()).await;
     assert!(output.status.success());
 
     let output = run_cli(&["hf", "key", "ls"], config_dir.path()).await;
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("test-key"));
+    assert!(stdout.contains(&key_name));
 }
 
 #[tokio::test]
@@ -438,13 +439,14 @@ async fn test_cli_hf_key_rm() {
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
 
-    let output = run_cli(&["hf", "key", "add", "--name", "test-key", "--token", "test-token"], config_dir.path()).await;
+    let key_name = format!("test-key-{}", uuid::Uuid::new_v4());
+    let output = run_cli(&["hf", "key", "add", "--name", &key_name, "--token", "test-token"], config_dir.path()).await;
     assert!(output.status.success());
 
-    let output = run_cli(&["hf", "key", "rm", "--name", "test-key"], config_dir.path()).await;
+    let output = run_cli(&["hf", "key", "rm", "--name", &key_name], config_dir.path()).await;
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("deleted key: test-key"));
+    assert!(stdout.contains(&format!("deleted key: {}", key_name)));
 }
 
 #[tokio::test]
@@ -454,7 +456,8 @@ async fn test_cli_hf_ingest_cancel() {
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
 
-    let output = run_cli(&["hf", "key", "add", "--name", "test-key", "--token", "test-token"], config_dir.path()).await;
+    let key_name = format!("test-key-{}", uuid::Uuid::new_v4());
+    let output = run_cli(&["hf", "key", "add", "--name", &key_name, "--token", "test-token"], config_dir.path()).await;
     assert!(output.status.success());
 
     let bucket_name = format!("my-hf-ingest-cancel-bucket-{}", uuid::Uuid::new_v4());
@@ -465,7 +468,7 @@ async fn test_cli_hf_ingest_cancel() {
 
     let output = run_cli(&[
         "hf", "ingest", "start",
-        "--key", "test-key",
+        "--key", &key_name,
         "--repo", "openai/gpt-oss-20b",
         "--bucket", &bucket_name,
         "--target-region", "test-region-1",
@@ -487,7 +490,8 @@ async fn test_cli_hf_ingest_start_with_options() {
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
 
-    let output = run_cli(&["hf", "key", "add", "--name", "test-key", "--token", "test-token"], config_dir.path()).await;
+    let key_name = format!("test-key-{}", uuid::Uuid::new_v4());
+    let output = run_cli(&["hf", "key", "add", "--name", &key_name, "--token", "test-token"], config_dir.path()).await;
     assert!(output.status.success());
 
     let bucket_name = format!("hf-ingest-opts-{}", uuid::Uuid::new_v4());
@@ -498,7 +502,7 @@ async fn test_cli_hf_ingest_start_with_options() {
 
     let output = run_cli(&[
         "hf", "ingest", "start",
-        "--key", "test-key",
+        "--key", &key_name,
         "--repo", "openai/gpt-oss-20b",
         "--bucket", &bucket_name,
         "--target-region", "test-region-1",
