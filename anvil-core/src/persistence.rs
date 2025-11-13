@@ -639,8 +639,8 @@ impl Persistence {
         name: &str,
         region: &str,
     ) -> Result<Bucket, tonic::Status> {
-        tracing::info!(
-            "[Persistence] Creating bucket: tenant_id={}, name={}, region={}",
+        tracing::debug!(
+            "[Persistence] ENTERING create_bucket: tenant_id={}, name={}, region={}",
             tenant_id,
             name,
             region
@@ -658,8 +658,12 @@ impl Persistence {
             .await;
 
         match result {
-            Ok(row) => Ok(row.into()),
+            Ok(row) => {
+                tracing::debug!("[Persistence] EXITING create_bucket: success");
+                Ok(row.into())
+            }
             Err(e) => {
+                tracing::debug!("[Persistence] EXITING create_bucket: error");
                 if let Some(db_err) = e.as_db_error() {
                     if db_err.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION {
                         return Err(tonic::Status::already_exists(
@@ -722,6 +726,7 @@ impl Persistence {
     }
 
     pub async fn list_buckets_for_tenant(&self, tenant_id: i64) -> Result<Vec<Bucket>> {
+        tracing::debug!("[Persistence] ENTERING list_buckets_for_tenant: tenant_id={}", tenant_id);
         let client = self.global_pool.get().await?;
         let rows = client
             .query(
@@ -729,7 +734,9 @@ impl Persistence {
                 &[&tenant_id],
             )
             .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        let buckets: Vec<Bucket> = rows.into_iter().map(Into::into).collect();
+        tracing::debug!("[Persistence] EXITING list_buckets_for_tenant, found {} buckets", buckets.len());
+        Ok(buckets)
     }
 
     // --- Regional Methods ---
