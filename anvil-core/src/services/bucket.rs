@@ -9,14 +9,11 @@ impl BucketService for AppState {
         &self,
         request: Request<CreateBucketRequest>,
     ) -> Result<Response<CreateBucketResponse>, Status> {
-        tracing::info!("[BucketService] ENTERING create_bucket. Metadata: {:?}", request.metadata());
-
+        println!("[service] ENTERING create_bucket");
         let claims = request
             .extensions()
             .get::<auth::Claims>()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
-
-        tracing::info!("[BucketService] Claims successfully extracted. Tenant ID: {}", claims.tenant_id);
 
         let req = request.get_ref();
 
@@ -29,6 +26,7 @@ impl BucketService for AppState {
             )
             .await?;
 
+        println!("[service] EXITING create_bucket");
         Ok(Response::new(CreateBucketResponse {}))
     }
 
@@ -53,6 +51,7 @@ impl BucketService for AppState {
         &self,
         request: Request<ListBucketsRequest>,
     ) -> Result<Response<ListBucketsResponse>, Status> {
+        println!("[service] ENTERING list_buckets");
         let claims = request
             .extensions()
             .get::<auth::Claims>()
@@ -63,7 +62,7 @@ impl BucketService for AppState {
             .list_buckets(claims.tenant_id, &claims.scopes)
             .await?;
 
-        let response_buckets = buckets
+        let response_buckets: Vec<crate::anvil_api::Bucket> = buckets
             .into_iter()
             .map(|b| crate::anvil_api::Bucket {
                 name: b.name,
@@ -71,6 +70,7 @@ impl BucketService for AppState {
             })
             .collect();
 
+        println!("[service] EXITING list_buckets, found {} buckets", response_buckets.len());
         Ok(Response::new(ListBucketsResponse {
             buckets: response_buckets,
         }))
