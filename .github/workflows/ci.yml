@@ -73,7 +73,9 @@ jobs:
       with:
         context: .
         file: anvil/Dockerfile
-        load: true
+#        Triggers Error: buildx failed with: ERROR: failed to build: docker exporter does not currently support exporting manifest lists
+#        https://github.com/docker/buildx/issues/59
+#        load: true
         push: false
         tags: ${{ steps.img.outputs.tag }}
         platforms: linux/amd64,linux/arm64

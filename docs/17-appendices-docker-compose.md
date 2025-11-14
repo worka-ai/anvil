@@ -1,17 +1,17 @@
 ---
 slug: /anvil/appendices/docker-compose
 title: 'Appendix A: Docker Compose Reference'
-description: A reference copy of the `docker-compose.yml` file for deploying a multi-node Anvil cluster.
+description: A reference copy of the `docker-compose.yml` file for deploying a multi-node Anvil cluster for testing.
 tags: [appendices, docker, configuration]
 ---
 
 # Appendix A: Docker Compose Reference
 
-This appendix contains the full `docker-compose.yml` file used for setting up a multi-node Anvil cluster for development and testing. It demonstrates how to configure multiple Anvil peers, connect them to shared databases, and set up the necessary networking and environment variables.
+This appendix contains a full `docker-compose.yml` file used for setting up a multi-node Anvil cluster for development and testing. It demonstrates how to configure multiple Anvil peers, connect them to shared databases, and set up the necessary networking and environment variables. This is a more complex setup than the single-node example in the Getting Started guide.
 
 ### Single-Node Development
 
-For a simpler, single-node setup, you can refer to the version in the [Getting Started](/docs/anvil/getting-started) guide.
+For a simpler, single-node setup, you can refer to the version in the [Getting Started](../getting-started) guide.
 
 ### Multi-Node Cluster (`docker-compose.yml`)
 
@@ -56,7 +56,7 @@ services:
       retries: 5
 
   anvil1:
-    build: .
+    image: ghcr.io/worka-ai/anvil:v2025.11.14-001012
     depends_on:
       postgres-global:
         condition: service_healthy
@@ -70,7 +70,7 @@ services:
       # --- CRITICAL: SET THESE TO SECURE, RANDOMLY GENERATED VALUES ---
       JWT_SECRET: "must-be-a-long-and-random-secret-for-signing-jwts"
       ANVIL_SECRET_ENCRYPTION_KEY: "must-be-a-64-character-hex-string-generate-with-openssl-rand-hex-32"
-      ANVIL_CLUSTER_SECRET: "must-be-a-long-and-random-secret-for-cluster-gossip"
+      CLUSTER_SECRET: "must-be-a-long-and-random-secret-for-cluster-gossip"
       # --- Networking Configuration ---
       # These addresses MUST be reachable by other nodes and clients.
       # In a real deployment, replace 203.0.113.1 with the node's public IP address.
@@ -91,7 +91,7 @@ services:
       retries: 5
 
   anvil2:
-    build: .
+    image: ghcr.io/worka-ai/anvil:v2025.11.14-001012
     depends_on:
       anvil1:
         condition: service_started
@@ -102,7 +102,7 @@ services:
       REGION: "europe-west-1"
       JWT_SECRET: "must-be-a-long-and-random-secret-for-signing-jwts"
       ANVIL_SECRET_ENCRYPTION_KEY: "must-be-a-64-character-hex-string-generate-with-openssl-rand-hex-32"
-      ANVIL_CLUSTER_SECRET: "must-be-a-long-and-random-secret-for-cluster-gossip"
+      CLUSTER_SECRET: "must-be-a-long-and-random-secret-for-cluster-gossip"
       API_LISTEN_ADDR: "0.0.0.0:50051"
       CLUSTER_LISTEN_ADDR: "/ip4/0.0.0.0/udp/7444/quic-v1"
       PUBLIC_CLUSTER_ADDRS: "/ip4/203.0.113.2/udp/7444/quic-v1"
@@ -115,7 +115,7 @@ services:
     networks: [anvilnet]
 
   anvil3:
-    build: .
+    image: ghcr.io/worka-ai/anvil:v2025.11.14-001012
     depends_on:
       anvil1:
         condition: service_started
@@ -126,7 +126,7 @@ services:
       REGION: "europe-west-1"
       JWT_SECRET: "must-be-a-long-and-random-secret-for-signing-jwts"
       ANVIL_SECRET_ENCRYPTION_KEY: "must-be-a-64-character-hex-string-generate-with-openssl-rand-hex-32"
-      ANVIL_CLUSTER_SECRET: "must-be-a-long-and-random-secret-for-cluster-gossip"
+      CLUSTER_SECRET: "must-be-a-long-and-random-secret-for-cluster-gossip"
       API_LISTEN_ADDR: "0.0.0.0:50051"
       CLUSTER_LISTEN_ADDR: "/ip4/0.0.0.0/udp/7445/quic-v1"
       PUBLIC_CLUSTER_ADDRS: "/ip4/203.0.113.3/udp/7445/quic-v1"

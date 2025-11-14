@@ -9,7 +9,7 @@ tags: [developer-guide, architecture, principles, rust, quic, postgres]
 
 > **TL;DR:** Anvil is a distributed system built on Rust, QUIC, and Postgres. It prioritizes operational simplicity and multi-tenancy, using erasure coding for durability and a gossip protocol for membership.
 
-This guide is for developers who want to contribute to Anvil or understand its internal workings. We begin with a high-level view of the system's architecture and the design decisions that shape it.
+This guide is for developers who want to understand Anvil's internal workings. We begin with a high-level view of the system's architecture and the design decisions that shape it.
 
 ### 10.1. Guiding Principles
 
@@ -22,8 +22,6 @@ Anvil's design is guided by a few core principles:
 3.  **Durability through Redundancy:** Data durability is achieved via Reed-Solomon erasure coding, which provides a much higher level of durability for the same storage overhead compared to simple replication.
 
 4.  **Performance-First:** We prioritize performance by using modern, efficient technologies. This includes zero-copy I/O where possible, a fully asynchronous Rust codebase built on Tokio, and a high-performance QUIC-based network protocol.
-
-5.  **Extensibility:** The system is designed to be a foundation for more than just storage. The concept of "Compute Capabilities" is a first-class citizen, paving the way for a unified data and compute fabric.
 
 ### 10.2. Core Technologies
 

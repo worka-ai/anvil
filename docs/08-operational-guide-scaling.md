@@ -50,7 +50,7 @@ version: "3.8"
 
 services:
   anvil2:
-    image: ghcr.io/worka-ai/anvil:main
+    image: ghcr.io/worka-ai/anvil:v2025.11.14-001012
     # We don't run databases here; we point to the ones on Host A
     environment:
       RUST_LOG: "info"
@@ -63,7 +63,7 @@ services:
       # --- Use the SAME secrets as the rest of the cluster ---
       JWT_SECRET: "must-be-a-long-and-random-secret-for-signing-jwts"
       ANVIL_SECRET_ENCRYPTION_KEY: "must-be-a-64-character-hex-string-generate-with-openssl-rand-hex-32"
-      ANVIL_CLUSTER_SECRET: "must-be-a-long-and-random-secret-for-cluster-gossip"
+      CLUSTER_SECRET: "must-be-a-long-and-random-secret-for-cluster-gossip"
 
       # --- Networking for Host B ---
       API_LISTEN_ADDR: "0.0.0.0:50051"
@@ -112,9 +112,9 @@ For large-scale, geographically distributed deployments, Anvil supports a multi-
 
 1.  **Set up a new PostgreSQL database** for the new region.
 2.  **Run the regional database migrations** against this new database.
-3.  **Register the new region** in the global database using the admin CLI:
+3.  **Register the new region** in the global database using the admin tool:
     ```bash
-    anvil admin regions create --name <NEW_REGION_NAME>
+    docker compose exec <ANY_ANVIL_NODE> admin regions create <NEW_REGION_NAME>
     ```
 4.  **Launch new Anvil peers** in the new geographical location, configuring them with:
     *   The shared `GLOBAL_DATABASE_URL`.
