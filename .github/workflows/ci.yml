@@ -39,6 +39,9 @@ jobs:
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@stable
 
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+
     - name: Install Protoc
       uses: arduino/setup-protoc@v2
       with:
@@ -73,9 +76,7 @@ jobs:
         load: true
         push: false
         tags: ${{ steps.img.outputs.tag }}
-        platforms: linux/amd64
-        build-args: |
-          BINARY_PATH=./target/release
+        platforms: linux/amd64,linux/arm64
 
     - name: Validate runtime binary in image
       run: |
@@ -130,9 +131,7 @@ jobs:
         push: true
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
-        platforms: linux/amd64
-        build-args: |
-          BINARY_PATH=./target/release
+        platforms: linux/amd64,linux/arm64
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
