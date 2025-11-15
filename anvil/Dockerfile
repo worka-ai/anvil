@@ -10,7 +10,8 @@ WORKDIR /usr/src/anvil
 COPY . .
 
 # Build the anvil server and the admin CLI in release mode
-RUN cargo build --release --bin anvil --bin admin -p anvil-cli
+RUN cargo build --release --bin anvil --bin admin
+RUN cargo build --release -p anvil-cli
 
 # Stage 2: Create the final, minimal image
 FROM rust:latest
