@@ -92,7 +92,7 @@ jobs:
     - name: Run All Tests
       env:
         ANVIL_IMAGE: ${{ steps.img.outputs.tag }}
-      run: cargo test -p anvil --test cli_extended -- --nocapture
+      run: cargo test -- --nocapture
 
     # --- Release Steps ---
     # These steps will only run on a successful push to the main branch.
