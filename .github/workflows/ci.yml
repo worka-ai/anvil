@@ -91,7 +91,7 @@ jobs:
 
     - name: Run All Tests
       env:
-        ANVIL_IMAGE: ${{ steps.img.outputs.tag }}
+        ANVIL_IMAGE: anvil:test
       run: cargo test -- --nocapture
 
     # --- Release Steps ---
