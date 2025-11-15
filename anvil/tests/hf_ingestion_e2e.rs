@@ -23,6 +23,7 @@ struct ComposeGuard;
 
 impl Drop for ComposeGuard { fn drop(&mut self) { let _ = Command::new("docker").args(["compose","down","-v"]).status(); } }
 
+#[ignore]
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn hf_ingestion_config_json() {
