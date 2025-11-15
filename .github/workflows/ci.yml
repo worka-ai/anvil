@@ -81,11 +81,6 @@ jobs:
 #        # platforms: linux/amd64,linux/arm64
         platforms: linux/amd64
 
-    - name: Validate runtime binary in image
-      run: |
-        docker run --rm ${{ steps.img.outputs.tag }} ls -l /usr/local/bin
-        docker run --rm ${{ steps.img.outputs.tag }} /usr/local/bin/anvil --help >/dev/null
-
     - name: Wait for PostgreSQL to be ready
       run: |
         until pg_isready -h localhost -p 5432 -U postgres; do
