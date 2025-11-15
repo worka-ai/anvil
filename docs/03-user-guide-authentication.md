@@ -25,7 +25,7 @@ This model ensures that you can issue, rotate, and revoke credentials for differ
 
 ### 3.2. Creating an App and Getting Credentials
 
-You create an App using the `anvil admin` CLI (as shown in the Getting Started guide) or via the administrative API.
+You create an App using the `admin` tool (as shown in the Getting Started guide) or via the administrative API.
 
 ```bash
 # This command is run by an administrator
@@ -49,7 +49,7 @@ Permissions in Anvil are defined by policies that connect an App to an **action*
     *   `write`: Permission to create, update, or delete resources.
     *   `grant`: Permission to manage the permissions of other apps (a highly privileged action).
 
-A policy is granted using the admin CLI:
+A policy is granted using the admin tool:
 
 ```bash
 # Grant the app permission to read and write objects in 'my-data-bucket'
@@ -75,7 +75,7 @@ When a bucket is public:
 -   `GetObject` and `HeadObject` operations are allowed for anonymous users (without any authentication).
 -   All other operations (`PutObject`, `DeleteObject`, `ListObjects`) still require valid, authorized credentials.
 
-You can set a bucket's public status using the `anvil admin` CLI or the gRPC API.
+You can set a bucket's public status using the `admin` tool or the gRPC API.
 
 ```bash
 # Make a bucket public (requires 'grant' permission on the bucket)

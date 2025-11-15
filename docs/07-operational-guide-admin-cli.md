@@ -1,19 +1,19 @@
+--- 
+slug: /anvil/operational-guide/admin-tool
+title: 'Operational Guide: The Admin Tool'
+description: A reference guide for using the `admin` tool to manage tenants, apps, policies, and regions.
+tags: [operational-guide, admin, tenants, apps, policies]
 ---
-slug: /anvil/operational-guide/admin-cli
-title: 'Operational Guide: The Anvil Admin CLI'
-description: A reference guide for using the `anvil admin` command-line interface to manage tenants, apps, policies, and regions.
-tags: [operational-guide, admin, cli, tenants, apps, policies]
----
 
-# Chapter 7: The Anvil Admin CLI
+# Chapter 9: The Admin Tool
 
-> **TL;DR:** Use the `anvil admin` CLI for core administrative tasks. It connects directly to the global database to manage tenants, regions, apps, and policies.
+> **TL;DR:** Use the `admin` tool for core administrative tasks. It connects directly to the global database to manage tenants, regions, apps, and policies.
 
-Anvil includes a powerful command-line interface (CLI) for performing essential administrative tasks. This tool is the primary way to bootstrap the system and manage high-level resources. It works by connecting directly to the global PostgreSQL database.
+Anvil includes a powerful command-line tool for performing essential administrative tasks. This tool is the primary way to bootstrap the system and manage high-level resources. It works by connecting directly to the global PostgreSQL database.
 
-### Running the Admin CLI
+### Running the Admin Tool
 
-When running Anvil via Docker Compose, you can execute the admin CLI using `docker-compose exec`. Note that the command is `admin`, not `anvil admin`.
+When running Anvil via Docker Compose, you can execute the admin tool using `docker-compose exec`. The command to run is `admin`.
 
 ```bash
 docker compose exec anvil1 admin <COMMAND>

@@ -39,6 +39,9 @@ jobs:
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@stable
 
+    # - name: Set up QEMU
+    #   uses: docker/setup-qemu-action@v3
+
     - name: Install Protoc
       uses: arduino/setup-protoc@v2
       with:
@@ -70,17 +73,13 @@ jobs:
       with:
         context: .
         file: anvil/Dockerfile
-        load: true
+#        Triggers Error: buildx failed with: ERROR: failed to build: docker exporter does not currently support exporting manifest lists
+#        https://github.com/docker/buildx/issues/59
+        load: true #When ARM support is re-enabled, this needs to be disabled
         push: false
-        tags: ${{ steps.img.outputs.tag }}
+        tags: anvil:test
+#        # platforms: linux/amd64,linux/arm64
         platforms: linux/amd64
-        build-args: |
-          BINARY_PATH=./target/release
-
-    - name: Validate runtime binary in image
-      run: |
-        docker run --rm ${{ steps.img.outputs.tag }} ls -l /usr/local/bin
-        docker run --rm ${{ steps.img.outputs.tag }} /usr/local/bin/anvil --help >/dev/null
 
     - name: Wait for PostgreSQL to be ready
       run: |
@@ -130,11 +129,17 @@ jobs:
         push: true
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
+        # platforms: linux/amd64,linux/arm64
         platforms: linux/amd64
-        build-args: |
-          BINARY_PATH=./target/release
         cache-from: type=gha
         cache-to: type=gha,mode=max
+
+    - name: Prepare Release Assets
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      run: |
+        mkdir -p release
+        docker cp $(docker create ${{ steps.meta.outputs.tags }}):/usr/local/bin/anvil-cli release/anvil
+        docker cp $(docker create ${{ steps.meta.outputs.tags }}):/usr/local/bin/admin release/anvil-admin
 
     - name: Create GitHub Release
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -150,3 +155,6 @@ jobs:
           ```sh
           docker pull ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.tag_name }}
           ```
+        files: |
+          release/anvil
+          release/anvil-admin

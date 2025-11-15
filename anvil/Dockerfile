@@ -11,6 +11,7 @@ COPY . .
 
 # Build the anvil server and the admin CLI in release mode
 RUN cargo build --release --bin anvil --bin admin
+RUN cargo build --release -p anvil-cli
 
 # Stage 2: Create the final, minimal image
 FROM rust:latest
@@ -24,6 +25,7 @@ RUN apt-get update && apt-get purge -y build-essential pkg-config libssl-dev pro
 # Copy the compiled binaries from the builder stage
 COPY --from=builder /usr/src/anvil/target/release/anvil /usr/local/bin/anvil
 COPY --from=builder /usr/src/anvil/target/release/admin /usr/local/bin/admin
+COPY --from=builder /usr/src/anvil/target/release/anvil-cli /usr/local/bin/anvil-cli
 
 # Expose the default gRPC/S3 port and a potential swarm port
 EXPOSE 50051

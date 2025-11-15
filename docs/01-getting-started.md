@@ -1,20 +1,20 @@
 ---
 slug: /anvil/getting-started
 title: 'Getting Started: Anvil in 10 Minutes'
-description: A hands-on guide to launching a single-node Anvil instance with Docker and interacting with it using an S3 client.
-tags: [getting-started, docker, s3]
+description: A hands-on guide to launching a single-node Anvil instance with Docker and interacting with it using the Anvil CLI.
+tags: [getting-started, docker, cli]
 ---
 
 # Chapter 1: Anvil in 10 Minutes
 
-> **TL;DR:** Use our `docker-compose.yml` to launch a single-node Anvil instance and its Postgres database. Use the `anvil-cli` or any S3 client to create a bucket and upload your first file.
+> **TL;DR:** Use our `docker-compose.yml` to launch a single-node Anvil instance and its Postgres database. Use the `anvil` to create a bucket and upload your first file.
 
 This guide will walk you through the fastest way to get a fully functional, single-node Anvil instance running on your local machine. By the end, you will have created a bucket, uploaded a file, and downloaded it back.
 
 ### 1.1. Prerequisites
 
 -   **Docker and Docker Compose:** Anvil is packaged as a Docker container for easy deployment. Ensure you have both [Docker](https://docs.docker.com/get-docker/) and [Docker Compose](https://docs.docker.com/compose/install/) installed.
--   **An S3 Client:** You will need a client tool that can speak the S3 protocol. We recommend the [AWS Command Line Interface (CLI)](https://aws.amazon.com/cli/).
+-   **`anvil`:** The Anvil command-line interface is the primary tool for interacting with your Anvil cluster. It should be provided as part of your Anvil distribution.
 
 ### 1.2. Launching Anvil with Docker Compose
 
@@ -61,7 +61,7 @@ services:
       retries: 5
 
   anvil1:
-    image: ghcr.io/worka-ai/anvil:main
+    image: ghcr.io/worka-ai/anvil:v2025.11.14-001012
     depends_on:
       postgres-global:
         condition: service_healthy
@@ -112,7 +112,7 @@ This command will download the necessary images and start the Anvil and Postgres
 
 ### 1.3. Creating Your First Tenant and API Key
 
-Anvil is a multi-tenant system. Before you can create buckets, you need a **Tenant** and an **App** with an API key. You can create these using the `admin` CLI, which we will run inside the running Docker container.
+Anvil is a multi-tenant system. Before you can create buckets, you need a **Tenant** and an **App** with an API key. You can create these using the `admin` tool, which we will run inside the running Docker container.
 
 **Step 1: Create the Region and Tenant**
 
@@ -126,14 +126,14 @@ docker compose exec anvil1 admin tenants create my-first-tenant
 
 **Step 2: Create an App**
 
-Next, create an App for this tenant. This will generate the credentials needed to interact with the S3 API.
+Next, create an App for this tenant. This will generate the credentials needed to interact with the API.
 
 ```bash
 # Create an app and get its credentials (uses named flags)
-docker compose exec anvil1 admin apps create --tenant-name my-first-tenant --app-name my-s3-app
+docker compose exec anvil1 admin apps create --tenant-name my-first-tenant --app-name my-cli-app
 ```
 
-This command will output a **Client ID** and a **Client Secret**. **Save these securely!** They are your S3 access credentials.
+This command will output a **Client ID** and a **Client Secret**. **Save these securely!** They are your API credentials.
 
 **Step 3: Grant Permissions**
 
@@ -143,31 +143,28 @@ By default, a new app has **no permissions**. You must explicitly grant it the r
 
 ```bash
 # Grant the app full permissions on all resources
-docker compose exec anvil1 admin policies grant --app-name my-s3-app --action "*" --resource "*"
+docker compose exec anvil1 admin policies grant --app-name my-cli-app --action "*" --resource "*"
 ```
 
-### 1.4. Using an S3 Client to Create a Bucket
+### 1.4. Using the `anvil` to Create a Bucket
 
-Now you can configure your S3 client to connect to Anvil. For the AWS CLI, you can set the credentials and endpoint URL using environment variables.
+Now you can configure the `anvil` to connect to your new Anvil instance.
 
-Replace `YOUR_CLIENT_ID` and `YOUR_CLIENT_SECRET` with the values you saved in the previous step.
+**Step 1: Configure the CLI**
+
+Run the `configure` command and provide the host and the credentials you saved.
 
 ```bash
-export AWS_ACCESS_KEY_ID=YOUR_CLIENT_ID
-export AWS_SECRET_ACCESS_KEY=YOUR_SECRET_ACCESS_KEY
-export AWS_DEFAULT_REGION=europe-west-1
-
-# The Anvil S3 endpoint (note the port)
-ANVIL_ENDPOINT="http://localhost:50051"
+# Replace YOUR_CLIENT_ID and YOUR_CLIENT_SECRET with the values from the previous step
+anvil configure --host http://localhost:50051 --client-id YOUR_CLIENT_ID --client-secret YOUR_CLIENT_SECRET
 ```
 
-Now, create a bucket. Bucket names must be globally unique.
+**Step 2: Create a Bucket**
+
+Now, create a bucket.
 
 ```bash
-aws s3api create-bucket \
-    --bucket my-first-anvil-bucket \
-    --region europe-west-1 \
-    --endpoint-url $ANVIL_ENDPOINT
+anvil bucket create --name my-first-anvil-bucket --region europe-west-1
 ```
 
 ### 1.5. Uploading and Downloading Your First Object
@@ -178,22 +175,22 @@ Create a sample file to upload:
 echo "Hello, Anvil!" > hello.txt
 ```
 
-Upload it to your new bucket:
+Upload it to your new bucket using an S3-style path:
 
 ```bash
-aws s3 cp hello.txt s3://my-first-anvil-bucket/hello.txt --endpoint-url $ANVIL_ENDPOINT
+anvil object put --src hello.txt --dest s3://my-first-anvil-bucket/hello.txt
 ```
 
 You can list the objects in your bucket to confirm the upload was successful:
 
 ```bash
-aws s3 ls s3://my-first-anvil-bucket/ --endpoint-url $ANVIL_ENDPOINT
+anvil object ls --path s3://my-first-anvil-bucket/
 ```
 
 Finally, download the file back to verify its contents:
 
 ```bash
-aws s3 cp s3://my-first-anvil-bucket/hello.txt downloaded_hello.txt --endpoint-url $ANVIL_ENDPOINT
+anvil object get --src s3://my-first-anvil-bucket/hello.txt --dest downloaded_hello.txt
 
 cat downloaded_hello.txt
 # Expected output: Hello, Anvil!

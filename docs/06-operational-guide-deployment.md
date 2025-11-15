@@ -15,7 +15,7 @@ This chapter covers the fundamentals of deploying Anvil. The architecture is fle
 
 A single-node deployment is the simplest way to run Anvil and is perfect for development, testing, or small-scale use cases. It consists of one Anvil instance and two PostgreSQL databases (which can run on the same Postgres server).
 
-See the `docker-compose.yml` in the [Getting Started](/docs/anvil/getting-started) guide for a complete, working example.
+See the `docker-compose.yml` in the [Getting Started](../getting-started) guide for a complete, working example.
 
 **Key Configuration Parameters:**
 
@@ -92,7 +92,7 @@ sudo firewall-cmd --reload
 
 ### 6.3. Configuration Reference
 
-Anvil is configured entirely through environment variables. The following is a reference for the most important variables, defined in `src/config.rs`.
+Anvil is configured entirely through environment variables. The following is a reference for the most important variables.
 
 | Variable                        | Description                                                                 |
 | ------------------------------- | --------------------------------------------------------------------------- |
@@ -101,7 +101,7 @@ Anvil is configured entirely through environment variables. The following is a r
 | `REGION`                        | **Required.** The name of the region this node belongs to.                  |
 | `JWT_SECRET`                    | **Required.** Secret key for minting and verifying JWTs.                    |
 | `ANVIL_SECRET_ENCRYPTION_KEY`   | **Required.** A 64-character hex-encoded string for AES-256 encryption. <br/><br/> **CRITICAL:** This key is used to encrypt sensitive data at rest. It **MUST** be a cryptographically secure, 64-character hexadecimal string (representing 32 bytes). Loss of this key will result in permanent data loss. <br/><br/> Generate a secure key with: <br/> `openssl rand -hex 32` |
-| `ANVIL_CLUSTER_SECRET`          | A shared secret to authenticate and encrypt inter-node gossip messages.     |
+| `CLUSTER_SECRET`          | A shared secret to authenticate and encrypt inter-node gossip messages.     |
 | `API_LISTEN_ADDR`               | The local IP and port for the unified S3 Gateway and gRPC service (e.g., `0.0.0.0:50051`). |
 | `CLUSTER_LISTEN_ADDR`           | The local multiaddress for the QUIC P2P listener.                           |
 | `PUBLIC_CLUSTER_ADDRS`          | Comma-separated list of public-facing multiaddresses for this node.         |
