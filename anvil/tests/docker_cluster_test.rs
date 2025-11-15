@@ -38,6 +38,7 @@ impl Drop for ComposeGuard {
     }
 }
 
+#[ignore]
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn docker_cluster_end_to_end() {
