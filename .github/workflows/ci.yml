@@ -75,8 +75,9 @@ jobs:
         file: anvil/Dockerfile
 #        Triggers Error: buildx failed with: ERROR: failed to build: docker exporter does not currently support exporting manifest lists
 #        https://github.com/docker/buildx/issues/59
-        load: 'true' #When ARM support is re-enabled, this needs to be disabled
-        push: 'false'
+        load: true #When ARM support is re-enabled, this needs to be disabled
+        push: false
+        tags: anvil:test
 #        # platforms: linux/amd64,linux/arm64
         platforms: linux/amd64
 
