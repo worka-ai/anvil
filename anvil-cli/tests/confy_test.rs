@@ -1,6 +1,6 @@
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use serde::{Serialize, Deserialize};
 use tempfile::tempdir;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -36,8 +36,11 @@ fn test_confy_store_and_load_path() {
 
     // 4. Use `std::fs` to read the file that `confy` just wrote.
     let file_content = fs::read_to_string(&config_path).expect("Failed to read config file");
-    println!("Content of config file:
-{}", file_content);
+    println!(
+        "Content of config file:
+{}",
+        file_content
+    );
 
     // Verify the content is what we expect.
     // Note: The order of fields in a TOML file is not guaranteed.

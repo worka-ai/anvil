@@ -1,6 +1,6 @@
 use crate::anvil_api::internal_anvil_service_server::InternalAnvilService;
 use crate::anvil_api::*;
-use crate::{AppState, auth};
+use crate::{AppState, auth, permissions::AnvilAction};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -32,7 +32,7 @@ impl InternalAnvilService for AppState {
             };
 
         let resource = format!("{}/{}", upload_id, shard_index);
-        if !auth::is_authorized(&format!("internal:put_shard:{}", resource), &claims.scopes) {
+        if !auth::is_authorized(AnvilAction::InternalPutShard, &resource, &claims.scopes) {
             return Err(Status::permission_denied("Permission denied"));
         }
 
@@ -61,10 +61,7 @@ impl InternalAnvilService for AppState {
         let req = request.into_inner();
 
         let resource = format!("{}/{}", req.final_object_hash, req.shard_index);
-        if !auth::is_authorized(
-            &format!("internal:commit_shard:{}", resource),
-            &claims.scopes,
-        ) {
+        if !auth::is_authorized(AnvilAction::InternalCommitShard, &resource, &claims.scopes) {
             return Err(Status::permission_denied("Permission denied"));
         }
 
@@ -79,7 +76,17 @@ impl InternalAnvilService for AppState {
         &self,
         request: Request<GetShardRequest>,
     ) -> Result<Response<Self::GetShardStream>, Status> {
-        let req = request.into_inner();
+        let (_metadata, extensions, req) = request.into_parts();
+
+        let claims = extensions
+            .get::<auth::Claims>()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+
+        let resource = format!("{}/{}", req.object_hash, req.shard_index);
+        if !auth::is_authorized(AnvilAction::InternalGetShard, &resource, &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
         let data = self
             .storage
             .retrieve_shard(&req.object_hash, req.shard_index)
@@ -116,11 +123,8 @@ impl InternalAnvilService for AppState {
             .clone();
         let req = request.into_inner();
 
-        let resource = format!(
-            "internal:delete_shard:{}/{}",
-            req.object_hash, req.shard_index
-        );
-        if !auth::is_authorized(&resource, &claims.scopes) {
+        let resource = format!("{}/{}", req.object_hash, req.shard_index);
+        if !auth::is_authorized(AnvilAction::InternalDeleteShard, &resource, &claims.scopes) {
             return Err(Status::permission_denied("Permission denied"));
         }
 

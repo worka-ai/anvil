@@ -1,5 +1,6 @@
 use crate::{
     auth,
+    permissions::AnvilAction,
     persistence::{Bucket, Persistence},
     tasks::TaskType,
     validation,
@@ -23,15 +24,14 @@ impl BucketManager {
         region: &str,
         scopes: &[String],
     ) -> Result<(), Status> {
-        tracing::debug!("[manager] ENTERING create_bucket for bucket: {}", bucket_name);
+        tracing::debug!(
+            "[manager] ENTERING create_bucket for bucket: {}",
+            bucket_name
+        );
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
-        if !validation::is_valid_region_name(region) {
-            return Err(Status::invalid_argument("Invalid region name"));
-        }
-        let resource = format!("bucket:{}", bucket_name);
-        if !auth::is_authorized(&format!("write:{}", resource), scopes) {
+        if !auth::is_authorized(AnvilAction::BucketWrite, bucket_name, scopes) {
             return Err(Status::permission_denied("Permission denied"));
         }
 
@@ -41,13 +41,15 @@ impl BucketManager {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        tracing::debug!("[manager] EXITING create_bucket for bucket: {}", bucket_name);
+        tracing::debug!(
+            "[manager] EXITING create_bucket for bucket: {}",
+            bucket_name
+        );
         Ok(())
     }
 
     pub async fn delete_bucket(&self, bucket_name: &str, scopes: &[String]) -> Result<(), Status> {
-        let resource = format!("bucket:{}", bucket_name);
-        if !auth::is_authorized(&format!("write:{}", resource), scopes) {
+        if !auth::is_authorized(AnvilAction::BucketDelete, bucket_name, scopes) {
             return Err(Status::permission_denied("Permission denied"));
         }
 
@@ -75,20 +77,26 @@ impl BucketManager {
         scopes: &[String],
     ) -> Result<Vec<Bucket>, Status> {
         tracing::debug!("[manager] ENTERING list_buckets for tenant: {}", tenant_id);
-        if !auth::is_authorized("read:bucket:*", scopes) {
+        if !auth::is_authorized(AnvilAction::BucketList, "*", scopes) {
             return Err(Status::permission_denied(
                 "Permission denied to list buckets",
             ));
         }
 
-        tracing::debug!("[manager] Calling DB to list buckets for tenant: {}", tenant_id);
+        tracing::debug!(
+            "[manager] Calling DB to list buckets for tenant: {}",
+            tenant_id
+        );
         let buckets = self
             .db
             .list_buckets_for_tenant(tenant_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        tracing::debug!("[manager] EXITING list_buckets, found {} buckets", buckets.len());
+        tracing::debug!(
+            "[manager] EXITING list_buckets, found {} buckets",
+            buckets.len()
+        );
         Ok(buckets)
     }
 
@@ -98,8 +106,7 @@ impl BucketManager {
         is_public: bool,
         scopes: &[String],
     ) -> Result<(), Status> {
-        let resource = format!("bucket:{}", bucket_name);
-        if !auth::is_authorized(&format!("write:{}:policy", resource), scopes) {
+        if !auth::is_authorized(AnvilAction::BucketWrite, bucket_name, scopes) {
             return Err(Status::permission_denied("Permission denied"));
         }
 

@@ -1,5 +1,8 @@
 use crate::context::Context;
-use anvil::anvil_api::{self as api, hf_ingestion_service_client::HfIngestionServiceClient, hugging_face_key_service_client::HuggingFaceKeyServiceClient};
+use anvil::anvil_api::{
+    self as api, hf_ingestion_service_client::HfIngestionServiceClient,
+    hugging_face_key_service_client::HuggingFaceKeyServiceClient,
+};
 use clap::Subcommand;
 
 #[derive(Subcommand)]
@@ -85,7 +88,9 @@ pub async fn handle_hf_command(command: &HfCommands, ctx: &Context) -> anyhow::R
                     });
                     request.metadata_mut().insert(
                         "authorization",
-                        format!("Bearer {}", ctx.get_bearer_token().await?).parse().unwrap(),
+                        format!("Bearer {}", ctx.get_bearer_token().await?)
+                            .parse()
+                            .unwrap(),
                     );
                     let resp = client.create_key(request).await?;
                     println!("created key: {}", resp.into_inner().name);
@@ -102,9 +107,8 @@ pub async fn handle_hf_command(command: &HfCommands, ctx: &Context) -> anyhow::R
                     }
                 }
                 HfKeyCommands::Rm { name } => {
-                    let mut request = tonic::Request::new(api::DeleteHfKeyRequest {
-                        name: name.clone(),
-                    });
+                    let mut request =
+                        tonic::Request::new(api::DeleteHfKeyRequest { name: name.clone() });
                     request.metadata_mut().insert(
                         "authorization",
                         format!("Bearer {}", token).parse().unwrap(),
@@ -133,7 +137,7 @@ pub async fn handle_hf_command(command: &HfCommands, ctx: &Context) -> anyhow::R
                         repo: repo.clone(),
                         revision: revision.clone().unwrap_or_default(),
                         target_bucket: bucket.clone(),
-                        target_prefix: prefix.clone().unwrap_or_default(),
+                        target_prefix: prefix.clone().unwrap_or_else(|| repo.clone()),
                         include_globs: include.clone(),
                         exclude_globs: exclude.clone(),
                         target_region: target_region.clone(),

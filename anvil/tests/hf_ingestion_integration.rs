@@ -8,7 +8,7 @@ async fn hf_ingestion_single_file_integration() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
 
-    let token = cluster.token.clone();
+    let token = get_auth_token(&cluster.global_db_url, &cluster.grpc_addrs[0]).await;
 
     // Create a bucket via gRPC
     let mut bucket_client = anvil::anvil_api::bucket_service_client::BucketServiceClient::connect(
@@ -16,8 +16,15 @@ async fn hf_ingestion_single_file_integration() {
     )
     .await
     .unwrap();
+    let bucket_name = format!(
+        "models-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    );
     let mut req = tonic::Request::new(anvil::anvil_api::CreateBucketRequest {
-        bucket_name: "models".into(),
+        bucket_name: bucket_name.clone(),
         region: "test-region-1".into(),
     });
     req.metadata_mut().insert(
@@ -26,17 +33,16 @@ async fn hf_ingestion_single_file_integration() {
     );
     bucket_client.create_bucket(req).await.unwrap();
 
-
-
     // Create HF key with empty token (public repo)
-    let mut key_client = anvil::anvil_api::hugging_face_key_service_client::HuggingFaceKeyServiceClient::connect(
-        cluster.grpc_addrs[0].clone(),
-    )
-    .await
-    .unwrap();
+    let mut key_client =
+        anvil::anvil_api::hugging_face_key_service_client::HuggingFaceKeyServiceClient::connect(
+            cluster.grpc_addrs[0].clone(),
+        )
+        .await
+        .unwrap();
     let mut kreq = tonic::Request::new(anvil::anvil_api::CreateHfKeyRequest {
         name: "test".into(),
-        token: "test-token".into(),
+        token: "".into(),
         note: "".into(),
     });
     kreq.metadata_mut().insert(
@@ -46,16 +52,17 @@ async fn hf_ingestion_single_file_integration() {
     key_client.create_key(kreq).await.unwrap();
 
     // Start ingestion for public config.json
-    let mut ing_client = anvil::anvil_api::hf_ingestion_service_client::HfIngestionServiceClient::connect(
-        cluster.grpc_addrs[0].clone(),
-    )
-    .await
-    .unwrap();
+    let mut ing_client =
+        anvil::anvil_api::hf_ingestion_service_client::HfIngestionServiceClient::connect(
+            cluster.grpc_addrs[0].clone(),
+        )
+        .await
+        .unwrap();
     let mut sreq = tonic::Request::new(anvil::anvil_api::StartHfIngestionRequest {
         key_name: "test".into(),
         repo: "openai/gpt-oss-20b".into(),
         revision: "main".into(),
-        target_bucket: "models".into(),
+        target_bucket: bucket_name.clone(),
         target_region: "test-region-1".into(),
         target_prefix: "gpt-oss-20b".into(),
         include_globs: vec!["config.json".into()],
@@ -85,7 +92,11 @@ async fn hf_ingestion_single_file_integration() {
             "authorization",
             format!("Bearer {}", token).parse().unwrap(),
         );
-        let st = ing_client.get_ingestion_status(streq).await.unwrap().into_inner();
+        let st = ing_client
+            .get_ingestion_status(streq)
+            .await
+            .unwrap()
+            .into_inner();
         if st.state == "completed" {
             break;
         }
@@ -97,9 +108,13 @@ async fn hf_ingestion_single_file_integration() {
 
     // Verify object is not public initially
     let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
-    let url = format!("{}/models/gpt-oss-20b/config.json", http_base);
+    let url = format!("{}/{}/gpt-oss-20b/config.json", http_base, bucket_name);
     let resp_before = reqwest::get(&url).await.unwrap();
-    assert_eq!(resp_before.status(), 403, "Object should be private initially");
+    assert_eq!(
+        resp_before.status(),
+        403,
+        "Object should be private initially"
+    );
 
     // Make the bucket public
     let mut auth_client = anvil::anvil_api::auth_service_client::AuthServiceClient::connect(
@@ -108,7 +123,7 @@ async fn hf_ingestion_single_file_integration() {
     .await
     .unwrap();
     let mut req = tonic::Request::new(anvil::anvil_api::SetPublicAccessRequest {
-        bucket: "models".into(),
+        bucket: bucket_name.clone(),
         allow_public_read: true,
     });
     req.metadata_mut().insert(
@@ -119,7 +134,11 @@ async fn hf_ingestion_single_file_integration() {
 
     // Verify object is now public
     let resp_after = reqwest::get(&url).await.unwrap();
-    assert_eq!(resp_after.status(), 200, "Object should be public after setting policy");
+    assert_eq!(
+        resp_after.status(),
+        200,
+        "Object should be public after setting policy"
+    );
     let txt = resp_after.text().await.unwrap();
     let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
     assert!(v.is_object());
@@ -132,10 +151,16 @@ async fn hf_ingestion_permission_denied() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
 
-    let limited_token = cluster
-        .states[0]
+    let ok_token = cluster.states[0]
         .jwt_manager
-        .mint_token("test-app".into(), vec!["read:*".into()], 0)
+        .mint_token(
+            "test-app".into(),
+            vec![
+                "hf_key:create|pd-test".into(),
+                "bucket:create|models-denied".into(),
+            ],
+            1,
+        )
         .unwrap();
 
     // Create bucket
@@ -150,33 +175,35 @@ async fn hf_ingestion_permission_denied() {
     });
     req.metadata_mut().insert(
         "authorization",
-        format!("Bearer {}", limited_token).parse().unwrap(),
+        format!("Bearer {}", ok_token).parse().unwrap(),
     );
     let _ = bucket_client.create_bucket(req).await;
 
     // Create key with auth ok
-    let mut key_client = anvil::anvil_api::hugging_face_key_service_client::HuggingFaceKeyServiceClient::connect(
-        cluster.grpc_addrs[0].clone(),
-    )
-    .await
-    .unwrap();
+    let mut key_client =
+        anvil::anvil_api::hugging_face_key_service_client::HuggingFaceKeyServiceClient::connect(
+            cluster.grpc_addrs[0].clone(),
+        )
+        .await
+        .unwrap();
     let mut kreq = tonic::Request::new(anvil::anvil_api::CreateHfKeyRequest {
         name: "pd-test".into(),
-        token: "test-token".into(),
+        token: "".into(),
         note: "".into(),
     });
     kreq.metadata_mut().insert(
         "authorization",
-        format!("Bearer {}", limited_token).parse().unwrap(),
+        format!("Bearer {}", ok_token).parse().unwrap(),
     );
     key_client.create_key(kreq).await.unwrap();
 
     // Start ingestion with a token that lacks required scopes -> PermissionDenied
-    let mut ing_client = anvil::anvil_api::hf_ingestion_service_client::HfIngestionServiceClient::connect(
-        cluster.grpc_addrs[0].clone(),
-    )
-    .await
-    .unwrap();
+    let mut ing_client =
+        anvil::anvil_api::hf_ingestion_service_client::HfIngestionServiceClient::connect(
+            cluster.grpc_addrs[0].clone(),
+        )
+        .await
+        .unwrap();
     let mut sreq = tonic::Request::new(anvil::anvil_api::StartHfIngestionRequest {
         key_name: "pd-test".into(),
         repo: "openai/gpt-oss-20b".into(),
@@ -188,14 +215,14 @@ async fn hf_ingestion_permission_denied() {
         exclude_globs: vec![],
     });
     // Forge a very limited token: no hf:ingest:start scopes
-    let limited_token = cluster
-        .states[0]
+    let limited_token = cluster.states[0]
         .jwt_manager
         .mint_token("test-app".into(), vec!["read:*".into()], 0)
         .unwrap();
-    sreq
-        .metadata_mut()
-        .insert("authorization", format!("Bearer {}", limited_token).parse().unwrap());
+    sreq.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", limited_token).parse().unwrap(),
+    );
     let err = ing_client.start_ingestion(sreq).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
 }

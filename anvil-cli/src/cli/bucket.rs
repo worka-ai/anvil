@@ -37,7 +37,9 @@ pub async fn handle_bucket_command(command: &BucketCommands, ctx: &Context) -> a
             println!("Bucket {} created", name);
         }
         BucketCommands::Rm { name } => {
-            let mut request = tonic::Request::new(api::DeleteBucketRequest { bucket_name: name.clone() });
+            let mut request = tonic::Request::new(api::DeleteBucketRequest {
+                bucket_name: name.clone(),
+            });
             request.metadata_mut().insert(
                 "authorization",
                 format!("Bearer {}", token).parse().unwrap(),

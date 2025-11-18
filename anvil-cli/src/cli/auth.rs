@@ -1,9 +1,9 @@
 use crate::context::Context;
 use anvil::anvil_api as api;
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
-use tonic::transport::Endpoint;
-use tokio::time::{timeout, Duration};
 use clap::Subcommand;
+use tokio::time::{Duration, timeout};
+use tonic::transport::Endpoint;
 
 #[derive(Subcommand)]
 pub enum AuthCommands {
@@ -36,10 +36,16 @@ pub async fn handle_auth_command(command: &AuthCommands, ctx: &Context) -> anyho
     let mut client = AuthServiceClient::new(channel);
 
     match command {
-        AuthCommands::GetToken { client_id, client_secret } => {
+        AuthCommands::GetToken {
+            client_id,
+            client_secret,
+        } => {
             let (id, secret) = match (client_id.as_ref(), client_secret.as_ref()) {
                 (Some(id), Some(secret)) => (id.clone(), secret.clone()),
-                _ => (ctx.profile.client_id.clone(), ctx.profile.client_secret.clone()),
+                _ => (
+                    ctx.profile.client_id.clone(),
+                    ctx.profile.client_secret.clone(),
+                ),
             };
 
             let host = ctx.profile.host.clone();
@@ -67,7 +73,11 @@ pub async fn handle_auth_command(command: &AuthCommands, ctx: &Context) -> anyho
             eprintln!("[anvil-cli] get-token: RPC completed, printing token");
             println!("{}", token);
         }
-        AuthCommands::Grant { app, action, resource } => {
+        AuthCommands::Grant {
+            app,
+            action,
+            resource,
+        } => {
             let token = ctx.get_bearer_token().await?;
             let mut request = tonic::Request::new(api::GrantAccessRequest {
                 grantee_app_id: app.clone(),
@@ -81,7 +91,11 @@ pub async fn handle_auth_command(command: &AuthCommands, ctx: &Context) -> anyho
             client.grant_access(request).await?;
             println!("Permission granted.");
         }
-        AuthCommands::Revoke { app, action, resource } => {
+        AuthCommands::Revoke {
+            app,
+            action,
+            resource,
+        } => {
             let token = ctx.get_bearer_token().await?;
             let mut request = tonic::Request::new(api::RevokeAccessRequest {
                 grantee_app_id: app.clone(),

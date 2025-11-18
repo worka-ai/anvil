@@ -96,12 +96,8 @@ pub fn handle_static_config_command(
     }
 
     match &config_path {
-        Some(path) => {
-            confy::store_path(path, &config)?
-        }
-        None => {
-            confy::store("anvil-cli", None, &config)?
-        }
+        Some(path) => confy::store_path(path, &config)?,
+        None => confy::store("anvil-cli", None, &config)?,
     };
 
     println!("Profile '{}' saved.", name);

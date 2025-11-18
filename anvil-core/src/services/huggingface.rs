@@ -1,115 +1,134 @@
+use crate::{AppState, auth, crypto, permissions::AnvilAction, tasks::TaskType};
 use tonic::{Request, Response, Status};
-use crate::crypto;
-use crate::AppState;
-use crate::tasks::TaskType;
-use crate::auth;
 
 use crate::anvil_api as api;
 
 #[tonic::async_trait]
+
 impl api::hugging_face_key_service_server::HuggingFaceKeyService for AppState {
     async fn create_key(
         &self,
-        _request: Request<api::CreateHfKeyRequest>,
+        request: Request<api::CreateHfKeyRequest>,
     ) -> Result<Response<api::CreateHfKeyResponse>, Status> {
-        let (_metadata, _extensions, req) = _request.into_parts();
+        let (_metadata, extensions, req) = request.into_parts();
+        let scopes = auth::try_get_scopes_from_extensions(&extensions).unwrap_or_default();
+        if !auth::is_authorized(AnvilAction::HfKeyCreate, &req.name, &scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
         if req.name.trim().is_empty() {
             return Err(Status::invalid_argument("name is required"));
         }
-        // Skip validation for a known test token.
-        if req.token != "test-token" {
-            // Validate the token with Hugging Face
-            let client = reqwest::Client::new();
-            let resp = client
-                .get("https://huggingface.co/api/whoami-v2")
-                .header("Authorization", format!("Bearer {}", req.token))
-                .send()
-                .await
-                .map_err(|e| Status::internal(format!("Failed to validate token: {}", e)))?;
 
-            if !resp.status().is_success() {
-                return Err(Status::unauthenticated("Unauthorised, invalid token"));
-            }
-        }
-        // Authorization: align with existing services. Interceptor validated JWT; rely on
-        // cluster policies already granted in tests (wildcard) without extracting scopes
-        // from extensions (other services do not do this).
-        // Config stores encryption key as hex; decode before use (AES-256-GCM expects 32 bytes)
         let enc_key = hex::decode(&self.config.anvil_secret_encryption_key)
             .map_err(|e| Status::internal(e.to_string()))?;
+
         let enc = crypto::encrypt(req.token.as_bytes(), &enc_key)
             .map_err(|e| Status::internal(e.to_string()))?;
-        let note_opt = if req.note.is_empty() { None } else { Some(req.note.as_str()) };
-        self
-            .db
+
+        let note_opt = if req.note.is_empty() {
+            None
+        } else {
+            Some(req.note.as_str())
+        };
+
+        self.db
             .hf_create_key(&req.name, &enc, note_opt)
             .await
             .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;
-        let resp = api::CreateHfKeyResponse { name: req.name, note: req.note, created_at: chrono::Utc::now().to_rfc3339() };
+
+        let resp = api::CreateHfKeyResponse {
+            name: req.name,
+            note: req.note,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+
         Ok(Response::new(resp))
     }
 
     async fn delete_key(
         &self,
-        _request: Request<api::DeleteHfKeyRequest>,
+        request: Request<api::DeleteHfKeyRequest>,
     ) -> Result<Response<api::DeleteHfKeyResponse>, Status> {
-        let (_metadata, _extensions, req) = _request.into_parts();
+        let (_metadata, extensions, req) = request.into_parts();
+        let scopes = auth::try_get_scopes_from_extensions(&extensions).unwrap_or_default();
+
+        if !auth::is_authorized(AnvilAction::HfKeyDelete, &req.name, &scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
         let n = self
             .db
             .hf_delete_key(&req.name)
             .await
             .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;
-        if n == 0 { return Err(Status::not_found("key not found")); }
-        Ok(Response::new(api::DeleteHfKeyResponse{}))
+
+        if n == 0 {
+            return Err(Status::not_found("key not found"));
+        }
+
+        Ok(Response::new(api::DeleteHfKeyResponse {}))
     }
 
     async fn list_keys(
         &self,
-        _request: Request<api::ListHfKeysRequest>,
+        request: Request<api::ListHfKeysRequest>,
     ) -> Result<Response<api::ListHfKeysResponse>, Status> {
-        let (_metadata, _extensions, _req) = _request.into_parts();
+        let (_metadata, extensions, _req) = request.into_parts();
+        let scopes = auth::try_get_scopes_from_extensions(&extensions).unwrap_or_default();
+
+        if !auth::is_authorized(AnvilAction::HfKeyList, "*", &scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
         let rows = self
             .db
             .hf_list_keys()
             .await
             .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;
+
         let keys: Vec<api::HfKey> = rows
             .into_iter()
             .map(|(name, note, created, updated)| api::HfKey {
                 name,
+
                 note: note.unwrap_or_default(),
+
                 created_at: created.to_rfc3339(),
+
                 updated_at: updated.to_rfc3339(),
             })
             .collect();
-        Ok(Response::new(api::ListHfKeysResponse{ keys }))
-}
+
+        Ok(Response::new(api::ListHfKeysResponse { keys }))
+    }
 }
 
 #[tonic::async_trait]
 impl api::hf_ingestion_service_server::HfIngestionService for AppState {
     async fn start_ingestion(
         &self,
-        _request: Request<api::StartHfIngestionRequest>,
+        request: Request<api::StartHfIngestionRequest>,
     ) -> Result<Response<api::StartHfIngestionResponse>, Status> {
-        let (_metadata, extensions, req) = _request.into_parts();
+        tracing::info!(?request, "ENTERED start_ingestion");
+        let (_metadata, extensions, req) = request.into_parts();
         if req.key_name.is_empty() || req.repo.is_empty() || req.target_bucket.is_empty() {
-            return Err(Status::invalid_argument("key_name, repo and target_bucket required"));
+            return Err(Status::invalid_argument(
+                "key_name, repo and target_bucket required",
+            ));
         }
-        // Authorization: allow either a specific bucket write or a dedicated ingestion scope
+
         let scopes = auth::try_get_scopes_from_extensions(&extensions).unwrap_or_default();
-        let bucket_req = format!("write:bucket:{}", req.target_bucket);
-        let prefix_req = if req.target_prefix.is_empty() {
-            String::new()
-        } else {
-            format!("write:bucket:{}/{}", req.target_bucket, req.target_prefix)
-        };
-        let allowed = auth::is_authorized("hf:ingest:start", &scopes)
-            || auth::is_authorized(&bucket_req, &scopes)
-            || (!prefix_req.is_empty() && auth::is_authorized(&prefix_req, &scopes));
-        if !allowed {
+
+        tracing::info!(?scopes, "Extracted scopes");
+
+        if !auth::is_authorized(AnvilAction::HfIngestionCreate, "*", &scopes) {
+            tracing::warn!("Authorization failed for start_ingestion");
+
             return Err(Status::permission_denied("Permission denied"));
         }
+
+        tracing::info!("Authorization successful for start_ingestion");
         // Lookup key id
         let Some((key_id, _enc)) = self
             .db
@@ -122,7 +141,10 @@ impl api::hf_ingestion_service_server::HfIngestionService for AppState {
         let claims = auth::try_get_claims_from_extensions(&extensions)
             .ok_or_else(|| Status::unauthenticated("Missing authentication claims"))?;
 
-        let app_id = claims.sub.parse::<i64>().map_err(|_| Status::unauthenticated("Invalid app ID in token"))?;
+        let app_id = claims
+            .sub
+            .parse::<i64>()
+            .map_err(|_| Status::unauthenticated("Invalid app ID in token"))?;
 
         let app = self
             .db
@@ -131,45 +153,78 @@ impl api::hf_ingestion_service_server::HfIngestionService for AppState {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::unauthenticated("Invalid app ID in token"))?;
 
-        let ingestion_id = self.db.hf_create_ingestion(
-            key_id,
-            claims.tenant_id,
-            app.id,
-            &req.repo,
-            if req.revision.is_empty() { None } else { Some(req.revision.as_str()) },
-            &req.target_bucket,
-            &req.target_region,
-            if req.target_prefix.is_empty() { None } else { Some(req.target_prefix.as_str()) },
-            &req.include_globs,
-            &req.exclude_globs,
-        )
-        .await
-        .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;
+        let ingestion_id = self
+            .db
+            .hf_create_ingestion(
+                key_id,
+                claims.tenant_id,
+                app.id,
+                &req.repo,
+                if req.revision.is_empty() {
+                    None
+                } else {
+                    Some(req.revision.as_str())
+                },
+                &req.target_bucket,
+                &req.target_region,
+                if req.target_prefix.is_empty() {
+                    None
+                } else {
+                    Some(req.target_prefix.as_str())
+                },
+                &req.include_globs,
+                &req.exclude_globs,
+            )
+            .await
+            .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;
         // Enqueue task
         let payload = serde_json::json!({"ingestion_id": ingestion_id});
-        self
-            .db
+        self.db
             .enqueue_task(TaskType::HFIngestion, payload, 100)
             .await
             .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;
-        Ok(Response::new(api::StartHfIngestionResponse{ ingestion_id: ingestion_id.to_string() }))
+        Ok(Response::new(api::StartHfIngestionResponse {
+            ingestion_id: ingestion_id.to_string(),
+        }))
     }
 
     async fn get_ingestion_status(
         &self,
-        _request: Request<api::GetHfIngestionStatusRequest>,
+        request: Request<api::GetHfIngestionStatusRequest>,
     ) -> Result<Response<api::GetHfIngestionStatusResponse>, Status> {
-        let (_metadata, _extensions, req) = _request.into_parts();
-        let id: i64 = req.ingestion_id.parse().map_err(|_| Status::invalid_argument("invalid id"))?;
+        let (_metadata, extensions, req) = request.into_parts();
+        let scopes = auth::try_get_scopes_from_extensions(&extensions).unwrap_or_default();
+        if !auth::is_authorized(AnvilAction::HfIngestionRead, &req.ingestion_id, &scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        let id: i64 = req
+            .ingestion_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("invalid id"))?;
         // Policy: allow requester or explicit permission
-        let (_state_s, _q, _d, _s, _f, _err, _st, _ft, _cr) = self
+        let (_state_s, _q, _d, _s, _f, _err, _st, _ft, _cr) =
+            self.db
+                .hf_status_summary(id)
+                .await
+                .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;
+        // Authorization aligned: interceptor validated token; rely on cluster policy wildcard in tests
+        let (
+            state_s,
+            queued,
+            downloading,
+            stored,
+            failed,
+            err,
+            started_at,
+            finished_at,
+            created_at,
+        ) = self
             .db
             .hf_status_summary(id)
             .await
-            .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;
-        // Authorization aligned: interceptor validated token; rely on cluster policy wildcard in tests
-        let (state_s, queued, downloading, stored, failed, err, started_at, finished_at, created_at) = self.db.hf_status_summary(id).await.map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(api::GetHfIngestionStatusResponse{
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(api::GetHfIngestionStatusResponse {
             state: state_s,
             queued: queued as u64,
             downloading: downloading as u64,
@@ -177,23 +232,35 @@ impl api::hf_ingestion_service_server::HfIngestionService for AppState {
             failed: failed as u64,
             error: err.unwrap_or_default(),
             created_at: created_at.to_rfc3339(),
-            started_at: started_at.map(|d: chrono::DateTime<chrono::Utc>| d.to_rfc3339()).unwrap_or_default(),
-            finished_at: finished_at.map(|d: chrono::DateTime<chrono::Utc>| d.to_rfc3339()).unwrap_or_default(),
+            started_at: started_at
+                .map(|d: chrono::DateTime<chrono::Utc>| d.to_rfc3339())
+                .unwrap_or_default(),
+            finished_at: finished_at
+                .map(|d: chrono::DateTime<chrono::Utc>| d.to_rfc3339())
+                .unwrap_or_default(),
         }))
     }
 
     async fn cancel_ingestion(
         &self,
-        _request: Request<api::CancelHfIngestionRequest>,
+        request: Request<api::CancelHfIngestionRequest>,
     ) -> Result<Response<api::CancelHfIngestionResponse>, Status> {
-        let (_metadata, _extensions, req) = _request.into_parts();
-        let id: i64 = req.ingestion_id.parse().map_err(|_| Status::invalid_argument("invalid id"))?;
+        let (_metadata, extensions, req) = request.into_parts();
+        let scopes = auth::try_get_scopes_from_extensions(&extensions).unwrap_or_default();
+        if !auth::is_authorized(AnvilAction::HfIngestionDelete, &req.ingestion_id, &scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        let id: i64 = req
+            .ingestion_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("invalid id"))?;
         // Authorization aligned
         let _ = self
             .db
             .hf_cancel_ingestion(id)
             .await
             .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;
-        Ok(Response::new(api::CancelHfIngestionResponse{}))
-}
+        Ok(Response::new(api::CancelHfIngestionResponse {}))
+    }
 }

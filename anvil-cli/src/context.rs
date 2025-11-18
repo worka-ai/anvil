@@ -1,7 +1,7 @@
 use crate::config::{Config, Profile};
-use anyhow::{anyhow, Result};
 use anvil::anvil_api as api;
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
+use anyhow::{Result, anyhow};
 
 pub struct Context {
     pub profile: Profile,
@@ -35,7 +35,10 @@ impl Context {
             profile.host = format!("http://{}", profile.host);
         }
 
-        Ok(Self { profile, config_path })
+        Ok(Self {
+            profile,
+            config_path,
+        })
     }
 
     pub async fn get_bearer_token(&self) -> anyhow::Result<String> {

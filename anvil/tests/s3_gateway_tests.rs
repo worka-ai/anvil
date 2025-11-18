@@ -19,7 +19,7 @@ fn create_app(global_db_url: &str, app_name: &str) -> (String, String) {
             global_db_url,
             "--anvil-secret-encryption-key",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "apps",
+            "app",
             "create",
             "--tenant-name",
             "default",
@@ -67,7 +67,7 @@ async fn test_s3_public_and_private_access() {
     // Grant wildcard policy to the app before getting a token
     let admin_args = &["run", "--bin", "admin", "--"];
     let policy_args = &[
-        "policies",
+        "policy",
         "grant",
         "--app-name",
         "s3-test-app",
@@ -100,9 +100,10 @@ async fn test_s3_public_and_private_access() {
         &client_id,
         &client_secret,
         vec![
-            "read:*".to_string(),
-            "write:*".to_string(),
-            "grant:*".to_string(),
+            "bucket:write|*".to_string(),
+            "policy:grant|*".to_string(),
+            "object:write|*".to_string(),
+            "object:read|*".to_string(),
         ],
     )
     .await;
@@ -234,7 +235,7 @@ async fn test_streaming_upload_decoding() {
     // Grant wildcard policy to the app
     let admin_args = &["run", "--bin", "admin", "--"];
     let policy_args = &[
-        "policies",
+        "policy",
         "grant",
         "--app-name",
         "streaming-decode-app",
@@ -329,7 +330,7 @@ async fn test_streaming_upload_decoding() {
         &cluster.grpc_addrs[0],
         &client_id,
         &client_secret,
-        vec!["grant:*".to_string()],
+        vec!["policy:grant|*".to_string()],
     )
     .await;
     let mut public_req = tonic::Request::new(SetPublicAccessRequest {

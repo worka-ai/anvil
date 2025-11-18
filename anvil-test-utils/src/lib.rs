@@ -2,14 +2,14 @@ use std::sync::Once;
 
 static INIT_LOGGER: Once = Once::new();
 
-use anvil::run_migrations;
-use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::GetAccessTokenRequest;
+use anvil::anvil_api::auth_service_client::AuthServiceClient;
+use anvil::run_migrations;
 use anvil_core::AppState;
 use anyhow::Result;
 use aws_config::BehaviorVersion;
-use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::config::Credentials;
 use deadpool_postgres::{ManagerConfig, Pool, RecyclingMethod};
 use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -53,20 +53,30 @@ pub fn extract_credential(output: &str, key: &str) -> String {
 
 #[allow(dead_code)]
 pub async fn get_auth_token(global_db_url: &str, grpc_addr: &str) -> String {
-    let admin_args = &["run", "-p", "anvil", "--features", "anvil/enterprise", "--bin", "admin", "--"];
+    let admin_args = &[
+        "run",
+        "-p",
+        "anvil",
+        "--features",
+        "anvil/enterprise",
+        "--bin",
+        "admin",
+        "--",
+    ];
 
+    let app_name = format!("test-app-{}", uuid::Uuid::new_v4());
     let app_output = Command::new("cargo")
         .args(admin_args.iter().chain(&[
             "--global-database-url",
             global_db_url,
             "--anvil-secret-encryption-key",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "apps",
+            "app",
             "create",
             "--tenant-name",
             "default",
             "--app-name",
-            "test-app",
+            &app_name,
         ]))
         .output()
         .unwrap();
@@ -86,10 +96,10 @@ pub async fn get_auth_token(global_db_url: &str, grpc_addr: &str) -> String {
         global_db_url,
         "--anvil-secret-encryption-key",
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "policies",
+        "policy",
         "grant",
         "--app-name",
-        "test-app",
+        &app_name,
         "--action",
         "*",
         "--resource",
@@ -136,9 +146,11 @@ pub struct TestCluster {
 impl TestCluster {
     pub async fn create_bucket(&self, bucket_name: &str, region: &str) {
         let mut bucket_client =
-            anvil::anvil_api::bucket_service_client::BucketServiceClient::connect(self.grpc_addrs[0].clone())
-                .await
-                .unwrap();
+            anvil::anvil_api::bucket_service_client::BucketServiceClient::connect(
+                self.grpc_addrs[0].clone(),
+            )
+            .await
+            .unwrap();
         let mut create_req = tonic::Request::new(anvil::anvil_api::CreateBucketRequest {
             bucket_name: bucket_name.to_string(),
             region: region.to_string(),
@@ -367,7 +379,9 @@ impl Drop for TestCluster {
     }
 }
 
-async fn create_isolated_dbs(num_regional: usize) -> Result<(String, Vec<String>, tokio_postgres::Client)> {
+async fn create_isolated_dbs(
+    num_regional: usize,
+) -> Result<(String, Vec<String>, tokio_postgres::Client)> {
     dotenvy::dotenv().ok();
     let maint_db_url =
         std::env::var("MAINTENANCE_DATABASE_URL").expect("MAINTENANCE_DATABASE_URL must be set");

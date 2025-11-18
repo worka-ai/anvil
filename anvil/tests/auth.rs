@@ -22,7 +22,7 @@ async fn test_auth_flow_with_wildcard_scopes() {
             &global_db_url,
             "--anvil-secret-encryption-key",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "apps",
+            "app",
             "create",
             "--tenant-name",
             "default",
@@ -37,14 +37,14 @@ async fn test_auth_flow_with_wildcard_scopes() {
     let client_secret = extract_credential(&creds, "Client Secret");
 
     let policy_args = &[
-        "policies",
+        "policy",
         "grant",
         "--app-name",
         "auth-app",
         "--action",
-        "write",
+        "bucket:write",
         "--resource",
-        "bucket:auth-test-*",
+        "auth-test-*",
     ];
     let status = Command::new("cargo")
         .args(

@@ -14,11 +14,7 @@ pub fn auth_interceptor<T>(mut req: Request<T>, state: &AppState) -> Result<Requ
             "Invalid gRPC request, extension not found",
         ));
     };
-    tracing::info!(
-        "[auth_interceptor] path={} auth_present={}",
-        uri,
-        has_auth
-    );
+    tracing::info!("[auth_interceptor] path={} auth_present={}", uri, has_auth);
     // A list of public routes that do not require authentication.
     const PUBLIC_ROUTES: &[&str] = &["/anvil.AuthService/GetAccessToken"];
     if PUBLIC_ROUTES.contains(&uri.as_str()) {
@@ -53,7 +49,10 @@ pub async fn save_uri_mw(
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    tracing::info!("[axum_mw] Received request with headers: {:?}", req.headers());
+    tracing::info!(
+        "[axum_mw] Received request with headers: {:?}",
+        req.headers()
+    );
 
     // Prefer the original (unstripped) URI if we’re nested
     let full_uri: Uri = req

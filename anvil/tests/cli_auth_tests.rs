@@ -1,11 +1,11 @@
 use anvil_test_utils::TestCluster;
+use serde_json::Value;
+use std::env;
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tempfile::tempdir;
 use uuid::Uuid;
-use serde_json::Value;
-use std::env;
 
 static ADMIN_PATH: OnceLock<String> = OnceLock::new();
 
@@ -77,7 +77,7 @@ async fn test_cli_auth_and_hf_key_add() {
         &cluster.global_db_url,
         "--anvil-secret-encryption-key",
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "apps",
+        "app",
         "create",
         "--tenant-name",
         "default",
@@ -85,7 +85,11 @@ async fn test_cli_auth_and_hf_key_add() {
         &app_name,
     ]);
     let admin_output = admin_cmd.output().unwrap();
-    assert!(admin_output.status.success(), "admin apps create failed: {}", String::from_utf8_lossy(&admin_output.stderr));
+    assert!(
+        admin_output.status.success(),
+        "admin apps create failed: {}",
+        String::from_utf8_lossy(&admin_output.stderr)
+    );
     let output_str = String::from_utf8(admin_output.stdout).unwrap();
 
     let client_id = output_str
@@ -102,7 +106,11 @@ async fn test_cli_auth_and_hf_key_add() {
     // 2. Configure the CLI
     // 2. Configure the CLI using `cargo run` with absolute cargo path
     let mut cli_cmd = Command::new(cargo_path());
-    cli_cmd.args(&["run", "-p", "anvil-cli", "--",
+    cli_cmd.args(&[
+        "run",
+        "-p",
+        "anvil-cli",
+        "--",
         "--config",
         config_path.to_str().unwrap(),
         "static-config",
@@ -114,7 +122,8 @@ async fn test_cli_auth_and_hf_key_add() {
         client_id,
         "--client-secret",
         client_secret,
-        "--default"]);
+        "--default",
+    ]);
     let cli_output = cli_cmd.output().unwrap();
     if !cli_output.status.success() {
         eprintln!(
@@ -127,17 +136,40 @@ async fn test_cli_auth_and_hf_key_add() {
 
     // 3. Get a token
     let mut cli_cmd = Command::new(cargo_path());
-    cli_cmd.args(&["run", "-p", "anvil-cli", "--",
-        "--config", config_path.to_str().unwrap(), "--profile", "test-profile", "auth", "get-token"]);
+    cli_cmd.args(&[
+        "run",
+        "-p",
+        "anvil-cli",
+        "--",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--profile",
+        "test-profile",
+        "auth",
+        "get-token",
+    ]);
     let cli_output = cli_cmd.output().unwrap();
-    println!("get-token stdout: {}", String::from_utf8_lossy(&cli_output.stdout));
-    println!("get-token stderr: {}", String::from_utf8_lossy(&cli_output.stderr));
+    println!(
+        "get-token stdout: {}",
+        String::from_utf8_lossy(&cli_output.stdout)
+    );
+    println!(
+        "get-token stderr: {}",
+        String::from_utf8_lossy(&cli_output.stderr)
+    );
     assert!(cli_output.status.success());
-    let auth_token = String::from_utf8(cli_output.stdout).unwrap().trim().to_string();
+    let auth_token = String::from_utf8(cli_output.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
 
     // 4. Add an HF key
     let mut cli_cmd = Command::new(cargo_path());
-    cli_cmd.args(&["run", "-p", "anvil-cli", "--",
+    cli_cmd.args(&[
+        "run",
+        "-p",
+        "anvil-cli",
+        "--",
         "--config",
         config_path.to_str().unwrap(),
         "--profile",
@@ -152,5 +184,9 @@ async fn test_cli_auth_and_hf_key_add() {
     ]);
     cli_cmd.env("ANVIL_AUTH_TOKEN", auth_token);
     let cli_output = cli_cmd.output().unwrap();
-    assert!(cli_output.status.success(), "anvil-cli hf key add failed: {}", String::from_utf8_lossy(&cli_output.stderr));
+    assert!(
+        cli_output.status.success(),
+        "anvil-cli hf key add failed: {}",
+        String::from_utf8_lossy(&cli_output.stderr)
+    );
 }

@@ -4,6 +4,7 @@ use crate::{
     },
     auth,
     cluster::ClusterState,
+    permissions::AnvilAction,
     persistence::{Bucket, Object, Persistence},
     placement::PlacementManager,
     sharding::ShardManager,
@@ -17,6 +18,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
+use tracing::{error, info};
 
 #[derive(Debug, Clone)]
 pub struct ObjectManager {
@@ -64,6 +66,14 @@ impl ObjectManager {
         scopes: &[String],
         mut data_stream: impl Stream<Item = Result<Vec<u8>, Status>> + Unpin,
     ) -> Result<Object, Status> {
+        info!(
+            tenant_id,
+            bucket_name,
+            object_key,
+            ?scopes,
+            "put_object called"
+        );
+
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
@@ -71,11 +81,15 @@ impl ObjectManager {
             return Err(Status::invalid_argument("Invalid object key"));
         }
 
-        let resource = format!("bucket:{}/{}", bucket_name, object_key);
-        if !auth::is_authorized(&format!("write:{}", resource), scopes) {
+        let authorized = auth::is_authorized(
+            AnvilAction::ObjectWrite,
+            &format!("{}/{}", bucket_name, object_key),
+            scopes,
+        );
+
+        if !authorized {
             return Err(Status::permission_denied("Permission denied"));
         }
-
         let nodes = self
             .placer
             .calculate_placement(object_key, &self.cluster, self.sharder.total_shards())
@@ -94,6 +108,7 @@ impl ObjectManager {
                     .map_err(|e| Status::internal(e.to_string()))?;
                 total_bytes = bytes;
                 content_hash = hash;
+                info!("Committing whole object");
                 self.storage
                     .commit_whole_object(&temp_path, &content_hash)
                     .await
@@ -135,9 +150,10 @@ impl ObjectManager {
                 } else {
                     format!("http://{}", addr)
                 };
-                let client = internal_anvil_service_client::InternalAnvilServiceClient::connect(endpoint)
-                    .await
-                    .map_err(|e| Status::unavailable(e.to_string()))?;
+                let client =
+                    internal_anvil_service_client::InternalAnvilServiceClient::connect(endpoint)
+                        .await
+                        .map_err(|e| Status::unavailable(e.to_string()))?;
                 clients.push(client);
             }
 
@@ -167,7 +183,7 @@ impl ObjectManager {
 
             let mut futures = Vec::new();
             for (i, client) in clients.into_iter().enumerate() {
-                let scope = format!("internal:commit_shard:{}/{}", content_hash, i);
+                let scope = format!("internal:commit_shard|{}/{}", content_hash, i);
                 let token = self
                     .jwt_manager
                     .mint_token("internal".to_string(), vec![scope], 0)
@@ -241,7 +257,7 @@ impl ObjectManager {
 
         let mut futures = Vec::new();
         for (i, shard_data) in shards.into_iter().enumerate() {
-            let scope = format!("internal:put_shard:{}/{}", upload_id, i);
+            let scope = format!("internal:put_shard|{}/{}", upload_id, i);
             let token = self
                 .jwt_manager
                 .mint_token("internal".to_string(), vec![scope], 0)
@@ -289,8 +305,11 @@ impl ObjectManager {
 
         if !bucket.is_public_read {
             let claims = claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
-            let resource = format!("bucket:{}/{}", bucket_name, object_key);
-            if !auth::is_authorized(&format!("read:{}", resource), &claims.scopes) {
+            if !auth::is_authorized(
+                AnvilAction::ObjectRead,
+                &format!("{}/{}", bucket_name, object_key),
+                &claims.scopes,
+            ) {
                 return Err(Status::permission_denied("Permission denied"));
             }
         }
@@ -389,7 +408,9 @@ impl ObjectManager {
                         let object_hash = object_clone.content_hash.clone();
                         let jwt_manager = app_state.jwt_manager.clone();
                         missing_shards_futures.push(async move {
-                            let endpoint = if grpc_addr.starts_with("http://") || grpc_addr.starts_with("https://") {
+                            let endpoint = if grpc_addr.starts_with("http://")
+                                || grpc_addr.starts_with("https://")
+                            {
                                 grpc_addr
                             } else {
                                 format!("http://{}", grpc_addr)
@@ -402,7 +423,7 @@ impl ObjectManager {
                                 .map_err(|e| {
                                     Status::internal(format!("Failed to connect to peer: {}", e))
                                 })?;
-                            let scope = format!("internal:get_shard:{}/{}", object_hash, i);
+                            let scope = format!("internal:get_shard|{}/{}", object_hash, i);
                             let token = jwt_manager
                                 .mint_token("internal".to_string(), vec![scope], 0)
                                 .map_err(|e| Status::internal(e.to_string()))?;
@@ -494,8 +515,11 @@ impl ObjectManager {
             return Err(Status::invalid_argument("Invalid object key"));
         }
 
-        let resource = format!("bucket:{}/{}", bucket_name, object_key);
-        if !auth::is_authorized(&format!("write:{}", resource), scopes) {
+        if !auth::is_authorized(
+            AnvilAction::ObjectDelete,
+            &format!("{}/{}", bucket_name, object_key),
+            scopes,
+        ) {
             return Err(Status::permission_denied("Permission denied"));
         }
 
@@ -546,8 +570,11 @@ impl ObjectManager {
             .await?;
         if !bucket.is_public_read {
             let claims = claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
-            let resource = format!("bucket:{}/{}", bucket_name, object_key);
-            if !auth::is_authorized(&format!("read:{}", resource), &claims.scopes) {
+            if !auth::is_authorized(
+                AnvilAction::ObjectRead,
+                &format!("{}/{}", bucket_name, object_key),
+                &claims.scopes,
+            ) {
                 return Err(Status::permission_denied("Permission denied"));
             }
         }
@@ -578,8 +605,7 @@ impl ObjectManager {
             .await?;
         if !bucket.is_public_read {
             let claims = claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
-            let resource = format!("bucket:{}", bucket_name);
-            if !auth::is_authorized(&format!("read:{}", resource), &claims.scopes) {
+            if !auth::is_authorized(AnvilAction::ObjectList, bucket_name, &claims.scopes) {
                 return Err(Status::permission_denied("Permission denied"));
             }
         }

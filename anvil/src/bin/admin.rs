@@ -1,9 +1,9 @@
 use anvil::crypto;
 use anvil::persistence::Persistence;
 use anvil::{create_pool, migrations, run_migrations};
+use anvil_core::permissions::AnvilAction;
 use clap::{Parser, Subcommand};
 use tracing::info;
-// Import the shared config
 
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
@@ -27,32 +27,32 @@ struct SharedConfig {
 #[derive(Subcommand)]
 enum Commands {
     /// Manage tenants
-    Tenants {
+    Tenant {
         #[clap(subcommand)]
         command: TenantCommands,
     },
     /// Manage apps
-    Apps {
+    App {
         #[clap(subcommand)]
         command: AppCommands,
     },
     /// Manage policies
-    Policies {
+    Policy {
         #[clap(subcommand)]
         command: PolicyCommands,
     },
     /// Manage regions
-    Regions {
+    Region {
         #[clap(subcommand)]
         command: RegionCommands,
     },
     /// Manage buckets
-    Buckets {
+    Bucket {
         #[clap(subcommand)]
         command: BucketCommands,
     },
     /// Manage admin users
-    Users {
+    User {
         #[clap(subcommand)]
         command: UserCommands,
     },
@@ -113,7 +113,7 @@ enum PolicyCommands {
         #[clap(long)]
         app_name: String,
         #[clap(long)]
-        action: String,
+        action: AnvilAction,
         #[clap(long)]
         resource: String,
     },
@@ -145,13 +145,13 @@ async fn main() -> anyhow::Result<()> {
     let encryption_key = hex::decode(config.anvil_secret_encryption_key)?;
 
     match &cli.command {
-        Commands::Tenants { command } => match command {
+        Commands::Tenant { command } => match command {
             TenantCommands::Create { name } => {
                 let tenant = persistence.create_tenant(name, "admin-created-key").await?;
                 info!("Created tenant: {} (ID: {})", tenant.name, tenant.id);
             }
         },
-        Commands::Apps { command } => match command {
+        Commands::App { command } => match command {
             AppCommands::Create {
                 tenant_name,
                 app_name,
@@ -203,7 +203,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("Client Secret: {}", new_client_secret);
             }
         },
-        Commands::Policies { command } => match command {
+        Commands::Policy { command } => match command {
             PolicyCommands::Grant {
                 app_name,
                 action,
@@ -213,14 +213,16 @@ async fn main() -> anyhow::Result<()> {
                     .get_app_by_name(app_name)
                     .await?
                     .expect("App not found");
-                persistence.grant_policy(app.id, resource, action).await?;
+                persistence
+                    .grant_policy(app.id, resource, &action.to_string())
+                    .await?;
                 info!(
                     "Granted action '{}' on resource '{}' to app '{}'",
                     action, resource, app_name
                 );
             }
         },
-        Commands::Regions { command } => match command {
+        Commands::Region { command } => match command {
             RegionCommands::Create { name } => {
                 let created = persistence.create_region(name).await?;
                 if created {
@@ -230,7 +232,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         },
-        Commands::Buckets { command } => match command {
+        Commands::Bucket { command } => match command {
             BucketCommands::SetPublicAccess { bucket, allow } => {
                 persistence.set_bucket_public_access(bucket, *allow).await?;
                 info!(
@@ -239,14 +241,20 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         },
-        Commands::Users { command } => match command {
-            UserCommands::Create { username, email, password, role } => {
+        Commands::User { command } => match command {
+            UserCommands::Create {
+                username,
+                email,
+                password,
+                role,
+            } => {
                 let hashed_password = bcrypt::hash(password, bcrypt::DEFAULT_COST)?;
-                persistence.create_admin_user(username, email, &hashed_password, role).await?;
+                persistence
+                    .create_admin_user(username, email, &hashed_password, role)
+                    .await?;
                 info!("Created admin user: {}", username);
             }
         },
     }
-
     Ok(())
 }

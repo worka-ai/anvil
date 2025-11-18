@@ -1,7 +1,9 @@
+use crate::permissions::AnvilAction;
 use anyhow::Result;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use std::str::FromStr;
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
@@ -67,109 +69,148 @@ impl JwtManager {
     }
 }
 
-/// Checks if a required scope is satisfied by the scopes present in a token.
-/// Supports wildcards.
-pub fn is_authorized(required_scope: &str, token_scopes: &[String]) -> bool {
-    debug!(%required_scope, ?token_scopes, "Checking authorization");
-
-    let required_parts: Vec<&str> = required_scope.splitn(2, ':').collect();
-    if required_parts.len() != 2 {
-        warn!(%required_scope, "Malformed required scope");
-        return false;
-    }
-    let required_action = required_parts[0];
-    let required_resource = required_parts[1];
+/// Checks if a required action on a resource is satisfied by the scopes present in a token.
+///
+/// This function uses a new, structured scope format: `action|resource_pattern`.
+/// Example: `bucket:write|some-bucket/*`
+pub fn is_authorized(
+    required_action: AnvilAction,
+    required_resource: &str,
+    token_scopes: &[String],
+) -> bool {
+    let required_action_str = required_action.to_string();
+    info!(
+        %required_action,
+        %required_resource,
+        ?token_scopes,
+        "Checking authorization"
+    );
 
     for scope in token_scopes {
-        let parts: Vec<&str> = scope.splitn(2, ':').collect();
+        let parts: Vec<&str> = scope.splitn(2, '|').collect();
         if parts.len() != 2 {
+            warn!(malformed_scope = %scope, "Skipping malformed scope in token");
             continue;
         }
-        let action = parts[0];
-        let resource = parts[1];
 
-        if action == required_action || action == "*" {
-            if resource_matches(required_resource, resource) {
-                debug!(%required_scope, matched_scope = %scope, "Authorization successful");
-                return true;
-            }
+        let token_action_str = parts[0];
+        let token_resource_pattern = parts[1];
+
+        // Check if the action matches (or is a wildcard)
+        let action_matches = token_action_str == "*" || token_action_str == required_action_str;
+
+        if !action_matches {
+            continue;
+        }
+
+        // If actions match, check if the resource is covered by the pattern.
+        if resource_matches(required_resource, token_resource_pattern) {
+            debug!(
+                required = %format!("{}|{}", required_action, required_resource),
+                matched_scope = %scope,
+                "Authorization successful"
+            );
+            return true;
         }
     }
 
-    debug!(%required_scope, "Authorization failed");
+    debug!(
+        required = %format!("{}|{}", required_action, required_resource),
+        "Authorization failed"
+    );
     false
 }
 
-// Helper to extract scopes from AppState via current request context.
-// In this codebase, services are wrapped with an interceptor that sets claims in request extensions.
-// Here we provide a minimal helper to be invoked in services, where AppState is available.
-// Attempts to extract scopes from the request context previously attached by middleware.
-// For minimal impact, we expose a function that services can use to require scopes
-// and return PermissionDenied if missing. We do NOT modify the middleware here.
-pub fn try_get_claims_from_extensions(ext: &http::Extensions) -> Option<Claims> {
-    if let Some(claims) = ext.get::<crate::auth::Claims>() {
-        return Some(claims.clone());
-    }
-    None
-}
-
-pub fn try_get_scopes_from_extensions(ext: &http::Extensions) -> Option<Vec<String>> {
-    // If your middleware inserts Claims or a custom context into extensions,
-    // adapt these lookups. We first try our Claims type.
-    if let Some(claims) = ext.get::<crate::auth::Claims>() {
-        return Some(claims.scopes.clone());
-    }
-    None
-}
-
+/// Checks if a given resource string matches a pattern.
+/// Supports exact matches, prefix matches with a wildcard (`*`), and a global wildcard.
 fn resource_matches(required: &str, pattern: &str) -> bool {
     if pattern == "*" {
         return true;
     }
-    if pattern.ends_with('*') {
-        let base = &pattern[..pattern.len() - 1];
+    if let Some(base) = pattern.strip_suffix('*') {
         return required.starts_with(base);
     }
     required == pattern
 }
 
+pub fn try_get_claims_from_extensions(ext: &http::Extensions) -> Option<Claims> {
+    ext.get::<crate::auth::Claims>().cloned()
+}
+
+pub fn try_get_scopes_from_extensions(ext: &http::Extensions) -> Option<Vec<String>> {
+    ext.get::<crate::auth::Claims>()
+        .map(|claims| claims.scopes.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::permissions::AnvilAction;
 
     #[test]
-    fn test_is_authorized() {
+    fn test_is_authorized_new_format() {
         let token_scopes = vec![
-            "read:bucket/folder/*".to_string(),
-            "write:bucket/specific/file.txt".to_string(),
-            "grant:bucket/*".to_string(),
+            "bucket:read|images-bucket".to_string(),
+            "bucket:write|images-bucket".to_string(),
+            "object:read|images-bucket/users/*".to_string(),
+            "object:write|images-bucket/users/123/*".to_string(),
+            "object:delete|other-bucket/stuff".to_string(),
+            "*|*".to_string(), // Global wildcard
         ];
 
         // Exact match
         assert!(is_authorized(
-            "write:bucket/specific/file.txt",
+            AnvilAction::BucketRead,
+            "images-bucket",
             &token_scopes
         ));
 
-        // Wildcard match
+        // Prefix match
         assert!(is_authorized(
-            "read:bucket/folder/sub/image.jpg",
+            AnvilAction::ObjectRead,
+            "images-bucket/users/abc",
+            &token_scopes
+        ));
+        assert!(is_authorized(
+            AnvilAction::ObjectWrite,
+            "images-bucket/users/123/avatar.jpg",
             &token_scopes
         ));
 
-        // Grant match
-        assert!(is_authorized("grant:bucket/some/path", &token_scopes));
+        // Global wildcard action and resource
+        assert!(is_authorized(
+            AnvilAction::BucketCreate,
+            "any-bucket",
+            &token_scopes
+        ));
+
+        //below the we get unauthorised if wildcard doesn't grant access
+        let no_wildcard = token_scopes
+            .clone()
+            .iter()
+            .filter(|v| v != &"*|*")
+            .map(|v| v.to_string())
+            .collect::<Vec<String>>();
 
         // Mismatch action
         assert!(!is_authorized(
-            "delete:bucket/folder/sub/image.jpg",
-            &token_scopes
+            AnvilAction::BucketDelete,
+            "images-bucket",
+            &no_wildcard
         ));
 
         // Mismatch resource
         assert!(!is_authorized(
-            "read:another-bucket/folder/file.txt",
-            &token_scopes
+            AnvilAction::ObjectRead,
+            "other-bucket/users/abc",
+            &no_wildcard
+        ));
+
+        // Mismatch on prefix rule
+        assert!(!is_authorized(
+            AnvilAction::ObjectWrite,
+            "images-bucket/users/456/avatar.jpg", // 456 does not match 123/*
+            &no_wildcard
         ));
     }
 }

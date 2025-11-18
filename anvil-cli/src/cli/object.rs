@@ -127,7 +127,10 @@ pub async fn handle_object_command(command: &ObjectCommands, ctx: &Context) -> a
             );
             let resp = client.head_object(request).await?;
             let obj = resp.into_inner();
-            println!("ETag: {}\nSize: {}\nLast Modified: {}", obj.etag, obj.size, obj.last_modified);
+            println!(
+                "ETag: {}\nSize: {}\nLast Modified: {}",
+                obj.etag, obj.size, obj.last_modified
+            );
         }
     }
 

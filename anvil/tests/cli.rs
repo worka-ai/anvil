@@ -29,17 +29,16 @@ fn get_cli_path() -> &'static str {
 async fn run_cli(args: &[&str], config_dir: &std::path::Path) -> std::process::Output {
     let cli_path = get_cli_path().to_string();
     let config_path = config_dir.join("config.toml");
-    let mut all_args = vec!["--config".to_string(), config_path.to_str().unwrap().to_string()];
+    let mut all_args = vec![
+        "--config".to_string(),
+        config_path.to_str().unwrap().to_string(),
+    ];
     all_args.extend(args.iter().map(|s| s.to_string()));
 
     let config_dir_path = config_dir.to_path_buf();
 
     tokio::task::spawn_blocking(move || {
-        println!(
-            "Running CLI command: {} {}",
-            cli_path,
-            all_args.join(" "),
-        );
+        println!("Running CLI command: {} {}", cli_path, all_args.join(" "),);
         let output = Command::new(&cli_path)
             .args(&all_args)
             .env("HOME", &config_dir_path)
@@ -77,7 +76,7 @@ async fn setup_test_profile(cluster: &TestCluster, config_dir: &std::path::Path)
             global_db_url.clone(),
             "--anvil-secret-encryption-key".to_string(),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            "apps".to_string(),
+            "app".to_string(),
             "create".to_string(),
             "--tenant-name".to_string(),
             "default".to_string(),
@@ -87,11 +86,13 @@ async fn setup_test_profile(cluster: &TestCluster, config_dir: &std::path::Path)
         .collect();
 
     let app_output = tokio::task::spawn_blocking(move || {
+        println!("Running `cargo {}`", create_args.join(" "));
         Command::new("cargo").args(&create_args).output().unwrap()
     })
     .await
     .unwrap();
 
+    println!("configure output: {:?}", app_output);
     assert!(app_output.status.success());
     let creds = String::from_utf8(app_output.stdout).unwrap();
     let client_id = extract_credential(&creds, "Client ID");
@@ -106,7 +107,7 @@ async fn setup_test_profile(cluster: &TestCluster, config_dir: &std::path::Path)
             global_db_url,
             "--anvil-secret-encryption-key".to_string(),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            "policies".to_string(),
+            "policy".to_string(),
             "grant".to_string(),
             "--app-name".to_string(),
             app_name.to_string(),
@@ -118,12 +119,12 @@ async fn setup_test_profile(cluster: &TestCluster, config_dir: &std::path::Path)
         .collect();
 
     let grant_output = tokio::task::spawn_blocking(move || {
+        println!("Running `cargo {}`", grant_args.join(" "));
         Command::new("cargo").args(&grant_args).output().unwrap()
     })
     .await
     .unwrap();
     assert!(grant_output.status.success());
-
 
     // Configure the CLI profile
     let output = run_cli(
@@ -153,7 +154,11 @@ async fn test_cli_configure_and_bucket_ls() {
     setup_test_profile(&cluster, config_dir.path()).await;
 
     let bucket_name = format!("my-cli-bucket-{}", uuid::Uuid::new_v4());
-    let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
+    let output = run_cli(
+        &["bucket", "create", &bucket_name, "test-region-1"],
+        config_dir.path(),
+    )
+    .await;
     assert!(output.status.success());
 
     let output = run_cli(&["bucket", "ls"], config_dir.path()).await;
@@ -171,7 +176,11 @@ async fn test_cli_bucket_create_and_rm() {
 
     let bucket_name = format!("my-cli-bucket-{}", uuid::Uuid::new_v4());
 
-    let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
+    let output = run_cli(
+        &["bucket", "create", &bucket_name, "test-region-1"],
+        config_dir.path(),
+    )
+    .await;
     assert!(output.status.success());
 
     let output = run_cli(&["bucket", "ls"], config_dir.path()).await;
@@ -197,7 +206,11 @@ async fn test_cli_object_put_and_get() {
     let object_key = "my-cli-object";
     let content = "hello from cli object test";
 
-    let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
+    let output = run_cli(
+        &["bucket", "create", &bucket_name, "test-region-1"],
+        config_dir.path(),
+    )
+    .await;
     assert!(output.status.success());
 
     let temp_dir = tempdir().unwrap();
@@ -205,7 +218,11 @@ async fn test_cli_object_put_and_get() {
     std::fs::write(&file_path, content).unwrap();
 
     let dest = format!("s3://{}/{}", bucket_name, object_key);
-    let output = run_cli(&["object", "put", file_path.to_str().unwrap(), &dest], config_dir.path()).await;
+    let output = run_cli(
+        &["object", "put", file_path.to_str().unwrap(), &dest],
+        config_dir.path(),
+    )
+    .await;
     assert!(output.status.success());
 
     let output = run_cli(&["object", "get", &dest], config_dir.path()).await;
@@ -222,23 +239,46 @@ async fn test_cli_hf_ingestion() {
     setup_test_profile(&cluster, config_dir.path()).await;
 
     let bucket_name = format!("my-cli-hf-bucket-{}", uuid::Uuid::new_v4());
-    let object_key = "config.json";
+    let repo = "openai/gpt-oss-20b";
+    let file = "config.json";
+    let object_key = format!("{}/{}", repo, file);
 
-    let output = run_cli(&["bucket", "create", &bucket_name, "test-region-1"], config_dir.path()).await;
+    let output = run_cli(
+        &["bucket", "create", &bucket_name, "test-region-1"],
+        config_dir.path(),
+    )
+    .await;
     assert!(output.status.success());
 
     let hf_token = "test-token";
-    let output = run_cli(&["hf", "key", "add", "--name", "test-key", "--token", &hf_token], config_dir.path()).await;
+    let output = run_cli(
+        &[
+            "hf", "key", "add", "--name", "test-key", "--token", &hf_token,
+        ],
+        config_dir.path(),
+    )
+    .await;
     assert!(output.status.success());
 
-    let output = run_cli(&[
-        "hf", "ingest", "start",
-        "--key", "test-key",
-        "--repo", "openai/gpt-oss-20b",
-        "--bucket", &bucket_name,
-        "--target-region", "test-region-1",
-        "--include", "config.json",
-    ], config_dir.path()).await;
+    let output = run_cli(
+        &[
+            "hf",
+            "ingest",
+            "start",
+            "--key",
+            "test-key",
+            "--repo",
+            repo,
+            "--bucket",
+            &bucket_name,
+            "--target-region",
+            "test-region-1",
+            "--include",
+            file,
+        ],
+        config_dir.path(),
+    )
+    .await;
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     let ingestion_id = stdout.split_whitespace().last().unwrap();
@@ -248,8 +288,13 @@ async fn test_cli_hf_ingestion() {
         if start.elapsed() > Duration::from_secs(120) {
             panic!("Timeout waiting for HF ingestion to complete");
         }
-        let output = run_cli(&["hf", "ingest", "status", "--id", ingestion_id], config_dir.path()).await;
+        let output = run_cli(
+            &["hf", "ingest", "status", "--id", ingestion_id],
+            config_dir.path(),
+        )
+        .await;
         let stdout = String::from_utf8(output.stdout).unwrap();
+        println!("HF Ingestion Status: {}", stdout);
         if stdout.contains("state=completed") {
             break;
         }

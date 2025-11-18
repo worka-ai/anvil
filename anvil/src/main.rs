@@ -3,8 +3,8 @@ use clap::Parser;
 use std::net::SocketAddr;
 use tracing::info;
 
-use anvil_core::config;
 use anvil::config::Config;
+use anvil_core::config;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

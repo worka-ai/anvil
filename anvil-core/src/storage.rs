@@ -3,6 +3,7 @@ use futures_util::StreamExt;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use tracing::info;
 
 const STORAGE_DIR: &str = "anvil-data";
 const TEMP_DIR: &str = "tmp";
@@ -14,7 +15,11 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub async fn commit_whole_object_from_bytes(&self, data: &[u8], final_object_hash: &str) -> Result<()> {
+    pub async fn commit_whole_object_from_bytes(
+        &self,
+        data: &[u8],
+        final_object_hash: &str,
+    ) -> Result<()> {
         let final_path = self.get_whole_object_path(final_object_hash);
         let mut file = fs::File::create(&final_path).await?;
         file.write_all(data).await?;
@@ -77,6 +82,7 @@ impl Storage {
         let temp_path = self.get_temp_shard_path(upload_id, shard_index);
         let final_path = self.get_shard_path(final_object_hash, shard_index);
         fs::rename(temp_path, final_path).await?;
+        info!("File renamed successfully");
         Ok(())
     }
 
@@ -106,6 +112,7 @@ impl Storage {
         &self,
         mut data_stream: impl futures_util::Stream<Item = Result<Vec<u8>, tonic::Status>> + Unpin,
     ) -> Result<(PathBuf, i64, String)> {
+        info!("stream_to_temp_file called");
         let upload_id = uuid::Uuid::new_v4().to_string();
         let temp_path = self.get_temp_whole_object_path(&upload_id);
         let mut file = fs::File::create(&temp_path).await?;
@@ -121,6 +128,12 @@ impl Storage {
         }
 
         let content_hash = overall_hasher.finalize().to_hex().to_string();
+        info!(
+            ?temp_path,
+            total_bytes,
+            %content_hash,
+            "stream_to_temp_file finished"
+        );
         Ok((temp_path, total_bytes, content_hash))
     }
 
@@ -130,7 +143,13 @@ impl Storage {
         final_object_hash: &str,
     ) -> Result<()> {
         let final_path = self.get_whole_object_path(final_object_hash);
+        info!(
+            temp_path = %temp_path.display(),
+            final_path = %final_path.display(),
+            "Renaming temporary file to final object path"
+        );
         fs::rename(temp_path, final_path).await?;
+        info!("File renamed successfully");
         Ok(())
     }
 }

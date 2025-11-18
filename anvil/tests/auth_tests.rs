@@ -19,7 +19,7 @@ fn create_app(global_db_url: &str, app_name: &str) -> (String, String) {
             global_db_url,
             "--anvil-secret-encryption-key",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "apps",
+            "app",
             "create",
             "--tenant-name",
             "default",
@@ -78,18 +78,19 @@ async fn test_grant_and_revoke_access() {
     let (granter_client_id, granter_client_secret) =
         create_app(&cluster.global_db_url, "granter-app");
 
+    // Grant the granter app the ability to grant policies
     let admin_args = &["run", "--bin", "admin", "--"];
     let policy_args = &[
-        "policies",
+        "policy",
         "grant",
         "--app-name",
         "granter-app",
         "--action",
-        "*",
+        "policy:grant",
         "--resource",
         "*",
     ];
-    let status = std::process::Command::new("cargo")
+    let output = std::process::Command::new("cargo")
         .args(
             admin_args
                 .iter()
@@ -101,9 +102,35 @@ async fn test_grant_and_revoke_access() {
                 ])
                 .chain(policy_args.iter()),
         )
-        .status()
+        .output()
         .unwrap();
-    assert!(status.success());
+    assert!(output.status.success());
+
+    let revoke_policy_args = &[
+        "policy",
+        "grant",
+        "--app-name",
+        "granter-app",
+        "--action",
+        "policy:revoke",
+        "--resource",
+        "*",
+    ];
+    let revoke_output = std::process::Command::new("cargo")
+        .args(
+            admin_args
+                .iter()
+                .chain(&[
+                    "--global-database-url",
+                    &cluster.global_db_url,
+                    "--anvil-secret-encryption-key",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ])
+                .chain(revoke_policy_args.iter()),
+        )
+        .output()
+        .unwrap();
+    assert!(revoke_output.status.success());
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -111,7 +138,7 @@ async fn test_grant_and_revoke_access() {
         &cluster.grpc_addrs[0],
         &granter_client_id,
         &granter_client_secret,
-        vec!["*".to_string()],
+        vec!["*"].into_iter().map(|s| s.to_string()).collect(),
     )
     .await;
 
@@ -125,7 +152,7 @@ async fn test_grant_and_revoke_access() {
     let mut grant_req = Request::new(GrantAccessRequest {
         grantee_app_id: "grantee-app".to_string(),
         resource: resource.clone(),
-        action: "read".to_string(),
+        action: "bucket:read".to_string(),
     });
     grant_req.metadata_mut().insert(
         "authorization",
@@ -138,7 +165,7 @@ async fn test_grant_and_revoke_access() {
         &cluster.grpc_addrs[0],
         &grantee_client_id,
         &grantee_client_secret,
-        vec![format!("read:{}", resource)],
+        vec![format!("bucket:read|{}", resource)],
     )
     .await;
     assert!(!grantee_token.is_empty());
@@ -147,7 +174,7 @@ async fn test_grant_and_revoke_access() {
     let mut revoke_req = Request::new(RevokeAccessRequest {
         grantee_app_id: "grantee-app".to_string(),
         resource: resource.clone(),
-        action: "read".to_string(),
+        action: "bucket:read".to_string(),
     });
     revoke_req.metadata_mut().insert(
         "authorization",
@@ -160,7 +187,7 @@ async fn test_grant_and_revoke_access() {
         &cluster.grpc_addrs[0],
         &grantee_client_id,
         &grantee_client_secret,
-        vec![format!("read:{}", resource)],
+        vec![format!("bucket:read|{}", resource)],
     )
     .await;
     assert!(res.is_err());
@@ -277,7 +304,7 @@ async fn test_reset_app_secret() {
     // Grant it permissions
     let admin_args = &["run", "--bin", "admin", "--"];
     let policy_args = &[
-        "policies",
+        "policy",
         "grant",
         "--app-name",
         app_name,
@@ -309,7 +336,7 @@ async fn test_reset_app_secret() {
             &cluster.global_db_url,
             "--anvil-secret-encryption-key",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "apps",
+            "app",
             "reset-secret",
             "--app-name",
             app_name,
@@ -328,7 +355,9 @@ async fn test_reset_app_secret() {
     cluster.restart(Duration::from_secs(10)).await;
 
     // 5. Verify the NEW secret works against the restarted node
-    let s3_client_new = cluster.get_s3_client("eu-west-1", &client_id, &new_secret).await;
+    let s3_client_new = cluster
+        .get_s3_client("eu-west-1", &client_id, &new_secret)
+        .await;
     match s3_client_new.list_buckets().send().await {
         Ok(_list_bucket_output) => {}
         Err(e) => {
@@ -418,7 +447,7 @@ async fn test_admin_cli_set_public_access() {
             &cluster.global_db_url,
             "--anvil-secret-encryption-key",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "buckets",
+            "bucket",
             "set-public-access",
             "--bucket",
             &bucket_name,

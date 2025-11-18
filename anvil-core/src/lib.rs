@@ -16,6 +16,7 @@ pub mod crypto;
 pub mod discovery;
 pub mod middleware;
 pub mod object_manager;
+pub mod permissions;
 pub mod persistence;
 pub mod placement;
 pub mod s3_auth;
@@ -31,8 +32,6 @@ pub mod worker;
 pub mod anvil_api {
     tonic::include_proto!("anvil");
 }
-
-
 
 // Our application state, which will hold the persistence layer, storage engine, etc.
 #[derive(Clone, Debug)]
@@ -85,5 +84,3 @@ impl AppState {
         })
     }
 }
-
-

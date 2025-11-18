@@ -69,15 +69,46 @@ enum Commands {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     eprintln!("[anvil-cli] starting v{}", env!("CARGO_PKG_VERSION"));
-    eprintln!("[anvil-cli] args: {:?}", std::env::args().collect::<Vec<_>>());
+    eprintln!(
+        "[anvil-cli] args: {:?}",
+        std::env::args().collect::<Vec<_>>()
+    );
     let cli = Cli::parse();
 
-    if let Commands::Configure { name, host, client_id, client_secret, default } = &cli.command {
-        cli::configure::handle_configure_command(name.clone(), host.clone(), client_id.clone(), client_secret.clone(), *default, cli.config)?;
+    if let Commands::Configure {
+        name,
+        host,
+        client_id,
+        client_secret,
+        default,
+    } = &cli.command
+    {
+        cli::configure::handle_configure_command(
+            name.clone(),
+            host.clone(),
+            client_id.clone(),
+            client_secret.clone(),
+            *default,
+            cli.config,
+        )?;
         return Ok(());
     }
-    if let Commands::StaticConfig { name, host, client_id, client_secret, default } = &cli.command {
-        cli::configure::handle_static_config_command(name.clone(), host.clone(), client_id.clone(), client_secret.clone(), *default, cli.config)?;
+    if let Commands::StaticConfig {
+        name,
+        host,
+        client_id,
+        client_secret,
+        default,
+    } = &cli.command
+    {
+        cli::configure::handle_static_config_command(
+            name.clone(),
+            host.clone(),
+            client_id.clone(),
+            client_secret.clone(),
+            *default,
+            cli.config,
+        )?;
         return Ok(());
     }
 

@@ -1,6 +1,6 @@
 use crate::anvil_api::auth_service_server::AuthService;
 use crate::anvil_api::*;
-use crate::{AppState, auth, crypto};
+use crate::{AppState, auth, crypto, permissions::AnvilAction};
 use tonic::{Request, Response, Status};
 
 #[tonic::async_trait]
@@ -43,7 +43,17 @@ impl AuthService for AppState {
         } else {
             req.scopes
                 .into_iter()
-                .filter(|requested_scope| auth::is_authorized(requested_scope, &allowed_scopes))
+                .filter(|requested_scope| {
+                    let parts: Vec<&str> = requested_scope.splitn(2, '|').collect();
+                    if parts.len() != 2 {
+                        return false;
+                    }
+                    if let Ok(action) = parts[0].parse::<AnvilAction>() {
+                        auth::is_authorized(action, parts[1], &allowed_scopes)
+                    } else {
+                        false
+                    }
+                })
                 .collect()
         };
 
@@ -60,7 +70,10 @@ impl AuthService for AppState {
                 app_details.tenant_id,
             )
             .map_err(|e| Status::internal(e.to_string()))?;
-        tracing::info!("[AuthService] Returning access token for app_id={}", app_details.id);
+        tracing::info!(
+            "[AuthService] Returning access token for app_id={}",
+            app_details.id
+        );
         Ok(Response::new(GetAccessTokenResponse {
             access_token: token,
             expires_in: 3600,
@@ -77,7 +90,7 @@ impl AuthService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.get_ref();
 
-        if !auth::is_authorized(&format!("grant:{}", req.resource), &claims.scopes) {
+        if !auth::is_authorized(AnvilAction::PolicyGrant, &req.resource, &claims.scopes) {
             return Err(Status::permission_denied(
                 "Permission denied to grant access to this resource",
             ));
@@ -107,7 +120,7 @@ impl AuthService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.get_ref();
 
-        if !auth::is_authorized(&format!("grant:{}", req.resource), &claims.scopes) {
+        if !auth::is_authorized(AnvilAction::PolicyRevoke, &req.resource, &claims.scopes) {
             return Err(Status::permission_denied(
                 "Permission denied to revoke access to this resource",
             ));
@@ -139,7 +152,7 @@ impl AuthService for AppState {
         let req = request.get_ref();
 
         let resource = format!("bucket:{}", req.bucket);
-        if !auth::is_authorized(&format!("grant:{}", resource), &claims.scopes) {
+        if !auth::is_authorized(AnvilAction::PolicyGrant, &resource, &claims.scopes) {
             return Err(Status::permission_denied(
                 "Permission denied to modify public access on this bucket",
             ));

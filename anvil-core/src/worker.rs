@@ -5,14 +5,14 @@ use crate::cluster::ClusterState;
 use crate::object_manager::ObjectManager;
 use crate::persistence::Persistence;
 use crate::tasks::{HFIngestionItemState, HFIngestionState, TaskStatus, TaskType};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::Row;
 use tonic::Status;
-use tracing::{error, info, debug, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug)]
 struct Task {
@@ -101,13 +101,14 @@ pub async fn run(
                         error!("Failed to mark task {} as failed: {:?}", task.id, fail_err);
                     }
                 } else {
-                                        if let Err(complete_err) =
-                                            p.update_task_status(task.id, TaskStatus::Completed).await
-                                        {
-                                            error!(
-                                                "Failed to mark task {} as completed: {}",
-                                                task.id, complete_err
-                                            );                    }
+                    if let Err(complete_err) =
+                        p.update_task_status(task.id, TaskStatus::Completed).await
+                    {
+                        error!(
+                            "Failed to mark task {} as completed: {}",
+                            task.id, complete_err
+                        );
+                    }
                 }
             });
         }
@@ -120,7 +121,7 @@ async fn handle_hf_ingestion(
     task: &Task,
 ) -> anyhow::Result<()> {
     use globset::{Glob, GlobSetBuilder};
-    use hf_hub::{api::sync::Api, Repo, RepoType};
+    use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
 
     let ingestion_id: i64 = task
         .payload
@@ -179,10 +180,11 @@ async fn handle_hf_ingestion(
             let token = String::from_utf8(token_bytes)?;
             debug!("Decrypted token.");
 
-            unsafe {
-                std::env::set_var("HF_TOKEN", token);
-            }
-            let api = Api::new()?;
+            let cache_dir = tempfile::tempdir()?;
+            let api = ApiBuilder::new()
+                .with_cache_dir(cache_dir.path().to_path_buf())
+                .with_token(Some(token))
+                .build()?;
 
             // --- Blocking File Listing ---
             info!("Getting repo file list (blocking)...");
@@ -262,16 +264,20 @@ async fn handle_hf_ingestion(
                 let repo_details_clone = (repo_str.clone(), revision.clone());
                 let api_clone_2 = api.clone();
                 let filename = e.rfilename.clone();
-                let local_path = tokio::task::spawn_blocking(move || {
-                    let repo = Repo::with_revision(
-                        repo_details_clone.0,
-                        RepoType::Model,
-                        repo_details_clone.1,
-                    );
-                    let repo_client = api_clone_2.repo(repo);
-                    repo_client.get(&filename)
-                })
-                .await??;
+                let local_path_buf;
+                    info!("Downloading from Hugging Face");
+                    local_path_buf = tokio::task::spawn_blocking(move || {
+                        let repo = Repo::with_revision(
+                            repo_details_clone.0,
+                            RepoType::Model,
+                            repo_details_clone.1,
+                        );
+                        let repo_client = api_clone_2.repo(repo);
+                        repo_client.get(&filename)
+                    })
+                    .await??;
+
+                let local_path = &local_path_buf;
                 debug!(path = ?local_path, "Downloaded to");
                 // --- End Blocking ---
 
@@ -307,10 +313,11 @@ async fn handle_hf_ingestion(
                 };
 
                 let mut reader = make_reader().await?;
-                let scopes = vec![format!("write:bucket:{}/{}", target_bucket, full_key)];
+                let scopes = vec!["object:write|*".to_string()];
                 let mut attempt = 0;
                 loop {
                     attempt += 1;
+                    info!("Putting object, attempt {}", attempt);
                     let res = object_manager
                         .put_object(tenant_id, &target_bucket, &full_key, &scopes, reader)
                         .await;
@@ -323,6 +330,7 @@ async fn handle_hf_ingestion(
                             warn!(
                                 attempt,
                                 key = %full_key,
+                                error = %e.to_string(),
                                 "Upload attempt failed. Retrying..."
                             );
                             let jitter = (rand::random::<u64>() % 200) as u64;
@@ -353,9 +361,11 @@ async fn handle_hf_ingestion(
                 ingestion_id,
                 "Ingestion task completed successfully."
             );
+            info!(ingestion_id, "Updating ingestion state to completed.");
             persistence
                 .hf_update_ingestion_state(ingestion_id, HFIngestionState::Completed, None)
                 .await?;
+            info!(ingestion_id, "Ingestion state set to completed.");
 
             Ok::<(), anyhow::Error>(())
         }
@@ -391,11 +401,12 @@ async fn handle_delete_object(
                 )?;
 
                 futures.push(async move {
-                    let endpoint = if grpc_addr.starts_with("http://") || grpc_addr.starts_with("https://") {
-                        grpc_addr
-                    } else {
-                        format!("http://{}", grpc_addr)
-                    };
+                    let endpoint =
+                        if grpc_addr.starts_with("http://") || grpc_addr.starts_with("https://") {
+                            grpc_addr
+                        } else {
+                            format!("http://{}", grpc_addr)
+                        };
                     let mut client = InternalAnvilServiceClient::connect(endpoint)
                         .await
                         .map_err(|e| Status::internal(e.to_string()))?;
@@ -425,4 +436,3 @@ async fn handle_delete_object(
     );
     Ok(())
 }
-

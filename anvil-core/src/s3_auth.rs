@@ -6,8 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::{AppState, auth::Claims, crypto};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
-    PercentEncodingMode, SignableBody, SignableRequest, SignatureLocation,
-    SigningParams, SigningSettings, UriPathNormalizationMode, sign,
+    PercentEncodingMode, SignableBody, SignableRequest, SignatureLocation, SigningParams,
+    SigningSettings, UriPathNormalizationMode, sign,
 };
 use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;

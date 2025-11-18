@@ -1,15 +1,14 @@
 pub mod auth;
 pub mod bucket;
+pub mod huggingface;
 pub mod internal;
 pub mod object;
-pub mod huggingface;
 
 use crate::anvil_api::{
-    auth_service_server::AuthServiceServer,
-    bucket_service_server::BucketServiceServer,
-    internal_anvil_service_server::InternalAnvilServiceServer,
-    hugging_face_key_service_server::HuggingFaceKeyServiceServer,
+    auth_service_server::AuthServiceServer, bucket_service_server::BucketServiceServer,
     hf_ingestion_service_server::HfIngestionServiceServer,
+    hugging_face_key_service_server::HuggingFaceKeyServiceServer,
+    internal_anvil_service_server::InternalAnvilServiceServer,
     object_service_server::ObjectServiceServer,
 };
 use crate::{AppState, middleware};
@@ -26,7 +25,9 @@ impl AuthInterceptorFn {
     where
         F: Fn(Request<()>) -> Result<Request<()>, Status> + Send + Sync + 'static,
     {
-        Self { f: std::sync::Arc::new(f) }
+        Self {
+            f: std::sync::Arc::new(f),
+        }
     }
 
     pub fn call(&self, req: Request<()>) -> Result<Request<()>, Status> {
@@ -34,10 +35,7 @@ impl AuthInterceptorFn {
     }
 }
 
-pub fn create_grpc_router(
-    state: AppState,
-    auth_interceptor: AuthInterceptorFn,
-) -> Routes {
+pub fn create_grpc_router(state: AppState, auth_interceptor: AuthInterceptorFn) -> Routes {
     // Adapt our handle to a closure Interceptor Tonic accepts
     let auth_closure = {
         let f = auth_interceptor.clone();

@@ -1,10 +1,10 @@
 use anyhow::Result;
 use axum::ServiceExt;
 use deadpool_postgres::{ManagerConfig, Pool, RecyclingMethod};
-use std::str::FromStr;
-use tonic::service;
 use once_cell::sync::OnceCell;
+use std::str::FromStr;
 use tokio_postgres::NoTls;
+use tonic::service;
 use tower::ServiceExt as TowerServiceExt;
 use tracing::{error, info};
 
@@ -26,7 +26,10 @@ pub mod regional_migrations {
     embed_migrations!("./migrations_regional");
 }
 
-pub async fn run(listener: tokio::net::TcpListener, config: anvil_core::config::Config) -> Result<()> {
+pub async fn run(
+    listener: tokio::net::TcpListener,
+    config: anvil_core::config::Config,
+) -> Result<()> {
     // Run migrations first
     run_migrations(
         &config.global_database_url,
@@ -76,11 +79,13 @@ pub async fn start_node(
 
     // --- Services ---
     let state_clone = state.clone();
-    let auth_interceptor = anvil_core::services::AuthInterceptorFn::new(move |req: tonic::Request<()>| {
-        middleware::auth_interceptor(req, &state_clone)
-    });
+    let auth_interceptor =
+        anvil_core::services::AuthInterceptorFn::new(move |req: tonic::Request<()>| {
+            middleware::auth_interceptor(req, &state_clone)
+        });
 
-    let mut grpc_router = anvil_core::services::create_grpc_router(state.clone(), auth_interceptor.clone());
+    let mut grpc_router =
+        anvil_core::services::create_grpc_router(state.clone(), auth_interceptor.clone());
 
     if let Some(ext) = ENTERPRISE_EXTENDER.get() {
         grpc_router = ext(grpc_router, state.clone(), auth_interceptor);
@@ -103,7 +108,10 @@ pub async fn start_node(
             if content_type.starts_with("application/grpc") {
                 grpc_router.oneshot(req).await
             } else {
-                tracing::info!("[gRPC Mux] Routing to S3 gateway for content-type: {}", content_type);
+                tracing::info!(
+                    "[gRPC Mux] Routing to S3 gateway for content-type: {}",
+                    content_type
+                );
                 s3_router.oneshot(req).await
             }
         }
@@ -157,11 +165,19 @@ pub async fn run_migrations(
     Ok(())
 }
 static ENTERPRISE_EXTENDER: OnceCell<
-    fn(service::Routes, anvil_core::AppState, anvil_core::services::AuthInterceptorFn) -> service::Routes,
+    fn(
+        service::Routes,
+        anvil_core::AppState,
+        anvil_core::services::AuthInterceptorFn,
+    ) -> service::Routes,
 > = OnceCell::new();
 
 pub fn register_enterprise_extender(
-    f: fn(service::Routes, anvil_core::AppState, anvil_core::services::AuthInterceptorFn) -> service::Routes,
+    f: fn(
+        service::Routes,
+        anvil_core::AppState,
+        anvil_core::services::AuthInterceptorFn,
+    ) -> service::Routes,
 ) {
     let _ = ENTERPRISE_EXTENDER.set(f);
 }

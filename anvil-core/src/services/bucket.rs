@@ -70,7 +70,10 @@ impl BucketService for AppState {
             })
             .collect();
 
-        tracing::debug!("[service] EXITING list_buckets, found {} buckets", response_buckets.len());
+        tracing::debug!(
+            "[service] EXITING list_buckets, found {} buckets",
+            response_buckets.len()
+        );
         Ok(Response::new(ListBucketsResponse {
             buckets: response_buckets,
         }))

@@ -188,7 +188,13 @@ impl Persistence {
         &self.global_pool
     }
 
-    pub async fn create_admin_user(&self, username: &str, email: &str, password_hash: &str, role: &str) -> Result<()> {
+    pub async fn create_admin_user(
+        &self,
+        username: &str,
+        email: &str,
+        password_hash: &str,
+        role: &str,
+    ) -> Result<()> {
         let mut client = self.global_pool.get().await?;
         let tx = client.transaction().await?;
 
@@ -197,15 +203,16 @@ impl Persistence {
             &[&username, &email, &password_hash],
         ).await?.get(0);
 
-        let role_id: i32 = tx.query_one(
-            "SELECT id FROM admin_roles WHERE name = $1",
-            &[&role],
-        ).await?.get(0);
+        let role_id: i32 = tx
+            .query_one("SELECT id FROM admin_roles WHERE name = $1", &[&role])
+            .await?
+            .get(0);
 
         tx.execute(
             "INSERT INTO admin_user_roles (user_id, role_id) VALUES ($1, $2)",
             &[&user_id, &role_id],
-        ).await?;
+        )
+        .await?;
 
         tx.commit().await?;
         Ok(())
@@ -245,15 +252,30 @@ impl Persistence {
             return Ok(());
         }
 
-        let query = format!("UPDATE admin_users SET {} WHERE id = ${}", query_parts.join(", "), param_idx);
+        let query = format!(
+            "UPDATE admin_users SET {} WHERE id = ${}",
+            query_parts.join(", "),
+            param_idx
+        );
         params.push(Box::new(user_id));
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
         client.execute(&query, &param_refs).await?;
 
         if let Some(r) = role {
-            let role_id: i32 = client.query_one("SELECT id FROM admin_roles WHERE name = $1", &[&r]).await?.get(0);
-            client.execute("UPDATE admin_user_roles SET role_id = $1 WHERE user_id = $2", &[&role_id, &user_id]).await?;
+            let role_id: i32 = client
+                .query_one("SELECT id FROM admin_roles WHERE name = $1", &[&r])
+                .await?
+                .get(0);
+            client
+                .execute(
+                    "UPDATE admin_user_roles SET role_id = $1 WHERE user_id = $2",
+                    &[&role_id, &user_id],
+                )
+                .await?;
         }
 
         Ok(())
@@ -261,25 +283,37 @@ impl Persistence {
 
     pub async fn delete_admin_user(&self, user_id: i64) -> Result<()> {
         let client = self.global_pool.get().await?;
-        client.execute("DELETE FROM admin_users WHERE id = $1", &[&user_id]).await?;
+        client
+            .execute("DELETE FROM admin_users WHERE id = $1", &[&user_id])
+            .await?;
         Ok(())
     }
 
     pub async fn list_admin_users(&self) -> Result<Vec<AdminUser>> {
         let client = self.global_pool.get().await?;
-        let rows = client.query("SELECT id, username, email, password_hash, is_active FROM admin_users", &[]).await?;
-        Ok(rows.into_iter().map(|r| AdminUser {
-            id: r.get("id"),
-            username: r.get("username"),
-            email: r.get("email"),
-            password_hash: r.get("password_hash"),
-            is_active: r.get("is_active"),
-        }).collect())
+        let rows = client
+            .query(
+                "SELECT id, username, email, password_hash, is_active FROM admin_users",
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| AdminUser {
+                id: r.get("id"),
+                username: r.get("username"),
+                email: r.get("email"),
+                password_hash: r.get("password_hash"),
+                is_active: r.get("is_active"),
+            })
+            .collect())
     }
 
     pub async fn create_admin_role(&self, name: &str) -> Result<()> {
         let client = self.global_pool.get().await?;
-        client.execute("INSERT INTO admin_roles (name) VALUES ($1)", &[&name]).await?;
+        client
+            .execute("INSERT INTO admin_roles (name) VALUES ($1)", &[&name])
+            .await?;
         Ok(())
     }
 
@@ -302,20 +336,38 @@ impl Persistence {
 
     pub async fn update_admin_role(&self, id: i32, name: &str) -> Result<()> {
         let client = self.global_pool.get().await?;
-        client.execute("UPDATE admin_roles SET name = $1 WHERE id = $2", &[&name, &id]).await?;
+        client
+            .execute(
+                "UPDATE admin_roles SET name = $1 WHERE id = $2",
+                &[&name, &id],
+            )
+            .await?;
         Ok(())
     }
 
     pub async fn delete_admin_role(&self, id: i32) -> Result<()> {
         let client = self.global_pool.get().await?;
-        client.execute("DELETE FROM admin_roles WHERE id = $1", &[&id]).await?;
+        client
+            .execute("DELETE FROM admin_roles WHERE id = $1", &[&id])
+            .await?;
         Ok(())
     }
 
     pub async fn list_policies(&self) -> Result<Vec<String>> {
         let client = self.global_pool.get().await?;
-        let rows = client.query("SELECT resource, action FROM policies", &[]).await?;
-        Ok(rows.into_iter().map(|r| format!("{}:{}", r.get::<_, String>("action"), r.get::<_, String>("resource"))).collect())
+        let rows = client
+            .query("SELECT resource, action FROM policies", &[])
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                format!(
+                    "{}:{}",
+                    r.get::<_, String>("action"),
+                    r.get::<_, String>("resource")
+                )
+            })
+            .collect())
     }
 
     // --- Model Registry Methods ---
@@ -338,7 +390,11 @@ impl Persistence {
         Ok(())
     }
 
-    pub async fn create_model_tensors(&self, artifact_id: &str, tensors: &[crate::anvil_api::TensorIndexRow]) -> Result<()> {
+    pub async fn create_model_tensors(
+        &self,
+        artifact_id: &str,
+        tensors: &[crate::anvil_api::TensorIndexRow],
+    ) -> Result<()> {
         if tensors.is_empty() {
             return Ok(());
         }
@@ -352,7 +408,15 @@ impl Persistence {
         let mut writer = pin!(sink);
 
         for tensor in tensors {
-            let shape_array = format!("{{{}}}", tensor.shape.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","));
+            let shape_array = format!(
+                "{{{}}}",
+                tensor
+                    .shape
+                    .iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
             let blocks_json = serde_json::to_string(&tensor.blocks)?;
 
             let row_string = format!(
@@ -374,7 +438,7 @@ impl Persistence {
         Ok(())
     }
 
-        pub async fn list_tensors(
+    pub async fn list_tensors(
         &self,
         artifact_id: &str,
         limit: i64,
@@ -413,7 +477,11 @@ impl Persistence {
         Ok(tensors)
     }
 
-    pub async fn get_tensor_metadata(&self, artifact_id: &str, tensor_name: &str) -> Result<Option<crate::anvil_api::TensorIndexRow>> {
+    pub async fn get_tensor_metadata(
+        &self,
+        artifact_id: &str,
+        tensor_name: &str,
+    ) -> Result<Option<crate::anvil_api::TensorIndexRow>> {
         let client = self.regional_pool.get().await?;
         let row = client
             .query_opt(
@@ -443,7 +511,10 @@ impl Persistence {
         }))
     }
 
-    pub async fn get_model_artifact(&self, artifact_id: &str) -> Result<Option<crate::anvil_api::ModelManifest>> {
+    pub async fn get_model_artifact(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<crate::anvil_api::ModelManifest>> {
         let client = self.regional_pool.get().await?;
         let row = client
             .query_opt(
@@ -455,14 +526,19 @@ impl Persistence {
         match row {
             Some(row) => {
                 let manifest_json: serde_json::Value = row.get("manifest");
-                let manifest: crate::anvil_api::ModelManifest = serde_json::from_value(manifest_json)?;
+                let manifest: crate::anvil_api::ModelManifest =
+                    serde_json::from_value(manifest_json)?;
                 Ok(Some(manifest))
             }
             None => Ok(None),
         }
     }
 
-    pub async fn get_tensor_metadata_recursive(&self, artifact_id: &str, tensor_name: &str) -> Result<Option<crate::anvil_api::TensorIndexRow>> {
+    pub async fn get_tensor_metadata_recursive(
+        &self,
+        artifact_id: &str,
+        tensor_name: &str,
+    ) -> Result<Option<crate::anvil_api::TensorIndexRow>> {
         // 1. Try to find the tensor in the current artifact.
         if let Some(tensor) = self.get_tensor_metadata(artifact_id, tensor_name).await? {
             return Ok(Some(tensor));
@@ -472,7 +548,10 @@ impl Persistence {
         if let Some(manifest) = self.get_model_artifact(artifact_id).await? {
             if !manifest.base_artifact_id.is_empty() {
                 // 3. If it has a base, recurse.
-                return Box::pin(self.get_tensor_metadata_recursive(&manifest.base_artifact_id, tensor_name)).await;
+                return Box::pin(
+                    self.get_tensor_metadata_recursive(&manifest.base_artifact_id, tensor_name),
+                )
+                .await;
             }
         }
 
@@ -495,7 +574,9 @@ impl Persistence {
 
     pub async fn list_regions(&self) -> Result<Vec<String>> {
         let client = self.global_pool.get().await?;
-        let rows = client.query("SELECT name FROM regions ORDER BY name", &[]).await?;
+        let rows = client
+            .query("SELECT name FROM regions ORDER BY name", &[])
+            .await?;
         Ok(rows.into_iter().map(|r| r.get("name")).collect())
     }
 
@@ -509,7 +590,9 @@ impl Persistence {
 
     pub async fn list_tenants(&self) -> Result<Vec<Tenant>> {
         let client = self.global_pool.get().await?;
-        let rows = client.query("SELECT id, name FROM tenants ORDER BY name", &[]).await?;
+        let rows = client
+            .query("SELECT id, name FROM tenants ORDER BY name", &[])
+            .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
@@ -536,7 +619,7 @@ impl Persistence {
             .into_iter()
             .map(|row| {
                 format!(
-                    "{}:{}",
+                    "{}|{}",
                     row.get::<_, String>("action"),
                     row.get::<_, String>("resource")
                 )
@@ -575,10 +658,7 @@ impl Persistence {
     pub async fn get_app_by_id(&self, id: i64) -> Result<Option<App>> {
         let client = self.global_pool.get().await?;
         let row = client
-            .query_opt(
-                "SELECT id, name, client_id FROM apps WHERE id = $1",
-                &[&id],
-            )
+            .query_opt("SELECT id, name, client_id FROM apps WHERE id = $1", &[&id])
             .await?;
         Ok(row.map(Into::into))
     }
@@ -596,7 +676,12 @@ impl Persistence {
 
     pub async fn list_apps_for_tenant(&self, tenant_id: i64) -> Result<Vec<App>> {
         let client = self.global_pool.get().await?;
-        let rows = client.query("SELECT id, name, client_id FROM apps WHERE tenant_id = $1 ORDER BY name", &[&tenant_id]).await?;
+        let rows = client
+            .query(
+                "SELECT id, name, client_id FROM apps WHERE tenant_id = $1 ORDER BY name",
+                &[&tenant_id],
+            )
+            .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
@@ -665,6 +750,7 @@ impl Persistence {
             Err(e) => {
                 tracing::debug!("[Persistence] EXITING create_bucket: error");
                 if let Some(db_err) = e.as_db_error() {
+                    tracing::error!(?db_err, "Database error on create_bucket");
                     if db_err.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION {
                         return Err(tonic::Status::already_exists(
                             "A bucket with that name already exists.",
@@ -726,7 +812,10 @@ impl Persistence {
     }
 
     pub async fn list_buckets_for_tenant(&self, tenant_id: i64) -> Result<Vec<Bucket>> {
-        tracing::debug!("[Persistence] ENTERING list_buckets_for_tenant: tenant_id={}", tenant_id);
+        tracing::debug!(
+            "[Persistence] ENTERING list_buckets_for_tenant: tenant_id={}",
+            tenant_id
+        );
         let client = self.global_pool.get().await?;
         let rows = client
             .query(
@@ -735,7 +824,10 @@ impl Persistence {
             )
             .await?;
         let buckets: Vec<Bucket> = rows.into_iter().map(Into::into).collect();
-        tracing::debug!("[Persistence] EXITING list_buckets_for_tenant, found {} buckets", buckets.len());
+        tracing::debug!(
+            "[Persistence] EXITING list_buckets_for_tenant, found {} buckets",
+            buckets.len()
+        );
         Ok(buckets)
     }
 
@@ -807,7 +899,7 @@ impl Persistence {
             // If your ingestion uses a different normalization, replace this to match it.
             let mut out = String::with_capacity(seg.len());
             for (i, ch) in seg.chars().enumerate() {
-                let valid = ch.is_ascii_alphanumeric() || ch == '_' ;
+                let valid = ch.is_ascii_alphanumeric() || ch == '_';
                 if i == 0 {
                     // label must start with alpha (ltree requirement). If not, prefix with 'x'
                     if ch.is_ascii_alphabetic() {
@@ -1040,7 +1132,11 @@ impl Persistence {
         Ok(rows)
     }
 
-    pub async fn update_task_status(&self, task_id: i64, status: crate::tasks::TaskStatus) -> Result<()> {
+    pub async fn update_task_status(
+        &self,
+        task_id: i64,
+        status: crate::tasks::TaskStatus,
+    ) -> Result<()> {
         let client = self.global_pool.get().await?;
         client
             .execute(
@@ -1063,7 +1159,12 @@ impl Persistence {
     }
 
     // ---- Hugging Face Keys ----
-    pub async fn hf_create_key(&self, name: &str, token_encrypted: &[u8], note: Option<&str>) -> Result<()> {
+    pub async fn hf_create_key(
+        &self,
+        name: &str,
+        token_encrypted: &[u8],
+        note: Option<&str>,
+    ) -> Result<()> {
         let client = self.global_pool.get().await?;
         client
             .execute(
@@ -1101,7 +1202,14 @@ impl Persistence {
 
     pub async fn hf_list_keys(
         &self,
-    ) -> Result<Vec<(String, Option<String>, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>> {
+    ) -> Result<
+        Vec<(
+            String,
+            Option<String>,
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+        )>,
+    > {
         let client = self.global_pool.get().await?;
         let rows = client
             .query(
@@ -1231,23 +1339,33 @@ impl Persistence {
                 &[&id],
             )
             .await?;
-        let state: String = job.get(0);
+        let mut state: String = job.get(0);
         let err: Option<String> = job.get(1);
         let created_at: chrono::DateTime<chrono::Utc> = job.get(2);
         let started_at: Option<chrono::DateTime<chrono::Utc>> = job.get(3);
         let finished_at: Option<chrono::DateTime<chrono::Utc>> = job.get(4);
         let counts = client
             .query_one(
-                r#"SELECT COUNT(*) FILTER (WHERE state='queued') AS queued, COUNT(*) FILTER (WHERE state='downloading') AS downloading, COUNT(*) FILTER (WHERE state='stored') AS stored, COUNT(*) FILTER (WHERE state='failed') AS failed FROM hf_ingestion_items WHERE ingestion_id=$1"#,
+                r#"SELECT COUNT(*) FILTER (WHERE state::text='queued') AS queued, COUNT(*) FILTER (WHERE state::text='downloading') AS downloading, COUNT(*) FILTER (WHERE state::text='stored') AS stored, COUNT(*) FILTER (WHERE state::text='failed') AS failed FROM hf_ingestion_items WHERE ingestion_id=$1"#,
                 &[&id],
             )
             .await?;
+
+        let queued: i64 = counts.get(0);
+        let downloading: i64 = counts.get(1);
+        let stored: i64 = counts.get(2);
+        let failed: i64 = counts.get(3);
+
+        if state == "running" && queued == 0 && downloading == 0 && (stored > 0 || failed > 0) {
+            state = "completed".to_string();
+        }
+
         Ok((
             state,
-            counts.get(0),
-            counts.get(1),
-            counts.get(2),
-            counts.get(3),
+            queued,
+            downloading,
+            stored,
+            failed,
             err,
             started_at,
             finished_at,
