@@ -116,9 +116,9 @@ After a few moments, the gossip protocol will ensure all nodes are discovered. Y
 2.  **Create Admin Resources:** Use the `admin` CLI on any node to set up your tenant and an app for testing. Remember to save the Client ID and Secret.
     ```bash
     # Run on any Anvil host
-    docker compose exec <anvil_service_name> admin tenants create my-company
-    docker compose exec <anvil_service_name> admin apps create --tenant-name my-company --app-name ci-runner
-    docker compose exec <anvil_service_name> admin policies grant --app-name ci-runner --action "*" --resource "*"
+    docker compose exec <anvil_service_name> admin tenant create my-company
+    docker compose exec <anvil_service_name> admin app create --tenant-name my-company --app-name ci-runner
+    docker compose exec <anvil_service_name> admin policy grant --app-name ci-runner --action "*" --resource "*"
     ```
 
 3.  **Configure S3 Client:** Configure your `aws-cli` with the credentials from the previous step and point it to the public S3 endpoint of one of your regions (e.g., `https://s3.mycompany.com`).

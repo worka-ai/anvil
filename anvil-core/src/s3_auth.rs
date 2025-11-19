@@ -533,3 +533,132 @@ fn constant_time_eq_str(a: &str, b: &str) -> bool {
     }
     a.as_bytes().ct_eq(b.as_bytes()).into()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use http_body_util::Full;
+    use std::time::SystemTime;
+
+    #[tokio::test]
+    async fn test_decode_aws_chunked_body_single_chunk() {
+        let body_str = "4\r\nWiki\r\n0\r\n\r\n";
+        let body = Body::new(Full::new(Bytes::from(body_str)));
+        let decoded = decode_aws_chunked_body(body).await.unwrap();
+        assert_eq!(decoded, Bytes::from_static(b"Wiki"));
+    }
+
+    #[tokio::test]
+    async fn test_decode_aws_chunked_body_multiple_chunks() {
+        let body_str = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+        let body = Body::new(Full::new(Bytes::from(body_str)));
+        let decoded = decode_aws_chunked_body(body).await.unwrap();
+        assert_eq!(decoded, Bytes::from_static(b"Wikipedia"));
+    }
+
+    #[tokio::test]
+    async fn test_decode_aws_chunked_body_with_extension() {
+        let body_str = "4;chunk-id=1\r\nWiki\r\n5;chunk-id=2\r\npedia\r\n0\r\n\r\n";
+        let body = Body::new(Full::new(Bytes::from(body_str)));
+        let decoded = decode_aws_chunked_body(body).await.unwrap();
+        assert_eq!(decoded, Bytes::from_static(b"Wikipedia"));
+    }
+
+    #[tokio::test]
+    async fn test_decode_aws_chunked_body_empty() {
+        let body_str = "0\r\n\r\n";
+        let body = Body::new(Full::new(Bytes::from(body_str)));
+        let decoded = decode_aws_chunked_body(body).await.unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_decode_aws_chunked_body_malformed_missing_crlf() {
+        let body_str = "4\r\nWiki0\r\n\r\n"; // Missing CRLF after chunk data
+        let body = Body::new(Full::new(Bytes::from(body_str)));
+        let result = decode_aws_chunked_body(body).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_decode_aws_chunked_body_malformed_invalid_hex() {
+        let body_str = "G\r\nWiki\r\n0\r\n\r\n"; // Invalid hex digit
+        let body = Body::new(Full::new(Bytes::from(body_str)));
+        let result = decode_aws_chunked_body(body).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_parse_auth_header_success() {
+        let header = "AWS4-HMAC-SHA256 Credential=AKID/20230101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=some_signature";
+        let parsed = parse_auth_header(header).unwrap();
+        assert_eq!(parsed.access_key_id, "AKID");
+        assert_eq!(parsed.date, "20230101");
+        assert_eq!(parsed.region, "us-east-1");
+        assert_eq!(parsed.service, "s3");
+        assert_eq!(parsed.signed_headers, vec!["host", "x-amz-date"]);
+        assert_eq!(parsed.signature, "some_signature");
+    }
+
+    #[test]
+    fn test_parse_auth_header_missing_prefix() {
+        let header = "Credential=AKID/20230101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=some_signature";
+        let result = parse_auth_header(header);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_auth_header_missing_credential() {
+        let header = "AWS4-HMAC-SHA256 SignedHeaders=host;x-amz-date, Signature=some_signature";
+        let result = parse_auth_header(header);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_x_amz_date_success() {
+        let date_str = "20230101T123000Z";
+        let system_time = parse_x_amz_date(date_str).unwrap();
+        let expected_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1672576200);
+        assert_eq!(system_time, expected_time);
+    }
+
+    #[test]
+    fn test_parse_x_amz_date_invalid_format() {
+        assert!(parse_x_amz_date("20230101123000Z").is_none()); // Missing T
+        assert!(parse_x_amz_date("20230101T123000").is_none()); // Missing Z
+        assert!(parse_x_amz_date("20230101T12300Z").is_none()); // Wrong length
+    }
+
+    #[test]
+    fn test_parse_scope_yyyymmdd_success() {
+        let date_str = "20230101";
+        let system_time = parse_scope_yyyymmdd(date_str).unwrap();
+        let expected_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1672531200);
+        assert_eq!(system_time, expected_time);
+    }
+
+    #[test]
+    fn test_parse_scope_yyyymmdd_invalid_format() {
+        assert!(parse_scope_yyyymmdd("2023010").is_none()); // Wrong length
+        assert!(parse_scope_yyyymmdd("2023010AZ").is_none()); // Invalid chars
+    }
+
+    #[test]
+    fn test_sha256_hex() {
+        let input = b"hello world";
+        let expected_hash = "b94d27b9934d3e08a52e52d7da7d3abf8e4fecd00d50cdbbdcf132d2e73b6734";
+        assert_eq!(sha256_hex(input), expected_hash);
+        assert_eq!(sha256_hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    }
+
+    #[test]
+    fn test_constant_time_eq_str() {
+        assert!(constant_time_eq_str("abc", "abc"));
+        assert!(!constant_time_eq_str("abc", "abd"));
+        assert!(!constant_time_eq_str("abc", "abcd"));
+        assert!(!constant_time_eq_str("abcd", "abc"));
+        assert!(!constant_time_eq_str("", "abc"));
+        assert!(constant_time_eq_str("", ""));
+    }
+}

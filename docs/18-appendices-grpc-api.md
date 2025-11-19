@@ -182,9 +182,6 @@ service InternalAnvilService {
 
 service AuthService {
   rpc GetAccessToken(GetAccessTokenRequest) returns (GetAccessTokenResponse);
-  rpc GrantAccess(GrantAccessRequest) returns (GrantAccessResponse);
-  rpc RevokeAccess(RevokeAccessRequest) returns (RevokeAccessResponse);
-  rpc SetPublicAccess(SetPublicAccessRequest) returns (SetPublicAccessResponse);
 }
 
 message GetAccessTokenRequest {
@@ -197,29 +194,6 @@ message GetAccessTokenResponse {
   string access_token = 1;
   int64 expires_in = 2;
 }
-
-message GrantAccessRequest {
-  string grantee_app_id = 1;
-  string resource = 2;
-  string action = 3;
-}
-
-message GrantAccessResponse {}
-
-message RevokeAccessRequest {
-  string grantee_app_id = 1;
-  string resource = 2;
-  string action = 3;
-}
-
-message RevokeAccessResponse {}
-
-message SetPublicAccessRequest {
-  string bucket = 1;
-  bool allow_public_read = 2;
-}
-
-message SetPublicAccessResponse {}
 
 
 message PutShardRequest {

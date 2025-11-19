@@ -114,7 +114,7 @@ For large-scale, geographically distributed deployments, Anvil supports a multi-
 2.  **Run the regional database migrations** against this new database.
 3.  **Register the new region** in the global database using the admin tool:
     ```bash
-    docker compose exec <ANY_ANVIL_NODE> admin regions create <NEW_REGION_NAME>
+    docker compose exec <ANY_ANVIL_NODE> admin region create <NEW_REGION_NAME>
     ```
 4.  **Launch new Anvil peers** in the new geographical location, configuring them with:
     *   The shared `GLOBAL_DATABASE_URL`.

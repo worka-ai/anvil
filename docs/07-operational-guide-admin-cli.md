@@ -32,8 +32,8 @@ Regions must be created before you can assign buckets to them.
 This command is idempotent and uses a positional argument for the name.
 
 ```bash
-# Usage: admin regions create <NAME>
-docker compose exec anvil1 admin regions create us-east-1
+# Usage: admin region create <NAME>
+docker compose exec anvil1 admin region create us-east-1
 ```
 
 #### Managing Tenants
@@ -45,8 +45,8 @@ Tenants are the top-level organizational unit in Anvil.
 This command also uses a positional argument for the name.
 
 ```bash
-# Usage: admin tenants create <NAME>
-docker compose exec anvil1 admin tenants create my-organization
+# Usage: admin tenant create <NAME>
+docker compose exec anvil1 admin tenant create my-organization
 ```
 
 #### Managing Apps
@@ -58,7 +58,7 @@ Apps are entities within a tenant that are granted API credentials.
 This command uses named flags for the tenant and app names.
 
 ```bash
-docker compose exec anvil1 admin apps create --tenant-name <TENANT_NAME> --app-name <APP_NAME>
+docker compose exec anvil1 admin app create --tenant-name <TENANT_NAME> --app-name <APP_NAME>
 ```
 
 *   `--tenant-name`: The name of the tenant that will own the app.
@@ -75,7 +75,7 @@ Policies grant permissions to apps.
 This command uses named flags.
 
 ```bash
-docker compose exec anvil1 admin policies grant \
+docker compose exec anvil1 admin policy grant \
     --app-name <APP_NAME> \
     --action <ACTION> \
     --resource <RESOURCE>
@@ -89,7 +89,7 @@ docker compose exec anvil1 admin policies grant \
 
 ```bash
 # Allow the 'web-frontend' app to read objects from the 'public-assets' bucket
-docker compose exec anvil1 admin policies grant \
+docker compose exec anvil1 admin policy grant \
     --app-name web-frontend \
     --action "read" \
     --resource "bucket:public-assets/*"

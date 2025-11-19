@@ -118,10 +118,10 @@ Anvil is a multi-tenant system. Before you can create buckets, you need a **Tena
 
 ```bash
 # Create the region (uses a positional argument)
-docker compose exec anvil1 admin regions create europe-west-1
+docker compose exec anvil1 admin region create europe-west-1
 
 # Create the tenant (uses a positional argument)
-docker compose exec anvil1 admin tenants create my-first-tenant
+docker compose exec anvil1 admin tenant create my-first-tenant
 ```
 
 **Step 2: Create an App**
@@ -130,23 +130,39 @@ Next, create an App for this tenant. This will generate the credentials needed t
 
 ```bash
 # Create an app and get its credentials (uses named flags)
-docker compose exec anvil1 admin apps create --tenant-name my-first-tenant --app-name my-cli-app
+docker compose exec anvil1 admin app create --tenant-name my-first-tenant --app-name my-cli-app
 ```
 
 This command will output a **Client ID** and a **Client Secret**. **Save these securely!** They are your API credentials.
 
-**Step 3: Grant Permissions**
+### 1.4. Granting Permissions
 
-By default, a new app has **no permissions**. You must explicitly grant it the rights to perform actions. For this guide, we will grant it full admin-like permissions.
+By default, a new app has **no permissions**. You must explicitly grant it the rights to perform actions. For this guide, we will grant the app the specific permissions it needs to create a bucket and manage objects within that bucket.
 
 > **IMPORTANT:** This is the critical step that allows your app to create buckets and upload objects.
 
 ```bash
-# Grant the app full permissions on all resources
-docker compose exec anvil1 admin policies grant --app-name my-cli-app --action "*" --resource "*"
+# 1. Grant permission to create buckets
+docker compose exec anvil1 admin policy grant \
+    --app-name my-cli-app \
+    --action "bucket:create" \
+    --resource "*"
+
+# 2. Grant permission to list buckets
+docker compose exec anvil1 admin policy grant \
+    --app-name my-cli-app \
+    --action "bucket:read" \
+    --resource "*"
+
+# 3. Grant full object permissions for the bucket we are about to create
+# Note that the bucket does not have to exist yet.
+docker compose exec anvil1 admin policy grant \
+    --app-name my-cli-app \
+    --action "object:*" \
+    --resource "my-first-anvil-bucket/*"
 ```
 
-### 1.4. Using the `anvil` to Create a Bucket
+### 1.5. Using the `anvil` to Create a Bucket
 
 Now you can configure the `anvil` to connect to your new Anvil instance.
 

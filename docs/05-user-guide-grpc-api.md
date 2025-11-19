@@ -41,6 +41,8 @@ message GetObjectRequest {
 
 ### 5.2. Authentication Flow: From API Key to JWT
 
+> **Note on Administrative Tasks:** The gRPC API is used for data plane operations (like `PutObject`, `GetObject`). Administrative tasks such as creating tenants, managing apps, and granting policies are handled by the [`admin` tool](../operational-guide/admin-tool), not the gRPC API.
+
 Unlike the S3 gateway which uses SigV4 on every request, the gRPC API uses a bearer token model with JSON Web Tokens (JWT).
 
 The flow is as follows:

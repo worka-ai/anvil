@@ -213,4 +213,46 @@ mod tests {
             &no_wildcard
         ));
     }
+
+    #[test]
+    fn test_mint_and_verify_token_success() {
+        let jwt_manager = JwtManager::new("test_secret".to_string());
+        let app_id = "test_app".to_string();
+        let scopes = vec!["scope1".to_string(), "scope2".to_string()];
+        let tenant_id = 123;
+
+        let token = jwt_manager
+            .mint_token(app_id.clone(), scopes.clone(), tenant_id)
+            .unwrap();
+        let claims = jwt_manager.verify_token(&token).unwrap();
+
+        assert_eq!(claims.sub, app_id);
+        assert_eq!(claims.scopes, scopes);
+        assert_eq!(claims.tenant_id, tenant_id);
+    }
+
+    #[test]
+    fn test_verify_token_invalid_secret() {
+        let jwt_manager = JwtManager::new("test_secret".to_string());
+        let app_id = "test_app".to_string();
+        let scopes = vec!["scope1".to_string()];
+        let tenant_id = 123;
+
+        let token = jwt_manager.mint_token(app_id, scopes, tenant_id).unwrap();
+
+        let wrong_jwt_manager = JwtManager::new("wrong_secret".to_string());
+        let result = wrong_jwt_manager.verify_token(&token);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_token_malformed() {
+        let jwt_manager = JwtManager::new("test_secret".to_string());
+        let malformed_token = "this.is.not.a.jwt";
+
+        let result = jwt_manager.verify_token(malformed_token);
+
+        assert!(result.is_err());
+    }
 }

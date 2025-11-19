@@ -29,39 +29,66 @@ You create an App using the `admin` tool (as shown in the Getting Started guide)
 
 ```bash
 # This command is run by an administrator
-docker compose exec anvil1 admin apps create \
+docker compose exec anvil1 admin app create \
     --tenant-name my-first-tenant \
     --app-name my-application
 ```
 
 This will output the `Client ID` and `Client Secret` for the new app. Store these securely.
 
-### 3.3. Understanding Policies: Resource and Action Scopes
+### 3.3. Understanding Policies: Actions and Resources
 
-Permissions in Anvil are defined by policies that connect an App to an **action** and a **resource**.
+Permissions in Anvil are defined by policies that connect an App to an **action** and a **resource**. When you grant a policy, you are creating a **scope** that the system uses to authorize requests.
 
--   **Resource:** A string that identifies a set of Anvil resources. It follows the format `type:identifier`. Wildcards (`*`) are supported.
-    *   `bucket:my-bucket`: A specific bucket.
-    *   `bucket:my-bucket/invoices/*`: All objects inside the `invoices/` prefix in `my-bucket`.
-    *   `bucket:*`: All buckets.
--   **Action:** A string representing an operation. Common actions include:
-    *   `read`: Permission to get or list resources.
-    *   `write`: Permission to create, update, or delete resources.
-    *   `grant`: Permission to manage the permissions of other apps (a highly privileged action).
+-   **Action:** A string representing the operation to be performed.
+-   **Resource:** A string identifying the Anvil resource(s) the action applies to. Wildcards (`*`) are supported.
 
-A policy is granted using the admin tool:
+When granting a policy, you provide the action and resource separately. Internally, Anvil combines them into a single scope string in the format `action|resource` for evaluation.
+
+**Common Actions:**
+
+| Action          | Description                               |
+| --------------- | ----------------------------------------- |
+| `bucket:create` | Ability to create new buckets.            |
+| `bucket:read`   | Ability to list objects in a bucket.      |
+| `bucket:write`  | Ability to update a bucket's properties.  |
+| `bucket:delete` | Ability to delete a bucket.               |
+| `object:read`   | Ability to download an object.            |
+| `object:write`  | Ability to upload or overwrite an object. |
+| `object:delete` | Ability to delete an object.              |
+| `*`             | A wildcard representing **any** action.   |
+
+**Resource Examples:**
+
+| Resource Pattern              | Description                               |
+| ----------------------------- | ----------------------------------------- |
+| `my-specific-bucket`          | A single, specific bucket.                |
+| `my-company-bucket/*`         | All objects within `my-company-bucket`.   |
+| `my-company-bucket/invoices/*`| All objects under the `invoices/` prefix. |
+| `*`                           | A wildcard representing **all** resources.|
+
+**Granting Policies:**
+
+You grant policies using the `admin` tool. The tool takes the action and resource as separate flags.
 
 ```bash
-# Grant the app permission to read and write objects in 'my-data-bucket'
-docker compose exec anvil1 admin policies grant \
+# Grant the app permission to write objects in 'my-data-bucket'
+docker compose exec anvil1 admin policy grant \
     --app-name my-application \
-    --action "write" \
-    --resource "bucket:my-data-bucket/*"
+    --action "object:write" \
+    --resource "my-data-bucket/*"
 
-docker compose exec anvil1 admin policies grant \
+# Grant the app permission to read objects from the same bucket
+docker compose exec anvil1 admin policy grant \
     --app-name my-application \
-    --action "read" \
-    --resource "bucket:my-data-bucket/*"
+    --action "object:read" \
+    --resource "my-data-bucket/*"
+
+# Grant the app permission to create buckets
+docker compose exec anvil1 admin policy grant \
+    --app-name my-application \
+    --action "bucket:create" \
+    --resource "*"
 ```
 
 ### 3.4. Public vs. Private Buckets
@@ -79,5 +106,5 @@ You can set a bucket's public status using the `admin` tool or the gRPC API.
 
 ```bash
 # Make a bucket public (requires 'grant' permission on the bucket)
-docker compose exec anvil1 admin buckets set-public-access --bucket my-public-assets --allow
+docker compose exec anvil1 admin bucket set-public-access --bucket my-public-assets --allow
 ```
