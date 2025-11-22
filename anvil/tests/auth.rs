@@ -42,7 +42,7 @@ async fn test_auth_flow_with_wildcard_scopes() {
         "--app-name",
         "auth-app",
         "--action",
-        "bucket:write",
+        "bucket:create",
         "--resource",
         "auth-test-*",
     ];

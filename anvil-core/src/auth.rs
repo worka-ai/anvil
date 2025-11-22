@@ -96,10 +96,16 @@ pub fn is_authorized(
         let token_action_str = parts[0];
         let token_resource_pattern = parts[1];
 
-        // Check if the action matches (or is a wildcard)
-        let action_matches = token_action_str == "*" || token_action_str == required_action_str;
+        let token_action = match token_action_str.parse::<AnvilAction>() {
+            Ok(action) => action,
+            Err(_) => {
+                warn!(unknown_action = %token_action_str, "Skipping scope with unknown action");
+                continue;
+            }
+        };
 
-        if !action_matches {
+        // Check if the action matches (or is a wildcard)
+        if !action_covers_required(&token_action, &required_action) {
             continue;
         }
 
@@ -119,6 +125,45 @@ pub fn is_authorized(
         "Authorization failed"
     );
     false
+}
+
+fn action_covers_required(token_action: &AnvilAction, required_action: &AnvilAction) -> bool {
+    match token_action {
+        AnvilAction::All => true, // Covers everything
+        AnvilAction::BucketAll => matches!(
+            required_action,
+            AnvilAction::BucketCreate
+                | AnvilAction::BucketDelete
+                | AnvilAction::BucketRead
+                | AnvilAction::BucketWrite
+                | AnvilAction::BucketList
+        ),
+        AnvilAction::ObjectAll => matches!(
+            required_action,
+            AnvilAction::ObjectRead
+                | AnvilAction::ObjectWrite
+                | AnvilAction::ObjectDelete
+                | AnvilAction::ObjectList
+        ),
+        AnvilAction::HfKeyAll => matches!(
+            required_action,
+            AnvilAction::HfKeyCreate
+                | AnvilAction::HfKeyRead
+                | AnvilAction::HfKeyDelete
+                | AnvilAction::HfKeyList
+        ),
+        AnvilAction::HfIngestionAll => matches!(
+            required_action,
+            AnvilAction::HfIngestionCreate
+                | AnvilAction::HfIngestionRead
+                | AnvilAction::HfIngestionDelete
+        ),
+        AnvilAction::PolicyAll => matches!(
+            required_action,
+            AnvilAction::PolicyGrant | AnvilAction::PolicyRevoke
+        ),
+        _ => token_action == required_action, // Exact match for specific actions
+    }
 }
 
 /// Checks if a given resource string matches a pattern.

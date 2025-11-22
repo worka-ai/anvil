@@ -31,7 +31,7 @@ impl BucketManager {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
-        if !auth::is_authorized(AnvilAction::BucketWrite, bucket_name, scopes) {
+        if !auth::is_authorized(AnvilAction::BucketCreate, bucket_name, scopes) {
             return Err(Status::permission_denied("Permission denied"));
         }
 

@@ -100,7 +100,7 @@ async fn test_s3_public_and_private_access() {
         &client_id,
         &client_secret,
         vec![
-            "bucket:write|*".to_string(),
+            "bucket:create|*".to_string(),
             "policy:grant|*".to_string(),
             "object:write|*".to_string(),
             "object:read|*".to_string(),

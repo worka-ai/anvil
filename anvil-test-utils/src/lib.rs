@@ -140,7 +140,10 @@ pub struct TestCluster {
     pub token: String,
     pub global_db_url: String,
     pub regional_db_urls: Vec<String>,
+    pub global_db_name: String,
+    pub regional_db_names: Vec<String>,
     pub config: Arc<anvil_core::config::Config>,
+    maint_client: Option<tokio_postgres::Client>,
 }
 
 impl TestCluster {
@@ -190,9 +193,9 @@ impl TestCluster {
 
         let unique_regions: HashSet<String> = regions.iter().map(|s| s.to_string()).collect();
 
-        let (global_db_url, regional_dbs, _maint_client) =
+        let (global_db_url, regional_db_urls, global_db_name, regional_db_names, maint_client) =
             create_isolated_dbs(unique_regions.len()).await.unwrap();
-        let regional_db_map = regional_dbs
+        let regional_db_map = regional_db_urls
             .into_iter()
             .enumerate()
             .map(|(i, db_url)| (unique_regions.iter().nth(i).unwrap().to_string(), db_url))
@@ -243,7 +246,10 @@ impl TestCluster {
             token: String::new(),
             global_db_url,
             regional_db_urls: regional_db_map.values().cloned().collect(),
+            global_db_name,
+            regional_db_names,
             config,
+            maint_client: Some(maint_client),
         }
     }
 
@@ -373,15 +379,42 @@ impl TestCluster {
 
 impl Drop for TestCluster {
     fn drop(&mut self) {
-        for node in &self.nodes {
+        // Abort all spawned Anvil nodes
+        for node in self.nodes.drain(..) {
             node.abort();
+        }
+
+        // Drop the isolated test databases
+        if let Some(maint_client) = self.maint_client.take() {
+            let global_db_name = self.global_db_name.clone();
+            let regional_db_names = self.regional_db_names.clone();
+
+            tokio::spawn(async move {
+                // Drop global database
+                if let Err(e) = maint_client.execute(
+                    &format!("DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)", global_db_name),
+                    &[],
+                ).await {
+                    eprintln!("Failed to drop global database {}: {}", global_db_name, e);
+                }
+
+                // Drop regional databases
+                for db_name in &regional_db_names {
+                    if let Err(e) = maint_client.execute(
+                        &format!("DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)", db_name),
+                        &[],
+                    ).await {
+                        eprintln!("Failed to drop regional database {}: {}", db_name, e);
+                    }
+                }
+            });
         }
     }
 }
 
 async fn create_isolated_dbs(
     num_regional: usize,
-) -> Result<(String, Vec<String>, tokio_postgres::Client)> {
+) -> Result<(String, Vec<String>, String, Vec<String>, tokio_postgres::Client)> {
     dotenvy::dotenv().ok();
     let maint_db_url =
         std::env::var("MAINTENANCE_DATABASE_URL").expect("MAINTENANCE_DATABASE_URL must be set");
@@ -414,6 +447,7 @@ async fn create_isolated_dbs(
         .unwrap();
 
     let mut regional_db_urls = Vec::new();
+    let mut regional_db_names = Vec::new();
     let base_db_url = "postgres://worka:worka@localhost:5432";
 
     for i in 0..num_regional {
@@ -423,11 +457,18 @@ async fn create_isolated_dbs(
             .await
             .unwrap();
         regional_db_urls.push(format!("{}/{}", base_db_url, regional_db_name));
+        regional_db_names.push(regional_db_name);
     }
 
     let global_db_url = format!("{}/{}", base_db_url, global_db_name);
 
-    Ok((global_db_url, regional_db_urls, maint_client))
+    Ok((
+        global_db_url,
+        regional_db_urls,
+        global_db_name,
+        regional_db_names,
+        maint_client,
+    ))
 }
 
 pub async fn create_default_tenant(global_pool: &Pool, region: &str) {

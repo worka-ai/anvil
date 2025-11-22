@@ -7,7 +7,14 @@ use std::str::FromStr;
 /// Permissions are structured as `<resource>:<action>`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AnvilAction {
-    All,
+    All, // Matches *:*
+
+    // Wildcard actions
+    BucketAll,     // Matches bucket:*
+    ObjectAll,     // Matches object:*
+    HfKeyAll,      // Matches hf_key:*
+    HfIngestionAll, // Matches hf_ingestion:*
+    PolicyAll,     // Matches policy:*
 
     // Bucket actions
     BucketCreate,
@@ -48,6 +55,13 @@ impl fmt::Display for AnvilAction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             AnvilAction::All => "*",
+
+            // Wildcard actions
+            AnvilAction::BucketAll => "bucket:*",
+            AnvilAction::ObjectAll => "object:*",
+            AnvilAction::HfKeyAll => "hf_key:*",
+            AnvilAction::HfIngestionAll => "hf_ingestion:*",
+            AnvilAction::PolicyAll => "policy:*",
 
             // Bucket actions
             AnvilAction::BucketCreate => "bucket:create",
@@ -93,6 +107,13 @@ impl FromStr for AnvilAction {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "*" => Ok(AnvilAction::All),
+
+            // Wildcard actions
+            "bucket:*" => Ok(AnvilAction::BucketAll),
+            "object:*" => Ok(AnvilAction::ObjectAll),
+            "hf_key:*" => Ok(AnvilAction::HfKeyAll),
+            "hf_ingestion:*" => Ok(AnvilAction::HfIngestionAll),
+            "policy:*" => Ok(AnvilAction::PolicyAll),
 
             // Bucket actions
             "bucket:create" => Ok(AnvilAction::BucketCreate),
@@ -141,6 +162,11 @@ mod tests {
     fn test_action_display_and_from_str() {
         let actions = vec![
             AnvilAction::All,
+            AnvilAction::BucketAll,
+            AnvilAction::ObjectAll,
+            AnvilAction::HfKeyAll,
+            AnvilAction::HfIngestionAll,
+            AnvilAction::PolicyAll,
             AnvilAction::BucketCreate,
             AnvilAction::ObjectWrite,
             AnvilAction::HfKeyList,

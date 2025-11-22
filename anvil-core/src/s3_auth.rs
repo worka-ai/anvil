@@ -647,7 +647,7 @@ mod tests {
     #[test]
     fn test_sha256_hex() {
         let input = b"hello world";
-        let expected_hash = "b94d27b9934d3e08a52e52d7da7d3abf8e4fecd00d50cdbbdcf132d2e73b6734";
+        let expected_hash = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
         assert_eq!(sha256_hex(input), expected_hash);
         assert_eq!(sha256_hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
     }
