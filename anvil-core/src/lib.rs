@@ -10,6 +10,7 @@ use tokio::sync::RwLock;
 // The modules we've created
 pub mod auth;
 pub mod bucket_manager;
+pub mod cache;
 pub mod cluster;
 pub mod config;
 pub mod crypto;
@@ -49,12 +50,17 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub async fn new(global_pool: Pool, regional_pool: Pool, config: Config) -> Result<Self> {
+    pub async fn new(
+        global_pool: Pool,
+        regional_pool: Pool,
+        config: Config,
+        event_publisher: Option<tokio::sync::mpsc::Sender<cluster::MetadataEvent>>,
+    ) -> Result<Self> {
         let arc_config = Arc::new(config);
         let jwt_manager = Arc::new(JwtManager::new(arc_config.jwt_secret.clone()));
         let storage = storage::Storage::new().await?;
         let cluster_state = Arc::new(RwLock::new(HashMap::new()));
-        let db = persistence::Persistence::new(global_pool, regional_pool);
+        let db = persistence::Persistence::new(global_pool, regional_pool, event_publisher, &arc_config);
         let sharder = sharding::ShardManager::new();
         let placer = placement::PlacementManager::default();
 

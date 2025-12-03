@@ -55,6 +55,10 @@ pub struct Config {
     /// The shared secret for cluster authentication.
     #[arg(long, env)]
     pub cluster_secret: Option<String>,
+
+    /// TTL for metadata cache entries in seconds.
+    #[arg(long, env, default_value_t = 300)]
+    pub metadata_cache_ttl_secs: u64,
 }
 impl Config {
     #[allow(unused)]

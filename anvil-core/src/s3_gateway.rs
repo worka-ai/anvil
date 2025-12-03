@@ -183,7 +183,7 @@ async fn head_bucket(
 
     match state
         .db
-        .get_bucket_by_name(claims.tenant_id, &bucket_name, &state.region)
+        .get_bucket_by_name(claims.tenant_id, &bucket_name)
         .await
     {
         Ok(Some(_)) => (axum::http::StatusCode::OK, "").into_response(),

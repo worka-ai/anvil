@@ -457,8 +457,19 @@ async fn test_admin_cli_set_public_access() {
         .unwrap();
     assert!(set_public_status.success());
 
-    // 4. Verify the object IS public now.
-    let resp_after = http_client.get(&object_url).send().await.unwrap();
+    // 4. Verify the object IS public now, with retries for cache consistency.
+    let mut resp_after = None;
+    for i in 0..5 { // Retry up to 5 times
+        let resp = http_client.get(&object_url).send().await.unwrap();
+        if resp.status() == 200 {
+            resp_after = Some(resp);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await; // Wait 500ms before retrying
+        println!("Retry {} for public access check...", i + 1);
+    }
+    let resp_after = resp_after.expect("Object should be public after CLI command, but never became public");
+
     assert_eq!(
         resp_after.status(),
         200,

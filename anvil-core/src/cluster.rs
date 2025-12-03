@@ -14,7 +14,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, error};
+
+use crate::cache::MetadataCache;
 
 // Rich information about a peer in the cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +38,13 @@ pub struct ClusterMessage {
     pub timestamp: i64,
     #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MetadataEvent {
+    BucketUpdated { tenant_id: i64, name: String },
+    TenantUpdated { api_key: String },
+    PolicyUpdated { app_id: i64 },
 }
 
 impl ClusterMessage {
@@ -174,9 +183,13 @@ pub async fn run_gossip(
     cluster_state: ClusterState,
     grpc_addr: String,
     cluster_secret: Option<String>,
+    metadata_cache: MetadataCache,
+    mut outbound_events: tokio::sync::mpsc::Receiver<MetadataEvent>,
 ) -> Result<()> {
-    let topic = Topic::new("anvil-cluster");
-    swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+    let cluster_topic = Topic::new("anvil-cluster");
+    let metadata_topic = Topic::new("anvil-metadata");
+    swarm.behaviour_mut().gossipsub.subscribe(&cluster_topic)?;
+    swarm.behaviour_mut().gossipsub.subscribe(&metadata_topic)?;
 
     let local_peer_id = *swarm.local_peer_id();
 
@@ -215,14 +228,24 @@ pub async fn run_gossip(
                 }
 
                 if let Ok(encoded_message) = serde_json::to_vec(&message) {
-                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), encoded_message) {
+                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(cluster_topic.clone(), encoded_message) {
                         info!("[GOSSIP] Failed to publish gossip message: {:?}", e);
                     }
                 }
             }
 
+            Some(event) = outbound_events.recv() => {
+                 if let Ok(encoded_event) = serde_json::to_vec(&event) {
+                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(metadata_topic.clone(), encoded_event) {
+                        error!("[GOSSIP] Failed to publish metadata event: {:?}", e);
+                    } else {
+                        info!("[GOSSIP] Published metadata event: {:?}", event);
+                    }
+                }
+            }
+
             event = swarm.select_next_some() => {
-                handle_swarm_event(event, &mut swarm, &cluster_state, &grpc_addr, &cluster_secret).await;
+                handle_swarm_event(event, &mut swarm, &cluster_state, &grpc_addr, &cluster_secret, &metadata_cache).await;
             }
         }
     }
@@ -234,8 +257,12 @@ pub async fn handle_swarm_event(
     cluster_state: &ClusterState,
     grpc_addr: &str,
     cluster_secret: &Option<String>,
+    metadata_cache: &MetadataCache,
 ) {
     let local_peer_id = *swarm.local_peer_id();
+    let cluster_topic = Topic::new("anvil-cluster");
+    let metadata_topic = Topic::new("anvil-metadata");
+
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
             info!("[GOSSIP] Listening on {address}");
@@ -272,42 +299,59 @@ pub async fn handle_swarm_event(
             message,
             ..
         })) => {
-            if let Ok(cluster_message) = serde_json::from_slice::<ClusterMessage>(&message.data) {
-                if let Some(secret) = cluster_secret {
-                    if let Err(e) = cluster_message.verify(secret) {
-                        info!(
-                            "[GOSSIP] Invalid signature from peer: {}, error: {:?}",
-                            cluster_message.peer_id, e
-                        );
-                        return;
+            if message.topic == cluster_topic.hash() {
+                if let Ok(cluster_message) = serde_json::from_slice::<ClusterMessage>(&message.data) {
+                    if let Some(secret) = cluster_secret {
+                        if let Err(e) = cluster_message.verify(secret) {
+                            info!(
+                                "[GOSSIP] Invalid signature from peer: {}, error: {:?}",
+                                cluster_message.peer_id, e
+                            );
+                            return;
+                        }
+                        // Check timestamp to prevent replay attacks
+                        let now = Utc::now().timestamp();
+                        if (now - cluster_message.timestamp).abs() > 60 {
+                            info!(
+                                "[GOSSIP] Stale message from peer: {}, timestamp: {}",
+                                cluster_message.peer_id, cluster_message.timestamp
+                            );
+                            return;
+                        }
                     }
-                    // Check timestamp to prevent replay attacks
-                    let now = Utc::now().timestamp();
-                    if (now - cluster_message.timestamp).abs() > 60 {
-                        info!(
-                            "[GOSSIP] Stale message from peer: {}, timestamp: {}",
-                            cluster_message.peer_id, cluster_message.timestamp
-                        );
-                        return;
-                    }
-                }
 
-                info!(
-                    "[GOSSIP] Received cluster message from peer: {}",
-                    cluster_message.peer_id
-                );
-                let mut state = cluster_state.write().await;
-                let info = state
-                    .entry(cluster_message.peer_id)
-                    .or_insert_with(|| PeerInfo {
-                        p2p_addrs: Vec::new(),
-                        grpc_addr: cluster_message.grpc_addr,
-                    });
-                for addr in cluster_message.p2p_addrs {
-                    if !info.p2p_addrs.contains(&addr) {
-                        info.p2p_addrs.push(addr);
+                    info!(
+                        "[GOSSIP] Received cluster message from peer: {}",
+                        cluster_message.peer_id
+                    );
+                    let mut state = cluster_state.write().await;
+                    let info = state
+                        .entry(cluster_message.peer_id)
+                        .or_insert_with(|| PeerInfo {
+                            p2p_addrs: Vec::new(),
+                            grpc_addr: cluster_message.grpc_addr,
+                        });
+                    for addr in cluster_message.p2p_addrs {
+                        if !info.p2p_addrs.contains(&addr) {
+                            info.p2p_addrs.push(addr);
+                        }
                     }
                 }
+            } else if message.topic == metadata_topic.hash() {
+                 if let Ok(event) = serde_json::from_slice::<MetadataEvent>(&message.data) {
+                    info!("[GOSSIP] Received metadata event: {:?}", event);
+                    match event {
+                        MetadataEvent::BucketUpdated { tenant_id, name } => {
+                            metadata_cache.invalidate_bucket(tenant_id, &name).await;
+                        }
+                        MetadataEvent::TenantUpdated { api_key } => {
+                            metadata_cache.invalidate_tenant(&api_key).await;
+                        }
+                        MetadataEvent::PolicyUpdated { app_id } => {
+                            metadata_cache.invalidate_app_policies(app_id).await;
+                        }
+                    }
+                 }
             }
         }
         _ => {}

@@ -46,17 +46,21 @@ pub async fn run(
 
     let regional_pool = create_pool(&config.regional_database_url)?;
     let global_pool = create_pool(&config.global_database_url)?;
-    let state = AppState::new(global_pool, regional_pool, config).await?;
+    
+    let (tx, rx) = tokio::sync::mpsc::channel(100);
+    
+    let state = AppState::new(global_pool, regional_pool, config, Some(tx)).await?;
     let swarm = anvil_core::cluster::create_swarm(state.config.clone()).await?;
 
     // Then start the node
-    start_node(listener, state, swarm).await
+    start_node(listener, state, swarm, rx).await
 }
 
 pub async fn start_node(
     listener: tokio::net::TcpListener,
     state: AppState,
     mut swarm: libp2p::Swarm<anvil_core::cluster::ClusterBehaviour>,
+    outbound_events_rx: tokio::sync::mpsc::Receiver<anvil_core::cluster::MetadataEvent>,
 ) -> Result<()> {
     for addr in &state.config.bootstrap_addrs {
         let multiaddr: libp2p::Multiaddr = addr.parse()?;
@@ -126,6 +130,8 @@ pub async fn start_node(
         state.cluster.clone(),
         state.config.public_api_addr.clone(),
         state.config.cluster_secret.clone(),
+        state.db.cache().clone(),
+        outbound_events_rx,
     ));
     let server_task =
         tokio::spawn(async move { axum::serve(listener, app.into_make_service()).await });
