@@ -209,10 +209,17 @@ impl ObjectManager {
 
         let bucket = self
             .db
-            .get_bucket_by_name(tenant_id, bucket_name, &self.region)
+            .get_bucket_by_name(tenant_id, bucket_name)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
+
+        if bucket.region != self.region {
+            return Err(Status::failed_precondition(format!(
+                "Bucket is in region {}",
+                bucket.region
+            )));
+        }
         let shard_map_json = if nodes.len() > 1 {
             let peer_ids: Vec<String> = nodes.iter().map(|p| p.to_base58()).collect();
             Some(serde_json::json!(peer_ids))
@@ -525,10 +532,17 @@ impl ObjectManager {
 
         let bucket = self
             .db
-            .get_bucket_by_name(tenant_id, bucket_name, &self.region)
+            .get_bucket_by_name(tenant_id, bucket_name)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
+
+        if bucket.region != self.region {
+            return Err(Status::failed_precondition(format!(
+                "Bucket is in region {}",
+                bucket.region
+            )));
+        }
 
         let object = self
             .db
@@ -627,10 +641,10 @@ impl ObjectManager {
         claims: Option<&auth::Claims>,
         bucket_name: &str,
     ) -> Result<Bucket, Status> {
-        match claims {
+        let bucket = match claims {
             Some(c) => self
                 .db
-                .get_bucket_by_name(c.tenant_id, bucket_name, &self.region)
+                .get_bucket_by_name(c.tenant_id, bucket_name)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?
                 .ok_or_else(|| Status::not_found("Bucket not found for this tenant")),
@@ -640,6 +654,15 @@ impl ObjectManager {
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?
                 .ok_or_else(|| Status::not_found("Public bucket not found")),
+        }?;
+
+        if bucket.region != self.region {
+            return Err(Status::failed_precondition(format!(
+                "Bucket is in region {}",
+                bucket.region
+            )));
         }
+
+        Ok(bucket)
     }
 }

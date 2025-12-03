@@ -286,6 +286,7 @@ dependencies = [
  "libp2p",
  "listenfd",
  "local-ip-address",
+ "moka",
  "postgres-types",
  "prost",
  "prost-types",
@@ -444,6 +445,17 @@ dependencies = [
  "rustix",
  "slab",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "async-lock"
+version = "3.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd03604047cee9b6ce9de9f70c6cd540a0520c813cbd49bae61f33ab80ed1dc"
+dependencies = [
+ "event-listener",
+ "event-listener-strategy",
+ "pin-project-lite",
 ]
 
 [[package]]
@@ -3482,10 +3494,13 @@ version = "0.12.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8261cd88c312e0004c1d51baad2980c66528dfdb2bee62003e643a4d8f86b077"
 dependencies = [
+ "async-lock",
  "crossbeam-channel",
  "crossbeam-epoch",
  "crossbeam-utils",
  "equivalent",
+ "event-listener",
+ "futures-util",
  "parking_lot 0.12.5",
  "portable-atomic",
  "rustc_version",

@@ -128,7 +128,15 @@ enum RegionCommands {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let config = cli.config;
+    let shared_config = cli.config;
+
+    let mut config = anvil_core::config::Config::default();
+    config.global_database_url = shared_config.global_database_url;
+    config.anvil_secret_encryption_key = shared_config.anvil_secret_encryption_key;
+    // Set a dummy region and public_api_addr, as admin CLI doesn't use them,
+    // but Persistence::new needs a full Config.
+    config.region = "admin-cli-region".to_string();
+    config.public_api_addr = "127.0.0.1:0".to_string();
 
     let global_pool = create_pool(&config.global_database_url)?;
     // The admin tool only interacts with the global DB, so we can use it as a placeholder for the regional pool.
@@ -141,7 +149,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    let persistence = Persistence::new(global_pool, regional_pool);
+    let persistence = Persistence::new(global_pool, regional_pool, None, &config);
     let encryption_key = hex::decode(config.anvil_secret_encryption_key)?;
 
     match &cli.command {
@@ -157,7 +165,6 @@ async fn main() -> anyhow::Result<()> {
                 app_name,
             } => {
                 println!("Creating app for tenant: {}", tenant_name);
-                println!("Admin received tenant_name: {}", tenant_name);
                 let tenant = persistence
                     .get_tenant_by_name(tenant_name)
                     .await?

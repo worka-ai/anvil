@@ -4,14 +4,20 @@ use deadpool_postgres::Pool;
 use serde_json::Value as JsonValue;
 use tokio_postgres::Row;
 
+use crate::cache::MetadataCache;
+use crate::cluster::MetadataEvent;
+use tokio::sync::mpsc::Sender;
+
 #[derive(Debug, Clone)]
 pub struct Persistence {
     global_pool: Pool,
     regional_pool: Pool,
+    cache: MetadataCache,
+    event_publisher: Option<Sender<MetadataEvent>>,
 }
 
 // Structs that map to our database tables
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Tenant {
     pub id: i64,
     pub name: String,
@@ -24,7 +30,7 @@ pub struct App {
     pub client_id: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Bucket {
     pub id: i64,
     pub tenant_id: i64,
@@ -140,12 +146,28 @@ impl From<Row> for AppDetails {
 }
 
 impl Persistence {
-    pub fn new(global_pool: Pool, regional_pool: Pool) -> Self {
+    pub fn new(
+        global_pool: Pool,
+        regional_pool: Pool,
+        event_publisher: Option<Sender<MetadataEvent>>,
+        config: &crate::config::Config,
+    ) -> Self {
         Self {
             global_pool,
             regional_pool,
+            cache: MetadataCache::new(config),
+            event_publisher,
         }
     }
+
+    async fn publish_event(&self, event: MetadataEvent) {
+        if let Some(publisher) = &self.event_publisher {
+             if let Err(e) = publisher.send(event).await {
+                 tracing::warn!("Failed to publish metadata event: {}", e);
+             }
+        }
+    }
+
 
     pub async fn get_admin_user_by_username(&self, username: &str) -> Result<Option<AdminUser>> {
         let client = self.global_pool.get().await?;
@@ -186,6 +208,10 @@ impl Persistence {
 
     pub fn get_global_pool(&self) -> &Pool {
         &self.global_pool
+    }
+
+    pub fn cache(&self) -> &MetadataCache {
+        &self.cache
     }
 
     pub async fn create_admin_user(
@@ -745,7 +771,13 @@ impl Persistence {
         match result {
             Ok(row) => {
                 tracing::debug!("[Persistence] EXITING create_bucket: success");
-                Ok(row.into())
+                let bucket: Bucket = row.into();
+                self.cache.insert_bucket(tenant_id, name.to_string(), bucket.clone()).await;
+                self.publish_event(MetadataEvent::BucketUpdated {
+                    tenant_id,
+                    name: name.to_string(),
+                }).await;
+                Ok(bucket)
             }
             Err(e) => {
                 tracing::debug!("[Persistence] EXITING create_bucket: error");
@@ -766,37 +798,80 @@ impl Persistence {
         &self,
         tenant_id: i64,
         name: &str,
-        region: &str,
     ) -> Result<Option<Bucket>> {
+        // Check cache first
+        if let Some(bucket) = self.cache.get_bucket(tenant_id, name).await {
+            return Ok(Some(bucket));
+        }
+
         let client = self.global_pool.get().await?;
+        // Removed region constraint
         let row = client
             .query_opt(
-            "SELECT id, name, region, created_at, is_public_read, tenant_id FROM buckets WHERE tenant_id = $1 AND name = $2 AND region = $3 AND deleted_at IS NULL",
-                &[&tenant_id, &name, &region],
+            "SELECT id, name, region, created_at, is_public_read, tenant_id FROM buckets WHERE tenant_id = $1 AND name = $2 AND deleted_at IS NULL",
+                &[&tenant_id, &name],
             )
             .await?;
-        Ok(row.map(Into::into))
+        
+        if let Some(row) = row {
+            let bucket: Bucket = row.into();
+            self.cache.insert_bucket(tenant_id, name.to_string(), bucket.clone()).await;
+            Ok(Some(bucket))
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn get_public_bucket_by_name(&self, name: &str) -> Result<Option<Bucket>> {
+        if let Some(bucket) = self.cache.get_bucket_by_name_only(name).await {
+            if bucket.is_public_read {
+                return Ok(Some(bucket));
+            }
+            // If cached but not public, return None (effectively hiding it)
+            return Ok(None);
+        }
+
         let client = self.global_pool.get().await?;
         let row = client
             .query_opt(
-                "SELECT * FROM buckets WHERE name = $1 AND is_public_read = true AND deleted_at IS NULL",
+                "SELECT * FROM buckets WHERE name = $1 AND deleted_at IS NULL",
                 &[&name],
             )
             .await?;
-        Ok(row.map(Into::into))
+        
+        if let Some(row) = row {
+            let bucket: Bucket = row.into();
+            // We cache it regardless of public status so we don't hit DB repeatedly for non-public buckets?
+            // Or only if public?
+            // My `buckets_by_name` cache is generic. It's better to cache it.
+            self.cache.insert_bucket(bucket.tenant_id, name.to_string(), bucket.clone()).await;
+            
+            if bucket.is_public_read {
+                Ok(Some(bucket))
+            } else {
+                Ok(None)
+            }
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn set_bucket_public_access(&self, bucket_name: &str, is_public: bool) -> Result<()> {
         let client = self.global_pool.get().await?;
-        client
-            .execute(
-                "UPDATE buckets SET is_public_read = $1 WHERE name = $2",
+        let row = client
+            .query_one(
+                "UPDATE buckets SET is_public_read = $1 WHERE name = $2 RETURNING tenant_id",
                 &[&is_public, &bucket_name],
             )
             .await?;
+        
+        let tenant_id: i64 = row.get("tenant_id");
+        self.cache.invalidate_bucket(tenant_id, bucket_name).await;
+        self.publish_event(MetadataEvent::BucketUpdated {
+            tenant_id,
+            name: bucket_name.to_string(),
+        }).await;
+
         Ok(())
     }
 
@@ -808,6 +883,16 @@ impl Persistence {
                 &[&bucket_name],
             )
             .await?;
+        
+        if let Some(ref r) = row {
+            let tenant_id: i64 = r.get("tenant_id");
+            self.cache.invalidate_bucket(tenant_id, bucket_name).await;
+            self.publish_event(MetadataEvent::BucketUpdated {
+                tenant_id,
+                name: bucket_name.to_string(),
+            }).await;
+        }
+
         Ok(row.map(Into::into))
     }
 

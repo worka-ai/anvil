@@ -237,7 +237,7 @@ async fn handle_hf_ingestion(
                 debug!(item_id, "Item state set to downloading.");
 
                 if let Ok(bucket_opt) =
-                    persistence.get_bucket_by_name(tenant_id, &target_bucket, &target_region).await
+                    persistence.get_bucket_by_name(tenant_id, &target_bucket).await
                 {
                     if let Some(bucket) = bucket_opt {
                         if let Ok(obj_opt) = persistence.get_object(bucket.id, &path).await {
@@ -282,7 +282,7 @@ async fn handle_hf_ingestion(
                 // --- End Blocking ---
 
                 let _bucket = persistence
-                    .get_bucket_by_name(tenant_id, &target_bucket, &target_region)
+                    .get_bucket_by_name(tenant_id, &target_bucket)
                     .await?
                     .ok_or_else(|| anyhow!("target bucket not found"))?;
                 let full_key = if target_prefix.is_empty() {

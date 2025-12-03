@@ -11,6 +11,13 @@ use axum::{
 };
 use futures_util::stream::StreamExt;
 use std::collections::HashMap;
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct CreateBucketConfiguration {
+    #[serde(rename = "LocationConstraint")]
+    location_constraint: Option<String>,
+}
 
 fn s3_error(code: &str, message: &str, status: axum::http::StatusCode) -> Response {
     let body = format!(
@@ -128,15 +135,21 @@ async fn create_bucket(
             );
         }
     };
-    //let _ = body.collect().await;
-    // let body_stream = req.into_body().into_data_stream().map(|r| {
-    //     r.map(|chunk| chunk.to_vec())
-    //         .map_err(|e| tonic::Status::internal(e.to_string()))
-    // }).collect::<Vec<_>>();
-    // println!("{:?}", body_stream);
+
+    let bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024).await.unwrap_or_default();
+    let region = if !bytes.is_empty() {
+         if let Ok(config) = quick_xml::de::from_reader::<_, CreateBucketConfiguration>(&bytes[..]) {
+             config.location_constraint.unwrap_or(state.region.clone())
+         } else {
+             state.region.clone()
+         }
+    } else {
+        state.region.clone()
+    };
+
     match state
         .bucket_manager
-        .create_bucket(claims.tenant_id, &bucket, &state.region, &claims.scopes)
+        .create_bucket(claims.tenant_id, &bucket, &region, &claims.scopes)
         .await
     {
         Ok(_) => (axum::http::StatusCode::OK, "").into_response(),
@@ -165,6 +178,19 @@ async fn create_bucket(
     }
 }
 
+fn s3_redirect(region: &str) -> Response {
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\n  <Code>PermanentRedirect</Code>\n  <Message>The bucket is in this region: {}. Please use this region to retry the request.</Message>\n  <BucketRegion>{}</BucketRegion>\n</Error>\n",
+        region, region
+    );
+    Response::builder()
+        .status(axum::http::StatusCode::MOVED_PERMANENTLY)
+        .header("Content-Type", "application/xml")
+        .header("x-amz-bucket-region", region)
+        .body(Body::from(body))
+        .unwrap()
+}
+
 async fn head_bucket(
     State(state): State<AppState>,
     Path(bucket_name): Path<String>,
@@ -183,10 +209,15 @@ async fn head_bucket(
 
     match state
         .db
-        .get_bucket_by_name(claims.tenant_id, &bucket_name, &state.region)
+        .get_bucket_by_name(claims.tenant_id, &bucket_name)
         .await
     {
-        Ok(Some(_)) => (axum::http::StatusCode::OK, "").into_response(),
+        Ok(Some(bucket)) => {
+            if bucket.region != state.region {
+                return s3_redirect(&bucket.region);
+            }
+            (axum::http::StatusCode::OK, "").into_response()
+        },
         Ok(None) => s3_error(
             "NoSuchBucket",
             "The specified bucket does not exist",
@@ -267,6 +298,17 @@ async fn list_objects(
                 .unwrap()
         }
         Err(status) => match status.code() {
+            tonic::Code::FailedPrecondition => {
+                if status.message().starts_with("Bucket is in region ") {
+                    let region = status.message().trim_start_matches("Bucket is in region ");
+                    return s3_redirect(region);
+                }
+                s3_error(
+                    "PreconditionFailed",
+                    status.message(),
+                    axum::http::StatusCode::PRECONDITION_FAILED,
+                )
+            }
             tonic::Code::NotFound => {
                 if req.extensions().get::<Claims>().is_none() {
                     s3_error(
@@ -337,6 +379,17 @@ async fn get_object(
                 .unwrap()
         }
         Err(status) => match status.code() {
+            tonic::Code::FailedPrecondition => {
+                if status.message().starts_with("Bucket is in region ") {
+                    let region = status.message().trim_start_matches("Bucket is in region ");
+                    return s3_redirect(region);
+                }
+                s3_error(
+                    "PreconditionFailed",
+                    status.message(),
+                    axum::http::StatusCode::PRECONDITION_FAILED,
+                )
+            }
             tonic::Code::NotFound => {
                 if req.extensions().get::<Claims>().is_none() {
                     s3_error(
@@ -398,6 +451,17 @@ async fn put_object(
             .body(Body::empty())
             .unwrap(),
         Err(status) => match status.code() {
+            tonic::Code::FailedPrecondition => {
+                if status.message().starts_with("Bucket is in region ") {
+                    let region = status.message().trim_start_matches("Bucket is in region ");
+                    return s3_redirect(region);
+                }
+                s3_error(
+                    "PreconditionFailed",
+                    status.message(),
+                    axum::http::StatusCode::PRECONDITION_FAILED,
+                )
+            }
             tonic::Code::NotFound => s3_error(
                 "NoSuchBucket",
                 status.message(),
@@ -437,6 +501,17 @@ async fn head_object(
             .body(Body::empty())
             .unwrap(),
         Err(status) => match status.code() {
+            tonic::Code::FailedPrecondition => {
+                if status.message().starts_with("Bucket is in region ") {
+                    let region = status.message().trim_start_matches("Bucket is in region ");
+                    return s3_redirect(region);
+                }
+                s3_error(
+                    "PreconditionFailed",
+                    status.message(),
+                    axum::http::StatusCode::PRECONDITION_FAILED,
+                )
+            }
             tonic::Code::NotFound => {
                 if req.extensions().get::<Claims>().is_none() {
                     s3_error(

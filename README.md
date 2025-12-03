@@ -1,104 +1,93 @@
-# Anvil: Open‑Source Object Storage in Rust
+# Anvil: An Open-Source Object Store for AI/ML Research
 
-**Anvil** is an open‑source, S3‑compatible object storage server written in Rust. Built by the team behind Worka, Anvil is designed to host large files—such as open‑source model weights—with high performance and reliability. It exposes a familiar S3 HTTP gateway, a high‑performance gRPC API, multi‑tenant isolation, and the ability to scale from a single development node to a multi‑region cluster.
+[![Build Status](https://github.com/worka-ai/anvil-enterprise/actions/workflows/ci.yml/badge.svg)](https://github.com/worka-ai/anvil-enterprise/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![JOSS Submission](https://joss.theoj.org/papers/10.21105/joss.XXXXX/status.svg)](https://joss.theoj.org/papers/10.21105/joss.XXXXX)
 
----
-
-## 🔥 Why Anvil?
-
-- **Written in Rust**: Modern, memory-safe, and highly concurrent.
-- **S3-Compatible**: Works out of the box with AWS SDKs, CLI, and third-party tools.
-- **gRPC API**: For low-latency, high-throughput access.
-- **Multi-Tenant**: Serve different model groups or clients in isolation.
-- **Clusterable**: Run standalone or as a horizontally-scalable distributed system.
-- **Model Hosting Friendly**: Built to serve billions of tokens efficiently.
+**Anvil** is a high-performance, open-source distributed object store built in Rust. It is designed to address the data management and storage challenges inherent in modern computational research, particularly for large-scale Artificial Intelligence (AI) and Machine Learning (ML) workloads. By providing an S3-compatible interface, a native high-throughput gRPC API, and first-class support for content-addressing, Anvil serves as a foundational infrastructure layer for reproducible and efficient research.
 
 ---
 
-## 🚀 Quick Start (Standalone)
+## Key Features
 
-```bash
-cargo install anvil
-anvil server --root ./data --port 9000
-```
-
-Now test it:
-
-```bash
-aws --endpoint-url http://localhost:9000 s3 ls
-```
+-   **Content-Addressable Storage:** Automatically deduplicates identical data using BLAKE3 hashing, dramatically reducing storage costs for versioned models and datasets.
+-   **High-Performance gRPC Streaming:** A native gRPC API with bidirectional streaming, ideal for high-throughput ML data loaders that feed GPUs directly from storage.
+-   **S3-Compatible Gateway:** Provides drop-in compatibility with the vast ecosystem of existing research tools and SDKs that support the S3 API (Boto3, MLflow, Rclone, etc.).
+-   **Built for the ML Ecosystem:** Includes features like the `anvil hf ingest` command to import model repositories directly from the Hugging Face Hub.
+-   **Modern, Resilient Architecture:** Built in Rust for memory safety and high concurrency, with a SWIM-like gossip protocol over QUIC for clustering and failure detection.
+-   **Multi-Tenant by Design:** Provides strong logical isolation between different users, teams, or projects.
 
 ---
 
-## 🧪 Example: Upload and Fetch via S3
+## 🚀 Quick Start
 
-```bash
-# Upload a file
-aws --endpoint-url http://localhost:9000 s3 cp weights.gguf s3://mymodels/weights.gguf
+The fastest way to get a single-node Anvil instance running is with Docker Compose.
 
-# Fetch the file
-curl http://localhost:9000/mymodels/weights.gguf
-```
+1.  **Save the `docker-compose.yml`:**
+    Save the example `docker-compose.yml` from the [Getting Started Guide](./docs/01-getting-started.md) to a local file.
 
----
+2.  **Launch Anvil:**
+    ```bash
+    docker-compose up -d
+    ```
 
-## 🏗️ Building From Source
+3.  **Create Your First Tenant and App:**
+    Use the `admin` tool to create a tenant and an app with API credentials.
+    ```bash
+    # Create a region and a tenant
+    docker compose exec anvil1 admin region create europe-west-1
+    docker compose exec anvil1 admin tenant create my-first-tenant
 
-Anvil uses [Rust](https://www.rust-lang.org/tools/install) and requires at least version 1.72.
+    # Create an app and save the credentials
+    docker compose exec anvil1 admin app create --tenant-name my-first-tenant --app-name my-cli-app
+    ```
 
-```bash
-git clone https://github.com/worka-ai/anvil
-cd anvil
-cargo build --release
-```
-
----
-
-## ⚙️ Running in Cluster Mode
-
-Start multiple nodes with a shared cluster config (see [docs](https://worka.ai/docs/anvil/operational-guide/scaling)).
-
----
-
-## 📡 gRPC API
-
-See full [API reference](https://worka.ai/docs/anvil/user-guide/grpc-api). Example client use:
-
-```bash
-anvil grpc-client --list-buckets
-```
-
----
-
-## 🔐 Authentication
-
-Supports API key-based tenant isolation. See [Auth docs](https://worka.ai/docs/anvil/user-guide/auth-permissions).
+4.  **Configure the Anvil CLI:**
+    Use the credentials from the previous step to configure your local `anvil` CLI.
+    ```bash
+    anvil configure --host http://localhost:50051 --client-id YOUR_CLIENT_ID --client-secret YOUR_CLIENT_SECRET
+    ```
 
 ---
 
 ## 📘 Documentation
 
-- [Getting Started](https://worka.ai/docs/anvil/getting-started)
-- [Deployment](https://worka.ai/docs/anvil/operational-guide/deployment)
-- [S3 Gateway](https://worka.ai/docs/anvil/user-guide/s3-gateway)
-- [Cluster Scaling](https://worka.ai/docs/anvil/operational-guide/scaling)
-- [Contributing](https://worka.ai/docs/anvil/developer-guide/contributing)
+For complete guides on deployment, architecture, and usage, please see the [**Full Documentation**](./docs/index.md).
+
+-   [Getting Started](./docs/01-getting-started.md)
+-   [Authentication & Permissions](./docs/03-user-guide-authentication.md)
+-   [Using the S3 Gateway](./docs/04-user-guide-s3-gateway.md)
+-   [Deployment Guide](./docs/06-operational-guide-deployment.md)
 
 ---
 
 ## 🤝 Contributing
 
-We welcome PRs! Check out [CONTRIBUTING.md](https://worka.ai/docs/anvil/developer-guide/contributing) and start with [good first issues](https://github.com/worka-ai/anvil/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
+We welcome contributions of all kinds! Please read our [**Contributing Guide**](./CONTRIBUTING.md) to get started. All participation in the Anvil community is governed by our [**Code of Conduct**](./CODE_OF_CONDUCT.md).
 
 ---
 
-## 📣 Community
+## 📜 Citing Anvil
 
-- [Discord](https://discord.gg/uCWVg5STGh) — Chat with the team
-- [Product Hunt](https://www.producthunt.com/products/worka-anvil)
+If you use Anvil in your research, please cite it. Once published in JOSS, a BibTeX entry will be provided here.
+
+```bibtex
+@article{Anvil2025,
+  doi = {10.21105/joss.XXXXX},
+  url = {https://doi.org/10.21105/joss.XXXXX},
+  year = {2025},
+  publisher = {The Open Journal},
+  volume = {X},
+  number = {XX},
+  pages = {XXXXX},
+  author = {Your Name and Other Authors},
+  title = {Anvil: An Open-Source Object Store for AI/ML Research},
+  journal = {Journal of Open Source Software}
+}
+```
 
 ---
 
 ## License
 
-Licensed under [Apache 2.0](LICENSE).
+Anvil is licensed under the [Apache 2.0 License](./LICENSE).

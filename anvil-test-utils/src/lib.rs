@@ -183,7 +183,8 @@ impl TestCluster {
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             cluster_listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".to_string(),
             public_cluster_addrs: vec![],
-            public_api_addr: "".to_string(),
+            metadata_cache_ttl_secs: 1,
+            public_api_addr: "127.0.0.1:0".to_string(),
             api_listen_addr: "127.0.0.1:0".to_string(),
             region: "".to_string(),
             bootstrap_addrs: vec![],
@@ -233,7 +234,8 @@ impl TestCluster {
             let regional_pool = regional_pools.get(*region_name).unwrap().clone();
             let mut node_config = config.deref().clone();
             node_config.region = region_name.to_string();
-            let state = AppState::new(global_pool.clone(), regional_pool, node_config)
+            node_config.metadata_cache_ttl_secs = 1; // Short TTL for tests
+            let state = AppState::new(global_pool.clone(), regional_pool, node_config, None)
                 .await
                 .unwrap();
             states.push(state);
@@ -307,7 +309,8 @@ impl TestCluster {
             state.config = Arc::new(cfg);
 
             let handle = tokio::spawn(async move {
-                anvil::start_node(listener, state, swarm).await.unwrap();
+                let (_tx, rx) = tokio::sync::mpsc::channel(1);
+                anvil::start_node(listener, state, swarm, rx).await.unwrap();
             });
             self.nodes.push(handle);
         }
