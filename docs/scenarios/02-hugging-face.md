@@ -17,10 +17,10 @@ First, an administrator must grant the client's app the necessary permissions to
 
 ```bash
 # Grant permission to manage HF keys and start ingestions
-admin policy grant --app-name data-science-app --action hf:key-create --resource "*"
-admin policy grant --app-name data-science-app --action hf:key-delete --resource "*"
-admin policy grant --app-name data-science-app --action hf:key-read --resource "*"
-admin policy grant --app-name data-science-app --action hf:ingest-start --resource "*"
+admin policy grant --app-name data-science-app --action hf_key:create --resource "*"
+admin policy grant --app-name data-science-app --action hf_key:delete --resource "*"
+admin policy grant --app-name data-science-app --action hf_key:read --resource "*"
+admin policy grant --app-name data-science-app --action hf_ingestion:create --resource "*"
 ```
 
 ### 2. Client: Manage Hugging Face API Keys

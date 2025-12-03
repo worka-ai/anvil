@@ -26,8 +26,10 @@ admin policy grant \
   --resource "public-assets/*"
 
 # 3. Use the admin tool to set the bucket's public flag to true
-admin bucket set-public-access --bucket public-assets --allow true
+admin bucket set-public-access --bucket public-assets --allow
 ```
+
+> **Note on Public Access:** The `--allow` flag is a switch. Including it enables public access (sets it to `true`). Omitting the flag entirely disables public access (sets it to `false`), making the bucket private.
 
 ### 2. Client: Upload to the Public Bucket
 

@@ -58,7 +58,11 @@ Performs administrative tasks on buckets.
 
 - **`set-public-access`**: Sets a bucket to be publicly readable or private.
   ```bash
-  admin bucket set-public-access --bucket <bucket_name> --allow <true|false>
+  # To ENABLE public access:
+  admin bucket set-public-access --bucket <bucket_name> --allow
+
+  # To DISABLE public access (make private):
+  admin bucket set-public-access --bucket <bucket_name>
   ```
 
 ## `user`
