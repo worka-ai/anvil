@@ -1,11 +1,11 @@
 ---
-slug: /anvil/user-guide/s3-gateway
-title: 'User Guide: Using the S3-Compatible Gateway'
+slug: /scenarios/s3-gateway
+title: 'Scenario: Using the S3 Gateway'
 description: Learn how to use standard S3 tools and SDKs to interact with your Anvil cluster.
-tags: [user-guide, s3, aws-cli, rclone, sdk]
+tags: [scenario, s3, aws-cli, rclone, sdk]
 ---
 
-# Chapter 4: Using the S3-Compatible Gateway
+# Scenario: Using the S3-Compatible Gateway
 
 > **TL;DR:** Point your existing S3 tools to the Anvil HTTP endpoint. Use your App's Client ID and Secret as the AWS Access Key and Secret Key. All standard operations like `put-object`, `get-object`, and `list-objects` are supported.
 

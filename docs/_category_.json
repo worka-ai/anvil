@@ -1,8 +1,0 @@
-{
-  "label": "Worka Anvil",
-  "position": 9,
-  "link": {
-    "type": "generated-index",
-    "description": "Worka Anvil is an open-source distributed storage and compute system designed for simplicity, scalability, and future extensibility."
-  }
-}

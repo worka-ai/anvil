@@ -1,8 +1,8 @@
 ---
-slug: /anvil/developer-guide/request-lifecycle
-title: 'Developer Guide: The Lifecycle of a Request'
+slug: /architecture/request-lifecycle
+title: 'Deep Dive: The Lifecycle of a Request'
 description: A step-by-step walkthrough of how Anvil handles a PutObject (write) and GetObject (read) request.
-tags: [developer-guide, architecture, write-path, read-path, sharding, placement]
+tags: [architecture, deep-dive, write-path, read-path]
 ---
 
 # Chapter 11: The Lifecycle of a Request
@@ -16,6 +16,8 @@ Understanding the path a request takes through the system is key to understandin
 When a client initiates a `PutObject` operation, either via the S3 gateway or the gRPC API, the following sequence of events occurs on the coordinating node that receives the request:
 
 1.  **Authentication and Authorization:** The request is first processed by the authentication middleware. For S3, this involves verifying the SigV4 signature. For gRPC, it involves validating the JWT. The system then checks if the authenticated App has `write` permission for the target bucket and key.
+
+    > **Note (Smart Routing):** During this phase, the node performs a cached lookup of the bucket in the Global Database. If the bucket resides in a different region than the current node, the request is rejected with a `301 Moved Permanently` (S3) or `FailedPrecondition` (gRPC) error, directing the client to the correct region.
 
 2.  **Placement Calculation:** The `ObjectManager` calls the `PlacementManager` to determine which nodes in the cluster should store the object's shards. It uses **Rendezvous Hashing** (also known as Highest Random Weight hashing) for this. For a given object key, it hashes the key with each peer's ID to calculate a score. The peers with the highest scores are selected as storage targets. This is a deterministic and decentralized process.
 

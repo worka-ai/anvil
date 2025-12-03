@@ -1,0 +1,8 @@
+{
+  "label": "Fundamentals",
+  "position": 1,
+  "link": {
+    "type": "generated-index",
+    "description": "Start here. Learn about Anvil's core concepts and get a single node running."
+  }
+}

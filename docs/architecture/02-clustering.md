@@ -1,8 +1,8 @@
 ---
-slug: /anvil/developer-guide/deep-dive/clustering
+slug: /architecture/clustering
 title: 'Deep Dive: Clustering and Membership'
 description: A detailed look at how Anvil nodes discover each other and maintain cluster state using a SWIM-like gossip protocol over QUIC.
-tags: [developer-guide, architecture, clustering, gossip, swim, libp2p]
+tags: [architecture, deep-dive, clustering, gossip, libp2p]
 ---
 
 # Chapter 12: Deep Dive: Clustering and Membership

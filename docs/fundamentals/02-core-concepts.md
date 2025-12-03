@@ -1,8 +1,8 @@
 ---
-slug: /anvil/user-guide/core-concepts
-title: 'User Guide: Core Concepts'
+slug: /fundamentals/core-concepts
+title: 'Core Concepts'
 description: An explanation of the fundamental concepts in Anvil - Tenants, Buckets, Objects, and Apps.
-tags: [user-guide, concepts, tenants, buckets, objects]
+tags: [fundamentals, concepts, tenants, buckets, objects]
 ---
 
 # Chapter 2: Core Concepts

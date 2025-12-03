@@ -1,11 +1,11 @@
 ---
-slug: /anvil/appendices/grpc-api
-title: 'Appendix B: gRPC API Protobufs'
+slug: /reference/grpc-api
+title: 'Reference: gRPC API'
 description: A reference copy of the Protocol Buffer (Protobuf) definitions for Anvil's gRPC services.
-tags: [appendices, grpc, api, protobuf]
+tags: [reference, grpc, api, protobuf]
 ---
 
-# Appendix B: gRPC API Protobufs
+# Reference: gRPC API Protobufs
 
 This appendix contains the full Protocol Buffers definition (`.proto`) for all of Anvil's gRPC services. This file is the canonical source of truth for the API's structure, and you can use it with `protoc` to generate client libraries for any supported language.
 

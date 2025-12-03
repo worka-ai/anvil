@@ -1,0 +1,8 @@
+{
+  "label": "Architecture Deep Dives",
+  "position": 5,
+  "link": {
+    "type": "generated-index",
+    "description": "In-depth explanations of Anvil's internal architecture for advanced users and contributors."
+  }
+}

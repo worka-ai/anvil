@@ -1,8 +1,8 @@
 ---
-slug: /anvil/getting-started
-title: 'Getting Started: Anvil in 10 Minutes'
+slug: /fundamentals/getting-started
+title: 'Getting Started'
 description: A hands-on guide to launching a single-node Anvil instance with Docker and interacting with it using the Anvil CLI.
-tags: [getting-started, docker, cli]
+tags: [getting-started, quickstart, tutorial, fundamentals]
 ---
 
 # Chapter 1: Anvil in 10 Minutes
@@ -110,106 +110,94 @@ docker-compose up -d
 
 This command will download the necessary images and start the Anvil and Postgres containers in the background.
 
-### 1.3. Creating Your First Tenant and API Key
+### 1.3. Setup: Tenant, App, and Permissions
 
-Anvil is a multi-tenant system. Before you can create buckets, you need a **Tenant** and an **App** with an API key. You can create these using the `admin` tool, which we will run inside the running Docker container.
+Anvil is a multi-tenant system where access is controlled by apps with fine-grained permissions. Before you can store files, an administrator must perform this one-time setup.
 
-**Step 1: Create the Region and Tenant**
+**Step 1: Create Region, Tenant, and App**
+
+First, we use the `admin` tool inside the Docker container to create the necessary resources.
 
 ```bash
-# Create the region (uses a positional argument)
+# 1. Create the region declared in your docker-compose.yml
 docker compose exec anvil1 admin region create europe-west-1
 
-# Create the tenant (uses a positional argument)
+# 2. Create a tenant to own your resources
 docker compose exec anvil1 admin tenant create my-first-tenant
-```
 
-**Step 2: Create an App**
-
-Next, create an App for this tenant. This will generate the credentials needed to interact with the API.
-
-```bash
-# Create an app and get its credentials (uses named flags)
+# 3. Create an app for your tenant. This generates your API credentials.
 docker compose exec anvil1 admin app create --tenant-name my-first-tenant --app-name my-cli-app
 ```
 
-This command will output a **Client ID** and a **Client Secret**. **Save these securely!** They are your API credentials.
+The `app create` command will output a **Client ID** and a **Client Secret**. **Copy these securely!**
 
-### 1.4. Granting Permissions
+**Step 2: Grant Permissions**
 
-By default, a new app has **no permissions**. You must explicitly grant it the rights to perform actions. For this guide, we will grant the app the specific permissions it needs to create a bucket and manage objects within that bucket.
-
-> **IMPORTANT:** This is the critical step that allows your app to create buckets and upload objects.
+By default, a new app has **zero permissions**. The administrator must explicitly grant it the rights to perform actions.
 
 ```bash
-# 1. Grant permission to create buckets
+# 1. Grant permission to create buckets. The resource "*" allows creation in any region.
 docker compose exec anvil1 admin policy grant \
     --app-name my-cli-app \
     --action "bucket:create" \
     --resource "*"
 
-# 2. Grant permission to list buckets
+# 2. Grant the necessary object permissions for the bucket we are about to create.
+# The bucket does not need to exist yet to set its permissions.
 docker compose exec anvil1 admin policy grant \
     --app-name my-cli-app \
-    --action "bucket:read" \
-    --resource "*"
-
-# 3. Grant full object permissions for the bucket we are about to create
-# Note that the bucket does not have to exist yet.
-docker compose exec anvil1 admin policy grant \
-    --app-name my-cli-app \
-    --action "object:*" \
+    --action "object:write" \
     --resource "my-first-anvil-bucket/*"
+
+docker compose exec anvil1 admin policy grant \
+    --app-name my-cli-app \
+    --action "object:read" \
+    --resource "my-first-anvil-bucket/*"
+
+docker compose exec anvil1 admin policy grant \
+    --app-name my-cli-app \
+    --action "object:list" \
+    --resource "my-first-anvil-bucket"
 ```
 
-### 1.5. Using the `anvil` to Create a Bucket
+### 1.4. Using the Anvil CLI
 
-Now you can configure the `anvil` to connect to your new Anvil instance.
+Now, with the setup complete, you can use the `anvil` client CLI to manage your data.
 
 **Step 1: Configure the CLI**
 
-Run the `configure` command and provide the host and the credentials you saved.
+Use the `static-config` command to non-interactively create your configuration profile. Replace `YOUR_CLIENT_ID` and `YOUR_CLIENT_SECRET` with the credentials you saved.
 
 ```bash
-# Replace YOUR_CLIENT_ID and YOUR_CLIENT_SECRET with the values from the previous step
-anvil configure --host http://localhost:50051 --client-id YOUR_CLIENT_ID --client-secret YOUR_CLIENT_SECRET
+anvil static-config \
+    --name default \
+    --host "http://localhost:50051" \
+    --client-id YOUR_CLIENT_ID \
+    --client-secret YOUR_CLIENT_SECRET \
+    --default
 ```
 
-**Step 2: Create a Bucket**
+**Step 2: Create a Bucket and Manage an Object**
 
-Now, create a bucket.
-
-```bash
-anvil bucket create --name my-first-anvil-bucket --region europe-west-1
-```
-
-### 1.5. Uploading and Downloading Your First Object
-
-Create a sample file to upload:
+Now you can create your bucket and perform file operations.
 
 ```bash
+# 1. Create the bucket (this succeeds due to the "bucket:create" permission)
+anvil bucket create my-first-anvil-bucket europe-west-1
+
+# 2. Create a sample file to upload
 echo "Hello, Anvil!" > hello.txt
-```
 
-Upload it to your new bucket using an S3-style path:
+# 3. Upload the file (succeeds due to "object:write")
+anvil object put ./hello.txt s3://my-first-anvil-bucket/hello.txt
 
-```bash
-anvil object put --src hello.txt --dest s3://my-first-anvil-bucket/hello.txt
-```
+# 4. List objects to verify (succeeds due to "object:list")
+anvil object ls s3://my-first-anvil-bucket/
 
-You can list the objects in your bucket to confirm the upload was successful:
-
-```bash
-anvil object ls --path s3://my-first-anvil-bucket/
-```
-
-Finally, download the file back to verify its contents:
-
-```bash
-anvil object get --src s3://my-first-anvil-bucket/hello.txt --dest downloaded_hello.txt
-
-cat downloaded_hello.txt
+# 5. Download the file to verify (succeeds due to "object:read")
+anvil object get s3://my-first-anvil-bucket/hello.txt ./downloaded_hello.txt
+cat ./downloaded_hello.txt
 # Expected output: Hello, Anvil!
 ```
 
-Congratulations! You have successfully deployed Anvil, created a bucket, and performed basic object storage operations. You are now ready to explore the more advanced features covered in the rest of this guide.
+Congratulations! You have successfully deployed Anvil and performed a complete, permission-aware workflow. You are now ready to explore the scenarios and reference guides to learn about more advanced features.

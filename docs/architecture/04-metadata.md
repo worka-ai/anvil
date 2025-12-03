@@ -1,8 +1,8 @@
 ---
-slug: /anvil/developer-guide/deep-dive/metadata
+slug: /architecture/metadata
 title: 'Deep Dive: Metadata and Indexing'
 description: A detailed look at Anvil's metadata architecture, including the global vs. regional database split and the use of advanced PostgreSQL features.
-tags: [developer-guide, architecture, metadata, postgres, ltree, pg_trgm]
+tags: [architecture, deep-dive, metadata, postgres, ltree, pg_trgm]
 ---
 
 # Chapter 14: Deep Dive: Metadata and Indexing
@@ -38,6 +38,14 @@ The `objects` table is the centerpiece of the regional schema. It contains colum
 -   `content_hash`: The BLAKE3 hash of the object's content, used for content-addressing.
 -   `size`, `etag`, `content_type`, etc.: Standard object metadata.
 -   `shard_map`: A JSONB column that stores the list of peer IDs responsible for holding the object's shards.
+
+### Metadata Caching and Coherence
+
+To minimize latency and reduce load on the Global Database, Anvil employs an in-memory read-through cache (using `moka`) on every node.
+
+*   **Cached Data:** High-frequency global metadata such as `buckets`, `tenants`, and `policies`.
+*   **TTL:** Entries have a configurable Time-To-Live (default 5 minutes) to ensure eventual freshness.
+*   **Coherence via Gossip:** When a node updates metadata (e.g., creating a bucket or granting a policy), it broadcasts a `MetadataEvent` over the cluster's P2P gossip mesh. Other nodes receiving this event immediately invalidate the corresponding entries in their local cache, ensuring that security and routing updates propagate near-instantly across the cluster.
 
 ### Advanced Indexing with PostgreSQL Extensions
 
