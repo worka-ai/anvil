@@ -1403,6 +1403,33 @@ impl Persistence {
         Ok(())
     }
 
+    pub async fn hf_update_item_success(
+        &self,
+        id: i64,
+        size: i64,
+        etag: &str,
+    ) -> Result<()> {
+        let client = self.global_pool.get().await?;
+        client
+            .execute(
+                r#"UPDATE hf_ingestion_items SET state='stored'::hf_item_state, size=$2, etag=$3, finished_at=now() WHERE id=$1"#,
+                &[&id, &size, &etag],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn hf_get_ingestion_items(&self, ingestion_id: i64) -> Result<Vec<(String, Option<i64>, Option<String>, Option<DateTime<Utc>>)>> {
+        let client = self.global_pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT path, size, etag, finished_at FROM hf_ingestion_items WHERE ingestion_id=$1 AND state='stored'::hf_item_state",
+                &[&ingestion_id],
+            )
+            .await?;
+        Ok(rows.into_iter().map(|r| (r.get(0), r.get(1), r.get(2), r.get(3))).collect())
+    }
+
     pub async fn hf_status_summary(
         &self,
         id: i64,

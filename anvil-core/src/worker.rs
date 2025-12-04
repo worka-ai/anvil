@@ -5,14 +5,20 @@ use crate::cluster::ClusterState;
 use crate::object_manager::ObjectManager;
 use crate::persistence::Persistence;
 use crate::tasks::{HFIngestionItemState, HFIngestionState, TaskStatus, TaskType};
+use crate::persistence::Object;
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
-use serde_json::Value as JsonValue;
+use serde_json::{Value as JsonValue, json};
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::boxed::Box;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::Row;
 use tonic::Status;
 use tracing::{debug, error, info, warn};
+use futures_util::{StreamExt, Stream};
 
 #[derive(Debug)]
 struct Task {
@@ -322,11 +328,11 @@ async fn handle_hf_ingestion(
                         .put_object(tenant_id, &target_bucket, &full_key, &scopes, reader)
                         .await;
                     match res {
-                        Ok(_obj) => {
-                            info!(key = %full_key, "Upload successful");
-                            break;
-                        }
-                        Err(e) if attempt < 3 => {
+                                                        Ok(obj) => {
+                                                            info!(key = %full_key, "Upload successful");
+                                                            persistence.hf_update_item_success(item_id, obj.size, &obj.etag).await?;
+                                                            break;
+                                                        }                        Err(e) if attempt < 3 => {
                             warn!(
                                 attempt,
                                 key = %full_key,
@@ -351,16 +357,105 @@ async fn handle_hf_ingestion(
                         }
                     }
                 }
-                persistence
-                    .hf_update_item_state(item_id, HFIngestionItemState::Stored, None)
-                    .await?;
-                debug!(item_id, "Item state set to stored.");
+
             }
 
             info!(
                 ingestion_id,
                 "Ingestion task completed successfully."
             );
+
+            // --- Generate and upload anvil-index.json ---
+            let items = persistence.hf_get_ingestion_items(ingestion_id).await?;
+            let mut file_map = HashMap::new();
+            let mut total_bytes = 0;
+            for (path, size_opt, etag_opt, finished_at_opt) in items {
+                let mut meta = json!({});
+                if let Some(s) = size_opt {
+                    meta["size"] = json!(s);
+                    total_bytes += s;
+                }
+                if let Some(e) = etag_opt {
+                    meta["etag"] = json!(e);
+                }
+                if let Some(f) = finished_at_opt {
+                    meta["last_modified"] = json!(f.to_rfc3339());
+                }
+                file_map.insert(path, meta);
+            }
+
+            let index_json = json!({
+                "meta": {
+                    "source_repo": repo_str,
+                    "revision": revision,
+                    "generated_at": chrono::Utc::now().to_rfc3339(),
+                    "total_files": file_map.len(),
+                    "total_bytes": total_bytes
+                },
+                "files": file_map,
+            });
+
+            let index_content_data = serde_json::to_vec_pretty(&index_json)?;
+            let index_key = if target_prefix.is_empty() {
+                "anvil-index.json".to_string()
+            } else {
+                format!("{}/anvil-index.json", target_prefix.trim_end_matches('/'))
+            };
+            info!(index_key = %index_key, "Uploading anvil-index.json");
+
+            // Upload index file, using retry logic adapted from above for robustness
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                info!("Putting anvil-index.json, attempt {}", attempt);
+                let current_index_content = index_content_data.clone();
+                let index_stream: Pin<Box<dyn Stream<Item = Result<Vec<u8>, Status>> + Send + 'static>> = Box::pin(
+                    futures_util::stream::once(async move {
+                        Ok(current_index_content)
+                    })
+                    .map(|item: Result<Vec<u8>, Infallible>| {
+                        item.map_err(|e| match e {})
+                    })
+                );
+
+                let res: Result<Object, Status> = object_manager.put_object(
+                    tenant_id,
+                    &target_bucket,
+                    &index_key,
+                    &vec!["object:write|*".to_string()], // Scopes
+                    index_stream,
+                ).await;
+                match res {
+                    Ok(_) => {
+                        info!(key = %index_key, "anvil-index.json upload successful");
+                        break;
+                    }
+                    Err(e) if attempt < 3 => {
+                        warn!(
+                            attempt,
+                            key = %index_key,
+                            error = %e.to_string(),
+                            "anvil-index.json upload attempt failed. Retrying..."
+                        );
+                        let jitter = (rand::random::<u64>() % 200) as u64;
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            500 * attempt as u64 + jitter,
+                        ))
+                        .await;
+                        continue;
+                    }
+                    Err(e) => {
+                        error!(
+                            key = %index_key,
+                            error = %e,
+                            "anvil-index.json upload failed permanently"
+                        );
+                        return Err(anyhow::anyhow!(e.to_string()));
+                    }
+                }
+            }
+            // --- End anvil-index.json upload ---
+
             info!(ingestion_id, "Updating ingestion state to completed.");
             persistence
                 .hf_update_ingestion_state(ingestion_id, HFIngestionState::Completed, None)

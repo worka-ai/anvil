@@ -11,7 +11,7 @@ tags: [scenario, s3, aws-cli, rclone, sdk]
 
 One of Anvil's most powerful features is its S3-compatible API gateway. This allows you to leverage the vast ecosystem of existing S3 tools, libraries, and SDKs to interact with your Anvil cluster without needing to write any custom code.
 
-> **Note:** While this guide focuses on S3-compatible tools, the `anvil` is the recommended primary interface for most operations. See the [Getting Started](./getting-started) guide for `anvil` examples.
+> **Note:** While this guide focuses on S3-compatible tools, the `anvil` is the recommended primary interface for most operations. See the getting started guide for `anvil` examples.
 
 ### 4.1. Configuring S3 Clients
 

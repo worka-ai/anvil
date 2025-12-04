@@ -21,7 +21,7 @@ This guide covers the fundamentals of deploying Anvil. The architecture is flexi
 
 A single-node deployment is the simplest way to run Anvil and is perfect for development and testing. It consists of one Anvil instance and its required PostgreSQL databases.
 
-For a complete, working `docker-compose.yml` and a step-by-step tutorial for this setup, please refer to the [**Getting Started Guide**](../fundamentals/getting-started).
+For a complete, working `docker-compose.yml` and a step-by-step tutorial for this setup, please refer to the getting started guide.
 
 ## 3. Multi-Node Deployment (Single Region)
 
