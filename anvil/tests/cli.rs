@@ -307,4 +307,16 @@ async fn test_cli_hf_ingestion() {
     let dest = format!("s3://{}/{}", bucket_name, object_key);
     let output = run_cli(&["object", "head", &dest], config_dir.path()).await;
     assert!(output.status.success());
+
+    // Verify anvil-index.json
+    let index_key = format!("{}/anvil-index.json", repo);
+    let index_dest = format!("s3://{}/{}", bucket_name, index_key);
+    let output = run_cli(&["object", "get", &index_dest], config_dir.path()).await;
+    assert!(output.status.success(), "Failed to get anvil-index.json");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let index_json: serde_json::Value = serde_json::from_str(&stdout).expect("Failed to parse anvil-index.json");
+
+    assert_eq!(index_json["meta"]["source_repo"], repo);
+    assert_eq!(index_json["meta"]["total_files"], 1);
+    assert!(index_json["files"][file].is_object());
 }

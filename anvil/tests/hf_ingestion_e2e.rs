@@ -267,4 +267,35 @@ async fn hf_ingestion_config_json() {
     let txt = resp.text().await.unwrap();
     let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
     assert!(v.is_object());
+
+    // Verify anvil-index.json
+    let index_url = "http://localhost:50051/models/gpt-oss-20b/anvil-index.json";
+    let index_resp = reqwest::get(index_url).await.unwrap();
+    assert_eq!(index_resp.status(), 200, "anvil-index.json should be accessible");
+    let index_txt = index_resp.text().await.unwrap();
+    let index_v: serde_json::Value = serde_json::from_str(&index_txt).unwrap();
+
+    // Assert meta fields
+    assert_eq!(index_v["meta"]["source_repo"], "openai/gpt-oss-20b");
+    assert_eq!(index_v["meta"]["revision"], "main");
+    assert_eq!(index_v["meta"]["total_files"], 1);
+    assert!(index_v["meta"]["total_bytes"].is_number());
+    assert!(index_v["meta"]["generated_at"].is_string());
+
+    // Assert files entry
+    let files_map = index_v["files"].as_object().unwrap();
+    assert_eq!(files_map.len(), 1);
+    assert!(files_map.contains_key("config.json"));
+
+    let config_json_entry = files_map["config.json"].as_object().unwrap();
+    assert!(config_json_entry.contains_key("size"));
+    assert!(config_json_entry["size"].is_number());
+    assert!(config_json_entry.contains_key("etag"));
+    assert!(config_json_entry["etag"].is_string());
+    assert!(config_json_entry.contains_key("last_modified"));
+    assert!(config_json_entry["last_modified"].is_string());
+
+    // The size in anvil-index.json should match the actual file size.
+    let expected_config_size = txt.len() as i64;
+    assert_eq!(config_json_entry["size"].as_i64().unwrap(), expected_config_size);
 }
