@@ -373,33 +373,11 @@ async fn handle_hf_ingestion(
             };
 
             let mut file_map = HashMap::new();
+            
+            // Fetch ALL items for this target (from past and current jobs) to build a complete index
+            let all_items = persistence.hf_get_all_items_for_prefix(tenant_id, &target_bucket, &target_prefix).await?;
 
-            // Try to load existing index to merge
-            let claims = crate::auth::Claims {
-                sub: "internal-worker".to_string(),
-                exp: (chrono::Utc::now().timestamp() + 3600) as usize,
-                scopes: vec!["object:read|*".to_string()],
-                tenant_id: tenant_id,
-            };
-
-            if let Ok((_, mut stream)) = object_manager.get_object(Some(claims), target_bucket.clone(), index_key.clone()).await {
-                let mut data = Vec::new();
-                while let Some(chunk_res) = stream.next().await {
-                    if let Ok(chunk) = chunk_res {
-                        data.extend_from_slice(&chunk);
-                    }
-                }
-                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&data) {
-                    if let Some(files) = val.get("files").and_then(|f| f.as_object()) {
-                        for (k, v) in files {
-                            file_map.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-            }
-
-            let items = persistence.hf_get_ingestion_items(ingestion_id).await?;
-            for (path, size_opt, etag_opt, finished_at_opt) in items {
+            for (path, size_opt, etag_opt, finished_at_opt) in all_items {
                 let mut meta = json!({});
                 if let Some(s) = size_opt {
                     meta["size"] = json!(s);
@@ -410,6 +388,7 @@ async fn handle_hf_ingestion(
                 if let Some(f) = finished_at_opt {
                     meta["last_modified"] = json!(f.to_rfc3339());
                 }
+                // Insert will overwrite existing entries, so later jobs (ordered by finished_at) win.
                 file_map.insert(path, meta);
             }
 

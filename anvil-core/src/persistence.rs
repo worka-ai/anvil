@@ -1430,6 +1430,29 @@ impl Persistence {
         Ok(rows.into_iter().map(|r| (r.get(0), r.get(1), r.get(2), r.get(3))).collect())
     }
 
+    pub async fn hf_get_all_items_for_prefix(
+        &self,
+        tenant_id: i64,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<(String, Option<i64>, Option<String>, Option<DateTime<Utc>>)>> {
+        let client = self.global_pool.get().await?;
+        let rows = client.query(
+            r#"
+            SELECT i.path, i.size, i.etag, i.finished_at
+            FROM hf_ingestion_items i
+            JOIN hf_ingestions h ON i.ingestion_id = h.id
+            WHERE h.tenant_id = $1
+              AND h.target_bucket = $2
+              AND COALESCE(h.target_prefix, '') = $3
+              AND i.state = 'stored'::hf_item_state
+            ORDER BY i.finished_at ASC
+            "#,
+            &[&tenant_id, &bucket, &prefix]
+        ).await?;
+        Ok(rows.into_iter().map(|r| (r.get(0), r.get(1), r.get(2), r.get(3))).collect())
+    }
+
     pub async fn hf_status_summary(
         &self,
         id: i64,
