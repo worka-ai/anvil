@@ -36,7 +36,6 @@ impl Drop for ComposeGuard {
 
 #[ignore]
 #[tokio::test]
-#[cfg(target_os = "linux")]
 async fn hf_ingestion_config_json() {
     // Bring up cluster via compose (reuse existing compose file and image tag).
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
@@ -298,4 +297,67 @@ async fn hf_ingestion_config_json() {
     // The size in anvil-index.json should match the actual file size.
     let expected_config_size = txt.len() as i64;
     assert_eq!(config_json_entry["size"].as_i64().unwrap(), expected_config_size);
+
+    // --- Second Ingestion (Merge Test) ---
+    // Ingest README.md to the same location to verify index merging
+    let mut sreq2 = tonic::Request::new(anvil::anvil_api::StartHfIngestionRequest {
+        key_name: "test".into(),
+        repo: "openai/gpt-oss-20b".into(),
+        revision: "main".into(),
+        target_bucket: "models".into(),
+        target_prefix: "gpt-oss-20b".into(),
+        include_globs: vec!["README.md".into()],
+        exclude_globs: vec![],
+        target_region: "DOCKER_TEST".into(),
+    });
+    sreq2.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let ing_id_2 = ing_client
+        .start_ingestion(sreq2)
+        .await
+        .unwrap()
+        .into_inner()
+        .ingestion_id;
+
+    // Poll status for job 2
+    let start2 = Instant::now();
+    loop {
+        if start2.elapsed() > Duration::from_secs(90) {
+            panic!("timeout waiting for second ingestion");
+        }
+        let mut streq = tonic::Request::new(anvil::anvil_api::GetHfIngestionStatusRequest {
+            ingestion_id: ing_id_2.clone(),
+        });
+        streq.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+        let status = ing_client
+            .get_ingestion_status(streq)
+            .await
+            .unwrap()
+            .into_inner();
+        if status.state == "completed" {
+            break;
+        }
+        if status.state == "failed" {
+            panic!("second ingestion failed: {}", status.error);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Verify merged anvil-index.json
+    let index_resp_2 = reqwest::get(index_url).await.unwrap();
+    assert_eq!(index_resp_2.status(), 200);
+    let index_txt_2 = index_resp_2.text().await.unwrap();
+    let index_v_2: serde_json::Value = serde_json::from_str(&index_txt_2).unwrap();
+
+    // Assert meta fields
+    assert_eq!(index_v_2["meta"]["total_files"], 2, "Index should contain 2 files after merge (found: {:?})", index_v_2["files"]);
+
+    let files_map_2 = index_v_2["files"].as_object().unwrap();
+    assert!(files_map_2.contains_key("config.json"), "Index should still contain config.json");
+    assert!(files_map_2.contains_key("README.md"), "Index should now contain README.md");
 }

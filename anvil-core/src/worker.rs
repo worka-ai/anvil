@@ -160,7 +160,7 @@ async fn handle_hf_ingestion(
             let repo_str: String = job.get(3);
             let revision: String = job.get(4);
             let target_bucket: String = job.get(5);
-            let target_region: String = job.get(6);
+            let _target_region: String = job.get(6);
             let target_prefix: String = job.get(7);
             let include_globs: Vec<String> = job.get(8);
             let exclude_globs: Vec<String> = job.get(9);
@@ -366,14 +366,43 @@ async fn handle_hf_ingestion(
             );
 
             // --- Generate and upload anvil-index.json ---
-            let items = persistence.hf_get_ingestion_items(ingestion_id).await?;
+            let index_key = if target_prefix.is_empty() {
+                "anvil-index.json".to_string()
+            } else {
+                format!("{}/anvil-index.json", target_prefix.trim_end_matches('/'))
+            };
+
             let mut file_map = HashMap::new();
-            let mut total_bytes = 0;
+
+            // Try to load existing index to merge
+            let claims = crate::auth::Claims {
+                sub: "internal-worker".to_string(),
+                exp: (chrono::Utc::now().timestamp() + 3600) as usize,
+                scopes: vec!["object:read|*".to_string()],
+                tenant_id: tenant_id,
+            };
+
+            if let Ok((_, mut stream)) = object_manager.get_object(Some(claims), target_bucket.clone(), index_key.clone()).await {
+                let mut data = Vec::new();
+                while let Some(chunk_res) = stream.next().await {
+                    if let Ok(chunk) = chunk_res {
+                        data.extend_from_slice(&chunk);
+                    }
+                }
+                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&data) {
+                    if let Some(files) = val.get("files").and_then(|f| f.as_object()) {
+                        for (k, v) in files {
+                            file_map.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+
+            let items = persistence.hf_get_ingestion_items(ingestion_id).await?;
             for (path, size_opt, etag_opt, finished_at_opt) in items {
                 let mut meta = json!({});
                 if let Some(s) = size_opt {
                     meta["size"] = json!(s);
-                    total_bytes += s;
                 }
                 if let Some(e) = etag_opt {
                     meta["etag"] = json!(e);
@@ -382,6 +411,13 @@ async fn handle_hf_ingestion(
                     meta["last_modified"] = json!(f.to_rfc3339());
                 }
                 file_map.insert(path, meta);
+            }
+
+            let mut total_bytes = 0;
+            for meta in file_map.values() {
+                if let Some(s) = meta.get("size").and_then(|v| v.as_i64()) {
+                    total_bytes += s;
+                }
             }
 
             let index_json = json!({
@@ -396,11 +432,6 @@ async fn handle_hf_ingestion(
             });
 
             let index_content_data = serde_json::to_vec_pretty(&index_json)?;
-            let index_key = if target_prefix.is_empty() {
-                "anvil-index.json".to_string()
-            } else {
-                format!("{}/anvil-index.json", target_prefix.trim_end_matches('/'))
-            };
             info!(index_key = %index_key, "Uploading anvil-index.json");
 
             // Upload index file, using retry logic adapted from above for robustness
