@@ -1433,6 +1433,37 @@ impl Persistence {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    pub async fn list_active_multipart_uploads(
+        &self,
+        bucket_id: i64,
+        prefix: &str,
+        key_marker: &str,
+        limit: i32,
+    ) -> Result<Vec<MultipartUpload>> {
+        let client = self.regional_pool.get().await?;
+        let rows = client
+            .query(
+                r#"
+                SELECT *
+                FROM multipart_uploads
+                WHERE bucket_id = $1
+                  AND key LIKE $2
+                  AND key > $3
+                  AND completed_at IS NULL
+                  AND aborted_at IS NULL
+                ORDER BY key, created_at
+                LIMIT $4"#,
+                &[
+                    &bucket_id,
+                    &format!(r#"{}%"#, prefix),
+                    &key_marker,
+                    &(if limit == 0 { 1000 } else { limit } as i64),
+                ],
+            )
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     pub async fn complete_multipart_upload(&self, upload_row_id: i64) -> Result<()> {
         let client = self.regional_pool.get().await?;
         client

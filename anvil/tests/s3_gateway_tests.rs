@@ -345,6 +345,18 @@ async fn test_s3_public_and_private_access() {
         .await
         .expect("create multipart upload for abort should succeed");
     let aborted_upload_id = aborted.upload_id().expect("abort upload id").to_string();
+    let active_uploads = client
+        .list_multipart_uploads()
+        .bucket(&private_bucket)
+        .prefix(aborted_key)
+        .send()
+        .await
+        .expect("list multipart uploads should succeed");
+    assert_eq!(active_uploads.uploads().len(), 1);
+    assert_eq!(
+        active_uploads.uploads()[0].upload_id(),
+        Some(aborted_upload_id.as_str())
+    );
     client
         .abort_multipart_upload()
         .bucket(&private_bucket)
@@ -366,6 +378,14 @@ async fn test_s3_public_and_private_access() {
         upload_after_abort.is_err(),
         "uploading a part after abort must fail"
     );
+    let active_uploads_after_abort = client
+        .list_multipart_uploads()
+        .bucket(&private_bucket)
+        .prefix(aborted_key)
+        .send()
+        .await
+        .expect("list multipart uploads after abort should succeed");
+    assert!(active_uploads_after_abort.uploads().is_empty());
 
     // 5b. S3 version listing returns overwritten versions and delete markers.
     client

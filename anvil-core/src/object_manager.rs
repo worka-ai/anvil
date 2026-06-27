@@ -451,6 +451,35 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))
     }
 
+    pub async fn list_multipart_uploads(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        prefix: &str,
+        key_marker: &str,
+        limit: i32,
+        scopes: &[String],
+    ) -> Result<Vec<crate::persistence::MultipartUpload>, Status> {
+        if !validation::is_valid_bucket_name(bucket_name) {
+            return Err(Status::invalid_argument("Invalid bucket name"));
+        }
+        if validation::is_reserved_internal_key(prefix) {
+            return Err(Status::permission_denied("UnauthorizedReservedNamespace"));
+        }
+        if !prefix.is_empty() && !validation::is_valid_object_key(prefix) {
+            return Err(Status::invalid_argument("Invalid object key prefix"));
+        }
+        if !auth::is_authorized(AnvilAction::ObjectList, bucket_name, scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
+        self.db
+            .list_active_multipart_uploads(bucket.id, prefix, key_marker, limit)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))
+    }
+
     async fn send_stripe(
         &self,
         clients: &[internal_anvil_service_client::InternalAnvilServiceClient<

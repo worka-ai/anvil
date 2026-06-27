@@ -333,6 +333,20 @@ async fn list_objects(
             .await;
     }
 
+    if q.contains_key("uploads") {
+        let claims = match claims {
+            Some(claims) => claims,
+            None => {
+                return s3_error(
+                    "AccessDenied",
+                    "Missing credentials",
+                    axum::http::StatusCode::FORBIDDEN,
+                );
+            }
+        };
+        return list_multipart_uploads_response(state, claims, &bucket, &q).await;
+    }
+
     let prefix = q.get("prefix").cloned().unwrap_or_default();
     let start_after = q
         .get("start-after")
@@ -429,6 +443,66 @@ async fn list_objects(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             ),
         },
+    }
+}
+
+async fn list_multipart_uploads_response(
+    state: AppState,
+    claims: Claims,
+    bucket: &str,
+    q: &HashMap<String, String>,
+) -> Response {
+    let prefix = q.get("prefix").cloned().unwrap_or_default();
+    let key_marker = q
+        .get("key-marker")
+        .or_else(|| q.get("keyMarker"))
+        .cloned()
+        .unwrap_or_default();
+    let max_uploads: i32 = q
+        .get("max-uploads")
+        .or_else(|| q.get("maxUploads"))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+
+    match state
+        .object_manager
+        .list_multipart_uploads(
+            claims.tenant_id,
+            bucket,
+            &prefix,
+            &key_marker,
+            max_uploads,
+            &claims.scopes,
+        )
+        .await
+    {
+        Ok(uploads) => {
+            let mut xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Bucket>{}</Bucket>\n  <KeyMarker>{}</KeyMarker>\n  <UploadIdMarker></UploadIdMarker>\n  <NextKeyMarker></NextKeyMarker>\n  <NextUploadIdMarker></NextUploadIdMarker>\n  <Delimiter></Delimiter>\n  <Prefix>{}</Prefix>\n  <MaxUploads>{}</MaxUploads>\n  <IsTruncated>false</IsTruncated>\n",
+                xml_escape(bucket),
+                xml_escape(&key_marker),
+                xml_escape(&prefix),
+                max_uploads
+            );
+            for upload in uploads {
+                xml.push_str("  <Upload>\n");
+                xml.push_str(&format!("    <Key>{}</Key>\n", xml_escape(&upload.key)));
+                xml.push_str(&format!("    <UploadId>{}</UploadId>\n", upload.upload_id));
+                xml.push_str(&format!(
+                    "    <Initiated>{}</Initiated>\n",
+                    upload.created_at.to_rfc3339()
+                ));
+                xml.push_str("    <StorageClass>STANDARD</StorageClass>\n");
+                xml.push_str("  </Upload>\n");
+            }
+            xml.push_str("</ListMultipartUploadsResult>\n");
+            Response::builder()
+                .status(200)
+                .header("Content-Type", "application/xml")
+                .body(Body::from(xml))
+                .unwrap()
+        }
+        Err(status) => s3_status_to_response_for_auth(status, true, "NoSuchBucket"),
     }
 }
 
