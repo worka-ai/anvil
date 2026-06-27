@@ -403,6 +403,91 @@ impl ObjectService for AppState {
         ))
     }
 
+    async fn create_append_stream(
+        &self,
+        request: Request<CreateAppendStreamRequest>,
+    ) -> Result<Response<CreateAppendStreamResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        let stream_id = self
+            .object_manager
+            .create_append_stream(
+                claims.tenant_id,
+                &req.bucket_name,
+                &req.stream_key,
+                &claims.scopes,
+            )
+            .await?;
+
+        Ok(Response::new(CreateAppendStreamResponse {
+            stream_id: stream_id.to_string(),
+        }))
+    }
+
+    async fn append_stream_record(
+        &self,
+        request: Request<AppendStreamRecordRequest>,
+    ) -> Result<Response<AppendStreamRecordResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        let stream_id = uuid::Uuid::parse_str(&req.stream_id)
+            .map_err(|_| Status::invalid_argument("Invalid stream_id"))?;
+        let record = self
+            .object_manager
+            .append_stream_record(
+                claims.tenant_id,
+                &req.bucket_name,
+                &req.stream_key,
+                stream_id,
+                req.payload,
+                &claims.scopes,
+            )
+            .await?;
+
+        Ok(Response::new(AppendStreamRecordResponse {
+            record_sequence: record.record_sequence,
+            payload_hash: record.payload_hash,
+            payload_size: record.payload_size,
+        }))
+    }
+
+    async fn seal_append_stream_segment(
+        &self,
+        request: Request<SealAppendStreamSegmentRequest>,
+    ) -> Result<Response<SealAppendStreamSegmentResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        let stream_id = uuid::Uuid::parse_str(&req.stream_id)
+            .map_err(|_| Status::invalid_argument("Invalid stream_id"))?;
+        let sealed = self
+            .object_manager
+            .seal_append_stream_segment(
+                claims.tenant_id,
+                &req.bucket_name,
+                &req.stream_key,
+                stream_id,
+                &claims.scopes,
+            )
+            .await?;
+
+        Ok(Response::new(SealAppendStreamSegmentResponse {
+            record_count: sealed.record_count,
+            segment_hash: sealed.segment_hash,
+        }))
+    }
+
     async fn initiate_multipart_upload(
         &self,
         request: Request<InitiateMultipartRequest>,

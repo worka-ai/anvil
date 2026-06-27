@@ -1,11 +1,12 @@
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::{
-    self, CompleteMultipartPart, CompleteMultipartRequest, ComposeObjectRequest,
-    ComposeObjectSource, CopyObjectRequest, CreateBucketRequest, DeleteObjectRequest,
-    GetObjectRequest, HeadObjectRequest, InitiateMultipartRequest, ListObjectVersionsRequest,
-    ListObjectsRequest, ObjectMetadata, PatchJsonObjectRequest, PutObjectRequest,
-    UploadPartMetadata, UploadPartRequest, WatchPrefixRequest,
+    self, AppendStreamRecordRequest, CompleteMultipartPart, CompleteMultipartRequest,
+    ComposeObjectRequest, ComposeObjectSource, CopyObjectRequest, CreateAppendStreamRequest,
+    CreateBucketRequest, DeleteObjectRequest, GetObjectRequest, HeadObjectRequest,
+    InitiateMultipartRequest, ListObjectVersionsRequest, ListObjectsRequest, ObjectMetadata,
+    PatchJsonObjectRequest, PutObjectRequest, SealAppendStreamSegmentRequest, UploadPartMetadata,
+    UploadPartRequest, WatchPrefixRequest,
 };
 use futures_util::StreamExt;
 use std::time::Duration;
@@ -413,6 +414,118 @@ async fn test_watch_prefix_streams_snapshot_and_live_events() {
     assert_eq!(second.object_key, object_key);
     assert_eq!(second.event_type, "delete");
     assert!(second.is_delete_marker);
+}
+
+#[tokio::test]
+async fn test_append_stream_records_are_ordered_and_sealable() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+
+    let bucket_name = "test-append-bucket".to_string();
+    let stream_key = "events/topic-a".to_string();
+    let mut create_req = Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
+    });
+    create_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client.create_bucket(create_req).await.unwrap();
+
+    let mut create_stream_req = Request::new(CreateAppendStreamRequest {
+        bucket_name: bucket_name.clone(),
+        stream_key: stream_key.clone(),
+    });
+    create_stream_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let stream_id = object_client
+        .create_append_stream(create_stream_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .stream_id;
+
+    let mut first_req = Request::new(AppendStreamRecordRequest {
+        bucket_name: bucket_name.clone(),
+        stream_key: stream_key.clone(),
+        stream_id: stream_id.clone(),
+        payload: b"first".to_vec(),
+    });
+    first_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let first = object_client
+        .append_stream_record(first_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.record_sequence, 1);
+    assert_eq!(first.payload_size, 5);
+    assert!(!first.payload_hash.is_empty());
+
+    let mut second_req = Request::new(AppendStreamRecordRequest {
+        bucket_name: bucket_name.clone(),
+        stream_key: stream_key.clone(),
+        stream_id: stream_id.clone(),
+        payload: b"second".to_vec(),
+    });
+    second_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let second = object_client
+        .append_stream_record(second_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second.record_sequence, 2);
+
+    let mut seal_req = Request::new(SealAppendStreamSegmentRequest {
+        bucket_name: bucket_name.clone(),
+        stream_key: stream_key.clone(),
+        stream_id: stream_id.clone(),
+    });
+    seal_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let sealed = object_client
+        .seal_append_stream_segment(seal_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(sealed.record_count, 2);
+    assert!(!sealed.segment_hash.is_empty());
+
+    let mut append_after_seal = Request::new(AppendStreamRecordRequest {
+        bucket_name,
+        stream_key,
+        stream_id,
+        payload: b"must fail".to_vec(),
+    });
+    append_after_seal.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    assert!(
+        object_client
+            .append_stream_record(append_after_seal)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

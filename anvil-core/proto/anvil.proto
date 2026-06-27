@@ -63,6 +63,9 @@ service ObjectService {
   rpc ComposeObject(ComposeObjectRequest) returns (ComposeObjectResponse);
   rpc PatchJsonObject(PatchJsonObjectRequest) returns (PatchJsonObjectResponse);
   rpc WatchPrefix(WatchPrefixRequest) returns (stream WatchPrefixResponse);
+  rpc CreateAppendStream(CreateAppendStreamRequest) returns (CreateAppendStreamResponse);
+  rpc AppendStreamRecord(AppendStreamRecordRequest) returns (AppendStreamRecordResponse);
+  rpc SealAppendStreamSegment(SealAppendStreamSegmentRequest) returns (SealAppendStreamSegmentResponse);
   rpc InitiateMultipartUpload(InitiateMultipartRequest) returns (InitiateMultipartResponse);
   rpc UploadPart(stream UploadPartRequest) returns (UploadPartResponse);
   rpc CompleteMultipartUpload(CompleteMultipartRequest) returns (CompleteMultipartResponse);
@@ -266,6 +269,39 @@ message WatchPrefixResponse {
     int64 size = 7;
     bool is_delete_marker = 8;
     string created_at = 9;
+}
+
+message CreateAppendStreamRequest {
+    string bucket_name = 1;
+    string stream_key = 2;
+}
+
+message CreateAppendStreamResponse {
+    string stream_id = 1;
+}
+
+message AppendStreamRecordRequest {
+    string bucket_name = 1;
+    string stream_key = 2;
+    string stream_id = 3;
+    bytes payload = 4;
+}
+
+message AppendStreamRecordResponse {
+    uint64 record_sequence = 1;
+    string payload_hash = 2;
+    int64 payload_size = 3;
+}
+
+message SealAppendStreamSegmentRequest {
+    string bucket_name = 1;
+    string stream_key = 2;
+    string stream_id = 3;
+}
+
+message SealAppendStreamSegmentResponse {
+    uint64 record_count = 1;
+    string segment_hash = 2;
 }
 
 message CompleteMultipartResponse {

@@ -48,6 +48,19 @@ pub struct CompleteMultipartPart {
     pub etag: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct AppendStreamRecordResult {
+    pub record_sequence: u64,
+    pub payload_hash: String,
+    pub payload_size: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SealAppendStreamResult {
+    pub record_count: u64,
+    pub segment_hash: String,
+}
+
 impl ObjectManager {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -528,6 +541,111 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok((bucket.id, snapshot, live))
+    }
+
+    pub async fn create_append_stream(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        stream_key: &str,
+        scopes: &[String],
+    ) -> Result<uuid::Uuid, Status> {
+        self.validate_write_request(bucket_name, stream_key, scopes)?;
+        let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
+        let stream = self
+            .db
+            .create_append_stream(tenant_id, bucket.id, &bucket.name, stream_key)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(stream.stream_id)
+    }
+
+    pub async fn append_stream_record(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        stream_key: &str,
+        stream_id: uuid::Uuid,
+        payload: Vec<u8>,
+        scopes: &[String],
+    ) -> Result<AppendStreamRecordResult, Status> {
+        self.validate_write_request(bucket_name, stream_key, scopes)?;
+        let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
+        let stream = self
+            .db
+            .get_active_append_stream(tenant_id, bucket.id, stream_key, stream_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Append stream not found"))?;
+
+        let payload_hash = blake3::hash(&payload).to_hex().to_string();
+        self.storage
+            .store_whole_object(&payload_hash, &payload)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let record = self
+            .db
+            .append_stream_record(stream.id, &payload_hash, payload.len() as i64)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(AppendStreamRecordResult {
+            record_sequence: u64::try_from(record.record_sequence)
+                .map_err(|_| Status::internal("Invalid record sequence"))?,
+            payload_hash,
+            payload_size: payload.len() as i64,
+        })
+    }
+
+    pub async fn seal_append_stream_segment(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        stream_key: &str,
+        stream_id: uuid::Uuid,
+        scopes: &[String],
+    ) -> Result<SealAppendStreamResult, Status> {
+        self.validate_write_request(bucket_name, stream_key, scopes)?;
+        let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
+        let stream = self
+            .db
+            .get_active_append_stream(tenant_id, bucket.id, stream_key, stream_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Append stream not found"))?;
+        let records = self
+            .db
+            .list_append_stream_records(stream.id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if records.is_empty() {
+            return Err(Status::failed_precondition(
+                "Append stream has no records to seal",
+            ));
+        }
+
+        let mut hasher = blake3::Hasher::new();
+        for record in &records {
+            hasher.update(&record.record_sequence.to_le_bytes());
+            hasher.update(record.payload_hash.as_bytes());
+            hasher.update(&record.payload_size.to_le_bytes());
+        }
+        let segment_hash = hasher.finalize().to_hex().to_string();
+        let sealed = self
+            .db
+            .seal_append_stream(stream.id, &segment_hash)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if !sealed {
+            return Err(Status::failed_precondition(
+                "Append stream is already sealed",
+            ));
+        }
+
+        Ok(SealAppendStreamResult {
+            record_count: records.len() as u64,
+            segment_hash,
+        })
     }
 
     async fn send_stripe(

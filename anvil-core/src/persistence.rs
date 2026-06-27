@@ -104,6 +104,29 @@ pub struct ObjectWatchEvent {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AppendStream {
+    pub id: i64,
+    pub tenant_id: i64,
+    pub bucket_id: i64,
+    pub bucket_name: String,
+    pub stream_key: String,
+    pub stream_id: uuid::Uuid,
+    pub created_at: DateTime<Utc>,
+    pub sealed_at: Option<DateTime<Utc>>,
+    pub segment_hash: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppendStreamRecord {
+    pub id: i64,
+    pub stream_id: i64,
+    pub record_sequence: i64,
+    pub payload_hash: String,
+    pub payload_size: i64,
+    pub created_at: DateTime<Utc>,
+}
+
 // Manual row-to-struct mapping
 impl From<Row> for Tenant {
     fn from(row: Row) -> Self {
@@ -201,6 +224,35 @@ impl From<Row> for ObjectWatchEvent {
             etag: row.get("etag"),
             size: row.get("size"),
             is_delete_marker: row.get("is_delete_marker"),
+            created_at: row.get("created_at"),
+        }
+    }
+}
+
+impl From<Row> for AppendStream {
+    fn from(row: Row) -> Self {
+        Self {
+            id: row.get("id"),
+            tenant_id: row.get("tenant_id"),
+            bucket_id: row.get("bucket_id"),
+            bucket_name: row.get("bucket_name"),
+            stream_key: row.get("stream_key"),
+            stream_id: row.get("stream_id"),
+            created_at: row.get("created_at"),
+            sealed_at: row.get("sealed_at"),
+            segment_hash: row.get("segment_hash"),
+        }
+    }
+}
+
+impl From<Row> for AppendStreamRecord {
+    fn from(row: Row) -> Self {
+        Self {
+            id: row.get("id"),
+            stream_id: row.get("stream_id"),
+            record_sequence: row.get("record_sequence"),
+            payload_hash: row.get("payload_hash"),
+            payload_size: row.get("payload_size"),
             created_at: row.get("created_at"),
         }
     }
@@ -1601,6 +1653,124 @@ impl Persistence {
             )
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn create_append_stream(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        bucket_name: &str,
+        stream_key: &str,
+    ) -> Result<AppendStream> {
+        let client = self.regional_pool.get().await?;
+        let row = client
+            .query_one(
+                r#"
+                INSERT INTO append_streams
+                    (tenant_id, bucket_id, bucket_name, stream_key, stream_id)
+                VALUES ($1, $2, $3, $4, gen_random_uuid())
+                RETURNING *"#,
+                &[&tenant_id, &bucket_id, &bucket_name, &stream_key],
+            )
+            .await?;
+        Ok(row.into())
+    }
+
+    pub async fn get_active_append_stream(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        stream_key: &str,
+        stream_id: uuid::Uuid,
+    ) -> Result<Option<AppendStream>> {
+        let client = self.regional_pool.get().await?;
+        let row = client
+            .query_opt(
+                r#"
+                SELECT *
+                FROM append_streams
+                WHERE tenant_id = $1
+                  AND bucket_id = $2
+                  AND stream_key = $3
+                  AND stream_id = $4
+                  AND sealed_at IS NULL"#,
+                &[&tenant_id, &bucket_id, &stream_key, &stream_id],
+            )
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
+    pub async fn append_stream_record(
+        &self,
+        append_stream_row_id: i64,
+        payload_hash: &str,
+        payload_size: i64,
+    ) -> Result<AppendStreamRecord> {
+        let mut client = self.regional_pool.get().await?;
+        let tx = client.transaction().await?;
+        let sequence: i64 = tx
+            .query_one(
+                r#"
+                SELECT COALESCE(MAX(record_sequence), 0) + 1
+                FROM append_stream_records
+                WHERE stream_id = $1"#,
+                &[&append_stream_row_id],
+            )
+            .await?
+            .get(0);
+        let row = tx
+            .query_one(
+                r#"
+                INSERT INTO append_stream_records
+                    (stream_id, record_sequence, payload_hash, payload_size)
+                VALUES ($1, $2, $3, $4)
+                RETURNING *"#,
+                &[
+                    &append_stream_row_id,
+                    &sequence,
+                    &payload_hash,
+                    &payload_size,
+                ],
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(row.into())
+    }
+
+    pub async fn list_append_stream_records(
+        &self,
+        append_stream_row_id: i64,
+    ) -> Result<Vec<AppendStreamRecord>> {
+        let client = self.regional_pool.get().await?;
+        let rows = client
+            .query(
+                r#"
+                SELECT *
+                FROM append_stream_records
+                WHERE stream_id = $1
+                ORDER BY record_sequence"#,
+                &[&append_stream_row_id],
+            )
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn seal_append_stream(
+        &self,
+        append_stream_row_id: i64,
+        segment_hash: &str,
+    ) -> Result<bool> {
+        let client = self.regional_pool.get().await?;
+        let changed = client
+            .execute(
+                r#"
+                UPDATE append_streams
+                SET sealed_at = now(), segment_hash = $2
+                WHERE id = $1 AND sealed_at IS NULL"#,
+                &[&append_stream_row_id, &segment_hash],
+            )
+            .await?;
+        Ok(changed > 0)
     }
 
     pub async fn hard_delete_object(&self, object_id: i64) -> Result<()> {
