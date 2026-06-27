@@ -64,7 +64,7 @@ async fn hf_ingestion_config_json() {
             "admin",
             "--",
             "--global-database-url",
-            "postgres://worka:worka@localhost:5433/anvil_global",
+            "postgres://anvil:anvil@localhost:5433/anvil_global",
             "--anvil-secret-encryption-key",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "regions",
@@ -80,7 +80,7 @@ async fn hf_ingestion_config_json() {
             "admin",
             "--",
             "--global-database-url",
-            "postgres://worka:worka@localhost:5433/anvil_global",
+            "postgres://anvil:anvil@localhost:5433/anvil_global",
             "--anvil-secret-encryption-key",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "tenants",
@@ -96,7 +96,7 @@ async fn hf_ingestion_config_json() {
             "admin",
             "--",
             "--global-database-url",
-            "postgres://worka:worka@localhost:5433/anvil_global",
+            "postgres://anvil:anvil@localhost:5433/anvil_global",
             "--anvil-secret-encryption-key",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "apps",
@@ -139,7 +139,7 @@ async fn hf_ingestion_config_json() {
             "admin",
             "--",
             "--global-database-url",
-            "postgres://worka:worka@localhost:5433/anvil_global",
+            "postgres://anvil:anvil@localhost:5433/anvil_global",
             "--anvil-secret-encryption-key",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "policies",
@@ -270,7 +270,11 @@ async fn hf_ingestion_config_json() {
     // Verify anvil-index.json
     let index_url = "http://localhost:50051/models/gpt-oss-20b/anvil-index.json";
     let index_resp = reqwest::get(index_url).await.unwrap();
-    assert_eq!(index_resp.status(), 200, "anvil-index.json should be accessible");
+    assert_eq!(
+        index_resp.status(),
+        200,
+        "anvil-index.json should be accessible"
+    );
     let index_txt = index_resp.text().await.unwrap();
     let index_v: serde_json::Value = serde_json::from_str(&index_txt).unwrap();
 
@@ -296,7 +300,10 @@ async fn hf_ingestion_config_json() {
 
     // The size in anvil-index.json should match the actual file size.
     let expected_config_size = txt.len() as i64;
-    assert_eq!(config_json_entry["size"].as_i64().unwrap(), expected_config_size);
+    assert_eq!(
+        config_json_entry["size"].as_i64().unwrap(),
+        expected_config_size
+    );
 
     // --- Second Ingestion (Merge Test) ---
     // Ingest README.md to the same location to verify index merging
@@ -355,9 +362,19 @@ async fn hf_ingestion_config_json() {
     let index_v_2: serde_json::Value = serde_json::from_str(&index_txt_2).unwrap();
 
     // Assert meta fields
-    assert_eq!(index_v_2["meta"]["total_files"], 2, "Index should contain 2 files after merge (found: {:?})", index_v_2["files"]);
+    assert_eq!(
+        index_v_2["meta"]["total_files"], 2,
+        "Index should contain 2 files after merge (found: {:?})",
+        index_v_2["files"]
+    );
 
     let files_map_2 = index_v_2["files"].as_object().unwrap();
-    assert!(files_map_2.contains_key("config.json"), "Index should still contain config.json");
-    assert!(files_map_2.contains_key("README.md"), "Index should now contain README.md");
+    assert!(
+        files_map_2.contains_key("config.json"),
+        "Index should still contain config.json"
+    );
+    assert!(
+        files_map_2.contains_key("README.md"),
+        "Index should now contain README.md"
+    );
 }

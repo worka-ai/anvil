@@ -624,7 +624,7 @@ async fn test_streaming_upload_decoding() {
     // let body = StreamBody::new(stream);
     let mut file = PathBuf::new();
     file.push(temp_dir());
-    file.push(format!("worka-test-streaming-{}", random::<i32>()));
+    file.push(format!("anvil-test-streaming-{}", random::<i32>()));
     fs::write(file.as_path(), original_content).await.unwrap();
     let bytestream = ByteStream::read_from()
         .path(file.as_path())
