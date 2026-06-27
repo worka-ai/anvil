@@ -25,6 +25,12 @@ struct CreateBucketConfiguration {
 }
 
 #[derive(Debug, Deserialize)]
+struct BucketVersioningConfigurationXml {
+    #[serde(rename = "Status")]
+    status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CompleteMultipartUploadXml {
     #[serde(rename = "Part", default)]
     parts: Vec<CompleteMultipartUploadXmlPart>,
@@ -211,6 +217,7 @@ async fn list_buckets(State(state): State<AppState>, req: Request) -> Response {
 async fn create_bucket(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
     req: Request,
 ) -> Response {
     // The S3 `CreateBucket` operation can contain an XML body with the location
@@ -229,6 +236,10 @@ async fn create_bucket(
             );
         }
     };
+
+    if q.contains_key("versioning") {
+        return put_bucket_versioning_response(state, claims, &bucket, req).await;
+    }
 
     let bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
         .await
@@ -272,6 +283,100 @@ async fn create_bucket(
             ),
         },
     }
+}
+
+async fn get_bucket_versioning_response(state: AppState, claims: Claims, bucket: &str) -> Response {
+    if !auth::is_authorized(AnvilAction::BucketRead, bucket, &claims.scopes) {
+        return s3_error(
+            "AccessDenied",
+            "Permission denied",
+            axum::http::StatusCode::FORBIDDEN,
+        );
+    }
+
+    match state.db.get_bucket_by_name(claims.tenant_id, bucket).await {
+        Ok(Some(_)) => {
+            let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Status>Enabled</Status>\n</VersioningConfiguration>\n";
+            Response::builder()
+                .status(200)
+                .header("Content-Type", "application/xml")
+                .body(Body::from(xml))
+                .unwrap()
+        }
+        Ok(None) => s3_error(
+            "NoSuchBucket",
+            "The specified bucket does not exist",
+            axum::http::StatusCode::NOT_FOUND,
+        ),
+        Err(e) => s3_error(
+            "InternalError",
+            &e.to_string(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+async fn put_bucket_versioning_response(
+    state: AppState,
+    claims: Claims,
+    bucket: &str,
+    req: Request,
+) -> Response {
+    if !auth::is_authorized(AnvilAction::BucketWrite, bucket, &claims.scopes) {
+        return s3_error(
+            "AccessDenied",
+            "Permission denied",
+            axum::http::StatusCode::FORBIDDEN,
+        );
+    }
+
+    match state.db.get_bucket_by_name(claims.tenant_id, bucket).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return s3_error(
+                "NoSuchBucket",
+                "The specified bucket does not exist",
+                axum::http::StatusCode::NOT_FOUND,
+            );
+        }
+        Err(e) => {
+            return s3_error(
+                "InternalError",
+                &e.to_string(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    }
+
+    let bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    if !bytes.is_empty() {
+        match quick_xml::de::from_reader::<_, BucketVersioningConfigurationXml>(&bytes[..]) {
+            Ok(config) => {
+                if config
+                    .status
+                    .as_deref()
+                    .is_some_and(|status| status != "Enabled")
+                {
+                    return s3_error(
+                        "NotImplemented",
+                        "Bucket versioning can only be enabled",
+                        axum::http::StatusCode::NOT_IMPLEMENTED,
+                    );
+                }
+            }
+            Err(e) => {
+                return s3_error(
+                    "MalformedXML",
+                    &format!("Invalid versioning configuration: {e}"),
+                    axum::http::StatusCode::BAD_REQUEST,
+                );
+            }
+        }
+    }
+
+    (axum::http::StatusCode::OK, "").into_response()
 }
 
 async fn delete_bucket(
@@ -403,6 +508,20 @@ async fn list_objects(
             }
         };
         return list_multipart_uploads_response(state, claims, &bucket, &q).await;
+    }
+
+    if q.contains_key("versioning") {
+        let claims = match claims {
+            Some(claims) => claims,
+            None => {
+                return s3_error(
+                    "AccessDenied",
+                    "Missing credentials",
+                    axum::http::StatusCode::FORBIDDEN,
+                );
+            }
+        };
+        return get_bucket_versioning_response(state, claims, &bucket).await;
     }
 
     if q.contains_key("location") {

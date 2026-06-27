@@ -2,7 +2,9 @@ use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::{GetAccessTokenRequest, SetPublicAccessRequest};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::types::{
+    BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration,
+};
 use rand::random;
 use std::env::temp_dir;
 use std::path::PathBuf;
@@ -188,6 +190,28 @@ async fn test_s3_public_and_private_access() {
     assert!(
         format!("{:?}", location.location_constraint()).contains("test-region-1"),
         "bucket location response should include the stored bucket region"
+    );
+
+    client
+        .put_bucket_versioning()
+        .bucket(&private_bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let versioning = client
+        .get_bucket_versioning()
+        .bucket(&private_bucket)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        matches!(versioning.status(), Some(BucketVersioningStatus::Enabled)),
+        "bucket versioning should be reported as enabled"
     );
 
     let deleted_bucket = format!("delete-s3-bucket-{}", uuid::Uuid::new_v4());
