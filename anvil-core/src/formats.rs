@@ -1,6 +1,7 @@
 pub mod authz;
 pub mod full_text;
 pub mod git;
+pub mod hybrid;
 pub mod personaldb;
 pub mod segment;
 pub mod vector;
