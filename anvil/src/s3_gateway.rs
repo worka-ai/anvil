@@ -2705,6 +2705,35 @@ mod tests {
         assert!(xml.contains(&format!("<RequestId>{request_id}</RequestId>")));
     }
 
+    #[tokio::test]
+    async fn s3_not_found_errors_do_not_leak_existence_to_unauthenticated_callers() {
+        let unauthenticated = s3_status_to_response_for_auth(
+            tonic::Status::not_found("missing protected object"),
+            false,
+            "NoSuchKey",
+        );
+        assert_eq!(unauthenticated.status(), axum::http::StatusCode::FORBIDDEN);
+        assert!(unauthenticated.headers().contains_key("x-amz-request-id"));
+        let body = axum::body::to_bytes(unauthenticated.into_body(), 1024)
+            .await
+            .unwrap();
+        let xml = std::str::from_utf8(&body).unwrap();
+        assert!(xml.contains("<Code>AccessDenied</Code>"));
+        assert!(!xml.contains("NoSuchKey"));
+
+        let authenticated = s3_status_to_response_for_auth(
+            tonic::Status::not_found("missing visible object"),
+            true,
+            "NoSuchKey",
+        );
+        assert_eq!(authenticated.status(), axum::http::StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(authenticated.into_body(), 1024)
+            .await
+            .unwrap();
+        let xml = std::str::from_utf8(&body).unwrap();
+        assert!(xml.contains("<Code>NoSuchKey</Code>"));
+    }
+
     #[test]
     fn reserved_namespace_guard_detects_object_keys() {
         assert!(request_targets_reserved_namespace(&request(
