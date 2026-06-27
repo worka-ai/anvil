@@ -140,6 +140,22 @@ impl Storage {
             .join(format!("bucket-{bucket_id}.anwatch"))
     }
 
+    pub fn personaldb_group_watch_path(
+        &self,
+        tenant_id: i64,
+        database_id: &str,
+    ) -> Result<PathBuf> {
+        ensure_safe_internal_component(database_id, "personaldb database id")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("watch")
+            .join("personaldb")
+            .join(format!("tenant-{tenant_id}"))
+            .join("groups")
+            .join(format!("{database_id}.anwatch")))
+    }
+
     pub fn personaldb_group_dir(&self, tenant_id: i64, database_id: &str) -> Result<PathBuf> {
         ensure_safe_internal_component(database_id, "personaldb database id")?;
         Ok(self

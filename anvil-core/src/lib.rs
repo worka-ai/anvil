@@ -34,6 +34,7 @@ pub mod personaldb_control;
 pub mod personaldb_heads;
 pub mod personaldb_row_index;
 pub mod personaldb_segment;
+pub mod personaldb_watch;
 pub mod placement;
 pub mod s3_auth;
 pub mod search_query;
