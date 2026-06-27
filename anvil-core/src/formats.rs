@@ -321,6 +321,7 @@ pub enum JournalRecordKind {
     TaskQueue = 11,
     ModelMetadata = 12,
     IndexDiagnostic = 13,
+    MultipartMetadata = 14,
 }
 
 impl JournalRecordKind {
@@ -339,6 +340,7 @@ impl JournalRecordKind {
             11 => Ok(Self::TaskQueue),
             12 => Ok(Self::ModelMetadata),
             13 => Ok(Self::IndexDiagnostic),
+            14 => Ok(Self::MultipartMetadata),
             other => Err(FormatError::UnsupportedFamily(other)),
         }
     }

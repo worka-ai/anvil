@@ -93,6 +93,38 @@ impl Storage {
             .join("definitions.anjournal")
     }
 
+    pub fn multipart_journal_path(&self, tenant_id: i64, bucket_id: i64) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("multipart")
+            .join(format!("tenant-{tenant_id}"))
+            .join(format!("bucket-{bucket_id}"))
+            .join("uploads.anjournal")
+    }
+
+    pub async fn multipart_journal_paths(&self) -> anyhow::Result<Vec<PathBuf>> {
+        let mut paths = Vec::new();
+        let root = self.storage_path.join("_anvil").join("multipart");
+        if tokio::fs::metadata(&root).await.is_err() {
+            return Ok(paths);
+        }
+        let mut tenants = tokio::fs::read_dir(&root).await?;
+        while let Some(tenant) = tenants.next_entry().await? {
+            let mut buckets = match tokio::fs::read_dir(tenant.path()).await {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            while let Some(bucket) = buckets.next_entry().await? {
+                let path = bucket.path().join("uploads.anjournal");
+                if tokio::fs::metadata(&path).await.is_ok() {
+                    paths.push(path);
+                }
+            }
+        }
+        paths.sort();
+        Ok(paths)
+    }
+
     pub fn index_diagnostic_journal_path(&self, tenant_id: i64, bucket_id: i64) -> PathBuf {
         self.storage_path
             .join("_anvil")

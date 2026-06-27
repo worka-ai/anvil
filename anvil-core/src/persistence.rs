@@ -12,6 +12,7 @@ use crate::{
     cluster::MetadataEvent,
     config::Config,
     control_journal, index_diagnostic_journal, index_journal, metadata_journal, model_journal,
+    multipart_journal,
     storage::Storage,
     task_journal,
 };
@@ -28,8 +29,6 @@ pub struct Persistence {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct NativeState {
     next_id: i64,
-    multipart_uploads: Vec<MultipartUpload>,
-    multipart_parts: Vec<MultipartUploadPart>,
     object_events: Vec<ObjectWatchEvent>,
     append_streams: Vec<AppendStream>,
     append_records: Vec<AppendStreamRecord>,
@@ -887,10 +886,7 @@ impl Persistence {
         if has_objects {
             return Ok(true);
         }
-        let state = self.state.read().await;
-        Ok(state.multipart_uploads.iter().any(|u| {
-            u.bucket_id == bucket_id && u.completed_at.is_none() && u.aborted_at.is_none()
-        }))
+        multipart_journal::has_active_multipart_upload(&self.storage, bucket_id).await
     }
 
     pub async fn hard_delete_bucket_if_empty(&self, bucket_id: i64) -> Result<bool> {
@@ -1195,43 +1191,24 @@ impl Persistence {
         bucket_id: i64,
         key: &str,
     ) -> Result<MultipartUpload> {
-        let mut state = self.state.write().await;
-        let upload = MultipartUpload {
-            id: state.allocate_id(),
-            tenant_id,
-            bucket_id,
-            key: key.to_string(),
-            upload_id: uuid::Uuid::new_v4(),
-            created_at: Utc::now(),
-            completed_at: None,
-            aborted_at: None,
-        };
-        state.multipart_uploads.push(upload.clone());
-        self.persist_after_write(&state).await?;
-        Ok(upload)
+        multipart_journal::create_multipart_upload(&self.storage, tenant_id, bucket_id, key).await
     }
 
     pub async fn get_active_multipart_upload(
         &self,
-        _tenant_id: i64,
+        tenant_id: i64,
         bucket_id: i64,
         key: &str,
         upload_id: uuid::Uuid,
     ) -> Result<Option<MultipartUpload>> {
-        Ok(self
-            .state
-            .read()
-            .await
-            .multipart_uploads
-            .iter()
-            .find(|u| {
-                u.bucket_id == bucket_id
-                    && u.key == key
-                    && u.upload_id == upload_id
-                    && u.completed_at.is_none()
-                    && u.aborted_at.is_none()
-            })
-            .cloned())
+        multipart_journal::get_active_multipart_upload(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            key,
+            upload_id,
+        )
+        .await
     }
 
     pub async fn upsert_multipart_part(
@@ -1242,49 +1219,22 @@ impl Persistence {
         size: i64,
         etag: &str,
     ) -> Result<MultipartUploadPart> {
-        let mut state = self.state.write().await;
-        if let Some(part) = state
-            .multipart_parts
-            .iter_mut()
-            .find(|p| p.upload_id == upload_row_id && p.part_number == part_number)
-        {
-            part.content_hash = content_hash.to_string();
-            part.size = size;
-            part.etag = etag.to_string();
-            part.created_at = Utc::now();
-            let out = part.clone();
-            self.persist_after_write(&state).await?;
-            return Ok(out);
-        }
-        let part = MultipartUploadPart {
-            id: state.allocate_id(),
-            upload_id: upload_row_id,
+        multipart_journal::upsert_multipart_part(
+            &self.storage,
+            upload_row_id,
             part_number,
-            content_hash: content_hash.to_string(),
+            content_hash,
             size,
-            etag: etag.to_string(),
-            created_at: Utc::now(),
-        };
-        state.multipart_parts.push(part.clone());
-        self.persist_after_write(&state).await?;
-        Ok(part)
+            etag,
+        )
+        .await
     }
 
     pub async fn list_multipart_parts(
         &self,
         upload_row_id: i64,
     ) -> Result<Vec<MultipartUploadPart>> {
-        let mut parts = self
-            .state
-            .read()
-            .await
-            .multipart_parts
-            .iter()
-            .filter(|p| p.upload_id == upload_row_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        parts.sort_by_key(|p| p.part_number);
-        Ok(parts)
+        multipart_journal::list_multipart_parts(&self.storage, upload_row_id).await
     }
 
     pub async fn list_multipart_parts_page(
@@ -1293,31 +1243,13 @@ impl Persistence {
         part_number_marker: i32,
         limit: i32,
     ) -> Result<MultipartPartsPage> {
-        let mut parts = self
-            .list_multipart_parts(upload_row_id)
-            .await?
-            .into_iter()
-            .filter(|p| p.part_number > part_number_marker)
-            .collect::<Vec<_>>();
-        let limit = if limit == 0 {
-            1000
-        } else {
-            limit.max(1) as usize
-        };
-        let is_truncated = parts.len() > limit;
-        if is_truncated {
-            parts.truncate(limit);
-        }
-        let next_part_number_marker = if is_truncated {
-            parts.last().map(|p| p.part_number)
-        } else {
-            None
-        };
-        Ok(MultipartPartsPage {
-            parts,
-            is_truncated,
-            next_part_number_marker,
-        })
+        multipart_journal::list_multipart_parts_page(
+            &self.storage,
+            upload_row_id,
+            part_number_marker,
+            limit,
+        )
+        .await
     }
 
     pub async fn list_active_multipart_uploads(
@@ -1328,106 +1260,36 @@ impl Persistence {
         upload_id_marker: Option<uuid::Uuid>,
         limit: i32,
     ) -> Result<MultipartUploadsPage> {
-        let mut uploads = self
-            .state
-            .read()
-            .await
-            .multipart_uploads
-            .iter()
-            .filter(|u| {
-                u.bucket_id == bucket_id
-                    && u.key.starts_with(prefix)
-                    && u.completed_at.is_none()
-                    && u.aborted_at.is_none()
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        uploads.sort_by(|a, b| {
-            a.key
-                .cmp(&b.key)
-                .then_with(|| a.created_at.cmp(&b.created_at))
-        });
-        if !key_marker.is_empty() {
-            let mut past_marker = upload_id_marker.is_none();
-            uploads.retain(|u| {
-                if u.key.as_str() < key_marker {
-                    return false;
-                }
-                if u.key.as_str() > key_marker {
-                    return true;
-                }
-                if let Some(marker) = upload_id_marker {
-                    if past_marker {
-                        return true;
-                    }
-                    if u.upload_id == marker {
-                        past_marker = true;
-                    }
-                    return false;
-                }
-                true
-            });
-        }
-        let limit = if limit == 0 {
-            1000
-        } else {
-            limit.max(1) as usize
-        };
-        let is_truncated = uploads.len() > limit;
-        if is_truncated {
-            uploads.truncate(limit);
-        }
-        let (next_key_marker, next_upload_id_marker) = if is_truncated {
-            uploads
-                .last()
-                .map(|u| (Some(u.key.clone()), Some(u.upload_id)))
-                .unwrap_or((None, None))
-        } else {
-            (None, None)
-        };
-        Ok(MultipartUploadsPage {
-            uploads,
-            is_truncated,
-            next_key_marker,
-            next_upload_id_marker,
-        })
+        multipart_journal::list_active_multipart_uploads(
+            &self.storage,
+            bucket_id,
+            prefix,
+            key_marker,
+            upload_id_marker,
+            limit,
+        )
+        .await
     }
 
     pub async fn complete_multipart_upload(&self, upload_row_id: i64) -> Result<()> {
-        let mut state = self.state.write().await;
-        if let Some(upload) = state
-            .multipart_uploads
-            .iter_mut()
-            .find(|u| u.id == upload_row_id)
-        {
-            upload.completed_at = Some(Utc::now());
-        }
-        self.persist_after_write(&state).await
+        multipart_journal::complete_multipart_upload(&self.storage, upload_row_id).await
     }
 
     pub async fn abort_multipart_upload(
         &self,
-        _tenant_id: i64,
+        tenant_id: i64,
         bucket_id: i64,
         key: &str,
         upload_id: uuid::Uuid,
     ) -> Result<bool> {
-        let mut state = self.state.write().await;
-        let mut updated = false;
-        if let Some(upload) = state.multipart_uploads.iter_mut().find(|u| {
-            u.bucket_id == bucket_id
-                && u.key == key
-                && u.upload_id == upload_id
-                && u.completed_at.is_none()
-                && u.aborted_at.is_none()
-        }) {
-            upload.aborted_at = Some(Utc::now());
-            updated = true;
-        }
-        if updated {
-            self.persist_after_write(&state).await?;
-        }
-        Ok(updated)
+        multipart_journal::abort_multipart_upload(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            key,
+            upload_id,
+        )
+        .await
     }
 
     pub async fn create_object_watch_event(
