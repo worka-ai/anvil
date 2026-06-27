@@ -81,6 +81,10 @@ pub enum FormatError {
     UnsupportedCodec(u8),
     #[error("unsupported operation {0}")]
     UnsupportedOperation(u8),
+    #[error("unsupported vector metric {0}")]
+    UnsupportedVectorMetric(u8),
+    #[error("unsupported vector modality {0}")]
+    UnsupportedVectorModality(u8),
     #[error("file family does not match magic")]
     FamilyMagicMismatch,
     #[error("declared length is invalid for {context}")]

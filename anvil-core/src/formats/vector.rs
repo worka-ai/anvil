@@ -286,6 +286,151 @@ impl NodeAdjacency {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum VectorMetric {
+    Cosine = 1,
+    Dot = 2,
+    L2 = 3,
+}
+
+impl VectorMetric {
+    pub fn from_u8(value: u8) -> Result<Self, FormatError> {
+        match value {
+            1 => Ok(Self::Cosine),
+            2 => Ok(Self::Dot),
+            3 => Ok(Self::L2),
+            other => Err(FormatError::UnsupportedVectorMetric(other)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum VectorModality {
+    Text = 1,
+    Image = 2,
+    Audio = 3,
+    Video = 4,
+}
+
+impl VectorModality {
+    pub fn from_u8(value: u8) -> Result<Self, FormatError> {
+        match value {
+            1 => Ok(Self::Text),
+            2 => Ok(Self::Image),
+            3 => Ok(Self::Audio),
+            4 => Ok(Self::Video),
+            other => Err(FormatError::UnsupportedVectorModality(other)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorSearchCandidate {
+    pub record: VectorRecord,
+    pub values: Vec<f32>,
+    pub authorized: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorSearchResult {
+    pub vector_id: u64,
+    pub score: f32,
+    pub object_version_id: [u8; 16],
+    pub chunk_id: u32,
+    pub source_start: u64,
+    pub source_len: u32,
+}
+
+pub fn vector_score(
+    query: &[f32],
+    candidate: &[f32],
+    metric: VectorMetric,
+) -> Result<f32, FormatError> {
+    if query.is_empty() || query.len() != candidate.len() {
+        return Err(FormatError::InvalidDeclaredLength {
+            context: "vector query dimension",
+        });
+    }
+
+    match metric {
+        VectorMetric::Dot => Ok(dot_product(query, candidate)),
+        VectorMetric::Cosine => {
+            let query_norm = dot_product(query, query).sqrt();
+            let candidate_norm = dot_product(candidate, candidate).sqrt();
+            if query_norm == 0.0 || candidate_norm == 0.0 {
+                return Ok(0.0);
+            }
+            Ok(dot_product(query, candidate) / (query_norm * candidate_norm))
+        }
+        VectorMetric::L2 => {
+            let distance = query
+                .iter()
+                .zip(candidate.iter())
+                .map(|(left, right)| {
+                    let delta = left - right;
+                    delta * delta
+                })
+                .sum::<f32>()
+                .sqrt();
+            Ok(-distance)
+        }
+    }
+}
+
+pub fn select_authorized_vector_results(
+    query: &[f32],
+    candidates: &[VectorSearchCandidate],
+    metric: VectorMetric,
+    result_count: usize,
+) -> Result<Vec<VectorSearchResult>, FormatError> {
+    if result_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let max_candidate_count = result_count.saturating_mul(20).max(result_count);
+    let mut scored = candidates
+        .iter()
+        .map(|candidate| {
+            Ok((
+                vector_score(query, &candidate.values, metric)?,
+                candidate.authorized,
+                candidate,
+            ))
+        })
+        .collect::<Result<Vec<_>, FormatError>>()?;
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.2.record.vector_id.cmp(&right.2.record.vector_id))
+    });
+
+    Ok(scored
+        .into_iter()
+        .take(max_candidate_count)
+        .filter(|(_, authorized, _)| *authorized)
+        .take(result_count)
+        .map(|(score, _, candidate)| VectorSearchResult {
+            vector_id: candidate.record.vector_id,
+            score,
+            object_version_id: candidate.record.object_version_id,
+            chunk_id: candidate.record.chunk_id,
+            source_start: candidate.record.source_start,
+            source_len: candidate.record.source_len,
+        })
+        .collect())
+}
+
+fn dot_product(left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .zip(right.iter())
+        .map(|(left, right)| left * right)
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +503,101 @@ mod tests {
             }],
         };
         assert_eq!(HnswGraph::decode(&graph.encode()).unwrap(), graph);
+    }
+
+    #[test]
+    fn vector_metric_and_modality_decode_supported_values() {
+        assert_eq!(VectorMetric::from_u8(1).unwrap(), VectorMetric::Cosine);
+        assert_eq!(VectorMetric::from_u8(2).unwrap(), VectorMetric::Dot);
+        assert_eq!(VectorMetric::from_u8(3).unwrap(), VectorMetric::L2);
+        assert_eq!(VectorModality::from_u8(1).unwrap(), VectorModality::Text);
+        assert_eq!(VectorModality::from_u8(2).unwrap(), VectorModality::Image);
+        assert_eq!(VectorModality::from_u8(3).unwrap(), VectorModality::Audio);
+        assert_eq!(VectorModality::from_u8(4).unwrap(), VectorModality::Video);
+        assert_eq!(
+            VectorMetric::from_u8(99).unwrap_err(),
+            FormatError::UnsupportedVectorMetric(99)
+        );
+        assert_eq!(
+            VectorModality::from_u8(99).unwrap_err(),
+            FormatError::UnsupportedVectorModality(99)
+        );
+    }
+
+    #[test]
+    fn vector_score_supports_cosine_dot_and_l2() {
+        let query = [1.0, 0.0, 0.0];
+        let same = [1.0, 0.0, 0.0];
+        let orthogonal = [0.0, 1.0, 0.0];
+
+        assert_eq!(
+            vector_score(&query, &same, VectorMetric::Cosine).unwrap(),
+            1.0
+        );
+        assert_eq!(
+            vector_score(&query, &orthogonal, VectorMetric::Dot).unwrap(),
+            0.0
+        );
+        assert!(vector_score(&query, &orthogonal, VectorMetric::L2).unwrap() < 0.0);
+        assert_eq!(
+            vector_score(&query, &[1.0, 0.0], VectorMetric::Cosine).unwrap_err(),
+            FormatError::InvalidDeclaredLength {
+                context: "vector query dimension"
+            }
+        );
+    }
+
+    #[test]
+    fn vector_result_selection_applies_authorization_after_scoring() {
+        let query = [1.0, 0.0];
+        let candidates = vec![
+            candidate(1, [1.0, 0.0], false),
+            candidate(2, [0.9, 0.1], true),
+            candidate(3, [0.0, 1.0], true),
+        ];
+
+        let results =
+            select_authorized_vector_results(&query, &candidates, VectorMetric::Cosine, 2).unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.vector_id)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert!(results[0].score > results[1].score);
+    }
+
+    #[test]
+    fn vector_result_selection_respects_candidate_multiplier_limit() {
+        let query = [1.0, 0.0];
+        let mut candidates = (0..20)
+            .map(|idx| candidate(idx + 1, [1.0 - idx as f32 * 0.001, 0.0], false))
+            .collect::<Vec<_>>();
+        candidates.push(candidate(100, [0.1, 0.0], true));
+
+        let results =
+            select_authorized_vector_results(&query, &candidates, VectorMetric::Dot, 1).unwrap();
+        assert!(results.is_empty());
+    }
+
+    fn candidate(vector_id: u64, values: [f32; 2], authorized: bool) -> VectorSearchCandidate {
+        VectorSearchCandidate {
+            record: VectorRecord {
+                vector_id,
+                object_version_id: [vector_id as u8; 16],
+                chunk_id: vector_id as u32,
+                modality: VectorModality::Text as u8,
+                metric: VectorMetric::Cosine as u8,
+                dimension: 2,
+                vector_payload_offset: 0,
+                source_start: vector_id * 10,
+                source_len: 10,
+                authz_label_hash: [0; 32],
+                metadata_filter_bits: 0,
+            },
+            values: values.to_vec(),
+            authorized,
+        }
     }
 }
