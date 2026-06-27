@@ -1479,7 +1479,9 @@ async fn get_object(
         .await
     {
         Ok((object, stream)) => {
-            if let Some(response) = evaluate_etag_preconditions(req.headers(), &object.etag) {
+            if let Some(response) =
+                evaluate_object_preconditions(req.headers(), &object.etag, object.created_at)
+            {
                 return response;
             }
             let range = match requested_range {
@@ -2215,7 +2217,9 @@ async fn head_object(
         .await
     {
         Ok(object) => {
-            if let Some(response) = evaluate_etag_preconditions(req.headers(), &object.etag) {
+            if let Some(response) =
+                evaluate_object_preconditions(req.headers(), &object.etag, object.created_at)
+            {
                 return response;
             }
             let builder = Response::builder()
@@ -2285,9 +2289,10 @@ impl ByteRange {
     }
 }
 
-fn evaluate_etag_preconditions(
+fn evaluate_object_preconditions(
     headers: &axum::http::HeaderMap,
     current_etag: &str,
+    last_modified: chrono::DateTime<chrono::Utc>,
 ) -> Option<Response> {
     if let Some(value) = headers.get(axum::http::header::IF_MATCH) {
         let value = value.to_str().unwrap_or_default();
@@ -2295,16 +2300,32 @@ fn evaluate_etag_preconditions(
             return Some(precondition_failed_response());
         }
     }
+    if let Some(value) = headers.get(axum::http::header::IF_UNMODIFIED_SINCE) {
+        let Ok(value) = value.to_str() else {
+            return Some(precondition_failed_response());
+        };
+        let Ok(condition_time) = httpdate::parse_http_date(value) else {
+            return Some(precondition_failed_response());
+        };
+        if object_last_modified_time(last_modified) > condition_time {
+            return Some(precondition_failed_response());
+        }
+    }
     if let Some(value) = headers.get(axum::http::header::IF_NONE_MATCH) {
         let value = value.to_str().unwrap_or_default();
         if etag_condition_matches(value, current_etag) {
-            return Some(
-                Response::builder()
-                    .status(axum::http::StatusCode::NOT_MODIFIED)
-                    .header("ETag", current_etag)
-                    .body(Body::empty())
-                    .unwrap(),
-            );
+            return Some(not_modified_response(current_etag));
+        }
+    }
+    if let Some(value) = headers.get(axum::http::header::IF_MODIFIED_SINCE) {
+        let Ok(value) = value.to_str() else {
+            return Some(precondition_failed_response());
+        };
+        let Ok(condition_time) = httpdate::parse_http_date(value) else {
+            return Some(precondition_failed_response());
+        };
+        if object_last_modified_time(last_modified) <= condition_time {
+            return Some(not_modified_response(current_etag));
         }
     }
     None
@@ -2331,6 +2352,23 @@ fn precondition_failed_response() -> Response {
         "At least one precondition did not hold",
         axum::http::StatusCode::PRECONDITION_FAILED,
     )
+}
+
+fn not_modified_response(current_etag: &str) -> Response {
+    Response::builder()
+        .status(axum::http::StatusCode::NOT_MODIFIED)
+        .header("ETag", current_etag)
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn object_last_modified_time(value: chrono::DateTime<chrono::Utc>) -> std::time::SystemTime {
+    let seconds = value.timestamp();
+    if seconds <= 0 {
+        std::time::UNIX_EPOCH
+    } else {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds as u64)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2497,6 +2535,15 @@ mod tests {
         headers
     }
 
+    fn http_date_headers(
+        name: axum::http::header::HeaderName,
+        value: std::time::SystemTime,
+    ) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(name, httpdate::fmt_http_date(value).parse().unwrap());
+        headers
+    }
+
     #[test]
     fn reserved_namespace_guard_detects_object_keys() {
         assert!(request_targets_reserved_namespace(&request(
@@ -2570,26 +2617,88 @@ mod tests {
 
     #[test]
     fn etag_preconditions_return_s3_status_responses() {
-        let failed = evaluate_etag_preconditions(
+        let last_modified = chrono::DateTime::from_timestamp(1_700_000_000, 123_000_000).unwrap();
+        let failed = evaluate_object_preconditions(
             &etag_headers(axum::http::header::IF_MATCH, "\"other\""),
             "abc",
+            last_modified,
         )
         .expect("if-match mismatch should fail");
         assert_eq!(failed.status(), axum::http::StatusCode::PRECONDITION_FAILED);
 
-        let not_modified = evaluate_etag_preconditions(
+        let not_modified = evaluate_object_preconditions(
             &etag_headers(axum::http::header::IF_NONE_MATCH, "\"abc\""),
             "abc",
+            last_modified,
         )
         .expect("if-none-match match should return not modified");
         assert_eq!(not_modified.status(), axum::http::StatusCode::NOT_MODIFIED);
 
         assert!(
-            evaluate_etag_preconditions(
+            evaluate_object_preconditions(
                 &etag_headers(axum::http::header::IF_NONE_MATCH, "\"other\""),
                 "abc",
+                last_modified,
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn date_preconditions_compare_against_second_precision_last_modified() {
+        let last_modified = chrono::DateTime::from_timestamp(1_700_000_000, 999_000_000).unwrap();
+        let exact_second = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let before = exact_second - std::time::Duration::from_secs(1);
+        let after = exact_second + std::time::Duration::from_secs(1);
+
+        let unmodified_since_before = evaluate_object_preconditions(
+            &http_date_headers(axum::http::header::IF_UNMODIFIED_SINCE, before),
+            "abc",
+            last_modified,
+        )
+        .expect("older if-unmodified-since should fail");
+        assert_eq!(
+            unmodified_since_before.status(),
+            axum::http::StatusCode::PRECONDITION_FAILED
+        );
+
+        assert!(
+            evaluate_object_preconditions(
+                &http_date_headers(axum::http::header::IF_UNMODIFIED_SINCE, exact_second),
+                "abc",
+                last_modified,
+            )
+            .is_none()
+        );
+
+        let modified_since_exact = evaluate_object_preconditions(
+            &http_date_headers(axum::http::header::IF_MODIFIED_SINCE, exact_second),
+            "abc",
+            last_modified,
+        )
+        .expect("equal if-modified-since should be not modified");
+        assert_eq!(
+            modified_since_exact.status(),
+            axum::http::StatusCode::NOT_MODIFIED
+        );
+
+        assert!(
+            evaluate_object_preconditions(
+                &http_date_headers(axum::http::header::IF_MODIFIED_SINCE, before),
+                "abc",
+                last_modified,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            evaluate_object_preconditions(
+                &http_date_headers(axum::http::header::IF_MODIFIED_SINCE, after),
+                "abc",
+                last_modified,
+            )
+            .expect("future if-modified-since should be not modified")
+            .status(),
+            axum::http::StatusCode::NOT_MODIFIED
         );
     }
 
