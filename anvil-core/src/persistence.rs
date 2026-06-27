@@ -133,6 +133,23 @@ pub struct ManifestCasResult {
     pub manifest_hash: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct AuthzTupleRecord {
+    pub revision: i64,
+    pub tenant_id: i64,
+    pub namespace: String,
+    pub object_id: String,
+    pub relation: String,
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub caveat_hash: String,
+    pub operation: String,
+    pub written_by: String,
+    pub reason: String,
+    pub record_hash: String,
+    pub written_at: DateTime<Utc>,
+}
+
 // Manual row-to-struct mapping
 impl From<Row> for Tenant {
     fn from(row: Row) -> Self {
@@ -260,6 +277,26 @@ impl From<Row> for AppendStreamRecord {
             payload_hash: row.get("payload_hash"),
             payload_size: row.get("payload_size"),
             created_at: row.get("created_at"),
+        }
+    }
+}
+
+impl From<Row> for AuthzTupleRecord {
+    fn from(row: Row) -> Self {
+        Self {
+            revision: row.get("revision"),
+            tenant_id: row.get("tenant_id"),
+            namespace: row.get("namespace"),
+            object_id: row.get("object_id"),
+            relation: row.get("relation"),
+            subject_kind: row.get("subject_kind"),
+            subject_id: row.get("subject_id"),
+            caveat_hash: row.get("caveat_hash"),
+            operation: row.get("operation"),
+            written_by: row.get("written_by"),
+            reason: row.get("reason"),
+            record_hash: row.get("record_hash"),
+            written_at: row.get("written_at"),
         }
     }
 }
@@ -1858,6 +1895,117 @@ impl Persistence {
             revision: next_revision,
             manifest_hash: manifest_hash.to_string(),
         }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_authz_tuple(
+        &self,
+        tenant_id: i64,
+        namespace: &str,
+        object_id: &str,
+        relation: &str,
+        subject_kind: &str,
+        subject_id: &str,
+        caveat_hash: &str,
+        operation: &str,
+        written_by: &str,
+        reason: &str,
+        record_hash: &str,
+    ) -> Result<AuthzTupleRecord> {
+        let client = self.regional_pool.get().await?;
+        let row = client
+            .query_one(
+                r#"
+                INSERT INTO authz_tuple_log
+                    (tenant_id, namespace, object_id, relation, subject_kind, subject_id,
+                     caveat_hash, operation, written_by, reason, record_hash)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                RETURNING *"#,
+                &[
+                    &tenant_id,
+                    &namespace,
+                    &object_id,
+                    &relation,
+                    &subject_kind,
+                    &subject_id,
+                    &caveat_hash,
+                    &operation,
+                    &written_by,
+                    &reason,
+                    &record_hash,
+                ],
+            )
+            .await?;
+        Ok(row.into())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn check_authz_tuple(
+        &self,
+        tenant_id: i64,
+        namespace: &str,
+        object_id: &str,
+        relation: &str,
+        subject_kind: &str,
+        subject_id: &str,
+        caveat_hash: &str,
+    ) -> Result<Option<AuthzTupleRecord>> {
+        let client = self.regional_pool.get().await?;
+        let row = client
+            .query_opt(
+                r#"
+                SELECT *
+                FROM authz_tuple_log
+                WHERE tenant_id = $1
+                  AND namespace = $2
+                  AND object_id = $3
+                  AND relation = $4
+                  AND subject_kind = $5
+                  AND subject_id = $6
+                  AND caveat_hash = $7
+                ORDER BY revision DESC
+                LIMIT 1"#,
+                &[
+                    &tenant_id,
+                    &namespace,
+                    &object_id,
+                    &relation,
+                    &subject_kind,
+                    &subject_id,
+                    &caveat_hash,
+                ],
+            )
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
+    pub async fn list_authz_tuple_log(
+        &self,
+        tenant_id: i64,
+        after_revision: i64,
+        namespace: &str,
+        limit: i32,
+    ) -> Result<Vec<AuthzTupleRecord>> {
+        let client = self.regional_pool.get().await?;
+        let rows = client
+            .query(
+                r#"
+                SELECT *
+                FROM authz_tuple_log
+                WHERE tenant_id = $1
+                  AND revision > $2
+                  AND ($3 = '' OR namespace = $3)
+                ORDER BY revision
+                LIMIT $4"#,
+                &[
+                    &tenant_id,
+                    &after_revision,
+                    &namespace,
+                    &(if limit == 0 { 1000 } else { limit } as i64),
+                ],
+            )
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     pub async fn hard_delete_object(&self, object_id: i64) -> Result<()> {

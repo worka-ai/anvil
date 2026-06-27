@@ -160,6 +160,13 @@ fn action_covers_required(token_action: &AnvilAction, required_action: &AnvilAct
             required_action,
             AnvilAction::PolicyGrant | AnvilAction::PolicyRevoke
         ),
+        AnvilAction::AuthzAll => matches!(
+            required_action,
+            AnvilAction::AuthzTupleWrite
+                | AnvilAction::AuthzTupleRead
+                | AnvilAction::AuthzCheck
+                | AnvilAction::AuthzWatch
+        ),
         _ => token_action == required_action, // Exact match for specific actions
     }
 }

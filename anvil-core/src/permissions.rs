@@ -10,11 +10,12 @@ pub enum AnvilAction {
     All, // Matches *:*
 
     // Wildcard actions
-    BucketAll,     // Matches bucket:*
-    ObjectAll,     // Matches object:*
-    HfKeyAll,      // Matches hf_key:*
+    BucketAll,      // Matches bucket:*
+    ObjectAll,      // Matches object:*
+    HfKeyAll,       // Matches hf_key:*
     HfIngestionAll, // Matches hf_ingestion:*
-    PolicyAll,     // Matches policy:*
+    PolicyAll,      // Matches policy:*
+    AuthzAll,       // Matches authz:*
 
     // Bucket actions
     BucketCreate,
@@ -44,6 +45,12 @@ pub enum AnvilAction {
     PolicyGrant,
     PolicyRevoke,
 
+    // Relationship authorization actions
+    AuthzTupleWrite,
+    AuthzTupleRead,
+    AuthzCheck,
+    AuthzWatch,
+
     // Internal actions
     InternalPutShard,
     InternalGetShard,
@@ -62,6 +69,7 @@ impl fmt::Display for AnvilAction {
             AnvilAction::HfKeyAll => "hf_key:*",
             AnvilAction::HfIngestionAll => "hf_ingestion:*",
             AnvilAction::PolicyAll => "policy:*",
+            AnvilAction::AuthzAll => "authz:*",
 
             // Bucket actions
             AnvilAction::BucketCreate => "bucket:create",
@@ -91,6 +99,12 @@ impl fmt::Display for AnvilAction {
             AnvilAction::PolicyGrant => "policy:grant",
             AnvilAction::PolicyRevoke => "policy:revoke",
 
+            // Relationship authorization actions
+            AnvilAction::AuthzTupleWrite => "authz:tuple_write",
+            AnvilAction::AuthzTupleRead => "authz:tuple_read",
+            AnvilAction::AuthzCheck => "authz:check",
+            AnvilAction::AuthzWatch => "authz:watch",
+
             // Internal actions
             AnvilAction::InternalPutShard => "internal:put_shard",
             AnvilAction::InternalGetShard => "internal:get_shard",
@@ -114,6 +128,7 @@ impl FromStr for AnvilAction {
             "hf_key:*" => Ok(AnvilAction::HfKeyAll),
             "hf_ingestion:*" => Ok(AnvilAction::HfIngestionAll),
             "policy:*" => Ok(AnvilAction::PolicyAll),
+            "authz:*" => Ok(AnvilAction::AuthzAll),
 
             // Bucket actions
             "bucket:create" => Ok(AnvilAction::BucketCreate),
@@ -142,6 +157,12 @@ impl FromStr for AnvilAction {
             // Policy actions
             "policy:grant" => Ok(AnvilAction::PolicyGrant),
             "policy:revoke" => Ok(AnvilAction::PolicyRevoke),
+
+            // Relationship authorization actions
+            "authz:tuple_write" => Ok(AnvilAction::AuthzTupleWrite),
+            "authz:tuple_read" => Ok(AnvilAction::AuthzTupleRead),
+            "authz:check" => Ok(AnvilAction::AuthzCheck),
+            "authz:watch" => Ok(AnvilAction::AuthzWatch),
 
             // Internal actions
             "internal:put_shard" => Ok(AnvilAction::InternalPutShard),

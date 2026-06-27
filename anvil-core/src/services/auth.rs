@@ -1,10 +1,16 @@
 use crate::anvil_api::auth_service_server::AuthService;
 use crate::anvil_api::*;
 use crate::{AppState, auth, crypto, permissions::AnvilAction};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 #[tonic::async_trait]
 impl AuthService for AppState {
+    type WatchAuthzTupleLogStream = std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = Result<WatchAuthzTupleLogResponse, Status>> + Send>,
+    >;
+
     async fn get_access_token(
         &self,
         request: Request<GetAccessTokenRequest>,
@@ -164,5 +170,284 @@ impl AuthService for AppState {
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(SetPublicAccessResponse {}))
+    }
+
+    async fn write_authz_tuple(
+        &self,
+        request: Request<WriteAuthzTupleRequest>,
+    ) -> Result<Response<WriteAuthzTupleResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        validate_tuple_field("namespace", &req.namespace)?;
+        validate_tuple_field("object_id", &req.object_id)?;
+        validate_tuple_field("relation", &req.relation)?;
+        validate_tuple_field("subject_kind", &req.subject_kind)?;
+        validate_tuple_field("subject_id", &req.subject_id)?;
+        let operation = match req.operation.as_str() {
+            "add" | "remove" => req.operation.as_str(),
+            _ => return Err(Status::invalid_argument("operation must be add or remove")),
+        };
+        let resource = authz_resource(&req.namespace, &req.object_id, &req.relation);
+        if !auth::is_authorized(AnvilAction::AuthzTupleWrite, &resource, &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        let caveat_hash = req.caveat_hash;
+        let reason = req.reason;
+        let record_hash = authz_record_hash(AuthzRecordHashInput {
+            tenant_id: claims.tenant_id,
+            namespace: &req.namespace,
+            object_id: &req.object_id,
+            relation: &req.relation,
+            subject_kind: &req.subject_kind,
+            subject_id: &req.subject_id,
+            caveat_hash: &caveat_hash,
+            operation,
+            written_by: &claims.sub,
+            reason: &reason,
+        });
+        let record = self
+            .db
+            .write_authz_tuple(
+                claims.tenant_id,
+                &req.namespace,
+                &req.object_id,
+                &req.relation,
+                &req.subject_kind,
+                &req.subject_id,
+                &caveat_hash,
+                operation,
+                &claims.sub,
+                &reason,
+                &record_hash,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let _ = self.authz_watch_tx.send(record.clone());
+
+        Ok(Response::new(WriteAuthzTupleResponse {
+            revision: revision_to_u64(record.revision)?,
+            zookie: zookie(record.revision),
+            record_hash: record.record_hash,
+        }))
+    }
+
+    async fn check_permission(
+        &self,
+        request: Request<CheckPermissionRequest>,
+    ) -> Result<Response<CheckPermissionResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        validate_tuple_field("namespace", &req.namespace)?;
+        validate_tuple_field("object_id", &req.object_id)?;
+        validate_tuple_field("relation", &req.relation)?;
+        validate_tuple_field("subject_kind", &req.subject_kind)?;
+        validate_tuple_field("subject_id", &req.subject_id)?;
+        let resource = authz_resource(&req.namespace, &req.object_id, &req.relation);
+        if !auth::is_authorized(AnvilAction::AuthzCheck, &resource, &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+        validate_authz_consistency(&req.consistency)?;
+
+        let record = self
+            .db
+            .check_authz_tuple(
+                claims.tenant_id,
+                &req.namespace,
+                &req.object_id,
+                &req.relation,
+                &req.subject_kind,
+                &req.subject_id,
+                &req.caveat_hash,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let allowed = record
+            .as_ref()
+            .is_some_and(|record| record.operation == "add");
+        let revision = record.as_ref().map(|record| record.revision).unwrap_or(0);
+
+        Ok(Response::new(CheckPermissionResponse {
+            allowed,
+            revision: revision_to_u64(revision)?,
+            zookie: zookie(revision),
+            explanation_ref: if allowed {
+                "direct_tuple_match".to_string()
+            } else {
+                "no_current_tuple".to_string()
+            },
+        }))
+    }
+
+    async fn watch_authz_tuple_log(
+        &self,
+        request: Request<WatchAuthzTupleLogRequest>,
+    ) -> Result<Response<Self::WatchAuthzTupleLogStream>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        let resource = if req.namespace.is_empty() {
+            "*".to_string()
+        } else {
+            req.namespace.clone()
+        };
+        if !auth::is_authorized(AnvilAction::AuthzWatch, &resource, &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+        let after_revision = i64::try_from(req.after_revision)
+            .map_err(|_| Status::invalid_argument("after_revision exceeds supported range"))?;
+        let mut live = self.authz_watch_tx.subscribe();
+        let snapshot = self
+            .db
+            .list_authz_tuple_log(claims.tenant_id, after_revision, &req.namespace, 1000)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let (tx, rx) = mpsc::channel(32);
+        tokio::spawn(async move {
+            let mut last_revision = after_revision;
+            for record in snapshot {
+                last_revision = last_revision.max(record.revision);
+                if tx
+                    .send(Ok(authz_tuple_log_response(&record)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+
+            loop {
+                match live.recv().await {
+                    Ok(record) => {
+                        if record.tenant_id != claims.tenant_id
+                            || record.revision <= last_revision
+                            || (!req.namespace.is_empty() && record.namespace != req.namespace)
+                        {
+                            continue;
+                        }
+                        last_revision = record.revision;
+                        if tx
+                            .send(Ok(authz_tuple_log_response(&record)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let _ = tx
+                            .send(Err(Status::data_loss(
+                                "Authz tuple watch fell behind retained live event window",
+                            )))
+                            .await;
+                        return;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+
+        Ok(Response::new(
+            Box::pin(ReceiverStream::new(rx)) as Self::WatchAuthzTupleLogStream
+        ))
+    }
+}
+
+struct AuthzRecordHashInput<'a> {
+    tenant_id: i64,
+    namespace: &'a str,
+    object_id: &'a str,
+    relation: &'a str,
+    subject_kind: &'a str,
+    subject_id: &'a str,
+    caveat_hash: &'a str,
+    operation: &'a str,
+    written_by: &'a str,
+    reason: &'a str,
+}
+
+fn authz_record_hash(input: AuthzRecordHashInput<'_>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&input.tenant_id.to_le_bytes());
+    for part in [
+        input.namespace,
+        input.object_id,
+        input.relation,
+        input.subject_kind,
+        input.subject_id,
+        input.caveat_hash,
+        input.operation,
+        input.written_by,
+        input.reason,
+    ] {
+        hasher.update(&(part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn authz_resource(namespace: &str, object_id: &str, relation: &str) -> String {
+    format!("{}/{}#{}", namespace, object_id, relation)
+}
+
+fn validate_tuple_field(name: &str, value: &str) -> Result<(), Status> {
+    if value.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "{name} must not be empty"
+        )));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(Status::invalid_argument(format!(
+            "{name} must not contain control characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_authz_consistency(value: &str) -> Result<(), Status> {
+    match value {
+        "" | "latest" | "at_least" | "exact" => Ok(()),
+        _ => Err(Status::invalid_argument(
+            "consistency must be latest, at_least, exact, or empty",
+        )),
+    }
+}
+
+fn revision_to_u64(revision: i64) -> Result<u64, Status> {
+    u64::try_from(revision).map_err(|_| Status::internal("Invalid authz revision"))
+}
+
+fn zookie(revision: i64) -> String {
+    format!("authz:{}", revision.max(0))
+}
+
+fn authz_tuple_log_response(
+    record: &crate::persistence::AuthzTupleRecord,
+) -> WatchAuthzTupleLogResponse {
+    WatchAuthzTupleLogResponse {
+        revision: revision_to_u64(record.revision).unwrap_or_default(),
+        namespace: record.namespace.clone(),
+        object_id: record.object_id.clone(),
+        relation: record.relation.clone(),
+        subject_kind: record.subject_kind.clone(),
+        subject_id: record.subject_id.clone(),
+        caveat_hash: record.caveat_hash.clone(),
+        operation: record.operation.clone(),
+        written_by: record.written_by.clone(),
+        reason: record.reason.clone(),
+        record_hash: record.record_hash.clone(),
+        written_at: record.written_at.to_string(),
     }
 }

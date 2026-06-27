@@ -2,9 +2,11 @@ use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::{
-    CreateBucketRequest, GetAccessTokenRequest, GetObjectRequest, GrantAccessRequest,
-    ObjectMetadata, PutObjectRequest, RevokeAccessRequest, SetPublicAccessRequest,
+    CheckPermissionRequest, CreateBucketRequest, GetAccessTokenRequest, GetObjectRequest,
+    GrantAccessRequest, ObjectMetadata, PutObjectRequest, RevokeAccessRequest,
+    SetPublicAccessRequest, WatchAuthzTupleLogRequest, WriteAuthzTupleRequest,
 };
+use futures_util::StreamExt;
 use std::time::Duration;
 use tonic::Request;
 
@@ -191,6 +193,138 @@ async fn test_grant_and_revoke_access() {
     )
     .await;
     assert!(res.is_err());
+}
+
+#[tokio::test]
+async fn test_authz_tuple_write_check_and_watch() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut watch_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    let mut write_add = Request::new(WriteAuthzTupleRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: String::new(),
+        operation: "add".to_string(),
+        reason: "grant viewer".to_string(),
+    });
+    write_add.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let add = auth_client
+        .write_authz_tuple(write_add)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(add.revision, 1);
+    assert_eq!(add.zookie, "authz:1");
+    assert!(!add.record_hash.is_empty());
+
+    let mut watch_req = Request::new(WatchAuthzTupleLogRequest {
+        after_revision: 0,
+        namespace: "document".to_string(),
+    });
+    watch_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let mut stream = watch_client
+        .watch_authz_tuple_log(watch_req)
+        .await
+        .unwrap()
+        .into_inner();
+    let watched_add = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(watched_add.revision, add.revision);
+    assert_eq!(watched_add.namespace, "document");
+    assert_eq!(watched_add.operation, "add");
+
+    let mut check_req = Request::new(CheckPermissionRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: String::new(),
+        consistency: "latest".to_string(),
+        zookie: String::new(),
+    });
+    check_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let allowed = auth_client
+        .check_permission(check_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(allowed.allowed);
+    assert_eq!(allowed.revision, add.revision);
+
+    let mut write_remove = Request::new(WriteAuthzTupleRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: String::new(),
+        operation: "remove".to_string(),
+        reason: "revoke viewer".to_string(),
+    });
+    write_remove.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let remove = auth_client
+        .write_authz_tuple(write_remove)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(remove.revision, 2);
+
+    let watched_remove = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(watched_remove.revision, remove.revision);
+    assert_eq!(watched_remove.operation, "remove");
+
+    let mut check_req = Request::new(CheckPermissionRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: String::new(),
+        consistency: "latest".to_string(),
+        zookie: String::new(),
+    });
+    check_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let denied = auth_client
+        .check_permission(check_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!denied.allowed);
+    assert_eq!(denied.revision, remove.revision);
 }
 
 #[tokio::test]
@@ -459,7 +593,8 @@ async fn test_admin_cli_set_public_access() {
 
     // 4. Verify the object IS public now, with retries for cache consistency.
     let mut resp_after = None;
-    for i in 0..5 { // Retry up to 5 times
+    for i in 0..5 {
+        // Retry up to 5 times
         let resp = http_client.get(&object_url).send().await.unwrap();
         if resp.status() == 200 {
             resp_after = Some(resp);
@@ -468,7 +603,8 @@ async fn test_admin_cli_set_public_access() {
         tokio::time::sleep(Duration::from_millis(500)).await; // Wait 500ms before retrying
         println!("Retry {} for public access check...", i + 1);
     }
-    let resp_after = resp_after.expect("Object should be public after CLI command, but never became public");
+    let resp_after =
+        resp_after.expect("Object should be public after CLI command, but never became public");
 
     assert_eq!(
         resp_after.status(),

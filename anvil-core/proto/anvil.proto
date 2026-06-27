@@ -343,6 +343,9 @@ service AuthService {
   rpc GrantAccess(GrantAccessRequest) returns (GrantAccessResponse);
   rpc RevokeAccess(RevokeAccessRequest) returns (RevokeAccessResponse);
   rpc SetPublicAccess(SetPublicAccessRequest) returns (SetPublicAccessResponse);
+  rpc WriteAuthzTuple(WriteAuthzTupleRequest) returns (WriteAuthzTupleResponse);
+  rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
+  rpc WatchAuthzTupleLog(WatchAuthzTupleLogRequest) returns (stream WatchAuthzTupleLogResponse);
 }
 
 // Hugging Face Keys (public API, policy enforced)
@@ -441,6 +444,61 @@ message SetPublicAccessRequest {
 }
 
 message SetPublicAccessResponse {}
+
+message WriteAuthzTupleRequest {
+    string namespace = 1;
+    string object_id = 2;
+    string relation = 3;
+    string subject_kind = 4;
+    string subject_id = 5;
+    string caveat_hash = 6;
+    string operation = 7;
+    string reason = 8;
+}
+
+message WriteAuthzTupleResponse {
+    uint64 revision = 1;
+    string zookie = 2;
+    string record_hash = 3;
+}
+
+message CheckPermissionRequest {
+    string namespace = 1;
+    string object_id = 2;
+    string relation = 3;
+    string subject_kind = 4;
+    string subject_id = 5;
+    string caveat_hash = 6;
+    string consistency = 7;
+    string zookie = 8;
+}
+
+message CheckPermissionResponse {
+    bool allowed = 1;
+    uint64 revision = 2;
+    string zookie = 3;
+    string explanation_ref = 4;
+}
+
+message WatchAuthzTupleLogRequest {
+    uint64 after_revision = 1;
+    string namespace = 2;
+}
+
+message WatchAuthzTupleLogResponse {
+    uint64 revision = 1;
+    string namespace = 2;
+    string object_id = 3;
+    string relation = 4;
+    string subject_kind = 5;
+    string subject_id = 6;
+    string caveat_hash = 7;
+    string operation = 8;
+    string written_by = 9;
+    string reason = 10;
+    string record_hash = 11;
+    string written_at = 12;
+}
 
 
 message PutShardRequest {
