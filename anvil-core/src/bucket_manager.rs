@@ -59,7 +59,21 @@ impl BucketManager {
             return Err(Status::permission_denied("Permission denied"));
         }
 
-        // Soft-delete the bucket
+        let existing_bucket = self
+            .db
+            .get_bucket_by_name(tenant_id, bucket_name)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Bucket not found"))?;
+        if self
+            .db
+            .bucket_has_retained_objects_or_uploads(existing_bucket.id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            return Err(Status::failed_precondition("Bucket not empty"));
+        }
+
         let bucket = self
             .db
             .soft_delete_bucket(tenant_id, bucket_name)

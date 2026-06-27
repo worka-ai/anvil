@@ -282,6 +282,12 @@ async fn test_s3_public_and_private_access() {
         .await
         .expect("Failed to put public object");
 
+    let delete_nonempty = client.delete_bucket().bucket(&private_bucket).send().await;
+    assert!(
+        format!("{delete_nonempty:?}").contains("BucketNotEmpty"),
+        "S3 DeleteBucket must reject buckets with retained object versions"
+    );
+
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // 5. Test Private Access (Success): Use S3 client to get from private bucket

@@ -439,6 +439,11 @@ async fn delete_bucket(
                 status.message(),
                 axum::http::StatusCode::BAD_REQUEST,
             ),
+            tonic::Code::FailedPrecondition => s3_error(
+                "BucketNotEmpty",
+                status.message(),
+                axum::http::StatusCode::CONFLICT,
+            ),
             _ => s3_error(
                 "InternalError",
                 status.message(),

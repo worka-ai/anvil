@@ -1,7 +1,8 @@
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
+use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::{
     CreateBucketRequest, DeleteBucketRequest, GetBucketPolicyRequest, ListBucketsRequest,
-    PutBucketPolicyRequest, WatchBucketMetadataRequest,
+    ObjectMetadata, PutBucketPolicyRequest, PutObjectRequest, WatchBucketMetadataRequest,
 };
 use anvil::tasks::TaskStatus;
 use futures_util::StreamExt;
@@ -82,6 +83,69 @@ async fn test_delete_bucket_soft_deletes_and_enqueues_task() {
     let status: TaskStatus = row.get("status");
     assert!(matches!(task_type, anvil::tasks::TaskType::DeleteBucket));
     assert_eq!(status, TaskStatus::Pending);
+}
+
+#[tokio::test]
+async fn test_delete_bucket_rejects_retained_objects() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+
+    let bucket_name = "test-delete-nonempty-bucket".to_string();
+    let object_key = "object.txt".to_string();
+    let mut create_req = Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
+    });
+    create_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client.create_bucket(create_req).await.unwrap();
+
+    let chunks = vec![
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                ObjectMetadata {
+                    bucket_name: bucket_name.clone(),
+                    object_key,
+                },
+            )),
+        },
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                b"retained".to_vec(),
+            )),
+        },
+    ];
+    let mut put_req = Request::new(tokio_stream::iter(chunks));
+    put_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    object_client.put_object(put_req).await.unwrap();
+
+    let mut del_req = Request::new(DeleteBucketRequest {
+        bucket_name: bucket_name.clone(),
+    });
+    del_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let err = bucket_client
+        .delete_bucket(del_req)
+        .await
+        .expect_err("retained object versions should keep bucket non-empty");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("Bucket not empty"));
 }
 
 #[tokio::test]

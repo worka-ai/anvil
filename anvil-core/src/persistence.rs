@@ -1350,6 +1350,34 @@ impl Persistence {
         Ok(row.map(Into::into))
     }
 
+    pub async fn bucket_has_retained_objects_or_uploads(&self, bucket_id: i64) -> Result<bool> {
+        let client = self.regional_pool.get().await?;
+        let object_exists = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM objects WHERE bucket_id = $1)",
+                &[&bucket_id],
+            )
+            .await?
+            .get::<_, bool>(0);
+        if object_exists {
+            return Ok(true);
+        }
+
+        let active_upload_exists = client
+            .query_one(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM multipart_uploads
+                    WHERE bucket_id = $1 AND completed_at IS NULL AND aborted_at IS NULL
+                )"#,
+                &[&bucket_id],
+            )
+            .await?
+            .get::<_, bool>(0);
+        Ok(active_upload_exists)
+    }
+
     pub async fn create_bucket_metadata_event(
         &self,
         tenant_id: i64,
