@@ -140,6 +140,18 @@ impl Storage {
             .join(format!("bucket-{bucket_id}.anwatch"))
     }
 
+    pub fn git_source_watch_path(&self, tenant_id: i64, repository_id: &str) -> Result<PathBuf> {
+        ensure_safe_internal_component(repository_id, "git repository id")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("watch")
+            .join("git")
+            .join(format!("tenant-{tenant_id}"))
+            .join("repositories")
+            .join(format!("{repository_id}.anwatch")))
+    }
+
     pub fn personaldb_group_watch_path(
         &self,
         tenant_id: i64,
