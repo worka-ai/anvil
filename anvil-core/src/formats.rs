@@ -88,6 +88,8 @@ pub enum FormatError {
     UnsupportedVectorModality(u8),
     #[error("invalid vector index definition field {field}")]
     InvalidVectorIndexDefinition { field: &'static str },
+    #[error("invalid full text index definition field {field}")]
+    InvalidFullTextIndexDefinition { field: &'static str },
     #[error("file family does not match magic")]
     FamilyMagicMismatch,
     #[error("declared length is invalid for {context}")]

@@ -394,9 +394,16 @@ fn validate_authorization_mode(value: &str) -> Result<(), Status> {
 }
 
 fn validate_index_definition_shape(kind: &str, build_policy: &JsonValue) -> Result<(), Status> {
-    if kind == "vector" {
-        crate::formats::vector::VectorIndexDefinition::from_json(build_policy)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+    match kind {
+        "full_text" => {
+            crate::formats::full_text::FullTextIndexDefinition::from_json(build_policy)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        }
+        "vector" => {
+            crate::formats::vector::VectorIndexDefinition::from_json(build_policy)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        }
+        _ => {}
     }
     Ok(())
 }

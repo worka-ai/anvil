@@ -258,6 +258,26 @@ async fn test_index_definition_rejects_invalid_policy_shape() {
         .unwrap_err();
     assert_eq!(invalid_kind.code(), tonic::Code::InvalidArgument);
 
+    let invalid_full_text_policy = index_client
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket_name: bucket_name.clone(),
+                name: "invalid-full-text-policy".to_string(),
+                kind: "full_text".to_string(),
+                selector_json: "{}".to_string(),
+                extractor_json: "{}".to_string(),
+                authorization_mode: "inherit_object".to_string(),
+                build_policy_json: serde_json::json!({"max_token_chars": 129}).to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        invalid_full_text_policy.code(),
+        tonic::Code::InvalidArgument
+    );
+
     let valid_vector_policy = serde_json::json!({
         "dimension": 768,
         "metric": "cosine",

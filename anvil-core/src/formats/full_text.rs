@@ -239,6 +239,113 @@ impl Default for TokenizerConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullTextIndexDefinition {
+    pub positions_enabled: bool,
+    pub language: String,
+    pub tokenizer: TokenizerConfig,
+    pub stop_words_enabled: bool,
+    pub stemming: Option<String>,
+    pub require_index_success: bool,
+}
+
+impl FullTextIndexDefinition {
+    pub fn from_json(value: &serde_json::Value) -> Result<Self, FormatError> {
+        let object = value
+            .as_object()
+            .ok_or(FormatError::InvalidFullTextIndexDefinition { field: "root" })?;
+        let positions_enabled = optional_bool(object, "positions", true)?;
+        let language = optional_str(object, "language", "simple")?.to_string();
+        if language.trim().is_empty() {
+            return Err(FormatError::InvalidFullTextIndexDefinition { field: "language" });
+        }
+        let max_token_chars = optional_usize(object, "max_token_chars", 128)?;
+        if max_token_chars == 0 || max_token_chars > 128 {
+            return Err(FormatError::InvalidFullTextIndexDefinition {
+                field: "max_token_chars",
+            });
+        }
+        let lowercase = optional_bool(object, "lowercase", true)?;
+        let normalize_nfkc = optional_bool(object, "normalize_nfkc", true)?;
+        let record_original_ranges = optional_bool(object, "record_original_ranges", true)?;
+        let stop_words_enabled = optional_bool(object, "stop_words_enabled", false)?;
+        let stemming = optional_string(object, "stemming")?;
+        if stemming.as_deref().is_some_and(str::is_empty) {
+            return Err(FormatError::InvalidFullTextIndexDefinition { field: "stemming" });
+        }
+        let require_index_success = optional_bool(object, "require_index_success", false)?;
+        Ok(Self {
+            positions_enabled,
+            language,
+            tokenizer: TokenizerConfig {
+                max_token_chars,
+                lowercase,
+                normalize_nfkc,
+                record_original_ranges,
+            },
+            stop_words_enabled,
+            stemming,
+            require_index_success,
+        })
+    }
+}
+
+fn optional_bool(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+    default: bool,
+) -> Result<bool, FormatError> {
+    match object.get(field) {
+        Some(value) => value
+            .as_bool()
+            .ok_or(FormatError::InvalidFullTextIndexDefinition { field }),
+        None => Ok(default),
+    }
+}
+
+fn optional_str<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+    default: &'a str,
+) -> Result<&'a str, FormatError> {
+    match object.get(field) {
+        Some(value) => value
+            .as_str()
+            .ok_or(FormatError::InvalidFullTextIndexDefinition { field }),
+        None => Ok(default),
+    }
+}
+
+fn optional_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+) -> Result<Option<String>, FormatError> {
+    match object.get(field) {
+        Some(value) => value
+            .as_str()
+            .map(|value| Some(value.to_string()))
+            .ok_or(FormatError::InvalidFullTextIndexDefinition { field }),
+        None => Ok(None),
+    }
+}
+
+fn optional_usize(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+    default: usize,
+) -> Result<usize, FormatError> {
+    match object.get(field) {
+        Some(value) => {
+            let value = value
+                .as_u64()
+                .ok_or(FormatError::InvalidFullTextIndexDefinition { field })?;
+            usize::try_from(value)
+                .map_err(|_| FormatError::InvalidFullTextIndexDefinition { field })
+        }
+        None => Ok(default),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Token {
     pub term: String,
     pub position: u32,
@@ -759,6 +866,81 @@ mod tests {
             vec!["one", "two"]
         );
         assert_eq!(tokens[1].position, 2);
+    }
+
+    #[test]
+    fn full_text_index_definition_parses_defaults() {
+        let definition = FullTextIndexDefinition::from_json(&serde_json::json!({})).unwrap();
+
+        assert!(definition.positions_enabled);
+        assert_eq!(definition.language, "simple");
+        assert_eq!(definition.tokenizer, TokenizerConfig::default());
+        assert!(!definition.stop_words_enabled);
+        assert_eq!(definition.stemming, None);
+        assert!(!definition.require_index_success);
+    }
+
+    #[test]
+    fn full_text_index_definition_parses_explicit_policy() {
+        let definition = FullTextIndexDefinition::from_json(&serde_json::json!({
+            "positions": false,
+            "language": "en",
+            "max_token_chars": 64,
+            "lowercase": false,
+            "normalize_nfkc": false,
+            "record_original_ranges": false,
+            "stop_words_enabled": true,
+            "stemming": "porter",
+            "require_index_success": true
+        }))
+        .unwrap();
+
+        assert!(!definition.positions_enabled);
+        assert_eq!(definition.language, "en");
+        assert_eq!(definition.tokenizer.max_token_chars, 64);
+        assert!(!definition.tokenizer.lowercase);
+        assert!(!definition.tokenizer.normalize_nfkc);
+        assert!(!definition.tokenizer.record_original_ranges);
+        assert!(definition.stop_words_enabled);
+        assert_eq!(definition.stemming.as_deref(), Some("porter"));
+        assert!(definition.require_index_success);
+    }
+
+    #[test]
+    fn full_text_index_definition_rejects_invalid_shapes() {
+        for (field, value) in [
+            ("root", serde_json::json!("not an object")),
+            ("positions", serde_json::json!({"positions": "yes"})),
+            ("language", serde_json::json!({"language": ""})),
+            ("max_token_chars", serde_json::json!({"max_token_chars": 0})),
+            (
+                "max_token_chars",
+                serde_json::json!({"max_token_chars": 129}),
+            ),
+            ("lowercase", serde_json::json!({"lowercase": "true"})),
+            (
+                "normalize_nfkc",
+                serde_json::json!({"normalize_nfkc": "true"}),
+            ),
+            (
+                "record_original_ranges",
+                serde_json::json!({"record_original_ranges": "true"}),
+            ),
+            (
+                "stop_words_enabled",
+                serde_json::json!({"stop_words_enabled": "false"}),
+            ),
+            ("stemming", serde_json::json!({"stemming": ""})),
+            (
+                "require_index_success",
+                serde_json::json!({"require_index_success": "false"}),
+            ),
+        ] {
+            assert_eq!(
+                FullTextIndexDefinition::from_json(&value).unwrap_err(),
+                FormatError::InvalidFullTextIndexDefinition { field }
+            );
+        }
     }
 
     #[test]
