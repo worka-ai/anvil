@@ -170,6 +170,20 @@ impl Storage {
             )))
     }
 
+    pub fn personaldb_row_index_path(
+        &self,
+        tenant_id: i64,
+        database_id: &str,
+        generation: u64,
+        source_hash: &str,
+    ) -> Result<PathBuf> {
+        ensure_hash_hex(source_hash, "personaldb row index source hash")?;
+        Ok(self
+            .personaldb_group_dir(tenant_id, database_id)?
+            .join("row-index")
+            .join(format!("{generation:020}-{source_hash}.rowidx")))
+    }
+
     pub fn relative_storage_path(&self, path: &Path) -> Result<String> {
         let relative = path.strip_prefix(&self.storage_path)?;
         Ok(relative.to_string_lossy().replace('\\', "/"))
