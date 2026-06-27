@@ -205,6 +205,42 @@ impl Storage {
             .join(format!("generation-{generation:020}-{source_hash}.angit")))
     }
 
+    pub fn full_text_segment_path(
+        &self,
+        index_id: &str,
+        generation: u64,
+        segment_hash: &str,
+    ) -> Result<PathBuf> {
+        ensure_safe_internal_component(index_id, "full text index id")?;
+        ensure_hash_hex(segment_hash, "full text segment hash")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("index")
+            .join("full-text")
+            .join(index_id)
+            .join("segments")
+            .join(format!("generation-{generation:020}-{segment_hash}.anfts")))
+    }
+
+    pub fn vector_segment_path(
+        &self,
+        index_id: &str,
+        generation: u64,
+        segment_hash: &str,
+    ) -> Result<PathBuf> {
+        ensure_safe_internal_component(index_id, "vector index id")?;
+        ensure_hash_hex(segment_hash, "vector segment hash")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("index")
+            .join("vector")
+            .join(index_id)
+            .join("segments")
+            .join(format!("generation-{generation:020}-{segment_hash}.anvec")))
+    }
+
     pub fn relative_storage_path(&self, path: &Path) -> Result<String> {
         let relative = path.strip_prefix(&self.storage_path)?;
         Ok(relative.to_string_lossy().replace('\\', "/"))

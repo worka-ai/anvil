@@ -19,6 +19,7 @@ pub mod config;
 pub mod crypto;
 pub mod discovery;
 pub mod formats;
+pub mod full_text_segment;
 pub mod git_source_index;
 pub mod index_journal;
 pub mod metadata_journal;
@@ -35,6 +36,7 @@ pub mod sharding;
 pub mod storage;
 pub mod tasks;
 pub mod validation;
+pub mod vector_segment;
 pub mod watch_log;
 pub mod worker;
 
