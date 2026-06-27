@@ -263,6 +263,13 @@ impl Storage {
             )))
     }
 
+    pub fn personaldb_log_segment_dir(&self, tenant_id: i64, database_id: &str) -> Result<PathBuf> {
+        Ok(self
+            .personaldb_group_dir(tenant_id, database_id)?
+            .join("log")
+            .join("segments"))
+    }
+
     pub fn personaldb_row_index_path(
         &self,
         tenant_id: i64,
