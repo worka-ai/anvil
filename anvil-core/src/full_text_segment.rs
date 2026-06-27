@@ -113,6 +113,23 @@ pub async fn read_full_text_segment(path: impl Into<PathBuf>) -> Result<DecodedF
     decode_full_text_segment(&bytes)
 }
 
+pub async fn read_latest_full_text_segment(
+    storage: &Storage,
+    index_id: &str,
+) -> Result<Option<DecodedFullTextSegment>> {
+    let Some(path) = latest_full_text_segment_path(storage, index_id).await? else {
+        return Ok(None);
+    };
+    Ok(Some(read_full_text_segment(path).await?))
+}
+
+pub async fn latest_full_text_segment_path(
+    storage: &Storage,
+    index_id: &str,
+) -> Result<Option<PathBuf>> {
+    latest_segment_path(storage.full_text_segment_dir(index_id)?, ".anfts").await
+}
+
 pub fn decode_full_text_segment(bytes: &[u8]) -> Result<DecodedFullTextSegment> {
     let envelope = BinaryEnvelopeHeader::decode(bytes)?;
     if envelope.family != FileFamily::FullTextSegment {
@@ -248,6 +265,36 @@ fn term_hash_bounds(terms: &[TermEntry]) -> (Hash32, Hash32) {
     (first, last)
 }
 
+async fn latest_segment_path(dir: PathBuf, suffix: &str) -> Result<Option<PathBuf>> {
+    let mut entries = match tokio::fs::read_dir(&dir).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let mut latest: Option<(u64, PathBuf)> = None;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(suffix) {
+            continue;
+        }
+        let Some(generation) = name
+            .strip_prefix("generation-")
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        match latest {
+            Some((current, _)) if generation <= current => {}
+            _ => latest = Some((generation, path)),
+        }
+    }
+    Ok(latest.map(|(_, path)| path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,5 +381,39 @@ mod tests {
         let mut bytes = tokio::fs::read(path).await.unwrap();
         bytes[COMMON_HEADER_LEN + 1] ^= 1;
         assert!(decode_full_text_segment(&bytes).is_err());
+    }
+
+    #[tokio::test]
+    async fn latest_full_text_segment_selects_highest_generation() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let built = build_full_text_postings(&[], &TokenizerConfig::default());
+        for generation in [1, 3, 2] {
+            write_full_text_segment(
+                &storage,
+                FullTextSegmentWrite {
+                    index_id: "index-alpha",
+                    generation,
+                    tokenizer: serde_json::json!({}),
+                    scorer: serde_json::json!({}),
+                    source_cursor: generation,
+                    authz_revision: 0,
+                    built_postings: &built,
+                    document_table: b"",
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let latest = read_latest_full_text_segment(&storage, "index-alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.header.generation, 3);
+        assert!(
+            latest_full_text_segment_path(&storage, "../escape")
+                .await
+                .is_err()
+        );
     }
 }

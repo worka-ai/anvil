@@ -214,13 +214,19 @@ impl Storage {
         ensure_safe_internal_component(index_id, "full text index id")?;
         ensure_hash_hex(segment_hash, "full text segment hash")?;
         Ok(self
+            .full_text_segment_dir(index_id)?
+            .join(format!("generation-{generation:020}-{segment_hash}.anfts")))
+    }
+
+    pub fn full_text_segment_dir(&self, index_id: &str) -> Result<PathBuf> {
+        ensure_safe_internal_component(index_id, "full text index id")?;
+        Ok(self
             .storage_path
             .join("_anvil")
             .join("index")
             .join("full-text")
             .join(index_id)
-            .join("segments")
-            .join(format!("generation-{generation:020}-{segment_hash}.anfts")))
+            .join("segments"))
     }
 
     pub fn vector_segment_path(
@@ -232,13 +238,19 @@ impl Storage {
         ensure_safe_internal_component(index_id, "vector index id")?;
         ensure_hash_hex(segment_hash, "vector segment hash")?;
         Ok(self
+            .vector_segment_dir(index_id)?
+            .join(format!("generation-{generation:020}-{segment_hash}.anvec")))
+    }
+
+    pub fn vector_segment_dir(&self, index_id: &str) -> Result<PathBuf> {
+        ensure_safe_internal_component(index_id, "vector index id")?;
+        Ok(self
             .storage_path
             .join("_anvil")
             .join("index")
             .join("vector")
             .join(index_id)
-            .join("segments")
-            .join(format!("generation-{generation:020}-{segment_hash}.anvec")))
+            .join("segments"))
     }
 
     pub fn relative_storage_path(&self, path: &Path) -> Result<String> {

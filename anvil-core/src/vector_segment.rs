@@ -126,6 +126,23 @@ pub async fn read_vector_segment(path: impl Into<PathBuf>) -> Result<DecodedVect
     decode_vector_segment(&bytes)
 }
 
+pub async fn read_latest_vector_segment(
+    storage: &Storage,
+    index_id: &str,
+) -> Result<Option<DecodedVectorSegment>> {
+    let Some(path) = latest_vector_segment_path(storage, index_id).await? else {
+        return Ok(None);
+    };
+    Ok(Some(read_vector_segment(path).await?))
+}
+
+pub async fn latest_vector_segment_path(
+    storage: &Storage,
+    index_id: &str,
+) -> Result<Option<PathBuf>> {
+    latest_segment_path(storage.vector_segment_dir(index_id)?, ".anvec").await
+}
+
 pub fn decode_vector_segment(bytes: &[u8]) -> Result<DecodedVectorSegment> {
     let envelope = BinaryEnvelopeHeader::decode(bytes)?;
     if envelope.family != FileFamily::VectorSegment {
@@ -300,6 +317,36 @@ fn record_hash_bounds(entries: &[VectorSegmentEntry]) -> (Hash32, Hash32) {
     (first, last)
 }
 
+async fn latest_segment_path(dir: PathBuf, suffix: &str) -> Result<Option<PathBuf>> {
+    let mut entries = match tokio::fs::read_dir(&dir).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let mut latest: Option<(u64, PathBuf)> = None;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(suffix) {
+            continue;
+        }
+        let Some(generation) = name
+            .strip_prefix("generation-")
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        match latest {
+            Some((current, _)) if generation <= current => {}
+            _ => latest = Some((generation, path)),
+        }
+    }
+    Ok(latest.map(|(_, path)| path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,5 +458,45 @@ mod tests {
         let mut bytes = tokio::fs::read(path).await.unwrap();
         bytes[COMMON_HEADER_LEN + 1] ^= 1;
         assert!(decode_vector_segment(&bytes).is_err());
+    }
+
+    #[tokio::test]
+    async fn latest_vector_segment_selects_highest_generation() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let graph = graph();
+        let entries = [entry(1, vec![1.0, 0.0, 0.0])];
+        for generation in [1, 3, 2] {
+            write_vector_segment(
+                &storage,
+                VectorSegmentWrite {
+                    index_id: "vector-alpha",
+                    generation,
+                    dimension: 3,
+                    metric: VectorMetric::Cosine,
+                    embedding_model: "embedding-v1",
+                    modality: VectorModality::Text,
+                    hnsw_m: 32,
+                    hnsw_ef_construction: 200,
+                    source_cursor: generation,
+                    authz_revision: 0,
+                    entries: &entries,
+                    hnsw_graph: &graph,
+                    deleted_bitset: &[0],
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let latest = read_latest_vector_segment(&storage, "vector-alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.header.generation, 3);
+        assert!(
+            latest_vector_segment_path(&storage, "../escape")
+                .await
+                .is_err()
+        );
     }
 }
