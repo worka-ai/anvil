@@ -51,6 +51,7 @@ impl BucketManager {
 
     pub async fn delete_bucket(
         &self,
+        tenant_id: i64,
         bucket_name: &str,
         scopes: &[String],
     ) -> Result<Bucket, Status> {
@@ -61,7 +62,7 @@ impl BucketManager {
         // Soft-delete the bucket
         let bucket = self
             .db
-            .soft_delete_bucket(bucket_name)
+            .soft_delete_bucket(tenant_id, bucket_name)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
@@ -129,6 +130,7 @@ impl BucketManager {
 
     pub async fn set_bucket_public_access(
         &self,
+        tenant_id: i64,
         bucket_name: &str,
         is_public: bool,
         scopes: &[String],
@@ -139,7 +141,7 @@ impl BucketManager {
 
         let bucket = self
             .db
-            .set_bucket_public_access(bucket_name, is_public)
+            .set_bucket_public_access(tenant_id, bucket_name, is_public)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 

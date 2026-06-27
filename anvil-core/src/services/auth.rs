@@ -165,7 +165,7 @@ impl AuthService for AppState {
         }
 
         self.db
-            .set_bucket_public_access(&req.bucket, req.allow_public_read)
+            .set_bucket_public_access(claims.tenant_id, &req.bucket, req.allow_public_read)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 

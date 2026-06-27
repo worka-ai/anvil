@@ -1274,6 +1274,31 @@ impl Persistence {
 
     pub async fn set_bucket_public_access(
         &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        is_public: bool,
+    ) -> Result<Bucket> {
+        let client = self.global_pool.get().await?;
+        let row = client
+            .query_one(
+                "UPDATE buckets SET is_public_read = $1 WHERE tenant_id = $2 AND name = $3 RETURNING *",
+                &[&is_public, &tenant_id, &bucket_name],
+            )
+            .await?;
+
+        let bucket: Bucket = row.into();
+        self.cache.invalidate_bucket(tenant_id, bucket_name).await;
+        self.publish_event(MetadataEvent::BucketUpdated {
+            tenant_id,
+            name: bucket_name.to_string(),
+        })
+        .await;
+
+        Ok(bucket)
+    }
+
+    pub async fn set_bucket_public_access_by_name(
+        &self,
         bucket_name: &str,
         is_public: bool,
     ) -> Result<Bucket> {
@@ -1286,10 +1311,11 @@ impl Persistence {
             .await?;
 
         let bucket: Bucket = row.into();
-        let tenant_id = bucket.tenant_id;
-        self.cache.invalidate_bucket(tenant_id, bucket_name).await;
+        self.cache
+            .invalidate_bucket(bucket.tenant_id, bucket_name)
+            .await;
         self.publish_event(MetadataEvent::BucketUpdated {
-            tenant_id,
+            tenant_id: bucket.tenant_id,
             name: bucket_name.to_string(),
         })
         .await;
@@ -1297,17 +1323,20 @@ impl Persistence {
         Ok(bucket)
     }
 
-    pub async fn soft_delete_bucket(&self, bucket_name: &str) -> Result<Option<Bucket>> {
+    pub async fn soft_delete_bucket(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+    ) -> Result<Option<Bucket>> {
         let client = self.global_pool.get().await?;
         let row = client
             .query_opt(
-                r#"UPDATE buckets SET deleted_at = now() WHERE name = $1 AND deleted_at IS NULL RETURNING *"#,
-                &[&bucket_name],
+                r#"UPDATE buckets SET deleted_at = now() WHERE tenant_id = $1 AND name = $2 AND deleted_at IS NULL RETURNING *"#,
+                &[&tenant_id, &bucket_name],
             )
             .await?;
 
-        if let Some(ref r) = row {
-            let tenant_id: i64 = r.get("tenant_id");
+        if row.is_some() {
             self.cache.invalidate_bucket(tenant_id, bucket_name).await;
             self.publish_event(MetadataEvent::BucketUpdated {
                 tenant_id,

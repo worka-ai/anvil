@@ -416,7 +416,7 @@ async fn delete_bucket(
 
     match state
         .bucket_manager
-        .delete_bucket(&bucket, claims.scopes.as_slice())
+        .delete_bucket(claims.tenant_id, &bucket, claims.scopes.as_slice())
         .await
     {
         Ok(_) => Response::builder()

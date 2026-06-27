@@ -52,7 +52,7 @@ impl BucketService for AppState {
 
         let bucket = self
             .bucket_manager
-            .delete_bucket(&req.bucket_name, &claims.scopes)
+            .delete_bucket(claims.tenant_id, &req.bucket_name, &claims.scopes)
             .await?;
         self.publish_bucket_metadata_event(claims.tenant_id, &bucket, "delete", true)
             .await?;
@@ -132,7 +132,12 @@ impl BucketService for AppState {
 
         let bucket = self
             .bucket_manager
-            .set_bucket_public_access(&req.bucket_name, is_public_read, &claims.scopes)
+            .set_bucket_public_access(
+                claims.tenant_id,
+                &req.bucket_name,
+                is_public_read,
+                &claims.scopes,
+            )
             .await?;
         self.publish_bucket_metadata_event(claims.tenant_id, &bucket, "policy_update", false)
             .await?;
