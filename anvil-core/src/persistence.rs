@@ -2719,6 +2719,49 @@ impl Persistence {
         Ok(row.map(Into::into))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn check_authz_tuple_at_revision(
+        &self,
+        tenant_id: i64,
+        namespace: &str,
+        object_id: &str,
+        relation: &str,
+        subject_kind: &str,
+        subject_id: &str,
+        caveat_hash: &str,
+        revision: i64,
+    ) -> Result<Option<AuthzTupleRecord>> {
+        let client = self.regional_pool.get().await?;
+        let row = client
+            .query_opt(
+                r#"
+                SELECT *
+                FROM authz_tuple_log
+                WHERE tenant_id = $1
+                  AND namespace = $2
+                  AND object_id = $3
+                  AND relation = $4
+                  AND subject_kind = $5
+                  AND subject_id = $6
+                  AND caveat_hash = $7
+                  AND revision <= $8
+                ORDER BY revision DESC
+                LIMIT 1"#,
+                &[
+                    &tenant_id,
+                    &namespace,
+                    &object_id,
+                    &relation,
+                    &subject_kind,
+                    &subject_id,
+                    &caveat_hash,
+                    &revision,
+                ],
+            )
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
     pub async fn list_authz_tuple_log(
         &self,
         tenant_id: i64,

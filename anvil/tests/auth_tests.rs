@@ -275,6 +275,28 @@ async fn test_authz_tuple_write_check_and_watch() {
     assert!(allowed.allowed);
     assert_eq!(allowed.revision, add.revision);
 
+    let mut exact_add_req = Request::new(CheckPermissionRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: String::new(),
+        consistency: "exact".to_string(),
+        zookie: add.zookie.clone(),
+    });
+    exact_add_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let exact_add = auth_client
+        .check_permission(exact_add_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(exact_add.allowed);
+    assert_eq!(exact_add.revision, add.revision);
+
     let mut write_remove = Request::new(WriteAuthzTupleRequest {
         namespace: "document".to_string(),
         object_id: "alpha".to_string(),
@@ -325,6 +347,70 @@ async fn test_authz_tuple_write_check_and_watch() {
         .into_inner();
     assert!(!denied.allowed);
     assert_eq!(denied.revision, remove.revision);
+
+    let mut at_least_add_req = Request::new(CheckPermissionRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: String::new(),
+        consistency: "at_least".to_string(),
+        zookie: add.zookie,
+    });
+    at_least_add_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let at_least_add = auth_client
+        .check_permission(at_least_add_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!at_least_add.allowed);
+    assert_eq!(at_least_add.revision, remove.revision);
+
+    let mut exact_add_after_remove_req = Request::new(CheckPermissionRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: String::new(),
+        consistency: "exact".to_string(),
+        zookie: "authz:1".to_string(),
+    });
+    exact_add_after_remove_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let exact_add_after_remove = auth_client
+        .check_permission(exact_add_after_remove_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(exact_add_after_remove.allowed);
+    assert_eq!(exact_add_after_remove.revision, 1);
+
+    let mut unavailable_req = Request::new(CheckPermissionRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: String::new(),
+        consistency: "exact".to_string(),
+        zookie: "authz:999".to_string(),
+    });
+    unavailable_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let unavailable = auth_client
+        .check_permission(unavailable_req)
+        .await
+        .unwrap_err();
+    assert_eq!(unavailable.code(), tonic::Code::FailedPrecondition);
 }
 
 #[tokio::test]

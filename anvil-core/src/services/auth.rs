@@ -255,30 +255,61 @@ impl AuthService for AppState {
         if !auth::is_authorized(AnvilAction::AuthzCheck, &resource, &claims.scopes) {
             return Err(Status::permission_denied("Permission denied"));
         }
-        validate_authz_consistency(&req.consistency)?;
-
-        let record = self
+        let consistency = AuthzConsistency::from_request(&req.consistency, &req.zookie)?;
+        let latest_revision = self
             .db
-            .check_authz_tuple(
-                claims.tenant_id,
-                &req.namespace,
-                &req.object_id,
-                &req.relation,
-                &req.subject_kind,
-                &req.subject_id,
-                &req.caveat_hash,
-            )
+            .latest_authz_revision(claims.tenant_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        if let Some(required_revision) = consistency.required_revision()
+            && latest_revision < required_revision
+        {
+            return Err(Status::failed_precondition("AuthzRevisionUnavailable"));
+        }
+
+        let (record, response_revision) = match consistency {
+            AuthzConsistency::Exact(revision) => {
+                let record = self
+                    .db
+                    .check_authz_tuple_at_revision(
+                        claims.tenant_id,
+                        &req.namespace,
+                        &req.object_id,
+                        &req.relation,
+                        &req.subject_kind,
+                        &req.subject_id,
+                        &req.caveat_hash,
+                        revision,
+                    )
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                (record, revision)
+            }
+            AuthzConsistency::Latest | AuthzConsistency::AtLeast(_) => {
+                let record = self
+                    .db
+                    .check_authz_tuple(
+                        claims.tenant_id,
+                        &req.namespace,
+                        &req.object_id,
+                        &req.relation,
+                        &req.subject_kind,
+                        &req.subject_id,
+                        &req.caveat_hash,
+                    )
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                (record, latest_revision)
+            }
+        };
         let allowed = record
             .as_ref()
             .is_some_and(|record| record.operation == "add");
-        let revision = record.as_ref().map(|record| record.revision).unwrap_or(0);
 
         Ok(Response::new(CheckPermissionResponse {
             allowed,
-            revision: revision_to_u64(revision)?,
-            zookie: zookie(revision),
+            revision: revision_to_u64(response_revision)?,
+            zookie: zookie(response_revision),
             explanation_ref: if allowed {
                 "direct_tuple_match".to_string()
             } else {
@@ -416,13 +447,48 @@ fn validate_tuple_field(name: &str, value: &str) -> Result<(), Status> {
     Ok(())
 }
 
-fn validate_authz_consistency(value: &str) -> Result<(), Status> {
-    match value {
-        "" | "latest" | "at_least" | "exact" => Ok(()),
-        _ => Err(Status::invalid_argument(
-            "consistency must be latest, at_least, exact, or empty",
-        )),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthzConsistency {
+    Latest,
+    AtLeast(i64),
+    Exact(i64),
+}
+
+impl AuthzConsistency {
+    fn from_request(consistency: &str, zookie: &str) -> Result<Self, Status> {
+        match consistency {
+            "" | "latest" => Ok(Self::Latest),
+            "at_least" => Ok(Self::AtLeast(parse_authz_zookie(zookie)?)),
+            "exact" => Ok(Self::Exact(parse_authz_zookie(zookie)?)),
+            _ => Err(Status::invalid_argument(
+                "consistency must be latest, at_least, exact, or empty",
+            )),
+        }
     }
+
+    fn required_revision(self) -> Option<i64> {
+        match self {
+            Self::Latest => None,
+            Self::AtLeast(revision) | Self::Exact(revision) => Some(revision),
+        }
+    }
+}
+
+fn parse_authz_zookie(value: &str) -> Result<i64, Status> {
+    let Some(revision) = value.strip_prefix("authz:") else {
+        return Err(Status::invalid_argument(
+            "zookie must use authz:<revision> format",
+        ));
+    };
+    let revision = revision
+        .parse::<i64>()
+        .map_err(|_| Status::invalid_argument("zookie revision must be an integer"))?;
+    if revision < 0 {
+        return Err(Status::invalid_argument(
+            "zookie revision must not be negative",
+        ));
+    }
+    Ok(revision)
 }
 
 fn revision_to_u64(revision: i64) -> Result<u64, Status> {
@@ -449,5 +515,46 @@ fn authz_tuple_log_response(
         reason: record.reason.clone(),
         record_hash: record.record_hash.clone(),
         written_at: record.written_at.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authz_consistency_parses_latest_without_zookie() {
+        assert_eq!(
+            AuthzConsistency::from_request("", "").unwrap(),
+            AuthzConsistency::Latest
+        );
+        assert_eq!(
+            AuthzConsistency::from_request("latest", "").unwrap(),
+            AuthzConsistency::Latest
+        );
+    }
+
+    #[test]
+    fn authz_consistency_requires_zookie_for_at_least_and_exact() {
+        assert_eq!(
+            AuthzConsistency::from_request("at_least", "authz:42").unwrap(),
+            AuthzConsistency::AtLeast(42)
+        );
+        assert_eq!(
+            AuthzConsistency::from_request("exact", "authz:7").unwrap(),
+            AuthzConsistency::Exact(7)
+        );
+        assert_eq!(
+            AuthzConsistency::from_request("exact", "")
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            AuthzConsistency::from_request("at_least", "authz:-1")
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
     }
 }
