@@ -26,7 +26,11 @@ impl Storage {
         Ok(())
     }
     pub async fn new() -> Result<Self> {
-        let storage_path = Path::new(STORAGE_DIR).to_path_buf();
+        Self::new_at(Path::new(STORAGE_DIR)).await
+    }
+
+    pub async fn new_at(storage_path: impl AsRef<Path>) -> Result<Self> {
+        let storage_path = storage_path.as_ref().to_path_buf();
         let temp_path = storage_path.join(TEMP_DIR);
         fs::create_dir_all(&storage_path).await?;
         fs::create_dir_all(&temp_path).await?;
@@ -34,6 +38,15 @@ impl Storage {
             storage_path,
             temp_path,
         })
+    }
+
+    pub fn metadata_journal_path(&self, tenant_id: i64, bucket_id: i64) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("meta")
+            .join("journals")
+            .join(format!("tenant-{tenant_id}"))
+            .join(format!("bucket-{bucket_id}.anjournal"))
     }
 
     fn get_shard_path(&self, object_hash: &str, shard_index: u32) -> PathBuf {
