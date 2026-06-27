@@ -10,9 +10,6 @@ lazy_static! {
     // Regex to check if a string looks like an IP address.
     static ref IP_ADDRESS_REGEX: Regex = Regex::new(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$").unwrap();
 
-    // Visible ASCII except double quote and backslash. This keeps path-style S3
-    // keys broad enough for common clients while rejecting ambiguous separators.
-    static ref OBJECT_KEY_REGEX: Regex = Regex::new(r"^[\x21\x23-\x5B\x5D-\x7E]*$").unwrap();
 }
 
 const RESERVED_INTERNAL_PREFIXES: &[&str] = &[
@@ -42,7 +39,7 @@ pub fn is_valid_object_key(key: &str) -> bool {
     if key.is_empty() || key.len() > 4096 {
         return false;
     }
-    if key.contains('\\') {
+    if key.chars().any(|ch| ch == '\0' || ch.is_control()) {
         return false;
     }
     if key
@@ -51,7 +48,7 @@ pub fn is_valid_object_key(key: &str) -> bool {
     {
         return false;
     }
-    OBJECT_KEY_REGEX.is_match(key)
+    true
 }
 
 pub fn is_reserved_internal_key(key: &str) -> bool {
@@ -103,6 +100,9 @@ mod tests {
         assert!(is_valid_object_key("my*object"));
         assert!(is_valid_object_key("my'object"));
         assert!(is_valid_object_key("my+object=:,@"));
+        assert!(is_valid_object_key("folder/my object.txt"));
+        assert!(is_valid_object_key("folder/café/📄.txt"));
+        assert!(is_valid_object_key(r#"quote"and\backslash"#));
         assert!(is_valid_object_key(&"a".repeat(4096)));
     }
 
@@ -114,7 +114,8 @@ mod tests {
         assert!(!is_valid_object_key("my/./object"));
         assert!(!is_valid_object_key("my/object/.."));
         assert!(!is_valid_object_key("./my/object"));
-        assert!(!is_valid_object_key(r"my\object"));
+        assert!(!is_valid_object_key("my/\0/object"));
+        assert!(!is_valid_object_key("my/\n/object"));
     }
 
     #[test]

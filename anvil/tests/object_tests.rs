@@ -261,6 +261,100 @@ async fn test_delete_object_specific_version_removes_only_that_version() {
 }
 
 #[tokio::test]
+async fn test_utf8_object_keys_with_spaces_round_trip() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+
+    let bucket_name = "test-utf8-object-keys".to_string();
+    let object_key = "folder/my café document 📄.txt".to_string();
+    let payload = b"utf8 object key payload".to_vec();
+    let mut create_req = Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
+    });
+    create_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client.create_bucket(create_req).await.unwrap();
+
+    let chunks = vec![
+        PutObjectRequest {
+            data: Some(anvil_api::put_object_request::Data::Metadata(
+                ObjectMetadata {
+                    bucket_name: bucket_name.clone(),
+                    object_key: object_key.clone(),
+                },
+            )),
+        },
+        PutObjectRequest {
+            data: Some(anvil_api::put_object_request::Data::Chunk(payload.clone())),
+        },
+    ];
+    let mut put_req = Request::new(tokio_stream::iter(chunks));
+    put_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let put_res = object_client
+        .put_object(put_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!put_res.version_id.is_empty());
+
+    let mut list_req = Request::new(ListObjectsRequest {
+        bucket_name: bucket_name.clone(),
+        prefix: "folder/".to_string(),
+        delimiter: String::new(),
+        start_after: String::new(),
+        max_keys: 10,
+    });
+    list_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let list_res = object_client
+        .list_objects(list_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(list_res.objects.len(), 1);
+    assert_eq!(list_res.objects[0].key, object_key);
+
+    let mut get_req = Request::new(GetObjectRequest {
+        bucket_name,
+        object_key,
+        version_id: None,
+    });
+    get_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let mut stream = object_client
+        .get_object(get_req)
+        .await
+        .unwrap()
+        .into_inner();
+    let mut downloaded = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        if let anvil_api::get_object_response::Data::Chunk(bytes) = chunk.unwrap().data.unwrap() {
+            downloaded.extend_from_slice(&bytes);
+        }
+    }
+    assert_eq!(downloaded, payload);
+}
+
+#[tokio::test]
 async fn test_listing_omits_reserved_internal_object_keys() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;

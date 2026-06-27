@@ -316,6 +316,40 @@ async fn test_s3_public_and_private_access() {
         Some("metadata-test")
     );
 
+    let utf8_key = "folder/my café document 📄.txt";
+    let utf8_content = b"utf8 key over s3";
+    client
+        .put_object()
+        .bucket(&private_bucket)
+        .key(utf8_key)
+        .body(ByteStream::from_static(utf8_content))
+        .send()
+        .await
+        .expect("put UTF-8 S3 key should succeed");
+    let utf8_resp = client
+        .get_object()
+        .bucket(&private_bucket)
+        .key(utf8_key)
+        .send()
+        .await
+        .expect("UTF-8 S3 key should be readable");
+    let utf8_data = utf8_resp.body.collect().await.unwrap().into_bytes();
+    assert_eq!(utf8_data.as_ref(), utf8_content);
+    let utf8_listing = client
+        .list_objects_v2()
+        .bucket(&private_bucket)
+        .prefix("folder/")
+        .send()
+        .await
+        .expect("UTF-8 S3 key should be listable");
+    assert!(
+        utf8_listing
+            .contents()
+            .iter()
+            .any(|object| object.key() == Some(utf8_key)),
+        "list_objects_v2 should include the UTF-8 key"
+    );
+
     client
         .put_object()
         .bucket(&public_bucket)
