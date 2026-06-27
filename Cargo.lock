@@ -322,6 +322,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trust-dns-resolver",
+ "unicode-normalization",
  "uuid",
 ]
 
