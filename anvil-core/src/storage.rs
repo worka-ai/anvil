@@ -150,6 +150,22 @@ impl Storage {
             .join(format!("bucket-{bucket_id}.anwatch"))
     }
 
+    pub fn watch_checkpoint_path(
+        &self,
+        watch_stream_id: &str,
+        consumer_id: &str,
+    ) -> Result<PathBuf> {
+        ensure_safe_internal_component(watch_stream_id, "watch stream id")?;
+        ensure_safe_internal_component(consumer_id, "watch consumer id")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("watch")
+            .join("checkpoints")
+            .join(watch_stream_id)
+            .join(format!("{consumer_id}.json")))
+    }
+
     pub fn git_source_watch_path(&self, tenant_id: i64, repository_id: &str) -> Result<PathBuf> {
         ensure_safe_internal_component(repository_id, "git repository id")?;
         Ok(self

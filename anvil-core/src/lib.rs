@@ -51,6 +51,7 @@ pub mod task_lease;
 pub mod tasks;
 pub mod validation;
 pub mod vector_segment;
+pub mod watch_checkpoint;
 pub mod watch_log;
 pub mod worker;
 
