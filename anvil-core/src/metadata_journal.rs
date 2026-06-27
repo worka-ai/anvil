@@ -4,7 +4,7 @@ use crate::formats::{
     segment::{SegmentBody, SegmentRecord},
     validate_journal_chain,
 };
-use crate::persistence::{Bucket, Object};
+use crate::persistence::{Bucket, Object, ObjectVersion, ObjectVersionsPage};
 use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
@@ -573,6 +573,129 @@ pub async fn read_current_objects(
     bucket: &Bucket,
     manifest_signing_key: &[u8],
 ) -> Result<Vec<Object>> {
+    let body_records = read_object_version_bodies(storage, bucket, manifest_signing_key).await?;
+    let mut versions_by_key = object_versions_by_key(body_records);
+
+    let mut current = Vec::new();
+    for versions in versions_by_key.values_mut() {
+        sort_versions_for_key(versions);
+        if let Some((_, body)) = versions.last() {
+            if !body.delete_marker && body.deleted_at.is_none() {
+                current.push(object_from_body(body)?);
+            }
+        }
+    }
+    current.sort_by(|left, right| left.key.cmp(&right.key));
+    Ok(current)
+}
+
+pub async fn read_object_versions(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+    prefix: &str,
+    key_marker: &str,
+    version_id_marker: Option<uuid::Uuid>,
+    limit: i32,
+) -> Result<ObjectVersionsPage> {
+    let body_records = read_object_version_bodies(storage, bucket, manifest_signing_key).await?;
+    let mut versions_by_key = object_versions_by_key(body_records);
+    let marker = if let Some(version_id_marker) = version_id_marker {
+        let marker = versions_by_key
+            .get(key_marker)
+            .and_then(|versions| {
+                versions
+                    .iter()
+                    .find(|(_, body)| body.version_id == version_id_marker.to_string())
+            })
+            .cloned();
+        let Some(marker) = marker else {
+            return Ok(ObjectVersionsPage {
+                versions: Vec::new(),
+                is_truncated: false,
+                next_key_marker: None,
+                next_version_id_marker: None,
+            });
+        };
+        Some(marker)
+    } else {
+        None
+    };
+
+    let mut flattened = Vec::<(usize, ObjectVersionBody, bool)>::new();
+    for versions in versions_by_key.values_mut() {
+        sort_versions_for_key_descending(versions);
+        for (index, (order, body)) in versions.iter().enumerate() {
+            flattened.push((*order, body.clone(), index == 0));
+        }
+    }
+    flattened.sort_by(|(left_order, left, _), (right_order, right, _)| {
+        left.object_key
+            .cmp(&right.object_key)
+            .then_with(|| {
+                parse_body_timestamp(&right.created_at)
+                    .ok()
+                    .cmp(&parse_body_timestamp(&left.created_at).ok())
+            })
+            .then_with(|| right_order.cmp(left_order))
+    });
+
+    let mut selected = Vec::new();
+    for (order, body, is_latest) in flattened {
+        if !body.object_key.starts_with(prefix) {
+            continue;
+        }
+        if let Some((marker_order, marker_body)) = marker.as_ref() {
+            if body.object_key.as_str() < key_marker {
+                continue;
+            }
+            if body.object_key == key_marker
+                && !version_sorts_after_marker(order, &body, *marker_order, marker_body)?
+            {
+                continue;
+            }
+        } else if body.object_key.as_str() <= key_marker {
+            continue;
+        }
+
+        selected.push(ObjectVersion {
+            is_delete_marker: body.delete_marker || body.deleted_at.is_some(),
+            is_latest,
+            object: object_from_body(&body)?,
+        });
+    }
+
+    let limit = limit.max(1) as usize;
+    let is_truncated = selected.len() > limit;
+    if is_truncated {
+        selected.truncate(limit);
+    }
+    let (next_key_marker, next_version_id_marker) = if is_truncated {
+        selected
+            .last()
+            .map(|version| {
+                (
+                    Some(version.object.key.clone()),
+                    Some(version.object.version_id),
+                )
+            })
+            .unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
+    Ok(ObjectVersionsPage {
+        versions: selected,
+        is_truncated,
+        next_key_marker,
+        next_version_id_marker,
+    })
+}
+
+async fn read_object_version_bodies(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+) -> Result<Vec<(usize, ObjectVersionBody)>> {
     let mut body_records = Vec::<(usize, ObjectVersionBody)>::new();
     let mut order = 0usize;
     let mut compacted_through_sequence = 0u64;
@@ -615,7 +738,12 @@ pub async fn read_current_objects(
             }
         }
     }
+    Ok(body_records)
+}
 
+fn object_versions_by_key(
+    body_records: Vec<(usize, ObjectVersionBody)>,
+) -> std::collections::BTreeMap<String, Vec<(usize, ObjectVersionBody)>> {
     let mut versions_by_key =
         std::collections::BTreeMap::<String, Vec<(usize, ObjectVersionBody)>>::new();
     for (order, body) in body_records {
@@ -626,23 +754,36 @@ pub async fn read_current_objects(
             versions.push((order, body));
         }
     }
+    versions_by_key
+}
 
-    let mut current = Vec::new();
-    for versions in versions_by_key.values_mut() {
-        versions.sort_by(|(left_order, left), (right_order, right)| {
-            parse_body_timestamp(&left.created_at)
-                .ok()
-                .cmp(&parse_body_timestamp(&right.created_at).ok())
-                .then_with(|| left_order.cmp(right_order))
-        });
-        if let Some((_, body)) = versions.last() {
-            if !body.delete_marker && body.deleted_at.is_none() {
-                current.push(object_from_body(body)?);
-            }
-        }
-    }
-    current.sort_by(|left, right| left.key.cmp(&right.key));
-    Ok(current)
+fn sort_versions_for_key(versions: &mut [(usize, ObjectVersionBody)]) {
+    versions.sort_by(|(left_order, left), (right_order, right)| {
+        parse_body_timestamp(&left.created_at)
+            .ok()
+            .cmp(&parse_body_timestamp(&right.created_at).ok())
+            .then_with(|| left_order.cmp(right_order))
+    });
+}
+
+fn sort_versions_for_key_descending(versions: &mut [(usize, ObjectVersionBody)]) {
+    versions.sort_by(|(left_order, left), (right_order, right)| {
+        parse_body_timestamp(&right.created_at)
+            .ok()
+            .cmp(&parse_body_timestamp(&left.created_at).ok())
+            .then_with(|| right_order.cmp(left_order))
+    });
+}
+
+fn version_sorts_after_marker(
+    order: usize,
+    body: &ObjectVersionBody,
+    marker_order: usize,
+    marker_body: &ObjectVersionBody,
+) -> Result<bool> {
+    let created_at = parse_body_timestamp(&body.created_at)?;
+    let marker_created_at = parse_body_timestamp(&marker_body.created_at)?;
+    Ok(created_at < marker_created_at || (created_at == marker_created_at && order < marker_order))
 }
 
 async fn write_segment_file(
@@ -1170,6 +1311,29 @@ mod tests {
             .unwrap();
         assert_eq!(listed.objects.len(), 2);
         assert!(listed.common_prefixes.is_empty());
+        let versions = read_object_versions(&storage, &bucket, signing_key, "docs/", "", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(versions.versions.len(), 3);
+        assert_eq!(versions.versions[0].object.version_id, second.version_id);
+        assert!(versions.versions[0].is_latest);
+        assert_eq!(versions.versions[1].object.version_id, first.version_id);
+        assert!(!versions.versions[1].is_latest);
+        let next_versions = read_object_versions(
+            &storage,
+            &bucket,
+            signing_key,
+            "docs/",
+            "docs/a.txt",
+            Some(second.version_id),
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            next_versions.versions[0].object.version_id,
+            first.version_id
+        );
 
         let metadata_bytes = tokio::fs::read(&sealed.metadata_path).await.unwrap();
         let metadata_body =

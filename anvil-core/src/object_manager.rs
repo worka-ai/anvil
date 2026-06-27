@@ -1315,16 +1315,17 @@ impl ObjectManager {
             }
         }
 
-        self.db
-            .list_object_versions(
-                bucket.id,
-                prefix,
-                key_marker,
-                version_id_marker,
-                if limit == 0 { 1000 } else { limit },
-            )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))
+        metadata_journal::read_object_versions(
+            &self.storage,
+            &bucket,
+            &self.encryption_key,
+            prefix,
+            key_marker,
+            version_id_marker,
+            if limit == 0 { 1000 } else { limit },
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))
     }
 
     pub async fn current_object_for_write_precondition(
