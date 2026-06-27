@@ -226,6 +226,30 @@ impl Storage {
             .join(format!("generation-{generation:020}-{proof_hash}.json")))
     }
 
+    pub fn repair_finding_dir(&self, scope_kind: &str, scope_id: &str) -> Result<PathBuf> {
+        ensure_safe_internal_component(scope_kind, "repair finding scope kind")?;
+        ensure_safe_internal_component(scope_id, "repair finding scope id")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("repair")
+            .join("findings")
+            .join(scope_kind)
+            .join(scope_id))
+    }
+
+    pub fn repair_finding_path(
+        &self,
+        scope_kind: &str,
+        scope_id: &str,
+        finding_id: &str,
+    ) -> Result<PathBuf> {
+        ensure_safe_internal_component(finding_id, "repair finding id")?;
+        Ok(self
+            .repair_finding_dir(scope_kind, scope_id)?
+            .join(format!("{finding_id}.json")))
+    }
+
     pub fn git_source_watch_path(&self, tenant_id: i64, repository_id: &str) -> Result<PathBuf> {
         ensure_safe_internal_component(repository_id, "git repository id")?;
         Ok(self
