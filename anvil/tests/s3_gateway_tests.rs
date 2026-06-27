@@ -2,6 +2,7 @@ use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::{GetAccessTokenRequest, SetPublicAccessRequest};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use rand::random;
 use std::env::temp_dir;
 use std::path::PathBuf;
@@ -260,6 +261,69 @@ async fn test_s3_public_and_private_access() {
         .expect("copied object should be readable");
     let copied_data = copied_resp.body.collect().await.unwrap().into_bytes();
     assert_eq!(copied_data.as_ref(), private_content);
+
+    let multipart_key = "multipart-private.txt";
+    let multipart = client
+        .create_multipart_upload()
+        .bucket(&private_bucket)
+        .key(multipart_key)
+        .send()
+        .await
+        .expect("create multipart upload should succeed");
+    let upload_id = multipart.upload_id().expect("upload id").to_string();
+    let part_one = client
+        .upload_part()
+        .bucket(&private_bucket)
+        .key(multipart_key)
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"multi"))
+        .send()
+        .await
+        .expect("upload multipart part 1 should succeed");
+    let part_two = client
+        .upload_part()
+        .bucket(&private_bucket)
+        .key(multipart_key)
+        .upload_id(&upload_id)
+        .part_number(2)
+        .body(ByteStream::from_static(b"part"))
+        .send()
+        .await
+        .expect("upload multipart part 2 should succeed");
+    client
+        .complete_multipart_upload()
+        .bucket(&private_bucket)
+        .key(multipart_key)
+        .upload_id(&upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(part_one.e_tag().expect("part 1 etag"))
+                        .build(),
+                )
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(2)
+                        .e_tag(part_two.e_tag().expect("part 2 etag"))
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .expect("complete multipart upload should succeed");
+    let multipart_resp = client
+        .get_object()
+        .bucket(&private_bucket)
+        .key(multipart_key)
+        .send()
+        .await
+        .expect("multipart object should be readable");
+    let multipart_data = multipart_resp.body.collect().await.unwrap().into_bytes();
+    assert_eq!(multipart_data.as_ref(), b"multipart");
 
     // 5b. S3 version listing returns overwritten versions and delete markers.
     client

@@ -22,6 +22,20 @@ struct CreateBucketConfiguration {
     location_constraint: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CompleteMultipartUploadXml {
+    #[serde(rename = "Part", default)]
+    parts: Vec<CompleteMultipartUploadXmlPart>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompleteMultipartUploadXmlPart {
+    #[serde(rename = "PartNumber")]
+    part_number: i32,
+    #[serde(rename = "ETag")]
+    etag: String,
+}
+
 fn s3_error(code: &str, message: &str, status: axum::http::StatusCode) -> Response {
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\n  <Code>{}</Code>\n  <Message>{}</Message>\n</Error>\n",
@@ -53,6 +67,7 @@ pub fn app(state: AppState) -> Router {
             "/{bucket}/{*path}",
             get(get_object)
                 .put(put_object)
+                .post(post_object)
                 .delete(delete_object)
                 .head(head_object),
         )
@@ -666,6 +681,7 @@ async fn get_object(
 async fn put_object(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
+    Query(q): Query<HashMap<String, String>>,
     req: Request,
 ) -> Response {
     let claims = match req.extensions().get::<Claims>().cloned() {
@@ -694,6 +710,46 @@ async fn put_object(
 
     if let Some(copy_source) = copy_source {
         return copy_object(state, claims, bucket, key, copy_source).await;
+    }
+
+    if let Some(upload_id) = q.get("uploadId") {
+        let part_number = match q
+            .get("partNumber")
+            .and_then(|value| value.parse::<i32>().ok())
+        {
+            Some(part_number) => part_number,
+            None => {
+                return s3_error(
+                    "InvalidArgument",
+                    "Missing or invalid partNumber",
+                    axum::http::StatusCode::BAD_REQUEST,
+                );
+            }
+        };
+        let upload_id = match uuid::Uuid::parse_str(upload_id) {
+            Ok(upload_id) => upload_id,
+            Err(_) => {
+                return s3_error(
+                    "InvalidArgument",
+                    "Invalid uploadId",
+                    axum::http::StatusCode::BAD_REQUEST,
+                );
+            }
+        };
+        let body_stream = req.into_body().into_data_stream().map(|r| {
+            r.map(|chunk| chunk.to_vec())
+                .map_err(|e| tonic::Status::internal(e.to_string()))
+        });
+        return upload_part(
+            state,
+            claims,
+            bucket,
+            key,
+            upload_id,
+            part_number,
+            body_stream,
+        )
+        .await;
     }
 
     let body_stream = req.into_body().into_data_stream().map(|r| {
@@ -740,6 +796,170 @@ async fn put_object(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             ),
         },
+    }
+}
+
+async fn post_object(
+    State(state): State<AppState>,
+    Path((bucket, key)): Path<(String, String)>,
+    Query(q): Query<HashMap<String, String>>,
+    req: Request,
+) -> Response {
+    let claims = match req.extensions().get::<Claims>().cloned() {
+        Some(c) => c,
+        None => {
+            return s3_error(
+                "AccessDenied",
+                "Missing credentials",
+                axum::http::StatusCode::FORBIDDEN,
+            );
+        }
+    };
+
+    if q.contains_key("uploads") {
+        return initiate_multipart_upload(state, claims, bucket, key).await;
+    }
+
+    if let Some(upload_id) = q.get("uploadId") {
+        let upload_id = match uuid::Uuid::parse_str(upload_id) {
+            Ok(upload_id) => upload_id,
+            Err(_) => {
+                return s3_error(
+                    "InvalidArgument",
+                    "Invalid uploadId",
+                    axum::http::StatusCode::BAD_REQUEST,
+                );
+            }
+        };
+        let bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+            .await
+            .unwrap_or_default();
+        return complete_multipart_upload(state, claims, bucket, key, upload_id, bytes).await;
+    }
+
+    s3_error(
+        "InvalidArgument",
+        "Unsupported POST object operation",
+        axum::http::StatusCode::BAD_REQUEST,
+    )
+}
+
+async fn initiate_multipart_upload(
+    state: AppState,
+    claims: Claims,
+    bucket: String,
+    key: String,
+) -> Response {
+    match state
+        .object_manager
+        .initiate_multipart_upload(claims.tenant_id, &bucket, &key, &claims.scopes)
+        .await
+    {
+        Ok(upload_id) => {
+            let xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Bucket>{}</Bucket>\n  <Key>{}</Key>\n  <UploadId>{}</UploadId>\n</InitiateMultipartUploadResult>\n",
+                xml_escape(&bucket),
+                xml_escape(&key),
+                upload_id
+            );
+            Response::builder()
+                .status(200)
+                .header("Content-Type", "application/xml")
+                .body(Body::from(xml))
+                .unwrap()
+        }
+        Err(status) => s3_status_to_response_for_auth(status, true, "NoSuchBucket"),
+    }
+}
+
+async fn upload_part(
+    state: AppState,
+    claims: Claims,
+    bucket: String,
+    key: String,
+    upload_id: uuid::Uuid,
+    part_number: i32,
+    body_stream: impl Stream<Item = Result<Vec<u8>, tonic::Status>> + Unpin,
+) -> Response {
+    match state
+        .object_manager
+        .upload_part(
+            claims.tenant_id,
+            &bucket,
+            &key,
+            upload_id,
+            part_number,
+            &claims.scopes,
+            body_stream,
+        )
+        .await
+    {
+        Ok(etag) => Response::builder()
+            .status(200)
+            .header("ETag", format!("\"{}\"", etag))
+            .body(Body::empty())
+            .unwrap(),
+        Err(status) => s3_status_to_response_for_auth(status, true, "NoSuchUpload"),
+    }
+}
+
+async fn complete_multipart_upload(
+    state: AppState,
+    claims: Claims,
+    bucket: String,
+    key: String,
+    upload_id: uuid::Uuid,
+    body: axum::body::Bytes,
+) -> Response {
+    let completed = match quick_xml::de::from_reader::<_, CompleteMultipartUploadXml>(&body[..]) {
+        Ok(completed) => completed,
+        Err(error) => {
+            return s3_error(
+                "MalformedXML",
+                &format!("Invalid CompleteMultipartUpload body: {}", error),
+                axum::http::StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+    let parts = completed
+        .parts
+        .into_iter()
+        .map(|part| anvil_core::object_manager::CompleteMultipartPart {
+            part_number: part.part_number,
+            etag: part.etag,
+        })
+        .collect();
+
+    match state
+        .object_manager
+        .complete_multipart_upload(
+            claims.tenant_id,
+            &bucket,
+            &key,
+            upload_id,
+            parts,
+            &claims.scopes,
+        )
+        .await
+    {
+        Ok(object) => {
+            let xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Location>/{}/{}</Location>\n  <Bucket>{}</Bucket>\n  <Key>{}</Key>\n  <ETag>\"{}\"</ETag>\n</CompleteMultipartUploadResult>\n",
+                xml_escape(&bucket),
+                xml_escape(&key),
+                xml_escape(&bucket),
+                xml_escape(&key),
+                object.etag
+            );
+            Response::builder()
+                .status(200)
+                .header("Content-Type", "application/xml")
+                .header("ETag", object.etag)
+                .header("x-amz-version-id", object.version_id.to_string())
+                .body(Body::from(xml))
+                .unwrap()
+        }
+        Err(status) => s3_status_to_response_for_auth(status, true, "NoSuchUpload"),
     }
 }
 
@@ -882,6 +1102,7 @@ fn copy_status_to_response(status: tonic::Status, not_found_code: &str) -> Respo
 async fn delete_object(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
+    Query(q): Query<HashMap<String, String>>,
     req: Request,
 ) -> Response {
     let claims = match req.extensions().get::<Claims>().cloned() {
@@ -894,6 +1115,20 @@ async fn delete_object(
             );
         }
     };
+
+    if let Some(upload_id) = q.get("uploadId") {
+        let upload_id = match uuid::Uuid::parse_str(upload_id) {
+            Ok(upload_id) => upload_id,
+            Err(_) => {
+                return s3_error(
+                    "InvalidArgument",
+                    "Invalid uploadId",
+                    axum::http::StatusCode::BAD_REQUEST,
+                );
+            }
+        };
+        return abort_multipart_upload(state, claims, bucket, key, upload_id).await;
+    }
 
     match state
         .object_manager
@@ -938,6 +1173,26 @@ async fn delete_object(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             ),
         },
+    }
+}
+
+async fn abort_multipart_upload(
+    state: AppState,
+    claims: Claims,
+    bucket: String,
+    key: String,
+    upload_id: uuid::Uuid,
+) -> Response {
+    match state
+        .object_manager
+        .abort_multipart_upload(claims.tenant_id, &bucket, &key, upload_id, &claims.scopes)
+        .await
+    {
+        Ok(()) => Response::builder()
+            .status(axum::http::StatusCode::NO_CONTENT)
+            .body(Body::empty())
+            .unwrap(),
+        Err(status) => s3_status_to_response_for_auth(status, true, "NoSuchUpload"),
     }
 }
 
