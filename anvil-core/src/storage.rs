@@ -166,6 +166,37 @@ impl Storage {
             .join(format!("{consumer_id}.json")))
     }
 
+    pub fn diagnostic_source_dir(
+        &self,
+        scope_kind: &str,
+        scope_id: &str,
+        source: &str,
+    ) -> Result<PathBuf> {
+        ensure_safe_internal_component(scope_kind, "diagnostic scope kind")?;
+        ensure_safe_internal_component(scope_id, "diagnostic scope id")?;
+        ensure_safe_internal_component(source, "diagnostic source")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("diagnostics")
+            .join(scope_kind)
+            .join(scope_id)
+            .join(source))
+    }
+
+    pub fn diagnostic_object_path(
+        &self,
+        scope_kind: &str,
+        scope_id: &str,
+        source: &str,
+        diagnostic_id: &str,
+    ) -> Result<PathBuf> {
+        ensure_safe_internal_component(diagnostic_id, "diagnostic id")?;
+        Ok(self
+            .diagnostic_source_dir(scope_kind, scope_id, source)?
+            .join(format!("{diagnostic_id}.json")))
+    }
+
     pub fn git_source_watch_path(&self, tenant_id: i64, repository_id: &str) -> Result<PathBuf> {
         ensure_safe_internal_component(repository_id, "git repository id")?;
         Ok(self
