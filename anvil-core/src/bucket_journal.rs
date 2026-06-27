@@ -97,6 +97,18 @@ pub async fn read_current_bucket_by_name(
     )
 }
 
+pub async fn read_current_bucket_by_id(
+    storage: &Storage,
+    bucket_id: i64,
+) -> Result<Option<Bucket>> {
+    Ok(
+        read_current_buckets_from_path(storage.global_bucket_metadata_journal_path())
+            .await?
+            .into_iter()
+            .find(|bucket| bucket.id == bucket_id),
+    )
+}
+
 pub async fn next_bucket_id(storage: &Storage) -> Result<i64> {
     let frames =
         read_bucket_journal_frames_at_path(&storage.global_bucket_metadata_journal_path()).await?;

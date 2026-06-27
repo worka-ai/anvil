@@ -58,6 +58,8 @@ struct MetadataJournalHeader<'a> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ObjectVersionBody {
+    #[serde(default)]
+    id: i64,
     tenant_id: i64,
     bucket_id: i64,
     bucket_name: String,
@@ -127,6 +129,7 @@ pub async fn append_object_mutation(
         .unwrap_or(1);
 
     let object_body = serde_json::to_vec(&ObjectVersionBody {
+        id: object.id,
         tenant_id: object.tenant_id,
         bucket_id: object.bucket_id,
         bucket_name: bucket.name.clone(),
@@ -498,6 +501,22 @@ pub async fn recover_object_metadata_partition(
     })
 }
 
+pub async fn next_object_id(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+) -> Result<i64> {
+    let max_id = read_object_version_bodies(storage, bucket, manifest_signing_key)
+        .await?
+        .into_iter()
+        .map(|(_, body)| body.id)
+        .max()
+        .unwrap_or(0);
+    max_id
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("object id overflow"))
+}
+
 pub async fn read_current_object(
     storage: &Storage,
     bucket: &Bucket,
@@ -548,7 +567,11 @@ pub async fn list_current_objects(
     delimiter: &str,
 ) -> Result<NativeObjectListing> {
     let mut objects = read_current_objects(storage, bucket, manifest_signing_key).await?;
-    objects.retain(|object| object.key.starts_with(prefix) && object.key.as_str() > start_after);
+    objects.retain(|object| {
+        object.key.starts_with(prefix)
+            && object.key.as_str() > start_after
+            && !crate::validation::is_reserved_internal_key(&object.key)
+    });
     objects.sort_by(|left, right| left.key.cmp(&right.key));
 
     let limit = limit.max(1) as usize;
@@ -670,7 +693,9 @@ pub async fn read_object_versions(
 
     let mut selected = Vec::new();
     for (order, body, is_latest) in flattened {
-        if !body.object_key.starts_with(prefix) {
+        if !body.object_key.starts_with(prefix)
+            || crate::validation::is_reserved_internal_key(&body.object_key)
+        {
             continue;
         }
         if let Some((marker_order, marker_body)) = marker.as_ref() {
@@ -1009,7 +1034,7 @@ fn decode_segment_body_records(body: &SegmentBody) -> Result<Vec<SegmentRecord>>
 
 fn object_from_body(body: &ObjectVersionBody) -> Result<Object> {
     Ok(Object {
-        id: 0,
+        id: body.id,
         tenant_id: body.tenant_id,
         bucket_id: body.bucket_id,
         key: body.object_key.clone(),

@@ -4,7 +4,7 @@ use crate::{
     },
     auth, bucket_journal,
     cluster::ClusterState,
-    metadata_journal::{self, ObjectJournalMutation},
+    metadata_journal,
     permissions::AnvilAction,
     persistence::{Bucket, Object, ObjectWatchEvent, Persistence},
     placement::PlacementManager,
@@ -309,15 +309,6 @@ impl ObjectManager {
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-
-        metadata_journal::append_object_mutation(
-            &self.storage,
-            &bucket,
-            &object,
-            ObjectJournalMutation::Put,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
 
         self.publish_object_watch_event(tenant_id, &bucket, &object, "put", false)
             .await?;
@@ -1081,15 +1072,6 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Object not found"))?;
 
-        metadata_journal::append_object_mutation(
-            &self.storage,
-            &bucket,
-            &delete_marker,
-            ObjectJournalMutation::DeleteMarker,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-
         self.publish_object_watch_event(tenant_id, &bucket, &delete_marker, "delete", true)
             .await?;
 
@@ -1136,15 +1118,6 @@ impl ObjectManager {
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Object version not found"))?;
-
-        metadata_journal::append_object_mutation(
-            &self.storage,
-            &bucket,
-            &deleted,
-            ObjectJournalMutation::DeleteVersion,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
 
         self.publish_object_watch_event(
             tenant_id,

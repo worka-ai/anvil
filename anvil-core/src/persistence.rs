@@ -2,11 +2,7 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::{
-    collections::{BTreeMap, HashSet},
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{collections::HashSet, path::PathBuf, sync::Arc};
 use tokio::sync::{RwLock, mpsc::Sender};
 
 use crate::{
@@ -15,7 +11,7 @@ use crate::{
     cache::MetadataCache,
     cluster::MetadataEvent,
     config::Config,
-    control_journal, index_diagnostic_journal, index_journal, model_journal,
+    control_journal, index_diagnostic_journal, index_journal, metadata_journal, model_journal,
     storage::Storage,
     task_journal,
 };
@@ -32,7 +28,6 @@ pub struct Persistence {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct NativeState {
     next_id: i64,
-    objects: Vec<Object>,
     multipart_uploads: Vec<MultipartUpload>,
     multipart_parts: Vec<MultipartUploadPart>,
     object_events: Vec<ObjectWatchEvent>,
@@ -879,19 +874,29 @@ impl Persistence {
     }
 
     pub async fn bucket_has_retained_objects_or_uploads(&self, bucket_id: i64) -> Result<bool> {
+        let has_objects = if let Some(bucket) =
+            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        {
+            !metadata_journal::read_object_versions(&self.storage, &bucket, &[], "", "", None, 1)
+                .await?
+                .versions
+                .is_empty()
+        } else {
+            false
+        };
+        if has_objects {
+            return Ok(true);
+        }
         let state = self.state.read().await;
-        Ok(state.objects.iter().any(|o| o.bucket_id == bucket_id)
-            || state.multipart_uploads.iter().any(|u| {
-                u.bucket_id == bucket_id && u.completed_at.is_none() && u.aborted_at.is_none()
-            }))
+        Ok(state.multipart_uploads.iter().any(|u| {
+            u.bucket_id == bucket_id && u.completed_at.is_none() && u.aborted_at.is_none()
+        }))
     }
 
     pub async fn hard_delete_bucket_if_empty(&self, bucket_id: i64) -> Result<bool> {
-        let state = self.state.read().await;
-        if state.objects.iter().any(|o| o.bucket_id == bucket_id)
-            || state.multipart_uploads.iter().any(|u| {
-                u.bucket_id == bucket_id && u.completed_at.is_none() && u.aborted_at.is_none()
-            })
+        if self
+            .bucket_has_retained_objects_or_uploads(bucket_id)
+            .await?
         {
             return Ok(false);
         }
@@ -981,6 +986,12 @@ impl Persistence {
         shard_map: Option<JsonValue>,
         inline_payload: Option<Vec<u8>>,
     ) -> Result<Object> {
+        let bucket = bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id)
+            .await?
+            .ok_or_else(|| anyhow!("bucket not found"))?;
+        if bucket.tenant_id != tenant_id {
+            return Err(anyhow!("bucket does not belong to tenant"));
+        }
         let version_id = uuid::Uuid::new_v4();
         let mutation_id = uuid::Uuid::new_v4();
         let index_policy_snapshot = self
@@ -1003,9 +1014,8 @@ impl Persistence {
             authz_revision,
             delete_marker: false,
         });
-        let mut state = self.state.write().await;
         let object = Object {
-            id: state.allocate_id(),
+            id: metadata_journal::next_object_id(&self.storage, &bucket, &[]).await?,
             tenant_id,
             bucket_id,
             key: key.to_string(),
@@ -1027,27 +1037,23 @@ impl Persistence {
             inline_payload,
             checksum: None,
         };
-        state.objects.push(object.clone());
-        self.persist_after_write(&state).await?;
+        metadata_journal::append_object_mutation(
+            &self.storage,
+            &bucket,
+            &object,
+            metadata_journal::ObjectJournalMutation::Put,
+        )
+        .await?;
         Ok(object)
     }
 
     pub async fn get_object(&self, bucket_id: i64, key: &str) -> Result<Option<Object>> {
-        let mut versions = self
-            .state
-            .read()
-            .await
-            .objects
-            .iter()
-            .filter(|o| o.bucket_id == bucket_id && o.key == key)
-            .cloned()
-            .collect::<Vec<_>>();
-        versions.sort_by(|a, b| {
-            a.created_at
-                .cmp(&b.created_at)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        Ok(versions.last().filter(|o| o.deleted_at.is_none()).cloned())
+        let Some(bucket) =
+            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        else {
+            return Ok(None);
+        };
+        metadata_journal::read_current_object(&self.storage, &bucket, &[], key).await
     }
 
     pub async fn get_object_version(
@@ -1056,14 +1062,12 @@ impl Persistence {
         key: &str,
         version_id: uuid::Uuid,
     ) -> Result<Option<Object>> {
-        Ok(self
-            .state
-            .read()
-            .await
-            .objects
-            .iter()
-            .find(|o| o.bucket_id == bucket_id && o.key == key && o.version_id == version_id)
-            .cloned())
+        let Some(bucket) =
+            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        else {
+            return Ok(None);
+        };
+        metadata_journal::read_object_version(&self.storage, &bucket, &[], key, version_id).await
     }
 
     pub async fn list_objects(
@@ -1074,87 +1078,38 @@ impl Persistence {
         limit: i32,
         delimiter: &str,
     ) -> Result<(Vec<Object>, Vec<String>)> {
-        let state = self.state.read().await;
-        let mut latest: BTreeMap<String, Object> = BTreeMap::new();
-        for object in state.objects.iter().filter(|o| {
-            o.bucket_id == bucket_id
-                && o.key.starts_with(prefix)
-                && o.key.as_str() > start_after
-                && !crate::validation::is_reserved_internal_key(&o.key)
-        }) {
-            latest
-                .entry(object.key.clone())
-                .and_modify(|existing| {
-                    if (object.created_at, object.id) > (existing.created_at, existing.id) {
-                        *existing = object.clone();
-                    }
-                })
-                .or_insert_with(|| object.clone());
-        }
-        let mut objects = latest
-            .into_values()
-            .filter(|o| o.deleted_at.is_none())
-            .collect::<Vec<_>>();
-        objects.sort_by(|a, b| a.key.cmp(&b.key));
-        let limit = if limit == 0 {
-            1000
-        } else {
-            limit.max(1) as usize
+        let Some(bucket) =
+            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        else {
+            return Ok((Vec::new(), Vec::new()));
         };
-        if delimiter.is_empty() {
-            objects.truncate(limit);
-            return Ok((objects, Vec::new()));
-        }
-        let mut object_by_key = BTreeMap::<String, Object>::new();
-        let mut prefixes = BTreeMap::<String, ()>::new();
-        for object in objects {
-            let suffix = &object.key[prefix.len()..];
-            if let Some(pos) = suffix.find(delimiter) {
-                prefixes.insert(
-                    format!("{}{}", prefix, &suffix[..pos + delimiter.len()]),
-                    (),
-                );
-            } else {
-                object_by_key.insert(object.key.clone(), object);
-            }
-        }
-        let mut merged = object_by_key
-            .keys()
-            .cloned()
-            .map(|k| (k, false))
-            .chain(prefixes.keys().cloned().map(|p| (p, true)))
-            .collect::<Vec<_>>();
-        merged.sort();
-        let mut out_objects = Vec::new();
-        let mut out_prefixes = Vec::new();
-        for (key, is_prefix) in merged.into_iter().take(limit) {
-            if is_prefix {
-                out_prefixes.push(key);
-            } else if let Some(object) = object_by_key.remove(&key) {
-                out_objects.push(object);
-            }
-        }
-        Ok((out_objects, out_prefixes))
+        let listing = metadata_journal::list_current_objects(
+            &self.storage,
+            &bucket,
+            &[],
+            prefix,
+            start_after,
+            limit,
+            delimiter,
+        )
+        .await?;
+        Ok((listing.objects, listing.common_prefixes))
     }
 
     pub async fn soft_delete_object(&self, bucket_id: i64, key: &str) -> Result<Option<Object>> {
-        let mut state = self.state.write().await;
-        let Some(base) = state
-            .objects
-            .iter()
-            .filter(|o| o.bucket_id == bucket_id && o.key == key && o.deleted_at.is_none())
-            .max_by(|a, b| {
-                a.created_at
-                    .cmp(&b.created_at)
-                    .then_with(|| a.id.cmp(&b.id))
-            })
-            .cloned()
+        let Some(bucket) =
+            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        else {
+            return Ok(None);
+        };
+        let Some(base) =
+            metadata_journal::read_current_object(&self.storage, &bucket, &[], key).await?
         else {
             return Ok(None);
         };
         let now = Utc::now();
         let object = Object {
-            id: state.allocate_id(),
+            id: metadata_journal::next_object_id(&self.storage, &bucket, &[]).await?,
             mutation_id: uuid::Uuid::new_v4(),
             version_id: uuid::Uuid::new_v4(),
             content_hash: String::new(),
@@ -1164,8 +1119,13 @@ impl Persistence {
             deleted_at: Some(now),
             ..base
         };
-        state.objects.push(object.clone());
-        self.persist_after_write(&state).await?;
+        metadata_journal::append_object_mutation(
+            &self.storage,
+            &bucket,
+            &object,
+            metadata_journal::ObjectJournalMutation::DeleteMarker,
+        )
+        .await?;
         Ok(Some(object))
     }
 
@@ -1175,17 +1135,27 @@ impl Persistence {
         key: &str,
         version_id: uuid::Uuid,
     ) -> Result<Option<Object>> {
-        let mut state = self.state.write().await;
-        let Some(pos) = state
-            .objects
-            .iter()
-            .position(|o| o.bucket_id == bucket_id && o.key == key && o.version_id == version_id)
+        let Some(bucket) =
+            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
         else {
             return Ok(None);
         };
-        let mut object = state.objects.remove(pos);
+        let Some(mut object) =
+            metadata_journal::read_object_version(&self.storage, &bucket, &[], key, version_id)
+                .await?
+        else {
+            return Ok(None);
+        };
+        object.id = metadata_journal::next_object_id(&self.storage, &bucket, &[]).await?;
+        object.mutation_id = uuid::Uuid::new_v4();
         object.deleted_at = Some(Utc::now());
-        self.persist_after_write(&state).await?;
+        metadata_journal::append_object_mutation(
+            &self.storage,
+            &bucket,
+            &object,
+            metadata_journal::ObjectJournalMutation::DeleteVersion,
+        )
+        .await?;
         Ok(Some(object))
     }
 
@@ -1197,82 +1167,26 @@ impl Persistence {
         version_id_marker: Option<uuid::Uuid>,
         limit: i32,
     ) -> Result<ObjectVersionsPage> {
-        let state = self.state.read().await;
-        let mut by_key: BTreeMap<String, Vec<Object>> = BTreeMap::new();
-        for object in state
-            .objects
-            .iter()
-            .filter(|o| o.bucket_id == bucket_id && o.key.starts_with(prefix))
-        {
-            by_key
-                .entry(object.key.clone())
-                .or_default()
-                .push(object.clone());
-        }
-        let mut flat = Vec::new();
-        for versions in by_key.values_mut() {
-            versions.sort_by(|a, b| {
-                b.created_at
-                    .cmp(&a.created_at)
-                    .then_with(|| b.id.cmp(&a.id))
+        let Some(bucket) =
+            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        else {
+            return Ok(ObjectVersionsPage {
+                versions: Vec::new(),
+                is_truncated: false,
+                next_key_marker: None,
+                next_version_id_marker: None,
             });
-            for (idx, object) in versions.iter().enumerate() {
-                flat.push(ObjectVersion {
-                    object: object.clone(),
-                    is_delete_marker: object.deleted_at.is_some(),
-                    is_latest: idx == 0,
-                });
-            }
-        }
-        flat.sort_by(|a, b| {
-            a.object
-                .key
-                .cmp(&b.object.key)
-                .then_with(|| b.object.created_at.cmp(&a.object.created_at))
-        });
-        if !key_marker.is_empty() {
-            let mut past_marker = version_id_marker.is_none();
-            flat.retain(|v| {
-                if v.object.key.as_str() < key_marker {
-                    return false;
-                }
-                if v.object.key.as_str() > key_marker {
-                    return true;
-                }
-                if let Some(marker) = version_id_marker {
-                    if past_marker {
-                        return true;
-                    }
-                    if v.object.version_id == marker {
-                        past_marker = true;
-                    }
-                    return false;
-                }
-                true
-            });
-        }
-        let limit = if limit == 0 {
-            1000
-        } else {
-            limit.max(1) as usize
         };
-        let is_truncated = flat.len() > limit;
-        if is_truncated {
-            flat.truncate(limit);
-        }
-        let (next_key_marker, next_version_id_marker) = if is_truncated {
-            flat.last()
-                .map(|v| (Some(v.object.key.clone()), Some(v.object.version_id)))
-                .unwrap_or((None, None))
-        } else {
-            (None, None)
-        };
-        Ok(ObjectVersionsPage {
-            versions: flat,
-            is_truncated,
-            next_key_marker,
-            next_version_id_marker,
-        })
+        metadata_journal::read_object_versions(
+            &self.storage,
+            &bucket,
+            &[],
+            prefix,
+            key_marker,
+            version_id_marker,
+            limit,
+        )
+        .await
     }
 
     pub async fn create_multipart_upload(
@@ -2079,10 +1993,10 @@ impl Persistence {
         .await
     }
 
-    pub async fn hard_delete_object(&self, object_id: i64) -> Result<()> {
-        let mut state = self.state.write().await;
-        state.objects.retain(|o| o.id != object_id);
-        self.persist_after_write(&state).await
+    pub async fn hard_delete_object(&self, _object_id: i64) -> Result<()> {
+        // Object metadata is append-only in the native journal. Physical shard cleanup
+        // must not erase the metadata history needed for watches, indexes, and audit.
+        Ok(())
     }
 
     pub async fn enqueue_task(
