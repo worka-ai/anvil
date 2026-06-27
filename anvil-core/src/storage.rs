@@ -215,6 +215,20 @@ impl Storage {
             .join(format!("{log_index:020}-{state_hash}.json")))
     }
 
+    pub fn personaldb_projection_manifest_path(
+        &self,
+        tenant_id: i64,
+        database_id: &str,
+        projection_id: &str,
+    ) -> Result<PathBuf> {
+        ensure_safe_internal_component(projection_id, "personaldb projection id")?;
+        Ok(self
+            .personaldb_group_dir(tenant_id, database_id)?
+            .join("projections")
+            .join(projection_id)
+            .join("manifest.json"))
+    }
+
     pub fn personaldb_commit_certificate_path(
         &self,
         tenant_id: i64,
