@@ -4,7 +4,6 @@ use std::net::SocketAddr;
 use tracing::info;
 
 use anvil::config::Config;
-use anvil_core::config;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

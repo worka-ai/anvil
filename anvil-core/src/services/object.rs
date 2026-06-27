@@ -68,7 +68,12 @@ impl ObjectService for AppState {
 
         let (object, mut data_stream) = self
             .object_manager
-            .get_object(claims, req.bucket_name, req.object_key)
+            .get_object(
+                claims,
+                req.bucket_name,
+                req.object_key,
+                parse_optional_version_id(req.version_id.as_deref())?,
+            )
             .await?;
 
         let (tx, rx) = mpsc::channel(4);
@@ -141,7 +146,12 @@ impl ObjectService for AppState {
 
         let object = self
             .object_manager
-            .head_object(Some(claims.clone()), &req.bucket_name, &req.object_key)
+            .head_object(
+                Some(claims.clone()),
+                &req.bucket_name,
+                &req.object_key,
+                parse_optional_version_id(req.version_id.as_deref())?,
+            )
             .await?;
 
         Ok(Response::new(HeadObjectResponse {
@@ -189,6 +199,44 @@ impl ObjectService for AppState {
         }))
     }
 
+    async fn list_object_versions(
+        &self,
+        request: Request<ListObjectVersionsRequest>,
+    ) -> Result<Response<ListObjectVersionsResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.get_ref();
+
+        let versions = self
+            .object_manager
+            .list_object_versions(
+                Some(claims.clone()),
+                &req.bucket_name,
+                &req.prefix,
+                &req.key_marker,
+                req.max_keys,
+            )
+            .await?
+            .into_iter()
+            .map(|version| {
+                let object = version.object;
+                crate::anvil_api::ObjectVersionSummary {
+                    key: object.key,
+                    version_id: object.version_id.to_string(),
+                    size: object.size,
+                    last_modified: object.created_at.to_string(),
+                    etag: object.etag,
+                    is_delete_marker: version.is_delete_marker,
+                    is_latest: version.is_latest,
+                }
+            })
+            .collect();
+
+        Ok(Response::new(ListObjectVersionsResponse { versions }))
+    }
+
     async fn initiate_multipart_upload(
         &self,
         _request: Request<InitiateMultipartRequest>,
@@ -202,4 +250,12 @@ impl ObjectService for AppState {
     ) -> Result<Response<CompleteMultipartResponse>, Status> {
         todo!()
     }
+}
+
+fn parse_optional_version_id(value: Option<&str>) -> Result<Option<uuid::Uuid>, Status> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(uuid::Uuid::parse_str)
+        .transpose()
+        .map_err(|_| Status::invalid_argument("Invalid version_id"))
 }

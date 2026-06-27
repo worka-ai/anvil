@@ -59,6 +59,13 @@ pub struct Object {
     pub checksum: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ObjectVersion {
+    pub object: Object,
+    pub is_delete_marker: bool,
+    pub is_latest: bool,
+}
+
 // Manual row-to-struct mapping
 impl From<Row> for Tenant {
     fn from(row: Row) -> Self {
@@ -162,12 +169,11 @@ impl Persistence {
 
     async fn publish_event(&self, event: MetadataEvent) {
         if let Some(publisher) = &self.event_publisher {
-             if let Err(e) = publisher.send(event).await {
-                 tracing::warn!("Failed to publish metadata event: {}", e);
-             }
+            if let Err(e) = publisher.send(event).await {
+                tracing::warn!("Failed to publish metadata event: {}", e);
+            }
         }
     }
-
 
     pub async fn get_admin_user_by_username(&self, username: &str) -> Result<Option<AdminUser>> {
         let client = self.global_pool.get().await?;
@@ -772,11 +778,14 @@ impl Persistence {
             Ok(row) => {
                 tracing::debug!("[Persistence] EXITING create_bucket: success");
                 let bucket: Bucket = row.into();
-                self.cache.insert_bucket(tenant_id, name.to_string(), bucket.clone()).await;
+                self.cache
+                    .insert_bucket(tenant_id, name.to_string(), bucket.clone())
+                    .await;
                 self.publish_event(MetadataEvent::BucketUpdated {
                     tenant_id,
                     name: name.to_string(),
-                }).await;
+                })
+                .await;
                 Ok(bucket)
             }
             Err(e) => {
@@ -794,11 +803,7 @@ impl Persistence {
         }
     }
 
-    pub async fn get_bucket_by_name(
-        &self,
-        tenant_id: i64,
-        name: &str,
-    ) -> Result<Option<Bucket>> {
+    pub async fn get_bucket_by_name(&self, tenant_id: i64, name: &str) -> Result<Option<Bucket>> {
         // Check cache first
         if let Some(bucket) = self.cache.get_bucket(tenant_id, name).await {
             return Ok(Some(bucket));
@@ -812,10 +817,12 @@ impl Persistence {
                 &[&tenant_id, &name],
             )
             .await?;
-        
+
         if let Some(row) = row {
             let bucket: Bucket = row.into();
-            self.cache.insert_bucket(tenant_id, name.to_string(), bucket.clone()).await;
+            self.cache
+                .insert_bucket(tenant_id, name.to_string(), bucket.clone())
+                .await;
             Ok(Some(bucket))
         } else {
             Ok(None)
@@ -838,14 +845,16 @@ impl Persistence {
                 &[&name],
             )
             .await?;
-        
+
         if let Some(row) = row {
             let bucket: Bucket = row.into();
             // We cache it regardless of public status so we don't hit DB repeatedly for non-public buckets?
             // Or only if public?
             // My `buckets_by_name` cache is generic. It's better to cache it.
-            self.cache.insert_bucket(bucket.tenant_id, name.to_string(), bucket.clone()).await;
-            
+            self.cache
+                .insert_bucket(bucket.tenant_id, name.to_string(), bucket.clone())
+                .await;
+
             if bucket.is_public_read {
                 Ok(Some(bucket))
             } else {
@@ -864,13 +873,14 @@ impl Persistence {
                 &[&is_public, &bucket_name],
             )
             .await?;
-        
+
         let tenant_id: i64 = row.get("tenant_id");
         self.cache.invalidate_bucket(tenant_id, bucket_name).await;
         self.publish_event(MetadataEvent::BucketUpdated {
             tenant_id,
             name: bucket_name.to_string(),
-        }).await;
+        })
+        .await;
 
         Ok(())
     }
@@ -883,14 +893,15 @@ impl Persistence {
                 &[&bucket_name],
             )
             .await?;
-        
+
         if let Some(ref r) = row {
             let tenant_id: i64 = r.get("tenant_id");
             self.cache.invalidate_bucket(tenant_id, bucket_name).await;
             self.publish_event(MetadataEvent::BucketUpdated {
                 tenant_id,
                 name: bucket_name.to_string(),
-            }).await;
+            })
+            .await;
         }
 
         Ok(row.map(Into::into))
@@ -942,8 +953,31 @@ impl Persistence {
         let client = self.regional_pool.get().await?;
         let row = client
             .query_opt(
-                r#"SELECT * FROM objects WHERE bucket_id = $1 AND key = $2 AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1"#,
+                r#"SELECT * FROM objects WHERE bucket_id = $1 AND key = $2 ORDER BY created_at DESC, id DESC LIMIT 1"#,
                 &[&bucket_id, &key],
+            )
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let object: Object = row.into();
+        if object.deleted_at.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(object))
+    }
+
+    pub async fn get_object_version(
+        &self,
+        bucket_id: i64,
+        key: &str,
+        version_id: uuid::Uuid,
+    ) -> Result<Option<Object>> {
+        let client = self.regional_pool.get().await?;
+        let row = client
+            .query_opt(
+                r#"SELECT * FROM objects WHERE bucket_id = $1 AND key = $2 AND version_id = $3"#,
+                &[&bucket_id, &key, &version_id],
             )
             .await?;
         Ok(row.map(Into::into))
@@ -1027,7 +1061,18 @@ impl Persistence {
             let client = self.regional_pool.get().await?;
             let rows = client
                 .query(
-                    r#"SELECT id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree FROM objects WHERE bucket_id = $1 AND deleted_at IS NULL AND key > $2 AND key LIKE $3 ORDER BY key LIMIT $4"#,
+                    r#"
+                    SELECT id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
+                    FROM (
+                      SELECT DISTINCT ON (key)
+                        id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
+                      FROM objects
+                      WHERE bucket_id = $1 AND key > $2 AND key LIKE $3
+                      ORDER BY key, created_at DESC, id DESC
+                    ) latest
+                    WHERE deleted_at IS NULL
+                    ORDER BY key
+                    LIMIT $4"#,
                     &[
                         &bucket_id,
                         &start_after,
@@ -1061,7 +1106,12 @@ impl Persistence {
             ),
             relevant AS (
               SELECT o.key, o.key_ltree
-              FROM objects o, params p
+              FROM (
+                SELECT DISTINCT ON (key) key, key_ltree, deleted_at, bucket_id
+                FROM objects
+                WHERE bucket_id = $1
+                ORDER BY key, created_at DESC, id DESC
+              ) o, params p
               WHERE o.bucket_id = p.bucket_id
                 AND o.deleted_at IS NULL
                 AND o.key > p.start_after
@@ -1157,7 +1207,17 @@ impl Persistence {
         let objects = if !object_keys.is_empty() {
             let rows = client
                 .query(
-                    r#"SELECT id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree FROM objects WHERE bucket_id = $1 AND deleted_at IS NULL AND key = ANY($2) ORDER BY key"#,
+                    r#"
+                    SELECT id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
+                    FROM (
+                      SELECT DISTINCT ON (key)
+                        id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
+                      FROM objects
+                      WHERE bucket_id = $1 AND key = ANY($2)
+                      ORDER BY key, created_at DESC, id DESC
+                    ) latest
+                    WHERE deleted_at IS NULL
+                    ORDER BY key"#,
                     &[&bucket_id, &object_keys],
                 )
                 .await?;
@@ -1173,11 +1233,62 @@ impl Persistence {
         let client = self.regional_pool.get().await?;
         let row = client
             .query_opt(
-                r#"UPDATE objects SET deleted_at = now() WHERE bucket_id = $1 AND key = $2 AND deleted_at IS NULL RETURNING *"#,
+                r#"
+                INSERT INTO objects (tenant_id, bucket_id, key, content_hash, size, etag, version_id, deleted_at)
+                SELECT tenant_id, bucket_id, key, '', 0, '', gen_random_uuid(), now()
+                FROM objects
+                WHERE bucket_id = $1 AND key = $2
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                RETURNING *"#,
                 &[&bucket_id, &key],
             )
             .await?;
         Ok(row.map(Into::into))
+    }
+
+    pub async fn list_object_versions(
+        &self,
+        bucket_id: i64,
+        prefix: &str,
+        key_marker: &str,
+        limit: i32,
+    ) -> Result<Vec<ObjectVersion>> {
+        let client = self.regional_pool.get().await?;
+        let rows = client
+            .query(
+                r#"
+                WITH ranked AS (
+                  SELECT
+                    id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree,
+                    row_number() OVER (PARTITION BY key ORDER BY created_at DESC, id DESC) = 1 AS is_latest
+                  FROM objects
+                  WHERE bucket_id = $1 AND key > $2 AND key LIKE $3
+                )
+                SELECT *
+                FROM ranked
+                ORDER BY key, created_at DESC, id DESC
+                LIMIT $4"#,
+                &[
+                    &bucket_id,
+                    &key_marker,
+                    &format!(r#"{}%"#, prefix),
+                    &(limit as i64),
+                ],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let is_latest: bool = row.get("is_latest");
+                let object: Object = row.into();
+                ObjectVersion {
+                    is_delete_marker: object.deleted_at.is_some(),
+                    is_latest,
+                    object,
+                }
+            })
+            .collect())
     }
 
     pub async fn hard_delete_object(&self, object_id: i64) -> Result<()> {
@@ -1403,12 +1514,7 @@ impl Persistence {
         Ok(())
     }
 
-    pub async fn hf_update_item_success(
-        &self,
-        id: i64,
-        size: i64,
-        etag: &str,
-    ) -> Result<()> {
+    pub async fn hf_update_item_success(&self, id: i64, size: i64, etag: &str) -> Result<()> {
         let client = self.global_pool.get().await?;
         client
             .execute(
@@ -1419,7 +1525,10 @@ impl Persistence {
         Ok(())
     }
 
-    pub async fn hf_get_ingestion_items(&self, ingestion_id: i64) -> Result<Vec<(String, Option<i64>, Option<String>, Option<DateTime<Utc>>)>> {
+    pub async fn hf_get_ingestion_items(
+        &self,
+        ingestion_id: i64,
+    ) -> Result<Vec<(String, Option<i64>, Option<String>, Option<DateTime<Utc>>)>> {
         let client = self.global_pool.get().await?;
         let rows = client
             .query(
@@ -1427,7 +1536,10 @@ impl Persistence {
                 &[&ingestion_id],
             )
             .await?;
-        Ok(rows.into_iter().map(|r| (r.get(0), r.get(1), r.get(2), r.get(3))).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+            .collect())
     }
 
     pub async fn hf_get_all_items_for_prefix(
@@ -1437,8 +1549,9 @@ impl Persistence {
         prefix: &str,
     ) -> Result<Vec<(String, Option<i64>, Option<String>, Option<DateTime<Utc>>)>> {
         let client = self.global_pool.get().await?;
-        let rows = client.query(
-            r#"
+        let rows = client
+            .query(
+                r#"
             SELECT i.path, i.size, i.etag, i.finished_at
             FROM hf_ingestion_items i
             JOIN hf_ingestions h ON i.ingestion_id = h.id
@@ -1448,9 +1561,13 @@ impl Persistence {
               AND i.state = 'stored'::hf_item_state
             ORDER BY i.finished_at ASC
             "#,
-            &[&tenant_id, &bucket, &prefix]
-        ).await?;
-        Ok(rows.into_iter().map(|r| (r.get(0), r.get(1), r.get(2), r.get(3))).collect())
+                &[&tenant_id, &bucket, &prefix],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+            .collect())
     }
 
     pub async fn hf_status_summary(

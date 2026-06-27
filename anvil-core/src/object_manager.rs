@@ -5,11 +5,10 @@ use crate::{
     auth,
     cluster::ClusterState,
     permissions::AnvilAction,
-    persistence::{Bucket, Object, Persistence},
+    persistence::{Bucket, Object, ObjectVersion, Persistence},
     placement::PlacementManager,
     sharding::ShardManager,
     storage::Storage,
-    tasks::TaskType,
     validation,
 };
 use futures_util::{Stream, StreamExt};
@@ -18,7 +17,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
-use tracing::{error, info};
+use tracing::info;
 
 #[derive(Debug, Clone)]
 pub struct ObjectManager {
@@ -302,6 +301,7 @@ impl ObjectManager {
         claims: Option<auth::Claims>,
         bucket_name: String,
         object_key: String,
+        version_id: Option<uuid::Uuid>,
     ) -> Result<
         (
             Object,
@@ -334,12 +334,26 @@ impl ObjectManager {
             }
         }
 
-        let object = self
-            .db
-            .get_object(bucket.id, &object_key)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Object not found"))?;
+        let object = match version_id {
+            Some(version_id) => {
+                let object = self
+                    .db
+                    .get_object_version(bucket.id, &object_key, version_id)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .ok_or_else(|| Status::not_found("Object version not found"))?;
+                if object.deleted_at.is_some() {
+                    return Err(Status::not_found("Object version is a delete marker"));
+                }
+                object
+            }
+            None => self
+                .db
+                .get_object(bucket.id, &object_key)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::not_found("Object not found"))?,
+        };
 
         let (tx, rx) = mpsc::channel(4);
         let app_state = self.clone();
@@ -527,7 +541,7 @@ impl ObjectManager {
         bucket_name: &str,
         object_key: &str,
         scopes: &[String],
-    ) -> Result<(), Status> {
+    ) -> Result<Object, Status> {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
@@ -560,25 +574,14 @@ impl ObjectManager {
             )));
         }
 
-        let object = self
+        let delete_marker = self
             .db
             .soft_delete_object(bucket.id, object_key)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Object not found"))?;
 
-        let payload = serde_json::json!({
-            "object_id": object.id,
-            "content_hash": object.content_hash,
-            "region": self.region,
-            "shard_map": object.shard_map,
-        });
-        self.db
-            .enqueue_task(TaskType::DeleteObject, payload, 100)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        Ok(())
+        Ok(delete_marker)
     }
 
     pub async fn head_object(
@@ -586,6 +589,7 @@ impl ObjectManager {
         claims: Option<auth::Claims>,
         bucket_name: &str,
         object_key: &str,
+        version_id: Option<uuid::Uuid>,
     ) -> Result<Object, Status> {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
@@ -612,11 +616,26 @@ impl ObjectManager {
             }
         }
 
-        self.db
-            .get_object(bucket.id, object_key)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Object not found"))
+        match version_id {
+            Some(version_id) => {
+                let object = self
+                    .db
+                    .get_object_version(bucket.id, object_key, version_id)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .ok_or_else(|| Status::not_found("Object version not found"))?;
+                if object.deleted_at.is_some() {
+                    return Err(Status::not_found("Object version is a delete marker"));
+                }
+                Ok(object)
+            }
+            None => self
+                .db
+                .get_object(bucket.id, object_key)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::not_found("Object not found")),
+        }
     }
 
     pub async fn list_objects(
@@ -656,6 +675,45 @@ impl ObjectManager {
                 start_after,
                 if limit == 0 { 1000 } else { limit },
                 delimiter,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))
+    }
+
+    pub async fn list_object_versions(
+        &self,
+        claims: Option<auth::Claims>,
+        bucket_name: &str,
+        prefix: &str,
+        key_marker: &str,
+        limit: i32,
+    ) -> Result<Vec<ObjectVersion>, Status> {
+        if !validation::is_valid_bucket_name(bucket_name) {
+            return Err(Status::invalid_argument("Invalid bucket name"));
+        }
+        if validation::is_reserved_internal_key(prefix) {
+            return Err(Status::permission_denied("UnauthorizedReservedNamespace"));
+        }
+        if !prefix.is_empty() && !validation::is_valid_object_key(prefix) {
+            return Err(Status::invalid_argument("Invalid object key prefix"));
+        }
+
+        let bucket = self
+            .get_authorized_bucket(claims.as_ref(), bucket_name)
+            .await?;
+        if !bucket.is_public_read {
+            let claims = claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
+            if !auth::is_authorized(AnvilAction::ObjectList, bucket_name, &claims.scopes) {
+                return Err(Status::permission_denied("Permission denied"));
+            }
+        }
+
+        self.db
+            .list_object_versions(
+                bucket.id,
+                prefix,
+                key_marker,
+                if limit == 0 { 1000 } else { limit },
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))

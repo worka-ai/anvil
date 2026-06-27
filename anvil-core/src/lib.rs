@@ -22,7 +22,6 @@ pub mod permissions;
 pub mod persistence;
 pub mod placement;
 pub mod s3_auth;
-pub mod s3_gateway;
 pub mod services;
 pub mod sharding;
 pub mod storage;

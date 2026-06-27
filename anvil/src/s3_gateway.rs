@@ -308,6 +308,12 @@ async fn list_objects(
 ) -> Response {
     let claims = req.extensions().get::<Claims>().cloned();
 
+    if q.contains_key("versions") {
+        let request_is_authenticated = req.extensions().get::<Claims>().is_some();
+        return list_object_versions_response(state, claims, &bucket, &q, request_is_authenticated)
+            .await;
+    }
+
     let prefix = q.get("prefix").cloned().unwrap_or_default();
     let start_after = q
         .get("start-after")
@@ -407,6 +413,133 @@ async fn list_objects(
     }
 }
 
+async fn list_object_versions_response(
+    state: AppState,
+    claims: Option<Claims>,
+    bucket: &str,
+    q: &HashMap<String, String>,
+    request_is_authenticated: bool,
+) -> Response {
+    let prefix = q.get("prefix").cloned().unwrap_or_default();
+    let key_marker = q
+        .get("key-marker")
+        .or_else(|| q.get("keyMarker"))
+        .cloned()
+        .unwrap_or_default();
+    let max_keys: i32 = q
+        .get("max-keys")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+
+    match state
+        .object_manager
+        .list_object_versions(claims, bucket, &prefix, &key_marker, max_keys)
+        .await
+    {
+        Ok(versions) => {
+            let mut xml = String::from(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n",
+            );
+            xml.push_str(&format!("  <Name>{}</Name>\n", xml_escape(bucket)));
+            xml.push_str(&format!("  <Prefix>{}</Prefix>\n", xml_escape(&prefix)));
+            xml.push_str(&format!(
+                "  <KeyMarker>{}</KeyMarker>\n",
+                xml_escape(&key_marker)
+            ));
+            xml.push_str(&format!("  <MaxKeys>{}</MaxKeys>\n", max_keys));
+            xml.push_str("  <IsTruncated>false</IsTruncated>\n");
+            for version in versions {
+                let object = version.object;
+                let tag = if version.is_delete_marker {
+                    "DeleteMarker"
+                } else {
+                    "Version"
+                };
+                xml.push_str(&format!("  <{}>\n", tag));
+                xml.push_str(&format!("    <Key>{}</Key>\n", xml_escape(&object.key)));
+                xml.push_str(&format!(
+                    "    <VersionId>{}</VersionId>\n",
+                    object.version_id
+                ));
+                xml.push_str(&format!(
+                    "    <IsLatest>{}</IsLatest>\n",
+                    if version.is_latest { "true" } else { "false" }
+                ));
+                xml.push_str(&format!(
+                    "    <LastModified>{}</LastModified>\n",
+                    object.created_at.to_rfc3339()
+                ));
+                if !version.is_delete_marker {
+                    xml.push_str(&format!("    <ETag>\"{}\"</ETag>\n", object.etag));
+                    xml.push_str(&format!("    <Size>{}</Size>\n", object.size));
+                    xml.push_str("    <StorageClass>STANDARD</StorageClass>\n");
+                }
+                xml.push_str(&format!("  </{}>\n", tag));
+            }
+            xml.push_str("</ListVersionsResult>\n");
+
+            Response::builder()
+                .status(200)
+                .header("Content-Type", "application/xml")
+                .body(Body::from(xml))
+                .unwrap()
+        }
+        Err(status) => {
+            s3_status_to_response_for_auth(status, request_is_authenticated, "NoSuchBucket")
+        }
+    }
+}
+
+fn s3_status_to_response_for_auth(
+    status: tonic::Status,
+    request_is_authenticated: bool,
+    not_found_code: &str,
+) -> Response {
+    match status.code() {
+        tonic::Code::FailedPrecondition => {
+            if status.message().starts_with("Bucket is in region ") {
+                let region = status.message().trim_start_matches("Bucket is in region ");
+                return s3_redirect(region);
+            }
+            s3_error(
+                "PreconditionFailed",
+                status.message(),
+                axum::http::StatusCode::PRECONDITION_FAILED,
+            )
+        }
+        tonic::Code::NotFound => {
+            if !request_is_authenticated {
+                s3_error(
+                    "AccessDenied",
+                    status.message(),
+                    axum::http::StatusCode::FORBIDDEN,
+                )
+            } else {
+                s3_error(
+                    not_found_code,
+                    status.message(),
+                    axum::http::StatusCode::NOT_FOUND,
+                )
+            }
+        }
+        tonic::Code::PermissionDenied => s3_error(
+            "AccessDenied",
+            status.message(),
+            axum::http::StatusCode::FORBIDDEN,
+        ),
+        tonic::Code::InvalidArgument => s3_error(
+            "InvalidArgument",
+            status.message(),
+            axum::http::StatusCode::BAD_REQUEST,
+        ),
+        _ => s3_error(
+            "InternalError",
+            status.message(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -432,11 +565,20 @@ async fn readiness_check(State(state): State<AppState>) -> Response {
 async fn get_object(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
+    Query(q): Query<HashMap<String, String>>,
     req: Request,
 ) -> Response {
     let claims = req.extensions().get::<Claims>().cloned();
+    let version_id = match parse_s3_version_id(&q) {
+        Ok(version_id) => version_id,
+        Err(response) => return response,
+    };
 
-    match state.object_manager.get_object(claims, bucket, key).await {
+    match state
+        .object_manager
+        .get_object(claims, bucket, key, version_id)
+        .await
+    {
         Ok((object, stream)) => {
             let body = Body::from_stream(stream.map(|r| r.map_err(|e| axum::Error::new(e))));
             Response::builder()
@@ -444,6 +586,7 @@ async fn get_object(
                 .header("Content-Type", object.content_type.unwrap_or_default())
                 .header("Content-Length", object.size)
                 .header("ETag", object.etag)
+                .header("x-amz-version-id", object.version_id.to_string())
                 .body(body)
                 .unwrap()
         }
@@ -517,6 +660,7 @@ async fn put_object(
         Ok(object) => Response::builder()
             .status(200)
             .header("ETag", object.etag)
+            .header("x-amz-version-id", object.version_id.to_string())
             .body(Body::empty())
             .unwrap(),
         Err(status) => match status.code() {
@@ -571,8 +715,10 @@ async fn delete_object(
         .delete_object(claims.tenant_id, &bucket, &key, &claims.scopes)
         .await
     {
-        Ok(()) => Response::builder()
+        Ok(delete_marker) => Response::builder()
             .status(axum::http::StatusCode::NO_CONTENT)
+            .header("x-amz-delete-marker", "true")
+            .header("x-amz-version-id", delete_marker.version_id.to_string())
             .body(Body::empty())
             .unwrap(),
         Err(status) => match status.code() {
@@ -613,13 +759,18 @@ async fn delete_object(
 async fn head_object(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
+    Query(q): Query<HashMap<String, String>>,
     req: Request,
 ) -> Response {
     let claims = req.extensions().get::<Claims>().cloned();
+    let version_id = match parse_s3_version_id(&q) {
+        Ok(version_id) => version_id,
+        Err(response) => return response,
+    };
 
     match state
         .object_manager
-        .head_object(claims, &bucket, &key)
+        .head_object(claims, &bucket, &key, version_id)
         .await
     {
         Ok(object) => Response::builder()
@@ -627,6 +778,7 @@ async fn head_object(
             .header("Content-Type", object.content_type.unwrap_or_default())
             .header("Content-Length", object.size)
             .header("ETag", object.etag)
+            .header("x-amz-version-id", object.version_id.to_string())
             .body(Body::empty())
             .unwrap(),
         Err(status) => match status.code() {
@@ -668,6 +820,22 @@ async fn head_object(
             ),
         },
     }
+}
+
+fn parse_s3_version_id(q: &HashMap<String, String>) -> Result<Option<uuid::Uuid>, Response> {
+    q.get("versionId")
+        .or_else(|| q.get("version-id"))
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            uuid::Uuid::parse_str(value).map_err(|_| {
+                s3_error(
+                    "InvalidArgument",
+                    "Invalid versionId",
+                    axum::http::StatusCode::BAD_REQUEST,
+                )
+            })
+        })
+        .transpose()
 }
 
 #[cfg(test)]

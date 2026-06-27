@@ -1,17 +1,16 @@
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::{
-    CreateBucketRequest, DeleteObjectRequest, HeadObjectRequest, ListObjectsRequest,
-    ObjectMetadata, PutObjectRequest,
+    CreateBucketRequest, DeleteObjectRequest, HeadObjectRequest, ListObjectVersionsRequest,
+    ListObjectsRequest, ObjectMetadata, PutObjectRequest,
 };
-use anvil::tasks::{TaskStatus, TaskType};
 use std::time::Duration;
 use tonic::Request;
 
 use anvil_test_utils::*;
 
 #[tokio::test]
-async fn test_delete_object_soft_deletes_and_enqueues_task() {
+async fn test_delete_object_creates_delete_marker() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
@@ -105,20 +104,28 @@ async fn test_delete_object_soft_deletes_and_enqueues_task() {
         .into_inner();
     assert_eq!(list_res_after_delete.objects.len(), 0);
 
-    // 5. Verify a task was enqueued in the global DB
-    let global_pool = cluster.states[0].db.get_global_pool();
-    let client = global_pool.get().await.unwrap();
-    let row = client
-        .query_one(
-            "SELECT task_type, status FROM tasks WHERE payload->>'content_hash' IS NOT NULL",
-            &[],
-        )
+    // 5. Verify versions retain the original object plus a latest delete marker.
+    let mut versions_req = Request::new(ListObjectVersionsRequest {
+        bucket_name: bucket_name.clone(),
+        prefix: object_key.clone(),
+        key_marker: String::new(),
+        max_keys: 100,
+    });
+    versions_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let versions = object_client
+        .list_object_versions(versions_req)
         .await
-        .unwrap();
-    let task_type: TaskType = row.get("task_type");
-    let status: TaskStatus = row.get("status");
-    assert_eq!(task_type, TaskType::DeleteObject);
-    assert_eq!(status, TaskStatus::Pending);
+        .unwrap()
+        .into_inner()
+        .versions;
+    assert_eq!(versions.len(), 2);
+    assert!(versions[0].is_delete_marker);
+    assert!(versions[0].is_latest);
+    assert!(!versions[1].is_delete_marker);
+    assert!(!versions[1].is_latest);
 }
 
 #[tokio::test]

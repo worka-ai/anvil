@@ -215,6 +215,31 @@ async fn test_s3_public_and_private_access() {
     let data = resp.body.collect().await.unwrap().into_bytes();
     assert_eq!(data.as_ref(), private_content);
 
+    // 5b. S3 version listing returns overwritten versions and delete markers.
+    client
+        .put_object()
+        .bucket(&private_bucket)
+        .key(private_key)
+        .body(ByteStream::from(b"this is private content v2".to_vec()))
+        .send()
+        .await
+        .expect("Failed to overwrite private object");
+
+    let versions_before_delete = client
+        .list_object_versions()
+        .bucket(&private_bucket)
+        .prefix(private_key)
+        .send()
+        .await
+        .expect("list object versions should succeed");
+    assert_eq!(versions_before_delete.versions().len(), 2);
+    assert!(
+        versions_before_delete
+            .versions()
+            .iter()
+            .any(|version| version.is_latest().unwrap_or(false))
+    );
+
     // 6. Test Public Access (Success): Use reqwest (no auth) to get from public bucket
     let public_url = format!("{}/{}/{}", http_base, public_bucket, public_key);
     let public_resp = reqwest::get(&public_url)
@@ -283,6 +308,22 @@ async fn test_s3_public_and_private_access() {
         .send()
         .await
         .expect("normal S3 delete should succeed");
+
+    let versions_after_delete = client
+        .list_object_versions()
+        .bucket(&private_bucket)
+        .prefix(private_key)
+        .send()
+        .await
+        .expect("list object versions after delete should succeed");
+    assert_eq!(versions_after_delete.versions().len(), 2);
+    assert_eq!(versions_after_delete.delete_markers().len(), 1);
+    assert!(
+        versions_after_delete.delete_markers()[0]
+            .is_latest()
+            .unwrap_or(false),
+        "delete marker should be latest after S3 delete"
+    );
 
     let deleted_get = client
         .get_object()

@@ -58,6 +58,7 @@ service ObjectService {
   rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
   rpc HeadObject(HeadObjectRequest) returns (HeadObjectResponse);
   rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+  rpc ListObjectVersions(ListObjectVersionsRequest) returns (ListObjectVersionsResponse);
   rpc InitiateMultipartUpload(InitiateMultipartRequest) returns (InitiateMultipartResponse);
   rpc CompleteMultipartUpload(CompleteMultipartRequest) returns (CompleteMultipartResponse);
 }
@@ -136,6 +137,27 @@ message ObjectSummary {
 message ListObjectsResponse {
     repeated ObjectSummary objects = 1;
     repeated string common_prefixes = 2;
+}
+
+message ListObjectVersionsRequest {
+    string bucket_name = 1;
+    string prefix = 2;
+    string key_marker = 3;
+    int32 max_keys = 4;
+}
+
+message ObjectVersionSummary {
+    string key = 1;
+    string version_id = 2;
+    int64 size = 3;
+    string etag = 4;
+    string last_modified = 5;
+    bool is_delete_marker = 6;
+    bool is_latest = 7;
+}
+
+message ListObjectVersionsResponse {
+    repeated ObjectVersionSummary versions = 1;
 }
 
 message InitiateMultipartRequest {

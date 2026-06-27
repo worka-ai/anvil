@@ -2,7 +2,6 @@ use crate::permissions::AnvilAction;
 use anyhow::Result;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
-use std::str::FromStr;
 use tracing::{debug, info, warn};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -78,7 +77,6 @@ pub fn is_authorized(
     required_resource: &str,
     token_scopes: &[String],
 ) -> bool {
-    let required_action_str = required_action.to_string();
     info!(
         %required_action,
         %required_resource,
