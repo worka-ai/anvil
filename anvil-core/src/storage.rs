@@ -140,6 +140,36 @@ impl Storage {
             .join(format!("bucket-{bucket_id}.anwatch"))
     }
 
+    pub fn personaldb_group_dir(&self, tenant_id: i64, database_id: &str) -> Result<PathBuf> {
+        ensure_safe_internal_component(database_id, "personaldb database id")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("personaldb")
+            .join("tenants")
+            .join(format!("tenant-{tenant_id}"))
+            .join("groups")
+            .join(database_id))
+    }
+
+    pub fn personaldb_log_segment_path(
+        &self,
+        tenant_id: i64,
+        database_id: &str,
+        start_log_index: u64,
+        end_log_index: u64,
+        segment_hash: &str,
+    ) -> Result<PathBuf> {
+        ensure_hash_hex(segment_hash, "personaldb log segment hash")?;
+        Ok(self
+            .personaldb_group_dir(tenant_id, database_id)?
+            .join("log")
+            .join("segments")
+            .join(format!(
+                "{start_log_index:020}-{end_log_index:020}-{segment_hash}.pdbseg"
+            )))
+    }
+
     pub fn relative_storage_path(&self, path: &Path) -> Result<String> {
         let relative = path.strip_prefix(&self.storage_path)?;
         Ok(relative.to_string_lossy().replace('\\', "/"))
@@ -278,6 +308,26 @@ impl Storage {
         info!("File renamed successfully");
         Ok(())
     }
+}
+
+fn ensure_safe_internal_component(value: &str, context: &str) -> Result<()> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value.chars().any(|ch| ch == '\0' || ch.is_control())
+    {
+        anyhow::bail!("{context} is not a safe path component");
+    }
+    Ok(())
+}
+
+fn ensure_hash_hex(value: &str, context: &str) -> Result<()> {
+    if value.len() != 64 || !value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("{context} must be 32 bytes encoded as hex");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

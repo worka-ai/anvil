@@ -25,6 +25,7 @@ pub mod middleware;
 pub mod object_manager;
 pub mod permissions;
 pub mod persistence;
+pub mod personaldb_segment;
 pub mod placement;
 pub mod s3_auth;
 pub mod services;
