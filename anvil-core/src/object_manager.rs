@@ -5,7 +5,7 @@ use crate::{
     auth,
     cluster::ClusterState,
     permissions::AnvilAction,
-    persistence::{Bucket, Object, ObjectVersion, Persistence},
+    persistence::{Bucket, MultipartUploadPart, Object, ObjectVersion, Persistence},
     placement::PlacementManager,
     sharding::ShardManager,
     storage::Storage,
@@ -427,6 +427,28 @@ impl ObjectManager {
         } else {
             Err(Status::not_found("Multipart upload not found"))
         }
+    }
+
+    pub async fn list_multipart_parts(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        object_key: &str,
+        upload_id: uuid::Uuid,
+        scopes: &[String],
+    ) -> Result<Vec<MultipartUploadPart>, Status> {
+        self.validate_write_request(bucket_name, object_key, scopes)?;
+        let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
+        let upload = self
+            .db
+            .get_active_multipart_upload(tenant_id, bucket.id, object_key, upload_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Multipart upload not found"))?;
+        self.db
+            .list_multipart_parts(upload.id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))
     }
 
     async fn send_stripe(

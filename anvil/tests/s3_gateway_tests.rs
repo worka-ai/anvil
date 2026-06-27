@@ -291,6 +291,17 @@ async fn test_s3_public_and_private_access() {
         .send()
         .await
         .expect("upload multipart part 2 should succeed");
+    let listed_parts = client
+        .list_parts()
+        .bucket(&private_bucket)
+        .key(multipart_key)
+        .upload_id(&upload_id)
+        .send()
+        .await
+        .expect("list multipart parts should succeed");
+    assert_eq!(listed_parts.parts().len(), 2);
+    assert_eq!(listed_parts.parts()[0].part_number(), Some(1));
+    assert_eq!(listed_parts.parts()[1].part_number(), Some(2));
     client
         .complete_multipart_upload()
         .bucket(&private_bucket)

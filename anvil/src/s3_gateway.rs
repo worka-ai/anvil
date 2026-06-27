@@ -588,6 +588,30 @@ async fn get_object(
     req: Request,
 ) -> Response {
     let claims = req.extensions().get::<Claims>().cloned();
+    if let Some(upload_id) = q.get("uploadId") {
+        let claims = match claims {
+            Some(claims) => claims,
+            None => {
+                return s3_error(
+                    "AccessDenied",
+                    "Missing credentials",
+                    axum::http::StatusCode::FORBIDDEN,
+                );
+            }
+        };
+        let upload_id = match uuid::Uuid::parse_str(upload_id) {
+            Ok(upload_id) => upload_id,
+            Err(_) => {
+                return s3_error(
+                    "InvalidArgument",
+                    "Invalid uploadId",
+                    axum::http::StatusCode::BAD_REQUEST,
+                );
+            }
+        };
+        return list_multipart_parts_response(state, claims, bucket, key, upload_id).await;
+    }
+
     let version_id = match parse_s3_version_id(&q) {
         Ok(version_id) => version_id,
         Err(response) => return response,
@@ -675,6 +699,50 @@ async fn get_object(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             ),
         },
+    }
+}
+
+async fn list_multipart_parts_response(
+    state: AppState,
+    claims: Claims,
+    bucket: String,
+    key: String,
+    upload_id: uuid::Uuid,
+) -> Response {
+    match state
+        .object_manager
+        .list_multipart_parts(claims.tenant_id, &bucket, &key, upload_id, &claims.scopes)
+        .await
+    {
+        Ok(parts) => {
+            let mut xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Bucket>{}</Bucket>\n  <Key>{}</Key>\n  <UploadId>{}</UploadId>\n  <PartNumberMarker>0</PartNumberMarker>\n  <NextPartNumberMarker>0</NextPartNumberMarker>\n  <MaxParts>1000</MaxParts>\n  <IsTruncated>false</IsTruncated>\n",
+                xml_escape(&bucket),
+                xml_escape(&key),
+                upload_id
+            );
+            for part in parts {
+                xml.push_str("  <Part>\n");
+                xml.push_str(&format!(
+                    "    <PartNumber>{}</PartNumber>\n",
+                    part.part_number
+                ));
+                xml.push_str(&format!(
+                    "    <LastModified>{}</LastModified>\n",
+                    part.created_at.to_rfc3339()
+                ));
+                xml.push_str(&format!("    <ETag>\"{}\"</ETag>\n", part.etag));
+                xml.push_str(&format!("    <Size>{}</Size>\n", part.size));
+                xml.push_str("  </Part>\n");
+            }
+            xml.push_str("</ListPartsResult>\n");
+            Response::builder()
+                .status(200)
+                .header("Content-Type", "application/xml")
+                .body(Body::from(xml))
+                .unwrap()
+        }
+        Err(status) => s3_status_to_response_for_auth(status, true, "NoSuchUpload"),
     }
 }
 
