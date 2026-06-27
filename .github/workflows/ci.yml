@@ -18,9 +18,9 @@ jobs:
       postgres:
         image: postgres:17-alpine
         env:
-          POSTGRES_USER: worka
-          POSTGRES_PASSWORD: worka
-          POSTGRES_DB: worka
+          POSTGRES_USER: anvil
+          POSTGRES_PASSWORD: anvil
+          POSTGRES_DB: anvil
         ports:
           - 5432:5432
         options: >-
@@ -30,7 +30,7 @@ jobs:
           --health-retries 5
 
     env:
-      MAINTENANCE_DATABASE_URL: postgres://worka:worka@localhost:5432/worka
+      MAINTENANCE_DATABASE_URL: postgres://anvil:anvil@localhost:5432/anvil
 
     steps:
     - name: Checkout repository

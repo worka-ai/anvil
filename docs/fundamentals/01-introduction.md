@@ -7,7 +7,7 @@ tags: [introduction, architecture, principles]
 
 # Introduction to Anvil
 
-Worka Anvil is an open-source distributed storage and compute system designed for simplicity, scalability, and future extensibility. The goal is to provide a system that can start small—a single-node instance that fits into a Docker Compose file—and scale seamlessly to thousands of peers and millions of clients.
+Anvil is an open-source distributed storage and compute system designed for simplicity, scalability, and future extensibility. The goal is to provide a system that can start small—a single-node instance that fits into a Docker Compose file—and scale seamlessly to thousands of peers and millions of clients.
 
 What makes Anvil unique is that it isn't just about storage. It is also designed for a world where peers can register **compute capabilities**. Whether that's machine learning inference, data processing, or other compute-heavy tasks, Anvil treats compute as a first-class citizen alongside storage.
 

@@ -8,8 +8,8 @@ services:
   postgres-global:
     image: postgres:17-alpine
     environment:
-      POSTGRES_USER: worka
-      POSTGRES_PASSWORD: worka
+      POSTGRES_USER: anvil
+      POSTGRES_PASSWORD: anvil
       POSTGRES_DB: anvil_global
     ports:
       - "5433:5432"
@@ -17,7 +17,7 @@ services:
       - postgres_global_data:/var/lib/postgresql/data
     networks: [anvilnet]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U worka -d anvil_global"]
+      test: ["CMD-SHELL", "pg_isready -U anvil -d anvil_global"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -25,14 +25,14 @@ services:
   postgres-regional:
     image: postgres:17-alpine
     environment:
-      POSTGRES_USER: worka
-      POSTGRES_PASSWORD: worka
+      POSTGRES_USER: anvil
+      POSTGRES_PASSWORD: anvil
       POSTGRES_DB: anvil_regional_docker
     volumes:
       - postgres_regional_data:/var/lib/postgresql/data
     networks: [anvilnet]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U worka -d anvil_regional_docker"]
+      test: ["CMD-SHELL", "pg_isready -U anvil -d anvil_regional_docker"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -46,8 +46,8 @@ services:
         condition: service_healthy
     environment:
       - RUST_LOG=info
-      - GLOBAL_DATABASE_URL=postgres://worka:worka@postgres-global:5432/anvil_global
-      - REGIONAL_DATABASE_URL=postgres://worka:worka@postgres-regional:5432/anvil_regional_docker
+      - GLOBAL_DATABASE_URL=postgres://anvil:anvil@postgres-global:5432/anvil_global
+      - REGIONAL_DATABASE_URL=postgres://anvil:anvil@postgres-regional:5432/anvil_regional_docker
       - REGION=DOCKER_TEST
       - JWT_SECRET=docker-test-secret
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -75,8 +75,8 @@ services:
         condition: service_started
     environment:
       - RUST_LOG=info
-      - GLOBAL_DATABASE_URL=postgres://worka:worka@postgres-global:5432/anvil_global
-      - REGIONAL_DATABASE_URL=postgres://worka:worka@postgres-regional:5432/anvil_regional_docker
+      - GLOBAL_DATABASE_URL=postgres://anvil:anvil@postgres-global:5432/anvil_global
+      - REGIONAL_DATABASE_URL=postgres://anvil:anvil@postgres-regional:5432/anvil_regional_docker
       - REGION=DOCKER_TEST
       - JWT_SECRET=docker-test-secret
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -99,8 +99,8 @@ services:
         condition: service_started
     environment:
       - RUST_LOG=info
-      - GLOBAL_DATABASE_URL=postgres://worka:worka@postgres-global:5432/anvil_global
-      - REGIONAL_DATABASE_URL=postgres://worka:worka@postgres-regional:5432/anvil_regional_docker
+      - GLOBAL_DATABASE_URL=postgres://anvil:anvil@postgres-global:5432/anvil_global
+      - REGIONAL_DATABASE_URL=postgres://anvil:anvil@postgres-regional:5432/anvil_regional_docker
       - REGION=DOCKER_TEST
       - JWT_SECRET=docker-test-secret
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa

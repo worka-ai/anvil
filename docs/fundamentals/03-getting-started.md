@@ -31,7 +31,7 @@ services:
   postgres-global:
     image: postgres:17-alpine
     environment:
-      POSTGRES_USER: worka
+      POSTGRES_USER: anvil
       POSTGRES_PASSWORD: "a-secure-password" # <-- Change this in production
       POSTGRES_DB: anvil_global
     ports:
@@ -40,7 +40,7 @@ services:
       - postgres_global_data:/var/lib/postgresql/data
     networks: [anvilnet]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U worka -d anvil_global"]
+      test: ["CMD-SHELL", "pg_isready -U anvil -d anvil_global"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -48,14 +48,14 @@ services:
   postgres-regional:
     image: postgres:17-alpine
     environment:
-      POSTGRES_USER: worka
+      POSTGRES_USER: anvil
       POSTGRES_PASSWORD: "a-secure-password" # <-- Change this in production
       POSTGRES_DB: anvil_regional_europe
     volumes:
       - postgres_regional_data:/var/lib/postgresql/data
     networks: [anvilnet]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U worka -d anvil_regional_europe"]
+      test: ["CMD-SHELL", "pg_isready -U anvil -d anvil_regional_europe"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -70,8 +70,8 @@ services:
     environment:
       RUST_LOG: "info"
       # Use a URL-encoded password if it contains special characters
-      GLOBAL_DATABASE_URL: "postgres://worka:a-secure-password@postgres-global:5432/anvil_global"
-      REGIONAL_DATABASE_URL: "postgres://worka:a-secure-password@postgres-regional:5432/anvil_regional_europe"
+      GLOBAL_DATABASE_URL: "postgres://anvil:a-secure-password@postgres-global:5432/anvil_global"
+      REGIONAL_DATABASE_URL: "postgres://anvil:a-secure-password@postgres-regional:5432/anvil_regional_europe"
       REGION: "europe-west-1"
       # --- CRITICAL: SET THESE TO SECURE, RANDOMLY GENERATED VALUES ---
       JWT_SECRET: "must-be-a-long-and-random-secret-for-signing-jwts"

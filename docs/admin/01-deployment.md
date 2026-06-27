@@ -56,8 +56,8 @@ On Host B, configure the second Anvil node (`anvil2`). It must point to the same
 environment:
   REGION: "europe-west-1"
   # --- Point to existing databases on Host A ---
-  GLOBAL_DATABASE_URL: "postgres://worka:a-secure-password@203.0.113.1:5433/anvil_global"
-  REGIONAL_DATABASE_URL: "postgres://worka:a-secure-password@203.0.113.1:5432/anvil_regional_europe"
+  GLOBAL_DATABASE_URL: "postgres://anvil:a-secure-password@203.0.113.1:5433/anvil_global"
+  REGIONAL_DATABASE_URL: "postgres://anvil:a-secure-password@203.0.113.1:5432/anvil_regional_europe"
   # --- Use the SAME secrets as the rest of the cluster ---
   JWT_SECRET: "..."
   ANVIL_SECRET_ENCRYPTION_KEY: "..."
