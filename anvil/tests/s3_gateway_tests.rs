@@ -234,6 +234,49 @@ async fn test_s3_public_and_private_access() {
         "deleted bucket should no longer be visible"
     );
 
+    let active_multipart_bucket = format!("delete-s3-active-multipart-{}", uuid::Uuid::new_v4());
+    let active_multipart_key = "active-upload.txt";
+    client
+        .create_bucket()
+        .bucket(&active_multipart_bucket)
+        .send()
+        .await
+        .unwrap();
+    let active_upload = client
+        .create_multipart_upload()
+        .bucket(&active_multipart_bucket)
+        .key(active_multipart_key)
+        .send()
+        .await
+        .expect("create active multipart upload should succeed");
+    let active_upload_id = active_upload
+        .upload_id()
+        .expect("active upload id")
+        .to_string();
+    let active_delete = client
+        .delete_bucket()
+        .bucket(&active_multipart_bucket)
+        .send()
+        .await;
+    assert!(
+        format!("{active_delete:?}").contains("BucketNotEmpty"),
+        "S3 DeleteBucket must reject active multipart uploads"
+    );
+    client
+        .abort_multipart_upload()
+        .bucket(&active_multipart_bucket)
+        .key(active_multipart_key)
+        .upload_id(&active_upload_id)
+        .send()
+        .await
+        .expect("abort active multipart upload should succeed");
+    client
+        .delete_bucket()
+        .bucket(&active_multipart_bucket)
+        .send()
+        .await
+        .expect("empty bucket should be deletable after aborting multipart upload");
+
     let unauthenticated_list_buckets = reqwest::get(format!("{}/", http_base)).await.unwrap();
     assert_eq!(unauthenticated_list_buckets.status(), 403);
 

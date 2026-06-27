@@ -1,8 +1,9 @@
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::{
-    CreateBucketRequest, DeleteBucketRequest, GetBucketPolicyRequest, ListBucketsRequest,
-    ObjectMetadata, PutBucketPolicyRequest, PutObjectRequest, WatchBucketMetadataRequest,
+    AbortMultipartRequest, CreateBucketRequest, DeleteBucketRequest, GetBucketPolicyRequest,
+    InitiateMultipartRequest, ListBucketsRequest, ObjectMetadata, PutBucketPolicyRequest,
+    PutObjectRequest, WatchBucketMetadataRequest,
 };
 use anvil::tasks::TaskStatus;
 use futures_util::StreamExt;
@@ -146,6 +147,83 @@ async fn test_delete_bucket_rejects_retained_objects() {
         .expect_err("retained object versions should keep bucket non-empty");
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("Bucket not empty"));
+}
+
+#[tokio::test]
+async fn test_delete_bucket_rejects_active_multipart_uploads() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+
+    let bucket_name = "test-delete-active-multipart-bucket".to_string();
+    let object_key = "multipart-object.txt".to_string();
+    let mut create_req = Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
+    });
+    create_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client.create_bucket(create_req).await.unwrap();
+
+    let mut initiate_req = Request::new(InitiateMultipartRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: object_key.clone(),
+    });
+    initiate_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let upload_id = object_client
+        .initiate_multipart_upload(initiate_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .upload_id;
+
+    let mut active_delete_req = Request::new(DeleteBucketRequest {
+        bucket_name: bucket_name.clone(),
+    });
+    active_delete_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let err = bucket_client
+        .delete_bucket(active_delete_req)
+        .await
+        .expect_err("active multipart upload should keep bucket non-empty");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("Bucket not empty"));
+
+    let mut abort_req = Request::new(AbortMultipartRequest {
+        bucket_name: bucket_name.clone(),
+        object_key,
+        upload_id,
+    });
+    abort_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    object_client
+        .abort_multipart_upload(abort_req)
+        .await
+        .unwrap();
+
+    let mut empty_delete_req = Request::new(DeleteBucketRequest { bucket_name });
+    empty_delete_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client.delete_bucket(empty_delete_req).await.unwrap();
 }
 
 #[tokio::test]
