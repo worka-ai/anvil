@@ -644,6 +644,22 @@ async fn test_s3_public_and_private_access() {
         .expect_err("reserved namespace PUT must fail");
     assert_access_denied(put_err);
 
+    let forged_internal_token_put = reqwest::Client::new()
+        .put(format!("{reserved_url}?internal_write_token=caller-forged"))
+        .header("x-anvil-internal-write-token", "caller-forged")
+        .body("must not be stored")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged_internal_token_put.status(), 403);
+    assert!(
+        forged_internal_token_put
+            .text()
+            .await
+            .unwrap()
+            .contains("AccessDenied")
+    );
+
     let list_err = client
         .list_objects_v2()
         .bucket(&public_bucket)
