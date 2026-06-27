@@ -35,6 +35,7 @@ pub mod personaldb_envelope;
 pub mod personaldb_heads;
 pub mod personaldb_row_index;
 pub mod personaldb_segment;
+pub mod personaldb_submit;
 pub mod personaldb_watch;
 pub mod placement;
 pub mod s3_auth;
