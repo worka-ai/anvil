@@ -832,10 +832,14 @@ impl ObjectManager {
 
         let object = match version_id {
             Some(version_id) => {
-                let object = self
-                    .db
-                    .get_object_version(bucket.id, &object_key, version_id)
-                    .await
+                let object = metadata_journal::read_object_version(
+                    &self.storage,
+                    &bucket,
+                    &self.encryption_key,
+                    &object_key,
+                    version_id,
+                )
+                .await
                     .map_err(|e| Status::internal(e.to_string()))?
                     .ok_or_else(|| Status::not_found("Object version not found"))?;
                 if object.deleted_at.is_some() {
@@ -843,12 +847,15 @@ impl ObjectManager {
                 }
                 object
             }
-            None => self
-                .db
-                .get_object(bucket.id, &object_key)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-                .ok_or_else(|| Status::not_found("Object not found"))?,
+            None => metadata_journal::read_current_object(
+                &self.storage,
+                &bucket,
+                &self.encryption_key,
+                &object_key,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Object not found"))?,
         };
 
         let (tx, rx) = mpsc::channel(4);
@@ -1185,10 +1192,14 @@ impl ObjectManager {
 
         match version_id {
             Some(version_id) => {
-                let object = self
-                    .db
-                    .get_object_version(bucket.id, object_key, version_id)
-                    .await
+                let object = metadata_journal::read_object_version(
+                    &self.storage,
+                    &bucket,
+                    &self.encryption_key,
+                    object_key,
+                    version_id,
+                )
+                .await
                     .map_err(|e| Status::internal(e.to_string()))?
                     .ok_or_else(|| Status::not_found("Object version not found"))?;
                 if object.deleted_at.is_some() {

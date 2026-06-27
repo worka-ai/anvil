@@ -510,6 +510,34 @@ pub async fn read_current_object(
         .find(|object| object.key == object_key))
 }
 
+pub async fn read_object_version(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+    object_key: &str,
+    version_id: uuid::Uuid,
+) -> Result<Option<Object>> {
+    let body_records = read_object_version_bodies(storage, bucket, manifest_signing_key).await?;
+    let mut version_records = body_records
+        .into_iter()
+        .filter(|(_, body)| {
+            body.object_key == object_key && body.version_id == version_id.to_string()
+        })
+        .collect::<Vec<_>>();
+    sort_versions_for_key(&mut version_records);
+
+    let mut selected = None;
+    for (_, body) in version_records {
+        if body.event == "delete_version" {
+            selected = None;
+        } else {
+            selected = Some(body);
+        }
+    }
+
+    selected.as_ref().map(object_from_body).transpose()
+}
+
 pub async fn list_current_objects(
     storage: &Storage,
     bucket: &Bucket,
@@ -1239,6 +1267,101 @@ mod tests {
             .unwrap();
         assert_eq!(current.len(), 1);
         assert_eq!(current[0].key, first.key);
+    }
+
+    #[tokio::test]
+    async fn read_object_version_returns_exact_version_and_delete_marker() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let bucket = sample_bucket();
+        let object = sample_object(1, "docs/a.txt", false);
+        let delete_marker = sample_object(2, "docs/a.txt", true);
+
+        append_object_mutation(&storage, &bucket, &object, ObjectJournalMutation::Put)
+            .await
+            .unwrap();
+        append_object_mutation(
+            &storage,
+            &bucket,
+            &delete_marker,
+            ObjectJournalMutation::DeleteMarker,
+        )
+        .await
+        .unwrap();
+
+        let read = read_object_version(
+            &storage,
+            &bucket,
+            b"unused without manifest",
+            &object.key,
+            object.version_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(read.version_id, object.version_id);
+        assert!(read.deleted_at.is_none());
+
+        let read_marker = read_object_version(
+            &storage,
+            &bucket,
+            b"unused without manifest",
+            &delete_marker.key,
+            delete_marker.version_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(read_marker.version_id, delete_marker.version_id);
+        assert!(read_marker.deleted_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn read_object_version_hides_explicitly_deleted_version_after_seal() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let bucket = sample_bucket();
+        let object = sample_object(1, "docs/a.txt", false);
+
+        append_object_mutation(&storage, &bucket, &object, ObjectJournalMutation::Put)
+            .await
+            .unwrap();
+        let signing_key = b"manifest signing key";
+        seal_object_journal_segments(&storage, &bucket, signing_key)
+            .await
+            .unwrap();
+
+        let before_delete = read_object_version(
+            &storage,
+            &bucket,
+            signing_key,
+            &object.key,
+            object.version_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(before_delete.version_id, object.version_id);
+
+        append_object_mutation(
+            &storage,
+            &bucket,
+            &object,
+            ObjectJournalMutation::DeleteVersion,
+        )
+        .await
+        .unwrap();
+
+        let after_delete = read_object_version(
+            &storage,
+            &bucket,
+            signing_key,
+            &object.key,
+            object.version_id,
+        )
+        .await
+        .unwrap();
+        assert!(after_delete.is_none());
     }
 
     #[tokio::test]
