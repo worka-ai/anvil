@@ -1088,6 +1088,59 @@ impl ObjectManager {
         Ok(delete_marker)
     }
 
+    pub async fn delete_object_version(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        object_key: &str,
+        version_id: uuid::Uuid,
+        scopes: &[String],
+    ) -> Result<Object, Status> {
+        if !validation::is_valid_bucket_name(bucket_name) {
+            return Err(Status::invalid_argument("Invalid bucket name"));
+        }
+        if validation::is_reserved_internal_key(object_key) {
+            return Err(Status::permission_denied("UnauthorizedReservedNamespace"));
+        }
+        if !validation::is_valid_object_key(object_key) {
+            return Err(Status::invalid_argument("Invalid object key"));
+        }
+
+        if !auth::is_authorized(
+            AnvilAction::ObjectDelete,
+            &format!("{}/{}", bucket_name, object_key),
+            scopes,
+        ) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
+        if bucket.region != self.region {
+            return Err(Status::failed_precondition(format!(
+                "Bucket is in region {}",
+                bucket.region
+            )));
+        }
+
+        let deleted = self
+            .db
+            .delete_object_version(bucket.id, object_key, version_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Object version not found"))?;
+
+        self.publish_object_watch_event(
+            tenant_id,
+            &bucket,
+            &deleted,
+            "delete_version",
+            deleted.deleted_at.is_some(),
+        )
+        .await?;
+
+        Ok(deleted)
+    }
+
     pub async fn head_object(
         &self,
         claims: Option<auth::Claims>,

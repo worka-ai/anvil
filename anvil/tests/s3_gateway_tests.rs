@@ -602,6 +602,55 @@ async fn test_s3_public_and_private_access() {
             .any(|version| version.is_latest().unwrap_or(false))
     );
 
+    let version_specific_key = "version-specific-delete.txt";
+    client
+        .put_object()
+        .bucket(&private_bucket)
+        .key(version_specific_key)
+        .body(ByteStream::from_static(b"v1"))
+        .send()
+        .await
+        .expect("put version-specific v1 should succeed");
+    client
+        .put_object()
+        .bucket(&private_bucket)
+        .key(version_specific_key)
+        .body(ByteStream::from_static(b"v2"))
+        .send()
+        .await
+        .expect("put version-specific v2 should succeed");
+    let version_specific_before_delete = client
+        .list_object_versions()
+        .bucket(&private_bucket)
+        .prefix(version_specific_key)
+        .send()
+        .await
+        .expect("list version-specific object versions should succeed");
+    let older_version_id = version_specific_before_delete
+        .versions()
+        .iter()
+        .find(|version| !version.is_latest().unwrap_or(false))
+        .and_then(|version| version.version_id())
+        .expect("older version id")
+        .to_string();
+    client
+        .delete_object()
+        .bucket(&private_bucket)
+        .key(version_specific_key)
+        .version_id(older_version_id)
+        .send()
+        .await
+        .expect("version-specific delete should succeed");
+    let version_specific_after_delete = client
+        .list_object_versions()
+        .bucket(&private_bucket)
+        .prefix(version_specific_key)
+        .send()
+        .await
+        .expect("list after version-specific delete should succeed");
+    assert_eq!(version_specific_after_delete.versions().len(), 1);
+    assert!(version_specific_after_delete.delete_markers().is_empty());
+
     // 6. Test Public Access (Success): Use reqwest (no auth) to get from public bucket
     let public_url = format!("{}/{}/{}", http_base, public_bucket, public_key);
     let public_resp = reqwest::get(&public_url)

@@ -764,43 +764,57 @@ async fn delete_objects(
 
     for object in request.objects {
         let key = object.key;
+        let requested_version_id = object.version_id;
 
         if validation::is_reserved_internal_key(&key) {
             errors.push(DeleteObjectError {
                 key,
-                version_id: object.version_id,
+                version_id: requested_version_id,
                 code: "AccessDenied".to_string(),
                 message: "UnauthorizedReservedNamespace".to_string(),
             });
             continue;
         }
 
-        if object
-            .version_id
-            .as_deref()
-            .is_some_and(|version| !version.is_empty())
-        {
-            errors.push(DeleteObjectError {
-                key,
-                version_id: object.version_id,
-                code: "NotImplemented".to_string(),
-                message: "Version-specific multi-object delete is not supported".to_string(),
-            });
-            continue;
-        }
+        let version_id = match requested_version_id.as_deref() {
+            Some("") | None => None,
+            Some(version_id) => match uuid::Uuid::parse_str(version_id) {
+                Ok(version_id) => Some(version_id),
+                Err(_) => {
+                    errors.push(DeleteObjectError {
+                        key,
+                        version_id: requested_version_id,
+                        code: "InvalidArgument".to_string(),
+                        message: "Invalid versionId".to_string(),
+                    });
+                    continue;
+                }
+            },
+        };
 
-        match state
-            .object_manager
-            .delete_object(claims.tenant_id, &bucket, &key, &claims.scopes)
-            .await
-        {
+        let delete_result = if let Some(version_id) = version_id {
+            state
+                .object_manager
+                .delete_object_version(claims.tenant_id, &bucket, &key, version_id, &claims.scopes)
+                .await
+        } else {
+            state
+                .object_manager
+                .delete_object(claims.tenant_id, &bucket, &key, &claims.scopes)
+                .await
+        };
+
+        match delete_result {
             Ok(delete_marker) => {
                 if !quiet {
                     deleted.push(DeletedObject {
                         key,
-                        version_id: None,
-                        delete_marker: Some(true),
-                        delete_marker_version_id: Some(delete_marker.version_id.to_string()),
+                        version_id: requested_version_id,
+                        delete_marker: Some(delete_marker.deleted_at.is_some()),
+                        delete_marker_version_id: delete_marker
+                            .deleted_at
+                            .is_some()
+                            .then(|| delete_marker.version_id.to_string()),
                     });
                 }
             }
@@ -821,14 +835,14 @@ async fn delete_objects(
                 }
                 errors.push(DeleteObjectError::from_status(
                     key,
-                    object.version_id,
+                    requested_version_id,
                     status,
                 ));
             }
             Err(status) => {
                 errors.push(DeleteObjectError::from_status(
                     key,
-                    object.version_id,
+                    requested_version_id,
                     status,
                 ));
             }
@@ -1846,6 +1860,30 @@ async fn delete_object(
         return abort_multipart_upload(state, claims, bucket, key, upload_id).await;
     }
 
+    let version_id = match parse_s3_version_id(&q) {
+        Ok(version_id) => version_id,
+        Err(response) => return response,
+    };
+
+    if let Some(version_id) = version_id {
+        return match state
+            .object_manager
+            .delete_object_version(claims.tenant_id, &bucket, &key, version_id, &claims.scopes)
+            .await
+        {
+            Ok(deleted) => {
+                let mut builder = Response::builder()
+                    .status(axum::http::StatusCode::NO_CONTENT)
+                    .header("x-amz-version-id", deleted.version_id.to_string());
+                if deleted.deleted_at.is_some() {
+                    builder = builder.header("x-amz-delete-marker", "true");
+                }
+                builder.body(Body::empty()).unwrap()
+            }
+            Err(status) => s3_delete_status_to_response(status),
+        };
+    }
+
     match state
         .object_manager
         .delete_object(claims.tenant_id, &bucket, &key, &claims.scopes)
@@ -1857,38 +1895,42 @@ async fn delete_object(
             .header("x-amz-version-id", delete_marker.version_id.to_string())
             .body(Body::empty())
             .unwrap(),
-        Err(status) => match status.code() {
-            tonic::Code::FailedPrecondition => {
-                if status.message().starts_with("Bucket is in region ") {
-                    let region = status.message().trim_start_matches("Bucket is in region ");
-                    return s3_redirect(region);
-                }
-                s3_error(
-                    "PreconditionFailed",
-                    status.message(),
-                    axum::http::StatusCode::PRECONDITION_FAILED,
-                )
+        Err(status) => s3_delete_status_to_response(status),
+    }
+}
+
+fn s3_delete_status_to_response(status: tonic::Status) -> Response {
+    match status.code() {
+        tonic::Code::FailedPrecondition => {
+            if status.message().starts_with("Bucket is in region ") {
+                let region = status.message().trim_start_matches("Bucket is in region ");
+                return s3_redirect(region);
             }
-            tonic::Code::NotFound => Response::builder()
-                .status(axum::http::StatusCode::NO_CONTENT)
-                .body(Body::empty())
-                .unwrap(),
-            tonic::Code::PermissionDenied => s3_error(
-                "AccessDenied",
+            s3_error(
+                "PreconditionFailed",
                 status.message(),
-                axum::http::StatusCode::FORBIDDEN,
-            ),
-            tonic::Code::InvalidArgument => s3_error(
-                "InvalidArgument",
-                status.message(),
-                axum::http::StatusCode::BAD_REQUEST,
-            ),
-            _ => s3_error(
-                "InternalError",
-                status.message(),
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            ),
-        },
+                axum::http::StatusCode::PRECONDITION_FAILED,
+            )
+        }
+        tonic::Code::NotFound => Response::builder()
+            .status(axum::http::StatusCode::NO_CONTENT)
+            .body(Body::empty())
+            .unwrap(),
+        tonic::Code::PermissionDenied => s3_error(
+            "AccessDenied",
+            status.message(),
+            axum::http::StatusCode::FORBIDDEN,
+        ),
+        tonic::Code::InvalidArgument => s3_error(
+            "InvalidArgument",
+            status.message(),
+            axum::http::StatusCode::BAD_REQUEST,
+        ),
+        _ => s3_error(
+            "InternalError",
+            status.message(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 

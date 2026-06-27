@@ -135,6 +135,118 @@ async fn test_delete_object_creates_delete_marker() {
 }
 
 #[tokio::test]
+async fn test_delete_object_specific_version_removes_only_that_version() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+
+    let bucket_name = "test-delete-specific-version".to_string();
+    let object_key = "versioned-object".to_string();
+
+    let mut create_req = Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
+    });
+    create_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client.create_bucket(create_req).await.unwrap();
+
+    let first_chunks = vec![
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                ObjectMetadata {
+                    bucket_name: bucket_name.clone(),
+                    object_key: object_key.clone(),
+                },
+            )),
+        },
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                b"v1".to_vec(),
+            )),
+        },
+    ];
+    let mut first_put_req = Request::new(tokio_stream::iter(first_chunks));
+    first_put_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let first_put = object_client
+        .put_object(first_put_req)
+        .await
+        .unwrap()
+        .into_inner();
+
+    let second_chunks = vec![
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                ObjectMetadata {
+                    bucket_name: bucket_name.clone(),
+                    object_key: object_key.clone(),
+                },
+            )),
+        },
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                b"v2".to_vec(),
+            )),
+        },
+    ];
+    let mut second_put_req = Request::new(tokio_stream::iter(second_chunks));
+    second_put_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let second_put = object_client
+        .put_object(second_put_req)
+        .await
+        .unwrap()
+        .into_inner();
+
+    let mut delete_req = Request::new(DeleteObjectRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: object_key.clone(),
+        version_id: Some(first_put.version_id),
+    });
+    delete_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    object_client.delete_object(delete_req).await.unwrap();
+
+    let mut versions_req = Request::new(ListObjectVersionsRequest {
+        bucket_name: bucket_name.clone(),
+        prefix: object_key.clone(),
+        key_marker: String::new(),
+        max_keys: 100,
+    });
+    versions_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let versions = object_client
+        .list_object_versions(versions_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .versions;
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].version_id, second_put.version_id);
+    assert!(versions[0].is_latest);
+    assert!(!versions[0].is_delete_marker);
+}
+
+#[tokio::test]
 async fn test_head_object() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;

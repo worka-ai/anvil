@@ -133,14 +133,26 @@ impl ObjectService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.get_ref();
 
-        self.object_manager
-            .delete_object(
-                claims.tenant_id,
-                &req.bucket_name,
-                &req.object_key,
-                &claims.scopes,
-            )
-            .await?;
+        if let Some(version_id) = parse_optional_version_id(req.version_id.as_deref())? {
+            self.object_manager
+                .delete_object_version(
+                    claims.tenant_id,
+                    &req.bucket_name,
+                    &req.object_key,
+                    version_id,
+                    &claims.scopes,
+                )
+                .await?;
+        } else {
+            self.object_manager
+                .delete_object(
+                    claims.tenant_id,
+                    &req.bucket_name,
+                    &req.object_key,
+                    &claims.scopes,
+                )
+                .await?;
+        }
 
         Ok(Response::new(DeleteObjectResponse {}))
     }

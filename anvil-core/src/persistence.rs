@@ -1895,6 +1895,25 @@ impl Persistence {
         Ok(row.map(Into::into))
     }
 
+    pub async fn delete_object_version(
+        &self,
+        bucket_id: i64,
+        key: &str,
+        version_id: uuid::Uuid,
+    ) -> Result<Option<Object>> {
+        let client = self.regional_pool.get().await?;
+        let row = client
+            .query_opt(
+                r#"
+                DELETE FROM objects
+                WHERE bucket_id = $1 AND key = $2 AND version_id = $3
+                RETURNING *"#,
+                &[&bucket_id, &key, &version_id],
+            )
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
     pub async fn list_object_versions(
         &self,
         bucket_id: i64,
