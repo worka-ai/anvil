@@ -17,6 +17,7 @@ pub mod bucket_manager;
 pub mod cache;
 pub mod cluster;
 pub mod config;
+pub mod control_journal;
 pub mod crypto;
 pub mod derived_index_proof;
 pub mod diagnostic_store;
@@ -95,6 +96,9 @@ impl AppState {
         let storage = storage::Storage::new_at(&arc_config.storage_path).await?;
         let cluster_state = Arc::new(RwLock::new(HashMap::new()));
         let db = persistence::Persistence::new(&arc_config, event_publisher)?;
+        if !arc_config.region.is_empty() {
+            db.create_region(&arc_config.region).await?;
+        }
         let sharder = sharding::ShardManager::new();
         let placer = placement::PlacementManager::default();
         let (object_watch_tx, _object_watch_rx) = tokio::sync::broadcast::channel(1024);

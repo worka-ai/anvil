@@ -40,6 +40,24 @@ impl Storage {
         })
     }
 
+    pub fn new_at_sync(storage_path: impl AsRef<Path>) -> Result<Self> {
+        let storage_path = storage_path.as_ref().to_path_buf();
+        let temp_path = storage_path.join(TEMP_DIR);
+        std::fs::create_dir_all(&storage_path)?;
+        std::fs::create_dir_all(&temp_path)?;
+        Ok(Self {
+            storage_path,
+            temp_path,
+        })
+    }
+
+    pub fn control_journal_path(&self) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("meta")
+            .join("control.anjournal")
+    }
+
     pub fn metadata_journal_path(&self, tenant_id: i64, bucket_id: i64) -> PathBuf {
         self.storage_path
             .join("_anvil")

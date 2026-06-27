@@ -9,11 +9,14 @@ use std::{
 };
 use tokio::sync::{RwLock, mpsc::Sender};
 
-use crate::{cache::MetadataCache, cluster::MetadataEvent, config::Config};
+use crate::{
+    cache::MetadataCache, cluster::MetadataEvent, config::Config, control_journal, storage::Storage,
+};
 
 #[derive(Debug, Clone)]
 pub struct Persistence {
     state_path: PathBuf,
+    storage: Storage,
     state: Arc<RwLock<NativeState>>,
     cache: MetadataCache,
     event_publisher: Option<Sender<MetadataEvent>>,
@@ -22,10 +25,6 @@ pub struct Persistence {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct NativeState {
     next_id: i64,
-    regions: HashSet<String>,
-    tenants: Vec<Tenant>,
-    apps: Vec<StoredApp>,
-    app_policies: Vec<AppPolicy>,
     buckets: Vec<StoredBucket>,
     bucket_events: Vec<BucketMetadataEvent>,
     objects: Vec<Object>,
@@ -55,22 +54,6 @@ impl NativeState {
         self.next_id += 1;
         self.next_id
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredApp {
-    id: i64,
-    tenant_id: i64,
-    name: String,
-    client_id: String,
-    client_secret_encrypted: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AppPolicy {
-    app_id: i64,
-    resource: String,
-    action: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -514,6 +497,7 @@ fn canonical_json_bytes(value: &JsonValue) -> Vec<u8> {
 
 impl Persistence {
     pub fn new(config: &Config, event_publisher: Option<Sender<MetadataEvent>>) -> Result<Self> {
+        let storage = Storage::new_at_sync(&config.storage_path)?;
         let state_path = PathBuf::from(&config.storage_path)
             .join("_anvil")
             .join("meta")
@@ -521,7 +505,7 @@ impl Persistence {
         if let Some(parent) = state_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut state = if state_path.exists() {
+        let state = if state_path.exists() {
             let bytes = std::fs::read(&state_path)?;
             if bytes.is_empty() {
                 NativeState::default()
@@ -531,11 +515,9 @@ impl Persistence {
         } else {
             NativeState::default()
         };
-        if !config.region.is_empty() {
-            state.regions.insert(config.region.clone());
-        }
         Ok(Self {
             state_path,
+            storage,
             state: Arc::new(RwLock::new(state)),
             cache: MetadataCache::new(config),
             event_publisher,
@@ -775,15 +757,9 @@ impl Persistence {
     }
 
     pub async fn list_policies(&self) -> Result<Vec<String>> {
-        let state = self.state.read().await;
-        let mut policies = state
-            .app_policies
-            .iter()
-            .map(|p| format!("{}:{}", p.action, p.resource))
-            .collect::<Vec<_>>();
-        policies.sort();
-        policies.dedup();
-        Ok(policies)
+        Ok(control_journal::read_control_state(&self.storage)
+            .await?
+            .policy_summaries())
     }
 
     pub async fn create_model_artifact(
@@ -897,83 +873,41 @@ impl Persistence {
     }
 
     pub async fn create_region(&self, name: &str) -> Result<bool> {
-        let mut state = self.state.write().await;
-        let inserted = state.regions.insert(name.to_string());
-        self.persist_after_write(&state).await?;
-        Ok(inserted)
+        control_journal::create_region(&self.storage, name).await
     }
 
     pub async fn list_regions(&self) -> Result<Vec<String>> {
-        let mut regions = self
-            .state
-            .read()
-            .await
-            .regions
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        regions.sort();
-        Ok(regions)
+        Ok(control_journal::read_control_state(&self.storage)
+            .await?
+            .regions())
     }
 
     pub async fn get_tenant_by_name(&self, name: &str) -> Result<Option<Tenant>> {
-        self.refresh_from_disk().await?;
-        Ok(self
-            .state
-            .read()
-            .await
-            .tenants
-            .iter()
-            .find(|t| t.name == name)
-            .cloned())
+        Ok(control_journal::read_control_state(&self.storage)
+            .await?
+            .tenant_by_name(name))
     }
 
     pub async fn list_tenants(&self) -> Result<Vec<Tenant>> {
-        self.refresh_from_disk().await?;
-        Ok(self.state.read().await.tenants.clone())
+        Ok(control_journal::read_control_state(&self.storage)
+            .await?
+            .tenants())
     }
 
     pub async fn get_app_by_client_id(&self, client_id: &str) -> Result<Option<AppDetails>> {
-        self.refresh_from_disk().await?;
-        Ok(self
-            .state
-            .read()
-            .await
-            .apps
-            .iter()
-            .find(|a| a.client_id == client_id)
-            .map(|a| AppDetails {
-                id: a.id,
-                tenant_id: a.tenant_id,
-                client_secret_encrypted: a.client_secret_encrypted.clone(),
-            }))
+        Ok(control_journal::read_control_state(&self.storage)
+            .await?
+            .app_details_by_client_id(client_id))
     }
 
     pub async fn get_policies_for_app(&self, app_id: i64) -> Result<Vec<String>> {
-        self.refresh_from_disk().await?;
-        Ok(self
-            .state
-            .read()
-            .await
-            .app_policies
-            .iter()
-            .filter(|p| p.app_id == app_id)
-            .map(|p| format!("{}|{}", p.action, p.resource))
-            .collect())
+        Ok(control_journal::read_control_state(&self.storage)
+            .await?
+            .policies_for_app(app_id))
     }
 
     pub async fn create_tenant(&self, name: &str, _api_key: &str) -> Result<Tenant> {
-        let mut state = self.state.write().await;
-        if let Some(existing) = state.tenants.iter().find(|t| t.name == name).cloned() {
-            return Ok(existing);
-        }
-        let tenant = Tenant {
-            id: state.allocate_id(),
-            name: name.to_string(),
-        };
-        state.tenants.push(tenant.clone());
-        self.persist_after_write(&state).await?;
-        Ok(tenant)
+        control_journal::create_tenant(&self.storage, name).await
     }
 
     pub async fn create_app(
@@ -983,113 +917,38 @@ impl Persistence {
         client_id: &str,
         encrypted_secret: &[u8],
     ) -> Result<App> {
-        let mut state = self.state.write().await;
-        if state
-            .apps
-            .iter()
-            .any(|a| a.tenant_id == tenant_id && a.name == name)
-        {
-            return Err(anyhow!("app already exists"));
-        }
-        let id = state.allocate_id();
-        let app = StoredApp {
-            id,
-            tenant_id,
-            name: name.to_string(),
-            client_id: client_id.to_string(),
-            client_secret_encrypted: encrypted_secret.to_vec(),
-        };
-        state.apps.push(app.clone());
-        self.persist_after_write(&state).await?;
-        Ok(App {
-            id,
-            name: app.name,
-            client_id: app.client_id,
-        })
+        control_journal::create_app(&self.storage, tenant_id, name, client_id, encrypted_secret)
+            .await
     }
 
     pub async fn get_app_by_id(&self, id: i64) -> Result<Option<App>> {
-        self.refresh_from_disk().await?;
-        Ok(self
-            .state
-            .read()
-            .await
-            .apps
-            .iter()
-            .find(|a| a.id == id)
-            .map(|a| App {
-                id: a.id,
-                name: a.name.clone(),
-                client_id: a.client_id.clone(),
-            }))
+        Ok(control_journal::read_control_state(&self.storage)
+            .await?
+            .app_by_id(id))
     }
 
     pub async fn get_app_by_name(&self, name: &str) -> Result<Option<App>> {
-        self.refresh_from_disk().await?;
-        Ok(self
-            .state
-            .read()
-            .await
-            .apps
-            .iter()
-            .find(|a| a.name == name)
-            .map(|a| App {
-                id: a.id,
-                name: a.name.clone(),
-                client_id: a.client_id.clone(),
-            }))
+        Ok(control_journal::read_control_state(&self.storage)
+            .await?
+            .app_by_name(name))
     }
 
     pub async fn list_apps_for_tenant(&self, tenant_id: i64) -> Result<Vec<App>> {
-        self.refresh_from_disk().await?;
-        Ok(self
-            .state
-            .read()
-            .await
-            .apps
-            .iter()
-            .filter(|a| a.tenant_id == tenant_id)
-            .map(|a| App {
-                id: a.id,
-                name: a.name.clone(),
-                client_id: a.client_id.clone(),
-            })
-            .collect())
+        Ok(control_journal::read_control_state(&self.storage)
+            .await?
+            .apps_for_tenant(tenant_id))
     }
 
     pub async fn update_app_secret(&self, app_id: i64, new_encrypted_secret: &[u8]) -> Result<()> {
-        let mut state = self.state.write().await;
-        let app = state
-            .apps
-            .iter_mut()
-            .find(|a| a.id == app_id)
-            .ok_or_else(|| anyhow!("app not found"))?;
-        app.client_secret_encrypted = new_encrypted_secret.to_vec();
-        self.persist_after_write(&state).await
+        control_journal::update_app_secret(&self.storage, app_id, new_encrypted_secret).await
     }
 
     pub async fn grant_policy(&self, app_id: i64, resource: &str, action: &str) -> Result<()> {
-        let mut state = self.state.write().await;
-        if !state
-            .app_policies
-            .iter()
-            .any(|p| p.app_id == app_id && p.resource == resource && p.action == action)
-        {
-            state.app_policies.push(AppPolicy {
-                app_id,
-                resource: resource.to_string(),
-                action: action.to_string(),
-            });
-        }
-        self.persist_after_write(&state).await
+        control_journal::grant_policy(&self.storage, app_id, resource, action).await
     }
 
     pub async fn revoke_policy(&self, app_id: i64, resource: &str, action: &str) -> Result<()> {
-        let mut state = self.state.write().await;
-        state
-            .app_policies
-            .retain(|p| !(p.app_id == app_id && p.resource == resource && p.action == action));
-        self.persist_after_write(&state).await
+        control_journal::revoke_policy(&self.storage, app_id, resource, action).await
     }
 
     pub async fn create_bucket(
