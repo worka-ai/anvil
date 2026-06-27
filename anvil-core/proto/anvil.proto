@@ -62,6 +62,7 @@ service ObjectService {
   rpc CopyObject(CopyObjectRequest) returns (CopyObjectResponse);
   rpc ComposeObject(ComposeObjectRequest) returns (ComposeObjectResponse);
   rpc PatchJsonObject(PatchJsonObjectRequest) returns (PatchJsonObjectResponse);
+  rpc CompareAndSwapManifest(CompareAndSwapManifestRequest) returns (CompareAndSwapManifestResponse);
   rpc WatchPrefix(WatchPrefixRequest) returns (stream WatchPrefixResponse);
   rpc CreateAppendStream(CreateAppendStreamRequest) returns (CreateAppendStreamResponse);
   rpc AppendStreamRecord(AppendStreamRecordRequest) returns (AppendStreamRecordResponse);
@@ -251,6 +252,18 @@ message PatchJsonObjectResponse {
     string etag = 1;
     string version_id = 2;
     string last_modified = 3;
+}
+
+message CompareAndSwapManifestRequest {
+    string bucket_name = 1;
+    string manifest_key = 2;
+    uint64 expected_revision = 3;
+    string manifest_json = 4;
+}
+
+message CompareAndSwapManifestResponse {
+    uint64 revision = 1;
+    string manifest_hash = 2;
 }
 
 message WatchPrefixRequest {

@@ -1,12 +1,12 @@
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::{
-    self, AppendStreamRecordRequest, CompleteMultipartPart, CompleteMultipartRequest,
-    ComposeObjectRequest, ComposeObjectSource, CopyObjectRequest, CreateAppendStreamRequest,
-    CreateBucketRequest, DeleteObjectRequest, GetObjectRequest, HeadObjectRequest,
-    InitiateMultipartRequest, ListObjectVersionsRequest, ListObjectsRequest, ObjectMetadata,
-    PatchJsonObjectRequest, PutObjectRequest, SealAppendStreamSegmentRequest, UploadPartMetadata,
-    UploadPartRequest, WatchPrefixRequest,
+    self, AppendStreamRecordRequest, CompareAndSwapManifestRequest, CompleteMultipartPart,
+    CompleteMultipartRequest, ComposeObjectRequest, ComposeObjectSource, CopyObjectRequest,
+    CreateAppendStreamRequest, CreateBucketRequest, DeleteObjectRequest, GetObjectRequest,
+    HeadObjectRequest, InitiateMultipartRequest, ListObjectVersionsRequest, ListObjectsRequest,
+    ObjectMetadata, PatchJsonObjectRequest, PutObjectRequest, SealAppendStreamSegmentRequest,
+    UploadPartMetadata, UploadPartRequest, WatchPrefixRequest,
 };
 use futures_util::StreamExt;
 use std::time::Duration;
@@ -526,6 +526,86 @@ async fn test_append_stream_records_are_ordered_and_sealable() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn test_compare_and_swap_manifest_enforces_expected_revision() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+
+    let bucket_name = "test-manifest-bucket".to_string();
+    let manifest_key = "manifests/current.json".to_string();
+    let mut create_req = Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
+    });
+    create_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client.create_bucket(create_req).await.unwrap();
+
+    let mut create_manifest = Request::new(CompareAndSwapManifestRequest {
+        bucket_name: bucket_name.clone(),
+        manifest_key: manifest_key.clone(),
+        expected_revision: 0,
+        manifest_json: serde_json::json!({"generation": 1}).to_string(),
+    });
+    create_manifest.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let first = object_client
+        .compare_and_swap_manifest(create_manifest)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.revision, 1);
+    assert!(!first.manifest_hash.is_empty());
+
+    let mut stale_update = Request::new(CompareAndSwapManifestRequest {
+        bucket_name: bucket_name.clone(),
+        manifest_key: manifest_key.clone(),
+        expected_revision: 0,
+        manifest_json: serde_json::json!({"generation": 2}).to_string(),
+    });
+    stale_update.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    assert!(
+        object_client
+            .compare_and_swap_manifest(stale_update)
+            .await
+            .is_err()
+    );
+
+    let mut valid_update = Request::new(CompareAndSwapManifestRequest {
+        bucket_name,
+        manifest_key,
+        expected_revision: first.revision,
+        manifest_json: serde_json::json!({"generation": 2}).to_string(),
+    });
+    valid_update.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let second = object_client
+        .compare_and_swap_manifest(valid_update)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second.revision, 2);
+    assert_ne!(second.manifest_hash, first.manifest_hash);
 }
 
 #[tokio::test]

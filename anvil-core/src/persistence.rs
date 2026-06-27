@@ -127,6 +127,12 @@ pub struct AppendStreamRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ManifestCasResult {
+    pub revision: i64,
+    pub manifest_hash: String,
+}
+
 // Manual row-to-struct mapping
 impl From<Row> for Tenant {
     fn from(row: Row) -> Self {
@@ -1771,6 +1777,87 @@ impl Persistence {
             )
             .await?;
         Ok(changed > 0)
+    }
+
+    pub async fn compare_and_swap_manifest(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        bucket_name: &str,
+        manifest_key: &str,
+        expected_revision: i64,
+        manifest_json: JsonValue,
+        manifest_hash: &str,
+    ) -> Result<Option<ManifestCasResult>> {
+        let mut client = self.regional_pool.get().await?;
+        let tx = client.transaction().await?;
+        let existing = tx
+            .query_opt(
+                r#"
+                SELECT revision
+                FROM object_manifests
+                WHERE bucket_id = $1 AND manifest_key = $2
+                FOR UPDATE"#,
+                &[&bucket_id, &manifest_key],
+            )
+            .await?;
+
+        let next_revision = match existing {
+            Some(row) => {
+                let current_revision: i64 = row.get("revision");
+                if current_revision != expected_revision {
+                    tx.rollback().await?;
+                    return Ok(None);
+                }
+                let next_revision = current_revision + 1;
+                tx.execute(
+                    r#"
+                    UPDATE object_manifests
+                    SET revision = $3,
+                        manifest_json = $4,
+                        manifest_hash = $5,
+                        updated_at = now()
+                    WHERE bucket_id = $1 AND manifest_key = $2"#,
+                    &[
+                        &bucket_id,
+                        &manifest_key,
+                        &next_revision,
+                        &manifest_json,
+                        &manifest_hash,
+                    ],
+                )
+                .await?;
+                next_revision
+            }
+            None => {
+                if expected_revision != 0 {
+                    tx.rollback().await?;
+                    return Ok(None);
+                }
+                tx.execute(
+                    r#"
+                    INSERT INTO object_manifests
+                        (tenant_id, bucket_id, bucket_name, manifest_key, revision, manifest_json, manifest_hash)
+                    VALUES ($1, $2, $3, $4, 1, $5, $6)"#,
+                    &[
+                        &tenant_id,
+                        &bucket_id,
+                        &bucket_name,
+                        &manifest_key,
+                        &manifest_json,
+                        &manifest_hash,
+                    ],
+                )
+                .await?;
+                1
+            }
+        };
+
+        tx.commit().await?;
+        Ok(Some(ManifestCasResult {
+            revision: next_revision,
+            manifest_hash: manifest_hash.to_string(),
+        }))
     }
 
     pub async fn hard_delete_object(&self, object_id: i64) -> Result<()> {

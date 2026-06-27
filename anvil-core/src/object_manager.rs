@@ -61,6 +61,12 @@ pub struct SealAppendStreamResult {
     pub segment_hash: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ManifestCasResult {
+    pub revision: u64,
+    pub manifest_hash: String,
+}
+
 impl ObjectManager {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -645,6 +651,47 @@ impl ObjectManager {
         Ok(SealAppendStreamResult {
             record_count: records.len() as u64,
             segment_hash,
+        })
+    }
+
+    pub async fn compare_and_swap_manifest(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        manifest_key: &str,
+        expected_revision: u64,
+        manifest_json: &str,
+        scopes: &[String],
+    ) -> Result<ManifestCasResult, Status> {
+        self.validate_write_request(bucket_name, manifest_key, scopes)?;
+        let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
+        let expected_revision = i64::try_from(expected_revision)
+            .map_err(|_| Status::invalid_argument("expected_revision exceeds supported range"))?;
+        let manifest: JsonValue = serde_json::from_str(manifest_json)
+            .map_err(|e| Status::invalid_argument(format!("Invalid manifest JSON: {}", e)))?;
+        let manifest_bytes = serde_json::to_vec(&manifest)
+            .map_err(|e| Status::internal(format!("Failed to encode manifest JSON: {}", e)))?;
+        let manifest_hash = blake3::hash(&manifest_bytes).to_hex().to_string();
+
+        let result = self
+            .db
+            .compare_and_swap_manifest(
+                tenant_id,
+                bucket.id,
+                &bucket.name,
+                manifest_key,
+                expected_revision,
+                manifest,
+                &manifest_hash,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::failed_precondition("Manifest revision mismatch"))?;
+
+        Ok(ManifestCasResult {
+            revision: u64::try_from(result.revision)
+                .map_err(|_| Status::internal("Invalid manifest revision"))?,
+            manifest_hash: result.manifest_hash,
         })
     }
 

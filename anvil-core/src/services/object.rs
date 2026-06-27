@@ -336,6 +336,34 @@ impl ObjectService for AppState {
         }))
     }
 
+    async fn compare_and_swap_manifest(
+        &self,
+        request: Request<CompareAndSwapManifestRequest>,
+    ) -> Result<Response<CompareAndSwapManifestResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        let result = self
+            .object_manager
+            .compare_and_swap_manifest(
+                claims.tenant_id,
+                &req.bucket_name,
+                &req.manifest_key,
+                req.expected_revision,
+                &req.manifest_json,
+                &claims.scopes,
+            )
+            .await?;
+
+        Ok(Response::new(CompareAndSwapManifestResponse {
+            revision: result.revision,
+            manifest_hash: result.manifest_hash,
+        }))
+    }
+
     async fn watch_prefix(
         &self,
         request: Request<WatchPrefixRequest>,
