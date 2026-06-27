@@ -1,7 +1,7 @@
 use crate::anvil_api::index_service_server::IndexService;
 use crate::anvil_api::*;
 use crate::{AppState, auth, bucket_journal, index_journal, permissions::AnvilAction, validation};
-use serde_json::{Value as JsonValue, json};
+use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -51,7 +51,7 @@ impl IndexService for AppState {
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        self.publish_index_definition_event(claims.tenant_id, &bucket, &index, "create")
+        self.publish_index_definition_event(&bucket, &index, "create")
             .await?;
 
         Ok(Response::new(IndexDefinitionResponse {
@@ -103,7 +103,7 @@ impl IndexService for AppState {
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Index definition not found"))?;
-        self.publish_index_definition_event(claims.tenant_id, &bucket, &index, "update")
+        self.publish_index_definition_event(&bucket, &index, "update")
             .await?;
 
         Ok(Response::new(IndexDefinitionResponse {
@@ -135,7 +135,7 @@ impl IndexService for AppState {
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Index definition not found"))?;
-        self.publish_index_definition_event(claims.tenant_id, &bucket, &index, "disable")
+        self.publish_index_definition_event(&bucket, &index, "disable")
             .await?;
 
         Ok(Response::new(IndexDefinitionResponse {
@@ -167,7 +167,7 @@ impl IndexService for AppState {
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Index definition not found"))?;
-        self.publish_index_definition_event(claims.tenant_id, &bucket, &index, "drop")
+        self.publish_index_definition_event(&bucket, &index, "drop")
             .await?;
         Ok(Response::new(DropIndexResponse {}))
     }
@@ -345,26 +345,14 @@ impl AppState {
 
     async fn publish_index_definition_event(
         &self,
-        tenant_id: i64,
         bucket: &crate::persistence::Bucket,
         index: &crate::persistence::IndexDefinition,
         event_type: &str,
     ) -> Result<crate::persistence::IndexDefinitionEvent, Status> {
-        let event = self
-            .db
-            .create_index_definition_event(
-                tenant_id,
-                bucket.id,
-                &bucket.name,
-                index,
-                event_type,
-                index_definition_json(&bucket.name, index),
-            )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        index_journal::append_index_definition_event(&self.storage, &event)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let event =
+            index_journal::write_index_definition_event(&self.storage, bucket, index, event_type)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
         let _ = self.index_watch_tx.send(event.clone());
         Ok(event)
     }
@@ -445,26 +433,6 @@ fn index_record(
         version: u64::try_from(index.version).map_err(|_| Status::internal("Invalid version"))?,
         created_at: index.created_at.to_string(),
         updated_at: index.updated_at.to_string(),
-    })
-}
-
-fn index_definition_json(
-    bucket_name: &str,
-    index: &crate::persistence::IndexDefinition,
-) -> JsonValue {
-    json!({
-        "index_id": index.id,
-        "bucket_name": bucket_name,
-        "name": index.name,
-        "kind": index.kind,
-        "selector_json": index.selector.to_string(),
-        "extractor_json": index.extractor.to_string(),
-        "authorization_mode": index.authorization_mode,
-        "build_policy_json": index.build_policy.to_string(),
-        "enabled": index.enabled,
-        "version": index.version,
-        "created_at": index.created_at.to_string(),
-        "updated_at": index.updated_at.to_string(),
     })
 }
 

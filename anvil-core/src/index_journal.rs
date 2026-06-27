@@ -2,11 +2,11 @@ use crate::formats::{
     BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, Hash32, JournalFrame, JournalRecordKind,
     hash32, validate_journal_chain,
 };
-use crate::persistence::IndexDefinitionEvent;
+use crate::persistence::{Bucket, IndexDefinition, IndexDefinitionEvent};
 use crate::storage::Storage;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
+use serde_json::{Value as JsonValue, json};
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
 
@@ -88,6 +88,36 @@ pub async fn append_index_definition_event(
     file.write_all(&frame.encode()).await?;
     file.sync_data().await?;
     Ok(())
+}
+
+pub async fn write_index_definition_event(
+    storage: &Storage,
+    bucket: &Bucket,
+    index: &IndexDefinition,
+    event_type: &str,
+) -> Result<IndexDefinitionEvent> {
+    let cursor = read_all_index_definition_events(storage, bucket.tenant_id, bucket.id)
+        .await?
+        .into_iter()
+        .map(|event| event.id)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("index definition cursor overflow"))?;
+    let event = IndexDefinitionEvent {
+        id: cursor,
+        tenant_id: bucket.tenant_id,
+        bucket_id: bucket.id,
+        bucket_name: bucket.name.clone(),
+        index_id: index.id,
+        index_name: index.name.clone(),
+        event_type: event_type.to_string(),
+        index_version: index.version,
+        definition: index_definition_json(&bucket.name, index),
+        created_at: chrono::Utc::now(),
+    };
+    append_index_definition_event(storage, &event).await?;
+    Ok(event)
 }
 
 pub async fn read_index_definition_events(
@@ -236,6 +266,23 @@ fn index_key_hash(tenant_id: i64, bucket_id: i64, index_name: &str) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/bucket/{bucket_id}/index/{index_name}").as_bytes())
 }
 
+fn index_definition_json(bucket_name: &str, index: &IndexDefinition) -> JsonValue {
+    json!({
+        "index_id": index.id,
+        "bucket_name": bucket_name,
+        "name": index.name,
+        "kind": index.kind,
+        "selector_json": index.selector.to_string(),
+        "extractor_json": index.extractor.to_string(),
+        "authorization_mode": index.authorization_mode,
+        "build_policy_json": index.build_policy.to_string(),
+        "enabled": index.enabled,
+        "version": index.version,
+        "created_at": index.created_at.to_string(),
+        "updated_at": index.updated_at.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +315,35 @@ mod tests {
                 "updated_at": "2026-01-01 00:00:00 UTC",
             }),
             created_at: Utc::now(),
+        }
+    }
+
+    fn bucket() -> Bucket {
+        Bucket {
+            id: 7,
+            tenant_id: 42,
+            name: "docs".to_string(),
+            region: "test-region".to_string(),
+            created_at: Utc::now(),
+            is_public_read: false,
+        }
+    }
+
+    fn index(version: i64, enabled: bool) -> IndexDefinition {
+        IndexDefinition {
+            id: 100,
+            tenant_id: 42,
+            bucket_id: 7,
+            name: "body".to_string(),
+            kind: "full_text".to_string(),
+            selector: json!({"prefix": "docs/"}),
+            extractor: json!({"field": "body"}),
+            authorization_mode: "inherit_object".to_string(),
+            build_policy: json!({}),
+            enabled,
+            version,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         }
     }
 
@@ -309,5 +385,27 @@ mod tests {
         assert_eq!(with_disabled.len(), 1);
         assert_eq!(with_disabled[0].index_name, "body");
         assert_eq!(with_disabled[0].event_type, "disable");
+    }
+
+    #[tokio::test]
+    async fn index_journal_allocates_native_event_cursors() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let bucket = bucket();
+        let first = write_index_definition_event(&storage, &bucket, &index(1, true), "create")
+            .await
+            .unwrap();
+        let second = write_index_definition_event(&storage, &bucket, &index(2, false), "disable")
+            .await
+            .unwrap();
+
+        assert_eq!(first.id, 1);
+        assert_eq!(second.id, 2);
+        let events = read_index_definition_events(&storage, 42, 7, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].event_type, "disable");
+        assert_eq!(events[1].definition["enabled"].as_bool(), Some(false));
     }
 }
