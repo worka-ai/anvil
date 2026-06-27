@@ -22,6 +22,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 use tracing::info;
 
+const INLINE_PAYLOAD_MAX_BYTES: i64 = 64 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct ObjectManager {
     db: Persistence,
@@ -52,6 +54,30 @@ pub struct CompleteMultipartPart {
 pub struct ObjectWriteOptions {
     pub content_type: Option<String>,
     pub user_metadata: Option<JsonValue>,
+}
+
+async fn commit_temp_object_or_inline(
+    storage: &Storage,
+    temp_path: &std::path::Path,
+    total_bytes: i64,
+    content_hash: &str,
+) -> Result<Option<Vec<u8>>, Status> {
+    if total_bytes <= INLINE_PAYLOAD_MAX_BYTES {
+        let payload = tokio::fs::read(temp_path)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        tokio::fs::remove_file(temp_path)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        return Ok(Some(payload));
+    }
+
+    info!("Committing whole object");
+    storage
+        .commit_whole_object(temp_path, content_hash)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+    Ok(None)
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +170,7 @@ impl ObjectManager {
 
         let total_bytes;
         let content_hash;
+        let mut inline_payload = None;
 
         if nodes.len() < self.sharder.total_shards() {
             if nodes.len() >= 1 {
@@ -155,11 +182,13 @@ impl ObjectManager {
                     .map_err(|e| Status::internal(e.to_string()))?;
                 total_bytes = bytes;
                 content_hash = hash;
-                info!("Committing whole object");
-                self.storage
-                    .commit_whole_object(&temp_path, &content_hash)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
+                inline_payload = commit_temp_object_or_inline(
+                    &self.storage,
+                    &temp_path,
+                    total_bytes,
+                    &content_hash,
+                )
+                .await?;
             } else {
                 // No peers known; fallback to single-node path as well
                 let (temp_path, bytes, hash) = self
@@ -169,10 +198,13 @@ impl ObjectManager {
                     .map_err(|e| Status::internal(e.to_string()))?;
                 total_bytes = bytes;
                 content_hash = hash;
-                self.storage
-                    .commit_whole_object(&temp_path, &content_hash)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
+                inline_payload = commit_temp_object_or_inline(
+                    &self.storage,
+                    &temp_path,
+                    total_bytes,
+                    &content_hash,
+                )
+                .await?;
             }
         } else {
             // Distributed case: stream and erasure code stripes.
@@ -286,6 +318,7 @@ impl ObjectManager {
                 options.content_type.as_deref(),
                 options.user_metadata,
                 shard_map_json,
+                inline_payload,
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -819,6 +852,15 @@ impl ObjectManager {
         let object_clone = object.clone();
 
         tokio::spawn(async move {
+            if let Some(inline_payload) = object_clone.inline_payload.clone() {
+                for chunk in inline_payload.chunks(1024 * 64) {
+                    if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                        break;
+                    }
+                }
+                return;
+            }
+
             // Prefer whole-object if available
             if let Ok(full_data) = app_state
                 .storage

@@ -212,6 +212,144 @@ async fn test_head_object() {
 }
 
 #[tokio::test]
+async fn test_inline_payload_threshold_is_recorded_and_readable() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+
+    let bucket_name = "test-inline-payload-bucket".to_string();
+    let inline_key = "inline-64k.bin".to_string();
+    let external_key = "external-over-64k.bin".to_string();
+
+    let mut create_req = Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
+    });
+    create_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client.create_bucket(create_req).await.unwrap();
+
+    let inline_content = vec![7_u8; 64 * 1024];
+    let inline_chunks = vec![
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                ObjectMetadata {
+                    bucket_name: bucket_name.clone(),
+                    object_key: inline_key.clone(),
+                },
+            )),
+        },
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                inline_content.clone(),
+            )),
+        },
+    ];
+    let mut inline_put_req = Request::new(tokio_stream::iter(inline_chunks));
+    inline_put_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let inline_put = object_client
+        .put_object(inline_put_req)
+        .await
+        .unwrap()
+        .into_inner();
+
+    let external_content = vec![9_u8; 64 * 1024 + 1];
+    let external_chunks = vec![
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                ObjectMetadata {
+                    bucket_name: bucket_name.clone(),
+                    object_key: external_key.clone(),
+                },
+            )),
+        },
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                external_content.clone(),
+            )),
+        },
+    ];
+    let mut external_put_req = Request::new(tokio_stream::iter(external_chunks));
+    external_put_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let external_put = object_client
+        .put_object(external_put_req)
+        .await
+        .unwrap()
+        .into_inner();
+
+    let global_client = cluster.states[0].db.get_global_pool().get().await.unwrap();
+    let bucket_row = global_client
+        .query_one("SELECT id FROM buckets WHERE name = $1", &[&bucket_name])
+        .await
+        .unwrap();
+    let bucket_id: i64 = bucket_row.get("id");
+    let inline_object = cluster.states[0]
+        .db
+        .get_object_version(
+            bucket_id,
+            &inline_key,
+            uuid::Uuid::parse_str(&inline_put.version_id).unwrap(),
+        )
+        .await
+        .unwrap()
+        .expect("inline object version should exist");
+    assert_eq!(
+        inline_object.inline_payload.as_deref(),
+        Some(&inline_content[..])
+    );
+
+    let external_object = cluster.states[0]
+        .db
+        .get_object_version(
+            bucket_id,
+            &external_key,
+            uuid::Uuid::parse_str(&external_put.version_id).unwrap(),
+        )
+        .await
+        .unwrap()
+        .expect("external object version should exist");
+    assert!(external_object.inline_payload.is_none());
+
+    let mut get_req = Request::new(GetObjectRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: inline_key,
+        version_id: Some(inline_put.version_id),
+    });
+    get_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let mut stream = object_client
+        .get_object(get_req)
+        .await
+        .unwrap()
+        .into_inner();
+    let mut downloaded = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        if let anvil_api::get_object_response::Data::Chunk(bytes) = chunk.unwrap().data.unwrap() {
+            downloaded.extend_from_slice(&bytes);
+        }
+    }
+    assert_eq!(downloaded, inline_content);
+}
+
+#[tokio::test]
 async fn test_object_version_records_index_policy_snapshot_and_mutation_metadata() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;

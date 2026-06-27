@@ -72,6 +72,7 @@ pub struct Object {
     pub storage_class: Option<i16>,
     pub user_meta: Option<JsonValue>,
     pub shard_map: Option<JsonValue>,
+    pub inline_payload: Option<Vec<u8>>,
     pub checksum: Option<Vec<u8>>,
 }
 
@@ -299,6 +300,7 @@ impl From<Row> for Object {
             storage_class: row.get("storage_class"),
             user_meta: row.get("user_meta"),
             shard_map: row.get("shard_map"),
+            inline_payload: row.get("inline_payload"),
             checksum: row.get("checksum"),
         }
     }
@@ -1493,6 +1495,7 @@ impl Persistence {
         content_type: Option<&str>,
         user_meta: Option<JsonValue>,
         shard_map: Option<JsonValue>,
+        inline_payload: Option<Vec<u8>>,
     ) -> Result<Object> {
         let version_id = uuid::Uuid::new_v4();
         let mutation_id = uuid::Uuid::new_v4();
@@ -1522,9 +1525,9 @@ impl Persistence {
                 r#"
                 INSERT INTO objects
                     (tenant_id, bucket_id, key, content_hash, size, etag, version_id, mutation_id,
-                     content_type, user_meta, shard_map, index_policy_snapshot, user_metadata_hash,
+                     content_type, user_meta, shard_map, inline_payload, index_policy_snapshot, user_metadata_hash,
                      authz_revision, record_hash)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
                 RETURNING *;"#,
                 &[
                     &tenant_id,
@@ -1538,6 +1541,7 @@ impl Persistence {
                     &content_type,
                     &user_meta,
                     &shard_map,
+                    &inline_payload,
                     &index_policy_snapshot,
                     &user_metadata_hash,
                     &authz_revision,
@@ -1661,10 +1665,10 @@ impl Persistence {
             let rows = client
                 .query(
                     r#"
-                    SELECT id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
+                    SELECT id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, inline_payload, checksum, deleted_at, key_ltree
                     FROM (
                       SELECT DISTINCT ON (key)
-                        id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
+                        id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, inline_payload, checksum, deleted_at, key_ltree
                       FROM objects
                       WHERE bucket_id = $1 AND key > $2 AND key LIKE $3
                       ORDER BY key, created_at DESC, id DESC
@@ -1807,10 +1811,10 @@ impl Persistence {
             let rows = client
                 .query(
                     r#"
-                    SELECT id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
+                    SELECT id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, inline_payload, checksum, deleted_at, key_ltree
                     FROM (
                       SELECT DISTINCT ON (key)
-                        id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
+                        id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, inline_payload, checksum, deleted_at, key_ltree
                       FROM objects
                       WHERE bucket_id = $1 AND key = ANY($2)
                       ORDER BY key, created_at DESC, id DESC
@@ -1904,7 +1908,7 @@ impl Persistence {
                 r#"
                 WITH ranked AS (
                   SELECT
-                    id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree,
+                    id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, inline_payload, checksum, deleted_at, key_ltree,
                     row_number() OVER (PARTITION BY key ORDER BY created_at DESC, id DESC) = 1 AS is_latest
                   FROM objects
                   WHERE bucket_id = $1 AND key > $2 AND key LIKE $3
