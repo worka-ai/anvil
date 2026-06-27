@@ -15,7 +15,7 @@ use crate::{
     cache::MetadataCache,
     cluster::MetadataEvent,
     config::Config,
-    control_journal,
+    control_journal, model_journal,
     storage::Storage,
     task_journal,
 };
@@ -45,8 +45,6 @@ struct NativeState {
     hf_keys: Vec<HfKey>,
     hf_ingestions: Vec<HfIngestion>,
     hf_items: Vec<HfIngestionItem>,
-    model_artifacts: Vec<ModelArtifactRecord>,
-    model_tensors: Vec<ModelTensorRecord>,
 }
 
 impl NativeState {
@@ -109,20 +107,6 @@ struct HfIngestionItem {
     created_at: DateTime<Utc>,
     started_at: Option<DateTime<Utc>>,
     finished_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ModelArtifactRecord {
-    artifact_id: String,
-    bucket_id: i64,
-    key: String,
-    manifest: crate::anvil_api::ModelManifest,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ModelTensorRecord {
-    artifact_id: String,
-    tensor: crate::anvil_api::TensorIndexRow,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -653,17 +637,8 @@ impl Persistence {
         key: &str,
         manifest: &crate::anvil_api::ModelManifest,
     ) -> Result<()> {
-        let mut state = self.state.write().await;
-        state
-            .model_artifacts
-            .retain(|r| r.artifact_id != artifact_id);
-        state.model_artifacts.push(ModelArtifactRecord {
-            artifact_id: artifact_id.to_string(),
-            bucket_id,
-            key: key.to_string(),
-            manifest: manifest.clone(),
-        });
-        self.persist_after_write(&state).await
+        model_journal::create_model_artifact(&self.storage, artifact_id, bucket_id, key, manifest)
+            .await
     }
 
     pub async fn create_model_tensors(
@@ -671,15 +646,7 @@ impl Persistence {
         artifact_id: &str,
         tensors: &[crate::anvil_api::TensorIndexRow],
     ) -> Result<()> {
-        let mut state = self.state.write().await;
-        state.model_tensors.retain(|r| r.artifact_id != artifact_id);
-        state
-            .model_tensors
-            .extend(tensors.iter().cloned().map(|tensor| ModelTensorRecord {
-                artifact_id: artifact_id.to_string(),
-                tensor,
-            }));
-        self.persist_after_write(&state).await
+        model_journal::create_model_tensors(&self.storage, artifact_id, tensors).await
     }
 
     pub async fn list_tensors(
@@ -688,21 +655,7 @@ impl Persistence {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<crate::anvil_api::TensorIndexRow>> {
-        let mut tensors = self
-            .state
-            .read()
-            .await
-            .model_tensors
-            .iter()
-            .filter(|r| r.artifact_id == artifact_id)
-            .map(|r| r.tensor.clone())
-            .collect::<Vec<_>>();
-        tensors.sort_by(|a, b| a.tensor_name.cmp(&b.tensor_name));
-        Ok(tensors
-            .into_iter()
-            .skip(offset.max(0) as usize)
-            .take(limit.max(0) as usize)
-            .collect())
+        model_journal::list_tensors(&self.storage, artifact_id, limit, offset).await
     }
 
     pub async fn get_tensor_metadata(
@@ -710,28 +663,14 @@ impl Persistence {
         artifact_id: &str,
         tensor_name: &str,
     ) -> Result<Option<crate::anvil_api::TensorIndexRow>> {
-        Ok(self
-            .state
-            .read()
-            .await
-            .model_tensors
-            .iter()
-            .find(|r| r.artifact_id == artifact_id && r.tensor.tensor_name == tensor_name)
-            .map(|r| r.tensor.clone()))
+        model_journal::get_tensor_metadata(&self.storage, artifact_id, tensor_name).await
     }
 
     pub async fn get_model_artifact(
         &self,
         artifact_id: &str,
     ) -> Result<Option<crate::anvil_api::ModelManifest>> {
-        Ok(self
-            .state
-            .read()
-            .await
-            .model_artifacts
-            .iter()
-            .find(|r| r.artifact_id == artifact_id)
-            .map(|r| r.manifest.clone()))
+        model_journal::get_model_artifact(&self.storage, artifact_id).await
     }
 
     pub async fn get_tensor_metadata_recursive(

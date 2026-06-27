@@ -33,6 +33,7 @@ pub mod index_partition_watch;
 pub mod media_extraction;
 pub mod metadata_journal;
 pub mod middleware;
+pub mod model_journal;
 pub mod object_manager;
 pub mod permissions;
 pub mod persistence;
