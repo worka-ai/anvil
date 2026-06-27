@@ -1,3 +1,4 @@
+use crate::authz_segment;
 use crate::formats::{
     BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, Hash32, JournalFrame, JournalRecordKind,
     hash32, validate_journal_chain,
@@ -141,6 +142,8 @@ pub async fn append_authz_tuple_record(storage: &Storage, record: &AuthzTupleRec
         .with_context(|| format!("open authz tuple journal {}", path.display()))?;
     file.write_all(&frame.encode()).await?;
     file.sync_data().await?;
+    let records = read_all_authz_tuple_records_from_journal(storage, record.tenant_id).await?;
+    authz_segment::write_authz_tuple_segment(storage, record.tenant_id, &records).await?;
     Ok(())
 }
 
@@ -224,6 +227,25 @@ pub async fn list_authz_tuple_log(
 }
 
 async fn read_all_authz_tuple_records(
+    storage: &Storage,
+    tenant_id: i64,
+) -> Result<Vec<AuthzTupleRecord>> {
+    if let Some(segment) =
+        authz_segment::read_latest_authz_tuple_segment(storage, tenant_id).await?
+    {
+        return Ok(segment
+            .records
+            .into_iter()
+            .map(|mut record| {
+                record.tenant_id = tenant_id;
+                record
+            })
+            .collect());
+    }
+    read_all_authz_tuple_records_from_journal(storage, tenant_id).await
+}
+
+async fn read_all_authz_tuple_records_from_journal(
     storage: &Storage,
     tenant_id: i64,
 ) -> Result<Vec<AuthzTupleRecord>> {
@@ -388,7 +410,7 @@ mod tests {
             operation: operation.to_string(),
             written_by: "tester".to_string(),
             reason: "test".to_string(),
-            record_hash: format!("hash-{revision}"),
+            record_hash: hex::encode(hash32(format!("record-{revision}").as_bytes())),
             written_at: Utc::now(),
         }
     }

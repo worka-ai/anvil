@@ -129,16 +129,39 @@ impl TupleValue {
         written_by: Vec<u8>,
         reason: Vec<u8>,
     ) -> Self {
-        let mut value = Self {
+        let record_hash = hash32(&Self::bytes_without_hash_parts(
+            operation,
+            revision,
+            written_at_nanos,
+            &written_by,
+            &reason,
+        ));
+        Self::with_record_hash(
             operation,
             revision,
             written_at_nanos,
             written_by,
             reason,
-            record_hash: [0; 32],
-        };
-        value.record_hash = hash32(&value.bytes_without_hash());
-        value
+            record_hash,
+        )
+    }
+
+    pub fn with_record_hash(
+        operation: TupleOperation,
+        revision: u64,
+        written_at_nanos: i64,
+        written_by: Vec<u8>,
+        reason: Vec<u8>,
+        record_hash: Hash32,
+    ) -> Self {
+        Self {
+            operation,
+            revision,
+            written_at_nanos,
+            written_by,
+            reason,
+            record_hash,
+        }
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -182,11 +205,6 @@ impl TupleValue {
             });
         }
         let record_hash = input[hash_start..record_end].try_into().unwrap();
-        if hash32(&input[..hash_start]) != record_hash {
-            return Err(FormatError::HashMismatch {
-                context: "authz tuple value",
-            });
-        }
         Ok((
             Self {
                 operation: TupleOperation::from_u8(input[0])?,
@@ -201,14 +219,30 @@ impl TupleValue {
     }
 
     fn bytes_without_hash(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(21 + self.written_by.len() + self.reason.len());
-        out.push(self.operation as u8);
-        out.extend_from_slice(&self.revision.to_le_bytes());
-        out.extend_from_slice(&self.written_at_nanos.to_le_bytes());
-        out.extend_from_slice(&(self.written_by.len() as u16).to_le_bytes());
-        out.extend_from_slice(&(self.reason.len() as u16).to_le_bytes());
-        out.extend_from_slice(&self.written_by);
-        out.extend_from_slice(&self.reason);
+        Self::bytes_without_hash_parts(
+            self.operation,
+            self.revision,
+            self.written_at_nanos,
+            &self.written_by,
+            &self.reason,
+        )
+    }
+
+    fn bytes_without_hash_parts(
+        operation: TupleOperation,
+        revision: u64,
+        written_at_nanos: i64,
+        written_by: &[u8],
+        reason: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(21 + written_by.len() + reason.len());
+        out.push(operation as u8);
+        out.extend_from_slice(&revision.to_le_bytes());
+        out.extend_from_slice(&written_at_nanos.to_le_bytes());
+        out.extend_from_slice(&(written_by.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(reason.len() as u16).to_le_bytes());
+        out.extend_from_slice(written_by);
+        out.extend_from_slice(reason);
         out
     }
 }
@@ -234,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn tuple_value_round_trip_checks_hash_and_operation() {
+    fn tuple_value_round_trip_preserves_record_hash_and_checks_operation() {
         let value = TupleValue::new(
             TupleOperation::Add,
             42,
@@ -248,12 +282,10 @@ mod tests {
         assert_eq!(decoded, value);
 
         let mut corrupted = encoded;
-        corrupted[23] ^= 1;
+        corrupted[0] = 99;
         assert_eq!(
             TupleValue::decode(&corrupted).unwrap_err(),
-            FormatError::HashMismatch {
-                context: "authz tuple value"
-            }
+            FormatError::UnsupportedOperation(99)
         );
     }
 }

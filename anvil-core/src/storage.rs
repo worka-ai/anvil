@@ -76,11 +76,20 @@ impl Storage {
     }
 
     pub fn authz_tuple_journal_path(&self, tenant_id: i64) -> PathBuf {
+        self.authz_tuple_segment_dir(tenant_id)
+            .join("tuples.anjournal")
+    }
+
+    pub fn authz_tuple_segment_dir(&self, tenant_id: i64) -> PathBuf {
         self.storage_path
             .join("_anvil")
             .join("authz")
             .join(format!("tenant-{tenant_id}"))
-            .join("tuples.anjournal")
+    }
+
+    pub fn authz_tuple_segment_path(&self, tenant_id: i64, generation: u64) -> PathBuf {
+        self.authz_tuple_segment_dir(tenant_id)
+            .join(format!("generation-{generation:020}.anauthz"))
     }
 
     pub fn metadata_segment_path(
