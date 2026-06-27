@@ -272,6 +272,21 @@ impl Storage {
             .join(format!("{partition_id}.anwatch")))
     }
 
+    pub fn authz_derived_lag_watch_path(
+        &self,
+        tenant_id: i64,
+        derived_index_id: &str,
+    ) -> Result<PathBuf> {
+        ensure_safe_internal_component(derived_index_id, "authorization derived index id")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("watch")
+            .join("authz-derived-lag")
+            .join(format!("tenant-{tenant_id}"))
+            .join(format!("{derived_index_id}.anwatch")))
+    }
+
     pub fn git_source_watch_path(&self, tenant_id: i64, repository_id: &str) -> Result<PathBuf> {
         ensure_safe_internal_component(repository_id, "git repository id")?;
         Ok(self

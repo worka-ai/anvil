@@ -9,6 +9,7 @@ use tokio::sync::{RwLock, broadcast};
 
 // The modules we've created
 pub mod auth;
+pub mod authz_derived_lag_watch;
 pub mod authz_journal;
 pub mod authz_segment;
 pub mod bucket_journal;
