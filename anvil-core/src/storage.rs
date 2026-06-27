@@ -184,6 +184,27 @@ impl Storage {
             .join(format!("{generation:020}-{source_hash}.rowidx")))
     }
 
+    pub fn git_source_index_path(
+        &self,
+        tenant_id: i64,
+        repository_id: &str,
+        generation: u64,
+        source_hash: &str,
+    ) -> Result<PathBuf> {
+        ensure_safe_internal_component(repository_id, "git repository id")?;
+        ensure_hash_hex(source_hash, "git source index source hash")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("git")
+            .join("tenants")
+            .join(format!("tenant-{tenant_id}"))
+            .join("repositories")
+            .join(repository_id)
+            .join("indexes")
+            .join(format!("generation-{generation:020}-{source_hash}.angit")))
+    }
+
     pub fn relative_storage_path(&self, path: &Path) -> Result<String> {
         let relative = path.strip_prefix(&self.storage_path)?;
         Ok(relative.to_string_lossy().replace('\\', "/"))
