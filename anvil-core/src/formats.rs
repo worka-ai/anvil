@@ -1,7 +1,9 @@
 pub mod authz;
+pub mod full_text;
 pub mod git;
 pub mod personaldb;
 pub mod segment;
+pub mod vector;
 pub mod watch;
 
 use std::convert::TryInto;
