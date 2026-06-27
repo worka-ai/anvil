@@ -237,6 +237,36 @@ impl ObjectService for AppState {
         Ok(Response::new(ListObjectVersionsResponse { versions }))
     }
 
+    async fn copy_object(
+        &self,
+        request: Request<CopyObjectRequest>,
+    ) -> Result<Response<CopyObjectResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+
+        let object = self
+            .object_manager
+            .copy_object(
+                claims,
+                &req.source_bucket_name,
+                &req.source_object_key,
+                parse_optional_version_id(req.source_version_id.as_deref())?,
+                &req.destination_bucket_name,
+                &req.destination_object_key,
+            )
+            .await?;
+
+        Ok(Response::new(CopyObjectResponse {
+            etag: object.etag,
+            version_id: object.version_id.to_string(),
+            last_modified: object.created_at.to_string(),
+        }))
+    }
+
     async fn initiate_multipart_upload(
         &self,
         _request: Request<InitiateMultipartRequest>,

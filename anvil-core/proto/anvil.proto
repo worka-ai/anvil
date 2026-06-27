@@ -59,6 +59,7 @@ service ObjectService {
   rpc HeadObject(HeadObjectRequest) returns (HeadObjectResponse);
   rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
   rpc ListObjectVersions(ListObjectVersionsRequest) returns (ListObjectVersionsResponse);
+  rpc CopyObject(CopyObjectRequest) returns (CopyObjectResponse);
   rpc InitiateMultipartUpload(InitiateMultipartRequest) returns (InitiateMultipartResponse);
   rpc CompleteMultipartUpload(CompleteMultipartRequest) returns (CompleteMultipartResponse);
 }
@@ -173,6 +174,20 @@ message CompleteMultipartRequest {
     string bucket_name = 1;
     string object_key = 2;
     string upload_id = 3;
+}
+
+message CopyObjectRequest {
+    string source_bucket_name = 1;
+    string source_object_key = 2;
+    optional string source_version_id = 3;
+    string destination_bucket_name = 4;
+    string destination_object_key = 5;
+}
+
+message CopyObjectResponse {
+    string etag = 1;
+    string version_id = 2;
+    string last_modified = 3;
 }
 
 message CompleteMultipartResponse {

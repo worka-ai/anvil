@@ -719,6 +719,34 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))
     }
 
+    pub async fn copy_object(
+        &self,
+        claims: auth::Claims,
+        source_bucket_name: &str,
+        source_object_key: &str,
+        source_version_id: Option<uuid::Uuid>,
+        destination_bucket_name: &str,
+        destination_object_key: &str,
+    ) -> Result<Object, Status> {
+        let (_source_object, source_stream) = self
+            .get_object(
+                Some(claims.clone()),
+                source_bucket_name.to_string(),
+                source_object_key.to_string(),
+                source_version_id,
+            )
+            .await?;
+
+        self.put_object(
+            claims.tenant_id,
+            destination_bucket_name,
+            destination_object_key,
+            &claims.scopes,
+            source_stream,
+        )
+        .await
+    }
+
     async fn get_authorized_bucket(
         &self,
         claims: Option<&auth::Claims>,
