@@ -335,16 +335,139 @@ impl ObjectService for AppState {
 
     async fn initiate_multipart_upload(
         &self,
-        _request: Request<InitiateMultipartRequest>,
+        request: Request<InitiateMultipartRequest>,
     ) -> Result<Response<InitiateMultipartResponse>, Status> {
-        todo!()
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+
+        let upload_id = self
+            .object_manager
+            .initiate_multipart_upload(
+                claims.tenant_id,
+                &req.bucket_name,
+                &req.object_key,
+                &claims.scopes,
+            )
+            .await?;
+
+        Ok(Response::new(InitiateMultipartResponse {
+            upload_id: upload_id.to_string(),
+        }))
+    }
+
+    async fn upload_part(
+        &self,
+        request: Request<tonic::Streaming<UploadPartRequest>>,
+    ) -> Result<Response<UploadPartResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+
+        let mut stream = request.into_inner();
+        let metadata = match stream.next().await {
+            Some(Ok(chunk)) => match chunk.data {
+                Some(upload_part_request::Data::Metadata(metadata)) => metadata,
+                _ => return Err(Status::invalid_argument("First chunk must be metadata")),
+            },
+            Some(Err(status)) => return Err(status),
+            None => return Err(Status::invalid_argument("Empty stream")),
+        };
+
+        let upload_id = uuid::Uuid::parse_str(&metadata.upload_id)
+            .map_err(|_| Status::invalid_argument("Invalid upload_id"))?;
+        let data_stream = stream.map(|chunk_result| match chunk_result {
+            Ok(chunk) => match chunk.data {
+                Some(upload_part_request::Data::Chunk(bytes)) => Ok(bytes),
+                _ => Ok(vec![]),
+            },
+            Err(e) => Err(e),
+        });
+
+        let etag = self
+            .object_manager
+            .upload_part(
+                claims.tenant_id,
+                &metadata.bucket_name,
+                &metadata.object_key,
+                upload_id,
+                metadata.part_number,
+                &claims.scopes,
+                data_stream,
+            )
+            .await?;
+
+        Ok(Response::new(UploadPartResponse { etag }))
     }
 
     async fn complete_multipart_upload(
         &self,
-        _request: Request<CompleteMultipartRequest>,
+        request: Request<CompleteMultipartRequest>,
     ) -> Result<Response<CompleteMultipartResponse>, Status> {
-        todo!()
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        let upload_id = uuid::Uuid::parse_str(&req.upload_id)
+            .map_err(|_| Status::invalid_argument("Invalid upload_id"))?;
+        let parts = req
+            .parts
+            .into_iter()
+            .map(|part| crate::object_manager::CompleteMultipartPart {
+                part_number: part.part_number,
+                etag: part.etag,
+            })
+            .collect();
+
+        let object = self
+            .object_manager
+            .complete_multipart_upload(
+                claims.tenant_id,
+                &req.bucket_name,
+                &req.object_key,
+                upload_id,
+                parts,
+                &claims.scopes,
+            )
+            .await?;
+
+        Ok(Response::new(CompleteMultipartResponse {
+            etag: object.etag,
+            version_id: object.version_id.to_string(),
+        }))
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        request: Request<AbortMultipartRequest>,
+    ) -> Result<Response<AbortMultipartResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        let upload_id = uuid::Uuid::parse_str(&req.upload_id)
+            .map_err(|_| Status::invalid_argument("Invalid upload_id"))?;
+
+        self.object_manager
+            .abort_multipart_upload(
+                claims.tenant_id,
+                &req.bucket_name,
+                &req.object_key,
+                upload_id,
+                &claims.scopes,
+            )
+            .await?;
+
+        Ok(Response::new(AbortMultipartResponse {}))
     }
 }
 

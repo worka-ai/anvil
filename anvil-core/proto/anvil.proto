@@ -63,7 +63,9 @@ service ObjectService {
   rpc ComposeObject(ComposeObjectRequest) returns (ComposeObjectResponse);
   rpc PatchJsonObject(PatchJsonObjectRequest) returns (PatchJsonObjectResponse);
   rpc InitiateMultipartUpload(InitiateMultipartRequest) returns (InitiateMultipartResponse);
+  rpc UploadPart(stream UploadPartRequest) returns (UploadPartResponse);
   rpc CompleteMultipartUpload(CompleteMultipartRequest) returns (CompleteMultipartResponse);
+  rpc AbortMultipartUpload(AbortMultipartRequest) returns (AbortMultipartResponse);
 }
 
 message PutObjectRequest {
@@ -172,10 +174,34 @@ message InitiateMultipartResponse {
     string upload_id = 1;
 }
 
+message UploadPartRequest {
+    oneof data {
+        UploadPartMetadata metadata = 1;
+        bytes chunk = 2;
+    }
+}
+
+message UploadPartMetadata {
+    string bucket_name = 1;
+    string object_key = 2;
+    string upload_id = 3;
+    int32 part_number = 4;
+}
+
+message UploadPartResponse {
+    string etag = 1;
+}
+
+message CompleteMultipartPart {
+    int32 part_number = 1;
+    string etag = 2;
+}
+
 message CompleteMultipartRequest {
     string bucket_name = 1;
     string object_key = 2;
     string upload_id = 3;
+    repeated CompleteMultipartPart parts = 4;
 }
 
 message CopyObjectRequest {
@@ -227,6 +253,14 @@ message CompleteMultipartResponse {
     string etag = 1;
     string version_id = 2;
 }
+
+message AbortMultipartRequest {
+    string bucket_name = 1;
+    string object_key = 2;
+    string upload_id = 3;
+}
+
+message AbortMultipartResponse {}
 
 // Internal Service for node-to-node communication
 service InternalAnvilService {

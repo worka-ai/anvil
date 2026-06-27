@@ -66,6 +66,29 @@ pub struct ObjectVersion {
     pub is_latest: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct MultipartUpload {
+    pub id: i64,
+    pub tenant_id: i64,
+    pub bucket_id: i64,
+    pub key: String,
+    pub upload_id: uuid::Uuid,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub aborted_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MultipartUploadPart {
+    pub id: i64,
+    pub upload_id: i64,
+    pub part_number: i32,
+    pub content_hash: String,
+    pub size: i64,
+    pub etag: String,
+    pub created_at: DateTime<Utc>,
+}
+
 // Manual row-to-struct mapping
 impl From<Row> for Tenant {
     fn from(row: Row) -> Self {
@@ -117,6 +140,35 @@ impl From<Row> for Object {
             user_meta: row.get("user_meta"),
             shard_map: row.get("shard_map"),
             checksum: row.get("checksum"),
+        }
+    }
+}
+
+impl From<Row> for MultipartUpload {
+    fn from(row: Row) -> Self {
+        Self {
+            id: row.get("id"),
+            tenant_id: row.get("tenant_id"),
+            bucket_id: row.get("bucket_id"),
+            key: row.get("key"),
+            upload_id: row.get("upload_id"),
+            created_at: row.get("created_at"),
+            completed_at: row.get("completed_at"),
+            aborted_at: row.get("aborted_at"),
+        }
+    }
+}
+
+impl From<Row> for MultipartUploadPart {
+    fn from(row: Row) -> Self {
+        Self {
+            id: row.get("id"),
+            upload_id: row.get("upload_id"),
+            part_number: row.get("part_number"),
+            content_hash: row.get("content_hash"),
+            size: row.get("size"),
+            etag: row.get("etag"),
+            created_at: row.get("created_at"),
         }
     }
 }
@@ -1289,6 +1341,137 @@ impl Persistence {
                 }
             })
             .collect())
+    }
+
+    pub async fn create_multipart_upload(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        key: &str,
+    ) -> Result<MultipartUpload> {
+        let client = self.regional_pool.get().await?;
+        let row = client
+            .query_one(
+                r#"
+                INSERT INTO multipart_uploads (tenant_id, bucket_id, key, upload_id)
+                VALUES ($1, $2, $3, gen_random_uuid())
+                RETURNING *"#,
+                &[&tenant_id, &bucket_id, &key],
+            )
+            .await?;
+        Ok(row.into())
+    }
+
+    pub async fn get_active_multipart_upload(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        key: &str,
+        upload_id: uuid::Uuid,
+    ) -> Result<Option<MultipartUpload>> {
+        let client = self.regional_pool.get().await?;
+        let row = client
+            .query_opt(
+                r#"
+                SELECT *
+                FROM multipart_uploads
+                WHERE tenant_id = $1
+                  AND bucket_id = $2
+                  AND key = $3
+                  AND upload_id = $4
+                  AND completed_at IS NULL
+                  AND aborted_at IS NULL"#,
+                &[&tenant_id, &bucket_id, &key, &upload_id],
+            )
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
+    pub async fn upsert_multipart_part(
+        &self,
+        upload_row_id: i64,
+        part_number: i32,
+        content_hash: &str,
+        size: i64,
+        etag: &str,
+    ) -> Result<MultipartUploadPart> {
+        let client = self.regional_pool.get().await?;
+        let row = client
+            .query_one(
+                r#"
+                INSERT INTO multipart_upload_parts
+                    (upload_id, part_number, content_hash, size, etag)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (upload_id, part_number)
+                DO UPDATE SET
+                    content_hash = EXCLUDED.content_hash,
+                    size = EXCLUDED.size,
+                    etag = EXCLUDED.etag,
+                    created_at = now()
+                RETURNING *"#,
+                &[&upload_row_id, &part_number, &content_hash, &size, &etag],
+            )
+            .await?;
+        Ok(row.into())
+    }
+
+    pub async fn list_multipart_parts(
+        &self,
+        upload_row_id: i64,
+    ) -> Result<Vec<MultipartUploadPart>> {
+        let client = self.regional_pool.get().await?;
+        let rows = client
+            .query(
+                r#"
+                SELECT *
+                FROM multipart_upload_parts
+                WHERE upload_id = $1
+                ORDER BY part_number"#,
+                &[&upload_row_id],
+            )
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn complete_multipart_upload(&self, upload_row_id: i64) -> Result<()> {
+        let client = self.regional_pool.get().await?;
+        client
+            .execute(
+                r#"
+                UPDATE multipart_uploads
+                SET completed_at = now()
+                WHERE id = $1
+                  AND completed_at IS NULL
+                  AND aborted_at IS NULL"#,
+                &[&upload_row_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn abort_multipart_upload(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        key: &str,
+        upload_id: uuid::Uuid,
+    ) -> Result<bool> {
+        let client = self.regional_pool.get().await?;
+        let changed = client
+            .execute(
+                r#"
+                UPDATE multipart_uploads
+                SET aborted_at = now()
+                WHERE tenant_id = $1
+                  AND bucket_id = $2
+                  AND key = $3
+                  AND upload_id = $4
+                  AND completed_at IS NULL
+                  AND aborted_at IS NULL"#,
+                &[&tenant_id, &bucket_id, &key, &upload_id],
+            )
+            .await?;
+        Ok(changed > 0)
     }
 
     pub async fn hard_delete_object(&self, object_id: i64) -> Result<()> {

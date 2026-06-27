@@ -39,6 +39,12 @@ pub struct ComposeSource {
     pub version_id: Option<uuid::Uuid>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CompleteMultipartPart {
+    pub part_number: i32,
+    pub etag: String,
+}
+
 impl ObjectManager {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -252,6 +258,175 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(object)
+    }
+
+    pub async fn initiate_multipart_upload(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        object_key: &str,
+        scopes: &[String],
+    ) -> Result<uuid::Uuid, Status> {
+        self.validate_write_request(bucket_name, object_key, scopes)?;
+        let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
+
+        let upload = self
+            .db
+            .create_multipart_upload(tenant_id, bucket.id, object_key)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(upload.upload_id)
+    }
+
+    pub async fn upload_part(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        object_key: &str,
+        upload_id: uuid::Uuid,
+        part_number: i32,
+        scopes: &[String],
+        data_stream: impl Stream<Item = Result<Vec<u8>, Status>> + Unpin,
+    ) -> Result<String, Status> {
+        self.validate_write_request(bucket_name, object_key, scopes)?;
+        validate_multipart_part_number(part_number)?;
+        let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
+        let upload = self
+            .db
+            .get_active_multipart_upload(tenant_id, bucket.id, object_key, upload_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Multipart upload not found"))?;
+
+        let (temp_path, bytes, content_hash) = self
+            .storage
+            .stream_to_temp_file(data_stream)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        self.storage
+            .commit_whole_object(&temp_path, &content_hash)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let part = self
+            .db
+            .upsert_multipart_part(
+                upload.id,
+                part_number,
+                &content_hash,
+                bytes as i64,
+                &content_hash,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(part.etag)
+    }
+
+    pub async fn complete_multipart_upload(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        object_key: &str,
+        upload_id: uuid::Uuid,
+        parts: Vec<CompleteMultipartPart>,
+        scopes: &[String],
+    ) -> Result<Object, Status> {
+        self.validate_write_request(bucket_name, object_key, scopes)?;
+        if parts.is_empty() {
+            return Err(Status::invalid_argument(
+                "CompleteMultipartUpload requires at least one part",
+            ));
+        }
+        for part in &parts {
+            validate_multipart_part_number(part.part_number)?;
+        }
+
+        let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
+        let upload = self
+            .db
+            .get_active_multipart_upload(tenant_id, bucket.id, object_key, upload_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Multipart upload not found"))?;
+        let stored_parts = self
+            .db
+            .list_multipart_parts(upload.id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let mut ordered_hashes = Vec::with_capacity(parts.len());
+        for expected in parts {
+            let stored = stored_parts
+                .iter()
+                .find(|part| part.part_number == expected.part_number)
+                .ok_or_else(|| {
+                    Status::invalid_argument("Complete request references missing part")
+                })?;
+            if trim_s3_etag(&stored.etag) != trim_s3_etag(&expected.etag) {
+                return Err(Status::invalid_argument(
+                    "Complete request part ETag mismatch",
+                ));
+            }
+            ordered_hashes.push(stored.content_hash.clone());
+        }
+
+        let storage = self.storage.clone();
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            for content_hash in ordered_hashes {
+                let bytes = match storage.retrieve_whole_object(&content_hash).await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        let _ = tx.send(Err(Status::internal(error.to_string()))).await;
+                        return;
+                    }
+                };
+                for chunk in bytes.chunks(1024 * 64) {
+                    if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+
+        let object = self
+            .put_object(
+                tenant_id,
+                bucket_name,
+                object_key,
+                scopes,
+                ReceiverStream::new(rx),
+            )
+            .await?;
+
+        self.db
+            .complete_multipart_upload(upload.id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(object)
+    }
+
+    pub async fn abort_multipart_upload(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        object_key: &str,
+        upload_id: uuid::Uuid,
+        scopes: &[String],
+    ) -> Result<(), Status> {
+        self.validate_write_request(bucket_name, object_key, scopes)?;
+        let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
+        let aborted = self
+            .db
+            .abort_multipart_upload(tenant_id, bucket.id, object_key, upload_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if aborted {
+            Ok(())
+        } else {
+            Err(Status::not_found("Multipart upload not found"))
+        }
     }
 
     async fn send_stripe(
@@ -875,6 +1050,49 @@ impl ObjectManager {
 
         Ok(bucket)
     }
+
+    fn validate_write_request(
+        &self,
+        bucket_name: &str,
+        object_key: &str,
+        scopes: &[String],
+    ) -> Result<(), Status> {
+        if !validation::is_valid_bucket_name(bucket_name) {
+            return Err(Status::invalid_argument("Invalid bucket name"));
+        }
+        if validation::is_reserved_internal_key(object_key) {
+            return Err(Status::permission_denied("UnauthorizedReservedNamespace"));
+        }
+        if !validation::is_valid_object_key(object_key) {
+            return Err(Status::invalid_argument("Invalid object key"));
+        }
+        if !auth::is_authorized(
+            AnvilAction::ObjectWrite,
+            &format!("{}/{}", bucket_name, object_key),
+            scopes,
+        ) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+        Ok(())
+    }
+
+    async fn get_tenant_bucket(&self, tenant_id: i64, bucket_name: &str) -> Result<Bucket, Status> {
+        let bucket = self
+            .db
+            .get_bucket_by_name(tenant_id, bucket_name)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Bucket not found"))?;
+
+        if bucket.region != self.region {
+            return Err(Status::failed_precondition(format!(
+                "Bucket is in region {}",
+                bucket.region
+            )));
+        }
+
+        Ok(bucket)
+    }
 }
 
 async fn collect_stream_bytes(
@@ -909,4 +1127,18 @@ fn apply_json_merge_patch(target: &mut JsonValue, patch: JsonValue) {
             *target = replacement;
         }
     }
+}
+
+fn validate_multipart_part_number(part_number: i32) -> Result<(), Status> {
+    if (1..=10_000).contains(&part_number) {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(
+            "Multipart part number must be between 1 and 10000",
+        ))
+    }
+}
+
+fn trim_s3_etag(value: &str) -> &str {
+    value.trim().trim_matches('"')
 }

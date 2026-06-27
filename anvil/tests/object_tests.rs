@@ -1,9 +1,11 @@
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::{
-    self, ComposeObjectRequest, ComposeObjectSource, CopyObjectRequest, CreateBucketRequest,
-    DeleteObjectRequest, GetObjectRequest, HeadObjectRequest, ListObjectVersionsRequest,
+    self, CompleteMultipartPart, CompleteMultipartRequest, ComposeObjectRequest,
+    ComposeObjectSource, CopyObjectRequest, CreateBucketRequest, DeleteObjectRequest,
+    GetObjectRequest, HeadObjectRequest, InitiateMultipartRequest, ListObjectVersionsRequest,
     ListObjectsRequest, ObjectMetadata, PatchJsonObjectRequest, PutObjectRequest,
+    UploadPartMetadata, UploadPartRequest,
 };
 use futures_util::StreamExt;
 use std::time::Duration;
@@ -309,6 +311,121 @@ async fn test_copy_object_creates_independent_destination_version() {
         }
     }
     assert_eq!(downloaded, content);
+}
+
+#[tokio::test]
+async fn test_multipart_upload_completes_ordered_parts() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+
+    let bucket_name = "test-multipart-bucket".to_string();
+    let object_key = "multipart.txt".to_string();
+    let mut create_req = Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
+    });
+    create_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client.create_bucket(create_req).await.unwrap();
+
+    let mut initiate_req = Request::new(InitiateMultipartRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: object_key.clone(),
+    });
+    initiate_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let upload_id = object_client
+        .initiate_multipart_upload(initiate_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .upload_id;
+
+    let part_payloads = [(1, b"multi".to_vec()), (2, b"part".to_vec())];
+    let mut completed_parts = Vec::new();
+    for (part_number, payload) in part_payloads {
+        let chunks = vec![
+            UploadPartRequest {
+                data: Some(anvil_api::upload_part_request::Data::Metadata(
+                    UploadPartMetadata {
+                        bucket_name: bucket_name.clone(),
+                        object_key: object_key.clone(),
+                        upload_id: upload_id.clone(),
+                        part_number,
+                    },
+                )),
+            },
+            UploadPartRequest {
+                data: Some(anvil_api::upload_part_request::Data::Chunk(payload)),
+            },
+        ];
+        let mut upload_req = Request::new(tokio_stream::iter(chunks));
+        upload_req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+        let upload_part = object_client
+            .upload_part(upload_req)
+            .await
+            .unwrap()
+            .into_inner();
+        completed_parts.push(CompleteMultipartPart {
+            part_number,
+            etag: upload_part.etag,
+        });
+    }
+
+    let mut complete_req = Request::new(CompleteMultipartRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: object_key.clone(),
+        upload_id,
+        parts: completed_parts,
+    });
+    complete_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let complete_res = object_client
+        .complete_multipart_upload(complete_req)
+        .await
+        .unwrap()
+        .into_inner();
+
+    let mut get_req = Request::new(GetObjectRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: object_key.clone(),
+        version_id: Some(complete_res.version_id),
+    });
+    get_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let mut stream = object_client
+        .get_object(get_req)
+        .await
+        .unwrap()
+        .into_inner();
+    let mut downloaded = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        if let anvil_api::get_object_response::Data::Chunk(bytes) = chunk.unwrap().data.unwrap() {
+            downloaded.extend_from_slice(&bytes);
+        }
+    }
+
+    assert_eq!(downloaded, b"multipart");
 }
 
 #[tokio::test]
