@@ -2741,6 +2741,27 @@ impl Persistence {
         Ok(row.map(Into::into))
     }
 
+    pub async fn get_index_definition(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        name: &str,
+    ) -> Result<Option<IndexDefinition>> {
+        let client = self.regional_pool.get().await?;
+        let row = client
+            .query_opt(
+                r#"
+                SELECT *
+                FROM index_definitions
+                WHERE tenant_id = $1
+                  AND bucket_id = $2
+                  AND name = $3"#,
+                &[&tenant_id, &bucket_id, &name],
+            )
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
     pub async fn disable_index_definition(
         &self,
         tenant_id: i64,

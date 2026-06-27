@@ -35,6 +35,7 @@ impl IndexService for AppState {
         let extractor = parse_json_field("extractor_json", &req.extractor_json)?;
         let build_policy = parse_json_field("build_policy_json", &req.build_policy_json)?;
         validate_authorization_mode(&req.authorization_mode)?;
+        validate_index_definition_shape(&req.kind, &build_policy)?;
 
         let index = self
             .db
@@ -80,6 +81,13 @@ impl IndexService for AppState {
         let extractor = parse_json_field("extractor_json", &req.extractor_json)?;
         let build_policy = parse_json_field("build_policy_json", &req.build_policy_json)?;
         validate_authorization_mode(&req.authorization_mode)?;
+        let existing = self
+            .db
+            .get_index_definition(claims.tenant_id, bucket.id, &req.name)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Index definition not found"))?;
+        validate_index_definition_shape(&existing.kind, &build_policy)?;
 
         let index = self
             .db
@@ -383,6 +391,14 @@ fn validate_authorization_mode(value: &str) -> Result<(), Status> {
         "inherit_object" | "index_only" | "public" => Ok(()),
         _ => Err(Status::invalid_argument("Invalid authorization_mode")),
     }
+}
+
+fn validate_index_definition_shape(kind: &str, build_policy: &JsonValue) -> Result<(), Status> {
+    if kind == "vector" {
+        crate::formats::vector::VectorIndexDefinition::from_json(build_policy)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+    }
+    Ok(())
 }
 
 fn validate_diagnostic_severity(value: &str) -> Result<(), Status> {

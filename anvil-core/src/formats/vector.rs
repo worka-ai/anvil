@@ -303,6 +303,23 @@ impl VectorMetric {
             other => Err(FormatError::UnsupportedVectorMetric(other)),
         }
     }
+
+    pub fn from_name(value: &str) -> Result<Self, FormatError> {
+        match value {
+            "cosine" => Ok(Self::Cosine),
+            "dot" => Ok(Self::Dot),
+            "l2" => Ok(Self::L2),
+            _ => Err(FormatError::InvalidVectorIndexDefinition { field: "metric" }),
+        }
+    }
+
+    pub fn as_name(self) -> &'static str {
+        match self {
+            Self::Cosine => "cosine",
+            Self::Dot => "dot",
+            Self::L2 => "l2",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,6 +340,131 @@ impl VectorModality {
             4 => Ok(Self::Video),
             other => Err(FormatError::UnsupportedVectorModality(other)),
         }
+    }
+
+    pub fn from_name(value: &str) -> Result<Self, FormatError> {
+        match value {
+            "text" => Ok(Self::Text),
+            "image" => Ok(Self::Image),
+            "audio" => Ok(Self::Audio),
+            "video" => Ok(Self::Video),
+            _ => Err(FormatError::InvalidVectorIndexDefinition { field: "modality" }),
+        }
+    }
+
+    pub fn as_name(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Image => "image",
+            Self::Audio => "audio",
+            Self::Video => "video",
+        }
+    }
+}
+
+pub const DEFAULT_HNSW_M: u16 = 32;
+pub const DEFAULT_HNSW_EF_CONSTRUCTION: u16 = 200;
+pub const DEFAULT_HNSW_EF_SEARCH: u16 = 80;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorIndexDefinition {
+    pub dimension: u16,
+    pub metric: VectorMetric,
+    pub modality: VectorModality,
+    pub embedding_model: String,
+    pub chunking: serde_json::Value,
+    pub hnsw_m: u16,
+    pub hnsw_ef_construction: u16,
+    pub hnsw_ef_search_default: u16,
+}
+
+impl VectorIndexDefinition {
+    pub fn from_json(value: &serde_json::Value) -> Result<Self, FormatError> {
+        let object = value
+            .as_object()
+            .ok_or(FormatError::InvalidVectorIndexDefinition { field: "root" })?;
+        let dimension = required_u16(object, "dimension")?;
+        if dimension == 0 {
+            return Err(FormatError::InvalidVectorIndexDefinition { field: "dimension" });
+        }
+        let metric = VectorMetric::from_name(required_str(object, "metric")?)?;
+        let modality = VectorModality::from_name(required_str(object, "modality")?)?;
+        let embedding_model = required_str(object, "embedding_model")?.to_string();
+        if embedding_model.trim().is_empty() {
+            return Err(FormatError::InvalidVectorIndexDefinition {
+                field: "embedding_model",
+            });
+        }
+        let chunking = object
+            .get("chunking")
+            .filter(|value| value.is_object())
+            .cloned()
+            .ok_or(FormatError::InvalidVectorIndexDefinition { field: "chunking" })?;
+        let hnsw_m = optional_u16(object, "hnsw_m", DEFAULT_HNSW_M)?;
+        let hnsw_ef_construction =
+            optional_u16(object, "hnsw_ef_construction", DEFAULT_HNSW_EF_CONSTRUCTION)?;
+        let hnsw_ef_search_default =
+            optional_u16(object, "hnsw_ef_search_default", DEFAULT_HNSW_EF_SEARCH)?;
+        if hnsw_m == 0 {
+            return Err(FormatError::InvalidVectorIndexDefinition { field: "hnsw_m" });
+        }
+        if hnsw_ef_construction == 0 {
+            return Err(FormatError::InvalidVectorIndexDefinition {
+                field: "hnsw_ef_construction",
+            });
+        }
+        if hnsw_ef_search_default == 0 {
+            return Err(FormatError::InvalidVectorIndexDefinition {
+                field: "hnsw_ef_search_default",
+            });
+        }
+        Ok(Self {
+            dimension,
+            metric,
+            modality,
+            embedding_model,
+            chunking,
+            hnsw_m,
+            hnsw_ef_construction,
+            hnsw_ef_search_default,
+        })
+    }
+}
+
+fn required_str<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+) -> Result<&'a str, FormatError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or(FormatError::InvalidVectorIndexDefinition { field })
+}
+
+fn required_u16(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+) -> Result<u16, FormatError> {
+    let value = object
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(FormatError::InvalidVectorIndexDefinition { field })?;
+    u16::try_from(value).map_err(|_| FormatError::InvalidVectorIndexDefinition { field })
+}
+
+fn optional_u16(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+    default: u16,
+) -> Result<u16, FormatError> {
+    match object.get(field) {
+        Some(value) => {
+            let value = value
+                .as_u64()
+                .ok_or(FormatError::InvalidVectorIndexDefinition { field })?;
+            u16::try_from(value).map_err(|_| FormatError::InvalidVectorIndexDefinition { field })
+        }
+        None => Ok(default),
     }
 }
 
@@ -510,10 +652,34 @@ mod tests {
         assert_eq!(VectorMetric::from_u8(1).unwrap(), VectorMetric::Cosine);
         assert_eq!(VectorMetric::from_u8(2).unwrap(), VectorMetric::Dot);
         assert_eq!(VectorMetric::from_u8(3).unwrap(), VectorMetric::L2);
+        assert_eq!(
+            VectorMetric::from_name("cosine").unwrap(),
+            VectorMetric::Cosine
+        );
+        assert_eq!(VectorMetric::from_name("dot").unwrap(), VectorMetric::Dot);
+        assert_eq!(VectorMetric::from_name("l2").unwrap(), VectorMetric::L2);
+        assert_eq!(VectorMetric::L2.as_name(), "l2");
         assert_eq!(VectorModality::from_u8(1).unwrap(), VectorModality::Text);
         assert_eq!(VectorModality::from_u8(2).unwrap(), VectorModality::Image);
         assert_eq!(VectorModality::from_u8(3).unwrap(), VectorModality::Audio);
         assert_eq!(VectorModality::from_u8(4).unwrap(), VectorModality::Video);
+        assert_eq!(
+            VectorModality::from_name("text").unwrap(),
+            VectorModality::Text
+        );
+        assert_eq!(
+            VectorModality::from_name("image").unwrap(),
+            VectorModality::Image
+        );
+        assert_eq!(
+            VectorModality::from_name("audio").unwrap(),
+            VectorModality::Audio
+        );
+        assert_eq!(
+            VectorModality::from_name("video").unwrap(),
+            VectorModality::Video
+        );
+        assert_eq!(VectorModality::Video.as_name(), "video");
         assert_eq!(
             VectorMetric::from_u8(99).unwrap_err(),
             FormatError::UnsupportedVectorMetric(99)
@@ -522,6 +688,162 @@ mod tests {
             VectorModality::from_u8(99).unwrap_err(),
             FormatError::UnsupportedVectorModality(99)
         );
+    }
+
+    #[test]
+    fn vector_index_definition_parses_required_shape_and_defaults() {
+        let definition = VectorIndexDefinition::from_json(&serde_json::json!({
+            "dimension": 768,
+            "metric": "cosine",
+            "modality": "text",
+            "embedding_model": "text-embedding-v1",
+            "chunking": {
+                "kind": "tokens",
+                "max_tokens": 512,
+                "overlap_tokens": 64
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(definition.dimension, 768);
+        assert_eq!(definition.metric, VectorMetric::Cosine);
+        assert_eq!(definition.modality, VectorModality::Text);
+        assert_eq!(definition.embedding_model, "text-embedding-v1");
+        assert_eq!(definition.chunking["kind"], "tokens");
+        assert_eq!(definition.hnsw_m, DEFAULT_HNSW_M);
+        assert_eq!(
+            definition.hnsw_ef_construction,
+            DEFAULT_HNSW_EF_CONSTRUCTION
+        );
+        assert_eq!(definition.hnsw_ef_search_default, DEFAULT_HNSW_EF_SEARCH);
+    }
+
+    #[test]
+    fn vector_index_definition_accepts_all_modalities_metrics_and_explicit_hnsw() {
+        for (metric, expected_metric) in [
+            ("cosine", VectorMetric::Cosine),
+            ("dot", VectorMetric::Dot),
+            ("l2", VectorMetric::L2),
+        ] {
+            for (modality, expected_modality) in [
+                ("text", VectorModality::Text),
+                ("image", VectorModality::Image),
+                ("audio", VectorModality::Audio),
+                ("video", VectorModality::Video),
+            ] {
+                let definition = VectorIndexDefinition::from_json(&serde_json::json!({
+                    "dimension": 1024,
+                    "metric": metric,
+                    "modality": modality,
+                    "embedding_model": format!("{modality}-embedding-v1"),
+                    "chunking": {"kind": "fixed_bytes", "max_bytes": 65536},
+                    "hnsw_m": 48,
+                    "hnsw_ef_construction": 320,
+                    "hnsw_ef_search_default": 96
+                }))
+                .unwrap();
+                assert_eq!(definition.metric, expected_metric);
+                assert_eq!(definition.modality, expected_modality);
+                assert_eq!(definition.hnsw_m, 48);
+                assert_eq!(definition.hnsw_ef_construction, 320);
+                assert_eq!(definition.hnsw_ef_search_default, 96);
+            }
+        }
+    }
+
+    #[test]
+    fn vector_index_definition_rejects_invalid_shapes() {
+        for (field, value) in [
+            ("root", serde_json::json!("not an object")),
+            (
+                "dimension",
+                serde_json::json!({
+                    "dimension": 0,
+                    "metric": "cosine",
+                    "modality": "text",
+                    "embedding_model": "text-embedding-v1",
+                    "chunking": {}
+                }),
+            ),
+            (
+                "metric",
+                serde_json::json!({
+                    "dimension": 1,
+                    "metric": "manhattan",
+                    "modality": "text",
+                    "embedding_model": "text-embedding-v1",
+                    "chunking": {}
+                }),
+            ),
+            (
+                "modality",
+                serde_json::json!({
+                    "dimension": 1,
+                    "metric": "cosine",
+                    "modality": "binary",
+                    "embedding_model": "text-embedding-v1",
+                    "chunking": {}
+                }),
+            ),
+            (
+                "embedding_model",
+                serde_json::json!({
+                    "dimension": 1,
+                    "metric": "cosine",
+                    "modality": "text",
+                    "embedding_model": "   ",
+                    "chunking": {}
+                }),
+            ),
+            (
+                "chunking",
+                serde_json::json!({
+                    "dimension": 1,
+                    "metric": "cosine",
+                    "modality": "text",
+                    "embedding_model": "text-embedding-v1",
+                    "chunking": "none"
+                }),
+            ),
+            (
+                "hnsw_m",
+                serde_json::json!({
+                    "dimension": 1,
+                    "metric": "cosine",
+                    "modality": "text",
+                    "embedding_model": "text-embedding-v1",
+                    "chunking": {},
+                    "hnsw_m": 0
+                }),
+            ),
+            (
+                "hnsw_ef_construction",
+                serde_json::json!({
+                    "dimension": 1,
+                    "metric": "cosine",
+                    "modality": "text",
+                    "embedding_model": "text-embedding-v1",
+                    "chunking": {},
+                    "hnsw_ef_construction": 0
+                }),
+            ),
+            (
+                "hnsw_ef_search_default",
+                serde_json::json!({
+                    "dimension": 1,
+                    "metric": "cosine",
+                    "modality": "text",
+                    "embedding_model": "text-embedding-v1",
+                    "chunking": {},
+                    "hnsw_ef_search_default": 0
+                }),
+            ),
+        ] {
+            assert_eq!(
+                VectorIndexDefinition::from_json(&value).unwrap_err(),
+                FormatError::InvalidVectorIndexDefinition { field }
+            );
+        }
     }
 
     #[test]

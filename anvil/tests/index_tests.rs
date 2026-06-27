@@ -258,6 +258,80 @@ async fn test_index_definition_rejects_invalid_policy_shape() {
         .unwrap_err();
     assert_eq!(invalid_kind.code(), tonic::Code::InvalidArgument);
 
+    let valid_vector_policy = serde_json::json!({
+        "dimension": 768,
+        "metric": "cosine",
+        "modality": "text",
+        "embedding_model": "text-embedding-v1",
+        "chunking": {
+            "kind": "tokens",
+            "max_tokens": 512,
+            "overlap_tokens": 64
+        }
+    });
+    index_client
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket_name: bucket_name.clone(),
+                name: "valid-vector".to_string(),
+                kind: "vector".to_string(),
+                selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
+                extractor_json: serde_json::json!({"source": "object_body_utf8"}).to_string(),
+                authorization_mode: "inherit_object".to_string(),
+                build_policy_json: valid_vector_policy.to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let invalid_vector_policy = index_client
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket_name: bucket_name.clone(),
+                name: "invalid-vector".to_string(),
+                kind: "vector".to_string(),
+                selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
+                extractor_json: serde_json::json!({"source": "object_body_utf8"}).to_string(),
+                authorization_mode: "inherit_object".to_string(),
+                build_policy_json: serde_json::json!({
+                    "dimension": 0,
+                    "metric": "cosine",
+                    "modality": "text",
+                    "embedding_model": "text-embedding-v1",
+                    "chunking": {}
+                })
+                .to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(invalid_vector_policy.code(), tonic::Code::InvalidArgument);
+
+    let invalid_vector_update = index_client
+        .update_index(authorized(
+            UpdateIndexRequest {
+                bucket_name: bucket_name.clone(),
+                name: "valid-vector".to_string(),
+                selector_json: serde_json::json!({"prefix": "docs/v2/"}).to_string(),
+                extractor_json: serde_json::json!({"source": "object_body_utf8"}).to_string(),
+                authorization_mode: "inherit_object".to_string(),
+                build_policy_json: serde_json::json!({
+                    "dimension": 768,
+                    "metric": "cosine",
+                    "modality": "text",
+                    "embedding_model": "",
+                    "chunking": {}
+                })
+                .to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(invalid_vector_update.code(), tonic::Code::InvalidArgument);
+
     let invalid_json = index_client
         .create_index(authorized(
             CreateIndexRequest {
