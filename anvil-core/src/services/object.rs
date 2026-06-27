@@ -11,6 +11,9 @@ impl ObjectService for AppState {
     type GetObjectStream = std::pin::Pin<
         Box<dyn futures_core::Stream<Item = Result<GetObjectResponse, Status>> + Send>,
     >;
+    type WatchPrefixStream = std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = Result<WatchPrefixResponse, Status>> + Send>,
+    >;
 
     async fn put_object(
         &self,
@@ -333,6 +336,73 @@ impl ObjectService for AppState {
         }))
     }
 
+    async fn watch_prefix(
+        &self,
+        request: Request<WatchPrefixRequest>,
+    ) -> Result<Response<Self::WatchPrefixStream>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        let tenant_id = claims.tenant_id;
+        let prefix = req.prefix.clone();
+        let (bucket_id, snapshot, mut live) = self
+            .object_manager
+            .watch_prefix_snapshot(claims, &req.bucket_name, &req.prefix, req.after_cursor)
+            .await?;
+
+        let (tx, rx) = mpsc::channel(32);
+        tokio::spawn(async move {
+            let mut last_cursor = req.after_cursor;
+            for event in snapshot {
+                if let Some(response) = watch_event_response(&event) {
+                    last_cursor = last_cursor.max(response.cursor);
+                    if tx.send(Ok(response)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+
+            loop {
+                match live.recv().await {
+                    Ok(event) => {
+                        if event.tenant_id != tenant_id
+                            || event.bucket_id != bucket_id
+                            || !event.key.starts_with(&prefix)
+                        {
+                            continue;
+                        }
+                        let Some(response) = watch_event_response(&event) else {
+                            continue;
+                        };
+                        if response.cursor <= last_cursor {
+                            continue;
+                        }
+                        last_cursor = response.cursor;
+                        if tx.send(Ok(response)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let _ = tx
+                            .send(Err(Status::data_loss(
+                                "Watch cursor fell behind retained live event window",
+                            )))
+                            .await;
+                        return;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+
+        Ok(Response::new(
+            Box::pin(ReceiverStream::new(rx)) as Self::WatchPrefixStream
+        ))
+    }
+
     async fn initiate_multipart_upload(
         &self,
         request: Request<InitiateMultipartRequest>,
@@ -477,4 +547,23 @@ fn parse_optional_version_id(value: Option<&str>) -> Result<Option<uuid::Uuid>, 
         .map(uuid::Uuid::parse_str)
         .transpose()
         .map_err(|_| Status::invalid_argument("Invalid version_id"))
+}
+
+fn watch_event_response(
+    event: &crate::persistence::ObjectWatchEvent,
+) -> Option<WatchPrefixResponse> {
+    Some(WatchPrefixResponse {
+        cursor: u64::try_from(event.id).ok()?,
+        bucket_name: event.bucket_name.clone(),
+        object_key: event.key.clone(),
+        event_type: event.event_type.clone(),
+        version_id: event
+            .version_id
+            .map(|version_id| version_id.to_string())
+            .unwrap_or_default(),
+        etag: event.etag.clone().unwrap_or_default(),
+        size: event.size,
+        is_delete_marker: event.is_delete_marker,
+        created_at: event.created_at.to_string(),
+    })
 }

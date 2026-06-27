@@ -5,7 +5,9 @@ use crate::{
     auth,
     cluster::ClusterState,
     permissions::AnvilAction,
-    persistence::{Bucket, MultipartUploadPart, Object, ObjectVersion, Persistence},
+    persistence::{
+        Bucket, MultipartUploadPart, Object, ObjectVersion, ObjectWatchEvent, Persistence,
+    },
     placement::PlacementManager,
     sharding::ShardManager,
     storage::Storage,
@@ -15,7 +17,7 @@ use futures_util::{Stream, StreamExt};
 use serde_json::Value as JsonValue;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 use tracing::info;
@@ -30,6 +32,7 @@ pub struct ObjectManager {
     region: String,
     jwt_manager: Arc<auth::JwtManager>,
     encryption_key: Vec<u8>,
+    watch_tx: broadcast::Sender<ObjectWatchEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +59,7 @@ impl ObjectManager {
         region: String,
         jwt_manager: Arc<auth::JwtManager>,
         anvil_secret_encryption_key: String,
+        watch_tx: broadcast::Sender<ObjectWatchEvent>,
     ) -> Self {
         let encryption_key = hex::decode(anvil_secret_encryption_key)
             .expect("ANVIL_SECRET_ENCRYPTION_KEY must be a valid hex string");
@@ -68,6 +72,7 @@ impl ObjectManager {
             region,
             jwt_manager,
             encryption_key,
+            watch_tx,
         }
     }
 
@@ -256,6 +261,9 @@ impl ObjectManager {
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+
+        self.publish_object_watch_event(tenant_id, &bucket, &object, "put", false)
+            .await?;
 
         Ok(object)
     }
@@ -478,6 +486,48 @@ impl ObjectManager {
             .list_active_multipart_uploads(bucket.id, prefix, key_marker, limit)
             .await
             .map_err(|e| Status::internal(e.to_string()))
+    }
+
+    pub async fn watch_prefix_snapshot(
+        &self,
+        claims: auth::Claims,
+        bucket_name: &str,
+        prefix: &str,
+        after_cursor: u64,
+    ) -> Result<
+        (
+            i64,
+            Vec<ObjectWatchEvent>,
+            broadcast::Receiver<ObjectWatchEvent>,
+        ),
+        Status,
+    > {
+        if !validation::is_valid_bucket_name(bucket_name) {
+            return Err(Status::invalid_argument("Invalid bucket name"));
+        }
+        if validation::is_reserved_internal_key(prefix) {
+            return Err(Status::permission_denied("UnauthorizedReservedNamespace"));
+        }
+        if !prefix.is_empty() && !validation::is_valid_object_key(prefix) {
+            return Err(Status::invalid_argument("Invalid object key prefix"));
+        }
+        if !auth::is_authorized(AnvilAction::ObjectList, bucket_name, &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        let bucket = self
+            .get_tenant_bucket(claims.tenant_id, bucket_name)
+            .await?;
+        let live = self.watch_tx.subscribe();
+        let after_cursor = i64::try_from(after_cursor)
+            .map_err(|_| Status::invalid_argument("after_cursor exceeds supported range"))?;
+        let snapshot = self
+            .db
+            .list_object_watch_events(claims.tenant_id, bucket.id, prefix, after_cursor, 1000)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok((bucket.id, snapshot, live))
     }
 
     async fn send_stripe(
@@ -815,6 +865,9 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Object not found"))?;
 
+        self.publish_object_watch_event(tenant_id, &bucket, &delete_marker, "delete", true)
+            .await?;
+
         Ok(delete_marker)
     }
 
@@ -1100,6 +1153,30 @@ impl ObjectManager {
         }
 
         Ok(bucket)
+    }
+
+    async fn publish_object_watch_event(
+        &self,
+        tenant_id: i64,
+        bucket: &Bucket,
+        object: &Object,
+        event_type: &str,
+        is_delete_marker: bool,
+    ) -> Result<(), Status> {
+        let event = self
+            .db
+            .create_object_watch_event(
+                tenant_id,
+                bucket.id,
+                &bucket.name,
+                object,
+                event_type,
+                is_delete_marker,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let _ = self.watch_tx.send(event);
+        Ok(())
     }
 
     fn validate_write_request(

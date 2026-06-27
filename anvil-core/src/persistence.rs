@@ -89,6 +89,21 @@ pub struct MultipartUploadPart {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ObjectWatchEvent {
+    pub id: i64,
+    pub tenant_id: i64,
+    pub bucket_id: i64,
+    pub bucket_name: String,
+    pub key: String,
+    pub event_type: String,
+    pub version_id: Option<uuid::Uuid>,
+    pub etag: Option<String>,
+    pub size: i64,
+    pub is_delete_marker: bool,
+    pub created_at: DateTime<Utc>,
+}
+
 // Manual row-to-struct mapping
 impl From<Row> for Tenant {
     fn from(row: Row) -> Self {
@@ -168,6 +183,24 @@ impl From<Row> for MultipartUploadPart {
             content_hash: row.get("content_hash"),
             size: row.get("size"),
             etag: row.get("etag"),
+            created_at: row.get("created_at"),
+        }
+    }
+}
+
+impl From<Row> for ObjectWatchEvent {
+    fn from(row: Row) -> Self {
+        Self {
+            id: row.get("id"),
+            tenant_id: row.get("tenant_id"),
+            bucket_id: row.get("bucket_id"),
+            bucket_name: row.get("bucket_name"),
+            key: row.get("key"),
+            event_type: row.get("event_type"),
+            version_id: row.get("version_id"),
+            etag: row.get("etag"),
+            size: row.get("size"),
+            is_delete_marker: row.get("is_delete_marker"),
             created_at: row.get("created_at"),
         }
     }
@@ -1503,6 +1536,71 @@ impl Persistence {
             )
             .await?;
         Ok(changed > 0)
+    }
+
+    pub async fn create_object_watch_event(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        bucket_name: &str,
+        object: &Object,
+        event_type: &str,
+        is_delete_marker: bool,
+    ) -> Result<ObjectWatchEvent> {
+        let client = self.regional_pool.get().await?;
+        let row = client
+            .query_one(
+                r#"
+                INSERT INTO object_watch_events
+                    (tenant_id, bucket_id, bucket_name, key, event_type, version_id, etag, size, is_delete_marker)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                RETURNING *"#,
+                &[
+                    &tenant_id,
+                    &bucket_id,
+                    &bucket_name,
+                    &object.key,
+                    &event_type,
+                    &object.version_id,
+                    &object.etag,
+                    &object.size,
+                    &is_delete_marker,
+                ],
+            )
+            .await?;
+        Ok(row.into())
+    }
+
+    pub async fn list_object_watch_events(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        prefix: &str,
+        after_cursor: i64,
+        limit: i32,
+    ) -> Result<Vec<ObjectWatchEvent>> {
+        let client = self.regional_pool.get().await?;
+        let rows = client
+            .query(
+                r#"
+                SELECT *
+                FROM object_watch_events
+                WHERE tenant_id = $1
+                  AND bucket_id = $2
+                  AND key LIKE $3
+                  AND id > $4
+                ORDER BY id
+                LIMIT $5"#,
+                &[
+                    &tenant_id,
+                    &bucket_id,
+                    &format!(r#"{}%"#, prefix),
+                    &after_cursor,
+                    &(if limit == 0 { 1000 } else { limit } as i64),
+                ],
+            )
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     pub async fn hard_delete_object(&self, object_id: i64) -> Result<()> {

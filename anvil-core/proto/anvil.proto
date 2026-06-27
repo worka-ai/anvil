@@ -62,6 +62,7 @@ service ObjectService {
   rpc CopyObject(CopyObjectRequest) returns (CopyObjectResponse);
   rpc ComposeObject(ComposeObjectRequest) returns (ComposeObjectResponse);
   rpc PatchJsonObject(PatchJsonObjectRequest) returns (PatchJsonObjectResponse);
+  rpc WatchPrefix(WatchPrefixRequest) returns (stream WatchPrefixResponse);
   rpc InitiateMultipartUpload(InitiateMultipartRequest) returns (InitiateMultipartResponse);
   rpc UploadPart(stream UploadPartRequest) returns (UploadPartResponse);
   rpc CompleteMultipartUpload(CompleteMultipartRequest) returns (CompleteMultipartResponse);
@@ -247,6 +248,24 @@ message PatchJsonObjectResponse {
     string etag = 1;
     string version_id = 2;
     string last_modified = 3;
+}
+
+message WatchPrefixRequest {
+    string bucket_name = 1;
+    string prefix = 2;
+    uint64 after_cursor = 3;
+}
+
+message WatchPrefixResponse {
+    uint64 cursor = 1;
+    string bucket_name = 2;
+    string object_key = 3;
+    string event_type = 4;
+    string version_id = 5;
+    string etag = 6;
+    int64 size = 7;
+    bool is_delete_marker = 8;
+    string created_at = 9;
 }
 
 message CompleteMultipartResponse {

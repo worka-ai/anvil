@@ -5,7 +5,7 @@ use anvil::anvil_api::{
     ComposeObjectSource, CopyObjectRequest, CreateBucketRequest, DeleteObjectRequest,
     GetObjectRequest, HeadObjectRequest, InitiateMultipartRequest, ListObjectVersionsRequest,
     ListObjectsRequest, ObjectMetadata, PatchJsonObjectRequest, PutObjectRequest,
-    UploadPartMetadata, UploadPartRequest,
+    UploadPartMetadata, UploadPartRequest, WatchPrefixRequest,
 };
 use futures_util::StreamExt;
 use std::time::Duration;
@@ -311,6 +311,108 @@ async fn test_copy_object_creates_independent_destination_version() {
         }
     }
     assert_eq!(downloaded, content);
+}
+
+#[tokio::test]
+async fn test_watch_prefix_streams_snapshot_and_live_events() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut watch_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+
+    let bucket_name = "test-watch-bucket".to_string();
+    let object_key = "docs/a.txt".to_string();
+
+    let mut create_req = Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
+    });
+    create_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client.create_bucket(create_req).await.unwrap();
+
+    let metadata = ObjectMetadata {
+        bucket_name: bucket_name.clone(),
+        object_key: object_key.clone(),
+    };
+    let chunks = vec![
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                metadata,
+            )),
+        },
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                b"watch me".to_vec(),
+            )),
+        },
+    ];
+    let mut put_req = Request::new(tokio_stream::iter(chunks));
+    put_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    object_client.put_object(put_req).await.unwrap();
+
+    let mut watch_req = Request::new(WatchPrefixRequest {
+        bucket_name: bucket_name.clone(),
+        prefix: "docs/".to_string(),
+        after_cursor: 0,
+    });
+    watch_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let mut stream = watch_client
+        .watch_prefix(watch_req)
+        .await
+        .unwrap()
+        .into_inner();
+
+    let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.bucket_name, bucket_name);
+    assert_eq!(first.object_key, object_key);
+    assert_eq!(first.event_type, "put");
+    assert!(!first.is_delete_marker);
+    let first_cursor = first.cursor;
+
+    let mut delete_req = Request::new(DeleteObjectRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: object_key.clone(),
+        version_id: None,
+    });
+    delete_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    object_client.delete_object(delete_req).await.unwrap();
+
+    let second = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(second.cursor > first_cursor);
+    assert_eq!(second.bucket_name, bucket_name);
+    assert_eq!(second.object_key, object_key);
+    assert_eq!(second.event_type, "delete");
+    assert!(second.is_delete_marker);
 }
 
 #[tokio::test]

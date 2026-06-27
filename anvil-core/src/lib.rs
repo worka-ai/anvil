@@ -60,9 +60,11 @@ impl AppState {
         let jwt_manager = Arc::new(JwtManager::new(arc_config.jwt_secret.clone()));
         let storage = storage::Storage::new().await?;
         let cluster_state = Arc::new(RwLock::new(HashMap::new()));
-        let db = persistence::Persistence::new(global_pool, regional_pool, event_publisher, &arc_config);
+        let db =
+            persistence::Persistence::new(global_pool, regional_pool, event_publisher, &arc_config);
         let sharder = sharding::ShardManager::new();
         let placer = placement::PlacementManager::default();
+        let (object_watch_tx, _object_watch_rx) = tokio::sync::broadcast::channel(1024);
 
         let bucket_manager = bucket_manager::BucketManager::new(db.clone());
         let object_manager = object_manager::ObjectManager::new(
@@ -74,6 +76,7 @@ impl AppState {
             arc_config.region.clone(),
             jwt_manager.clone(),
             arc_config.anvil_secret_encryption_key.clone(),
+            object_watch_tx,
         );
 
         Ok(Self {
