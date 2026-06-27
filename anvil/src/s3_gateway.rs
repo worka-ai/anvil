@@ -59,11 +59,17 @@ pub fn app(state: AppState) -> Router {
         .route("/", get(list_buckets)) // ListBuckets
         .route(
             "/{bucket}",
-            put(create_bucket).head(head_bucket).get(list_objects),
+            put(create_bucket)
+                .delete(delete_bucket)
+                .head(head_bucket)
+                .get(list_objects),
         )
         .route(
             "/{bucket}/",
-            get(list_objects).put(create_bucket).head(head_bucket),
+            get(list_objects)
+                .put(create_bucket)
+                .delete(delete_bucket)
+                .head(head_bucket),
         )
         .route(
             "/{bucket}/{*path}",
@@ -253,6 +259,56 @@ async fn create_bucket(
                 "AccessDenied",
                 status.message(),
                 axum::http::StatusCode::FORBIDDEN,
+            ),
+            tonic::Code::InvalidArgument => s3_error(
+                "InvalidArgument",
+                status.message(),
+                axum::http::StatusCode::BAD_REQUEST,
+            ),
+            _ => s3_error(
+                "InternalError",
+                status.message(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        },
+    }
+}
+
+async fn delete_bucket(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+    req: Request,
+) -> Response {
+    let claims = match req.extensions().get::<Claims>().cloned() {
+        Some(c) => c,
+        None => {
+            return s3_error(
+                "AccessDenied",
+                "Missing credentials",
+                axum::http::StatusCode::FORBIDDEN,
+            );
+        }
+    };
+
+    match state
+        .bucket_manager
+        .delete_bucket(&bucket, claims.scopes.as_slice())
+        .await
+    {
+        Ok(_) => Response::builder()
+            .status(axum::http::StatusCode::NO_CONTENT)
+            .body(Body::empty())
+            .unwrap(),
+        Err(status) => match status.code() {
+            tonic::Code::PermissionDenied => s3_error(
+                "AccessDenied",
+                status.message(),
+                axum::http::StatusCode::FORBIDDEN,
+            ),
+            tonic::Code::NotFound => s3_error(
+                "NoSuchBucket",
+                status.message(),
+                axum::http::StatusCode::NOT_FOUND,
             ),
             tonic::Code::InvalidArgument => s3_error(
                 "InvalidArgument",

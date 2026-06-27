@@ -190,6 +190,25 @@ async fn test_s3_public_and_private_access() {
         "bucket location response should include the stored bucket region"
     );
 
+    let deleted_bucket = format!("delete-s3-bucket-{}", uuid::Uuid::new_v4());
+    client
+        .create_bucket()
+        .bucket(&deleted_bucket)
+        .send()
+        .await
+        .unwrap();
+    client
+        .delete_bucket()
+        .bucket(&deleted_bucket)
+        .send()
+        .await
+        .unwrap();
+    let deleted_head = client.head_bucket().bucket(&deleted_bucket).send().await;
+    assert!(
+        format!("{deleted_head:?}").contains("NoSuchBucket"),
+        "deleted bucket should no longer be visible"
+    );
+
     let unauthenticated_list_buckets = reqwest::get(format!("{}/", http_base)).await.unwrap();
     assert_eq!(unauthenticated_list_buckets.status(), 403);
 
