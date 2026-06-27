@@ -31,6 +31,7 @@ pub mod personaldb_row_index;
 pub mod personaldb_segment;
 pub mod placement;
 pub mod s3_auth;
+pub mod search_query;
 pub mod services;
 pub mod sharding;
 pub mod storage;
