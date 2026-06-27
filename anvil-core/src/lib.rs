@@ -31,6 +31,7 @@ pub mod persistence;
 pub mod personaldb_catchup;
 pub mod personaldb_commit_store;
 pub mod personaldb_control;
+pub mod personaldb_envelope;
 pub mod personaldb_heads;
 pub mod personaldb_row_index;
 pub mod personaldb_segment;
