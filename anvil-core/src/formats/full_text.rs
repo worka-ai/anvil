@@ -203,6 +203,22 @@ impl Posting {
     }
 }
 
+pub fn decode_postings(input: &[u8]) -> Result<Vec<Posting>, FormatError> {
+    let mut postings = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < input.len() {
+        let (posting, used) = Posting::decode(&input[cursor..])?;
+        if used == 0 {
+            return Err(FormatError::InvalidDeclaredLength {
+                context: "full text posting",
+            });
+        }
+        cursor += used;
+        postings.push(posting);
+    }
+    Ok(postings)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenizerConfig {
     pub max_token_chars: usize,
@@ -486,6 +502,99 @@ fn delta_encode_positions(positions: &[u32]) -> Vec<u32> {
         .collect()
 }
 
+pub fn delta_decode_positions(delta_positions: &[u32]) -> Vec<u32> {
+    let mut current = 0u32;
+    delta_positions
+        .iter()
+        .enumerate()
+        .map(|(idx, delta)| {
+            current = if idx == 0 {
+                *delta
+            } else {
+                current.saturating_add(*delta)
+            };
+            current
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullTextQueryError {
+    EmptyPhrase,
+    PositionsDisabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PhraseMatch {
+    pub document_id: u64,
+    pub field_id: u16,
+    pub object_version_id: [u8; 16],
+    pub authz_label_hash: Hash32,
+}
+
+pub fn evaluate_phrase_query(
+    postings_by_term: &[&[Posting]],
+    positions_enabled: bool,
+) -> Result<Vec<PhraseMatch>, FullTextQueryError> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    if postings_by_term.is_empty() {
+        return Err(FullTextQueryError::EmptyPhrase);
+    }
+    if !positions_enabled {
+        return Err(FullTextQueryError::PositionsDisabled);
+    }
+
+    let mut term_maps: Vec<BTreeMap<PhraseMatch, BTreeSet<u32>>> =
+        Vec::with_capacity(postings_by_term.len());
+    for postings in postings_by_term {
+        let mut by_document = BTreeMap::new();
+        for posting in *postings {
+            if posting.term_frequency > 0 && posting.delta_positions.is_empty() {
+                return Err(FullTextQueryError::PositionsDisabled);
+            }
+            by_document.insert(
+                PhraseMatch {
+                    document_id: posting.document_id,
+                    field_id: posting.field_id,
+                    object_version_id: posting.object_version_id,
+                    authz_label_hash: posting.authz_label_hash,
+                },
+                delta_decode_positions(&posting.delta_positions)
+                    .into_iter()
+                    .collect(),
+            );
+        }
+        term_maps.push(by_document);
+    }
+
+    let Some(first_term) = term_maps.first() else {
+        return Err(FullTextQueryError::EmptyPhrase);
+    };
+    let mut matches = Vec::new();
+    'candidate: for (document, first_positions) in first_term {
+        for term_map in term_maps.iter().skip(1) {
+            if !term_map.contains_key(document) {
+                continue 'candidate;
+            }
+        }
+        'start_position: for start_position in first_positions {
+            for (term_index, term_map) in term_maps.iter().enumerate().skip(1) {
+                let expected = start_position.saturating_add(term_index as u32);
+                if !term_map
+                    .get(document)
+                    .is_some_and(|positions| positions.contains(&expected))
+                {
+                    continue 'start_position;
+                }
+            }
+            matches.push(document.clone());
+            continue 'candidate;
+        }
+    }
+    Ok(matches)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Bm25Config {
     pub k1: f32,
@@ -704,6 +813,96 @@ mod tests {
     }
 
     #[test]
+    fn decode_postings_decodes_concatenated_posting_block() {
+        let postings = vec![
+            Posting {
+                document_id: 1,
+                field_id: 1,
+                term_frequency: 1,
+                object_version_id: [1; 16],
+                authz_label_hash: [1; 32],
+                delta_positions: vec![0],
+            },
+            Posting {
+                document_id: 2,
+                field_id: 1,
+                term_frequency: 2,
+                object_version_id: [2; 16],
+                authz_label_hash: [2; 32],
+                delta_positions: vec![1, 3],
+            },
+        ];
+        let mut encoded = Vec::new();
+        for posting in &postings {
+            encoded.extend_from_slice(&posting.encode());
+        }
+        assert_eq!(decode_postings(&encoded).unwrap(), postings);
+    }
+
+    #[test]
+    fn phrase_query_matches_only_adjacent_terms_in_same_document_field() {
+        let config = TokenizerConfig::default();
+        let built = build_full_text_postings(
+            &[
+                FullTextDocument {
+                    document_id: 1,
+                    field_id: 1,
+                    object_version_id: [1; 16],
+                    authz_label_hash: [1; 32],
+                    text: "the quick brown fox",
+                },
+                FullTextDocument {
+                    document_id: 2,
+                    field_id: 1,
+                    object_version_id: [2; 16],
+                    authz_label_hash: [2; 32],
+                    text: "quick blue brown",
+                },
+                FullTextDocument {
+                    document_id: 3,
+                    field_id: 2,
+                    object_version_id: [3; 16],
+                    authz_label_hash: [3; 32],
+                    text: "quick brown",
+                },
+            ],
+            &config,
+        );
+        let quick = postings_for_term(&built, "quick");
+        let brown = postings_for_term(&built, "brown");
+
+        let matches = evaluate_phrase_query(&[&quick, &brown], true).unwrap();
+        assert_eq!(
+            matches
+                .iter()
+                .map(|matched| (matched.document_id, matched.field_id))
+                .collect::<Vec<_>>(),
+            vec![(1, 1), (3, 2)]
+        );
+    }
+
+    #[test]
+    fn phrase_query_rejects_when_positions_are_disabled() {
+        let postings = vec![Posting {
+            document_id: 1,
+            field_id: 1,
+            term_frequency: 1,
+            object_version_id: [1; 16],
+            authz_label_hash: [1; 32],
+            delta_positions: Vec::new(),
+        }];
+
+        assert_eq!(
+            evaluate_phrase_query(&[&postings], false),
+            Err(FullTextQueryError::PositionsDisabled)
+        );
+        assert_eq!(
+            evaluate_phrase_query(&[&postings], true),
+            Err(FullTextQueryError::PositionsDisabled)
+        );
+    }
+
+    #[test]
     fn bm25_field_stats_are_derived_from_tokenized_lengths() {
         let config = TokenizerConfig::default();
         let documents = [
@@ -742,5 +941,16 @@ mod tests {
         assert!(common_twice > common_once);
         assert!(rare_once > common_once);
         assert_eq!(bm25_score(0, 5, 10, stats, Bm25Config::default()), 0.0);
+    }
+
+    fn postings_for_term(built: &BuiltFullTextPostings, term: &str) -> Vec<Posting> {
+        let entry = built
+            .terms
+            .iter()
+            .find(|entry| entry.term_utf8 == term.as_bytes())
+            .expect("term entry");
+        let start = entry.postings_offset as usize;
+        let end = start + entry.postings_len as usize;
+        decode_postings(&built.postings_bytes[start..end]).unwrap()
     }
 }
