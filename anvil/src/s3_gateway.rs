@@ -1,17 +1,18 @@
 use crate::AppState;
 use crate::auth::Claims;
 use crate::s3_auth::{aws_chunked_decoder, sigv4_auth};
+use anvil_core::validation;
 use axum::{
     Router,
     body::Body,
     extract::{Path, Query, Request, State},
-    middleware,
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, put},
 };
 use futures_util::stream::StreamExt;
-use std::collections::HashMap;
 use serde::Deserialize;
+use std::collections::HashMap;
 
 #[derive(Deserialize)]
 struct CreateBucketConfiguration {
@@ -48,13 +49,79 @@ pub fn app(state: AppState) -> Router {
         )
         .route(
             "/{bucket}/{*path}",
-            get(get_object).put(put_object).head(head_object),
+            get(get_object)
+                .put(put_object)
+                .delete(delete_object)
+                .head(head_object),
         )
         .with_state(state.clone())
         .route_layer(middleware::from_fn(aws_chunked_decoder))
-        .route_layer(middleware::from_fn_with_state(state.clone(), sigv4_auth));
+        .route_layer(middleware::from_fn_with_state(state.clone(), sigv4_auth))
+        .route_layer(middleware::from_fn(reserved_namespace_guard));
 
     public.merge(s3_routes)
+}
+
+async fn reserved_namespace_guard(req: Request, next: Next) -> Response {
+    if request_targets_reserved_namespace(&req) {
+        return s3_error(
+            "AccessDenied",
+            "UnauthorizedReservedNamespace",
+            axum::http::StatusCode::FORBIDDEN,
+        );
+    }
+    next.run(req).await
+}
+
+fn request_targets_reserved_namespace(req: &Request) -> bool {
+    let path = req.uri().path().trim_start_matches('/');
+    let mut parts = path.splitn(2, '/');
+    let _bucket = parts.next();
+
+    if let Some(object_key) = parts.next() {
+        if validation::is_reserved_internal_key(object_key) {
+            return true;
+        }
+    }
+
+    req.uri().query().is_some_and(|query| {
+        query.split('&').any(|pair| {
+            let mut fields = pair.splitn(2, '=');
+            matches!(fields.next(), Some("prefix"))
+                && fields
+                    .next()
+                    .map(percent_decode_query_component)
+                    .is_some_and(|prefix| validation::is_reserved_internal_key(&prefix))
+        })
+    })
+}
+
+fn percent_decode_query_component(value: &str) -> String {
+    let value = value.replace('+', " ");
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 async fn list_buckets(State(state): State<AppState>, req: Request) -> Response {
@@ -136,13 +203,15 @@ async fn create_bucket(
         }
     };
 
-    let bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024).await.unwrap_or_default();
+    let bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+        .await
+        .unwrap_or_default();
     let region = if !bytes.is_empty() {
-         if let Ok(config) = quick_xml::de::from_reader::<_, CreateBucketConfiguration>(&bytes[..]) {
-             config.location_constraint.unwrap_or(state.region.clone())
-         } else {
-             state.region.clone()
-         }
+        if let Ok(config) = quick_xml::de::from_reader::<_, CreateBucketConfiguration>(&bytes[..]) {
+            config.location_constraint.unwrap_or(state.region.clone())
+        } else {
+            state.region.clone()
+        }
     } else {
         state.region.clone()
     };
@@ -217,7 +286,7 @@ async fn head_bucket(
                 return s3_redirect(&bucket.region);
             }
             (axum::http::StatusCode::OK, "").into_response()
-        },
+        }
         Ok(None) => s3_error(
             "NoSuchBucket",
             "The specified bucket does not exist",
@@ -481,6 +550,66 @@ async fn put_object(
     }
 }
 
+async fn delete_object(
+    State(state): State<AppState>,
+    Path((bucket, key)): Path<(String, String)>,
+    req: Request,
+) -> Response {
+    let claims = match req.extensions().get::<Claims>().cloned() {
+        Some(c) => c,
+        None => {
+            return s3_error(
+                "AccessDenied",
+                "Missing credentials",
+                axum::http::StatusCode::FORBIDDEN,
+            );
+        }
+    };
+
+    match state
+        .object_manager
+        .delete_object(claims.tenant_id, &bucket, &key, &claims.scopes)
+        .await
+    {
+        Ok(()) => Response::builder()
+            .status(axum::http::StatusCode::NO_CONTENT)
+            .body(Body::empty())
+            .unwrap(),
+        Err(status) => match status.code() {
+            tonic::Code::FailedPrecondition => {
+                if status.message().starts_with("Bucket is in region ") {
+                    let region = status.message().trim_start_matches("Bucket is in region ");
+                    return s3_redirect(region);
+                }
+                s3_error(
+                    "PreconditionFailed",
+                    status.message(),
+                    axum::http::StatusCode::PRECONDITION_FAILED,
+                )
+            }
+            tonic::Code::NotFound => Response::builder()
+                .status(axum::http::StatusCode::NO_CONTENT)
+                .body(Body::empty())
+                .unwrap(),
+            tonic::Code::PermissionDenied => s3_error(
+                "AccessDenied",
+                status.message(),
+                axum::http::StatusCode::FORBIDDEN,
+            ),
+            tonic::Code::InvalidArgument => s3_error(
+                "InvalidArgument",
+                status.message(),
+                axum::http::StatusCode::BAD_REQUEST,
+            ),
+            _ => s3_error(
+                "InternalError",
+                status.message(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        },
+    }
+}
+
 async fn head_object(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
@@ -538,5 +667,40 @@ async fn head_object(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             ),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(uri: &str) -> Request {
+        Request::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn reserved_namespace_guard_detects_object_keys() {
+        assert!(request_targets_reserved_namespace(&request(
+            "/bucket/_anvil/authz/tuples"
+        )));
+        assert!(request_targets_reserved_namespace(&request(
+            "/bucket/_anvil/personaldb/group"
+        )));
+        assert!(!request_targets_reserved_namespace(&request(
+            "/bucket/customer/_anvil/authz/visible"
+        )));
+    }
+
+    #[test]
+    fn reserved_namespace_guard_detects_list_prefixes() {
+        assert!(request_targets_reserved_namespace(&request(
+            "/bucket?list-type=2&prefix=_anvil%2Fauthz%2F"
+        )));
+        assert!(request_targets_reserved_namespace(&request(
+            "/bucket?prefix=_anvil/personaldb/"
+        )));
+        assert!(!request_targets_reserved_namespace(&request(
+            "/bucket?prefix=customer%2F_anvil%2Fauthz%2F"
+        )));
     }
 }

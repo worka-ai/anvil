@@ -10,6 +10,14 @@ use tokio::fs;
 
 use anvil_test_utils::*;
 
+fn assert_access_denied(error: impl std::fmt::Debug) {
+    let rendered = format!("{error:?}");
+    assert!(
+        rendered.contains("AccessDenied"),
+        "expected AccessDenied error, got {rendered}"
+    );
+}
+
 // Helper function to create an app, since it's used in auth tests.
 fn create_app(global_db_url: &str, app_name: &str) -> (String, String) {
     let admin_args = &["run", "--bin", "admin", "--"];
@@ -222,6 +230,69 @@ async fn test_s3_public_and_private_access() {
     assert!(
         private_resp.status() == 403 || private_resp.status() == 404,
         "Private bucket should be blocked for anonymous access"
+    );
+
+    // 8. Reserved internal namespaces are never readable or writable through S3.
+    let reserved_key = "_anvil/authz/tuples";
+    let reserved_url = format!("{}/{}/{}", http_base, public_bucket, reserved_key);
+
+    let reserved_get = reqwest::get(&reserved_url).await.unwrap();
+    assert_eq!(reserved_get.status(), 403);
+    assert!(reserved_get.text().await.unwrap().contains("AccessDenied"));
+
+    let reserved_head = reqwest::Client::new()
+        .head(&reserved_url)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reserved_head.status(), 403);
+
+    let put_err = client
+        .put_object()
+        .bucket(&public_bucket)
+        .key(reserved_key)
+        .body(ByteStream::from(b"must not be stored".to_vec()))
+        .send()
+        .await
+        .expect_err("reserved namespace PUT must fail");
+    assert_access_denied(put_err);
+
+    let list_err = client
+        .list_objects_v2()
+        .bucket(&public_bucket)
+        .prefix("_anvil/authz/")
+        .send()
+        .await
+        .expect_err("reserved namespace LIST must fail");
+    assert_access_denied(list_err);
+
+    let delete_err = client
+        .delete_object()
+        .bucket(&public_bucket)
+        .key(reserved_key)
+        .send()
+        .await
+        .expect_err("reserved namespace DELETE must fail");
+    assert_access_denied(delete_err);
+
+    // 9. Normal S3 DELETE remains compatible and idempotent.
+    client
+        .delete_object()
+        .bucket(&private_bucket)
+        .key(private_key)
+        .send()
+        .await
+        .expect("normal S3 delete should succeed");
+
+    let deleted_get = client
+        .get_object()
+        .bucket(&private_bucket)
+        .key(private_key)
+        .send()
+        .await;
+    assert!(
+        deleted_get.is_err(),
+        "deleted key must no longer be readable"
     );
 }
 

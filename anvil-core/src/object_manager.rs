@@ -77,6 +77,9 @@ impl ObjectManager {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
+        if validation::is_reserved_internal_key(object_key) {
+            return Err(Status::permission_denied("UnauthorizedReservedNamespace"));
+        }
         if !validation::is_valid_object_key(object_key) {
             return Err(Status::invalid_argument("Invalid object key"));
         }
@@ -306,6 +309,16 @@ impl ObjectManager {
         ),
         Status,
     > {
+        if !validation::is_valid_bucket_name(&bucket_name) {
+            return Err(Status::invalid_argument("Invalid bucket name"));
+        }
+        if validation::is_reserved_internal_key(&object_key) {
+            return Err(Status::permission_denied("UnauthorizedReservedNamespace"));
+        }
+        if !validation::is_valid_object_key(&object_key) {
+            return Err(Status::invalid_argument("Invalid object key"));
+        }
+
         let bucket = self
             .get_authorized_bucket(claims.as_ref(), &bucket_name)
             .await?;
@@ -518,6 +531,9 @@ impl ObjectManager {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
+        if validation::is_reserved_internal_key(object_key) {
+            return Err(Status::permission_denied("UnauthorizedReservedNamespace"));
+        }
         if !validation::is_valid_object_key(object_key) {
             return Err(Status::invalid_argument("Invalid object key"));
         }
@@ -574,6 +590,9 @@ impl ObjectManager {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
+        if validation::is_reserved_internal_key(object_key) {
+            return Err(Status::permission_denied("UnauthorizedReservedNamespace"));
+        }
         if !validation::is_valid_object_key(object_key) {
             return Err(Status::invalid_argument("Invalid object key"));
         }
@@ -611,6 +630,12 @@ impl ObjectManager {
     ) -> Result<(Vec<Object>, Vec<String>), Status> {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
+        }
+        if validation::is_reserved_internal_key(prefix) {
+            return Err(Status::permission_denied("UnauthorizedReservedNamespace"));
+        }
+        if !prefix.is_empty() && !validation::is_valid_object_key(prefix) {
+            return Err(Status::invalid_argument("Invalid object key prefix"));
         }
 
         // Allow public buckets to bypass auth; otherwise require appropriate scope

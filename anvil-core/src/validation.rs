@@ -10,9 +10,20 @@ lazy_static! {
     // Regex to check if a string looks like an IP address.
     static ref IP_ADDRESS_REGEX: Regex = Regex::new(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$").unwrap();
 
-    // Restrictive regex for object keys. Allows most valid characters, but disallows directory traversal and backslashes.
-    static ref OBJECT_KEY_REGEX: Regex = Regex::new(r"^[a-zA-Z0-9!-_.*'()/]*$").unwrap();
+    // Visible ASCII except double quote and backslash. This keeps path-style S3
+    // keys broad enough for common clients while rejecting ambiguous separators.
+    static ref OBJECT_KEY_REGEX: Regex = Regex::new(r"^[\x21\x23-\x5B\x5D-\x7E]*$").unwrap();
 }
+
+const RESERVED_INTERNAL_PREFIXES: &[&str] = &[
+    "_anvil/meta/",
+    "_anvil/index/",
+    "_anvil/authz/",
+    "_anvil/watch/",
+    "_anvil/personaldb/",
+    "_anvil/git/",
+    "_anvil/tmp/",
+];
 
 pub fn is_valid_bucket_name(name: &str) -> bool {
     if name.len() < 3 || name.len() > 63 {
@@ -28,13 +39,25 @@ pub fn is_valid_bucket_name(name: &str) -> bool {
 }
 
 pub fn is_valid_object_key(key: &str) -> bool {
-    if key.is_empty() || key.len() > 1024 {
+    if key.is_empty() || key.len() > 4096 {
         return false;
     }
-    if key.contains("../") || key.contains("./") || key.contains('\\') {
+    if key.contains('\\') {
+        return false;
+    }
+    if key
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
         return false;
     }
     OBJECT_KEY_REGEX.is_match(key)
+}
+
+pub fn is_reserved_internal_key(key: &str) -> bool {
+    RESERVED_INTERNAL_PREFIXES
+        .iter()
+        .any(|prefix| key == prefix.trim_end_matches('/') || key.starts_with(prefix))
 }
 
 pub fn is_valid_region_name(name: &str) -> bool {
@@ -79,15 +102,29 @@ mod tests {
         assert!(is_valid_object_key("my.object"));
         assert!(is_valid_object_key("my*object"));
         assert!(is_valid_object_key("my'object"));
+        assert!(is_valid_object_key("my+object=:,@"));
+        assert!(is_valid_object_key(&"a".repeat(4096)));
     }
 
     #[test]
     fn test_invalid_object_keys() {
         assert!(!is_valid_object_key(""));
-        assert!(!is_valid_object_key(&"a".repeat(1025)));
+        assert!(!is_valid_object_key(&"a".repeat(4097)));
         assert!(!is_valid_object_key("my/../object"));
         assert!(!is_valid_object_key("my/./object"));
+        assert!(!is_valid_object_key("my/object/.."));
+        assert!(!is_valid_object_key("./my/object"));
         assert!(!is_valid_object_key(r"my\object"));
+    }
+
+    #[test]
+    fn test_reserved_internal_keys() {
+        assert!(is_reserved_internal_key("_anvil/authz"));
+        assert!(is_reserved_internal_key("_anvil/authz/tuples"));
+        assert!(is_reserved_internal_key("_anvil/personaldb/group"));
+        assert!(is_reserved_internal_key("_anvil/index/search"));
+        assert!(!is_reserved_internal_key("tenant/_anvil/authz/visible"));
+        assert!(!is_reserved_internal_key("_anvil-public/authz"));
     }
 
     #[test]
