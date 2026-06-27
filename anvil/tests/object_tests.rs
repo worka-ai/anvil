@@ -247,6 +247,123 @@ async fn test_delete_object_specific_version_removes_only_that_version() {
 }
 
 #[tokio::test]
+async fn test_listing_omits_reserved_internal_object_keys() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+
+    let bucket_name = "test-listing-hides-internal".to_string();
+    let visible_key = "visible/object.txt".to_string();
+    let reserved_key = "_anvil/authz/tuples".to_string();
+
+    let mut create_req = Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
+    });
+    create_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client.create_bucket(create_req).await.unwrap();
+
+    let chunks = vec![
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                ObjectMetadata {
+                    bucket_name: bucket_name.clone(),
+                    object_key: visible_key.clone(),
+                },
+            )),
+        },
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                b"visible".to_vec(),
+            )),
+        },
+    ];
+    let mut put_req = Request::new(tokio_stream::iter(chunks));
+    put_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    object_client.put_object(put_req).await.unwrap();
+
+    let global_client = cluster.states[0].db.get_global_pool().get().await.unwrap();
+    let bucket_row = global_client
+        .query_one(
+            "SELECT id, tenant_id FROM buckets WHERE name = $1",
+            &[&bucket_name],
+        )
+        .await
+        .unwrap();
+    let bucket_id: i64 = bucket_row.get("id");
+    let tenant_id: i64 = bucket_row.get("tenant_id");
+    cluster.states[0]
+        .db
+        .create_object(
+            tenant_id,
+            bucket_id,
+            &reserved_key,
+            "reserved-payload-hash",
+            0,
+            "reserved-etag",
+            None,
+            None,
+            None,
+            Some(Vec::new()),
+        )
+        .await
+        .unwrap();
+
+    let mut list_req = Request::new(ListObjectsRequest {
+        bucket_name: bucket_name.clone(),
+        prefix: String::new(),
+        delimiter: String::new(),
+        start_after: String::new(),
+        max_keys: 100,
+    });
+    list_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let objects = object_client
+        .list_objects(list_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .objects;
+    assert_eq!(objects.len(), 1);
+    assert_eq!(objects[0].key, visible_key);
+
+    let mut versions_req = Request::new(ListObjectVersionsRequest {
+        bucket_name,
+        prefix: String::new(),
+        key_marker: String::new(),
+        max_keys: 100,
+    });
+    versions_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let versions = object_client
+        .list_object_versions(versions_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .versions;
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].key, visible_key);
+}
+
+#[tokio::test]
 async fn test_head_object() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;

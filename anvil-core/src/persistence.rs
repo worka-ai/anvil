@@ -1671,6 +1671,7 @@ impl Persistence {
                         id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, inline_payload, checksum, deleted_at, key_ltree
                       FROM objects
                       WHERE bucket_id = $1 AND key > $2 AND key LIKE $3
+                        AND key !~ '^_anvil/(meta|index|authz|watch|personaldb|git|tmp)(/|$)'
                       ORDER BY key, created_at DESC, id DESC
                     ) latest
                     WHERE deleted_at IS NULL
@@ -1713,6 +1714,7 @@ impl Persistence {
                 SELECT DISTINCT ON (key) key, key_ltree, deleted_at, bucket_id
                 FROM objects
                 WHERE bucket_id = $1
+                  AND key !~ '^_anvil/(meta|index|authz|watch|personaldb|git|tmp)(/|$)'
                 ORDER BY key, created_at DESC, id DESC
               ) o, params p
               WHERE o.bucket_id = p.bucket_id
@@ -1817,6 +1819,7 @@ impl Persistence {
                         id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, inline_payload, checksum, deleted_at, key_ltree
                       FROM objects
                       WHERE bucket_id = $1 AND key = ANY($2)
+                        AND key !~ '^_anvil/(meta|index|authz|watch|personaldb|git|tmp)(/|$)'
                       ORDER BY key, created_at DESC, id DESC
                     ) latest
                     WHERE deleted_at IS NULL
@@ -1931,6 +1934,7 @@ impl Persistence {
                     row_number() OVER (PARTITION BY key ORDER BY created_at DESC, id DESC) = 1 AS is_latest
                   FROM objects
                   WHERE bucket_id = $1 AND key > $2 AND key LIKE $3
+                    AND key !~ '^_anvil/(meta|index|authz|watch|personaldb|git|tmp)(/|$)'
                 )
                 SELECT *
                 FROM ranked
