@@ -525,9 +525,10 @@ impl ObjectManager {
         bucket_name: &str,
         prefix: &str,
         key_marker: &str,
+        upload_id_marker: Option<uuid::Uuid>,
         limit: i32,
         scopes: &[String],
-    ) -> Result<Vec<crate::persistence::MultipartUpload>, Status> {
+    ) -> Result<crate::persistence::MultipartUploadsPage, Status> {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
@@ -543,7 +544,7 @@ impl ObjectManager {
 
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
         self.db
-            .list_active_multipart_uploads(bucket.id, prefix, key_marker, limit)
+            .list_active_multipart_uploads(bucket.id, prefix, key_marker, upload_id_marker, limit)
             .await
             .map_err(|e| Status::internal(e.to_string()))
     }

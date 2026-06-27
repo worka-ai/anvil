@@ -653,6 +653,17 @@ async fn test_s3_public_and_private_access() {
         .await
         .expect("create multipart upload for abort should succeed");
     let aborted_upload_id = aborted.upload_id().expect("abort upload id").to_string();
+    let second_aborted = client
+        .create_multipart_upload()
+        .bucket(&private_bucket)
+        .key(aborted_key)
+        .send()
+        .await
+        .expect("create second multipart upload for pagination should succeed");
+    let second_aborted_upload_id = second_aborted
+        .upload_id()
+        .expect("second abort upload id")
+        .to_string();
     let active_uploads = client
         .list_multipart_uploads()
         .bucket(&private_bucket)
@@ -660,11 +671,45 @@ async fn test_s3_public_and_private_access() {
         .send()
         .await
         .expect("list multipart uploads should succeed");
-    assert_eq!(active_uploads.uploads().len(), 1);
-    assert_eq!(
-        active_uploads.uploads()[0].upload_id(),
-        Some(aborted_upload_id.as_str())
-    );
+    assert_eq!(active_uploads.uploads().len(), 2);
+    assert!(active_uploads.uploads().iter().any(|upload| {
+        upload
+            .upload_id()
+            .is_some_and(|upload_id| upload_id == aborted_upload_id)
+    }));
+    assert!(active_uploads.uploads().iter().any(|upload| {
+        upload
+            .upload_id()
+            .is_some_and(|upload_id| upload_id == second_aborted_upload_id)
+    }));
+    let active_uploads_page_one = client
+        .list_multipart_uploads()
+        .bucket(&private_bucket)
+        .prefix(aborted_key)
+        .max_uploads(1)
+        .send()
+        .await
+        .expect("list multipart uploads first page should succeed");
+    assert_eq!(active_uploads_page_one.uploads().len(), 1);
+    assert!(active_uploads_page_one.is_truncated().unwrap_or(false));
+    let next_key_marker = active_uploads_page_one
+        .next_key_marker()
+        .expect("next multipart key marker");
+    let next_upload_id_marker = active_uploads_page_one
+        .next_upload_id_marker()
+        .expect("next multipart upload id marker");
+    let active_uploads_page_two = client
+        .list_multipart_uploads()
+        .bucket(&private_bucket)
+        .prefix(aborted_key)
+        .key_marker(next_key_marker)
+        .upload_id_marker(next_upload_id_marker)
+        .max_uploads(1)
+        .send()
+        .await
+        .expect("list multipart uploads second page should succeed");
+    assert_eq!(active_uploads_page_two.uploads().len(), 1);
+    assert!(!active_uploads_page_two.is_truncated().unwrap_or(false));
     client
         .abort_multipart_upload()
         .bucket(&private_bucket)
@@ -673,6 +718,14 @@ async fn test_s3_public_and_private_access() {
         .send()
         .await
         .expect("abort multipart upload should succeed");
+    client
+        .abort_multipart_upload()
+        .bucket(&private_bucket)
+        .key(aborted_key)
+        .upload_id(&second_aborted_upload_id)
+        .send()
+        .await
+        .expect("abort second multipart upload should succeed");
     let upload_after_abort = client
         .upload_part()
         .bucket(&private_bucket)

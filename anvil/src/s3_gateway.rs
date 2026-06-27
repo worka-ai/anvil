@@ -995,6 +995,22 @@ async fn list_multipart_uploads_response(
         .or_else(|| q.get("keyMarker"))
         .cloned()
         .unwrap_or_default();
+    let upload_id_marker = match q
+        .get("upload-id-marker")
+        .or_else(|| q.get("uploadIdMarker"))
+    {
+        Some(value) => match uuid::Uuid::parse_str(value) {
+            Ok(upload_id) => Some(upload_id),
+            Err(_) => {
+                return s3_error(
+                    "InvalidArgument",
+                    "Invalid upload-id-marker",
+                    axum::http::StatusCode::BAD_REQUEST,
+                );
+            }
+        },
+        None => None,
+    };
     let max_uploads: i32 = q
         .get("max-uploads")
         .or_else(|| q.get("maxUploads"))
@@ -1008,20 +1024,41 @@ async fn list_multipart_uploads_response(
             bucket,
             &prefix,
             &key_marker,
+            upload_id_marker,
             max_uploads,
             &claims.scopes,
         )
         .await
     {
-        Ok(uploads) => {
+        Ok(page) => {
             let mut xml = format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Bucket>{}</Bucket>\n  <KeyMarker>{}</KeyMarker>\n  <UploadIdMarker></UploadIdMarker>\n  <NextKeyMarker></NextKeyMarker>\n  <NextUploadIdMarker></NextUploadIdMarker>\n  <Delimiter></Delimiter>\n  <Prefix>{}</Prefix>\n  <MaxUploads>{}</MaxUploads>\n  <IsTruncated>false</IsTruncated>\n",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Bucket>{}</Bucket>\n  <KeyMarker>{}</KeyMarker>\n  <UploadIdMarker>{}</UploadIdMarker>\n",
                 xml_escape(bucket),
                 xml_escape(&key_marker),
-                xml_escape(&prefix),
-                max_uploads
+                upload_id_marker
+                    .map(|marker| marker.to_string())
+                    .as_deref()
+                    .map(xml_escape)
+                    .unwrap_or_default()
             );
-            for upload in uploads {
+            if let Some(next_key_marker) = page.next_key_marker.as_deref() {
+                xml.push_str(&format!(
+                    "  <NextKeyMarker>{}</NextKeyMarker>\n",
+                    xml_escape(next_key_marker)
+                ));
+            }
+            if let Some(next_upload_id_marker) = page.next_upload_id_marker {
+                xml.push_str(&format!(
+                    "  <NextUploadIdMarker>{next_upload_id_marker}</NextUploadIdMarker>\n"
+                ));
+            }
+            xml.push_str(&format!(
+                "  <Delimiter></Delimiter>\n  <Prefix>{}</Prefix>\n  <MaxUploads>{}</MaxUploads>\n  <IsTruncated>{}</IsTruncated>\n",
+                xml_escape(&prefix),
+                max_uploads,
+                if page.is_truncated { "true" } else { "false" }
+            ));
+            for upload in page.uploads {
                 xml.push_str("  <Upload>\n");
                 xml.push_str(&format!("    <Key>{}</Key>\n", xml_escape(&upload.key)));
                 xml.push_str(&format!("    <UploadId>{}</UploadId>\n", upload.upload_id));

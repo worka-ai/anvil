@@ -120,6 +120,14 @@ pub struct MultipartUpload {
 }
 
 #[derive(Debug, Clone)]
+pub struct MultipartUploadsPage {
+    pub uploads: Vec<MultipartUpload>,
+    pub is_truncated: bool,
+    pub next_key_marker: Option<String>,
+    pub next_upload_id_marker: Option<uuid::Uuid>,
+}
+
+#[derive(Debug, Clone)]
 pub struct MultipartUploadPart {
     pub id: i64,
     pub upload_id: i64,
@@ -2174,9 +2182,15 @@ impl Persistence {
         bucket_id: i64,
         prefix: &str,
         key_marker: &str,
+        upload_id_marker: Option<uuid::Uuid>,
         limit: i32,
-    ) -> Result<Vec<MultipartUpload>> {
+    ) -> Result<MultipartUploadsPage> {
         let client = self.regional_pool.get().await?;
+        let requested_limit = if limit <= 0 { 1000 } else { limit.min(1000) } as i64;
+        let marker_text = upload_id_marker
+            .filter(|_| !key_marker.is_empty())
+            .map(|marker| marker.to_string())
+            .unwrap_or_default();
         let rows = client
             .query(
                 r#"
@@ -2184,20 +2198,43 @@ impl Persistence {
                 FROM multipart_uploads
                 WHERE bucket_id = $1
                   AND left(key, length($2)) = $2
-                  AND key > $3
+                  AND (
+                      $3 = ''
+                      OR key > $3
+                      OR (key = $3 AND ($4 = '' OR upload_id::text > $4))
+                  )
                   AND completed_at IS NULL
                   AND aborted_at IS NULL
-                ORDER BY key, created_at
-                LIMIT $4"#,
+                ORDER BY key, upload_id
+                LIMIT $5"#,
                 &[
                     &bucket_id,
                     &prefix,
                     &key_marker,
-                    &(if limit == 0 { 1000 } else { limit } as i64),
+                    &marker_text,
+                    &(requested_limit + 1),
                 ],
             )
             .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        let mut uploads: Vec<MultipartUpload> = rows.into_iter().map(Into::into).collect();
+        let is_truncated = uploads.len() as i64 > requested_limit;
+        if is_truncated {
+            uploads.truncate(requested_limit as usize);
+        }
+        let (next_key_marker, next_upload_id_marker) = if is_truncated {
+            uploads
+                .last()
+                .map(|upload| (Some(upload.key.clone()), Some(upload.upload_id)))
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
+        Ok(MultipartUploadsPage {
+            uploads,
+            is_truncated,
+            next_key_marker,
+            next_upload_id_marker,
+        })
     }
 
     pub async fn complete_multipart_upload(&self, upload_row_id: i64) -> Result<()> {
