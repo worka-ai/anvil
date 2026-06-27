@@ -10,6 +10,8 @@ use tokio::io::AsyncWriteExt;
 
 const PERSONALDB_GROUP_PARTITION_FAMILY: u16 = 4;
 const PERSONALDB_GROUP_RECORD_KIND: u16 = 1;
+const PERSONALDB_PROJECTION_PARTITION_FAMILY: u16 = 5;
+const PERSONALDB_PROJECTION_RECORD_KIND: u16 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersonalDbGroupWatchPayload {
@@ -31,6 +33,28 @@ pub struct PersonalDbGroupWatchEvent {
     pub payload: PersonalDbGroupWatchPayload,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersonalDbProjectionWatchPayload {
+    pub database_id: String,
+    pub projection_id: String,
+    pub event_type: String,
+    pub source_database_id: String,
+    pub source_log_index: u64,
+    pub source_log_hash: String,
+    pub projection_log_index: u64,
+    pub projection_log_hash: String,
+    pub definition_hash: String,
+    pub emitted_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonalDbProjectionWatchEvent {
+    pub cursor: u128,
+    pub mutation_id: [u8; 16],
+    pub authz_revision: u64,
+    pub payload: PersonalDbProjectionWatchPayload,
+}
+
 pub async fn append_personaldb_group_watch_record(
     storage: &Storage,
     tenant_id: i64,
@@ -42,7 +66,15 @@ pub async fn append_personaldb_group_watch_record(
 ) -> Result<PathBuf> {
     validate_payload(database_id, &payload)?;
     let path = storage.personaldb_group_watch_path(tenant_id, database_id)?;
-    ensure_watch_header(storage, tenant_id, database_id, &path).await?;
+    ensure_watch_header(
+        tenant_id,
+        database_id,
+        "personaldb_group",
+        "personaldb_group",
+        partition_id(tenant_id, database_id),
+        &path,
+    )
+    .await?;
     ensure_cursor_is_monotonic(&path, cursor).await?;
 
     let record = WatchRecord::new(
@@ -54,6 +86,49 @@ pub async fn append_personaldb_group_watch_record(
         authz_revision,
         0,
         payload.log_index,
+        serde_json::to_vec(&payload)?,
+    );
+    let mut file = tokio::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .await?;
+    file.write_all(&record.encode()).await?;
+    file.sync_data().await?;
+    Ok(path)
+}
+
+pub async fn append_personaldb_projection_watch_record(
+    storage: &Storage,
+    tenant_id: i64,
+    database_id: &str,
+    projection_id: &str,
+    cursor: u128,
+    mutation_id: [u8; 16],
+    authz_revision: u64,
+    payload: PersonalDbProjectionWatchPayload,
+) -> Result<PathBuf> {
+    validate_projection_payload(database_id, projection_id, &payload)?;
+    let path = storage.personaldb_projection_watch_path(tenant_id, database_id, projection_id)?;
+    ensure_watch_header(
+        tenant_id,
+        &format!("{database_id}/{projection_id}"),
+        "personaldb_projection",
+        "personaldb_projection",
+        projection_partition_id(tenant_id, database_id, projection_id),
+        &path,
+    )
+    .await?;
+    ensure_cursor_is_monotonic(&path, cursor).await?;
+
+    let record = WatchRecord::new(
+        cursor,
+        PERSONALDB_PROJECTION_PARTITION_FAMILY,
+        projection_partition_id(tenant_id, database_id, projection_id),
+        mutation_id,
+        PERSONALDB_PROJECTION_RECORD_KIND,
+        authz_revision,
+        0,
+        payload.projection_log_index,
         serde_json::to_vec(&payload)?,
     );
     let mut file = tokio::fs::OpenOptions::new()
@@ -100,6 +175,42 @@ pub async fn list_personaldb_group_watch_events(
     Ok(events)
 }
 
+pub async fn list_personaldb_projection_watch_events(
+    storage: &Storage,
+    tenant_id: i64,
+    database_id: &str,
+    projection_id: &str,
+    after_cursor: u128,
+    limit: usize,
+) -> Result<Vec<PersonalDbProjectionWatchEvent>> {
+    let path = storage.personaldb_projection_watch_path(tenant_id, database_id, projection_id)?;
+    let decoded = read_watch_or_empty(&path).await?;
+    let mut events = Vec::new();
+    for record in decoded.records {
+        if record.cursor <= after_cursor {
+            continue;
+        }
+        if record.partition_family != PERSONALDB_PROJECTION_PARTITION_FAMILY
+            || record.record_kind != PERSONALDB_PROJECTION_RECORD_KIND
+            || record.partition_id != projection_partition_id(tenant_id, database_id, projection_id)
+        {
+            continue;
+        }
+        let payload: PersonalDbProjectionWatchPayload = serde_json::from_slice(&record.payload)?;
+        validate_projection_payload(database_id, projection_id, &payload)?;
+        events.push(PersonalDbProjectionWatchEvent {
+            cursor: record.cursor,
+            mutation_id: record.mutation_id,
+            authz_revision: record.authz_revision,
+            payload,
+        });
+        if limit > 0 && events.len() >= limit {
+            break;
+        }
+    }
+    Ok(events)
+}
+
 pub async fn latest_personaldb_group_watch_cursor(
     storage: &Storage,
     tenant_id: i64,
@@ -119,10 +230,33 @@ pub async fn latest_personaldb_group_watch_cursor(
         .max())
 }
 
-async fn ensure_watch_header(
-    _storage: &Storage,
+pub async fn latest_personaldb_projection_watch_cursor(
+    storage: &Storage,
     tenant_id: i64,
     database_id: &str,
+    projection_id: &str,
+) -> Result<Option<u128>> {
+    let path = storage.personaldb_projection_watch_path(tenant_id, database_id, projection_id)?;
+    let decoded = read_watch_or_empty(&path).await?;
+    Ok(decoded
+        .records
+        .into_iter()
+        .filter(|record| {
+            record.partition_family == PERSONALDB_PROJECTION_PARTITION_FAMILY
+                && record.record_kind == PERSONALDB_PROJECTION_RECORD_KIND
+                && record.partition_id
+                    == projection_partition_id(tenant_id, database_id, projection_id)
+        })
+        .map(|record| record.cursor)
+        .max())
+}
+
+async fn ensure_watch_header(
+    tenant_id: i64,
+    stream_key: &str,
+    watch_stream: &str,
+    partition_family: &str,
+    partition_id: Hash32,
     path: &PathBuf,
 ) -> Result<()> {
     if tokio::fs::metadata(path).await.is_ok() {
@@ -133,10 +267,10 @@ async fn ensure_watch_header(
     }
     let header = WatchLogHeader {
         tenant_id: tenant_id.to_string(),
-        bucket_id: database_id.to_string(),
-        watch_stream: "personaldb_group".to_string(),
-        partition_family: "personaldb_group".to_string(),
-        partition_id: hex::encode(partition_id(tenant_id, database_id)),
+        bucket_id: stream_key.to_string(),
+        watch_stream: watch_stream.to_string(),
+        partition_family: partition_family.to_string(),
+        partition_id: hex::encode(partition_id),
         created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
         codec: "none".to_string(),
     };
@@ -209,6 +343,28 @@ fn validate_payload(database_id: &str, payload: &PersonalDbGroupWatchPayload) ->
     Ok(())
 }
 
+fn validate_projection_payload(
+    database_id: &str,
+    projection_id: &str,
+    payload: &PersonalDbProjectionWatchPayload,
+) -> Result<()> {
+    if payload.database_id != database_id || payload.projection_id != projection_id {
+        return Err(anyhow!(
+            "personaldb projection watch payload scope mismatch"
+        ));
+    }
+    if payload.event_type.is_empty()
+        || payload.source_database_id.is_empty()
+        || payload.emitted_at.is_empty()
+    {
+        return Err(anyhow!("personaldb projection watch payload is incomplete"));
+    }
+    validate_hex32(&payload.source_log_hash, "source_log_hash")?;
+    validate_hex32(&payload.projection_log_hash, "projection_log_hash")?;
+    validate_hex32(&payload.definition_hash, "definition_hash")?;
+    Ok(())
+}
+
 fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
     if value.len() != 64 || !value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(anyhow!("{field} must be hex32"));
@@ -218,6 +374,13 @@ fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
 
 fn partition_id(tenant_id: i64, database_id: &str) -> Hash32 {
     hash32(format!("tenant:{tenant_id}:personaldb:{database_id}:watch:group").as_bytes())
+}
+
+fn projection_partition_id(tenant_id: i64, database_id: &str, projection_id: &str) -> Hash32 {
+    hash32(
+        format!("tenant:{tenant_id}:personaldb:{database_id}:projection:{projection_id}:watch")
+            .as_bytes(),
+    )
 }
 
 #[cfg(test)]
@@ -283,6 +446,112 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn personaldb_projection_watch_appends_lists_and_tracks_latest_cursor() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        append_personaldb_projection_watch_record(
+            &storage,
+            4,
+            "projection-db",
+            "projection-a",
+            20,
+            [1; 16],
+            9,
+            projection_payload(1),
+        )
+        .await
+        .unwrap();
+        append_personaldb_projection_watch_record(
+            &storage,
+            4,
+            "projection-db",
+            "projection-a",
+            21,
+            [2; 16],
+            10,
+            projection_payload(2),
+        )
+        .await
+        .unwrap();
+
+        let path = storage
+            .personaldb_projection_watch_path(4, "projection-db", "projection-a")
+            .unwrap();
+        assert!(path.ends_with(
+            "_anvil/watch/personaldb/tenant-4/groups/projection-db/projections/projection-a.anwatch"
+        ));
+        let events = list_personaldb_projection_watch_events(
+            &storage,
+            4,
+            "projection-db",
+            "projection-a",
+            20,
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].cursor, 21);
+        assert_eq!(events[0].authz_revision, 10);
+        assert_eq!(events[0].payload.projection_log_index, 2);
+        assert_eq!(
+            latest_personaldb_projection_watch_cursor(&storage, 4, "projection-db", "projection-a")
+                .await
+                .unwrap(),
+            Some(21)
+        );
+    }
+
+    #[tokio::test]
+    async fn personaldb_projection_watch_rejects_non_monotonic_cursor_and_bad_payload() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        append_personaldb_projection_watch_record(
+            &storage,
+            4,
+            "projection-db",
+            "projection-a",
+            20,
+            [1; 16],
+            9,
+            projection_payload(1),
+        )
+        .await
+        .unwrap();
+        assert!(
+            append_personaldb_projection_watch_record(
+                &storage,
+                4,
+                "projection-db",
+                "projection-a",
+                20,
+                [2; 16],
+                9,
+                projection_payload(2),
+            )
+            .await
+            .is_err()
+        );
+
+        let mut bad = projection_payload(3);
+        bad.projection_id = "projection-b".to_string();
+        assert!(
+            append_personaldb_projection_watch_record(
+                &storage,
+                4,
+                "projection-db",
+                "projection-a",
+                21,
+                [3; 16],
+                9,
+                bad,
+            )
+            .await
+            .is_err()
+        );
+    }
+
     fn payload(log_index: u64) -> PersonalDbGroupWatchPayload {
         PersonalDbGroupWatchPayload {
             database_id: "db-alpha".to_string(),
@@ -292,6 +561,21 @@ mod tests {
             changeset_payload_hash: hex::encode([2; 32]),
             certificate_hash: hex::encode([3; 32]),
             committed_head_hash: hex::encode([4; 32]),
+            emitted_at: "2026-06-27T00:00:00.000000000Z".to_string(),
+        }
+    }
+
+    fn projection_payload(log_index: u64) -> PersonalDbProjectionWatchPayload {
+        PersonalDbProjectionWatchPayload {
+            database_id: "projection-db".to_string(),
+            projection_id: "projection-a".to_string(),
+            event_type: "projection_committed".to_string(),
+            source_database_id: "source-db".to_string(),
+            source_log_index: log_index + 10,
+            source_log_hash: hex::encode([5; 32]),
+            projection_log_index: log_index,
+            projection_log_hash: hex::encode([log_index as u8; 32]),
+            definition_hash: hex::encode([6; 32]),
             emitted_at: "2026-06-27T00:00:00.000000000Z".to_string(),
         }
     }
