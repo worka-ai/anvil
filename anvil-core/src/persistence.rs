@@ -14,7 +14,7 @@ use crate::{
     control_journal, index_diagnostic_journal, index_journal, metadata_journal, model_journal,
     multipart_journal,
     storage::Storage,
-    task_journal,
+    task_journal, watch_log,
 };
 
 #[derive(Debug, Clone)]
@@ -29,7 +29,6 @@ pub struct Persistence {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct NativeState {
     next_id: i64,
-    object_events: Vec<ObjectWatchEvent>,
     append_streams: Vec<AppendStream>,
     append_records: Vec<AppendStreamRecord>,
     manifests: Vec<ManifestRecord>,
@@ -1301,9 +1300,13 @@ impl Persistence {
         event_type: &str,
         is_delete_marker: bool,
     ) -> Result<ObjectWatchEvent> {
-        let mut state = self.state.write().await;
-        let event = ObjectWatchEvent {
-            id: state.allocate_id(),
+        let id = self
+            .latest_object_watch_cursor(tenant_id, bucket_id)
+            .await?
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("object watch cursor overflow"))?;
+        Ok(ObjectWatchEvent {
+            id,
             tenant_id,
             bucket_id,
             bucket_name: bucket_name.to_string(),
@@ -1314,23 +1317,18 @@ impl Persistence {
             size: object.size,
             is_delete_marker,
             created_at: Utc::now(),
-        };
-        state.object_events.push(event.clone());
-        self.persist_after_write(&state).await?;
-        Ok(event)
+        })
     }
 
     pub async fn latest_object_watch_cursor(&self, tenant_id: i64, bucket_id: i64) -> Result<i64> {
-        Ok(self
-            .state
-            .read()
-            .await
-            .object_events
-            .iter()
-            .filter(|e| e.tenant_id == tenant_id && e.bucket_id == bucket_id)
-            .map(|e| e.id)
-            .max()
-            .unwrap_or(0))
+        Ok(
+            watch_log::list_object_watch_events(&self.storage, tenant_id, bucket_id, "", 0, 0)
+                .await?
+                .into_iter()
+                .map(|event| event.id)
+                .max()
+                .unwrap_or(0),
+        )
     }
 
     pub async fn list_object_watch_events(
@@ -1341,27 +1339,19 @@ impl Persistence {
         after_cursor: i64,
         limit: i32,
     ) -> Result<Vec<ObjectWatchEvent>> {
-        let mut events = self
-            .state
-            .read()
-            .await
-            .object_events
-            .iter()
-            .filter(|e| {
-                e.tenant_id == tenant_id
-                    && e.bucket_id == bucket_id
-                    && e.key.starts_with(prefix)
-                    && e.id > after_cursor
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        events.sort_by_key(|e| e.id);
-        events.truncate(if limit == 0 {
-            1000
-        } else {
-            limit.max(1) as usize
-        });
-        Ok(events)
+        watch_log::list_object_watch_events(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            prefix,
+            after_cursor,
+            if limit == 0 {
+                1000
+            } else {
+                limit.max(1) as usize
+            },
+        )
+        .await
     }
 
     pub async fn create_append_stream(
