@@ -1,4 +1,6 @@
 pub mod authz;
+pub mod git;
+pub mod personaldb;
 pub mod segment;
 pub mod watch;
 
@@ -81,12 +83,22 @@ pub enum FormatError {
     FamilyMagicMismatch,
     #[error("declared length is invalid for {context}")]
     InvalidDeclaredLength { context: &'static str },
+    #[error("{context} has invalid fixed length: expected {expected} bytes, got {actual}")]
+    InvalidFixedLength {
+        context: &'static str,
+        expected: usize,
+        actual: usize,
+    },
     #[error("hash mismatch for {context}")]
     HashMismatch { context: &'static str },
     #[error("journal sequence did not increase")]
     NonIncreasingJournalSequence,
     #[error("journal previous hash does not match prior frame")]
     JournalPreviousHashMismatch,
+    #[error("log index is not contiguous")]
+    NonContiguousLogIndex,
+    #[error("log previous hash does not match prior entry")]
+    LogPreviousHashMismatch,
     #[error("records are not sorted by key")]
     RecordsNotSorted,
 }
