@@ -1,3 +1,7 @@
+pub mod authz;
+pub mod segment;
+pub mod watch;
+
 use std::convert::TryInto;
 
 pub const FORMAT_MAJOR_VERSION: u16 = 1;
@@ -69,6 +73,10 @@ pub enum FormatError {
     UnsupportedMajorVersion(u16),
     #[error("unsupported file family {0}")]
     UnsupportedFamily(u16),
+    #[error("unsupported block codec {0}")]
+    UnsupportedCodec(u8),
+    #[error("unsupported operation {0}")]
+    UnsupportedOperation(u8),
     #[error("file family does not match magic")]
     FamilyMagicMismatch,
     #[error("declared length is invalid for {context}")]
@@ -79,6 +87,8 @@ pub enum FormatError {
     NonIncreasingJournalSequence,
     #[error("journal previous hash does not match prior frame")]
     JournalPreviousHashMismatch,
+    #[error("records are not sorted by key")]
+    RecordsNotSorted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
