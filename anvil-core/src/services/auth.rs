@@ -209,40 +209,23 @@ impl AuthService for AppState {
             return Err(Status::permission_denied("Permission denied"));
         }
 
-        let caveat_hash = req.caveat_hash;
-        let reason = req.reason;
-        let record_hash = authz_record_hash(AuthzRecordHashInput {
-            tenant_id: claims.tenant_id,
-            namespace: &req.namespace,
-            object_id: &req.object_id,
-            relation: &req.relation,
-            subject_kind: &req.subject_kind,
-            subject_id: &req.subject_id,
-            caveat_hash: &caveat_hash,
-            operation,
-            written_by: &claims.sub,
-            reason: &reason,
-        });
-        let record = self
-            .db
-            .write_authz_tuple(
-                claims.tenant_id,
-                &req.namespace,
-                &req.object_id,
-                &req.relation,
-                &req.subject_kind,
-                &req.subject_id,
-                &caveat_hash,
+        let record = authz_journal::write_authz_tuple(
+            &self.storage,
+            authz_journal::AuthzTupleWrite {
+                tenant_id: claims.tenant_id,
+                namespace: &req.namespace,
+                object_id: &req.object_id,
+                relation: &req.relation,
+                subject_kind: &req.subject_kind,
+                subject_id: &req.subject_id,
+                caveat_hash: &req.caveat_hash,
                 operation,
-                &claims.sub,
-                &reason,
-                &record_hash,
-            )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        authz_journal::append_authz_tuple_record(&self.storage, &record)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+                written_by: &claims.sub,
+                reason: &req.reason,
+            },
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
         let _ = self.authz_watch_tx.send(record.clone());
 
         Ok(Response::new(WriteAuthzTupleResponse {
@@ -410,39 +393,6 @@ impl AuthService for AppState {
             Box::pin(ReceiverStream::new(rx)) as Self::WatchAuthzTupleLogStream
         ))
     }
-}
-
-struct AuthzRecordHashInput<'a> {
-    tenant_id: i64,
-    namespace: &'a str,
-    object_id: &'a str,
-    relation: &'a str,
-    subject_kind: &'a str,
-    subject_id: &'a str,
-    caveat_hash: &'a str,
-    operation: &'a str,
-    written_by: &'a str,
-    reason: &'a str,
-}
-
-fn authz_record_hash(input: AuthzRecordHashInput<'_>) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&input.tenant_id.to_le_bytes());
-    for part in [
-        input.namespace,
-        input.object_id,
-        input.relation,
-        input.subject_kind,
-        input.subject_id,
-        input.caveat_hash,
-        input.operation,
-        input.written_by,
-        input.reason,
-    ] {
-        hasher.update(&(part.len() as u64).to_le_bytes());
-        hasher.update(part.as_bytes());
-    }
-    hasher.finalize().to_hex().to_string()
 }
 
 fn authz_resource(namespace: &str, object_id: &str, relation: &str) -> String {

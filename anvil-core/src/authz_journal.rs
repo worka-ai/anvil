@@ -37,6 +37,59 @@ struct AuthzTupleBody {
     written_at: String,
 }
 
+pub struct AuthzTupleWrite<'a> {
+    pub tenant_id: i64,
+    pub namespace: &'a str,
+    pub object_id: &'a str,
+    pub relation: &'a str,
+    pub subject_kind: &'a str,
+    pub subject_id: &'a str,
+    pub caveat_hash: &'a str,
+    pub operation: &'a str,
+    pub written_by: &'a str,
+    pub reason: &'a str,
+}
+
+pub async fn write_authz_tuple(
+    storage: &Storage,
+    input: AuthzTupleWrite<'_>,
+) -> Result<AuthzTupleRecord> {
+    let revision = latest_authz_revision(storage, input.tenant_id)
+        .await?
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("authz revision overflow"))?;
+    let written_at = chrono::Utc::now();
+    let record_hash = authz_record_hash(AuthzRecordHashInput {
+        tenant_id: input.tenant_id,
+        namespace: input.namespace,
+        object_id: input.object_id,
+        relation: input.relation,
+        subject_kind: input.subject_kind,
+        subject_id: input.subject_id,
+        caveat_hash: input.caveat_hash,
+        operation: input.operation,
+        written_by: input.written_by,
+        reason: input.reason,
+    });
+    let record = AuthzTupleRecord {
+        revision,
+        tenant_id: input.tenant_id,
+        namespace: input.namespace.to_string(),
+        object_id: input.object_id.to_string(),
+        relation: input.relation.to_string(),
+        subject_kind: input.subject_kind.to_string(),
+        subject_id: input.subject_id.to_string(),
+        caveat_hash: input.caveat_hash.to_string(),
+        operation: input.operation.to_string(),
+        written_by: input.written_by.to_string(),
+        reason: input.reason.to_string(),
+        record_hash,
+        written_at,
+    };
+    append_authz_tuple_record(storage, &record).await?;
+    Ok(record)
+}
+
 pub async fn append_authz_tuple_record(storage: &Storage, record: &AuthzTupleRecord) -> Result<()> {
     let path = storage.authz_tuple_journal_path(record.tenant_id);
     if let Some(parent) = path.parent() {
@@ -281,6 +334,39 @@ fn tuple_key_hash(record: &AuthzTupleRecord) -> Hash32 {
         )
         .as_bytes(),
     )
+}
+
+struct AuthzRecordHashInput<'a> {
+    tenant_id: i64,
+    namespace: &'a str,
+    object_id: &'a str,
+    relation: &'a str,
+    subject_kind: &'a str,
+    subject_id: &'a str,
+    caveat_hash: &'a str,
+    operation: &'a str,
+    written_by: &'a str,
+    reason: &'a str,
+}
+
+fn authz_record_hash(input: AuthzRecordHashInput<'_>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&input.tenant_id.to_le_bytes());
+    for part in [
+        input.namespace,
+        input.object_id,
+        input.relation,
+        input.subject_kind,
+        input.subject_id,
+        input.caveat_hash,
+        input.operation,
+        input.written_by,
+        input.reason,
+    ] {
+        hasher.update(&(part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 #[cfg(test)]
