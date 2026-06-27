@@ -569,6 +569,29 @@ async fn test_s3_public_and_private_access() {
     assert!(!second_page.is_truncated().unwrap_or(true));
     assert_eq!(second_page.contents().len(), 1);
     assert_eq!(second_page.contents()[0].key(), Some("page/b.txt"));
+    let first_v1_page = client
+        .list_objects()
+        .bucket(&private_bucket)
+        .prefix("page/")
+        .max_keys(1)
+        .send()
+        .await
+        .expect("first v1 paged list should succeed");
+    assert!(first_v1_page.is_truncated().unwrap_or(false));
+    assert_eq!(first_v1_page.contents().len(), 1);
+    assert_eq!(first_v1_page.contents()[0].key(), Some("page/a.txt"));
+    let second_v1_page = client
+        .list_objects()
+        .bucket(&private_bucket)
+        .prefix("page/")
+        .max_keys(1)
+        .marker(first_v1_page.next_marker().expect("next marker"))
+        .send()
+        .await
+        .expect("second v1 paged list should succeed");
+    assert!(!second_v1_page.is_truncated().unwrap_or(true));
+    assert_eq!(second_v1_page.contents().len(), 1);
+    assert_eq!(second_v1_page.contents()[0].key(), Some("page/b.txt"));
 
     let multipart_key = "multipart-private.txt";
     let multipart = client

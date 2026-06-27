@@ -563,17 +563,26 @@ async fn list_objects(
         return get_bucket_location_response(state, claims, &bucket).await;
     }
 
+    let is_list_v2 = q
+        .get("list-type")
+        .or_else(|| q.get("listType"))
+        .is_some_and(|value| value == "2");
     let prefix = q.get("prefix").cloned().unwrap_or_default();
     let continuation_token = q
         .get("continuation-token")
         .or_else(|| q.get("continuationToken"))
         .cloned();
-    let start_after = continuation_token.clone().unwrap_or_else(|| {
-        q.get("start-after")
-            .or_else(|| q.get("startAfter"))
-            .cloned()
-            .unwrap_or_default()
-    });
+    let marker = q.get("marker").cloned().unwrap_or_default();
+    let start_after = if is_list_v2 {
+        continuation_token.clone().unwrap_or_else(|| {
+            q.get("start-after")
+                .or_else(|| q.get("startAfter"))
+                .cloned()
+                .unwrap_or_default()
+        })
+    } else {
+        marker.clone()
+    };
     let delimiter = q.get("delimiter").cloned().unwrap_or_default();
     let max_keys: i32 = q
         .get("max-keys")
@@ -594,13 +603,12 @@ async fn list_objects(
         .await
     {
         Ok((objects, common_prefixes)) => {
-            // Basic ListObjectsV2 XML
             let requested_max_keys = if max_keys <= 0 {
                 1000
             } else {
                 max_keys as usize
             };
-            let (entries, is_truncated, next_continuation_token) =
+            let (entries, is_truncated, next_marker) =
                 paginate_list_bucket_entries(objects, common_prefixes, requested_max_keys);
             let key_count = entries.len() as i32;
             let mut xml = String::from(
@@ -609,44 +617,43 @@ async fn list_objects(
             );
             xml.push_str(&format!("  <Name>{}</Name>\n", &*bucket));
             xml.push_str(&format!("  <Prefix>{}</Prefix>\n", xml_escape(&prefix)));
-            if let Some(token) = continuation_token {
+            if is_list_v2 {
+                if let Some(token) = continuation_token {
+                    xml.push_str(&format!(
+                        "  <ContinuationToken>{}</ContinuationToken>\n",
+                        xml_escape(&token)
+                    ));
+                }
+                xml.push_str(&format!("  <KeyCount>{}</KeyCount>\n", key_count));
+            } else {
+                xml.push_str(&format!("  <Marker>{}</Marker>\n", xml_escape(&marker)));
+            }
+            if !delimiter.is_empty() {
                 xml.push_str(&format!(
-                    "  <ContinuationToken>{}</ContinuationToken>\n",
-                    xml_escape(&token)
+                    "  <Delimiter>{}</Delimiter>\n",
+                    xml_escape(&delimiter)
                 ));
             }
-            xml.push_str(&format!("  <KeyCount>{}</KeyCount>\n", key_count));
             xml.push_str(&format!("  <MaxKeys>{}</MaxKeys>\n", max_keys));
             xml.push_str(&format!(
                 "  <IsTruncated>{}</IsTruncated>\n",
                 if is_truncated { "true" } else { "false" }
             ));
-            if let Some(token) = next_continuation_token {
-                xml.push_str(&format!(
-                    "  <NextContinuationToken>{}</NextContinuationToken>\n",
-                    xml_escape(&token)
-                ));
+            if let Some(token) = next_marker {
+                if is_list_v2 {
+                    xml.push_str(&format!(
+                        "  <NextContinuationToken>{}</NextContinuationToken>\n",
+                        xml_escape(&token)
+                    ));
+                } else {
+                    xml.push_str(&format!(
+                        "  <NextMarker>{}</NextMarker>\n",
+                        xml_escape(&token)
+                    ));
+                }
             }
             for entry in entries {
-                match entry {
-                    ListBucketEntry::Object(o) => {
-                        xml.push_str("  <Contents>\n");
-                        xml.push_str(&format!("    <Key>{}</Key>\n", xml_escape(&o.key)));
-                        xml.push_str(&format!(
-                            "    <LastModified>{}</LastModified>\n",
-                            o.created_at.to_rfc3339()
-                        ));
-                        xml.push_str(&format!("    <ETag>\"{}\"</ETag>\n", o.etag));
-                        xml.push_str(&format!("    <Size>{}</Size>\n", o.size));
-                        xml.push_str("    <StorageClass>STANDARD</StorageClass>\n");
-                        xml.push_str("  </Contents>\n");
-                    }
-                    ListBucketEntry::Prefix(p) => {
-                        xml.push_str("  <CommonPrefixes>\n");
-                        xml.push_str(&format!("    <Prefix>{}</Prefix>\n", xml_escape(&p)));
-                        xml.push_str("  </CommonPrefixes>\n");
-                    }
-                }
+                append_list_bucket_entry_xml(&mut xml, entry);
             }
             xml.push_str("</ListBucketResult>\n");
 
@@ -1272,6 +1279,28 @@ impl ListBucketEntry {
         match self {
             Self::Object(_) => 0,
             Self::Prefix(_) => 1,
+        }
+    }
+}
+
+fn append_list_bucket_entry_xml(xml: &mut String, entry: ListBucketEntry) {
+    match entry {
+        ListBucketEntry::Object(object) => {
+            xml.push_str("  <Contents>\n");
+            xml.push_str(&format!("    <Key>{}</Key>\n", xml_escape(&object.key)));
+            xml.push_str(&format!(
+                "    <LastModified>{}</LastModified>\n",
+                object.created_at.to_rfc3339()
+            ));
+            xml.push_str(&format!("    <ETag>\"{}\"</ETag>\n", object.etag));
+            xml.push_str(&format!("    <Size>{}</Size>\n", object.size));
+            xml.push_str("    <StorageClass>STANDARD</StorageClass>\n");
+            xml.push_str("  </Contents>\n");
+        }
+        ListBucketEntry::Prefix(prefix) => {
+            xml.push_str("  <CommonPrefixes>\n");
+            xml.push_str(&format!("    <Prefix>{}</Prefix>\n", xml_escape(&prefix)));
+            xml.push_str("  </CommonPrefixes>\n");
         }
     }
 }
