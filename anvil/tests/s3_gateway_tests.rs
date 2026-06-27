@@ -687,6 +687,37 @@ async fn test_s3_public_and_private_access() {
             .iter()
             .any(|version| version.is_latest().unwrap_or(false))
     );
+    let first_versions_page = client
+        .list_object_versions()
+        .bucket(&private_bucket)
+        .prefix(private_key)
+        .max_keys(1)
+        .send()
+        .await
+        .expect("first paged version listing should succeed");
+    assert_eq!(first_versions_page.versions().len(), 1);
+    assert!(first_versions_page.is_truncated().unwrap_or(false));
+    let next_key_marker = first_versions_page
+        .next_key_marker()
+        .expect("next key marker")
+        .to_string();
+    let next_version_id_marker = first_versions_page
+        .next_version_id_marker()
+        .expect("next version marker")
+        .to_string();
+    assert_eq!(next_key_marker, private_key);
+    let second_versions_page = client
+        .list_object_versions()
+        .bucket(&private_bucket)
+        .prefix(private_key)
+        .key_marker(next_key_marker)
+        .version_id_marker(next_version_id_marker)
+        .max_keys(1)
+        .send()
+        .await
+        .expect("second paged version listing should succeed");
+    assert_eq!(second_versions_page.versions().len(), 1);
+    assert!(!second_versions_page.is_truncated().unwrap_or(true));
 
     let version_specific_key = "version-specific-delete.txt";
     client

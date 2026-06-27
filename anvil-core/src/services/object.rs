@@ -259,9 +259,12 @@ impl ObjectService for AppState {
                 &req.bucket_name,
                 &req.prefix,
                 &req.key_marker,
+                &req.version_id_marker,
                 req.max_keys,
             )
-            .await?
+            .await?;
+        let response_versions = versions
+            .versions
             .into_iter()
             .map(|version| {
                 let object = version.object;
@@ -277,7 +280,15 @@ impl ObjectService for AppState {
             })
             .collect();
 
-        Ok(Response::new(ListObjectVersionsResponse { versions }))
+        Ok(Response::new(ListObjectVersionsResponse {
+            versions: response_versions,
+            is_truncated: versions.is_truncated,
+            next_key_marker: versions.next_key_marker.unwrap_or_default(),
+            next_version_id_marker: versions
+                .next_version_id_marker
+                .map(|marker| marker.to_string())
+                .unwrap_or_default(),
+        }))
     }
 
     async fn copy_object(

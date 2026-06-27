@@ -83,6 +83,14 @@ pub struct ObjectVersion {
     pub is_latest: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ObjectVersionsPage {
+    pub versions: Vec<ObjectVersion>,
+    pub is_truncated: bool,
+    pub next_key_marker: Option<String>,
+    pub next_version_id_marker: Option<uuid::Uuid>,
+}
+
 struct ObjectVersionRecordHashInput<'a> {
     tenant_id: i64,
     bucket_id: i64,
@@ -1950,33 +1958,90 @@ impl Persistence {
         bucket_id: i64,
         prefix: &str,
         key_marker: &str,
+        version_id_marker: Option<uuid::Uuid>,
         limit: i32,
-    ) -> Result<Vec<ObjectVersion>> {
+    ) -> Result<ObjectVersionsPage> {
         let client = self.regional_pool.get().await?;
-        let rows = client
-            .query(
-                r#"
-                WITH ranked AS (
-                  SELECT
-                    id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, inline_payload, checksum, deleted_at, key_ltree,
-                    row_number() OVER (PARTITION BY key ORDER BY created_at DESC, id DESC) = 1 AS is_latest
-                  FROM objects
-                  WHERE bucket_id = $1 AND key > $2 AND key LIKE $3
-                    AND key !~ '^_anvil/(meta|index|authz|watch|personaldb|git|tmp)(/|$)'
+        let limit = limit.max(1) as i64;
+        let fetch_limit = limit + 1;
+        let prefix_like = format!(r#"{}%"#, prefix);
+        let rows = if let Some(version_id_marker) = version_id_marker {
+            let marker = client
+                .query_opt(
+                    r#"
+                    SELECT id, created_at
+                    FROM objects
+                    WHERE bucket_id = $1 AND key = $2 AND version_id = $3"#,
+                    &[&bucket_id, &key_marker, &version_id_marker],
                 )
-                SELECT *
-                FROM ranked
-                ORDER BY key, created_at DESC, id DESC
-                LIMIT $4"#,
-                &[
-                    &bucket_id,
-                    &key_marker,
-                    &format!(r#"{}%"#, prefix),
-                    &(limit as i64),
-                ],
-            )
-            .await?;
-        Ok(rows
+                .await?;
+            let Some(marker) = marker else {
+                return Ok(ObjectVersionsPage {
+                    versions: Vec::new(),
+                    is_truncated: false,
+                    next_key_marker: None,
+                    next_version_id_marker: None,
+                });
+            };
+            let marker_id: i64 = marker.get("id");
+            let marker_created_at: DateTime<Utc> = marker.get("created_at");
+            client
+                .query(
+                    r#"
+                    WITH ranked AS (
+                      SELECT
+                        id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, inline_payload, checksum, deleted_at, key_ltree,
+                        row_number() OVER (PARTITION BY key ORDER BY created_at DESC, id DESC) = 1 AS is_latest
+                      FROM objects
+                      WHERE bucket_id = $1 AND key LIKE $2
+                        AND (
+                          key > $3
+                          OR (
+                            key = $3
+                            AND (
+                              created_at < $4
+                              OR (created_at = $4 AND id < $5)
+                            )
+                          )
+                        )
+                        AND key !~ '^_anvil/(meta|index|authz|watch|personaldb|git|tmp)(/|$)'
+                    )
+                    SELECT *
+                    FROM ranked
+                    ORDER BY key, created_at DESC, id DESC
+                    LIMIT $6"#,
+                    &[
+                        &bucket_id,
+                        &prefix_like,
+                        &key_marker,
+                        &marker_created_at,
+                        &marker_id,
+                        &fetch_limit,
+                    ],
+                )
+                .await?
+        } else {
+            client
+                .query(
+                    r#"
+                    WITH ranked AS (
+                      SELECT
+                        id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, inline_payload, checksum, deleted_at, key_ltree,
+                        row_number() OVER (PARTITION BY key ORDER BY created_at DESC, id DESC) = 1 AS is_latest
+                      FROM objects
+                      WHERE bucket_id = $1 AND key > $2 AND key LIKE $3
+                        AND key !~ '^_anvil/(meta|index|authz|watch|personaldb|git|tmp)(/|$)'
+                    )
+                    SELECT *
+                    FROM ranked
+                    ORDER BY key, created_at DESC, id DESC
+                    LIMIT $4"#,
+                    &[&bucket_id, &key_marker, &prefix_like, &fetch_limit],
+                )
+                .await?
+        };
+
+        let mut versions: Vec<ObjectVersion> = rows
             .into_iter()
             .map(|row| {
                 let is_latest: bool = row.get("is_latest");
@@ -1987,7 +2052,30 @@ impl Persistence {
                     object,
                 }
             })
-            .collect())
+            .collect();
+        let is_truncated = versions.len() > limit as usize;
+        if is_truncated {
+            versions.truncate(limit as usize);
+        }
+        let (next_key_marker, next_version_id_marker) = if is_truncated {
+            versions
+                .last()
+                .map(|version| {
+                    (
+                        Some(version.object.key.clone()),
+                        Some(version.object.version_id),
+                    )
+                })
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
+        Ok(ObjectVersionsPage {
+            versions,
+            is_truncated,
+            next_key_marker,
+            next_version_id_marker,
+        })
     }
 
     pub async fn create_multipart_upload(

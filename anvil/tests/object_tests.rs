@@ -130,6 +130,7 @@ async fn test_delete_object_creates_delete_marker() {
         prefix: object_key.clone(),
         key_marker: String::new(),
         max_keys: 100,
+        version_id_marker: String::new(),
     });
     versions_req.metadata_mut().insert(
         "authorization",
@@ -227,10 +228,54 @@ async fn test_delete_object_specific_version_removes_only_that_version() {
         .unwrap()
         .into_inner();
 
+    let mut first_page_req = Request::new(ListObjectVersionsRequest {
+        bucket_name: bucket_name.clone(),
+        prefix: object_key.clone(),
+        key_marker: String::new(),
+        max_keys: 1,
+        version_id_marker: String::new(),
+    });
+    first_page_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let first_page = object_client
+        .list_object_versions(first_page_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first_page.versions.len(), 1);
+    assert_eq!(first_page.versions[0].version_id, second_put.version_id);
+    assert!(first_page.is_truncated);
+    assert_eq!(first_page.next_key_marker, object_key);
+    assert_eq!(first_page.next_version_id_marker, second_put.version_id);
+
+    let mut second_page_req = Request::new(ListObjectVersionsRequest {
+        bucket_name: bucket_name.clone(),
+        prefix: object_key.clone(),
+        key_marker: first_page.next_key_marker,
+        max_keys: 1,
+        version_id_marker: first_page.next_version_id_marker,
+    });
+    second_page_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let second_page = object_client
+        .list_object_versions(second_page_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second_page.versions.len(), 1);
+    assert_eq!(second_page.versions[0].version_id, first_put.version_id);
+    assert!(!second_page.is_truncated);
+    assert!(second_page.next_key_marker.is_empty());
+    assert!(second_page.next_version_id_marker.is_empty());
+
     let mut delete_req = Request::new(DeleteObjectRequest {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
-        version_id: Some(first_put.version_id),
+        version_id: Some(first_put.version_id.clone()),
     });
     delete_req.metadata_mut().insert(
         "authorization",
@@ -243,6 +288,7 @@ async fn test_delete_object_specific_version_removes_only_that_version() {
         prefix: object_key.clone(),
         key_marker: String::new(),
         max_keys: 100,
+        version_id_marker: String::new(),
     });
     versions_req.metadata_mut().insert(
         "authorization",
@@ -456,6 +502,7 @@ async fn test_listing_omits_reserved_internal_object_keys() {
         prefix: String::new(),
         key_marker: String::new(),
         max_keys: 100,
+        version_id_marker: String::new(),
     });
     versions_req.metadata_mut().insert(
         "authorization",

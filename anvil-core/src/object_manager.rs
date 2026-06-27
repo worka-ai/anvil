@@ -5,9 +5,7 @@ use crate::{
     auth,
     cluster::ClusterState,
     permissions::AnvilAction,
-    persistence::{
-        Bucket, MultipartUploadPart, Object, ObjectVersion, ObjectWatchEvent, Persistence,
-    },
+    persistence::{Bucket, MultipartUploadPart, Object, ObjectWatchEvent, Persistence},
     placement::PlacementManager,
     sharding::ShardManager,
     storage::Storage,
@@ -1243,8 +1241,9 @@ impl ObjectManager {
         bucket_name: &str,
         prefix: &str,
         key_marker: &str,
+        version_id_marker: &str,
         limit: i32,
-    ) -> Result<Vec<ObjectVersion>, Status> {
+    ) -> Result<crate::persistence::ObjectVersionsPage, Status> {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
@@ -1254,6 +1253,21 @@ impl ObjectManager {
         if !prefix.is_empty() && !validation::is_valid_object_key(prefix) {
             return Err(Status::invalid_argument("Invalid object key prefix"));
         }
+        if !key_marker.is_empty() && !validation::is_valid_object_key(key_marker) {
+            return Err(Status::invalid_argument("Invalid key marker"));
+        }
+        let version_id_marker = if version_id_marker.is_empty() {
+            None
+        } else if key_marker.is_empty() {
+            return Err(Status::invalid_argument(
+                "version id marker requires key marker",
+            ));
+        } else {
+            Some(
+                uuid::Uuid::parse_str(version_id_marker)
+                    .map_err(|_| Status::invalid_argument("Invalid version id marker"))?,
+            )
+        };
 
         let bucket = self
             .get_authorized_bucket(claims.as_ref(), bucket_name)
@@ -1270,6 +1284,7 @@ impl ObjectManager {
                 bucket.id,
                 prefix,
                 key_marker,
+                version_id_marker,
                 if limit == 0 { 1000 } else { limit },
             )
             .await

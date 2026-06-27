@@ -297,6 +297,7 @@ message ListObjectVersionsRequest {
     string prefix = 2;
     string key_marker = 3;
     int32 max_keys = 4;
+    string version_id_marker = 5;
 }
 
 message ObjectVersionSummary {
@@ -311,6 +312,9 @@ message ObjectVersionSummary {
 
 message ListObjectVersionsResponse {
     repeated ObjectVersionSummary versions = 1;
+    bool is_truncated = 2;
+    string next_key_marker = 3;
+    string next_version_id_marker = 4;
 }
 
 message InitiateMultipartRequest {

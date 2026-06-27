@@ -1056,6 +1056,11 @@ async fn list_object_versions_response(
         .or_else(|| q.get("keyMarker"))
         .cloned()
         .unwrap_or_default();
+    let version_id_marker = q
+        .get("version-id-marker")
+        .or_else(|| q.get("versionIdMarker"))
+        .cloned()
+        .unwrap_or_default();
     let max_keys: i32 = q
         .get("max-keys")
         .and_then(|v| v.parse().ok())
@@ -1063,10 +1068,17 @@ async fn list_object_versions_response(
 
     match state
         .object_manager
-        .list_object_versions(claims, bucket, &prefix, &key_marker, max_keys)
+        .list_object_versions(
+            claims,
+            bucket,
+            &prefix,
+            &key_marker,
+            &version_id_marker,
+            max_keys,
+        )
         .await
     {
-        Ok(versions) => {
+        Ok(page) => {
             let mut xml = String::from(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n",
             );
@@ -1076,9 +1088,28 @@ async fn list_object_versions_response(
                 "  <KeyMarker>{}</KeyMarker>\n",
                 xml_escape(&key_marker)
             ));
+            xml.push_str(&format!(
+                "  <VersionIdMarker>{}</VersionIdMarker>\n",
+                xml_escape(&version_id_marker)
+            ));
             xml.push_str(&format!("  <MaxKeys>{}</MaxKeys>\n", max_keys));
-            xml.push_str("  <IsTruncated>false</IsTruncated>\n");
-            for version in versions {
+            if let Some(next_key_marker) = page.next_key_marker.as_deref() {
+                xml.push_str(&format!(
+                    "  <NextKeyMarker>{}</NextKeyMarker>\n",
+                    xml_escape(next_key_marker)
+                ));
+            }
+            if let Some(next_version_id_marker) = page.next_version_id_marker {
+                xml.push_str(&format!(
+                    "  <NextVersionIdMarker>{}</NextVersionIdMarker>\n",
+                    next_version_id_marker
+                ));
+            }
+            xml.push_str(&format!(
+                "  <IsTruncated>{}</IsTruncated>\n",
+                if page.is_truncated { "true" } else { "false" }
+            ));
+            for version in page.versions {
                 let object = version.object;
                 let tag = if version.is_delete_marker {
                     "DeleteMarker"
