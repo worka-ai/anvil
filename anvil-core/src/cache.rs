@@ -7,15 +7,15 @@ pub struct MetadataCache {
     // (tenant_id, bucket_name) -> Bucket
     buckets: Cache<(i64, String), Bucket>,
     // bucket_name -> Bucket (for public/S3 lookups without tenant_id context initially)
-    // This might need to handle conflicts if bucket names aren't globally unique, but 
+    // This might need to handle conflicts if bucket names aren't globally unique, but
     // for S3 compat they should be. Assuming global uniqueness for now.
     buckets_by_name: Cache<String, Bucket>,
-    
+
     // api_key -> Tenant
     tenants: Cache<String, Tenant>,
-    
+
     // (app_id, resource, action) -> bool (authorized)
-    // Or perhaps cache the list of policies? 
+    // Or perhaps cache the list of policies?
     // Let's cache the policies list for an app as that's what `get_policies_for_app` returns.
     // app_id -> Vec<String> (policies)
     app_policies: Cache<i64, Vec<String>>,
@@ -27,7 +27,7 @@ impl MetadataCache {
         Self {
             buckets: Cache::builder()
                 .max_capacity(10_000)
-                .time_to_live(ttl) 
+                .time_to_live(ttl)
                 .build(),
             buckets_by_name: Cache::builder()
                 .max_capacity(10_000)
@@ -35,7 +35,7 @@ impl MetadataCache {
                 .build(),
             tenants: Cache::builder()
                 .max_capacity(5_000)
-                .time_to_live(ttl * 2) 
+                .time_to_live(ttl * 2)
                 .build(),
             app_policies: Cache::builder()
                 .max_capacity(5_000)
@@ -49,24 +49,31 @@ impl MetadataCache {
     }
 
     pub async fn insert_bucket(&self, tenant_id: i64, name: String, bucket: Bucket) {
-        self.buckets.insert((tenant_id, name.clone()), bucket.clone()).await;
+        self.buckets
+            .insert((tenant_id, name.clone()), bucket.clone())
+            .await;
         self.buckets_by_name.insert(name, bucket).await;
+        self.buckets.run_pending_tasks().await;
+        self.buckets_by_name.run_pending_tasks().await;
     }
 
     pub async fn invalidate_bucket(&self, tenant_id: i64, name: &str) {
-        self.buckets.invalidate(&(tenant_id, name.to_string())).await;
-        self.buckets_by_name.invalidate(name).await;
+        self.buckets.remove(&(tenant_id, name.to_string())).await;
+        self.buckets_by_name.remove(name).await;
+        self.buckets.run_pending_tasks().await;
+        self.buckets_by_name.run_pending_tasks().await;
     }
-    
+
     // For when we only know the name (e.g. deleting by name, or cross-tenant lookup if allowed)
     pub async fn get_bucket_by_name_only(&self, name: &str) -> Option<Bucket> {
         self.buckets_by_name.get(name).await
     }
 
     pub async fn invalidate_bucket_by_name(&self, name: &str) {
-        self.buckets_by_name.invalidate(name).await;
-        // Note: We can't easily invalidate the (tenant_id, name) key without scanning 
-        // or knowing the tenant_id. This is a trade-off. 
+        self.buckets_by_name.remove(name).await;
+        self.buckets_by_name.run_pending_tasks().await;
+        // Note: We can't easily invalidate the (tenant_id, name) key without scanning
+        // or knowing the tenant_id. This is a trade-off.
         // For strict consistency, the caller should provide tenant_id if possible.
         // However, P2P events usually contain enough info.
     }
@@ -96,4 +103,39 @@ impl MetadataCache {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use chrono::Utc;
 
+    fn bucket(name: &str) -> Bucket {
+        Bucket {
+            id: 1,
+            tenant_id: 7,
+            name: name.to_string(),
+            region: "test-region".to_string(),
+            created_at: Utc::now(),
+            is_public_read: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn bucket_invalidation_removes_all_bucket_lookup_entries() {
+        let cache = MetadataCache::new(&Config {
+            metadata_cache_ttl_secs: 300,
+            ..Config::default()
+        });
+        cache
+            .insert_bucket(7, "deleted".to_string(), bucket("deleted"))
+            .await;
+
+        assert!(cache.get_bucket(7, "deleted").await.is_some());
+        assert!(cache.get_bucket_by_name_only("deleted").await.is_some());
+
+        cache.invalidate_bucket(7, "deleted").await;
+
+        assert!(cache.get_bucket(7, "deleted").await.is_none());
+        assert!(cache.get_bucket_by_name_only("deleted").await.is_none());
+    }
+}

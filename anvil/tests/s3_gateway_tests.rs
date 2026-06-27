@@ -8,7 +8,9 @@ use aws_sdk_s3::types::{
 };
 use rand::random;
 use std::env::temp_dir;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::Duration;
 use tokio::fs;
 
@@ -20,6 +22,20 @@ fn assert_reserved_namespace_error(error: impl std::fmt::Debug) {
         rendered.contains("UnauthorizedReservedNamespace"),
         "expected UnauthorizedReservedNamespace error, got {rendered}"
     );
+}
+
+fn run_large_s3_gateway_test(future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("build S3 gateway test runtime");
+    runtime.block_on(async move {
+        tokio::spawn(future)
+            .await
+            .expect("S3 gateway test task should not panic");
+    });
 }
 
 // Helper function to create an app, since it's used in auth tests.
@@ -233,8 +249,12 @@ async fn test_s3_put_write_etag_preconditions() {
     );
 }
 
-#[tokio::test]
-async fn test_s3_public_and_private_access() {
+#[test]
+fn test_s3_public_and_private_access() {
+    run_large_s3_gateway_test(Box::pin(run_s3_public_and_private_access()));
+}
+
+async fn run_s3_public_and_private_access() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
@@ -354,9 +374,12 @@ async fn test_s3_public_and_private_access() {
         .await
         .unwrap();
     let deleted_head = client.head_bucket().bucket(&deleted_bucket).send().await;
+    let deleted_head_debug = format!("{deleted_head:?}");
     assert!(
-        format!("{deleted_head:?}").contains("NoSuchBucket"),
-        "deleted bucket should no longer be visible"
+        deleted_head.is_err()
+            && (deleted_head_debug.contains("StatusCode(404)")
+                || deleted_head_debug.contains("NotFound")),
+        "deleted bucket should no longer be visible: {deleted_head_debug}"
     );
 
     let active_multipart_bucket = format!("delete-s3-active-multipart-{}", uuid::Uuid::new_v4());
