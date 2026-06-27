@@ -64,6 +64,7 @@ pub struct Object {
     pub version_id: uuid::Uuid,
     pub mutation_id: uuid::Uuid,
     pub index_policy_snapshot: String,
+    pub user_metadata_hash: String,
     pub authz_revision: i64,
     pub record_hash: String,
     pub created_at: DateTime<Utc>,
@@ -90,6 +91,8 @@ struct ObjectVersionRecordHashInput<'a> {
     content_hash: &'a str,
     size: i64,
     etag: &'a str,
+    content_type: Option<&'a str>,
+    user_metadata_hash: &'a str,
     index_policy_snapshot: &'a str,
     authz_revision: i64,
     delete_marker: bool,
@@ -288,6 +291,7 @@ impl From<Row> for Object {
             version_id: row.get("version_id"),
             mutation_id: row.get("mutation_id"),
             index_policy_snapshot: row.get("index_policy_snapshot"),
+            user_metadata_hash: row.get("user_metadata_hash"),
             authz_revision: row.get("authz_revision"),
             record_hash: row.get("record_hash"),
             created_at: row.get("created_at"),
@@ -463,10 +467,65 @@ fn object_version_record_hash(input: ObjectVersionRecordHashInput<'_>) -> String
     hasher.update(input.content_hash.as_bytes());
     hasher.update(&input.size.to_le_bytes());
     hasher.update(input.etag.as_bytes());
+    if let Some(content_type) = input.content_type {
+        hasher.update(content_type.as_bytes());
+    }
+    hasher.update(&[0]);
+    hasher.update(input.user_metadata_hash.as_bytes());
     hasher.update(input.index_policy_snapshot.as_bytes());
     hasher.update(&input.authz_revision.to_le_bytes());
     hasher.update(&[u8::from(input.delete_marker)]);
     hasher.finalize().to_hex().to_string()
+}
+
+fn user_metadata_hash(user_meta: Option<&JsonValue>) -> String {
+    let Some(user_meta) = user_meta else {
+        return blake3::hash(&[]).to_hex().to_string();
+    };
+    blake3::hash(&canonical_json_bytes(user_meta))
+        .to_hex()
+        .to_string()
+}
+
+fn canonical_json_bytes(value: &JsonValue) -> Vec<u8> {
+    match value {
+        JsonValue::Null => b"null".to_vec(),
+        JsonValue::Bool(value) => {
+            if *value {
+                b"true".to_vec()
+            } else {
+                b"false".to_vec()
+            }
+        }
+        JsonValue::Number(value) => value.to_string().into_bytes(),
+        JsonValue::String(value) => serde_json::to_vec(value).unwrap_or_default(),
+        JsonValue::Array(values) => {
+            let mut out = vec![b'['];
+            for (idx, value) in values.iter().enumerate() {
+                if idx > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(&canonical_json_bytes(value));
+            }
+            out.push(b']');
+            out
+        }
+        JsonValue::Object(values) => {
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort();
+            let mut out = vec![b'{'];
+            for (idx, key) in keys.into_iter().enumerate() {
+                if idx > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(&serde_json::to_vec(key).unwrap_or_default());
+                out.push(b':');
+                out.extend_from_slice(&canonical_json_bytes(&values[key]));
+            }
+            out.push(b'}');
+            out
+        }
+    }
 }
 
 pub struct AppDetails {
@@ -1402,6 +1461,8 @@ impl Persistence {
         content_hash: &str,
         size: i64,
         etag: &str,
+        content_type: Option<&str>,
+        user_meta: Option<JsonValue>,
         shard_map: Option<JsonValue>,
     ) -> Result<Object> {
         let version_id = uuid::Uuid::new_v4();
@@ -1409,6 +1470,7 @@ impl Persistence {
         let index_policy_snapshot = self
             .active_index_policy_snapshot_hash(tenant_id, bucket_id)
             .await?;
+        let user_metadata_hash = user_metadata_hash(user_meta.as_ref());
         let authz_revision = self.latest_authz_revision(tenant_id).await?;
         let record_hash = object_version_record_hash(ObjectVersionRecordHashInput {
             tenant_id,
@@ -1419,6 +1481,8 @@ impl Persistence {
             content_hash,
             size,
             etag,
+            content_type,
+            user_metadata_hash: &user_metadata_hash,
             index_policy_snapshot: &index_policy_snapshot,
             authz_revision,
             delete_marker: false,
@@ -1429,8 +1493,9 @@ impl Persistence {
                 r#"
                 INSERT INTO objects
                     (tenant_id, bucket_id, key, content_hash, size, etag, version_id, mutation_id,
-                     shard_map, index_policy_snapshot, authz_revision, record_hash)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                     content_type, user_meta, shard_map, index_policy_snapshot, user_metadata_hash,
+                     authz_revision, record_hash)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                 RETURNING *;"#,
                 &[
                     &tenant_id,
@@ -1441,8 +1506,11 @@ impl Persistence {
                     &etag,
                     &version_id,
                     &mutation_id,
+                    &content_type,
+                    &user_meta,
                     &shard_map,
                     &index_policy_snapshot,
+                    &user_metadata_hash,
                     &authz_revision,
                     &record_hash,
                 ],
@@ -1564,10 +1632,10 @@ impl Persistence {
             let rows = client
                 .query(
                     r#"
-                    SELECT id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
+                    SELECT id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
                     FROM (
                       SELECT DISTINCT ON (key)
-                        id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
+                        id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
                       FROM objects
                       WHERE bucket_id = $1 AND key > $2 AND key LIKE $3
                       ORDER BY key, created_at DESC, id DESC
@@ -1710,10 +1778,10 @@ impl Persistence {
             let rows = client
                 .query(
                     r#"
-                    SELECT id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
+                    SELECT id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
                     FROM (
                       SELECT DISTINCT ON (key)
-                        id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
+                        id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
                       FROM objects
                       WHERE bucket_id = $1 AND key = ANY($2)
                       ORDER BY key, created_at DESC, id DESC
@@ -1754,6 +1822,7 @@ impl Persistence {
             .active_index_policy_snapshot_hash(source.tenant_id, bucket_id)
             .await?;
         let authz_revision = self.latest_authz_revision(source.tenant_id).await?;
+        let user_metadata_hash = user_metadata_hash(None);
         let record_hash = object_version_record_hash(ObjectVersionRecordHashInput {
             tenant_id: source.tenant_id,
             bucket_id,
@@ -1763,6 +1832,8 @@ impl Persistence {
             content_hash: "",
             size: 0,
             etag: "",
+            content_type: None,
+            user_metadata_hash: &user_metadata_hash,
             index_policy_snapshot: &index_policy_snapshot,
             authz_revision,
             delete_marker: true,
@@ -1772,8 +1843,8 @@ impl Persistence {
                 r#"
                 INSERT INTO objects
                     (tenant_id, bucket_id, key, content_hash, size, etag, version_id, mutation_id,
-                     deleted_at, index_policy_snapshot, authz_revision, record_hash)
-                VALUES ($1, $2, $3, '', 0, '', $4, $5, now(), $6, $7, $8)
+                     deleted_at, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash)
+                VALUES ($1, $2, $3, '', 0, '', $4, $5, now(), $6, $7, $8, $9)
                 RETURNING *"#,
                 &[
                     &source.tenant_id,
@@ -1782,6 +1853,7 @@ impl Persistence {
                     &version_id,
                     &mutation_id,
                     &index_policy_snapshot,
+                    &user_metadata_hash,
                     &authz_revision,
                     &record_hash,
                 ],
@@ -1803,7 +1875,7 @@ impl Persistence {
                 r#"
                 WITH ranked AS (
                   SELECT
-                    id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree,
+                    id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree,
                     row_number() OVER (PARTITION BY key ORDER BY created_at DESC, id DESC) = 1 AS is_latest
                   FROM objects
                   WHERE bucket_id = $1 AND key > $2 AND key LIKE $3

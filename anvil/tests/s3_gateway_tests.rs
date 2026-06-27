@@ -246,10 +246,31 @@ async fn test_s3_public_and_private_access() {
         .put_object()
         .bucket(&private_bucket)
         .key(private_key)
+        .content_type("text/plain")
+        .metadata("owner", "alice")
+        .metadata("purpose", "metadata-test")
         .body(ByteStream::from(private_content.to_vec()))
         .send()
         .await
         .expect("Failed to put private object");
+
+    let head_private = client
+        .head_object()
+        .bucket(&private_bucket)
+        .key(private_key)
+        .send()
+        .await
+        .expect("HEAD should return object metadata");
+    assert_eq!(head_private.content_type(), Some("text/plain"));
+    let head_metadata = head_private.metadata().expect("HEAD metadata");
+    assert_eq!(
+        head_metadata.get("owner").map(String::as_str),
+        Some("alice")
+    );
+    assert_eq!(
+        head_metadata.get("purpose").map(String::as_str),
+        Some("metadata-test")
+    );
 
     client
         .put_object()
@@ -270,6 +291,9 @@ async fn test_s3_public_and_private_access() {
         .send()
         .await
         .expect("Failed to get private object with S3 client");
+    assert_eq!(resp.content_type(), Some("text/plain"));
+    let get_metadata = resp.metadata().expect("GET metadata");
+    assert_eq!(get_metadata.get("owner").map(String::as_str), Some("alice"));
     let data = resp.body.collect().await.unwrap().into_bytes();
     assert_eq!(data.as_ref(), private_content);
 

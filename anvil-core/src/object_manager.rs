@@ -48,6 +48,12 @@ pub struct CompleteMultipartPart {
     pub etag: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ObjectWriteOptions {
+    pub content_type: Option<String>,
+    pub user_metadata: Option<JsonValue>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppendStreamRecordResult {
     pub record_sequence: u64,
@@ -102,6 +108,7 @@ impl ObjectManager {
         object_key: &str,
         scopes: &[String],
         mut data_stream: impl Stream<Item = Result<Vec<u8>, Status>> + Unpin,
+        options: ObjectWriteOptions,
     ) -> Result<Object, Status> {
         info!(
             tenant_id,
@@ -276,6 +283,8 @@ impl ObjectManager {
                 &content_hash,
                 total_bytes as i64,
                 &content_hash,
+                options.content_type.as_deref(),
+                options.user_metadata,
                 shard_map_json,
             )
             .await
@@ -423,6 +432,7 @@ impl ObjectManager {
                 object_key,
                 scopes,
                 ReceiverStream::new(rx),
+                ObjectWriteOptions::default(),
             )
             .await?;
 
@@ -1180,7 +1190,7 @@ impl ObjectManager {
         destination_bucket_name: &str,
         destination_object_key: &str,
     ) -> Result<Object, Status> {
-        let (_source_object, source_stream) = self
+        let (source_object, source_stream) = self
             .get_object(
                 Some(claims.clone()),
                 source_bucket_name.to_string(),
@@ -1195,6 +1205,10 @@ impl ObjectManager {
             destination_object_key,
             &claims.scopes,
             source_stream,
+            ObjectWriteOptions {
+                content_type: source_object.content_type,
+                user_metadata: source_object.user_meta,
+            },
         )
         .await
     }
@@ -1249,6 +1263,7 @@ impl ObjectManager {
             destination_object_key,
             &claims.scopes,
             ReceiverStream::new(rx),
+            ObjectWriteOptions::default(),
         )
         .await
     }
@@ -1286,6 +1301,10 @@ impl ObjectManager {
             object_key,
             &claims.scopes,
             tokio_stream::iter(vec![Ok(patched_bytes)]),
+            ObjectWriteOptions {
+                content_type: Some("application/json".to_string()),
+                user_metadata: None,
+            },
         )
         .await
     }

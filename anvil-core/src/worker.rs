@@ -3,22 +3,22 @@ use crate::anvil_api::internal_anvil_service_client::InternalAnvilServiceClient;
 use crate::auth::JwtManager;
 use crate::cluster::ClusterState;
 use crate::object_manager::ObjectManager;
+use crate::persistence::Object;
 use crate::persistence::Persistence;
 use crate::tasks::{HFIngestionItemState, HFIngestionState, TaskStatus, TaskType};
-use crate::persistence::Object;
 use anyhow::{Result, anyhow};
+use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
+use std::boxed::Box;
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::boxed::Box;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_postgres::Row;
 use tonic::Status;
 use tracing::{debug, error, info, warn};
-use futures_util::{StreamExt, Stream};
 
 #[derive(Debug)]
 struct Task {
@@ -325,14 +325,24 @@ async fn handle_hf_ingestion(
                     attempt += 1;
                     info!("Putting object, attempt {}", attempt);
                     let res = object_manager
-                        .put_object(tenant_id, &target_bucket, &full_key, &scopes, reader)
+                        .put_object(
+                            tenant_id,
+                            &target_bucket,
+                            &full_key,
+                            &scopes,
+                            reader,
+                            crate::object_manager::ObjectWriteOptions::default(),
+                        )
                         .await;
                     match res {
-                                                        Ok(obj) => {
-                                                            info!(key = %full_key, "Upload successful");
-                                                            persistence.hf_update_item_success(item_id, obj.size, &obj.etag).await?;
-                                                            break;
-                                                        }                        Err(e) if attempt < 3 => {
+                        Ok(obj) => {
+                            info!(key = %full_key, "Upload successful");
+                            persistence
+                                .hf_update_item_success(item_id, obj.size, &obj.etag)
+                                .await?;
+                            break;
+                        }
+                        Err(e) if attempt < 3 => {
                             warn!(
                                 attempt,
                                 key = %full_key,
@@ -373,7 +383,7 @@ async fn handle_hf_ingestion(
             };
 
             let mut file_map = HashMap::new();
-            
+
             // Fetch ALL items for this target (from past and current jobs) to build a complete index
             let all_items = persistence.hf_get_all_items_for_prefix(tenant_id, &target_bucket, &target_prefix).await?;
 
@@ -419,22 +429,26 @@ async fn handle_hf_ingestion(
                 attempt += 1;
                 info!("Putting anvil-index.json, attempt {}", attempt);
                 let current_index_content = index_content_data.clone();
-                let index_stream: Pin<Box<dyn Stream<Item = Result<Vec<u8>, Status>> + Send + 'static>> = Box::pin(
-                    futures_util::stream::once(async move {
-                        Ok(current_index_content)
-                    })
-                    .map(|item: Result<Vec<u8>, Infallible>| {
-                        item.map_err(|e| match e {})
-                    })
+                let index_stream: Pin<
+                    Box<dyn Stream<Item = Result<Vec<u8>, Status>> + Send + 'static>,
+                > = Box::pin(
+                    futures_util::stream::once(async move { Ok(current_index_content) })
+                        .map(|item: Result<Vec<u8>, Infallible>| item.map_err(|e| match e {})),
                 );
 
-                let res: Result<Object, Status> = object_manager.put_object(
-                    tenant_id,
-                    &target_bucket,
-                    &index_key,
-                    &vec!["object:write|*".to_string()], // Scopes
-                    index_stream,
-                ).await;
+                let res: Result<Object, Status> = object_manager
+                    .put_object(
+                        tenant_id,
+                        &target_bucket,
+                        &index_key,
+                        &vec!["object:write|*".to_string()], // Scopes
+                        index_stream,
+                        crate::object_manager::ObjectWriteOptions {
+                            content_type: Some("application/json".to_string()),
+                            user_metadata: None,
+                        },
+                    )
+                    .await;
                 match res {
                     Ok(_) => {
                         info!(key = %index_key, "anvil-index.json upload successful");

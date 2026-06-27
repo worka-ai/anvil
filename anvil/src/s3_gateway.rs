@@ -2,6 +2,7 @@ use crate::AppState;
 use crate::auth::Claims;
 use crate::s3_auth::{aws_chunked_decoder, sigv4_auth};
 use anvil_core::auth;
+use anvil_core::object_manager::ObjectWriteOptions;
 use anvil_core::permissions::AnvilAction;
 use anvil_core::validation;
 use axum::{
@@ -912,6 +913,42 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+fn s3_user_metadata(headers: &axum::http::HeaderMap) -> Option<serde_json::Value> {
+    let mut values = serde_json::Map::new();
+    for (name, value) in headers {
+        let Some(metadata_key) = name.as_str().strip_prefix("x-amz-meta-") else {
+            continue;
+        };
+        let Ok(metadata_value) = value.to_str() else {
+            continue;
+        };
+        values.insert(
+            metadata_key.to_string(),
+            serde_json::Value::String(metadata_value.to_string()),
+        );
+    }
+    if values.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(values))
+    }
+}
+
+fn add_s3_user_metadata_headers(
+    mut builder: axum::http::response::Builder,
+    user_meta: Option<&serde_json::Value>,
+) -> axum::http::response::Builder {
+    let Some(serde_json::Value::Object(values)) = user_meta else {
+        return builder;
+    };
+    for (key, value) in values {
+        if let Some(value) = value.as_str() {
+            builder = builder.header(format!("x-amz-meta-{key}"), value);
+        }
+    }
+    builder
+}
+
 async fn readiness_check(State(state): State<AppState>) -> Response {
     // DB readiness: attempt a lightweight operation. If Persistence exposes no ping, rely on pool creation success earlier.
     // Cluster readiness: at least 1 peer known (self included)
@@ -996,6 +1033,7 @@ async fn get_object(
                 .header("ETag", object.etag)
                 .header("Accept-Ranges", "bytes")
                 .header("x-amz-version-id", object.version_id.to_string());
+            builder = add_s3_user_metadata_headers(builder, object.user_meta.as_ref());
             if let Some(range) = range {
                 builder = builder.header(
                     "Content-Range",
@@ -1167,6 +1205,14 @@ async fn put_object(
         .await;
     }
 
+    let options = ObjectWriteOptions {
+        content_type: req
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string),
+        user_metadata: s3_user_metadata(req.headers()),
+    };
     let body_stream = req.into_body().into_data_stream().map(|r| {
         r.map(|chunk| chunk.to_vec())
             .map_err(|e| tonic::Status::internal(e.to_string()))
@@ -1174,7 +1220,14 @@ async fn put_object(
 
     match state
         .object_manager
-        .put_object(claims.tenant_id, &bucket, &key, &claims.scopes, body_stream)
+        .put_object(
+            claims.tenant_id,
+            &bucket,
+            &key,
+            &claims.scopes,
+            body_stream,
+            options,
+        )
         .await
     {
         Ok(object) => Response::builder()
@@ -1390,7 +1443,7 @@ async fn copy_object(
         Err(response) => return response,
     };
 
-    let (_source_object, source_stream) = match state
+    let (source_object, source_stream) = match state
         .object_manager
         .get_object(
             Some(claims.clone()),
@@ -1412,6 +1465,10 @@ async fn copy_object(
             &destination_key,
             &claims.scopes,
             source_stream,
+            ObjectWriteOptions {
+                content_type: source_object.content_type,
+                user_metadata: source_object.user_meta,
+            },
         )
         .await
     {
@@ -1628,15 +1685,21 @@ async fn head_object(
         .head_object(claims, &bucket, &key, version_id)
         .await
     {
-        Ok(object) => Response::builder()
-            .status(200)
-            .header("Content-Type", object.content_type.unwrap_or_default())
-            .header("Content-Length", object.size)
-            .header("ETag", object.etag)
-            .header("Accept-Ranges", "bytes")
-            .header("x-amz-version-id", object.version_id.to_string())
-            .body(Body::empty())
-            .unwrap(),
+        Ok(object) => {
+            let builder = Response::builder()
+                .status(200)
+                .header(
+                    "Content-Type",
+                    object.content_type.clone().unwrap_or_default(),
+                )
+                .header("Content-Length", object.size)
+                .header("ETag", object.etag)
+                .header("Accept-Ranges", "bytes")
+                .header("x-amz-version-id", object.version_id.to_string());
+            add_s3_user_metadata_headers(builder, object.user_meta.as_ref())
+                .body(Body::empty())
+                .unwrap()
+        }
         Err(status) => match status.code() {
             tonic::Code::FailedPrecondition => {
                 if status.message().starts_with("Bucket is in region ") {

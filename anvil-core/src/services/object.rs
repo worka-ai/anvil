@@ -1,5 +1,6 @@
 use crate::anvil_api::object_service_server::ObjectService;
 use crate::anvil_api::*;
+use crate::object_manager::ObjectWriteOptions;
 use crate::{AppState, auth};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
@@ -53,6 +54,7 @@ impl ObjectService for AppState {
                 &object_key,
                 &claims.scopes,
                 data_stream,
+                ObjectWriteOptions::default(),
             )
             .await?;
 
