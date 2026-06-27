@@ -1,7 +1,7 @@
 use crate::anvil_api::object_service_server::ObjectService;
 use crate::anvil_api::*;
 use crate::object_manager::ObjectWriteOptions;
-use crate::{AppState, auth};
+use crate::{AppState, auth, watch_log};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -717,12 +717,15 @@ async fn object_watch_cursor(
     state: &AppState,
     object: &crate::persistence::Object,
 ) -> Result<u64, Status> {
-    let cursor = state
-        .db
-        .latest_object_watch_cursor(object.tenant_id, object.bucket_id, object.version_id)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::internal("Object mutation watch event not found"))?;
+    let cursor = watch_log::latest_object_watch_cursor(
+        &state.storage,
+        object.tenant_id,
+        object.bucket_id,
+        object.version_id,
+    )
+    .await
+    .map_err(|e| Status::internal(e.to_string()))?
+    .ok_or_else(|| Status::internal("Object mutation watch event not found"))?;
     u64::try_from(cursor).map_err(|_| Status::internal("Invalid object watch cursor"))
 }
 

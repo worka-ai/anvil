@@ -28,6 +28,18 @@ pub struct DecodedWatchLog {
     pub records: Vec<WatchRecord>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ObjectWatchPayload {
+    bucket_name: String,
+    key: String,
+    event_type: String,
+    version_id: Option<String>,
+    etag: Option<String>,
+    size: i64,
+    is_delete_marker: bool,
+    emitted_at: String,
+}
+
 pub async fn append_object_watch_record(
     storage: &Storage,
     bucket: &Bucket,
@@ -59,16 +71,18 @@ pub async fn append_object_watch_record(
         file.sync_data().await?;
     }
 
-    let payload = serde_json::to_vec(&serde_json::json!({
-        "bucket_name": event.bucket_name,
-        "key": event.key,
-        "event_type": event.event_type,
-        "version_id": event.version_id.map(|id| id.to_string()),
-        "etag": event.etag,
-        "size": event.size,
-        "is_delete_marker": event.is_delete_marker,
-        "emitted_at": event.created_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-    }))?;
+    let payload = serde_json::to_vec(&ObjectWatchPayload {
+        bucket_name: event.bucket_name.clone(),
+        key: event.key.clone(),
+        event_type: event.event_type.clone(),
+        version_id: event.version_id.map(|id| id.to_string()),
+        etag: event.etag.clone(),
+        size: event.size,
+        is_delete_marker: event.is_delete_marker,
+        emitted_at: event
+            .created_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+    })?;
     let record = WatchRecord::new(
         event.id as u128,
         OBJECT_WATCH_PARTITION_FAMILY,
@@ -87,6 +101,81 @@ pub async fn append_object_watch_record(
     file.write_all(&record.encode()).await?;
     file.sync_data().await?;
     Ok(path)
+}
+
+pub async fn latest_object_watch_cursor(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+    version_id: uuid::Uuid,
+) -> Result<Option<u128>> {
+    let path = storage.object_watch_path(tenant_id, bucket_id);
+    let decoded = match tokio::fs::read(&path).await {
+        Ok(bytes) => decode_watch_log(&bytes)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let expected = version_id.to_string();
+    Ok(decoded
+        .records
+        .into_iter()
+        .filter_map(|record| {
+            let payload: ObjectWatchPayload = serde_json::from_slice(&record.payload).ok()?;
+            (payload.version_id.as_deref() == Some(expected.as_str())).then_some(record.cursor)
+        })
+        .max())
+}
+
+pub async fn list_object_watch_events(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+    prefix: &str,
+    after_cursor: i64,
+    limit: usize,
+) -> Result<Vec<ObjectWatchEvent>> {
+    let path = storage.object_watch_path(tenant_id, bucket_id);
+    let decoded = match tokio::fs::read(&path).await {
+        Ok(bytes) => decode_watch_log(&bytes)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+
+    let mut events = Vec::new();
+    for record in decoded.records {
+        if record.cursor <= after_cursor as u128 {
+            continue;
+        }
+        let payload: ObjectWatchPayload = serde_json::from_slice(&record.payload)?;
+        if !payload.key.starts_with(prefix) {
+            continue;
+        }
+        let id = i64::try_from(record.cursor).map_err(|_| anyhow!("watch cursor exceeds i64"))?;
+        let version_id = payload
+            .version_id
+            .as_deref()
+            .map(uuid::Uuid::parse_str)
+            .transpose()?;
+        let created_at =
+            chrono::DateTime::parse_from_rfc3339(&payload.emitted_at)?.with_timezone(&chrono::Utc);
+        events.push(ObjectWatchEvent {
+            id,
+            tenant_id,
+            bucket_id,
+            bucket_name: payload.bucket_name,
+            key: payload.key,
+            event_type: payload.event_type,
+            version_id,
+            etag: payload.etag,
+            size: payload.size,
+            is_delete_marker: payload.is_delete_marker,
+            created_at,
+        });
+        if limit > 0 && events.len() >= limit {
+            break;
+        }
+    }
+    Ok(events)
 }
 
 pub fn decode_watch_log(input: &[u8]) -> Result<DecodedWatchLog> {
@@ -221,5 +310,57 @@ mod tests {
         corrupted[last] ^= 1;
         let decoded = decode_watch_log(&corrupted).unwrap();
         assert_eq!(decoded.records.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn object_watch_queries_recover_from_native_log() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let bucket = sample_bucket();
+        let first = sample_object(1, "docs/a.txt");
+        let second = sample_object(2, "images/b.png");
+        append_object_watch_record(
+            &storage,
+            &bucket,
+            &first,
+            &sample_event(10, &bucket, &first, "put"),
+        )
+        .await
+        .unwrap();
+        append_object_watch_record(
+            &storage,
+            &bucket,
+            &second,
+            &sample_event(11, &bucket, &second, "delete"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            latest_object_watch_cursor(&storage, bucket.tenant_id, bucket.id, first.version_id)
+                .await
+                .unwrap(),
+            Some(10)
+        );
+        assert_eq!(
+            latest_object_watch_cursor(&storage, bucket.tenant_id, bucket.id, uuid::Uuid::new_v4())
+                .await
+                .unwrap(),
+            None
+        );
+
+        let docs = list_object_watch_events(&storage, bucket.tenant_id, bucket.id, "docs/", 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].key, "docs/a.txt");
+
+        let after_first =
+            list_object_watch_events(&storage, bucket.tenant_id, bucket.id, "", 10, 10)
+                .await
+                .unwrap();
+        assert_eq!(after_first.len(), 1);
+        assert_eq!(after_first[0].id, 11);
+        assert_eq!(after_first[0].event_type, "delete");
     }
 }

@@ -582,11 +582,16 @@ impl ObjectManager {
         let live = self.watch_tx.subscribe();
         let after_cursor = i64::try_from(after_cursor)
             .map_err(|_| Status::invalid_argument("after_cursor exceeds supported range"))?;
-        let snapshot = self
-            .db
-            .list_object_watch_events(claims.tenant_id, bucket.id, prefix, after_cursor, 1000)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let snapshot = watch_log::list_object_watch_events(
+            &self.storage,
+            claims.tenant_id,
+            bucket.id,
+            prefix,
+            after_cursor,
+            1000,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok((bucket.id, snapshot, live))
     }
