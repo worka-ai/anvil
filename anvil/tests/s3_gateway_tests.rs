@@ -178,6 +178,9 @@ async fn test_s3_public_and_private_access() {
         .build();
     let client = Client::from_conf(config);
 
+    let unauthenticated_list_buckets = reqwest::get(format!("{}/", http_base)).await.unwrap();
+    assert_eq!(unauthenticated_list_buckets.status(), 403);
+
     let private_key = "private.txt";
     let public_key = "public.txt";
     let private_content = b"this is private content";

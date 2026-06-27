@@ -133,12 +133,11 @@ async fn list_buckets(State(state): State<AppState>, req: Request) -> Response {
     let claims = match req.extensions().get::<Claims>().cloned() {
         Some(c) => c,
         None => {
-            // return s3_error(
-            //     "AccessDenied",
-            //     "Missing credentials",
-            //     axum::http::StatusCode::FORBIDDEN,
-            // );
-            return (axum::http::StatusCode::OK, "OK").into_response();
+            return s3_error(
+                "AccessDenied",
+                "Missing credentials",
+                axum::http::StatusCode::FORBIDDEN,
+            );
         }
     };
 
