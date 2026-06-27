@@ -348,38 +348,85 @@ async fn list_objects(
     }
 
     let prefix = q.get("prefix").cloned().unwrap_or_default();
-    let start_after = q
-        .get("start-after")
-        .or_else(|| q.get("startAfter"))
-        .cloned()
-        .unwrap_or_default();
+    let continuation_token = q
+        .get("continuation-token")
+        .or_else(|| q.get("continuationToken"))
+        .cloned();
+    let start_after = continuation_token.clone().unwrap_or_else(|| {
+        q.get("start-after")
+            .or_else(|| q.get("startAfter"))
+            .cloned()
+            .unwrap_or_default()
+    });
     let delimiter = q.get("delimiter").cloned().unwrap_or_default();
     let max_keys: i32 = q
         .get("max-keys")
         .and_then(|v| v.parse().ok())
         .unwrap_or(1000);
+    let fetch_limit = max_keys.saturating_add(1);
 
     match state
         .object_manager
-        .list_objects(claims, &bucket, &prefix, &start_after, max_keys, &delimiter)
+        .list_objects(
+            claims,
+            &bucket,
+            &prefix,
+            &start_after,
+            fetch_limit,
+            &delimiter,
+        )
         .await
     {
-        Ok((objects, common_prefixes)) => {
+        Ok((mut objects, mut common_prefixes)) => {
             // Basic ListObjectsV2 XML
-            let is_truncated = false; // TODO: support continuation tokens
-            let key_count = objects.len() as i32;
+            let requested_max_keys = if max_keys <= 0 {
+                1000
+            } else {
+                max_keys as usize
+            };
+            let total_count = objects.len() + common_prefixes.len();
+            let is_truncated = total_count > requested_max_keys;
+            let mut next_continuation_token = None;
+            if is_truncated {
+                while objects.len() + common_prefixes.len() > requested_max_keys {
+                    if let Some(prefix) = common_prefixes.pop() {
+                        next_continuation_token = Some(prefix);
+                    } else if let Some(object) = objects.pop() {
+                        next_continuation_token = Some(object.key);
+                    }
+                }
+                if next_continuation_token.is_none() {
+                    next_continuation_token = objects
+                        .last()
+                        .map(|object| object.key.clone())
+                        .or_else(|| common_prefixes.last().cloned());
+                }
+            }
+            let key_count = (objects.len() + common_prefixes.len()) as i32;
             let mut xml = String::from(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">
 ",
             );
             xml.push_str(&format!("  <Name>{}</Name>\n", &*bucket));
             xml.push_str(&format!("  <Prefix>{}</Prefix>\n", xml_escape(&prefix)));
+            if let Some(token) = continuation_token {
+                xml.push_str(&format!(
+                    "  <ContinuationToken>{}</ContinuationToken>\n",
+                    xml_escape(&token)
+                ));
+            }
             xml.push_str(&format!("  <KeyCount>{}</KeyCount>\n", key_count));
             xml.push_str(&format!("  <MaxKeys>{}</MaxKeys>\n", max_keys));
             xml.push_str(&format!(
                 "  <IsTruncated>{}</IsTruncated>\n",
                 if is_truncated { "true" } else { "false" }
             ));
+            if let Some(token) = next_continuation_token {
+                xml.push_str(&format!(
+                    "  <NextContinuationToken>{}</NextContinuationToken>\n",
+                    xml_escape(&token)
+                ));
+            }
             for o in objects {
                 xml.push_str("  <Contents>\n");
                 xml.push_str(&format!("    <Key>{}</Key>\n", xml_escape(&o.key)));

@@ -262,6 +262,46 @@ async fn test_s3_public_and_private_access() {
     let copied_data = copied_resp.body.collect().await.unwrap().into_bytes();
     assert_eq!(copied_data.as_ref(), private_content);
 
+    client
+        .put_object()
+        .bucket(&private_bucket)
+        .key("page/a.txt")
+        .body(ByteStream::from_static(b"a"))
+        .send()
+        .await
+        .expect("put page/a.txt should succeed");
+    client
+        .put_object()
+        .bucket(&private_bucket)
+        .key("page/b.txt")
+        .body(ByteStream::from_static(b"b"))
+        .send()
+        .await
+        .expect("put page/b.txt should succeed");
+    let first_page = client
+        .list_objects_v2()
+        .bucket(&private_bucket)
+        .prefix("page/")
+        .max_keys(1)
+        .send()
+        .await
+        .expect("first paged list should succeed");
+    assert!(first_page.is_truncated().unwrap_or(false));
+    assert_eq!(first_page.contents().len(), 1);
+    assert_eq!(first_page.contents()[0].key(), Some("page/a.txt"));
+    let second_page = client
+        .list_objects_v2()
+        .bucket(&private_bucket)
+        .prefix("page/")
+        .max_keys(1)
+        .continuation_token(first_page.next_continuation_token().expect("next token"))
+        .send()
+        .await
+        .expect("second paged list should succeed");
+    assert!(!second_page.is_truncated().unwrap_or(true));
+    assert_eq!(second_page.contents().len(), 1);
+    assert_eq!(second_page.contents()[0].key(), Some("page/b.txt"));
+
     let multipart_key = "multipart-private.txt";
     let multipart = client
         .create_multipart_upload()
