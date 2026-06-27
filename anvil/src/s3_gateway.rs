@@ -1665,7 +1665,7 @@ async fn put_object(
     };
 
     if let Some(copy_source) = copy_source {
-        return copy_object(state, claims, bucket, key, copy_source).await;
+        return copy_object(state, claims, bucket, key, copy_source, req.headers()).await;
     }
 
     if let Some(upload_id) = q.get("uploadId") {
@@ -1957,6 +1957,7 @@ async fn copy_object(
     destination_bucket: String,
     destination_key: String,
     copy_source: String,
+    headers: &axum::http::HeaderMap,
 ) -> Response {
     let (source_bucket, source_key, source_version_id) = match parse_copy_source(&copy_source) {
         Ok(source) => source,
@@ -1976,6 +1977,12 @@ async fn copy_object(
         Ok(source) => source,
         Err(status) => return copy_status_to_response(status, "NoSuchKey"),
     };
+
+    if let Some(response) =
+        evaluate_copy_source_preconditions(headers, &source_object.etag, source_object.created_at)
+    {
+        return response;
+    }
 
     match state
         .object_manager
@@ -2372,6 +2379,48 @@ fn evaluate_write_etag_preconditions(
     None
 }
 
+fn evaluate_copy_source_preconditions(
+    headers: &axum::http::HeaderMap,
+    current_etag: &str,
+    last_modified: chrono::DateTime<chrono::Utc>,
+) -> Option<Response> {
+    if let Some(value) = headers.get("x-amz-copy-source-if-match") {
+        let value = value.to_str().unwrap_or_default();
+        if !etag_condition_matches(value, current_etag) {
+            return Some(precondition_failed_response());
+        }
+    }
+    if let Some(value) = headers.get("x-amz-copy-source-if-unmodified-since") {
+        let Ok(value) = value.to_str() else {
+            return Some(precondition_failed_response());
+        };
+        let Ok(condition_time) = httpdate::parse_http_date(value) else {
+            return Some(precondition_failed_response());
+        };
+        if object_last_modified_time(last_modified) > condition_time {
+            return Some(precondition_failed_response());
+        }
+    }
+    if let Some(value) = headers.get("x-amz-copy-source-if-none-match") {
+        let value = value.to_str().unwrap_or_default();
+        if etag_condition_matches(value, current_etag) {
+            return Some(precondition_failed_response());
+        }
+    }
+    if let Some(value) = headers.get("x-amz-copy-source-if-modified-since") {
+        let Ok(value) = value.to_str() else {
+            return Some(precondition_failed_response());
+        };
+        let Ok(condition_time) = httpdate::parse_http_date(value) else {
+            return Some(precondition_failed_response());
+        };
+        if object_last_modified_time(last_modified) <= condition_time {
+            return Some(precondition_failed_response());
+        }
+    }
+    None
+}
+
 fn etag_condition_matches(header_value: &str, current_etag: &str) -> bool {
     header_value
         .split(',')
@@ -2576,6 +2625,15 @@ mod tests {
         headers
     }
 
+    fn x_amz_headers(name: &'static str, value: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_static(name),
+            value.parse().unwrap(),
+        );
+        headers
+    }
+
     fn http_date_headers(
         name: axum::http::header::HeaderName,
         value: std::time::SystemTime,
@@ -2743,6 +2801,69 @@ mod tests {
         .expect("If-None-Match wildcard should fail existing object writes");
         assert_eq!(
             failed_star.status(),
+            axum::http::StatusCode::PRECONDITION_FAILED
+        );
+    }
+
+    #[test]
+    fn copy_source_preconditions_return_precondition_failed() {
+        let last_modified = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let exact_second = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let before = exact_second - std::time::Duration::from_secs(1);
+        let after = exact_second + std::time::Duration::from_secs(1);
+
+        assert!(
+            evaluate_copy_source_preconditions(
+                &x_amz_headers("x-amz-copy-source-if-match", "\"abc\""),
+                "abc",
+                last_modified,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            evaluate_copy_source_preconditions(
+                &x_amz_headers("x-amz-copy-source-if-match", "\"other\""),
+                "abc",
+                last_modified,
+            )
+            .expect("source If-Match mismatch should fail")
+            .status(),
+            axum::http::StatusCode::PRECONDITION_FAILED
+        );
+        assert_eq!(
+            evaluate_copy_source_preconditions(
+                &x_amz_headers("x-amz-copy-source-if-none-match", "\"abc\""),
+                "abc",
+                last_modified,
+            )
+            .expect("source If-None-Match hit should fail")
+            .status(),
+            axum::http::StatusCode::PRECONDITION_FAILED
+        );
+        assert_eq!(
+            evaluate_copy_source_preconditions(
+                &x_amz_headers(
+                    "x-amz-copy-source-if-unmodified-since",
+                    &httpdate::fmt_http_date(before),
+                ),
+                "abc",
+                last_modified,
+            )
+            .expect("source If-Unmodified-Since before modification should fail")
+            .status(),
+            axum::http::StatusCode::PRECONDITION_FAILED
+        );
+        assert_eq!(
+            evaluate_copy_source_preconditions(
+                &x_amz_headers(
+                    "x-amz-copy-source-if-modified-since",
+                    &httpdate::fmt_http_date(after),
+                ),
+                "abc",
+                last_modified,
+            )
+            .expect("source If-Modified-Since after modification should fail")
+            .status(),
             axum::http::StatusCode::PRECONDITION_FAILED
         );
     }

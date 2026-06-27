@@ -189,6 +189,48 @@ async fn test_s3_put_write_etag_preconditions() {
         stale_update.is_err(),
         "stale If-Match PUT should reject the update"
     );
+
+    let updated_head = client
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("HEAD should return updated ETag");
+    let updated_etag = updated_head.e_tag().expect("updated ETag").to_string();
+    client
+        .copy_object()
+        .bucket(&bucket)
+        .key("copied-through-source-if-match.txt")
+        .copy_source(format!("{bucket}/{key}"))
+        .copy_source_if_match(&updated_etag)
+        .send()
+        .await
+        .expect("matching source If-Match CopyObject should succeed");
+    let stale_copy = client
+        .copy_object()
+        .bucket(&bucket)
+        .key("stale-copy.txt")
+        .copy_source(format!("{bucket}/{key}"))
+        .copy_source_if_match(&etag)
+        .send()
+        .await;
+    assert!(
+        stale_copy.is_err(),
+        "stale source If-Match CopyObject should fail"
+    );
+    let matching_none_match_copy = client
+        .copy_object()
+        .bucket(&bucket)
+        .key("none-match-copy.txt")
+        .copy_source(format!("{bucket}/{key}"))
+        .copy_source_if_none_match(&updated_etag)
+        .send()
+        .await;
+    assert!(
+        matching_none_match_copy.is_err(),
+        "matching source If-None-Match CopyObject should fail"
+    );
 }
 
 #[tokio::test]
