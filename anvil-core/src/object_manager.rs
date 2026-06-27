@@ -1337,10 +1337,14 @@ impl ObjectManager {
     ) -> Result<Option<Object>, Status> {
         self.validate_write_request(bucket_name, object_key, scopes)?;
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
-        self.db
-            .get_object(bucket.id, object_key)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))
+        metadata_journal::read_current_object(
+            &self.storage,
+            &bucket,
+            &self.encryption_key,
+            object_key,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))
     }
 
     pub async fn copy_object(
