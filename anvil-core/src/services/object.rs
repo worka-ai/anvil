@@ -267,6 +267,43 @@ impl ObjectService for AppState {
         }))
     }
 
+    async fn compose_object(
+        &self,
+        request: Request<ComposeObjectRequest>,
+    ) -> Result<Response<ComposeObjectResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+
+        let mut sources = Vec::with_capacity(req.sources.len());
+        for source in req.sources {
+            sources.push(crate::object_manager::ComposeSource {
+                bucket_name: source.bucket_name,
+                object_key: source.object_key,
+                version_id: parse_optional_version_id(source.version_id.as_deref())?,
+            });
+        }
+
+        let object = self
+            .object_manager
+            .compose_object(
+                claims,
+                sources,
+                &req.destination_bucket_name,
+                &req.destination_object_key,
+            )
+            .await?;
+
+        Ok(Response::new(ComposeObjectResponse {
+            etag: object.etag,
+            version_id: object.version_id.to_string(),
+            last_modified: object.created_at.to_string(),
+        }))
+    }
+
     async fn initiate_multipart_upload(
         &self,
         _request: Request<InitiateMultipartRequest>,

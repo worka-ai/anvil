@@ -31,6 +31,13 @@ pub struct ObjectManager {
     encryption_key: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ComposeSource {
+    pub bucket_name: String,
+    pub object_key: String,
+    pub version_id: Option<uuid::Uuid>,
+}
+
 impl ObjectManager {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -743,6 +750,60 @@ impl ObjectManager {
             destination_object_key,
             &claims.scopes,
             source_stream,
+        )
+        .await
+    }
+
+    pub async fn compose_object(
+        &self,
+        claims: auth::Claims,
+        sources: Vec<ComposeSource>,
+        destination_bucket_name: &str,
+        destination_object_key: &str,
+    ) -> Result<Object, Status> {
+        if sources.is_empty() {
+            return Err(Status::invalid_argument(
+                "ComposeObject requires at least one source",
+            ));
+        }
+
+        let manager = self.clone();
+        let source_claims = claims.clone();
+        let (tx, rx) = mpsc::channel(4);
+
+        tokio::spawn(async move {
+            for source in sources {
+                let source_stream = match manager
+                    .get_object(
+                        Some(source_claims.clone()),
+                        source.bucket_name,
+                        source.object_key,
+                        source.version_id,
+                    )
+                    .await
+                {
+                    Ok((_object, stream)) => stream,
+                    Err(status) => {
+                        let _ = tx.send(Err(status)).await;
+                        return;
+                    }
+                };
+
+                futures_util::pin_mut!(source_stream);
+                while let Some(chunk) = source_stream.next().await {
+                    if tx.send(chunk).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+
+        self.put_object(
+            claims.tenant_id,
+            destination_bucket_name,
+            destination_object_key,
+            &claims.scopes,
+            ReceiverStream::new(rx),
         )
         .await
     }

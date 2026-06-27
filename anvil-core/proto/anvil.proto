@@ -60,6 +60,7 @@ service ObjectService {
   rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
   rpc ListObjectVersions(ListObjectVersionsRequest) returns (ListObjectVersionsResponse);
   rpc CopyObject(CopyObjectRequest) returns (CopyObjectResponse);
+  rpc ComposeObject(ComposeObjectRequest) returns (ComposeObjectResponse);
   rpc InitiateMultipartUpload(InitiateMultipartRequest) returns (InitiateMultipartResponse);
   rpc CompleteMultipartUpload(CompleteMultipartRequest) returns (CompleteMultipartResponse);
 }
@@ -185,6 +186,24 @@ message CopyObjectRequest {
 }
 
 message CopyObjectResponse {
+    string etag = 1;
+    string version_id = 2;
+    string last_modified = 3;
+}
+
+message ComposeObjectSource {
+    string bucket_name = 1;
+    string object_key = 2;
+    optional string version_id = 3;
+}
+
+message ComposeObjectRequest {
+    repeated ComposeObjectSource sources = 1;
+    string destination_bucket_name = 2;
+    string destination_object_key = 3;
+}
+
+message ComposeObjectResponse {
     string etag = 1;
     string version_id = 2;
     string last_modified = 3;

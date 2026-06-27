@@ -1,9 +1,9 @@
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::{
-    self, CopyObjectRequest, CreateBucketRequest, DeleteObjectRequest, GetObjectRequest,
-    HeadObjectRequest, ListObjectVersionsRequest, ListObjectsRequest, ObjectMetadata,
-    PutObjectRequest,
+    self, ComposeObjectRequest, ComposeObjectSource, CopyObjectRequest, CreateBucketRequest,
+    DeleteObjectRequest, GetObjectRequest, HeadObjectRequest, ListObjectVersionsRequest,
+    ListObjectsRequest, ObjectMetadata, PutObjectRequest,
 };
 use futures_util::StreamExt;
 use std::time::Duration;
@@ -309,6 +309,117 @@ async fn test_copy_object_creates_independent_destination_version() {
         }
     }
     assert_eq!(downloaded, content);
+}
+
+#[tokio::test]
+async fn test_compose_object_concatenates_sources_in_order() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+
+    let bucket_name = "test-compose-bucket".to_string();
+    let mut create_req = Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
+    });
+    create_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client.create_bucket(create_req).await.unwrap();
+
+    let sources = vec![
+        ("part-a.txt", b"hello ".to_vec()),
+        ("part-b.txt", b"compose".to_vec()),
+    ];
+    let mut source_versions = Vec::new();
+    for (key, content) in &sources {
+        let metadata = ObjectMetadata {
+            bucket_name: bucket_name.clone(),
+            object_key: key.to_string(),
+        };
+        let chunks = vec![
+            PutObjectRequest {
+                data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                    metadata,
+                )),
+            },
+            PutObjectRequest {
+                data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                    content.clone(),
+                )),
+            },
+        ];
+        let mut put_req = Request::new(tokio_stream::iter(chunks));
+        put_req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+        let put_res = object_client
+            .put_object(put_req)
+            .await
+            .unwrap()
+            .into_inner();
+        source_versions.push((key.to_string(), put_res.version_id));
+    }
+
+    let mut compose_req = Request::new(ComposeObjectRequest {
+        sources: source_versions
+            .into_iter()
+            .map(|(key, version_id)| ComposeObjectSource {
+                bucket_name: bucket_name.clone(),
+                object_key: key,
+                version_id: Some(version_id),
+            })
+            .collect(),
+        destination_bucket_name: bucket_name.clone(),
+        destination_object_key: "composed.txt".to_string(),
+    });
+    compose_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let compose_res = object_client
+        .compose_object(compose_req)
+        .await
+        .unwrap()
+        .into_inner();
+
+    let mut get_req = Request::new(GetObjectRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: "composed.txt".to_string(),
+        version_id: Some(compose_res.version_id),
+    });
+    get_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let mut stream = object_client
+        .get_object(get_req)
+        .await
+        .unwrap()
+        .into_inner();
+    let mut downloaded = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk.unwrap().data.unwrap() {
+            anvil_api::get_object_response::Data::Metadata(metadata) => {
+                assert_eq!(metadata.content_length, "hello compose".len() as i64);
+            }
+            anvil_api::get_object_response::Data::Chunk(bytes) => {
+                downloaded.extend_from_slice(&bytes);
+            }
+        }
+    }
+
+    assert_eq!(downloaded, b"hello compose");
 }
 
 #[tokio::test]
