@@ -214,6 +214,37 @@ impl Storage {
             .join(format!("{log_index:020}-{entry_hash}.certificate.json")))
     }
 
+    pub fn personaldb_changeset_payload_by_index_path(
+        &self,
+        tenant_id: i64,
+        database_id: &str,
+        log_index: u64,
+        payload_hash: &str,
+    ) -> Result<PathBuf> {
+        ensure_hash_hex(payload_hash, "personaldb changeset payload hash")?;
+        Ok(self
+            .personaldb_group_dir(tenant_id, database_id)?
+            .join("log")
+            .join("payloads")
+            .join("by-index")
+            .join(format!("{log_index:020}-{payload_hash}.sqlite-changeset")))
+    }
+
+    pub fn personaldb_changeset_payload_by_hash_path(
+        &self,
+        tenant_id: i64,
+        database_id: &str,
+        payload_hash: &str,
+    ) -> Result<PathBuf> {
+        ensure_hash_hex(payload_hash, "personaldb changeset payload hash")?;
+        Ok(self
+            .personaldb_group_dir(tenant_id, database_id)?
+            .join("log")
+            .join("payloads")
+            .join("by-hash")
+            .join(format!("{payload_hash}.sqlite-changeset")))
+    }
+
     pub fn personaldb_log_segment_path(
         &self,
         tenant_id: i64,

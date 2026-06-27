@@ -28,6 +28,7 @@ pub mod middleware;
 pub mod object_manager;
 pub mod permissions;
 pub mod persistence;
+pub mod personaldb_commit_store;
 pub mod personaldb_control;
 pub mod personaldb_heads;
 pub mod personaldb_row_index;
