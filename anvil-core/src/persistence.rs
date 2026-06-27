@@ -10,7 +10,12 @@ use std::{
 use tokio::sync::{RwLock, mpsc::Sender};
 
 use crate::{
-    cache::MetadataCache, cluster::MetadataEvent, config::Config, control_journal, storage::Storage,
+    bucket_journal::{self, BucketJournalMutation},
+    cache::MetadataCache,
+    cluster::MetadataEvent,
+    config::Config,
+    control_journal,
+    storage::Storage,
 };
 
 #[derive(Debug, Clone)]
@@ -25,8 +30,6 @@ pub struct Persistence {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct NativeState {
     next_id: i64,
-    buckets: Vec<StoredBucket>,
-    bucket_events: Vec<BucketMetadataEvent>,
     objects: Vec<Object>,
     multipart_uploads: Vec<MultipartUpload>,
     multipart_parts: Vec<MultipartUploadPart>,
@@ -54,12 +57,6 @@ impl NativeState {
         self.next_id += 1;
         self.next_id
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredBucket {
-    bucket: Bucket,
-    deleted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -957,32 +954,35 @@ impl Persistence {
         name: &str,
         region: &str,
     ) -> Result<Bucket, tonic::Status> {
-        let mut state = self.state.write().await;
-        if state.buckets.iter().any(|b| {
-            b.bucket.tenant_id == tenant_id && b.bucket.name == name && b.deleted_at.is_none()
-        }) {
+        if bucket_journal::read_current_bucket(&self.storage, tenant_id, name)
+            .await
+            .map_err(|e| tonic::Status::internal(e.to_string()))?
+            .is_some()
+        {
             return Err(tonic::Status::already_exists(
                 "A bucket with that name already exists.",
             ));
         }
         let bucket = Bucket {
-            id: state.allocate_id(),
+            id: bucket_journal::next_bucket_id(&self.storage)
+                .await
+                .map_err(|e| tonic::Status::internal(e.to_string()))?,
             tenant_id,
             name: name.to_string(),
             region: region.to_string(),
             created_at: Utc::now(),
             is_public_read: false,
         };
-        state.buckets.push(StoredBucket {
-            bucket: bucket.clone(),
-            deleted_at: None,
-        });
+        bucket_journal::append_bucket_mutation(
+            &self.storage,
+            &bucket,
+            BucketJournalMutation::Create,
+        )
+        .await
+        .map_err(|e| tonic::Status::internal(e.to_string()))?;
         self.cache
             .insert_bucket(tenant_id, name.to_string(), bucket.clone())
             .await;
-        self.persist_after_write(&state)
-            .await
-            .map_err(|e| tonic::Status::internal(e.to_string()))?;
         self.publish_event(MetadataEvent::BucketUpdated {
             tenant_id,
             name: name.to_string(),
@@ -992,20 +992,10 @@ impl Persistence {
     }
 
     pub async fn get_bucket_by_name(&self, tenant_id: i64, name: &str) -> Result<Option<Bucket>> {
-        self.refresh_from_disk().await?;
         if let Some(bucket) = self.cache.get_bucket(tenant_id, name).await {
             return Ok(Some(bucket));
         }
-        let bucket = self
-            .state
-            .read()
-            .await
-            .buckets
-            .iter()
-            .find(|b| {
-                b.bucket.tenant_id == tenant_id && b.bucket.name == name && b.deleted_at.is_none()
-            })
-            .map(|b| b.bucket.clone());
+        let bucket = bucket_journal::read_current_bucket(&self.storage, tenant_id, name).await?;
         if let Some(bucket) = bucket.clone() {
             self.cache
                 .insert_bucket(tenant_id, name.to_string(), bucket)
@@ -1015,15 +1005,7 @@ impl Persistence {
     }
 
     pub async fn get_public_bucket_by_name(&self, name: &str) -> Result<Option<Bucket>> {
-        self.refresh_from_disk().await?;
-        Ok(self
-            .state
-            .read()
-            .await
-            .buckets
-            .iter()
-            .find(|b| b.bucket.name == name && b.deleted_at.is_none() && b.bucket.is_public_read)
-            .map(|b| b.bucket.clone()))
+        bucket_journal::read_public_bucket_by_name(&self.storage, name).await
     }
 
     pub async fn set_bucket_public_access(
@@ -1032,20 +1014,13 @@ impl Persistence {
         bucket_name: &str,
         is_public: bool,
     ) -> Result<Bucket> {
-        let mut state = self.state.write().await;
-        let bucket = state
-            .buckets
-            .iter_mut()
-            .find(|b| {
-                b.bucket.tenant_id == tenant_id
-                    && b.bucket.name == bucket_name
-                    && b.deleted_at.is_none()
-            })
+        let mut out = bucket_journal::read_current_bucket(&self.storage, tenant_id, bucket_name)
+            .await?
             .ok_or_else(|| anyhow!("bucket not found"))?;
-        bucket.bucket.is_public_read = is_public;
-        let out = bucket.bucket.clone();
+        out.is_public_read = is_public;
+        bucket_journal::append_bucket_mutation(&self.storage, &out, BucketJournalMutation::Update)
+            .await?;
         self.cache.invalidate_bucket(tenant_id, bucket_name).await;
-        self.persist_after_write(&state).await?;
         Ok(out)
     }
 
@@ -1054,32 +1029,29 @@ impl Persistence {
         bucket_name: &str,
         is_public: bool,
     ) -> Result<Bucket> {
-        let mut state = self.state.write().await;
-        let bucket = state
-            .buckets
-            .iter_mut()
-            .find(|b| b.bucket.name == bucket_name && b.deleted_at.is_none())
+        let mut out = bucket_journal::read_current_bucket_by_name(&self.storage, bucket_name)
+            .await?
             .ok_or_else(|| anyhow!("bucket not found"))?;
-        bucket.bucket.is_public_read = is_public;
-        let out = bucket.bucket.clone();
+        out.is_public_read = is_public;
+        bucket_journal::append_bucket_mutation(&self.storage, &out, BucketJournalMutation::Update)
+            .await?;
         self.cache
             .invalidate_bucket(out.tenant_id, bucket_name)
             .await;
-        self.persist_after_write(&state).await?;
         Ok(out)
     }
 
     pub async fn soft_delete_bucket(&self, tenant_id: i64, name: &str) -> Result<Option<Bucket>> {
-        let mut state = self.state.write().await;
-        let mut deleted = None;
-        if let Some(stored) = state.buckets.iter_mut().find(|b| {
-            b.bucket.tenant_id == tenant_id && b.bucket.name == name && b.deleted_at.is_none()
-        }) {
-            stored.deleted_at = Some(Utc::now());
-            deleted = Some(stored.bucket.clone());
+        let deleted = bucket_journal::read_current_bucket(&self.storage, tenant_id, name).await?;
+        if let Some(bucket) = &deleted {
+            bucket_journal::append_bucket_mutation(
+                &self.storage,
+                bucket,
+                BucketJournalMutation::Delete,
+            )
+            .await?;
         }
         self.cache.invalidate_bucket(tenant_id, name).await;
-        self.persist_after_write(&state).await?;
         Ok(deleted)
     }
 
@@ -1092,7 +1064,7 @@ impl Persistence {
     }
 
     pub async fn hard_delete_bucket_if_empty(&self, bucket_id: i64) -> Result<bool> {
-        let mut state = self.state.write().await;
+        let state = self.state.read().await;
         if state.objects.iter().any(|o| o.bucket_id == bucket_id)
             || state.multipart_uploads.iter().any(|u| {
                 u.bucket_id == bucket_id && u.completed_at.is_none() && u.aborted_at.is_none()
@@ -1100,13 +1072,7 @@ impl Persistence {
         {
             return Ok(false);
         }
-        let before = state.buckets.len();
-        state.buckets.retain(|b| b.bucket.id != bucket_id);
-        let removed = before != state.buckets.len();
-        if removed {
-            self.persist_after_write(&state).await?;
-        }
-        Ok(removed)
+        Ok(true)
     }
 
     pub async fn create_bucket_metadata_event(
@@ -1116,19 +1082,14 @@ impl Persistence {
         event_type: &str,
         bucket_metadata: JsonValue,
     ) -> Result<BucketMetadataEvent> {
-        let mut state = self.state.write().await;
-        let event = BucketMetadataEvent {
-            id: state.allocate_id(),
-            tenant_id,
-            bucket_id: bucket.id,
-            bucket_name: bucket.name.clone(),
-            event_type: event_type.to_string(),
-            bucket_metadata,
-            created_at: Utc::now(),
-        };
-        state.bucket_events.push(event.clone());
-        self.persist_after_write(&state).await?;
-        Ok(event)
+        bucket_journal::latest_bucket_metadata_event(&self.storage, tenant_id, &bucket.name)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "bucket metadata event not found after {event_type}: {}",
+                    bucket_metadata
+                )
+            })
     }
 
     pub async fn list_bucket_metadata_events(
@@ -1138,34 +1099,22 @@ impl Persistence {
         after_cursor: i64,
         limit: i32,
     ) -> Result<Vec<BucketMetadataEvent>> {
-        let mut events = self
-            .state
-            .read()
-            .await
-            .bucket_events
-            .iter()
-            .filter(|e| e.tenant_id == tenant_id && e.bucket_id == bucket_id && e.id > after_cursor)
-            .cloned()
-            .collect::<Vec<_>>();
-        events.sort_by_key(|e| e.id);
-        events.truncate(if limit == 0 {
-            1000
-        } else {
-            limit.max(1) as usize
-        });
-        Ok(events)
+        bucket_journal::list_bucket_metadata_events_by_bucket_id(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            after_cursor,
+            if limit == 0 {
+                1000
+            } else {
+                limit.max(1) as usize
+            },
+        )
+        .await
     }
 
     pub async fn list_buckets_for_tenant(&self, tenant_id: i64) -> Result<Vec<Bucket>> {
-        let mut buckets = self
-            .state
-            .read()
-            .await
-            .buckets
-            .iter()
-            .filter(|b| b.bucket.tenant_id == tenant_id && b.deleted_at.is_none())
-            .map(|b| b.bucket.clone())
-            .collect::<Vec<_>>();
+        let mut buckets = bucket_journal::read_current_buckets(&self.storage, tenant_id).await?;
         buckets.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(buckets)
     }

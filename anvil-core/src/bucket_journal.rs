@@ -85,6 +85,35 @@ pub async fn read_public_bucket_by_name(
     )
 }
 
+pub async fn read_current_bucket_by_name(
+    storage: &Storage,
+    bucket_name: &str,
+) -> Result<Option<Bucket>> {
+    Ok(
+        read_current_buckets_from_path(storage.global_bucket_metadata_journal_path())
+            .await?
+            .into_iter()
+            .find(|bucket| bucket.name == bucket_name),
+    )
+}
+
+pub async fn next_bucket_id(storage: &Storage) -> Result<i64> {
+    let frames =
+        read_bucket_journal_frames_at_path(&storage.global_bucket_metadata_journal_path()).await?;
+    let max_bucket_id = frames
+        .into_iter()
+        .filter(|frame| frame.record_kind == JournalRecordKind::BucketMetadata)
+        .map(|frame| serde_json::from_slice::<BucketJournalBody>(&frame.body))
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|body| body.bucket_id)
+        .max()
+        .unwrap_or(0);
+    max_bucket_id
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("bucket id overflow"))
+}
+
 async fn append_bucket_mutation_to_path(
     path: std::path::PathBuf,
     bucket: &Bucket,
@@ -186,6 +215,35 @@ pub async fn list_bucket_metadata_events(
         }
         let body: BucketJournalBody = serde_json::from_slice(&frame.body)?;
         if !bucket_name.is_empty() && body.bucket_name != bucket_name {
+            continue;
+        }
+        events.push(bucket_event_from_body(frame.partition_sequence, body)?);
+        if limit > 0 && events.len() >= limit {
+            break;
+        }
+    }
+    Ok(events)
+}
+
+pub async fn list_bucket_metadata_events_by_bucket_id(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+    after_cursor: i64,
+    limit: usize,
+) -> Result<Vec<BucketMetadataEvent>> {
+    let path = storage.bucket_metadata_journal_path(tenant_id);
+    let frames = read_bucket_journal_frames_at_path(path.as_path()).await?;
+    let mut events = Vec::new();
+    for frame in frames {
+        if frame.record_kind != JournalRecordKind::BucketMetadata {
+            continue;
+        }
+        if frame.partition_sequence <= after_cursor as u64 {
+            continue;
+        }
+        let body: BucketJournalBody = serde_json::from_slice(&frame.body)?;
+        if body.bucket_id != bucket_id {
             continue;
         }
         events.push(bucket_event_from_body(frame.partition_sequence, body)?);

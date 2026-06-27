@@ -1,8 +1,6 @@
 use anvil::crypto;
 use anvil::persistence::Persistence;
-use anvil_core::bucket_journal::{self, BucketJournalMutation};
 use anvil_core::permissions::AnvilAction;
-use anvil_core::storage::Storage;
 use clap::{Parser, Subcommand};
 use tracing::info;
 
@@ -231,16 +229,9 @@ async fn main() -> anyhow::Result<()> {
         },
         Commands::Bucket { command } => match command {
             BucketCommands::SetPublicAccess { bucket, allow } => {
-                let updated = persistence
+                persistence
                     .set_bucket_public_access_by_name(bucket, *allow)
                     .await?;
-                let storage = Storage::new_at(&config.storage_path).await?;
-                bucket_journal::append_bucket_mutation(
-                    &storage,
-                    &updated,
-                    BucketJournalMutation::Update,
-                )
-                .await?;
                 info!(
                     "Set public read access for bucket '{}' to {}",
                     bucket, allow

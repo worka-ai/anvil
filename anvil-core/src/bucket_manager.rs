@@ -1,6 +1,5 @@
 use crate::{
-    auth,
-    bucket_journal::{self, BucketJournalMutation},
+    auth, bucket_journal,
     permissions::AnvilAction,
     persistence::{Bucket, Persistence},
     storage::Storage,
@@ -44,13 +43,6 @@ impl BucketManager {
             .create_bucket(tenant_id, bucket_name, region)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        bucket_journal::append_bucket_mutation(
-            &self.storage,
-            &bucket,
-            BucketJournalMutation::Create,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
 
         tracing::debug!(
             "[manager] EXITING create_bucket for bucket: {}",
@@ -89,13 +81,6 @@ impl BucketManager {
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
-        bucket_journal::append_bucket_mutation(
-            &self.storage,
-            &bucket,
-            BucketJournalMutation::Delete,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
 
         // Enqueue a task for physical deletion
         let payload = serde_json::json!({ "bucket_id": bucket.id });
@@ -170,13 +155,6 @@ impl BucketManager {
             .set_bucket_public_access(tenant_id, bucket_name, is_public)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        bucket_journal::append_bucket_mutation(
-            &self.storage,
-            &bucket,
-            BucketJournalMutation::Update,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(bucket)
     }
