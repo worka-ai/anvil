@@ -1324,7 +1324,7 @@ async fn get_object(
                 );
             }
         };
-        return list_multipart_parts_response(state, claims, bucket, key, upload_id).await;
+        return list_multipart_parts_response(state, claims, bucket, key, upload_id, &q).await;
     }
 
     let version_id = match parse_s3_version_id(&q) {
@@ -1424,20 +1424,50 @@ async fn list_multipart_parts_response(
     bucket: String,
     key: String,
     upload_id: uuid::Uuid,
+    q: &HashMap<String, String>,
 ) -> Response {
+    let part_number_marker: i32 = q
+        .get("part-number-marker")
+        .or_else(|| q.get("partNumberMarker"))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let max_parts: i32 = q
+        .get("max-parts")
+        .or_else(|| q.get("maxParts"))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1000);
     match state
         .object_manager
-        .list_multipart_parts(claims.tenant_id, &bucket, &key, upload_id, &claims.scopes)
+        .list_multipart_parts(
+            claims.tenant_id,
+            &bucket,
+            &key,
+            upload_id,
+            part_number_marker,
+            max_parts,
+            &claims.scopes,
+        )
         .await
     {
-        Ok(parts) => {
+        Ok(page) => {
             let mut xml = format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Bucket>{}</Bucket>\n  <Key>{}</Key>\n  <UploadId>{}</UploadId>\n  <PartNumberMarker>0</PartNumberMarker>\n  <NextPartNumberMarker>0</NextPartNumberMarker>\n  <MaxParts>1000</MaxParts>\n  <IsTruncated>false</IsTruncated>\n",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Bucket>{}</Bucket>\n  <Key>{}</Key>\n  <UploadId>{}</UploadId>\n  <PartNumberMarker>{}</PartNumberMarker>\n",
                 xml_escape(&bucket),
                 xml_escape(&key),
-                upload_id
+                upload_id,
+                part_number_marker
             );
-            for part in parts {
+            if let Some(next_part_number_marker) = page.next_part_number_marker {
+                xml.push_str(&format!(
+                    "  <NextPartNumberMarker>{next_part_number_marker}</NextPartNumberMarker>\n"
+                ));
+            }
+            xml.push_str(&format!(
+                "  <MaxParts>{}</MaxParts>\n  <IsTruncated>{}</IsTruncated>\n",
+                max_parts,
+                if page.is_truncated { "true" } else { "false" }
+            ));
+            for part in page.parts {
                 xml.push_str("  <Part>\n");
                 xml.push_str(&format!(
                     "    <PartNumber>{}</PartNumber>\n",

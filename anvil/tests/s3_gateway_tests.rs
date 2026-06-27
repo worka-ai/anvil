@@ -610,6 +610,34 @@ async fn test_s3_public_and_private_access() {
     assert_eq!(listed_parts.parts().len(), 2);
     assert_eq!(listed_parts.parts()[0].part_number(), Some(1));
     assert_eq!(listed_parts.parts()[1].part_number(), Some(2));
+    let listed_parts_page_one = client
+        .list_parts()
+        .bucket(&private_bucket)
+        .key(multipart_key)
+        .upload_id(&upload_id)
+        .max_parts(1)
+        .send()
+        .await
+        .expect("list multipart parts first page should succeed");
+    assert_eq!(listed_parts_page_one.parts().len(), 1);
+    assert_eq!(listed_parts_page_one.parts()[0].part_number(), Some(1));
+    assert!(listed_parts_page_one.is_truncated().unwrap_or(false));
+    let next_part_number_marker = listed_parts_page_one
+        .next_part_number_marker()
+        .expect("next part number marker");
+    let listed_parts_page_two = client
+        .list_parts()
+        .bucket(&private_bucket)
+        .key(multipart_key)
+        .upload_id(&upload_id)
+        .part_number_marker(next_part_number_marker)
+        .max_parts(1)
+        .send()
+        .await
+        .expect("list multipart parts second page should succeed");
+    assert_eq!(listed_parts_page_two.parts().len(), 1);
+    assert_eq!(listed_parts_page_two.parts()[0].part_number(), Some(2));
+    assert!(!listed_parts_page_two.is_truncated().unwrap_or(false));
     client
         .complete_multipart_upload()
         .bucket(&private_bucket)

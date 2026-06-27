@@ -5,7 +5,7 @@ use crate::{
     auth,
     cluster::ClusterState,
     permissions::AnvilAction,
-    persistence::{Bucket, MultipartUploadPart, Object, ObjectWatchEvent, Persistence},
+    persistence::{Bucket, Object, ObjectWatchEvent, Persistence},
     placement::PlacementManager,
     sharding::ShardManager,
     storage::Storage,
@@ -503,8 +503,10 @@ impl ObjectManager {
         bucket_name: &str,
         object_key: &str,
         upload_id: uuid::Uuid,
+        part_number_marker: i32,
+        limit: i32,
         scopes: &[String],
-    ) -> Result<Vec<MultipartUploadPart>, Status> {
+    ) -> Result<crate::persistence::MultipartPartsPage, Status> {
         self.validate_write_request(bucket_name, object_key, scopes)?;
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
         let upload = self
@@ -514,7 +516,7 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Multipart upload not found"))?;
         self.db
-            .list_multipart_parts(upload.id)
+            .list_multipart_parts_page(upload.id, part_number_marker, limit)
             .await
             .map_err(|e| Status::internal(e.to_string()))
     }

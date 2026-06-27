@@ -139,6 +139,13 @@ pub struct MultipartUploadPart {
 }
 
 #[derive(Debug, Clone)]
+pub struct MultipartPartsPage {
+    pub parts: Vec<MultipartUploadPart>,
+    pub is_truncated: bool,
+    pub next_part_number_marker: Option<i32>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ObjectWatchEvent {
     pub id: i64,
     pub tenant_id: i64,
@@ -2175,6 +2182,41 @@ impl Persistence {
             )
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn list_multipart_parts_page(
+        &self,
+        upload_row_id: i64,
+        part_number_marker: i32,
+        limit: i32,
+    ) -> Result<MultipartPartsPage> {
+        let client = self.regional_pool.get().await?;
+        let requested_limit = if limit <= 0 { 1000 } else { limit.min(1000) } as i64;
+        let rows = client
+            .query(
+                r#"
+                SELECT *
+                FROM multipart_upload_parts
+                WHERE upload_id = $1
+                  AND part_number > $2
+                ORDER BY part_number
+                LIMIT $3"#,
+                &[&upload_row_id, &part_number_marker, &(requested_limit + 1)],
+            )
+            .await?;
+        let mut parts: Vec<MultipartUploadPart> = rows.into_iter().map(Into::into).collect();
+        let is_truncated = parts.len() as i64 > requested_limit;
+        if is_truncated {
+            parts.truncate(requested_limit as usize);
+        }
+        let next_part_number_marker = is_truncated
+            .then(|| parts.last().map(|part| part.part_number))
+            .flatten();
+        Ok(MultipartPartsPage {
+            parts,
+            is_truncated,
+            next_part_number_marker,
+        })
     }
 
     pub async fn list_active_multipart_uploads(
