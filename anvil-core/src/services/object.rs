@@ -304,6 +304,35 @@ impl ObjectService for AppState {
         }))
     }
 
+    async fn patch_json_object(
+        &self,
+        request: Request<PatchJsonObjectRequest>,
+    ) -> Result<Response<PatchJsonObjectResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+
+        let object = self
+            .object_manager
+            .patch_json_object(
+                claims,
+                &req.bucket_name,
+                &req.object_key,
+                parse_optional_version_id(req.base_version_id.as_deref())?,
+                &req.merge_patch_json,
+            )
+            .await?;
+
+        Ok(Response::new(PatchJsonObjectResponse {
+            etag: object.etag,
+            version_id: object.version_id.to_string(),
+            last_modified: object.created_at.to_string(),
+        }))
+    }
+
     async fn initiate_multipart_upload(
         &self,
         _request: Request<InitiateMultipartRequest>,

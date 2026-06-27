@@ -12,6 +12,7 @@ use crate::{
     validation,
 };
 use futures_util::{Stream, StreamExt};
+use serde_json::Value as JsonValue;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -808,6 +809,43 @@ impl ObjectManager {
         .await
     }
 
+    pub async fn patch_json_object(
+        &self,
+        claims: auth::Claims,
+        bucket_name: &str,
+        object_key: &str,
+        base_version_id: Option<uuid::Uuid>,
+        merge_patch_json: &str,
+    ) -> Result<Object, Status> {
+        let (_source_object, source_stream) = self
+            .get_object(
+                Some(claims.clone()),
+                bucket_name.to_string(),
+                object_key.to_string(),
+                base_version_id,
+            )
+            .await?;
+
+        let source_bytes = collect_stream_bytes(source_stream).await?;
+        let mut document: JsonValue = serde_json::from_slice(&source_bytes)
+            .map_err(|e| Status::invalid_argument(format!("Object is not valid JSON: {}", e)))?;
+        let patch: JsonValue = serde_json::from_str(merge_patch_json)
+            .map_err(|e| Status::invalid_argument(format!("Patch is not valid JSON: {}", e)))?;
+
+        apply_json_merge_patch(&mut document, patch);
+        let patched_bytes = serde_json::to_vec(&document)
+            .map_err(|e| Status::internal(format!("Failed to serialize patched JSON: {}", e)))?;
+
+        self.put_object(
+            claims.tenant_id,
+            bucket_name,
+            object_key,
+            &claims.scopes,
+            tokio_stream::iter(vec![Ok(patched_bytes)]),
+        )
+        .await
+    }
+
     async fn get_authorized_bucket(
         &self,
         claims: Option<&auth::Claims>,
@@ -836,5 +874,39 @@ impl ObjectManager {
         }
 
         Ok(bucket)
+    }
+}
+
+async fn collect_stream_bytes(
+    mut stream: Pin<Box<dyn Stream<Item = Result<Vec<u8>, Status>> + Send + 'static>>,
+) -> Result<Vec<u8>, Status> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        bytes.extend_from_slice(&chunk?);
+    }
+    Ok(bytes)
+}
+
+fn apply_json_merge_patch(target: &mut JsonValue, patch: JsonValue) {
+    match patch {
+        JsonValue::Object(patch_object) => {
+            if !target.is_object() {
+                *target = JsonValue::Object(serde_json::Map::new());
+            }
+            let target_object = target.as_object_mut().expect("target set to object");
+            for (key, value) in patch_object {
+                if value.is_null() {
+                    target_object.remove(&key);
+                } else {
+                    apply_json_merge_patch(
+                        target_object.entry(key).or_insert(JsonValue::Null),
+                        value,
+                    );
+                }
+            }
+        }
+        replacement => {
+            *target = replacement;
+        }
     }
 }

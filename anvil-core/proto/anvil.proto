@@ -61,6 +61,7 @@ service ObjectService {
   rpc ListObjectVersions(ListObjectVersionsRequest) returns (ListObjectVersionsResponse);
   rpc CopyObject(CopyObjectRequest) returns (CopyObjectResponse);
   rpc ComposeObject(ComposeObjectRequest) returns (ComposeObjectResponse);
+  rpc PatchJsonObject(PatchJsonObjectRequest) returns (PatchJsonObjectResponse);
   rpc InitiateMultipartUpload(InitiateMultipartRequest) returns (InitiateMultipartResponse);
   rpc CompleteMultipartUpload(CompleteMultipartRequest) returns (CompleteMultipartResponse);
 }
@@ -204,6 +205,19 @@ message ComposeObjectRequest {
 }
 
 message ComposeObjectResponse {
+    string etag = 1;
+    string version_id = 2;
+    string last_modified = 3;
+}
+
+message PatchJsonObjectRequest {
+    string bucket_name = 1;
+    string object_key = 2;
+    optional string base_version_id = 3;
+    string merge_patch_json = 4;
+}
+
+message PatchJsonObjectResponse {
     string etag = 1;
     string version_id = 2;
     string last_modified = 3;
