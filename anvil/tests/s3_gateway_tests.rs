@@ -325,6 +325,37 @@ async fn test_s3_public_and_private_access() {
     let multipart_data = multipart_resp.body.collect().await.unwrap().into_bytes();
     assert_eq!(multipart_data.as_ref(), b"multipart");
 
+    let aborted_key = "aborted-multipart-private.txt";
+    let aborted = client
+        .create_multipart_upload()
+        .bucket(&private_bucket)
+        .key(aborted_key)
+        .send()
+        .await
+        .expect("create multipart upload for abort should succeed");
+    let aborted_upload_id = aborted.upload_id().expect("abort upload id").to_string();
+    client
+        .abort_multipart_upload()
+        .bucket(&private_bucket)
+        .key(aborted_key)
+        .upload_id(&aborted_upload_id)
+        .send()
+        .await
+        .expect("abort multipart upload should succeed");
+    let upload_after_abort = client
+        .upload_part()
+        .bucket(&private_bucket)
+        .key(aborted_key)
+        .upload_id(&aborted_upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"must fail"))
+        .send()
+        .await;
+    assert!(
+        upload_after_abort.is_err(),
+        "uploading a part after abort must fail"
+    );
+
     // 5b. S3 version listing returns overwritten versions and delete markers.
     client
         .put_object()
