@@ -23,7 +23,7 @@ impl BucketManager {
         bucket_name: &str,
         region: &str,
         scopes: &[String],
-    ) -> Result<(), Status> {
+    ) -> Result<Bucket, Status> {
         tracing::debug!(
             "[manager] ENTERING create_bucket for bucket: {}",
             bucket_name
@@ -36,7 +36,8 @@ impl BucketManager {
         }
 
         tracing::debug!("[manager] Calling DB to create bucket: {}", bucket_name);
-        self.db
+        let bucket = self
+            .db
             .create_bucket(tenant_id, bucket_name, region)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -45,10 +46,14 @@ impl BucketManager {
             "[manager] EXITING create_bucket for bucket: {}",
             bucket_name
         );
-        Ok(())
+        Ok(bucket)
     }
 
-    pub async fn delete_bucket(&self, bucket_name: &str, scopes: &[String]) -> Result<(), Status> {
+    pub async fn delete_bucket(
+        &self,
+        bucket_name: &str,
+        scopes: &[String],
+    ) -> Result<Bucket, Status> {
         if !auth::is_authorized(AnvilAction::BucketDelete, bucket_name, scopes) {
             return Err(Status::permission_denied("Permission denied"));
         }
@@ -68,7 +73,7 @@ impl BucketManager {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        Ok(())
+        Ok(bucket)
     }
 
     pub async fn list_buckets(
@@ -127,16 +132,17 @@ impl BucketManager {
         bucket_name: &str,
         is_public: bool,
         scopes: &[String],
-    ) -> Result<(), Status> {
+    ) -> Result<Bucket, Status> {
         if !auth::is_authorized(AnvilAction::BucketWrite, bucket_name, scopes) {
             return Err(Status::permission_denied("Permission denied"));
         }
 
-        self.db
+        let bucket = self
+            .db
             .set_bucket_public_access(bucket_name, is_public)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        Ok(())
+        Ok(bucket)
     }
 }

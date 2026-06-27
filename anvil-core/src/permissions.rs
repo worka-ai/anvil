@@ -24,6 +24,7 @@ pub enum AnvilAction {
     BucketRead,
     BucketWrite,
     BucketList,
+    BucketWatch,
 
     // Object actions
     ObjectRead,
@@ -86,6 +87,7 @@ impl fmt::Display for AnvilAction {
             AnvilAction::BucketRead => "bucket:read",
             AnvilAction::BucketWrite => "bucket:write",
             AnvilAction::BucketList => "bucket:list",
+            AnvilAction::BucketWatch => "bucket:watch",
 
             // Object actions
             AnvilAction::ObjectRead => "object:read",
@@ -153,6 +155,7 @@ impl FromStr for AnvilAction {
             "bucket:read" => Ok(AnvilAction::BucketRead),
             "bucket:write" => Ok(AnvilAction::BucketWrite),
             "bucket:list" => Ok(AnvilAction::BucketList),
+            "bucket:watch" => Ok(AnvilAction::BucketWatch),
 
             // Object actions
             "object:read" => Ok(AnvilAction::ObjectRead),
@@ -215,6 +218,7 @@ mod tests {
             AnvilAction::AuthzAll,
             AnvilAction::IndexAll,
             AnvilAction::BucketCreate,
+            AnvilAction::BucketWatch,
             AnvilAction::ObjectWrite,
             AnvilAction::HfKeyList,
             AnvilAction::HfIngestionCreate,

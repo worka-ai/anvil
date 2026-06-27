@@ -135,6 +135,7 @@ fn action_covers_required(token_action: &AnvilAction, required_action: &AnvilAct
                 | AnvilAction::BucketRead
                 | AnvilAction::BucketWrite
                 | AnvilAction::BucketList
+                | AnvilAction::BucketWatch
         ),
         AnvilAction::ObjectAll => matches!(
             required_action,

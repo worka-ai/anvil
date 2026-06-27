@@ -47,6 +47,7 @@ pub struct AppState {
     pub bucket_manager: bucket_manager::BucketManager,
     pub object_manager: object_manager::ObjectManager,
     pub config: Arc<Config>,
+    pub bucket_watch_tx: broadcast::Sender<persistence::BucketMetadataEvent>,
     pub authz_watch_tx: broadcast::Sender<persistence::AuthzTupleRecord>,
     pub index_watch_tx: broadcast::Sender<persistence::IndexDefinitionEvent>,
 }
@@ -67,6 +68,7 @@ impl AppState {
         let sharder = sharding::ShardManager::new();
         let placer = placement::PlacementManager::default();
         let (object_watch_tx, _object_watch_rx) = tokio::sync::broadcast::channel(1024);
+        let (bucket_watch_tx, _bucket_watch_rx) = tokio::sync::broadcast::channel(1024);
         let (authz_watch_tx, _authz_watch_rx) = tokio::sync::broadcast::channel(1024);
         let (index_watch_tx, _index_watch_rx) = tokio::sync::broadcast::channel(1024);
 
@@ -94,6 +96,7 @@ impl AppState {
             bucket_manager,
             object_manager,
             config: arc_config,
+            bucket_watch_tx,
             authz_watch_tx,
             index_watch_tx,
         })

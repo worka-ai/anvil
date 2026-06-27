@@ -1,9 +1,10 @@
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::{
     CreateBucketRequest, DeleteBucketRequest, GetBucketPolicyRequest, ListBucketsRequest,
-    PutBucketPolicyRequest,
+    PutBucketPolicyRequest, WatchBucketMetadataRequest,
 };
 use anvil::tasks::TaskStatus;
+use futures_util::StreamExt;
 use std::time::Duration;
 use tonic::Request;
 
@@ -194,4 +195,81 @@ async fn test_get_bucket_policy_reflects_public_read_flag() {
         .policy_json;
     let policy: serde_json::Value = serde_json::from_str(&policy).unwrap();
     assert_eq!(policy["is_public_read"], true);
+}
+
+#[tokio::test]
+async fn test_watch_bucket_metadata_streams_snapshot_events() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+
+    let bucket_name = "watch-bucket-metadata".to_string();
+    let mut create_req = Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
+    });
+    create_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client.create_bucket(create_req).await.unwrap();
+
+    let mut put_req = Request::new(PutBucketPolicyRequest {
+        bucket_name: bucket_name.clone(),
+        policy_json: serde_json::json!({"is_public_read": true}).to_string(),
+    });
+    put_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client.put_bucket_policy(put_req).await.unwrap();
+
+    let mut del_req = Request::new(DeleteBucketRequest {
+        bucket_name: bucket_name.clone(),
+    });
+    del_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client.delete_bucket(del_req).await.unwrap();
+
+    let mut watch_req = Request::new(WatchBucketMetadataRequest {
+        bucket_name: bucket_name.clone(),
+        after_cursor: 0,
+    });
+    watch_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let mut watch = bucket_client
+        .watch_bucket_metadata(watch_req)
+        .await
+        .unwrap()
+        .into_inner();
+
+    let mut events = Vec::new();
+    for _ in 0..3 {
+        events.push(watch.next().await.unwrap().unwrap());
+    }
+
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        vec!["create", "policy_update", "delete"]
+    );
+    assert!(
+        events
+            .windows(2)
+            .all(|pair| pair[0].cursor < pair[1].cursor)
+    );
+    assert_eq!(events[0].bucket.as_ref().unwrap().name, bucket_name);
+    assert!(events[1].bucket.as_ref().unwrap().is_public_read);
+    assert!(events[2].bucket.as_ref().unwrap().deleted);
 }

@@ -41,6 +41,17 @@ pub struct Bucket {
 }
 
 #[derive(Debug, Clone)]
+pub struct BucketMetadataEvent {
+    pub id: i64,
+    pub tenant_id: i64,
+    pub bucket_id: i64,
+    pub bucket_name: String,
+    pub event_type: String,
+    pub bucket_metadata: JsonValue,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Object {
     pub id: i64,
     pub tenant_id: i64,
@@ -210,6 +221,20 @@ impl From<Row> for Bucket {
             region: row.get("region"),
             created_at: row.get("created_at"),
             is_public_read: row.get("is_public_read"),
+        }
+    }
+}
+
+impl From<Row> for BucketMetadataEvent {
+    fn from(row: Row) -> Self {
+        Self {
+            id: row.get("id"),
+            tenant_id: row.get("tenant_id"),
+            bucket_id: row.get("bucket_id"),
+            bucket_name: row.get("bucket_name"),
+            event_type: row.get("event_type"),
+            bucket_metadata: row.get("bucket_metadata"),
+            created_at: row.get("created_at"),
         }
     }
 }
@@ -1113,16 +1138,21 @@ impl Persistence {
         }
     }
 
-    pub async fn set_bucket_public_access(&self, bucket_name: &str, is_public: bool) -> Result<()> {
+    pub async fn set_bucket_public_access(
+        &self,
+        bucket_name: &str,
+        is_public: bool,
+    ) -> Result<Bucket> {
         let client = self.global_pool.get().await?;
         let row = client
             .query_one(
-                "UPDATE buckets SET is_public_read = $1 WHERE name = $2 RETURNING tenant_id",
+                "UPDATE buckets SET is_public_read = $1 WHERE name = $2 RETURNING *",
                 &[&is_public, &bucket_name],
             )
             .await?;
 
-        let tenant_id: i64 = row.get("tenant_id");
+        let bucket: Bucket = row.into();
+        let tenant_id = bucket.tenant_id;
         self.cache.invalidate_bucket(tenant_id, bucket_name).await;
         self.publish_event(MetadataEvent::BucketUpdated {
             tenant_id,
@@ -1130,7 +1160,7 @@ impl Persistence {
         })
         .await;
 
-        Ok(())
+        Ok(bucket)
     }
 
     pub async fn soft_delete_bucket(&self, bucket_name: &str) -> Result<Option<Bucket>> {
@@ -1153,6 +1183,62 @@ impl Persistence {
         }
 
         Ok(row.map(Into::into))
+    }
+
+    pub async fn create_bucket_metadata_event(
+        &self,
+        tenant_id: i64,
+        bucket: &Bucket,
+        event_type: &str,
+        bucket_metadata: JsonValue,
+    ) -> Result<BucketMetadataEvent> {
+        let client = self.global_pool.get().await?;
+        let row = client
+            .query_one(
+                r#"
+                INSERT INTO bucket_metadata_events
+                    (tenant_id, bucket_id, bucket_name, event_type, bucket_metadata)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING *"#,
+                &[
+                    &tenant_id,
+                    &bucket.id,
+                    &bucket.name,
+                    &event_type,
+                    &bucket_metadata,
+                ],
+            )
+            .await?;
+        Ok(row.into())
+    }
+
+    pub async fn list_bucket_metadata_events(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        after_cursor: i64,
+        limit: i32,
+    ) -> Result<Vec<BucketMetadataEvent>> {
+        let client = self.global_pool.get().await?;
+        let rows = client
+            .query(
+                r#"
+                SELECT *
+                FROM bucket_metadata_events
+                WHERE tenant_id = $1
+                  AND ($2 = '' OR bucket_name = $2)
+                  AND id > $3
+                ORDER BY id
+                LIMIT $4"#,
+                &[
+                    &tenant_id,
+                    &bucket_name,
+                    &after_cursor,
+                    &(if limit == 0 { 1000 } else { limit } as i64),
+                ],
+            )
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     pub async fn list_buckets_for_tenant(&self, tenant_id: i64) -> Result<Vec<Bucket>> {
