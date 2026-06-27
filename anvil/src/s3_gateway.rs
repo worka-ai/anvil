@@ -135,6 +135,10 @@ fn request_targets_reserved_namespace(req: &Request) -> bool {
         }
     }
 
+    if request_copy_source_targets_reserved_namespace(req.headers()) {
+        return true;
+    }
+
     req.uri().query().is_some_and(|query| {
         query.split('&').any(|pair| {
             let mut fields = pair.splitn(2, '=');
@@ -145,6 +149,23 @@ fn request_targets_reserved_namespace(req: &Request) -> bool {
                     .is_some_and(|prefix| validation::is_reserved_internal_key(&prefix))
         })
     })
+}
+
+fn request_copy_source_targets_reserved_namespace(headers: &axum::http::HeaderMap) -> bool {
+    let Some(copy_source) = headers
+        .get("x-amz-copy-source")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+
+    let copy_source = copy_source.trim_start_matches('/');
+    let (path, _) = copy_source.split_once('?').unwrap_or((copy_source, ""));
+    let Some((_, key)) = path.split_once('/') else {
+        return false;
+    };
+    let key = percent_decode_path_component(key);
+    !key.is_empty() && validation::is_reserved_internal_key(&key)
 }
 
 fn percent_decode_query_component(value: &str) -> String {
@@ -2613,6 +2634,14 @@ mod tests {
         Request::builder().uri(uri).body(Body::empty()).unwrap()
     }
 
+    fn request_with_copy_source(uri: &str, copy_source: &str) -> Request {
+        Request::builder()
+            .uri(uri)
+            .header("x-amz-copy-source", copy_source)
+            .body(Body::empty())
+            .unwrap()
+    }
+
     fn range_headers(value: &str) -> axum::http::HeaderMap {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(axum::http::header::RANGE, value.parse().unwrap());
@@ -2667,6 +2696,25 @@ mod tests {
         assert!(!request_targets_reserved_namespace(&request(
             "/bucket?prefix=customer%2F_anvil%2Fauthz%2F"
         )));
+    }
+
+    #[test]
+    fn reserved_namespace_guard_detects_copy_source_keys() {
+        assert!(request_targets_reserved_namespace(
+            &request_with_copy_source("/bucket/destination", "source/_anvil/authz/tuples")
+        ));
+        assert!(request_targets_reserved_namespace(
+            &request_with_copy_source("/bucket/destination", "/source/_anvil%2Fauthz%2Ftuples")
+        ));
+        assert!(!request_targets_reserved_namespace(
+            &request_with_copy_source(
+                "/bucket/destination",
+                "source/customer/_anvil/authz/visible"
+            )
+        ));
+        assert!(!request_targets_reserved_namespace(
+            &request_with_copy_source("/bucket/destination", "malformed-copy-source")
+        ));
     }
 
     #[test]

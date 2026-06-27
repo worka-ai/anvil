@@ -1221,6 +1221,26 @@ async fn run_s3_public_and_private_access() {
         .expect_err("reserved namespace DELETE must fail");
     assert_reserved_namespace_error(delete_err);
 
+    let copy_from_reserved_err = client
+        .copy_object()
+        .bucket(&public_bucket)
+        .key("copied-from-reserved.txt")
+        .copy_source(format!("{}/{}", public_bucket, reserved_key))
+        .send()
+        .await
+        .expect_err("reserved namespace CopyObject source must fail");
+    assert_reserved_namespace_error(copy_from_reserved_err);
+
+    let copy_to_reserved_err = client
+        .copy_object()
+        .bucket(&public_bucket)
+        .key(reserved_key)
+        .copy_source(format!("{}/{}", public_bucket, public_key))
+        .send()
+        .await
+        .expect_err("reserved namespace CopyObject destination must fail");
+    assert_reserved_namespace_error(copy_to_reserved_err);
+
     // 9. Normal S3 DELETE remains compatible and idempotent.
     client
         .delete_object()
