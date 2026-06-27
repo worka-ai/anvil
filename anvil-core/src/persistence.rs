@@ -15,7 +15,7 @@ use crate::{
     cache::MetadataCache,
     cluster::MetadataEvent,
     config::Config,
-    control_journal, index_journal, model_journal,
+    control_journal, index_diagnostic_journal, index_journal, model_journal,
     storage::Storage,
     task_journal,
 };
@@ -39,7 +39,6 @@ struct NativeState {
     append_streams: Vec<AppendStream>,
     append_records: Vec<AppendStreamRecord>,
     manifests: Vec<ManifestRecord>,
-    index_diagnostics: Vec<IndexDiagnostic>,
     hf_keys: Vec<HfKey>,
     hf_ingestions: Vec<HfIngestion>,
     hf_items: Vec<HfIngestionItem>,
@@ -2019,6 +2018,7 @@ impl Persistence {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_index_diagnostic(
         &self,
         tenant_id: i64,
@@ -2033,25 +2033,25 @@ impl Persistence {
         message: &str,
         details: JsonValue,
     ) -> Result<IndexDiagnostic> {
-        let mut state = self.state.write().await;
-        let diagnostic = IndexDiagnostic {
-            id: state.allocate_id(),
-            tenant_id,
-            bucket_id,
-            bucket_name: bucket_name.to_string(),
-            index_id,
-            index_name: index_name.to_string(),
-            object_key: object_key.to_string(),
-            version_id,
-            severity: severity.to_string(),
-            code: code.to_string(),
-            message: message.to_string(),
-            details,
-            created_at: Utc::now(),
-        };
-        state.index_diagnostics.push(diagnostic.clone());
-        self.persist_after_write(&state).await?;
-        Ok(diagnostic)
+        index_diagnostic_journal::write_index_diagnostic(
+            &self.storage,
+            IndexDiagnostic {
+                id: 0,
+                tenant_id,
+                bucket_id,
+                bucket_name: bucket_name.to_string(),
+                index_id,
+                index_name: index_name.to_string(),
+                object_key: object_key.to_string(),
+                version_id,
+                severity: severity.to_string(),
+                code: code.to_string(),
+                message: message.to_string(),
+                details,
+                created_at: Utc::now(),
+            },
+        )
+        .await
     }
 
     pub async fn list_index_diagnostics(
@@ -2063,28 +2063,20 @@ impl Persistence {
         after_cursor: i64,
         limit: i32,
     ) -> Result<Vec<IndexDiagnostic>> {
-        let mut diagnostics = self
-            .state
-            .read()
-            .await
-            .index_diagnostics
-            .iter()
-            .filter(|d| {
-                d.tenant_id == tenant_id
-                    && d.bucket_id == bucket_id
-                    && d.id > after_cursor
-                    && (index_name.is_empty() || d.index_name == index_name)
-                    && (severity.is_empty() || d.severity == severity)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        diagnostics.sort_by_key(|d| d.id);
-        diagnostics.truncate(if limit == 0 {
-            1000
-        } else {
-            limit.max(1) as usize
-        });
-        Ok(diagnostics)
+        index_diagnostic_journal::read_index_diagnostics(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            index_name,
+            severity,
+            after_cursor,
+            if limit == 0 {
+                1000
+            } else {
+                limit.max(1) as usize
+            },
+        )
+        .await
     }
 
     pub async fn hard_delete_object(&self, object_id: i64) -> Result<()> {

@@ -93,6 +93,15 @@ impl Storage {
             .join("definitions.anjournal")
     }
 
+    pub fn index_diagnostic_journal_path(&self, tenant_id: i64, bucket_id: i64) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("index")
+            .join(format!("tenant-{tenant_id}"))
+            .join(format!("bucket-{bucket_id}"))
+            .join("diagnostics.anjournal")
+    }
+
     pub fn task_lease_path(&self, task_id: &str) -> Result<PathBuf> {
         ensure_safe_internal_component(task_id, "task id")?;
         Ok(self
