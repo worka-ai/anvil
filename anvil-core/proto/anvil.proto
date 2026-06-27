@@ -75,6 +75,7 @@ service IndexService {
   rpc DropIndex(DropIndexRequest) returns (DropIndexResponse);
   rpc ListIndexes(ListIndexesRequest) returns (ListIndexesResponse);
   rpc WatchIndexDefinition(WatchIndexDefinitionRequest) returns (stream WatchIndexDefinitionResponse);
+  rpc ListIndexDiagnostics(ListIndexDiagnosticsRequest) returns (ListIndexDiagnosticsResponse);
 }
 
 message CreateIndexRequest {
@@ -146,6 +147,31 @@ message WatchIndexDefinitionResponse {
     string event_type = 2;
     IndexDefinitionRecord index = 3;
     string emitted_at = 4;
+}
+
+message ListIndexDiagnosticsRequest {
+    string bucket_name = 1;
+    string index_name = 2;
+    uint64 after_cursor = 3;
+    uint32 limit = 4;
+    string severity = 5;
+}
+
+message IndexDiagnosticRecord {
+    uint64 cursor = 1;
+    string bucket_name = 2;
+    string index_name = 3;
+    string object_key = 4;
+    string version_id = 5;
+    string severity = 6;
+    string code = 7;
+    string message = 8;
+    string details_json = 9;
+    string created_at = 10;
+}
+
+message ListIndexDiagnosticsResponse {
+    repeated IndexDiagnosticRecord diagnostics = 1;
 }
 
 // Object Service

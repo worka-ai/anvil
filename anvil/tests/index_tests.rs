@@ -2,7 +2,8 @@ use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::index_service_client::IndexServiceClient;
 use anvil::anvil_api::{
     CreateBucketRequest, CreateIndexRequest, DisableIndexRequest, DropIndexRequest,
-    ListIndexesRequest, UpdateIndexRequest, WatchIndexDefinitionRequest,
+    ListIndexDiagnosticsRequest, ListIndexesRequest, UpdateIndexRequest,
+    WatchIndexDefinitionRequest,
 };
 use anvil_test_utils::*;
 use futures_util::StreamExt;
@@ -273,4 +274,132 @@ async fn test_index_definition_rejects_invalid_policy_shape() {
         .await
         .unwrap_err();
     assert_eq!(invalid_json.code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn test_list_index_diagnostics_filters_by_index_and_severity() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
+
+    let bucket_name = "index-diagnostics-bucket".to_string();
+    bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let created = index_client
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket_name: bucket_name.clone(),
+                name: "body-text".to_string(),
+                kind: "full_text".to_string(),
+                selector_json: serde_json::json!({"selector": "object_body_utf8"}).to_string(),
+                extractor_json: serde_json::json!({"encoding": "utf8"}).to_string(),
+                authorization_mode: "inherit_object".to_string(),
+                build_policy_json: serde_json::json!({"require_index_success": false}).to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .index
+        .expect("created index");
+
+    let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
+    let bucket = cluster.states[0]
+        .db
+        .get_bucket_by_name(claims.tenant_id, &bucket_name)
+        .await
+        .unwrap()
+        .expect("bucket exists");
+    cluster.states[0]
+        .db
+        .create_index_diagnostic(
+            claims.tenant_id,
+            bucket.id,
+            &bucket.name,
+            Some(created.index_id as i64),
+            "body-text",
+            "docs/bad.txt",
+            None,
+            "warning",
+            "ExtractionFailed",
+            "object body was not valid UTF-8",
+            serde_json::json!({"selector": "object_body_utf8"}),
+        )
+        .await
+        .unwrap();
+    cluster.states[0]
+        .db
+        .create_index_diagnostic(
+            claims.tenant_id,
+            bucket.id,
+            &bucket.name,
+            Some(created.index_id as i64),
+            "body-text",
+            "docs/too-large.txt",
+            None,
+            "error",
+            "PayloadTooLarge",
+            "payload exceeded extraction limit",
+            serde_json::json!({"limit_bytes": 1048576}),
+        )
+        .await
+        .unwrap();
+
+    let warnings = index_client
+        .list_index_diagnostics(authorized(
+            ListIndexDiagnosticsRequest {
+                bucket_name: bucket_name.clone(),
+                index_name: "body-text".to_string(),
+                after_cursor: 0,
+                limit: 100,
+                severity: "warning".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .diagnostics;
+
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].object_key, "docs/bad.txt");
+    assert_eq!(warnings[0].code, "ExtractionFailed");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&warnings[0].details_json).unwrap()["selector"],
+        "object_body_utf8"
+    );
+
+    let all = index_client
+        .list_index_diagnostics(authorized(
+            ListIndexDiagnosticsRequest {
+                bucket_name,
+                index_name: String::new(),
+                after_cursor: warnings[0].cursor,
+                limit: 100,
+                severity: String::new(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .diagnostics;
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].severity, "error");
 }

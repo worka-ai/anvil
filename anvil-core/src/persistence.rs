@@ -192,6 +192,23 @@ pub struct IndexDefinitionEvent {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct IndexDiagnostic {
+    pub id: i64,
+    pub tenant_id: i64,
+    pub bucket_id: i64,
+    pub bucket_name: String,
+    pub index_id: Option<i64>,
+    pub index_name: String,
+    pub object_key: String,
+    pub version_id: Option<uuid::Uuid>,
+    pub severity: String,
+    pub code: String,
+    pub message: String,
+    pub details: JsonValue,
+    pub created_at: DateTime<Utc>,
+}
+
 // Manual row-to-struct mapping
 impl From<Row> for Tenant {
     fn from(row: Row) -> Self {
@@ -389,6 +406,26 @@ impl From<Row> for IndexDefinitionEvent {
             event_type: row.get("event_type"),
             index_version: row.get("index_version"),
             definition: row.get("definition"),
+            created_at: row.get("created_at"),
+        }
+    }
+}
+
+impl From<Row> for IndexDiagnostic {
+    fn from(row: Row) -> Self {
+        Self {
+            id: row.get("id"),
+            tenant_id: row.get("tenant_id"),
+            bucket_id: row.get("bucket_id"),
+            bucket_name: row.get("bucket_name"),
+            index_id: row.get("index_id"),
+            index_name: row.get("index_name"),
+            object_key: row.get("object_key"),
+            version_id: row.get("version_id"),
+            severity: row.get("severity"),
+            code: row.get("code"),
+            message: row.get("message"),
+            details: row.get("details"),
             created_at: row.get("created_at"),
         }
     }
@@ -2379,6 +2416,83 @@ impl Persistence {
                 &[
                     &tenant_id,
                     &bucket_id,
+                    &after_cursor,
+                    &(if limit == 0 { 1000 } else { limit } as i64),
+                ],
+            )
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_index_diagnostic(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        bucket_name: &str,
+        index_id: Option<i64>,
+        index_name: &str,
+        object_key: &str,
+        version_id: Option<uuid::Uuid>,
+        severity: &str,
+        code: &str,
+        message: &str,
+        details: JsonValue,
+    ) -> Result<IndexDiagnostic> {
+        let client = self.regional_pool.get().await?;
+        let row = client
+            .query_one(
+                r#"
+                INSERT INTO index_diagnostics
+                    (tenant_id, bucket_id, bucket_name, index_id, index_name, object_key,
+                     version_id, severity, code, message, details)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                RETURNING *"#,
+                &[
+                    &tenant_id,
+                    &bucket_id,
+                    &bucket_name,
+                    &index_id,
+                    &index_name,
+                    &object_key,
+                    &version_id,
+                    &severity,
+                    &code,
+                    &message,
+                    &details,
+                ],
+            )
+            .await?;
+        Ok(row.into())
+    }
+
+    pub async fn list_index_diagnostics(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        index_name: &str,
+        severity: &str,
+        after_cursor: i64,
+        limit: i32,
+    ) -> Result<Vec<IndexDiagnostic>> {
+        let client = self.regional_pool.get().await?;
+        let rows = client
+            .query(
+                r#"
+                SELECT *
+                FROM index_diagnostics
+                WHERE tenant_id = $1
+                  AND bucket_id = $2
+                  AND ($3 = '' OR index_name = $3)
+                  AND ($4 = '' OR severity = $4)
+                  AND id > $5
+                ORDER BY id
+                LIMIT $6"#,
+                &[
+                    &tenant_id,
+                    &bucket_id,
+                    &index_name,
+                    &severity,
                     &after_cursor,
                     &(if limit == 0 { 1000 } else { limit } as i64),
                 ],

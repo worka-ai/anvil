@@ -266,6 +266,51 @@ impl IndexService for AppState {
             Box::pin(ReceiverStream::new(rx)) as Self::WatchIndexDefinitionStream
         ))
     }
+
+    async fn list_index_diagnostics(
+        &self,
+        request: Request<ListIndexDiagnosticsRequest>,
+    ) -> Result<Response<ListIndexDiagnosticsResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        if !req.index_name.is_empty() {
+            validate_index_name(&req.index_name)?;
+        }
+        if !req.severity.is_empty() {
+            validate_diagnostic_severity(&req.severity)?;
+        }
+        if !auth::is_authorized(AnvilAction::IndexRead, &req.bucket_name, &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+        let bucket = self
+            .get_index_bucket(claims.tenant_id, &req.bucket_name)
+            .await?;
+        let after_cursor = i64::try_from(req.after_cursor)
+            .map_err(|_| Status::invalid_argument("after_cursor exceeds supported range"))?;
+        let limit = i32::try_from(req.limit)
+            .map_err(|_| Status::invalid_argument("limit exceeds supported range"))?;
+        let diagnostics = self
+            .db
+            .list_index_diagnostics(
+                claims.tenant_id,
+                bucket.id,
+                &req.index_name,
+                &req.severity,
+                after_cursor,
+                limit,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .into_iter()
+            .map(index_diagnostic_record)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Response::new(ListIndexDiagnosticsResponse { diagnostics }))
+    }
 }
 
 impl AppState {
@@ -337,6 +382,13 @@ fn validate_authorization_mode(value: &str) -> Result<(), Status> {
     match value {
         "inherit_object" | "index_only" | "public" => Ok(()),
         _ => Err(Status::invalid_argument("Invalid authorization_mode")),
+    }
+}
+
+fn validate_diagnostic_severity(value: &str) -> Result<(), Status> {
+    match value {
+        "info" | "warning" | "error" => Ok(()),
+        _ => Err(Status::invalid_argument("Invalid diagnostic severity")),
     }
 }
 
@@ -426,4 +478,25 @@ fn json_string_field(value: &JsonValue, name: &str) -> Result<String, Status> {
         .and_then(JsonValue::as_str)
         .map(ToString::to_string)
         .ok_or_else(|| Status::internal("Malformed index definition event"))
+}
+
+fn index_diagnostic_record(
+    diagnostic: crate::persistence::IndexDiagnostic,
+) -> Result<IndexDiagnosticRecord, Status> {
+    Ok(IndexDiagnosticRecord {
+        cursor: u64::try_from(diagnostic.id)
+            .map_err(|_| Status::internal("Invalid diagnostic cursor"))?,
+        bucket_name: diagnostic.bucket_name,
+        index_name: diagnostic.index_name,
+        object_key: diagnostic.object_key,
+        version_id: diagnostic
+            .version_id
+            .map(|version_id| version_id.to_string())
+            .unwrap_or_default(),
+        severity: diagnostic.severity,
+        code: diagnostic.code,
+        message: diagnostic.message,
+        details_json: diagnostic.details.to_string(),
+        created_at: diagnostic.created_at.to_string(),
+    })
 }
