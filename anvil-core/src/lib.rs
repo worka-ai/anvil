@@ -54,6 +54,7 @@ pub mod search_query;
 pub mod services;
 pub mod sharding;
 pub mod storage;
+pub mod task_journal;
 pub mod task_lease;
 pub mod tasks;
 pub mod validation;

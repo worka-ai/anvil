@@ -17,6 +17,7 @@ use crate::{
     config::Config,
     control_journal,
     storage::Storage,
+    task_journal,
 };
 
 #[derive(Debug, Clone)]
@@ -44,7 +45,6 @@ struct NativeState {
     admin_users: Vec<AdminUser>,
     admin_roles: Vec<AdminRole>,
     admin_user_roles: Vec<AdminUserRole>,
-    tasks: Vec<TaskRecord>,
     hf_keys: Vec<HfKey>,
     hf_ingestions: Vec<HfIngestion>,
     hf_items: Vec<HfIngestionItem>,
@@ -2289,50 +2289,15 @@ impl Persistence {
         payload: JsonValue,
         priority: i32,
     ) -> Result<()> {
-        let mut state = self.state.write().await;
-        let now = Utc::now();
-        let task = TaskRecord {
-            id: state.allocate_id(),
-            task_type,
-            payload,
-            priority,
-            status: crate::tasks::TaskStatus::Pending,
-            attempts: 0,
-            last_error: None,
-            scheduled_at: now,
-            created_at: now,
-            updated_at: now,
-        };
-        state.tasks.push(task);
-        self.persist_after_write(&state).await
+        task_journal::enqueue_task(&self.storage, task_type, payload, priority).await
     }
 
     pub async fn claim_pending_tasks(&self, limit: i64) -> Result<Vec<TaskRecord>> {
-        let mut state = self.state.write().await;
-        let now = Utc::now();
-        let mut indexes = state
-            .tasks
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.status == crate::tasks::TaskStatus::Pending && t.scheduled_at <= now)
-            .map(|(idx, t)| (idx, t.priority, t.created_at))
-            .collect::<Vec<_>>();
-        indexes.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2)));
-        let mut out = Vec::new();
-        for (idx, _, _) in indexes.into_iter().take(limit.max(0) as usize) {
-            state.tasks[idx].status = crate::tasks::TaskStatus::Running;
-            state.tasks[idx].updated_at = now;
-            out.push(state.tasks[idx].clone());
-        }
-        if !out.is_empty() {
-            self.persist_after_write(&state).await?;
-        }
-        Ok(out)
+        task_journal::claim_pending_tasks(&self.storage, limit).await
     }
 
     pub async fn list_tasks(&self) -> Result<Vec<TaskRecord>> {
-        self.refresh_from_disk().await?;
-        Ok(self.state.read().await.tasks.clone())
+        task_journal::list_tasks(&self.storage).await
     }
 
     pub async fn update_task_status(
@@ -2340,25 +2305,11 @@ impl Persistence {
         task_id: i64,
         status: crate::tasks::TaskStatus,
     ) -> Result<()> {
-        let mut state = self.state.write().await;
-        if let Some(task) = state.tasks.iter_mut().find(|t| t.id == task_id) {
-            task.status = status;
-            task.updated_at = Utc::now();
-        }
-        self.persist_after_write(&state).await
+        task_journal::update_task_status(&self.storage, task_id, status).await
     }
 
     pub async fn fail_task(&self, task_id: i64, error: &str) -> Result<()> {
-        let mut state = self.state.write().await;
-        if let Some(task) = state.tasks.iter_mut().find(|t| t.id == task_id) {
-            task.status = crate::tasks::TaskStatus::Failed;
-            task.last_error = Some(error.to_string());
-            task.attempts += 1;
-            task.scheduled_at = Utc::now()
-                + chrono::Duration::seconds(i64::from(task.attempts * task.attempts * 10));
-            task.updated_at = Utc::now();
-        }
-        self.persist_after_write(&state).await
+        task_journal::fail_task(&self.storage, task_id, error).await
     }
 
     pub async fn hf_create_key(

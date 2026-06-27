@@ -103,6 +103,13 @@ impl Storage {
             .join(format!("{task_id}.json")))
     }
 
+    pub fn task_queue_journal_path(&self) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("tasks")
+            .join("tasks.anjournal")
+    }
+
     pub fn authz_tuple_journal_path(&self, tenant_id: i64) -> PathBuf {
         self.authz_tuple_segment_dir(tenant_id)
             .join("tuples.anjournal")

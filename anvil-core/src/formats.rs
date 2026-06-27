@@ -318,6 +318,7 @@ pub enum JournalRecordKind {
     TaskCheckpoint = 8,
     BucketMetadata = 9,
     ControlPlane = 10,
+    TaskQueue = 11,
 }
 
 impl JournalRecordKind {
@@ -333,6 +334,7 @@ impl JournalRecordKind {
             8 => Ok(Self::TaskCheckpoint),
             9 => Ok(Self::BucketMetadata),
             10 => Ok(Self::ControlPlane),
+            11 => Ok(Self::TaskQueue),
             other => Err(FormatError::UnsupportedFamily(other)),
         }
     }
