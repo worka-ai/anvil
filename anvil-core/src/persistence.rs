@@ -150,6 +150,23 @@ pub struct AuthzTupleRecord {
     pub written_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct IndexDefinition {
+    pub id: i64,
+    pub tenant_id: i64,
+    pub bucket_id: i64,
+    pub name: String,
+    pub kind: String,
+    pub selector: JsonValue,
+    pub extractor: JsonValue,
+    pub authorization_mode: String,
+    pub build_policy: JsonValue,
+    pub enabled: bool,
+    pub version: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 // Manual row-to-struct mapping
 impl From<Row> for Tenant {
     fn from(row: Row) -> Self {
@@ -297,6 +314,26 @@ impl From<Row> for AuthzTupleRecord {
             reason: row.get("reason"),
             record_hash: row.get("record_hash"),
             written_at: row.get("written_at"),
+        }
+    }
+}
+
+impl From<Row> for IndexDefinition {
+    fn from(row: Row) -> Self {
+        Self {
+            id: row.get("id"),
+            tenant_id: row.get("tenant_id"),
+            bucket_id: row.get("bucket_id"),
+            name: row.get("name"),
+            kind: row.get("kind"),
+            selector: row.get("selector"),
+            extractor: row.get("extractor"),
+            authorization_mode: row.get("authorization_mode"),
+            build_policy: row.get("build_policy"),
+            enabled: row.get("enabled"),
+            version: row.get("version"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
         }
     }
 }
@@ -2035,6 +2072,138 @@ impl Persistence {
                     &namespace,
                     &(if limit == 0 { 1000 } else { limit } as i64),
                 ],
+            )
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_index_definition(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        name: &str,
+        kind: &str,
+        selector: JsonValue,
+        extractor: JsonValue,
+        authorization_mode: &str,
+        build_policy: JsonValue,
+    ) -> Result<IndexDefinition> {
+        let client = self.regional_pool.get().await?;
+        let row = client
+            .query_one(
+                r#"
+                INSERT INTO index_definitions
+                    (tenant_id, bucket_id, name, kind, selector, extractor, authorization_mode, build_policy)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                RETURNING *"#,
+                &[
+                    &tenant_id,
+                    &bucket_id,
+                    &name,
+                    &kind,
+                    &selector,
+                    &extractor,
+                    &authorization_mode,
+                    &build_policy,
+                ],
+            )
+            .await?;
+        Ok(row.into())
+    }
+
+    pub async fn update_index_definition(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        name: &str,
+        selector: JsonValue,
+        extractor: JsonValue,
+        authorization_mode: &str,
+        build_policy: JsonValue,
+    ) -> Result<Option<IndexDefinition>> {
+        let client = self.regional_pool.get().await?;
+        let row = client
+            .query_opt(
+                r#"
+                UPDATE index_definitions
+                SET selector = $4,
+                    extractor = $5,
+                    authorization_mode = $6,
+                    build_policy = $7,
+                    version = version + 1,
+                    updated_at = now()
+                WHERE tenant_id = $1 AND bucket_id = $2 AND name = $3
+                RETURNING *"#,
+                &[
+                    &tenant_id,
+                    &bucket_id,
+                    &name,
+                    &selector,
+                    &extractor,
+                    &authorization_mode,
+                    &build_policy,
+                ],
+            )
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
+    pub async fn disable_index_definition(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        name: &str,
+    ) -> Result<Option<IndexDefinition>> {
+        let client = self.regional_pool.get().await?;
+        let row = client
+            .query_opt(
+                r#"
+                UPDATE index_definitions
+                SET enabled = false,
+                    version = version + 1,
+                    updated_at = now()
+                WHERE tenant_id = $1 AND bucket_id = $2 AND name = $3
+                RETURNING *"#,
+                &[&tenant_id, &bucket_id, &name],
+            )
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
+    pub async fn drop_index_definition(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        name: &str,
+    ) -> Result<bool> {
+        let client = self.regional_pool.get().await?;
+        let changed = client
+            .execute(
+                "DELETE FROM index_definitions WHERE tenant_id = $1 AND bucket_id = $2 AND name = $3",
+                &[&tenant_id, &bucket_id, &name],
+            )
+            .await?;
+        Ok(changed > 0)
+    }
+
+    pub async fn list_index_definitions(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        include_disabled: bool,
+    ) -> Result<Vec<IndexDefinition>> {
+        let client = self.regional_pool.get().await?;
+        let rows = client
+            .query(
+                r#"
+                SELECT *
+                FROM index_definitions
+                WHERE tenant_id = $1
+                  AND bucket_id = $2
+                  AND ($3 OR enabled)
+                ORDER BY name"#,
+                &[&tenant_id, &bucket_id, &include_disabled],
             )
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())

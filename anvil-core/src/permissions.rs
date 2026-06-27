@@ -16,6 +16,7 @@ pub enum AnvilAction {
     HfIngestionAll, // Matches hf_ingestion:*
     PolicyAll,      // Matches policy:*
     AuthzAll,       // Matches authz:*
+    IndexAll,       // Matches index:*
 
     // Bucket actions
     BucketCreate,
@@ -51,6 +52,12 @@ pub enum AnvilAction {
     AuthzCheck,
     AuthzWatch,
 
+    // Index actions
+    IndexCreate,
+    IndexRead,
+    IndexUpdate,
+    IndexDelete,
+
     // Internal actions
     InternalPutShard,
     InternalGetShard,
@@ -70,6 +77,7 @@ impl fmt::Display for AnvilAction {
             AnvilAction::HfIngestionAll => "hf_ingestion:*",
             AnvilAction::PolicyAll => "policy:*",
             AnvilAction::AuthzAll => "authz:*",
+            AnvilAction::IndexAll => "index:*",
 
             // Bucket actions
             AnvilAction::BucketCreate => "bucket:create",
@@ -105,6 +113,12 @@ impl fmt::Display for AnvilAction {
             AnvilAction::AuthzCheck => "authz:check",
             AnvilAction::AuthzWatch => "authz:watch",
 
+            // Index actions
+            AnvilAction::IndexCreate => "index:create",
+            AnvilAction::IndexRead => "index:read",
+            AnvilAction::IndexUpdate => "index:update",
+            AnvilAction::IndexDelete => "index:delete",
+
             // Internal actions
             AnvilAction::InternalPutShard => "internal:put_shard",
             AnvilAction::InternalGetShard => "internal:get_shard",
@@ -129,6 +143,7 @@ impl FromStr for AnvilAction {
             "hf_ingestion:*" => Ok(AnvilAction::HfIngestionAll),
             "policy:*" => Ok(AnvilAction::PolicyAll),
             "authz:*" => Ok(AnvilAction::AuthzAll),
+            "index:*" => Ok(AnvilAction::IndexAll),
 
             // Bucket actions
             "bucket:create" => Ok(AnvilAction::BucketCreate),
@@ -164,6 +179,12 @@ impl FromStr for AnvilAction {
             "authz:check" => Ok(AnvilAction::AuthzCheck),
             "authz:watch" => Ok(AnvilAction::AuthzWatch),
 
+            // Index actions
+            "index:create" => Ok(AnvilAction::IndexCreate),
+            "index:read" => Ok(AnvilAction::IndexRead),
+            "index:update" => Ok(AnvilAction::IndexUpdate),
+            "index:delete" => Ok(AnvilAction::IndexDelete),
+
             // Internal actions
             "internal:put_shard" => Ok(AnvilAction::InternalPutShard),
             "internal:get_shard" => Ok(AnvilAction::InternalGetShard),
@@ -188,11 +209,15 @@ mod tests {
             AnvilAction::HfKeyAll,
             AnvilAction::HfIngestionAll,
             AnvilAction::PolicyAll,
+            AnvilAction::AuthzAll,
+            AnvilAction::IndexAll,
             AnvilAction::BucketCreate,
             AnvilAction::ObjectWrite,
             AnvilAction::HfKeyList,
             AnvilAction::HfIngestionCreate,
             AnvilAction::PolicyGrant,
+            AnvilAction::AuthzCheck,
+            AnvilAction::IndexCreate,
             AnvilAction::InternalPutShard,
             AnvilAction::InternalDeleteShard,
         ];

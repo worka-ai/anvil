@@ -51,6 +51,74 @@ message PutBucketPolicyRequest {
 message PutBucketPolicyResponse {}
 
 
+// Index Service
+service IndexService {
+  rpc CreateIndex(CreateIndexRequest) returns (IndexDefinitionResponse);
+  rpc UpdateIndex(UpdateIndexRequest) returns (IndexDefinitionResponse);
+  rpc DisableIndex(DisableIndexRequest) returns (IndexDefinitionResponse);
+  rpc DropIndex(DropIndexRequest) returns (DropIndexResponse);
+  rpc ListIndexes(ListIndexesRequest) returns (ListIndexesResponse);
+}
+
+message CreateIndexRequest {
+    string bucket_name = 1;
+    string name = 2;
+    string kind = 3;
+    string selector_json = 4;
+    string extractor_json = 5;
+    string authorization_mode = 6;
+    string build_policy_json = 7;
+}
+
+message UpdateIndexRequest {
+    string bucket_name = 1;
+    string name = 2;
+    string selector_json = 3;
+    string extractor_json = 4;
+    string authorization_mode = 5;
+    string build_policy_json = 6;
+}
+
+message DisableIndexRequest {
+    string bucket_name = 1;
+    string name = 2;
+}
+
+message DropIndexRequest {
+    string bucket_name = 1;
+    string name = 2;
+}
+
+message DropIndexResponse {}
+
+message ListIndexesRequest {
+    string bucket_name = 1;
+    bool include_disabled = 2;
+}
+
+message IndexDefinitionRecord {
+    uint64 index_id = 1;
+    string bucket_name = 2;
+    string name = 3;
+    string kind = 4;
+    string selector_json = 5;
+    string extractor_json = 6;
+    string authorization_mode = 7;
+    string build_policy_json = 8;
+    bool enabled = 9;
+    uint64 version = 10;
+    string created_at = 11;
+    string updated_at = 12;
+}
+
+message IndexDefinitionResponse {
+    IndexDefinitionRecord index = 1;
+}
+
+message ListIndexesResponse {
+    repeated IndexDefinitionRecord indexes = 1;
+}
+
 // Object Service
 service ObjectService {
   rpc PutObject(stream PutObjectRequest) returns (PutObjectResponse);
