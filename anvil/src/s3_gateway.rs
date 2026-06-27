@@ -1708,6 +1708,23 @@ async fn put_object(
         .await;
     }
 
+    if request_has_write_etag_preconditions(req.headers()) {
+        let current = match state
+            .object_manager
+            .current_object_for_write_precondition(claims.tenant_id, &bucket, &key, &claims.scopes)
+            .await
+        {
+            Ok(current) => current,
+            Err(status) => return s3_status_to_response_for_auth(status, true, "NoSuchBucket"),
+        };
+        if let Some(response) = evaluate_write_etag_preconditions(
+            req.headers(),
+            current.as_ref().map(|object| object.etag.as_str()),
+        ) {
+            return response;
+        }
+    }
+
     let options = ObjectWriteOptions {
         content_type: req
             .headers()
@@ -2331,6 +2348,30 @@ fn evaluate_object_preconditions(
     None
 }
 
+fn request_has_write_etag_preconditions(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key(axum::http::header::IF_MATCH)
+        || headers.contains_key(axum::http::header::IF_NONE_MATCH)
+}
+
+fn evaluate_write_etag_preconditions(
+    headers: &axum::http::HeaderMap,
+    current_etag: Option<&str>,
+) -> Option<Response> {
+    if let Some(value) = headers.get(axum::http::header::IF_MATCH) {
+        let value = value.to_str().unwrap_or_default();
+        if !current_etag.is_some_and(|etag| etag_condition_matches(value, etag)) {
+            return Some(precondition_failed_response());
+        }
+    }
+    if let Some(value) = headers.get(axum::http::header::IF_NONE_MATCH) {
+        let value = value.to_str().unwrap_or_default();
+        if current_etag.is_some_and(|etag| etag_condition_matches(value, etag)) {
+            return Some(precondition_failed_response());
+        }
+    }
+    None
+}
+
 fn etag_condition_matches(header_value: &str, current_etag: &str) -> bool {
     header_value
         .split(',')
@@ -2641,6 +2682,68 @@ mod tests {
                 last_modified,
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn write_etag_preconditions_require_existing_match() {
+        let failed_missing = evaluate_write_etag_preconditions(
+            &etag_headers(axum::http::header::IF_MATCH, "\"abc\""),
+            None,
+        )
+        .expect("If-Match without current object should fail");
+        assert_eq!(
+            failed_missing.status(),
+            axum::http::StatusCode::PRECONDITION_FAILED
+        );
+
+        assert!(
+            evaluate_write_etag_preconditions(
+                &etag_headers(axum::http::header::IF_MATCH, "\"abc\""),
+                Some("abc"),
+            )
+            .is_none()
+        );
+
+        let failed_mismatch = evaluate_write_etag_preconditions(
+            &etag_headers(axum::http::header::IF_MATCH, "\"other\""),
+            Some("abc"),
+        )
+        .expect("If-Match mismatch should fail");
+        assert_eq!(
+            failed_mismatch.status(),
+            axum::http::StatusCode::PRECONDITION_FAILED
+        );
+    }
+
+    #[test]
+    fn write_etag_preconditions_enforce_if_none_match() {
+        assert!(
+            evaluate_write_etag_preconditions(
+                &etag_headers(axum::http::header::IF_NONE_MATCH, "\"abc\""),
+                None,
+            )
+            .is_none()
+        );
+
+        let failed_existing = evaluate_write_etag_preconditions(
+            &etag_headers(axum::http::header::IF_NONE_MATCH, "\"abc\""),
+            Some("abc"),
+        )
+        .expect("matching If-None-Match should fail writes");
+        assert_eq!(
+            failed_existing.status(),
+            axum::http::StatusCode::PRECONDITION_FAILED
+        );
+
+        let failed_star = evaluate_write_etag_preconditions(
+            &etag_headers(axum::http::header::IF_NONE_MATCH, "*"),
+            Some("abc"),
+        )
+        .expect("If-None-Match wildcard should fail existing object writes");
+        assert_eq!(
+            failed_star.status(),
+            axum::http::StatusCode::PRECONDITION_FAILED
         );
     }
 

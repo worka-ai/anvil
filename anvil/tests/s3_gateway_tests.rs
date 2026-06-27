@@ -47,6 +47,53 @@ fn create_app(global_db_url: &str, app_name: &str) -> (String, String) {
     (client_id, client_secret)
 }
 
+fn grant_wildcard_policy(global_db_url: &str, app_name: &str) {
+    let admin_args = &["run", "--bin", "admin", "--"];
+    let policy_args = &[
+        "policy",
+        "grant",
+        "--app-name",
+        app_name,
+        "--action",
+        "*",
+        "--resource",
+        "*",
+    ];
+    let status = std::process::Command::new("cargo")
+        .args(
+            admin_args
+                .iter()
+                .chain(&[
+                    "--global-database-url",
+                    global_db_url,
+                    "--anvil-secret-encryption-key",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ])
+                .chain(policy_args.iter()),
+        )
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+fn s3_client(http_base: &str, client_id: &str, client_secret: &str) -> Client {
+    let credentials = aws_sdk_s3::config::Credentials::new(
+        client_id,
+        client_secret,
+        None, // session token
+        None, // expiry
+        "static",
+    );
+
+    let config = aws_sdk_s3::Config::builder()
+        .credentials_provider(credentials)
+        .region(aws_sdk_s3::config::Region::new("test-region"))
+        .endpoint_url(http_base)
+        .behavior_version_latest()
+        .build();
+    Client::from_conf(config)
+}
+
 // Helper to get a token for specific scopes.
 async fn get_token_for_scopes(
     grpc_addr: &str,
@@ -70,6 +117,81 @@ async fn get_token_for_scopes(
 }
 
 #[tokio::test]
+async fn test_s3_put_write_etag_preconditions() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let app_name = format!("s3-write-preconditions-{}", uuid::Uuid::new_v4());
+    let (client_id, client_secret) = create_app(&cluster.global_db_url, &app_name);
+    grant_wildcard_policy(&cluster.global_db_url, &app_name);
+
+    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
+    let client = s3_client(http_base, &client_id, &client_secret);
+    let bucket = format!("s3-write-preconditions-{}", uuid::Uuid::new_v4());
+    let key = "preconditioned.txt";
+
+    client
+        .create_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("S3 CreateBucket should succeed");
+
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_none_match("*")
+        .body(ByteStream::from_static(b"created once"))
+        .send()
+        .await
+        .expect("If-None-Match create should succeed when object is absent");
+    let duplicate_create = client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_none_match("*")
+        .body(ByteStream::from_static(b"created twice"))
+        .send()
+        .await;
+    assert!(
+        duplicate_create.is_err(),
+        "If-None-Match create should reject existing object"
+    );
+
+    let head = client
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("HEAD should return current ETag");
+    let etag = head.e_tag().expect("current ETag").to_string();
+
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match(&etag)
+        .body(ByteStream::from_static(b"updated through If-Match"))
+        .send()
+        .await
+        .expect("matching If-Match PUT should update the object");
+    let stale_update = client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match(&etag)
+        .body(ByteStream::from_static(b"stale update"))
+        .send()
+        .await;
+    assert!(
+        stale_update.is_err(),
+        "stale If-Match PUT should reject the update"
+    );
+}
+
+#[tokio::test]
 async fn test_s3_public_and_private_access() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
@@ -77,32 +199,7 @@ async fn test_s3_public_and_private_access() {
     let (client_id, client_secret) = create_app(&cluster.global_db_url, "s3-test-app");
 
     // Grant wildcard policy to the app before getting a token
-    let admin_args = &["run", "--bin", "admin", "--"];
-    let policy_args = &[
-        "policy",
-        "grant",
-        "--app-name",
-        "s3-test-app",
-        "--action",
-        "*",
-        "--resource",
-        "*",
-    ];
-    let status = std::process::Command::new("cargo")
-        .args(
-            admin_args
-                .iter()
-                .chain(&[
-                    "--global-database-url",
-                    &cluster.global_db_url,
-                    "--anvil-secret-encryption-key",
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                ])
-                .chain(policy_args.iter()),
-        )
-        .status()
-        .unwrap();
-    assert!(status.success());
+    grant_wildcard_policy(&cluster.global_db_url, "s3-test-app");
 
     // Allow a moment for the policy change to propagate or be read by the server.
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -164,23 +261,9 @@ async fn test_s3_public_and_private_access() {
     auth_client.set_public_access(public_req).await.unwrap();
 
     // 3. Configure AWS S3 client to talk to our local server
-    let credentials = aws_sdk_s3::config::Credentials::new(
-        &client_id,
-        &client_secret,
-        None, // session token
-        None, // expiry
-        "static",
-    );
-
     // TestCluster stores gRPC base at /grpc; S3 must hit HTTP root.
     let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
-    let config = aws_sdk_s3::Config::builder()
-        .credentials_provider(credentials)
-        .region(aws_sdk_s3::config::Region::new("test-region"))
-        .endpoint_url(http_base)
-        .behavior_version_latest()
-        .build();
-    let client = Client::from_conf(config);
+    let client = s3_client(http_base, &client_id, &client_secret);
 
     let location = client
         .get_bucket_location()
@@ -345,6 +428,62 @@ async fn test_s3_public_and_private_access() {
     assert!(
         if_none_match_hit.is_err(),
         "matching If-None-Match HEAD should return not modified"
+    );
+
+    let create_only_key = "create-only.txt";
+    client
+        .put_object()
+        .bucket(&private_bucket)
+        .key(create_only_key)
+        .if_none_match("*")
+        .body(ByteStream::from_static(b"created once"))
+        .send()
+        .await
+        .expect("If-None-Match create should succeed when object is absent");
+    let duplicate_create = client
+        .put_object()
+        .bucket(&private_bucket)
+        .key(create_only_key)
+        .if_none_match("*")
+        .body(ByteStream::from_static(b"created twice"))
+        .send()
+        .await;
+    assert!(
+        duplicate_create.is_err(),
+        "If-None-Match create should reject existing object"
+    );
+
+    let create_only_head = client
+        .head_object()
+        .bucket(&private_bucket)
+        .key(create_only_key)
+        .send()
+        .await
+        .expect("HEAD should return create-only ETag");
+    let create_only_etag = create_only_head
+        .e_tag()
+        .expect("create-only ETag")
+        .to_string();
+    client
+        .put_object()
+        .bucket(&private_bucket)
+        .key(create_only_key)
+        .if_match(&create_only_etag)
+        .body(ByteStream::from_static(b"updated through If-Match"))
+        .send()
+        .await
+        .expect("matching If-Match PUT should update the object");
+    let stale_update = client
+        .put_object()
+        .bucket(&private_bucket)
+        .key(create_only_key)
+        .if_match(&create_only_etag)
+        .body(ByteStream::from_static(b"stale update"))
+        .send()
+        .await;
+    assert!(
+        stale_update.is_err(),
+        "stale If-Match PUT should reject the update"
     );
 
     let utf8_key = "folder/my café document 📄.txt";

@@ -1294,6 +1294,21 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))
     }
 
+    pub async fn current_object_for_write_precondition(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        object_key: &str,
+        scopes: &[String],
+    ) -> Result<Option<Object>, Status> {
+        self.validate_write_request(bucket_name, object_key, scopes)?;
+        let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
+        self.db
+            .get_object(bucket.id, object_key)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))
+    }
+
     pub async fn copy_object(
         &self,
         claims: auth::Claims,
