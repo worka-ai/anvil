@@ -25,6 +25,7 @@ pub mod git_source_index;
 pub mod git_source_query;
 pub mod git_source_watch;
 pub mod index_journal;
+pub mod media_extraction;
 pub mod metadata_journal;
 pub mod middleware;
 pub mod object_manager;
