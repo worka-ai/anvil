@@ -1,7 +1,7 @@
 use super::{FormatError, Hash32, hash32};
 use std::convert::TryInto;
 
-const SEGMENT_BODY_HEADER_LEN: usize = 20;
+pub const SEGMENT_BODY_HEADER_LEN: usize = 20;
 const DATA_BLOCK_HEADER_LEN: usize = 84;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -367,6 +367,26 @@ pub struct SegmentBody {
 }
 
 impl SegmentBody {
+    pub fn from_uncompressed_records(records: &[SegmentRecord]) -> Result<Self, FormatError> {
+        let block = DataBlock::from_uncompressed_records(records)?;
+        let block_index = records
+            .first()
+            .zip(records.last())
+            .map(|(first, last)| {
+                vec![BlockIndexRecord {
+                    first_key: first.key.clone(),
+                    last_key: last.key.clone(),
+                    block_offset: SEGMENT_BODY_HEADER_LEN as u64,
+                    compressed_len: block.compressed_len,
+                    uncompressed_len: block.uncompressed_len,
+                    record_count: block.record_count,
+                    block_hash: block.block_hash,
+                }]
+            })
+            .unwrap_or_default();
+        Ok(Self::new(vec![block], block_index, Vec::new()))
+    }
+
     pub fn new(
         data_blocks: Vec<DataBlock>,
         block_index: Vec<BlockIndexRecord>,

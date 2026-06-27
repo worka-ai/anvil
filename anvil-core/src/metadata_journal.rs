@@ -1,11 +1,13 @@
 use crate::formats::{
-    BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, FormatError, Hash32, JournalFrame,
-    JournalRecordKind, hash32, validate_journal_chain,
+    BinaryEnvelopeHeader, BinaryFileFooter, COMMON_FOOTER_LEN, COMMON_HEADER_LEN, FileFamily,
+    FormatError, Hash32, JournalFrame, JournalRecordKind, hash32,
+    segment::{SegmentBody, SegmentRecord},
+    validate_journal_chain,
 };
 use crate::persistence::{Bucket, Object};
 use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
@@ -49,40 +51,40 @@ struct MetadataJournalHeader<'a> {
     codec: &'static str,
 }
 
-#[derive(Debug, Serialize)]
-struct ObjectVersionBody<'a> {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ObjectVersionBody {
     tenant_id: i64,
     bucket_id: i64,
-    bucket_name: &'a str,
-    object_key: &'a str,
-    event: &'a str,
+    bucket_name: String,
+    object_key: String,
+    event: String,
     version_id: String,
     mutation_id: String,
-    content_hash: &'a str,
+    content_hash: String,
     size: i64,
-    etag: &'a str,
-    content_type: Option<&'a str>,
-    user_metadata_hash: &'a str,
+    etag: String,
+    content_type: Option<String>,
+    user_metadata_hash: String,
     authz_revision: i64,
-    index_policy_snapshot: &'a str,
-    record_hash: &'a str,
+    index_policy_snapshot: String,
+    record_hash: String,
     storage_class: Option<i16>,
     delete_marker: bool,
     created_at: String,
     deleted_at: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct DirectoryEntryBody<'a> {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DirectoryEntryBody {
     tenant_id: i64,
     bucket_id: i64,
-    bucket_name: &'a str,
-    object_key: &'a str,
-    event: &'a str,
+    bucket_name: String,
+    object_key: String,
+    event: String,
     version_id: String,
     mutation_id: String,
     size: i64,
-    etag: &'a str,
+    etag: String,
     delete_marker: bool,
     created_at: String,
     deleted_at: Option<String>,
@@ -114,19 +116,19 @@ pub async fn append_object_mutation(
     let object_body = serde_json::to_vec(&ObjectVersionBody {
         tenant_id: object.tenant_id,
         bucket_id: object.bucket_id,
-        bucket_name: &bucket.name,
-        object_key: &object.key,
-        event: mutation.event_name(),
+        bucket_name: bucket.name.clone(),
+        object_key: object.key.clone(),
+        event: mutation.event_name().to_string(),
         version_id: object.version_id.to_string(),
         mutation_id: object.mutation_id.to_string(),
-        content_hash: &object.content_hash,
+        content_hash: object.content_hash.clone(),
         size: object.size,
-        etag: &object.etag,
-        content_type: object.content_type.as_deref(),
-        user_metadata_hash: &object.user_metadata_hash,
+        etag: object.etag.clone(),
+        content_type: object.content_type.clone(),
+        user_metadata_hash: object.user_metadata_hash.clone(),
         authz_revision: object.authz_revision,
-        index_policy_snapshot: &object.index_policy_snapshot,
-        record_hash: &object.record_hash,
+        index_policy_snapshot: object.index_policy_snapshot.clone(),
+        record_hash: object.record_hash.clone(),
         storage_class: object.storage_class,
         delete_marker: mutation.is_delete_marker(),
         created_at: object.created_at.to_rfc3339(),
@@ -145,13 +147,13 @@ pub async fn append_object_mutation(
     let directory_body = serde_json::to_vec(&DirectoryEntryBody {
         tenant_id: object.tenant_id,
         bucket_id: object.bucket_id,
-        bucket_name: &bucket.name,
-        object_key: &object.key,
-        event: mutation.event_name(),
+        bucket_name: bucket.name.clone(),
+        object_key: object.key.clone(),
+        event: mutation.event_name().to_string(),
         version_id: object.version_id.to_string(),
         mutation_id: object.mutation_id.to_string(),
         size: object.size,
-        etag: &object.etag,
+        etag: object.etag.clone(),
         delete_marker: mutation.is_delete_marker(),
         created_at: object.created_at.to_rfc3339(),
         deleted_at: object.deleted_at.map(|ts| ts.to_rfc3339()),
@@ -181,6 +183,205 @@ pub async fn append_object_mutation(
 
     debug_assert!(header_len <= existing.len());
     Ok(path)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedObjectMetadataSegments {
+    pub generation: u64,
+    pub metadata_path: PathBuf,
+    pub directory_path: PathBuf,
+    pub metadata_record_count: usize,
+    pub directory_record_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SegmentHeader {
+    tenant_id: String,
+    bucket_id: String,
+    partition_family: &'static str,
+    partition_id: String,
+    generation: u64,
+    key_order: &'static str,
+    compression: &'static str,
+    block_size_uncompressed: u32,
+    bloom_bits_per_key: u8,
+}
+
+pub async fn seal_object_journal_segments(
+    storage: &Storage,
+    bucket: &Bucket,
+) -> Result<SealedObjectMetadataSegments> {
+    let journal_path = storage.metadata_journal_path(bucket.tenant_id, bucket.id);
+    let journal_bytes = tokio::fs::read(&journal_path)
+        .await
+        .with_context(|| format!("read metadata journal {}", journal_path.display()))?;
+    let (_, frames) = decode_journal_file(&journal_bytes)?;
+    let generation = frames
+        .last()
+        .map(|frame| frame.partition_sequence)
+        .ok_or_else(|| anyhow!("metadata journal has no frames to seal"))?;
+
+    let mut metadata_records = Vec::new();
+    let mut directory_latest = std::collections::BTreeMap::<Vec<u8>, Vec<u8>>::new();
+    for frame in &frames {
+        match frame.record_kind {
+            JournalRecordKind::ObjectVersion | JournalRecordKind::DeleteMarker => {
+                let body: ObjectVersionBody = serde_json::from_slice(&frame.body)?;
+                metadata_records.push(SegmentRecord::new(
+                    metadata_segment_key(&body),
+                    frame.body.clone(),
+                ));
+            }
+            JournalRecordKind::DirectoryEntry => {
+                let body: DirectoryEntryBody = serde_json::from_slice(&frame.body)?;
+                directory_latest.insert(directory_segment_key(&body), frame.body.clone());
+            }
+            _ => {}
+        }
+    }
+    metadata_records.sort_by(|left, right| left.key.cmp(&right.key));
+    let directory_records = directory_latest
+        .into_iter()
+        .map(|(key, value)| SegmentRecord::new(key, value))
+        .collect::<Vec<_>>();
+
+    let metadata_path = storage.metadata_segment_path(bucket.tenant_id, bucket.id, generation);
+    let directory_path = storage.directory_segment_path(bucket.tenant_id, bucket.id, generation);
+
+    write_segment_file(
+        &metadata_path,
+        FileFamily::MetadataSegment,
+        segment_header(
+            bucket,
+            generation,
+            "object_metadata",
+            "tenant_bucket_key_version",
+        ),
+        &metadata_records,
+    )
+    .await?;
+    write_segment_file(
+        &directory_path,
+        FileFamily::DirectorySegment,
+        segment_header(bucket, generation, "directory", "tenant_bucket_prefix_key"),
+        &directory_records,
+    )
+    .await?;
+
+    Ok(SealedObjectMetadataSegments {
+        generation,
+        metadata_path,
+        directory_path,
+        metadata_record_count: metadata_records.len(),
+        directory_record_count: directory_records.len(),
+    })
+}
+
+pub fn decode_segment_file(input: &[u8], expected_family: FileFamily) -> Result<SegmentBody> {
+    let header = BinaryEnvelopeHeader::decode(input)?;
+    if header.family != expected_family {
+        return Err(anyhow!("segment file family mismatch"));
+    }
+    if input.len() < COMMON_FOOTER_LEN {
+        return Err(FormatError::TooShort {
+            context: "segment file footer",
+            needed: COMMON_FOOTER_LEN,
+            actual: input.len(),
+        }
+        .into());
+    }
+    let header_len = COMMON_HEADER_LEN
+        .checked_add(header.header_json.len())
+        .ok_or_else(|| anyhow!("segment header length overflow"))?;
+    let footer_start = input
+        .len()
+        .checked_sub(COMMON_FOOTER_LEN)
+        .ok_or_else(|| anyhow!("segment footer offset underflow"))?;
+    let body = &input[header_len..footer_start];
+    let footer = BinaryFileFooter::decode(&input[footer_start..])?;
+    footer.verify(&input[..header_len], body)?;
+    SegmentBody::decode(body).map_err(Into::into)
+}
+
+async fn write_segment_file(
+    path: &Path,
+    family: FileFamily,
+    header: SegmentHeader,
+    records: &[SegmentRecord],
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let header_json = serde_json::to_vec(&header)?;
+    let envelope = BinaryEnvelopeHeader::new(family, 0, 0, header_json);
+    let encoded_header = envelope.encode();
+    let body = SegmentBody::from_uncompressed_records(records)?.encode();
+    let (first_record_hash, last_record_hash) = segment_record_hash_bounds(records);
+    let footer = BinaryFileFooter::new(
+        &encoded_header,
+        &body,
+        records.len() as u64,
+        first_record_hash,
+        last_record_hash,
+    );
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .await?;
+    file.write_all(&encoded_header).await?;
+    file.write_all(&body).await?;
+    file.write_all(&footer.encode()).await?;
+    file.sync_data().await?;
+    Ok(())
+}
+
+fn segment_header(
+    bucket: &Bucket,
+    generation: u64,
+    partition_family: &'static str,
+    key_order: &'static str,
+) -> SegmentHeader {
+    SegmentHeader {
+        tenant_id: bucket.tenant_id.to_string(),
+        bucket_id: bucket.id.to_string(),
+        partition_family,
+        partition_id: hex::encode(partition_id(bucket.tenant_id, bucket.id)),
+        generation,
+        key_order,
+        compression: "none",
+        block_size_uncompressed: 64 * 1024,
+        bloom_bits_per_key: 0,
+    }
+}
+
+fn segment_record_hash_bounds(records: &[SegmentRecord]) -> (Hash32, Hash32) {
+    let first = records
+        .first()
+        .map(|record| hash32(&record.encode()))
+        .unwrap_or([0; 32]);
+    let last = records
+        .last()
+        .map(|record| hash32(&record.encode()))
+        .unwrap_or([0; 32]);
+    (first, last)
+}
+
+fn metadata_segment_key(body: &ObjectVersionBody) -> Vec<u8> {
+    format!(
+        "tenant/{}/bucket/{}/object/{}/version/{}",
+        body.tenant_id, body.bucket_id, body.object_key, body.version_id
+    )
+    .into_bytes()
+}
+
+fn directory_segment_key(body: &DirectoryEntryBody) -> Vec<u8> {
+    format!(
+        "tenant/{}/bucket/{}/directory/{}",
+        body.tenant_id, body.bucket_id, body.object_key
+    )
+    .into_bytes()
 }
 
 pub fn decode_journal_file(input: &[u8]) -> Result<(usize, Vec<JournalFrame>)> {
@@ -356,6 +557,57 @@ mod tests {
         assert_eq!(frames[1].previous_record_hash, frames[0].record_hash);
         assert_eq!(frames[2].previous_record_hash, frames[1].record_hash);
         validate_journal_chain(&frames).unwrap();
+    }
+
+    #[tokio::test]
+    async fn seal_object_journal_segments_writes_metadata_and_directory_segments() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let bucket = sample_bucket();
+        let first = sample_object(1, "docs/a.txt", false);
+        let second = sample_object(2, "docs/a.txt", false);
+        let third = sample_object(3, "docs/b.txt", false);
+
+        append_object_mutation(&storage, &bucket, &first, ObjectJournalMutation::Put)
+            .await
+            .unwrap();
+        append_object_mutation(&storage, &bucket, &second, ObjectJournalMutation::Put)
+            .await
+            .unwrap();
+        append_object_mutation(&storage, &bucket, &third, ObjectJournalMutation::Put)
+            .await
+            .unwrap();
+
+        let sealed = seal_object_journal_segments(&storage, &bucket)
+            .await
+            .unwrap();
+        assert_eq!(sealed.generation, 6);
+        assert_eq!(sealed.metadata_record_count, 3);
+        assert_eq!(sealed.directory_record_count, 2);
+
+        let metadata_bytes = tokio::fs::read(&sealed.metadata_path).await.unwrap();
+        let metadata_body =
+            decode_segment_file(&metadata_bytes, FileFamily::MetadataSegment).unwrap();
+        let metadata_records = metadata_body.data_blocks[0]
+            .decode_uncompressed_records()
+            .unwrap();
+        assert_eq!(metadata_records.len(), 3);
+        assert!(
+            metadata_records
+                .windows(2)
+                .all(|pair| pair[0].key <= pair[1].key)
+        );
+
+        let directory_bytes = tokio::fs::read(&sealed.directory_path).await.unwrap();
+        let directory_body =
+            decode_segment_file(&directory_bytes, FileFamily::DirectorySegment).unwrap();
+        let directory_records = directory_body.data_blocks[0]
+            .decode_uncompressed_records()
+            .unwrap();
+        assert_eq!(directory_records.len(), 2);
+        let latest_a: DirectoryEntryBody =
+            serde_json::from_slice(&directory_records[0].value).unwrap();
+        assert_eq!(latest_a.version_id, second.version_id.to_string());
     }
 
     #[tokio::test]

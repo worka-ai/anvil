@@ -49,6 +49,36 @@ impl Storage {
             .join(format!("bucket-{bucket_id}.anjournal"))
     }
 
+    pub fn metadata_segment_path(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        generation: u64,
+    ) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("meta")
+            .join("segments")
+            .join(format!("tenant-{tenant_id}"))
+            .join(format!("bucket-{bucket_id}"))
+            .join(format!("generation-{generation:020}.anseg"))
+    }
+
+    pub fn directory_segment_path(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        generation: u64,
+    ) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("meta")
+            .join("segments")
+            .join(format!("tenant-{tenant_id}"))
+            .join(format!("bucket-{bucket_id}"))
+            .join(format!("generation-{generation:020}.andir"))
+    }
+
     fn get_shard_path(&self, object_hash: &str, shard_index: u32) -> PathBuf {
         self.storage_path
             .join(format!("{}-{:02}", object_hash, shard_index))
