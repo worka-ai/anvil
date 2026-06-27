@@ -64,17 +64,25 @@ struct DeleteObjectsXmlObject {
 }
 
 fn s3_error(code: &str, message: &str, status: axum::http::StatusCode) -> Response {
+    let request_id = new_s3_request_id();
     let body = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\n  <Code>{}</Code>\n  <Message>{}</Message>\n</Error>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\n  <Code>{}</Code>\n  <Message>{}</Message>\n  <RequestId>{}</RequestId>\n</Error>\n",
         code,
-        xml_escape(message)
+        xml_escape(message),
+        request_id
     );
     Response::builder()
         .status(status)
         .header("Content-Type", "application/xml")
+        .header("x-amz-request-id", request_id)
         .body(Body::from(body))
         .unwrap()
 }
+
+fn new_s3_request_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
 pub fn app(state: AppState) -> Router {
     let public = Router::new()
         .route("/ready", get(readiness_check))
@@ -2668,6 +2676,33 @@ mod tests {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(name, httpdate::fmt_http_date(value).parse().unwrap());
         headers
+    }
+
+    #[tokio::test]
+    async fn s3_error_responses_include_request_id_in_header_and_xml() {
+        let response = s3_error(
+            "AccessDenied",
+            "denied <unsafe>",
+            axum::http::StatusCode::FORBIDDEN,
+        );
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+        let request_id = response
+            .headers()
+            .get("x-amz-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(request_id.len(), 32);
+        assert!(request_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let xml = std::str::from_utf8(&body).unwrap();
+        assert!(xml.contains("<Code>AccessDenied</Code>"));
+        assert!(xml.contains("<Message>denied &lt;unsafe&gt;</Message>"));
+        assert!(xml.contains(&format!("<RequestId>{request_id}</RequestId>")));
     }
 
     #[test]
