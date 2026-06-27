@@ -2157,6 +2157,27 @@ impl Persistence {
         Ok(row.into())
     }
 
+    pub async fn latest_object_watch_cursor(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        version_id: uuid::Uuid,
+    ) -> Result<Option<i64>> {
+        let client = self.regional_pool.get().await?;
+        let row = client
+            .query_opt(
+                r#"
+                SELECT id
+                FROM object_watch_events
+                WHERE tenant_id = $1 AND bucket_id = $2 AND version_id = $3
+                ORDER BY id DESC
+                LIMIT 1"#,
+                &[&tenant_id, &bucket_id, &version_id],
+            )
+            .await?;
+        Ok(row.map(|row| row.get("id")))
+    }
+
     pub async fn list_object_watch_events(
         &self,
         tenant_id: i64,

@@ -216,6 +216,7 @@ message PutObjectResponse {
     string record_hash = 5;
     uint64 authz_revision = 6;
     string index_policy_snapshot = 7;
+    uint64 watch_cursor = 8;
 }
 
 message GetObjectRequest {
@@ -243,7 +244,16 @@ message DeleteObjectRequest {
     optional string version_id = 3;
 }
 
-message DeleteObjectResponse {}
+message DeleteObjectResponse {
+    string version_id = 1;
+    string mutation_id = 2;
+    string payload_hash = 3;
+    string record_hash = 4;
+    uint64 authz_revision = 5;
+    string index_policy_snapshot = 6;
+    uint64 watch_cursor = 7;
+    bool delete_marker = 8;
+}
 
 message HeadObjectRequest {
     string bucket_name = 1;

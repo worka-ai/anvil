@@ -57,6 +57,7 @@ impl ObjectService for AppState {
                 ObjectWriteOptions::default(),
             )
             .await?;
+        let watch_cursor = object_watch_cursor(self, &object).await?;
 
         Ok(Response::new(PutObjectResponse {
             etag: object.etag,
@@ -67,6 +68,7 @@ impl ObjectService for AppState {
             authz_revision: u64::try_from(object.authz_revision)
                 .map_err(|_| Status::internal("Invalid authz revision"))?,
             index_policy_snapshot: object.index_policy_snapshot,
+            watch_cursor,
         }))
     }
 
@@ -133,28 +135,40 @@ impl ObjectService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.get_ref();
 
-        if let Some(version_id) = parse_optional_version_id(req.version_id.as_deref())? {
-            self.object_manager
-                .delete_object_version(
-                    claims.tenant_id,
-                    &req.bucket_name,
-                    &req.object_key,
-                    version_id,
-                    &claims.scopes,
-                )
-                .await?;
-        } else {
-            self.object_manager
-                .delete_object(
-                    claims.tenant_id,
-                    &req.bucket_name,
-                    &req.object_key,
-                    &claims.scopes,
-                )
-                .await?;
-        }
+        let deleted =
+            if let Some(version_id) = parse_optional_version_id(req.version_id.as_deref())? {
+                self.object_manager
+                    .delete_object_version(
+                        claims.tenant_id,
+                        &req.bucket_name,
+                        &req.object_key,
+                        version_id,
+                        &claims.scopes,
+                    )
+                    .await?
+            } else {
+                self.object_manager
+                    .delete_object(
+                        claims.tenant_id,
+                        &req.bucket_name,
+                        &req.object_key,
+                        &claims.scopes,
+                    )
+                    .await?
+            };
+        let watch_cursor = object_watch_cursor(self, &deleted).await?;
 
-        Ok(Response::new(DeleteObjectResponse {}))
+        Ok(Response::new(DeleteObjectResponse {
+            version_id: deleted.version_id.to_string(),
+            mutation_id: deleted.mutation_id.to_string(),
+            payload_hash: deleted.content_hash,
+            record_hash: deleted.record_hash,
+            authz_revision: u64::try_from(deleted.authz_revision)
+                .map_err(|_| Status::internal("Invalid authz revision"))?,
+            index_policy_snapshot: deleted.index_policy_snapshot,
+            watch_cursor,
+            delete_marker: deleted.deleted_at.is_some(),
+        }))
     }
 
     async fn head_object(
@@ -686,6 +700,19 @@ fn parse_optional_version_id(value: Option<&str>) -> Result<Option<uuid::Uuid>, 
         .map(uuid::Uuid::parse_str)
         .transpose()
         .map_err(|_| Status::invalid_argument("Invalid version_id"))
+}
+
+async fn object_watch_cursor(
+    state: &AppState,
+    object: &crate::persistence::Object,
+) -> Result<u64, Status> {
+    let cursor = state
+        .db
+        .latest_object_watch_cursor(object.tenant_id, object.bucket_id, object.version_id)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::internal("Object mutation watch event not found"))?;
+    u64::try_from(cursor).map_err(|_| Status::internal("Invalid object watch cursor"))
 }
 
 fn watch_event_response(

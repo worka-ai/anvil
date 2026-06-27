@@ -64,7 +64,12 @@ async fn test_delete_object_creates_delete_marker() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    object_client.put_object(put_req).await.unwrap();
+    let put_res = object_client
+        .put_object(put_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(put_res.watch_cursor > 0);
 
     // 2. Verify it exists
     let mut list_req = Request::new(ListObjectsRequest {
@@ -92,7 +97,16 @@ async fn test_delete_object_creates_delete_marker() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    object_client.delete_object(del_req).await.unwrap();
+    let delete_res = object_client
+        .delete_object(del_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(delete_res.watch_cursor > put_res.watch_cursor);
+    assert!(delete_res.delete_marker);
+    assert!(!delete_res.version_id.is_empty());
+    assert!(!delete_res.mutation_id.is_empty());
+    assert!(!delete_res.record_hash.is_empty());
 
     // 4. Verify it is gone from listings (soft deleted)
     let mut list_req_after_delete = Request::new(ListObjectsRequest {
