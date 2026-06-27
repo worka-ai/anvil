@@ -42,6 +42,16 @@ pub fn create_pool(db_url: &str) -> Result<Pool> {
     Pool::builder(mgr).build().map_err(Into::into)
 }
 
+fn database_server_url(database_url: &str) -> Result<String> {
+    let (server_url, database_name) = database_url
+        .rsplit_once('/')
+        .ok_or_else(|| anyhow::anyhow!("database URL must include a database name"))?;
+    if server_url.is_empty() || database_name.is_empty() {
+        anyhow::bail!("database URL must include a server URL and database name");
+    }
+    Ok(server_url.to_string())
+}
+
 #[allow(dead_code)]
 pub fn extract_credential(output: &str, key: &str) -> String {
     output
@@ -394,19 +404,28 @@ impl Drop for TestCluster {
 
             tokio::spawn(async move {
                 // Drop global database
-                if let Err(e) = maint_client.execute(
-                    &format!("DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)", global_db_name),
-                    &[],
-                ).await {
+                if let Err(e) = maint_client
+                    .execute(
+                        &format!(
+                            "DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)",
+                            global_db_name
+                        ),
+                        &[],
+                    )
+                    .await
+                {
                     eprintln!("Failed to drop global database {}: {}", global_db_name, e);
                 }
 
                 // Drop regional databases
                 for db_name in &regional_db_names {
-                    if let Err(e) = maint_client.execute(
-                        &format!("DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)", db_name),
-                        &[],
-                    ).await {
+                    if let Err(e) = maint_client
+                        .execute(
+                            &format!("DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)", db_name),
+                            &[],
+                        )
+                        .await
+                    {
                         eprintln!("Failed to drop regional database {}: {}", db_name, e);
                     }
                 }
@@ -417,7 +436,13 @@ impl Drop for TestCluster {
 
 async fn create_isolated_dbs(
     num_regional: usize,
-) -> Result<(String, Vec<String>, String, Vec<String>, tokio_postgres::Client)> {
+) -> Result<(
+    String,
+    Vec<String>,
+    String,
+    Vec<String>,
+    tokio_postgres::Client,
+)> {
     dotenvy::dotenv().ok();
     let maint_db_url =
         std::env::var("MAINTENANCE_DATABASE_URL").expect("MAINTENANCE_DATABASE_URL must be set");
@@ -451,7 +476,7 @@ async fn create_isolated_dbs(
 
     let mut regional_db_urls = Vec::new();
     let mut regional_db_names = Vec::new();
-    let base_db_url = "postgres://worka:worka@localhost:5432";
+    let base_db_url = database_server_url(&maint_db_url).expect("derive test database server URL");
 
     for i in 0..num_regional {
         let regional_db_name = format!("test_regional_{}_{}", suffix, i);
@@ -472,6 +497,19 @@ async fn create_isolated_dbs(
         regional_db_names,
         maint_client,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::database_server_url;
+
+    #[test]
+    fn database_server_url_reuses_configured_credentials_and_host() {
+        assert_eq!(
+            database_server_url("postgres://user:secret@127.0.0.1:5432/postgres").unwrap(),
+            "postgres://user:secret@127.0.0.1:5432"
+        );
+    }
 }
 
 pub async fn create_default_tenant(global_pool: &Pool, region: &str) {
