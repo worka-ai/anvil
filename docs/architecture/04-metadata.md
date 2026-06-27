@@ -1,71 +1,31 @@
 ---
-slug: /architecture/metadata
-title: 'Deep Dive: Metadata and Indexing'
-description: A detailed look at Anvil's metadata architecture, including the global vs. regional database split and the use of advanced PostgreSQL features.
-tags: [architecture, deep-dive, metadata, postgres, ltree, pg_trgm]
+title: Metadata Architecture
+description: Anvil's native metadata architecture.
+tags: [architecture, deep-dive, metadata, indexing]
 ---
 
-# Chapter 14: Deep Dive: Metadata and Indexing
+# Metadata Architecture
 
-> **TL;DR:** A global Postgres stores tenants/buckets, while regional Postgres instances use `ltree` and `pg_trgm` for powerful, scalable object indexing.
+Anvil owns its metadata store. Object records, bucket state, task state, authorization tuple state, index definitions, index events, manifests, and model artifact metadata are persisted below each node's `STORAGE_PATH`.
 
-Anvil's approach to metadata is one of its most critical architectural decisions, designed for massive scale and query flexibility. Instead of using a simple key-value store or a single monolithic database, Anvil splits metadata storage into two distinct roles: a **global database** and one or more **regional databases**.
+The current native store keeps control-plane records in Anvil-managed state files while object version state is read from the metadata journal. The target architecture is a partitioned native metadata engine where append-only mutation records, sealed manifests, and derived indexes are maintained by Anvil itself.
 
-### The Global Database
+## Metadata Responsibilities
 
-The global database is the single source of truth for data that is low-volume but has high importance and global relevance. All nodes in an Anvil deployment, regardless of their region, connect to this single database.
+Anvil metadata tracks:
 
-**Schema (`migrations_global/`):**
+- tenants, applications, encrypted app secrets, and app policies;
+- buckets, bucket metadata events, public access state, and deletion state;
+- object versions, delete markers, mutation ids, content hashes, user metadata, shard maps, and inline payload metadata;
+- multipart upload sessions and parts;
+- task queues and background work state;
+- authorization tuples and tuple indexes;
+- index definitions, index events, diagnostics, and search/vector index materialization state.
 
--   `tenants`: Stores tenant information, including their names and API keys.
--   `buckets`: Defines each bucket, its owner (`tenant_id`), and, crucially, which `region` it belongs to.
--   `apps`: Contains the `client_id` and encrypted `client_secret` for each application.
--   `policies`: Maps apps to the actions and resources they are permitted to access.
--   `regions`: A simple table that registers all available regions in the deployment.
+## Indexing
 
-This centralized approach for top-level resources simplifies management and ensures consistency across the entire system.
+Indexes are native Anvil data structures maintained from object and metadata watch streams. Index definitions describe what each bucket indexes. Watch events are durable inputs to the indexing pipeline, allowing index workers selected inside the Anvil process to catch up deterministically.
 
-### The Regional Database
+## Reserved Namespace
 
-The regional database is where Anvil handles the massive scale of object metadata. Each region in your deployment has its own, completely independent PostgreSQL database. This design is key to Anvil's scalability.
-
-**Schema (`migrations_regional/`):**
-
-The `objects` table is the centerpiece of the regional schema. It contains columns for:
-
--   `bucket_id` and `tenant_id`: To associate the object with its owner.
--   `key`: The user-visible name of the object.
--   `content_hash`: The BLAKE3 hash of the object's content, used for content-addressing.
--   `size`, `etag`, `content_type`, etc.: Standard object metadata.
--   `shard_map`: A JSONB column that stores the list of peer IDs responsible for holding the object's shards.
-
-### Metadata Caching and Coherence
-
-To minimize latency and reduce load on the Global Database, Anvil employs an in-memory read-through cache (using `moka`) on every node.
-
-*   **Cached Data:** High-frequency global metadata such as `buckets`, `tenants`, and `policies`.
-*   **TTL:** Entries have a configurable Time-To-Live (default 5 minutes) to ensure eventual freshness.
-*   **Coherence via Gossip:** When a node updates metadata (e.g., creating a bucket or granting a policy), it broadcasts a `MetadataEvent` over the cluster's P2P gossip mesh. Other nodes receiving this event immediately invalidate the corresponding entries in their local cache, ensuring that security and routing updates propagate near-instantly across the cluster.
-
-### Advanced Indexing with PostgreSQL Extensions
-
-Anvil leverages powerful PostgreSQL extensions to provide query capabilities far beyond what a simple key-value store could offer.
-
-#### `ltree` for Hierarchical Listing
-
-To efficiently handle S3-style listing with prefixes and delimiters (which simulates a directory structure), Anvil uses the `ltree` extension.
-
--   **How it Works:** When an object is created, a trigger automatically converts its `key` (e.g., `"path/to/my/file.txt"`) into a special `ltree` format (e.g., `path.to.my.file_txt`).
--   **Querying:** This `ltree` representation allows for extremely fast hierarchical queries. A query for all objects under the `path/to/` prefix can use the `ltree` ancestor operator (`<@`), which is indexed using a GIST index for high performance.
--   **Benefit:** This avoids slow and inefficient `LIKE 'path/to/%'` queries, which do not perform well on large datasets.
-
-#### `pg_trgm` for Flexible Searching
-
-The `pg_trgm` (trigram) extension is used to provide more flexible, non-prefix-based search capabilities in the future.
-
--   **How it Works:** This extension breaks down text into three-character chunks (trigrams). It creates an index of these trigrams, allowing for very fast similarity matching and pattern searching.
--   **Potential Use Cases:** While not fully exposed in the current API, this lays the groundwork for features like:
-    *   Finding objects with keys that *contain* a certain substring.
-    *   Fuzzy searching for object keys.
-
-By offloading complex indexing and querying to PostgreSQL, Anvil's application layer can remain simpler and more focused on the core logic of storage and retrieval, while still providing powerful and flexible metadata operations.
+Paths under Anvil's reserved internal namespace are owned by Anvil. Public object APIs must reject direct reads and writes to those paths. Internal components may mutate them only through private Anvil code paths with server-minted authority.

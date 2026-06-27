@@ -840,8 +840,8 @@ impl ObjectManager {
                     version_id,
                 )
                 .await
-                    .map_err(|e| Status::internal(e.to_string()))?
-                    .ok_or_else(|| Status::not_found("Object version not found"))?;
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::not_found("Object version not found"))?;
                 if object.deleted_at.is_some() {
                     return Err(Status::not_found("Object version is a delete marker"));
                 }
@@ -1200,8 +1200,8 @@ impl ObjectManager {
                     version_id,
                 )
                 .await
-                    .map_err(|e| Status::internal(e.to_string()))?
-                    .ok_or_else(|| Status::not_found("Object version not found"))?;
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::not_found("Object version not found"))?;
                 if object.deleted_at.is_some() {
                     return Err(Status::not_found("Object version is a delete marker"));
                 }

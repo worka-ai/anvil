@@ -27,7 +27,7 @@ async fn test_task_claim_marks_tasks_running_before_execution() {
 
     let claimed = db.claim_pending_tasks(10).await.unwrap();
     assert_eq!(claimed.len(), 1);
-    assert_eq!(claimed[0].get::<_, i64>("id"), 1);
+    let task_id = claimed[0].id;
 
     let claimed_again = db.claim_pending_tasks(10).await.unwrap();
     assert!(
@@ -35,13 +35,9 @@ async fn test_task_claim_marks_tasks_running_before_execution() {
         "running tasks must not be claimed again"
     );
 
-    let client = db.get_global_pool().get().await.unwrap();
-    let status: TaskStatus = client
-        .query_one("SELECT status FROM tasks WHERE id = 1", &[])
-        .await
-        .unwrap()
-        .get("status");
-    assert_eq!(status, TaskStatus::Running);
+    let tasks = db.list_tasks().await.unwrap();
+    let task = tasks.iter().find(|task| task.id == task_id).unwrap();
+    assert_eq!(task.status, TaskStatus::Running);
 }
 
 #[tokio::test]
@@ -102,26 +98,26 @@ async fn test_delete_bucket_soft_deletes_and_enqueues_task() {
         .into_inner();
     assert!(list_res_after_delete.buckets.is_empty());
 
-    // 4. Verify a task was enqueued in the global DB
-    let global_pool = cluster.states[0].db.get_global_pool();
-    let client = global_pool.get().await.unwrap();
-    let row = client
-        .query_one(
-            "SELECT task_type, status, payload FROM tasks WHERE payload->>'bucket_id' IS NOT NULL",
-            &[],
-        )
+    // 4. Verify a native metadata task was enqueued.
+    let task = cluster.states[0]
+        .db
+        .list_tasks()
         .await
-        .unwrap();
-    let task_type: anvil::tasks::TaskType = row.get("task_type");
-    let status: TaskStatus = row.get("status");
-    let payload: serde_json::Value = row.get("payload");
-    let bucket_id = payload
+        .unwrap()
+        .into_iter()
+        .find(|task| task.payload.get("bucket_id").is_some())
+        .expect("delete bucket task should be enqueued");
+    let bucket_id = task
+        .payload
         .get("bucket_id")
         .and_then(|value| value.as_i64())
         .expect("delete bucket task payload should contain bucket_id");
-    assert!(matches!(task_type, anvil::tasks::TaskType::DeleteBucket));
     assert!(matches!(
-        status,
+        task.task_type,
+        anvil::tasks::TaskType::DeleteBucket
+    ));
+    assert!(matches!(
+        task.status,
         TaskStatus::Pending | TaskStatus::Running | TaskStatus::Completed
     ));
 
@@ -129,14 +125,20 @@ async fn test_delete_bucket_soft_deletes_and_enqueues_task() {
     // name can be reused without leaving a permanently soft-deleted row behind.
     let start = Instant::now();
     loop {
-        let row = client
-            .query_one(
-                "SELECT status FROM tasks WHERE payload->>'bucket_id' = $1",
-                &[&bucket_id.to_string()],
-            )
+        let status = cluster.states[0]
+            .db
+            .list_tasks()
             .await
-            .unwrap();
-        let status: TaskStatus = row.get("status");
+            .unwrap()
+            .into_iter()
+            .find(|task| {
+                task.payload
+                    .get("bucket_id")
+                    .and_then(|value| value.as_i64())
+                    == Some(bucket_id)
+            })
+            .map(|task| task.status)
+            .expect("delete bucket task should still exist");
         if status == TaskStatus::Completed {
             break;
         }
@@ -147,15 +149,15 @@ async fn test_delete_bucket_soft_deletes_and_enqueues_task() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    let exists: bool = client
-        .query_one(
-            "SELECT EXISTS (SELECT 1 FROM buckets WHERE id = $1)",
-            &[&bucket_id],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    assert!(!exists, "delete bucket task should hard-delete bucket row");
+    assert!(
+        cluster.states[0]
+            .db
+            .get_bucket_by_name(1, &bucket_name)
+            .await
+            .unwrap()
+            .is_none(),
+        "delete bucket task should hard-delete bucket metadata"
+    );
 
     let mut recreate_req = Request::new(CreateBucketRequest {
         bucket_name,

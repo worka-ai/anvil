@@ -39,14 +39,14 @@ fn run_large_s3_gateway_test(future: Pin<Box<dyn Future<Output = ()> + Send>>) {
 }
 
 // Helper function to create an app, since it's used in auth tests.
-fn create_app(global_db_url: &str, app_name: &str) -> (String, String) {
+fn create_app(admin_state_path: &str, app_name: &str) -> (String, String) {
     let admin_args = &["run", "--bin", "admin", "--"];
     let app_output = std::process::Command::new("cargo")
         .args(admin_args.iter().chain(&[
-            "--global-database-url",
-            global_db_url,
             "--anvil-secret-encryption-key",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--storage-path",
+            admin_state_path,
             "app",
             "create",
             "--tenant-name",
@@ -63,7 +63,7 @@ fn create_app(global_db_url: &str, app_name: &str) -> (String, String) {
     (client_id, client_secret)
 }
 
-fn grant_wildcard_policy(global_db_url: &str, app_name: &str) {
+fn grant_wildcard_policy(admin_state_path: &str, app_name: &str) {
     let admin_args = &["run", "--bin", "admin", "--"];
     let policy_args = &[
         "policy",
@@ -80,10 +80,10 @@ fn grant_wildcard_policy(global_db_url: &str, app_name: &str) {
             admin_args
                 .iter()
                 .chain(&[
-                    "--global-database-url",
-                    global_db_url,
                     "--anvil-secret-encryption-key",
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "--storage-path",
+                    admin_state_path,
                 ])
                 .chain(policy_args.iter()),
         )
@@ -138,8 +138,8 @@ async fn test_s3_put_write_etag_preconditions() {
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let app_name = format!("s3-write-preconditions-{}", uuid::Uuid::new_v4());
-    let (client_id, client_secret) = create_app(&cluster.global_db_url, &app_name);
-    grant_wildcard_policy(&cluster.global_db_url, &app_name);
+    let (client_id, client_secret) = create_app(&cluster.admin_state_path, &app_name);
+    grant_wildcard_policy(&cluster.admin_state_path, &app_name);
 
     let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
     let client = s3_client(http_base, &client_id, &client_secret);
@@ -258,10 +258,10 @@ async fn run_s3_public_and_private_access() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
-    let (client_id, client_secret) = create_app(&cluster.global_db_url, "s3-test-app");
+    let (client_id, client_secret) = create_app(&cluster.admin_state_path, "s3-test-app");
 
     // Grant wildcard policy to the app before getting a token
-    grant_wildcard_policy(&cluster.global_db_url, "s3-test-app");
+    grant_wildcard_policy(&cluster.admin_state_path, "s3-test-app");
 
     // Allow a moment for the policy change to propagate or be read by the server.
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1283,7 +1283,7 @@ async fn test_streaming_upload_decoding() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
-    let (client_id, client_secret) = create_app(&cluster.global_db_url, "streaming-decode-app");
+    let (client_id, client_secret) = create_app(&cluster.admin_state_path, "streaming-decode-app");
 
     // Grant wildcard policy to the app
     let admin_args = &["run", "--bin", "admin", "--"];
@@ -1302,10 +1302,10 @@ async fn test_streaming_upload_decoding() {
             admin_args
                 .iter()
                 .chain(&[
-                    "--global-database-url",
-                    &cluster.global_db_url,
                     "--anvil-secret-encryption-key",
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "--storage-path",
+                    &cluster.admin_state_path,
                 ])
                 .chain(policy_args.iter()),
         )

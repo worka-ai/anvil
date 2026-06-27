@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{info, error};
+use tracing::{error, info};
 
 use crate::cache::MetadataCache;
 
@@ -300,7 +300,8 @@ pub async fn handle_swarm_event(
             ..
         })) => {
             if message.topic == cluster_topic.hash() {
-                if let Ok(cluster_message) = serde_json::from_slice::<ClusterMessage>(&message.data) {
+                if let Ok(cluster_message) = serde_json::from_slice::<ClusterMessage>(&message.data)
+                {
                     if let Some(secret) = cluster_secret {
                         if let Err(e) = cluster_message.verify(secret) {
                             info!(
@@ -338,7 +339,7 @@ pub async fn handle_swarm_event(
                     }
                 }
             } else if message.topic == metadata_topic.hash() {
-                 if let Ok(event) = serde_json::from_slice::<MetadataEvent>(&message.data) {
+                if let Ok(event) = serde_json::from_slice::<MetadataEvent>(&message.data) {
                     info!("[GOSSIP] Received metadata event: {:?}", event);
                     match event {
                         MetadataEvent::BucketUpdated { tenant_id, name } => {
@@ -351,7 +352,7 @@ pub async fn handle_swarm_event(
                             metadata_cache.invalidate_app_policies(app_id).await;
                         }
                     }
-                 }
+                }
             }
         }
         _ => {}

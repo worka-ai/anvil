@@ -73,10 +73,10 @@ async fn test_cli_auth_and_hf_key_add() {
     let admin_bin = get_admin_path();
     let mut admin_cmd = Command::new(admin_bin);
     admin_cmd.args(&[
-        "--global-database-url",
-        &cluster.global_db_url,
         "--anvil-secret-encryption-key",
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--storage-path",
+        &cluster.admin_state_path,
         "app",
         "create",
         "--tenant-name",

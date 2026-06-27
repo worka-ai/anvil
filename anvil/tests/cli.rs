@@ -64,7 +64,7 @@ async fn run_cli(args: &[&str], config_dir: &std::path::Path) -> std::process::O
 
 async fn setup_test_profile(cluster: &TestCluster, config_dir: &std::path::Path) {
     let admin_args = &["run", "--bin", "admin", "--"];
-    let global_db_url = cluster.global_db_url.clone();
+    let admin_state_path = cluster.admin_state_path.clone();
     let app_name = "cli-test-app";
 
     // Create the app
@@ -72,10 +72,10 @@ async fn setup_test_profile(cluster: &TestCluster, config_dir: &std::path::Path)
         .iter()
         .map(|s| s.to_string())
         .chain([
-            "--global-database-url".to_string(),
-            global_db_url.clone(),
             "--anvil-secret-encryption-key".to_string(),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "--storage-path".to_string(),
+            admin_state_path.clone(),
             "app".to_string(),
             "create".to_string(),
             "--tenant-name".to_string(),
@@ -103,10 +103,10 @@ async fn setup_test_profile(cluster: &TestCluster, config_dir: &std::path::Path)
         .iter()
         .map(|s| s.to_string())
         .chain([
-            "--global-database-url".to_string(),
-            global_db_url,
             "--anvil-secret-encryption-key".to_string(),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "--storage-path".to_string(),
+            admin_state_path,
             "policy".to_string(),
             "grant".to_string(),
             "--app-name".to_string(),
@@ -314,7 +314,8 @@ async fn test_cli_hf_ingestion() {
     let output = run_cli(&["object", "get", &index_dest], config_dir.path()).await;
     assert!(output.status.success(), "Failed to get anvil-index.json");
     let stdout = String::from_utf8(output.stdout).unwrap();
-    let index_json: serde_json::Value = serde_json::from_str(&stdout).expect("Failed to parse anvil-index.json");
+    let index_json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("Failed to parse anvil-index.json");
 
     assert_eq!(index_json["meta"]["source_repo"], repo);
     assert_eq!(index_json["meta"]["total_files"], 1);

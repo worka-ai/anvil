@@ -2,7 +2,6 @@ use crate::auth::JwtManager;
 use crate::config::Config;
 use anyhow::Result;
 use cluster::ClusterState;
-use deadpool_postgres::Pool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
@@ -88,8 +87,6 @@ pub struct AppState {
 
 impl AppState {
     pub async fn new(
-        global_pool: Pool,
-        regional_pool: Pool,
         config: Config,
         event_publisher: Option<tokio::sync::mpsc::Sender<cluster::MetadataEvent>>,
     ) -> Result<Self> {
@@ -97,8 +94,7 @@ impl AppState {
         let jwt_manager = Arc::new(JwtManager::new(arc_config.jwt_secret.clone()));
         let storage = storage::Storage::new_at(&arc_config.storage_path).await?;
         let cluster_state = Arc::new(RwLock::new(HashMap::new()));
-        let db =
-            persistence::Persistence::new(global_pool, regional_pool, event_publisher, &arc_config);
+        let db = persistence::Persistence::new(&arc_config, event_publisher)?;
         let sharder = sharding::ShardManager::new();
         let placer = placement::PlacementManager::default();
         let (object_watch_tx, _object_watch_rx) = tokio::sync::broadcast::channel(1024);

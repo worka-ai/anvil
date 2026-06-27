@@ -66,7 +66,7 @@ async fn setup_test_profile(
     config_dir: &std::path::Path,
 ) -> (String, String) {
     let admin_args = &["run", "--bin", "admin", "--"];
-    let global_db_url = cluster.global_db_url.clone();
+    let admin_state_path = cluster.admin_state_path.clone();
     let app_name = format!("cli-test-app-{}", uuid::Uuid::new_v4());
 
     // Create the app
@@ -74,10 +74,10 @@ async fn setup_test_profile(
         .iter()
         .map(|s| s.to_string())
         .chain([
-            "--global-database-url".to_string(),
-            global_db_url.clone(),
             "--anvil-secret-encryption-key".to_string(),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "--storage-path".to_string(),
+            admin_state_path.clone(),
             "app".to_string(),
             "create".to_string(),
             "--tenant-name".to_string(),
@@ -103,10 +103,10 @@ async fn setup_test_profile(
         .iter()
         .map(|s| s.to_string())
         .chain([
-            "--global-database-url".to_string(),
-            global_db_url,
             "--anvil-secret-encryption-key".to_string(),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "--storage-path".to_string(),
+            admin_state_path,
             "policy".to_string(),
             "grant".to_string(),
             "--app-name".to_string(),
@@ -172,17 +172,17 @@ async fn test_cli_auth_get_token() {
 
 async fn create_app(cluster: &TestCluster, app_name: &str) -> (String, String) {
     let admin_args = &["run", "--bin", "admin", "--"];
-    let global_db_url = cluster.global_db_url.clone();
+    let admin_state_path = cluster.admin_state_path.clone();
 
     // Create the app
     let create_args: Vec<String> = admin_args
         .iter()
         .map(|s| s.to_string())
         .chain([
-            "--global-database-url".to_string(),
-            global_db_url.clone(),
             "--anvil-secret-encryption-key".to_string(),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "--storage-path".to_string(),
+            admin_state_path.clone(),
             "app".to_string(),
             "create".to_string(),
             "--tenant-name".to_string(),
@@ -208,10 +208,10 @@ async fn create_app(cluster: &TestCluster, app_name: &str) -> (String, String) {
         .iter()
         .map(|s| s.to_string())
         .chain([
-            "--global-database-url".to_string(),
-            global_db_url,
             "--anvil-secret-encryption-key".to_string(),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "--storage-path".to_string(),
+            admin_state_path,
             "policy".to_string(),
             "grant".to_string(),
             "--app-name".to_string(),

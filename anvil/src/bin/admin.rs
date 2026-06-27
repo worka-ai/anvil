@@ -1,6 +1,5 @@
 use anvil::crypto;
 use anvil::persistence::Persistence;
-use anvil::{create_pool, migrations, run_migrations};
 use anvil_core::bucket_journal::{self, BucketJournalMutation};
 use anvil_core::permissions::AnvilAction;
 use anvil_core::storage::Storage;
@@ -19,9 +18,6 @@ struct Cli {
 
 #[derive(Parser, Debug)]
 struct SharedConfig {
-    #[arg(long, env)]
-    pub global_database_url: String,
-
     #[arg(long, env)]
     pub anvil_secret_encryption_key: String,
 
@@ -136,7 +132,6 @@ async fn main() -> anyhow::Result<()> {
     let shared_config = cli.config;
 
     let mut config = anvil_core::config::Config::default();
-    config.global_database_url = shared_config.global_database_url;
     config.anvil_secret_encryption_key = shared_config.anvil_secret_encryption_key;
     config.storage_path = shared_config.storage_path;
     // Set a dummy region and public_api_addr, as admin CLI doesn't use them,
@@ -144,18 +139,7 @@ async fn main() -> anyhow::Result<()> {
     config.region = "admin-cli-region".to_string();
     config.public_api_addr = "127.0.0.1:0".to_string();
 
-    let global_pool = create_pool(&config.global_database_url)?;
-    // The admin tool only interacts with the global DB, so we can use it as a placeholder for the regional pool.
-    let regional_pool = create_pool(&config.global_database_url)?;
-
-    run_migrations(
-        &config.global_database_url,
-        migrations::migrations::runner(),
-        "refinery_schema_history_global",
-    )
-    .await?;
-
-    let persistence = Persistence::new(global_pool, regional_pool, None, &config);
+    let persistence = Persistence::new(&config, None)?;
     let encryption_key = hex::decode(config.anvil_secret_encryption_key)?;
 
     match &cli.command {
@@ -272,7 +256,12 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 let hashed_password = bcrypt::hash(password, bcrypt::DEFAULT_COST)?;
                 persistence
-                    .create_admin_user(username, email, &hashed_password, role)
+                    .create_admin_user(
+                        username,
+                        email,
+                        &hashed_password,
+                        std::slice::from_ref(role),
+                    )
                     .await?;
                 info!("Created admin user: {}", username);
             }

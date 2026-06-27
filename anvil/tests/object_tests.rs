@@ -497,16 +497,14 @@ async fn test_listing_omits_reserved_internal_object_keys() {
     );
     object_client.put_object(put_req).await.unwrap();
 
-    let global_client = cluster.states[0].db.get_global_pool().get().await.unwrap();
-    let bucket_row = global_client
-        .query_one(
-            "SELECT id, tenant_id FROM buckets WHERE name = $1",
-            &[&bucket_name],
-        )
+    let bucket = cluster.states[0]
+        .db
+        .get_bucket_by_name(1, &bucket_name)
         .await
-        .unwrap();
-    let bucket_id: i64 = bucket_row.get("id");
-    let tenant_id: i64 = bucket_row.get("tenant_id");
+        .unwrap()
+        .expect("bucket metadata should exist");
+    let bucket_id = bucket.id;
+    let tenant_id = bucket.tenant_id;
     cluster.states[0]
         .db
         .create_object(
@@ -724,12 +722,13 @@ async fn test_inline_payload_threshold_is_recorded_and_readable() {
         .unwrap()
         .into_inner();
 
-    let global_client = cluster.states[0].db.get_global_pool().get().await.unwrap();
-    let bucket_row = global_client
-        .query_one("SELECT id FROM buckets WHERE name = $1", &[&bucket_name])
+    let bucket_id = cluster.states[0]
+        .db
+        .get_bucket_by_name(1, &bucket_name)
         .await
-        .unwrap();
-    let bucket_id: i64 = bucket_row.get("id");
+        .unwrap()
+        .expect("bucket metadata should exist")
+        .id;
     let inline_object = cluster.states[0]
         .db
         .get_object_version(

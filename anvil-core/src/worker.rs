@@ -9,46 +9,17 @@ use crate::tasks::{HFIngestionItemState, HFIngestionState, TaskStatus, TaskType}
 use anyhow::{Result, anyhow};
 use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
-use serde_json::{Value as JsonValue, json};
+use serde_json::json;
 use std::boxed::Box;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio_postgres::Row;
 use tonic::Status;
 use tracing::{debug, error, info, warn};
 
-#[derive(Debug)]
-struct Task {
-    id: i64,
-    task_type: TaskType,
-    payload: JsonValue,
-    _attempts: i32,
-}
-
-impl TryFrom<Row> for Task {
-    type Error = anyhow::Error;
-
-    fn try_from(row: Row) -> Result<Self, Self::Error> {
-        let task_type_str: &str = row.get("task_type");
-        let task_type = match task_type_str {
-            "DELETE_OBJECT" => TaskType::DeleteObject,
-            "DELETE_BUCKET" => TaskType::DeleteBucket,
-            "REBALANCE_SHARD" => TaskType::RebalanceShard,
-            "HF_INGESTION" => TaskType::HFIngestion,
-            _ => return Err(anyhow!("Unknown task type: {}", task_type_str)),
-        };
-
-        Ok(Self {
-            id: row.get("id"),
-            task_type,
-            payload: row.get("payload"),
-            _attempts: row.get("attempts"),
-        })
-    }
-}
+type Task = crate::persistence::TaskRecord;
 
 #[derive(Deserialize)]
 struct DeleteObjectPayload {
@@ -70,10 +41,7 @@ pub async fn run(
 ) -> Result<()> {
     loop {
         let tasks = match persistence.claim_pending_tasks(10).await {
-            Ok(rows) => rows
-                .into_iter()
-                .map(Task::try_from)
-                .collect::<Result<Vec<_>>>()?,
+            Ok(tasks) => tasks,
             Err(e) => {
                 error!("Failed to fetch tasks: {}", e);
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -137,359 +105,337 @@ async fn handle_hf_ingestion(
         .ok_or_else(|| anyhow!("missing ingestion_id"))?;
 
     // Wrap the main logic in a closure to ensure we can catch errors and update the final status.
-    let result =
-        async {
-            info!(
-                ingestion_id,
-                "Starting ingestion task."
-            );
+    let result = async {
+        info!(ingestion_id, "Starting ingestion task.");
 
-            persistence
-                .hf_update_ingestion_state(ingestion_id, HFIngestionState::Running, None)
-                .await?;
+        persistence
+            .hf_update_ingestion_state(ingestion_id, HFIngestionState::Running, None)
+            .await?;
 
-            let client = persistence.get_global_pool().get().await?;
-            let job = client
-                .query_one(
-                    "SELECT key_id, tenant_id, requester_app_id, repo, COALESCE(revision,'main'), target_bucket, target_region, COALESCE(target_prefix,''), include_globs, exclude_globs FROM hf_ingestions WHERE id=$1",
-                    &[&ingestion_id],
-                )
-                .await?;
-            let key_id: i64 = job.get(0);
-            let tenant_id: i64 = job.get(1);
-            let _requester_app_id: i64 = job.get(2);
-            let repo_str: String = job.get(3);
-            let revision: String = job.get(4);
-            let target_bucket: String = job.get(5);
-            let _target_region: String = job.get(6);
-            let target_prefix: String = job.get(7);
-            let include_globs: Vec<String> = job.get(8);
-            let exclude_globs: Vec<String> = job.get(9);
-            info!(
-                repo = %repo_str,
-                revision = %revision,
-                "Fetched job details."
-            );
+        let job = persistence
+            .hf_get_ingestion_job(ingestion_id)
+            .await?
+            .ok_or_else(|| anyhow!("ingestion job not found"))?;
+        let key_id = job.key_id;
+        let tenant_id = job.tenant_id;
+        let _requester_app_id = job.requester_app_id;
+        let repo_str = job.repo;
+        let revision = job.revision;
+        let target_bucket = job.target_bucket;
+        let _target_region = job.target_region;
+        let target_prefix = job.target_prefix;
+        let include_globs = job.include_globs;
+        let exclude_globs = job.exclude_globs;
+        info!(
+            repo = %repo_str,
+            revision = %revision,
+            "Fetched job details."
+        );
 
-            let row = client
-                .query_one(
-                    "SELECT token_encrypted FROM huggingface_keys WHERE id=$1",
-                    &[&key_id],
-                )
-                .await?;
-            let token_encrypted: Vec<u8> = row.get(0);
-            let enc_key_hex = std::env::var("ANVIL_SECRET_ENCRYPTION_KEY").unwrap_or_default();
-            if enc_key_hex.is_empty() {
-                anyhow::bail!("missing encryption key in worker");
+        let token_encrypted = persistence
+            .hf_get_key_encrypted_by_id(key_id)
+            .await?
+            .ok_or_else(|| anyhow!("hugging face key not found"))?;
+        let enc_key_hex = std::env::var("ANVIL_SECRET_ENCRYPTION_KEY").unwrap_or_default();
+        if enc_key_hex.is_empty() {
+            anyhow::bail!("missing encryption key in worker");
+        }
+        let enc_key = hex::decode(enc_key_hex)?;
+        let token_bytes = crate::crypto::decrypt(&token_encrypted, &enc_key)?;
+        let token = String::from_utf8(token_bytes)?;
+        debug!("Decrypted token.");
+
+        let cache_dir = tempfile::tempdir()?;
+        let api = ApiBuilder::new()
+            .with_cache_dir(cache_dir.path().to_path_buf())
+            .with_token(Some(token))
+            .build()?;
+
+        // --- Blocking File Listing ---
+        info!("Getting repo file list (blocking)...");
+        let repo_details = (repo_str.clone(), revision.clone());
+        let api_clone = api.clone();
+        let siblings = tokio::task::spawn_blocking(move || {
+            let repo = Repo::with_revision(repo_details.0, RepoType::Model, repo_details.1);
+            let repo_client = api_clone.repo(repo);
+            repo_client.info().map(|info| info.siblings)
+        })
+        .await??;
+        info!(num_files = siblings.len(), "Got files from repo.");
+        // --- End Blocking ---
+
+        let mut inc_builder = GlobSetBuilder::new();
+        if include_globs.is_empty() {
+            inc_builder.add(Glob::new("**/*")?);
+        } else {
+            for g in include_globs {
+                inc_builder.add(Glob::new(&g)?);
             }
-            let enc_key = hex::decode(enc_key_hex)?;
-            let token_bytes = crate::crypto::decrypt(&token_encrypted, &enc_key)?;
-            let token = String::from_utf8(token_bytes)?;
-            debug!("Decrypted token.");
+        }
+        let include = inc_builder.build()?;
+        let mut exc_builder = GlobSetBuilder::new();
+        for g in exclude_globs {
+            exc_builder.add(Glob::new(&g)?);
+        }
+        let exclude = exc_builder.build()?;
 
-            let cache_dir = tempfile::tempdir()?;
-            let api = ApiBuilder::new()
-                .with_cache_dir(cache_dir.path().to_path_buf())
-                .with_token(Some(token))
-                .build()?;
+        'outer: for e in siblings {
+            let path = e.rfilename.clone();
+            debug!(path = %path, "Processing file");
+            let path_buf = std::path::PathBuf::from(path.clone());
+            if !include.is_match(path_buf.as_path()) {
+                continue;
+            }
+            if exclude.is_match(path_buf.as_path()) {
+                continue;
+            }
+            let size = None; // hf-hub RepoSibling does not include size; will be known after download
+            let item_id = persistence
+                .hf_add_item(ingestion_id, &path, size, None)
+                .await?;
+            persistence
+                .hf_update_item_state(item_id, HFIngestionItemState::Downloading, None)
+                .await?;
+            debug!(item_id, "Item state set to downloading.");
 
-            // --- Blocking File Listing ---
-            info!("Getting repo file list (blocking)...");
-            let repo_details = (repo_str.clone(), revision.clone());
-            let api_clone = api.clone();
-            let siblings = tokio::task::spawn_blocking(move || {
-                let repo = Repo::with_revision(repo_details.0, RepoType::Model, repo_details.1);
-                let repo_client = api_clone.repo(repo);
-                repo_client.info().map(|info| info.siblings)
+            if let Ok(bucket_opt) = persistence
+                .get_bucket_by_name(tenant_id, &target_bucket)
+                .await
+            {
+                if let Some(bucket) = bucket_opt {
+                    if let Ok(obj_opt) = persistence.get_object(bucket.id, &path).await {
+                        if obj_opt.is_some() {
+                            info!(path = %path, "Skipping existing file");
+                            persistence
+                                .hf_update_item_state(item_id, HFIngestionItemState::Skipped, None)
+                                .await?;
+                            continue 'outer;
+                        }
+                    }
+                }
+            }
+
+            // --- Blocking File Download ---
+            info!(
+                file = %e.rfilename,
+                "Downloading file (blocking)..."
+            );
+            let repo_details_clone = (repo_str.clone(), revision.clone());
+            let api_clone_2 = api.clone();
+            let filename = e.rfilename.clone();
+            let local_path_buf;
+            info!("Downloading from Hugging Face");
+            local_path_buf = tokio::task::spawn_blocking(move || {
+                let repo = Repo::with_revision(
+                    repo_details_clone.0,
+                    RepoType::Model,
+                    repo_details_clone.1,
+                );
+                let repo_client = api_clone_2.repo(repo);
+                repo_client.get(&filename)
             })
             .await??;
-            info!(
-                num_files = siblings.len(),
-                "Got files from repo."
-            );
+
+            let local_path = &local_path_buf;
+            debug!(path = ?local_path, "Downloaded to");
             // --- End Blocking ---
 
-            let mut inc_builder = GlobSetBuilder::new();
-            if include_globs.is_empty() {
-                inc_builder.add(Glob::new("**/*")?);
+            let _bucket = persistence
+                .get_bucket_by_name(tenant_id, &target_bucket)
+                .await?
+                .ok_or_else(|| anyhow!("target bucket not found"))?;
+            let full_key = if target_prefix.is_empty() {
+                path.clone()
             } else {
-                for g in include_globs {
-                    inc_builder.add(Glob::new(&g)?);
-                }
-            }
-            let include = inc_builder.build()?;
-            let mut exc_builder = GlobSetBuilder::new();
-            for g in exclude_globs {
-                exc_builder.add(Glob::new(&g)?);
-            }
-            let exclude = exc_builder.build()?;
-
-            'outer: for e in siblings {
-                let path = e.rfilename.clone();
-                debug!(path = %path, "Processing file");
-                let path_buf = std::path::PathBuf::from(path.clone());
-                if !include.is_match(path_buf.as_path()) {
-                    continue;
-                }
-                if exclude.is_match(path_buf.as_path()) {
-                    continue;
-                }
-                let size = None; // hf-hub RepoSibling does not include size; will be known after download
-                let item_id = persistence
-                    .hf_add_item(ingestion_id, &path, size, None)
-                    .await?;
-                persistence
-                    .hf_update_item_state(item_id, HFIngestionItemState::Downloading, None)
-                    .await?;
-                debug!(item_id, "Item state set to downloading.");
-
-                if let Ok(bucket_opt) =
-                    persistence.get_bucket_by_name(tenant_id, &target_bucket).await
-                {
-                    if let Some(bucket) = bucket_opt {
-                        if let Ok(obj_opt) = persistence.get_object(bucket.id, &path).await {
-                            if obj_opt.is_some() {
-                                info!(path = %path, "Skipping existing file");
-                                persistence
-                                    .hf_update_item_state(
-                                        item_id,
-                                        HFIngestionItemState::Skipped,
-                                        None,
-                                    )
-                                    .await?;
-                                continue 'outer;
-                            }
-                        }
-                    }
-                }
-
-                // --- Blocking File Download ---
-                info!(
-                    file = %e.rfilename,
-                    "Downloading file (blocking)..."
-                );
-                let repo_details_clone = (repo_str.clone(), revision.clone());
-                let api_clone_2 = api.clone();
-                let filename = e.rfilename.clone();
-                let local_path_buf;
-                    info!("Downloading from Hugging Face");
-                    local_path_buf = tokio::task::spawn_blocking(move || {
-                        let repo = Repo::with_revision(
-                            repo_details_clone.0,
-                            RepoType::Model,
-                            repo_details_clone.1,
-                        );
-                        let repo_client = api_clone_2.repo(repo);
-                        repo_client.get(&filename)
-                    })
-                    .await??;
-
-                let local_path = &local_path_buf;
-                debug!(path = ?local_path, "Downloaded to");
-                // --- End Blocking ---
-
-                let _bucket = persistence
-                    .get_bucket_by_name(tenant_id, &target_bucket)
-                    .await?
-                    .ok_or_else(|| anyhow!("target bucket not found"))?;
-                let full_key = if target_prefix.is_empty() {
-                    path.clone()
-                } else {
-                    format!(
-                        "{}/{}",
-                        target_prefix.trim_end_matches('/'),
-                        path
-                    )
-                };
-
-                info!(
-                    bucket = %target_bucket,
-                    key = %full_key,
-                    "Uploading to Anvil"
-                );
-                let make_reader = || async {
-                    let f = tokio::fs::File::open(&local_path).await;
-                    f.map(|file| {
-                        use futures_util::StreamExt as _;
-                        use tokio_util::io::ReaderStream;
-                        ReaderStream::new(file).map(|r: Result<bytes::Bytes, std::io::Error>| {
-                            r.map(|b| b.to_vec())
-                                .map_err(|e| tonic::Status::internal(e.to_string()))
-                        })
-                    })
-                };
-
-                let mut reader = make_reader().await?;
-                let scopes = vec!["object:write|*".to_string()];
-                let mut attempt = 0;
-                loop {
-                    attempt += 1;
-                    info!("Putting object, attempt {}", attempt);
-                    let res = object_manager
-                        .put_object(
-                            tenant_id,
-                            &target_bucket,
-                            &full_key,
-                            &scopes,
-                            reader,
-                            crate::object_manager::ObjectWriteOptions::default(),
-                        )
-                        .await;
-                    match res {
-                        Ok(obj) => {
-                            info!(key = %full_key, "Upload successful");
-                            persistence
-                                .hf_update_item_success(item_id, obj.size, &obj.etag)
-                                .await?;
-                            break;
-                        }
-                        Err(e) if attempt < 3 => {
-                            warn!(
-                                attempt,
-                                key = %full_key,
-                                error = %e.to_string(),
-                                "Upload attempt failed. Retrying..."
-                            );
-                            let jitter = (rand::random::<u64>() % 200) as u64;
-                            tokio::time::sleep(std::time::Duration::from_millis(
-                                500 * attempt as u64 + jitter,
-                            ))
-                            .await;
-                            reader = make_reader().await?;
-                            continue;
-                        }
-                        Err(e) => {
-                            error!(
-                                key = %full_key,
-                                error = %e,
-                                "Upload failed permanently"
-                            );
-                            return Err(anyhow::anyhow!(e.to_string()));
-                        }
-                    }
-                }
-
-            }
-
-            info!(
-                ingestion_id,
-                "Ingestion task completed successfully."
-            );
-
-            // --- Generate and upload anvil-index.json ---
-            let index_key = if target_prefix.is_empty() {
-                "anvil-index.json".to_string()
-            } else {
-                format!("{}/anvil-index.json", target_prefix.trim_end_matches('/'))
+                format!("{}/{}", target_prefix.trim_end_matches('/'), path)
             };
 
-            let mut file_map = HashMap::new();
+            info!(
+                bucket = %target_bucket,
+                key = %full_key,
+                "Uploading to Anvil"
+            );
+            let make_reader = || async {
+                let f = tokio::fs::File::open(&local_path).await;
+                f.map(|file| {
+                    use futures_util::StreamExt as _;
+                    use tokio_util::io::ReaderStream;
+                    ReaderStream::new(file).map(|r: Result<bytes::Bytes, std::io::Error>| {
+                        r.map(|b| b.to_vec())
+                            .map_err(|e| tonic::Status::internal(e.to_string()))
+                    })
+                })
+            };
 
-            // Fetch ALL items for this target (from past and current jobs) to build a complete index
-            let all_items = persistence.hf_get_all_items_for_prefix(tenant_id, &target_bucket, &target_prefix).await?;
-
-            for (path, size_opt, etag_opt, finished_at_opt) in all_items {
-                let mut meta = json!({});
-                if let Some(s) = size_opt {
-                    meta["size"] = json!(s);
-                }
-                if let Some(e) = etag_opt {
-                    meta["etag"] = json!(e);
-                }
-                if let Some(f) = finished_at_opt {
-                    meta["last_modified"] = json!(f.to_rfc3339());
-                }
-                // Insert will overwrite existing entries, so later jobs (ordered by finished_at) win.
-                file_map.insert(path, meta);
-            }
-
-            let mut total_bytes = 0;
-            for meta in file_map.values() {
-                if let Some(s) = meta.get("size").and_then(|v| v.as_i64()) {
-                    total_bytes += s;
-                }
-            }
-
-            let index_json = json!({
-                "meta": {
-                    "source_repo": repo_str,
-                    "revision": revision,
-                    "generated_at": chrono::Utc::now().to_rfc3339(),
-                    "total_files": file_map.len(),
-                    "total_bytes": total_bytes
-                },
-                "files": file_map,
-            });
-
-            let index_content_data = serde_json::to_vec_pretty(&index_json)?;
-            info!(index_key = %index_key, "Uploading anvil-index.json");
-
-            // Upload index file, using retry logic adapted from above for robustness
+            let mut reader = make_reader().await?;
+            let scopes = vec!["object:write|*".to_string()];
             let mut attempt = 0;
             loop {
                 attempt += 1;
-                info!("Putting anvil-index.json, attempt {}", attempt);
-                let current_index_content = index_content_data.clone();
-                let index_stream: Pin<
-                    Box<dyn Stream<Item = Result<Vec<u8>, Status>> + Send + 'static>,
-                > = Box::pin(
-                    futures_util::stream::once(async move { Ok(current_index_content) })
-                        .map(|item: Result<Vec<u8>, Infallible>| item.map_err(|e| match e {})),
-                );
-
-                let res: Result<Object, Status> = object_manager
+                info!("Putting object, attempt {}", attempt);
+                let res = object_manager
                     .put_object(
                         tenant_id,
                         &target_bucket,
-                        &index_key,
-                        &vec!["object:write|*".to_string()], // Scopes
-                        index_stream,
-                        crate::object_manager::ObjectWriteOptions {
-                            content_type: Some("application/json".to_string()),
-                            user_metadata: None,
-                        },
+                        &full_key,
+                        &scopes,
+                        reader,
+                        crate::object_manager::ObjectWriteOptions::default(),
                     )
                     .await;
                 match res {
-                    Ok(_) => {
-                        info!(key = %index_key, "anvil-index.json upload successful");
+                    Ok(obj) => {
+                        info!(key = %full_key, "Upload successful");
+                        persistence
+                            .hf_update_item_success(item_id, obj.size, &obj.etag)
+                            .await?;
                         break;
                     }
                     Err(e) if attempt < 3 => {
                         warn!(
                             attempt,
-                            key = %index_key,
+                            key = %full_key,
                             error = %e.to_string(),
-                            "anvil-index.json upload attempt failed. Retrying..."
+                            "Upload attempt failed. Retrying..."
                         );
                         let jitter = (rand::random::<u64>() % 200) as u64;
                         tokio::time::sleep(std::time::Duration::from_millis(
                             500 * attempt as u64 + jitter,
                         ))
                         .await;
+                        reader = make_reader().await?;
                         continue;
                     }
                     Err(e) => {
                         error!(
-                            key = %index_key,
+                            key = %full_key,
                             error = %e,
-                            "anvil-index.json upload failed permanently"
+                            "Upload failed permanently"
                         );
                         return Err(anyhow::anyhow!(e.to_string()));
                     }
                 }
             }
-            // --- End anvil-index.json upload ---
-
-            info!(ingestion_id, "Updating ingestion state to completed.");
-            persistence
-                .hf_update_ingestion_state(ingestion_id, HFIngestionState::Completed, None)
-                .await?;
-            info!(ingestion_id, "Ingestion state set to completed.");
-
-            Ok::<(), anyhow::Error>(())
         }
-        .await;
+
+        info!(ingestion_id, "Ingestion task completed successfully.");
+
+        // --- Generate and upload anvil-index.json ---
+        let index_key = if target_prefix.is_empty() {
+            "anvil-index.json".to_string()
+        } else {
+            format!("{}/anvil-index.json", target_prefix.trim_end_matches('/'))
+        };
+
+        let mut file_map = HashMap::new();
+
+        // Fetch ALL items for this target (from past and current jobs) to build a complete index
+        let all_items = persistence
+            .hf_get_all_items_for_prefix(tenant_id, &target_bucket, &target_prefix)
+            .await?;
+
+        for (path, size_opt, etag_opt, finished_at_opt) in all_items {
+            let mut meta = json!({});
+            if let Some(s) = size_opt {
+                meta["size"] = json!(s);
+            }
+            if let Some(e) = etag_opt {
+                meta["etag"] = json!(e);
+            }
+            if let Some(f) = finished_at_opt {
+                meta["last_modified"] = json!(f.to_rfc3339());
+            }
+            // Insert will overwrite existing entries, so later jobs (ordered by finished_at) win.
+            file_map.insert(path, meta);
+        }
+
+        let mut total_bytes = 0;
+        for meta in file_map.values() {
+            if let Some(s) = meta.get("size").and_then(|v| v.as_i64()) {
+                total_bytes += s;
+            }
+        }
+
+        let index_json = json!({
+            "meta": {
+                "source_repo": repo_str,
+                "revision": revision,
+                "generated_at": chrono::Utc::now().to_rfc3339(),
+                "total_files": file_map.len(),
+                "total_bytes": total_bytes
+            },
+            "files": file_map,
+        });
+
+        let index_content_data = serde_json::to_vec_pretty(&index_json)?;
+        info!(index_key = %index_key, "Uploading anvil-index.json");
+
+        // Upload index file, using retry logic adapted from above for robustness
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            info!("Putting anvil-index.json, attempt {}", attempt);
+            let current_index_content = index_content_data.clone();
+            let index_stream: Pin<
+                Box<dyn Stream<Item = Result<Vec<u8>, Status>> + Send + 'static>,
+            > = Box::pin(
+                futures_util::stream::once(async move { Ok(current_index_content) })
+                    .map(|item: Result<Vec<u8>, Infallible>| item.map_err(|e| match e {})),
+            );
+
+            let res: Result<Object, Status> = object_manager
+                .put_object(
+                    tenant_id,
+                    &target_bucket,
+                    &index_key,
+                    &vec!["object:write|*".to_string()], // Scopes
+                    index_stream,
+                    crate::object_manager::ObjectWriteOptions {
+                        content_type: Some("application/json".to_string()),
+                        user_metadata: None,
+                    },
+                )
+                .await;
+            match res {
+                Ok(_) => {
+                    info!(key = %index_key, "anvil-index.json upload successful");
+                    break;
+                }
+                Err(e) if attempt < 3 => {
+                    warn!(
+                        attempt,
+                        key = %index_key,
+                        error = %e.to_string(),
+                        "anvil-index.json upload attempt failed. Retrying..."
+                    );
+                    let jitter = (rand::random::<u64>() % 200) as u64;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        500 * attempt as u64 + jitter,
+                    ))
+                    .await;
+                    continue;
+                }
+                Err(e) => {
+                    error!(
+                        key = %index_key,
+                        error = %e,
+                        "anvil-index.json upload failed permanently"
+                    );
+                    return Err(anyhow::anyhow!(e.to_string()));
+                }
+            }
+        }
+        // --- End anvil-index.json upload ---
+
+        info!(ingestion_id, "Updating ingestion state to completed.");
+        persistence
+            .hf_update_ingestion_state(ingestion_id, HFIngestionState::Completed, None)
+            .await?;
+        info!(ingestion_id, "Ingestion state set to completed.");
+
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
 
     if let Err(e) = &result {
         error!(ingestion_id, error = %e, "HF Ingestion task failed");

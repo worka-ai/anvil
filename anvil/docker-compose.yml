@@ -5,49 +5,10 @@ networks:
     driver: bridge
 
 services:
-  postgres-global:
-    image: postgres:17-alpine
-    environment:
-      POSTGRES_USER: anvil
-      POSTGRES_PASSWORD: anvil
-      POSTGRES_DB: anvil_global
-    ports:
-      - "5433:5432"
-    volumes:
-      - postgres_global_data:/var/lib/postgresql/data
-    networks: [anvilnet]
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U anvil -d anvil_global"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  postgres-regional:
-    image: postgres:17-alpine
-    environment:
-      POSTGRES_USER: anvil
-      POSTGRES_PASSWORD: anvil
-      POSTGRES_DB: anvil_regional_docker
-    volumes:
-      - postgres_regional_data:/var/lib/postgresql/data
-    networks: [anvilnet]
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U anvil -d anvil_regional_docker"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
   anvil1:
     image: ghcr.io/worka-ai/anvil:latest
-    depends_on:
-      postgres-global:
-        condition: service_healthy
-      postgres-regional:
-        condition: service_healthy
     environment:
       - RUST_LOG=info
-      - GLOBAL_DATABASE_URL=postgres://anvil:anvil@postgres-global:5432/anvil_global
-      - REGIONAL_DATABASE_URL=postgres://anvil:anvil@postgres-regional:5432/anvil_regional_docker
       - REGION=DOCKER_TEST
       - JWT_SECRET=docker-test-secret
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -57,10 +18,13 @@ services:
       - PUBLIC_CLUSTER_ADDRS=/dns4/anvil1/udp/7443/quic-v1
       - PUBLIC_API_ADDR=http://anvil1:50051
       - ENABLE_MDNS=false
+      - STORAGE_PATH=/var/lib/anvil
     command: ["anvil", "--init-cluster"]
     ports:
       - "50051:50051"
       - "7443:7443/udp"
+    volumes:
+      - anvil1_data:/var/lib/anvil
     networks: [anvilnet]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:50051/ready"]
@@ -75,8 +39,6 @@ services:
         condition: service_started
     environment:
       - RUST_LOG=info
-      - GLOBAL_DATABASE_URL=postgres://anvil:anvil@postgres-global:5432/anvil_global
-      - REGIONAL_DATABASE_URL=postgres://anvil:anvil@postgres-regional:5432/anvil_regional_docker
       - REGION=DOCKER_TEST
       - JWT_SECRET=docker-test-secret
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -87,9 +49,12 @@ services:
       - PUBLIC_API_ADDR=http://anvil2:50051
       - ENABLE_MDNS=false
       - BOOTSTRAP_ADDRS=/dns4/anvil1/udp/7443/quic-v1
+      - STORAGE_PATH=/var/lib/anvil
     ports:
       - "50052:50051"
       - "7444:7443/udp"
+    volumes:
+      - anvil2_data:/var/lib/anvil
     networks: [anvilnet]
 
   anvil3:
@@ -99,8 +64,6 @@ services:
         condition: service_started
     environment:
       - RUST_LOG=info
-      - GLOBAL_DATABASE_URL=postgres://anvil:anvil@postgres-global:5432/anvil_global
-      - REGIONAL_DATABASE_URL=postgres://anvil:anvil@postgres-regional:5432/anvil_regional_docker
       - REGION=DOCKER_TEST
       - JWT_SECRET=docker-test-secret
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -111,11 +74,15 @@ services:
       - PUBLIC_API_ADDR=http://anvil3:50051
       - ENABLE_MDNS=false
       - BOOTSTRAP_ADDRS=/dns4/anvil1/udp/7443/quic-v1
+      - STORAGE_PATH=/var/lib/anvil
     ports:
       - "50053:50051"
       - "7445:7443/udp"
+    volumes:
+      - anvil3_data:/var/lib/anvil
     networks: [anvilnet]
 
 volumes:
-  postgres_global_data:
-  postgres_regional_data:
+  anvil1_data:
+  anvil2_data:
+  anvil3_data:

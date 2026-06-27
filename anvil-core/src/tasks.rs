@@ -1,57 +1,60 @@
-use postgres_types::{FromSql, ToSql};
-
-#[derive(Debug, ToSql, FromSql, PartialEq, Eq)]
-#[postgres(name = "task_type")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TaskType {
-    #[postgres(name = "DELETE_OBJECT")]
     DeleteObject,
-    #[postgres(name = "DELETE_BUCKET")]
     DeleteBucket,
-    #[postgres(name = "REBALANCE_SHARD")]
     RebalanceShard,
-    #[postgres(name = "HF_INGESTION")]
     HFIngestion,
 }
 
-#[derive(Debug, ToSql, FromSql, PartialEq, Eq, Clone, Copy)]
-#[postgres(name = "task_status")]
+impl TaskType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DeleteObject => "DELETE_OBJECT",
+            Self::DeleteBucket => "DELETE_BUCKET",
+            Self::RebalanceShard => "REBALANCE_SHARD",
+            Self::HFIngestion => "HF_INGESTION",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
-    #[postgres(name = "pending")]
     Pending,
-    #[postgres(name = "running")]
     Running,
-    #[postgres(name = "completed")]
     Completed,
-    #[postgres(name = "failed")]
     Failed,
 }
 
-#[derive(Debug, ToSql, FromSql, PartialEq, Eq, Clone, Copy)]
-#[postgres(name = "hf_ingestion_state")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HFIngestionState {
-    #[postgres(name = "queued")]
     Queued,
-    #[postgres(name = "running")]
     Running,
-    #[postgres(name = "completed")]
     Completed,
-    #[postgres(name = "failed")]
     Failed,
-    #[postgres(name = "canceled")]
     Canceled,
 }
 
-#[derive(Debug, ToSql, FromSql, PartialEq, Eq, Clone, Copy)]
-#[postgres(name = "hf_item_state")]
+impl HFIngestionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HFIngestionItemState {
-    #[postgres(name = "queued")]
     Queued,
-    #[postgres(name = "downloading")]
     Downloading,
-    #[postgres(name = "stored")]
     Stored,
-    #[postgres(name = "failed")]
     Failed,
-    #[postgres(name = "skipped")]
     Skipped,
 }

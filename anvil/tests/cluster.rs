@@ -8,8 +8,6 @@ use libp2p::{gossipsub, swarm::SwarmEvent};
 #[tokio::test]
 async fn test_cluster_gossip() {
     let config = Arc::new(anvil::config::Config {
-        global_database_url: "".to_string(),
-        regional_database_url: "".to_string(),
         jwt_secret: "test-secret".to_string(),
         anvil_secret_encryption_key:
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
@@ -107,8 +105,6 @@ async fn test_cluster_gossip() {
 #[tokio::test]
 async fn test_cluster_gossip_invalid_secret() {
     let config1 = Arc::new(anvil::config::Config {
-        global_database_url: "".to_string(),
-        regional_database_url: "".to_string(),
         jwt_secret: "test-secret".to_string(),
         anvil_secret_encryption_key:
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
@@ -125,8 +121,6 @@ async fn test_cluster_gossip_invalid_secret() {
         storage_path: "anvil-data".to_string(),
     });
     let config2 = Arc::new(anvil::config::Config {
-        global_database_url: "".to_string(),
-        regional_database_url: "".to_string(),
         jwt_secret: "test-secret".to_string(),
         anvil_secret_encryption_key:
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),

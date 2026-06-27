@@ -1,57 +1,21 @@
-use std::sync::Once;
-
-static INIT_LOGGER: Once = Once::new();
-
-use anvil::anvil_api::GetAccessTokenRequest;
-use anvil::anvil_api::auth_service_client::AuthServiceClient;
-use anvil::run_migrations;
-use anvil_core::AppState;
-use anyhow::Result;
-use aws_config::BehaviorVersion;
-use aws_sdk_s3::Client as S3Client;
-use aws_sdk_s3::config::Credentials;
-use deadpool_postgres::{ManagerConfig, Pool, RecyclingMethod};
-use futures_util::StreamExt;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::process::Command;
-use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
+
+use anvil::anvil_api::GetAccessTokenRequest;
+use anvil::anvil_api::auth_service_client::AuthServiceClient;
+use anvil_core::AppState;
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::config::Credentials;
+use futures_util::StreamExt;
 use tokio::task::JoinHandle;
-use tokio_postgres::NoTls;
 use tracing_subscriber::{self, EnvFilter};
 
-pub mod migrations {
-    use refinery_macros::embed_migrations;
-    embed_migrations!("../anvil/migrations_global");
-}
-
-pub mod regional_migrations {
-    use refinery_macros::embed_migrations;
-    embed_migrations!("../anvil/migrations_regional");
-}
-
-pub fn create_pool(db_url: &str) -> Result<Pool> {
-    let pg_config = tokio_postgres::Config::from_str(db_url)?;
-    let mgr_config = ManagerConfig {
-        recycling_method: RecyclingMethod::Fast,
-    };
-    let mgr = deadpool_postgres::Manager::from_config(pg_config, NoTls, mgr_config);
-    Pool::builder(mgr).build().map_err(Into::into)
-}
-
-fn database_server_url(database_url: &str) -> Result<String> {
-    let (server_url, database_name) = database_url
-        .rsplit_once('/')
-        .ok_or_else(|| anyhow::anyhow!("database URL must include a database name"))?;
-    if server_url.is_empty() || database_name.is_empty() {
-        anyhow::bail!("database URL must include a server URL and database name");
-    }
-    Ok(server_url.to_string())
-}
+static INIT_LOGGER: Once = Once::new();
 
 #[allow(dead_code)]
 pub fn extract_credential(output: &str, key: &str) -> String {
@@ -63,67 +27,7 @@ pub fn extract_credential(output: &str, key: &str) -> String {
 }
 
 #[allow(dead_code)]
-pub async fn get_auth_token(global_db_url: &str, grpc_addr: &str) -> String {
-    let admin_args = &[
-        "run",
-        "-p",
-        "anvil",
-        "--features",
-        "anvil/enterprise",
-        "--bin",
-        "admin",
-        "--",
-    ];
-
-    let app_name = format!("test-app-{}", uuid::Uuid::new_v4());
-    let app_output = Command::new("cargo")
-        .args(admin_args.iter().chain(&[
-            "--global-database-url",
-            global_db_url,
-            "--anvil-secret-encryption-key",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "app",
-            "create",
-            "--tenant-name",
-            "default",
-            "--app-name",
-            &app_name,
-        ]))
-        .output()
-        .unwrap();
-    if !app_output.status.success() {
-        panic!(
-            "Failed to create app via admin CLI:\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&app_output.stdout),
-            String::from_utf8_lossy(&app_output.stderr)
-        );
-    }
-    let creds = String::from_utf8(app_output.stdout).unwrap();
-    let client_id = extract_credential(&creds, "Client ID");
-    let client_secret = extract_credential(&creds, "Client Secret");
-
-    let policy_args = &[
-        "--global-database-url",
-        global_db_url,
-        "--anvil-secret-encryption-key",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "policy",
-        "grant",
-        "--app-name",
-        &app_name,
-        "--action",
-        "*",
-        "--resource",
-        "*",
-    ];
-    let status = Command::new("cargo")
-        .args(admin_args.iter().chain(policy_args.iter()))
-        .status()
-        .unwrap();
-    assert!(status.success());
-
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
+pub async fn get_auth_token(_admin_state_path: &str, grpc_addr: &str) -> String {
     let grpc_url = if grpc_addr.ends_with("/grpc") {
         grpc_addr.to_string()
     } else {
@@ -132,9 +36,9 @@ pub async fn get_auth_token(global_db_url: &str, grpc_addr: &str) -> String {
     let mut auth_client = AuthServiceClient::connect(grpc_url).await.unwrap();
     let token_res = auth_client
         .get_access_token(GetAccessTokenRequest {
-            client_id,
-            client_secret,
-            scopes: vec![],
+            client_id: "test-app".to_string(),
+            client_secret: "test-secret".to_string(),
+            scopes: vec!["*|*".to_string()],
         })
         .await
         .unwrap()
@@ -149,13 +53,9 @@ pub struct TestCluster {
     pub states: Vec<AppState>,
     pub grpc_addrs: Vec<String>,
     pub token: String,
-    pub global_db_url: String,
-    pub regional_db_urls: Vec<String>,
-    pub global_db_name: String,
-    pub regional_db_names: Vec<String>,
+    pub admin_state_path: String,
     pub config: Arc<anvil_core::config::Config>,
     pub storage_path: PathBuf,
-    maint_client: Option<tokio_postgres::Client>,
 }
 
 impl TestCluster {
@@ -176,6 +76,7 @@ impl TestCluster {
         );
         bucket_client.create_bucket(create_req).await.unwrap();
     }
+
     #[allow(dead_code)]
     pub async fn new(regions: &[&str]) -> Self {
         INIT_LOGGER.call_once(|| {
@@ -189,8 +90,6 @@ impl TestCluster {
         let storage_path =
             std::env::temp_dir().join(format!("anvil-test-storage-{}", uuid::Uuid::new_v4()));
         let config = Arc::new(anvil_core::config::Config {
-            global_database_url: "".to_string(),
-            regional_database_url: "".to_string(),
             cluster_secret: Some("test-cluster-secret".to_string()),
             jwt_secret: "test-secret".to_string(),
             anvil_secret_encryption_key:
@@ -208,52 +107,47 @@ impl TestCluster {
         });
 
         let unique_regions: HashSet<String> = regions.iter().map(|s| s.to_string()).collect();
-
-        let (global_db_url, regional_db_urls, global_db_name, regional_db_names, maint_client) =
-            create_isolated_dbs(unique_regions.len()).await.unwrap();
-        let regional_db_map = regional_db_urls
-            .into_iter()
-            .enumerate()
-            .map(|(i, db_url)| (unique_regions.iter().nth(i).unwrap().to_string(), db_url))
-            .collect::<HashMap<String, String>>();
-
-        run_migrations(
-            &global_db_url,
-            migrations::migrations::runner(),
-            "refinery_schema_history_global",
-        )
-        .await
-        .unwrap();
-        for (_, db_url) in regional_db_map.iter() {
-            run_migrations(
-                db_url,
-                regional_migrations::migrations::runner(),
-                "refinery_schema_history_regional",
-            )
-            .await
-            .unwrap();
-        }
-
-        let mut regional_pools = HashMap::new();
-        for (region_name, db_url) in regional_db_map.iter() {
-            regional_pools.insert(region_name.clone(), create_pool(db_url).unwrap());
-        }
-
-        let global_pool = create_pool(&global_db_url).unwrap();
-        for region in &unique_regions {
-            create_default_tenant(&global_pool, region).await;
-        }
-
+        let first_region = regions.first().copied().unwrap_or("default");
+        let admin_state_path = storage_path.join(format!("node-{first_region}"));
         let mut states = Vec::new();
         for region_name in regions {
-            let regional_pool = regional_pools.get(*region_name).unwrap().clone();
             let mut node_config = config.deref().clone();
             node_config.region = region_name.to_string();
-            node_config.metadata_cache_ttl_secs = 1; // Short TTL for tests
-            let state = AppState::new(global_pool.clone(), regional_pool, node_config, None)
+            node_config.metadata_cache_ttl_secs = 1;
+            node_config.storage_path = storage_path
+                .join(format!("node-{region_name}"))
+                .to_string_lossy()
+                .into_owned();
+            let state = AppState::new(node_config, None).await.unwrap();
+            state.db.create_region(region_name).await.unwrap();
+            let tenant = state
+                .db
+                .create_tenant("default", "default-key")
                 .await
                 .unwrap();
+            let encryption_key = hex::decode(&state.config.anvil_secret_encryption_key).unwrap();
+            if state
+                .db
+                .get_app_by_client_id("test-app")
+                .await
+                .unwrap()
+                .is_none()
+            {
+                let encrypted_secret =
+                    anvil::crypto::encrypt(b"test-secret", &encryption_key).unwrap();
+                let app = state
+                    .db
+                    .create_app(tenant.id, "test-app", "test-app", &encrypted_secret)
+                    .await
+                    .unwrap();
+                state.db.grant_policy(app.id, "*", "*").await.unwrap();
+            }
             states.push(state);
+        }
+        for region in unique_regions {
+            for state in &states {
+                state.db.create_region(&region).await.unwrap();
+            }
         }
 
         Self {
@@ -261,13 +155,9 @@ impl TestCluster {
             states,
             grpc_addrs: Vec::new(),
             token: String::new(),
-            global_db_url,
-            regional_db_urls: regional_db_map.values().cloned().collect(),
-            global_db_name,
-            regional_db_names,
+            admin_state_path: admin_state_path.to_string_lossy().into_owned(),
             config,
             storage_path,
-            maint_client: Some(maint_client),
         }
     }
 
@@ -304,11 +194,10 @@ impl TestCluster {
         }
 
         for i in 0..swarms.len() {
-            for j in 0..listen_addrs.len() {
-                if i == j {
-                    continue;
+            for (j, addr) in listen_addrs.iter().enumerate() {
+                if i != j {
+                    swarms[i].dial(addr.clone()).unwrap();
                 }
-                swarms[i].dial(listen_addrs[j].clone()).unwrap();
             }
         }
 
@@ -332,7 +221,10 @@ impl TestCluster {
         }
 
         if get_new_token {
-            self.token = get_auth_token(&self.global_db_url, &self.grpc_addrs[0]).await;
+            self.token = self.states[0]
+                .jwt_manager
+                .mint_token("test-app".to_string(), vec!["*|*".to_string()], 1)
+                .unwrap();
         }
 
         let start = Instant::now();
@@ -347,19 +239,13 @@ impl TestCluster {
                 }
             }
             if all_converged {
-                println!("Cluster converged with {} nodes.", self.nodes.len());
-
-                // Also wait for all gRPC ports to be open.
                 for addr_str in &self.grpc_addrs {
                     let addr: SocketAddr = addr_str.replace("http://", "").parse().unwrap();
                     if !wait_for_port(addr, Duration::from_secs(5)).await {
                         panic!("gRPC port {} did not open in time", addr);
                     }
                 }
-
-                // Give gossipsub a moment to connect.
                 tokio::time::sleep(Duration::from_secs(3)).await;
-
                 return;
             }
         }
@@ -374,15 +260,13 @@ impl TestCluster {
         secret_key: &str,
     ) -> S3Client {
         let credentials = Credentials::new(access_key, secret_key, None, None, "static");
-
         let config = aws_sdk_s3::Config::builder()
             .credentials_provider(credentials)
             .region(aws_sdk_s3::config::Region::new(region.to_string()))
-            .endpoint_url(&self.grpc_addrs[0]) // Point to the test server
+            .endpoint_url(&self.grpc_addrs[0])
             .force_path_style(true)
             .behavior_version(BehaviorVersion::latest())
             .build();
-
         S3Client::from_conf(config)
     }
 
@@ -398,11 +282,9 @@ impl TestCluster {
 
 impl Drop for TestCluster {
     fn drop(&mut self) {
-        // Abort all spawned Anvil nodes
         for node in self.nodes.drain(..) {
             node.abort();
         }
-
         if let Err(e) = std::fs::remove_dir_all(&self.storage_path) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 eprintln!(
@@ -412,137 +294,7 @@ impl Drop for TestCluster {
                 );
             }
         }
-
-        // Drop the isolated test databases
-        if let Some(maint_client) = self.maint_client.take() {
-            let global_db_name = self.global_db_name.clone();
-            let regional_db_names = self.regional_db_names.clone();
-
-            tokio::spawn(async move {
-                // Drop global database
-                if let Err(e) = maint_client
-                    .execute(
-                        &format!(
-                            "DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)",
-                            global_db_name
-                        ),
-                        &[],
-                    )
-                    .await
-                {
-                    eprintln!("Failed to drop global database {}: {}", global_db_name, e);
-                }
-
-                // Drop regional databases
-                for db_name in &regional_db_names {
-                    if let Err(e) = maint_client
-                        .execute(
-                            &format!("DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)", db_name),
-                            &[],
-                        )
-                        .await
-                    {
-                        eprintln!("Failed to drop regional database {}: {}", db_name, e);
-                    }
-                }
-            });
-        }
     }
-}
-
-async fn create_isolated_dbs(
-    num_regional: usize,
-) -> Result<(
-    String,
-    Vec<String>,
-    String,
-    Vec<String>,
-    tokio_postgres::Client,
-)> {
-    dotenvy::dotenv().ok();
-    let maint_db_url =
-        std::env::var("MAINTENANCE_DATABASE_URL").expect("MAINTENANCE_DATABASE_URL must be set");
-
-    let mut attempt = 0;
-    let (maint_client, connection) = loop {
-        if attempt > 10 {
-            panic!("Failed to connect to maintenance database after 10 attempts");
-        }
-        match tokio_postgres::connect(&maint_db_url, NoTls).await {
-            Ok(conn) => break conn,
-            Err(e) => {
-                println!("Failed to connect to maintenance DB, retrying... ({})", e);
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                attempt += 1;
-            }
-        }
-    };
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("maintenance connection error: {}", e);
-        }
-    });
-
-    let suffix = uuid::Uuid::new_v4().to_string().replace('-', "");
-    let global_db_name = format!("test_global_{}", suffix);
-    maint_client
-        .execute(&format!("CREATE DATABASE \"{}\"", global_db_name), &[])
-        .await
-        .unwrap();
-
-    let mut regional_db_urls = Vec::new();
-    let mut regional_db_names = Vec::new();
-    let base_db_url = database_server_url(&maint_db_url).expect("derive test database server URL");
-
-    for i in 0..num_regional {
-        let regional_db_name = format!("test_regional_{}_{}", suffix, i);
-        maint_client
-            .execute(&format!("CREATE DATABASE \"{}\"", regional_db_name), &[])
-            .await
-            .unwrap();
-        regional_db_urls.push(format!("{}/{}", base_db_url, regional_db_name));
-        regional_db_names.push(regional_db_name);
-    }
-
-    let global_db_url = format!("{}/{}", base_db_url, global_db_name);
-
-    Ok((
-        global_db_url,
-        regional_db_urls,
-        global_db_name,
-        regional_db_names,
-        maint_client,
-    ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::database_server_url;
-
-    #[test]
-    fn database_server_url_reuses_configured_credentials_and_host() {
-        assert_eq!(
-            database_server_url("postgres://user:secret@127.0.0.1:5432/postgres").unwrap(),
-            "postgres://user:secret@127.0.0.1:5432"
-        );
-    }
-}
-
-pub async fn create_default_tenant(global_pool: &Pool, region: &str) {
-    let client = global_pool.get().await.unwrap();
-    client
-        .execute(
-            "INSERT INTO tenants (id, name, api_key) VALUES (1, 'default', 'default-key') ON CONFLICT (id) DO NOTHING",
-            &[],
-        )
-        .await.unwrap();
-    client
-        .execute(
-            "INSERT INTO regions (name) VALUES ($1) ON CONFLICT (name) DO NOTHING",
-            &[&region],
-        )
-        .await
-        .unwrap();
 }
 
 #[allow(dead_code)]

@@ -13,14 +13,14 @@ use tonic::Request;
 use anvil_test_utils::*;
 
 // Helper function to create an app, since it's used in auth tests.
-fn create_app(global_db_url: &str, app_name: &str) -> (String, String) {
+fn create_app(admin_state_path: &str, app_name: &str) -> (String, String) {
     let admin_args = &["run", "--bin", "admin", "--"];
     let app_output = std::process::Command::new("cargo")
         .args(admin_args.iter().chain(&[
-            "--global-database-url",
-            global_db_url,
             "--anvil-secret-encryption-key",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--storage-path",
+            admin_state_path,
             "app",
             "create",
             "--tenant-name",
@@ -78,7 +78,7 @@ async fn test_grant_and_revoke_access() {
         .unwrap();
 
     let (granter_client_id, granter_client_secret) =
-        create_app(&cluster.global_db_url, "granter-app");
+        create_app(&cluster.admin_state_path, "granter-app");
 
     // Grant the granter app the ability to grant policies
     let admin_args = &["run", "--bin", "admin", "--"];
@@ -97,10 +97,10 @@ async fn test_grant_and_revoke_access() {
             admin_args
                 .iter()
                 .chain(&[
-                    "--global-database-url",
-                    &cluster.global_db_url,
                     "--anvil-secret-encryption-key",
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "--storage-path",
+                    &cluster.admin_state_path,
                 ])
                 .chain(policy_args.iter()),
         )
@@ -123,10 +123,10 @@ async fn test_grant_and_revoke_access() {
             admin_args
                 .iter()
                 .chain(&[
-                    "--global-database-url",
-                    &cluster.global_db_url,
                     "--anvil-secret-encryption-key",
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "--storage-path",
+                    &cluster.admin_state_path,
                 ])
                 .chain(revoke_policy_args.iter()),
         )
@@ -145,7 +145,7 @@ async fn test_grant_and_revoke_access() {
     .await;
 
     let (grantee_client_id, grantee_client_secret) =
-        create_app(&cluster.global_db_url, "grantee-app");
+        create_app(&cluster.admin_state_path, "grantee-app");
 
     let bucket_name = "grant-test-bucket".to_string();
     let resource = format!("bucket:{}", bucket_name);
@@ -519,7 +519,7 @@ async fn test_reset_app_secret() {
     let app_name = "app-to-reset";
 
     // 1. Create an app and get original credentials
-    let (client_id, original_secret) = create_app(&cluster.global_db_url, app_name);
+    let (client_id, original_secret) = create_app(&cluster.admin_state_path, app_name);
 
     // Grant it permissions
     let admin_args = &["run", "--bin", "admin", "--"];
@@ -538,10 +538,10 @@ async fn test_reset_app_secret() {
             admin_args
                 .iter()
                 .chain(&[
-                    "--global-database-url",
-                    &cluster.global_db_url,
                     "--anvil-secret-encryption-key",
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "--storage-path",
+                    &cluster.admin_state_path,
                 ])
                 .chain(policy_args.iter()),
         )
@@ -552,10 +552,10 @@ async fn test_reset_app_secret() {
     // 2. Reset the secret using the new admin command
     let reset_output = std::process::Command::new("cargo")
         .args(admin_args.iter().chain(&[
-            "--global-database-url",
-            &cluster.global_db_url,
             "--anvil-secret-encryption-key",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--storage-path",
+            &cluster.admin_state_path,
             "app",
             "reset-secret",
             "--app-name",
@@ -663,12 +663,10 @@ async fn test_admin_cli_set_public_access() {
     let admin_args = &["run", "--bin", "admin", "--"];
     let set_public_status = std::process::Command::new("cargo")
         .args(admin_args.iter().chain(&[
-            "--global-database-url",
-            &cluster.global_db_url,
             "--anvil-secret-encryption-key",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "--storage-path",
-            cluster.storage_path.to_str().unwrap(),
+            &cluster.admin_state_path,
             "bucket",
             "set-public-access",
             "--bucket",

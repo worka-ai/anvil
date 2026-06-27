@@ -1,9 +1,6 @@
 use anyhow::Result;
 use axum::ServiceExt;
-use deadpool_postgres::{ManagerConfig, Pool, RecyclingMethod};
 use once_cell::sync::OnceCell;
-use std::str::FromStr;
-use tokio_postgres::NoTls;
 use tonic::service;
 use tower::ServiceExt as TowerServiceExt;
 use tracing::{error, info};
@@ -16,40 +13,12 @@ pub mod s3_gateway;
 
 pub mod s3_auth;
 
-pub mod migrations {
-    use refinery_macros::embed_migrations;
-    embed_migrations!("./migrations_global");
-}
-
-pub mod regional_migrations {
-    use refinery_macros::embed_migrations;
-    embed_migrations!("./migrations_regional");
-}
-
 pub async fn run(
     listener: tokio::net::TcpListener,
     config: anvil_core::config::Config,
 ) -> Result<()> {
-    // Run migrations first
-    run_migrations(
-        &config.global_database_url,
-        migrations::migrations::runner(),
-        "refinery_schema_history_global",
-    )
-    .await?;
-    run_migrations(
-        &config.regional_database_url,
-        regional_migrations::migrations::runner(),
-        "refinery_schema_history_regional",
-    )
-    .await?;
-
-    let regional_pool = create_pool(&config.regional_database_url)?;
-    let global_pool = create_pool(&config.global_database_url)?;
-    
     let (tx, rx) = tokio::sync::mpsc::channel(100);
-    
-    let state = AppState::new(global_pool, regional_pool, config, Some(tx)).await?;
+    let state = AppState::new(config, Some(tx)).await?;
     let swarm = anvil_core::cluster::create_swarm(state.config.clone()).await?;
 
     // Then start the node
@@ -144,32 +113,6 @@ pub async fn start_node(
     Ok(())
 }
 
-pub fn create_pool(db_url: &str) -> Result<Pool> {
-    let pg_config = tokio_postgres::Config::from_str(db_url)?;
-    let mgr_config = ManagerConfig {
-        recycling_method: RecyclingMethod::Fast,
-    };
-    let mgr = deadpool_postgres::Manager::from_config(pg_config, NoTls, mgr_config);
-    Pool::builder(mgr).build().map_err(Into::into)
-}
-
-pub async fn run_migrations(
-    db_url: &str,
-    mut runner: refinery::Runner,
-    table_name: &str,
-) -> Result<()> {
-    let (mut client, connection) = tokio_postgres::connect(db_url, NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            error!("connection error: {}", e);
-        }
-    });
-    runner
-        .set_migration_table_name(table_name)
-        .run_async(&mut client)
-        .await?;
-    Ok(())
-}
 static ENTERPRISE_EXTENDER: OnceCell<
     fn(
         service::Routes,

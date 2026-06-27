@@ -1,36 +1,173 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use deadpool_postgres::Pool;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use tokio_postgres::Row;
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+};
+use tokio::sync::{RwLock, mpsc::Sender};
 
-use crate::cache::MetadataCache;
-use crate::cluster::MetadataEvent;
-use tokio::sync::mpsc::Sender;
+use crate::{cache::MetadataCache, cluster::MetadataEvent, config::Config};
 
 #[derive(Debug, Clone)]
 pub struct Persistence {
-    global_pool: Pool,
-    regional_pool: Pool,
+    state_path: PathBuf,
+    state: Arc<RwLock<NativeState>>,
     cache: MetadataCache,
     event_publisher: Option<Sender<MetadataEvent>>,
 }
 
-// Structs that map to our database tables
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct NativeState {
+    next_id: i64,
+    regions: HashSet<String>,
+    tenants: Vec<Tenant>,
+    apps: Vec<StoredApp>,
+    app_policies: Vec<AppPolicy>,
+    buckets: Vec<StoredBucket>,
+    bucket_events: Vec<BucketMetadataEvent>,
+    objects: Vec<Object>,
+    multipart_uploads: Vec<MultipartUpload>,
+    multipart_parts: Vec<MultipartUploadPart>,
+    object_events: Vec<ObjectWatchEvent>,
+    append_streams: Vec<AppendStream>,
+    append_records: Vec<AppendStreamRecord>,
+    manifests: Vec<ManifestRecord>,
+    authz_tuples: Vec<AuthzTupleRecord>,
+    indexes: Vec<IndexDefinition>,
+    index_events: Vec<IndexDefinitionEvent>,
+    index_diagnostics: Vec<IndexDiagnostic>,
+    admin_users: Vec<AdminUser>,
+    admin_roles: Vec<AdminRole>,
+    admin_user_roles: Vec<AdminUserRole>,
+    tasks: Vec<TaskRecord>,
+    hf_keys: Vec<HfKey>,
+    hf_ingestions: Vec<HfIngestion>,
+    hf_items: Vec<HfIngestionItem>,
+    model_artifacts: Vec<ModelArtifactRecord>,
+    model_tensors: Vec<ModelTensorRecord>,
+}
+
+impl NativeState {
+    fn allocate_id(&mut self) -> i64 {
+        self.next_id += 1;
+        self.next_id
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredApp {
+    id: i64,
+    tenant_id: i64,
+    name: String,
+    client_id: String,
+    client_secret_encrypted: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppPolicy {
+    app_id: i64,
+    resource: String,
+    action: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredBucket {
+    bucket: Bucket,
+    deleted_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManifestRecord {
+    tenant_id: i64,
+    bucket_id: i64,
+    object_key: String,
+    revision: i64,
+    manifest_hash: String,
+    manifest: JsonValue,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AdminUserRole {
+    user_id: i64,
+    role_id: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HfKey {
+    id: i64,
+    name: String,
+    token_encrypted: Vec<u8>,
+    note: Option<String>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HfIngestion {
+    id: i64,
+    key_id: i64,
+    tenant_id: i64,
+    requester_app_id: i64,
+    repo: String,
+    revision: String,
+    target_bucket: String,
+    target_region: String,
+    target_prefix: String,
+    include_globs: Vec<String>,
+    exclude_globs: Vec<String>,
+    state: crate::tasks::HFIngestionState,
+    error: Option<String>,
+    created_at: DateTime<Utc>,
+    started_at: Option<DateTime<Utc>>,
+    finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HfIngestionItem {
+    id: i64,
+    ingestion_id: i64,
+    path: String,
+    size: Option<i64>,
+    etag: Option<String>,
+    state: crate::tasks::HFIngestionItemState,
+    error: Option<String>,
+    created_at: DateTime<Utc>,
+    started_at: Option<DateTime<Utc>>,
+    finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ModelArtifactRecord {
+    artifact_id: String,
+    bucket_id: i64,
+    key: String,
+    manifest: crate::anvil_api::ModelManifest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ModelTensorRecord {
+    artifact_id: String,
+    tensor: crate::anvil_api::TensorIndexRow,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tenant {
     pub id: i64,
     pub name: String,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct App {
     pub id: i64,
     pub name: String,
     pub client_id: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bucket {
     pub id: i64,
     pub tenant_id: i64,
@@ -40,7 +177,7 @@ pub struct Bucket {
     pub is_public_read: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BucketMetadataEvent {
     pub id: i64,
     pub tenant_id: i64,
@@ -51,7 +188,7 @@ pub struct BucketMetadataEvent {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Object {
     pub id: i64,
     pub tenant_id: i64,
@@ -76,14 +213,14 @@ pub struct Object {
     pub checksum: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectVersion {
     pub object: Object,
     pub is_delete_marker: bool,
     pub is_latest: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectVersionsPage {
     pub versions: Vec<ObjectVersion>,
     pub is_truncated: bool,
@@ -107,7 +244,7 @@ struct ObjectVersionRecordHashInput<'a> {
     delete_marker: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MultipartUpload {
     pub id: i64,
     pub tenant_id: i64,
@@ -119,7 +256,7 @@ pub struct MultipartUpload {
     pub aborted_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MultipartUploadsPage {
     pub uploads: Vec<MultipartUpload>,
     pub is_truncated: bool,
@@ -127,7 +264,7 @@ pub struct MultipartUploadsPage {
     pub next_upload_id_marker: Option<uuid::Uuid>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MultipartUploadPart {
     pub id: i64,
     pub upload_id: i64,
@@ -138,14 +275,14 @@ pub struct MultipartUploadPart {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MultipartPartsPage {
     pub parts: Vec<MultipartUploadPart>,
     pub is_truncated: bool,
     pub next_part_number_marker: Option<i32>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectWatchEvent {
     pub id: i64,
     pub tenant_id: i64,
@@ -160,7 +297,7 @@ pub struct ObjectWatchEvent {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendStream {
     pub id: i64,
     pub tenant_id: i64,
@@ -173,7 +310,7 @@ pub struct AppendStream {
     pub segment_hash: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendStreamRecord {
     pub id: i64,
     pub stream_id: i64,
@@ -183,13 +320,13 @@ pub struct AppendStreamRecord {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestCasResult {
     pub revision: i64,
     pub manifest_hash: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthzTupleRecord {
     pub revision: i64,
     pub tenant_id: i64,
@@ -206,7 +343,7 @@ pub struct AuthzTupleRecord {
     pub written_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexDefinition {
     pub id: i64,
     pub tenant_id: i64,
@@ -223,7 +360,7 @@ pub struct IndexDefinition {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexDefinitionEvent {
     pub id: i64,
     pub tenant_id: i64,
@@ -237,7 +374,7 @@ pub struct IndexDefinitionEvent {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexDiagnostic {
     pub id: i64,
     pub tenant_id: i64,
@@ -254,232 +391,54 @@ pub struct IndexDiagnostic {
     pub created_at: DateTime<Utc>,
 }
 
-// Manual row-to-struct mapping
-impl From<Row> for Tenant {
-    fn from(row: Row) -> Self {
-        Self {
-            id: row.get("id"),
-            name: row.get("name"),
-        }
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppDetails {
+    pub id: i64,
+    pub client_secret_encrypted: Vec<u8>,
+    pub tenant_id: i64,
 }
 
-impl From<Row> for App {
-    fn from(row: Row) -> Self {
-        Self {
-            id: row.get("id"),
-            name: row.get("name"),
-            client_id: row.get("client_id"),
-        }
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminUser {
+    pub id: i64,
+    pub username: String,
+    pub email: String,
+    pub password_hash: String,
+    pub is_active: bool,
 }
 
-impl From<Row> for Bucket {
-    fn from(row: Row) -> Self {
-        Self {
-            id: row.get("id"),
-            tenant_id: row.get("tenant_id"),
-            name: row.get("name"),
-            region: row.get("region"),
-            created_at: row.get("created_at"),
-            is_public_read: row.get("is_public_read"),
-        }
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminRole {
+    pub id: i32,
+    pub name: String,
 }
 
-impl From<Row> for BucketMetadataEvent {
-    fn from(row: Row) -> Self {
-        Self {
-            id: row.get("id"),
-            tenant_id: row.get("tenant_id"),
-            bucket_id: row.get("bucket_id"),
-            bucket_name: row.get("bucket_name"),
-            event_type: row.get("event_type"),
-            bucket_metadata: row.get("bucket_metadata"),
-            created_at: row.get("created_at"),
-        }
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRecord {
+    pub id: i64,
+    pub task_type: crate::tasks::TaskType,
+    pub payload: JsonValue,
+    pub priority: i32,
+    pub status: crate::tasks::TaskStatus,
+    pub attempts: i32,
+    pub last_error: Option<String>,
+    pub scheduled_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
-impl From<Row> for Object {
-    fn from(row: Row) -> Self {
-        Self {
-            id: row.get("id"),
-            tenant_id: row.get("tenant_id"),
-            bucket_id: row.get("bucket_id"),
-            key: row.get("key"),
-            content_hash: row.get("content_hash"),
-            size: row.get("size"),
-            etag: row.get("etag"),
-            content_type: row.get("content_type"),
-            version_id: row.get("version_id"),
-            mutation_id: row.get("mutation_id"),
-            index_policy_snapshot: row.get("index_policy_snapshot"),
-            user_metadata_hash: row.get("user_metadata_hash"),
-            authz_revision: row.get("authz_revision"),
-            record_hash: row.get("record_hash"),
-            created_at: row.get("created_at"),
-            deleted_at: row.get("deleted_at"),
-            storage_class: row.get("storage_class"),
-            user_meta: row.get("user_meta"),
-            shard_map: row.get("shard_map"),
-            inline_payload: row.get("inline_payload"),
-            checksum: row.get("checksum"),
-        }
-    }
-}
-
-impl From<Row> for MultipartUpload {
-    fn from(row: Row) -> Self {
-        Self {
-            id: row.get("id"),
-            tenant_id: row.get("tenant_id"),
-            bucket_id: row.get("bucket_id"),
-            key: row.get("key"),
-            upload_id: row.get("upload_id"),
-            created_at: row.get("created_at"),
-            completed_at: row.get("completed_at"),
-            aborted_at: row.get("aborted_at"),
-        }
-    }
-}
-
-impl From<Row> for MultipartUploadPart {
-    fn from(row: Row) -> Self {
-        Self {
-            id: row.get("id"),
-            upload_id: row.get("upload_id"),
-            part_number: row.get("part_number"),
-            content_hash: row.get("content_hash"),
-            size: row.get("size"),
-            etag: row.get("etag"),
-            created_at: row.get("created_at"),
-        }
-    }
-}
-
-impl From<Row> for ObjectWatchEvent {
-    fn from(row: Row) -> Self {
-        Self {
-            id: row.get("id"),
-            tenant_id: row.get("tenant_id"),
-            bucket_id: row.get("bucket_id"),
-            bucket_name: row.get("bucket_name"),
-            key: row.get("key"),
-            event_type: row.get("event_type"),
-            version_id: row.get("version_id"),
-            etag: row.get("etag"),
-            size: row.get("size"),
-            is_delete_marker: row.get("is_delete_marker"),
-            created_at: row.get("created_at"),
-        }
-    }
-}
-
-impl From<Row> for AppendStream {
-    fn from(row: Row) -> Self {
-        Self {
-            id: row.get("id"),
-            tenant_id: row.get("tenant_id"),
-            bucket_id: row.get("bucket_id"),
-            bucket_name: row.get("bucket_name"),
-            stream_key: row.get("stream_key"),
-            stream_id: row.get("stream_id"),
-            created_at: row.get("created_at"),
-            sealed_at: row.get("sealed_at"),
-            segment_hash: row.get("segment_hash"),
-        }
-    }
-}
-
-impl From<Row> for AppendStreamRecord {
-    fn from(row: Row) -> Self {
-        Self {
-            id: row.get("id"),
-            stream_id: row.get("stream_id"),
-            record_sequence: row.get("record_sequence"),
-            payload_hash: row.get("payload_hash"),
-            payload_size: row.get("payload_size"),
-            created_at: row.get("created_at"),
-        }
-    }
-}
-
-impl From<Row> for AuthzTupleRecord {
-    fn from(row: Row) -> Self {
-        Self {
-            revision: row.get("revision"),
-            tenant_id: row.get("tenant_id"),
-            namespace: row.get("namespace"),
-            object_id: row.get("object_id"),
-            relation: row.get("relation"),
-            subject_kind: row.get("subject_kind"),
-            subject_id: row.get("subject_id"),
-            caveat_hash: row.get("caveat_hash"),
-            operation: row.get("operation"),
-            written_by: row.get("written_by"),
-            reason: row.get("reason"),
-            record_hash: row.get("record_hash"),
-            written_at: row.get("written_at"),
-        }
-    }
-}
-
-impl From<Row> for IndexDefinition {
-    fn from(row: Row) -> Self {
-        Self {
-            id: row.get("id"),
-            tenant_id: row.get("tenant_id"),
-            bucket_id: row.get("bucket_id"),
-            name: row.get("name"),
-            kind: row.get("kind"),
-            selector: row.get("selector"),
-            extractor: row.get("extractor"),
-            authorization_mode: row.get("authorization_mode"),
-            build_policy: row.get("build_policy"),
-            enabled: row.get("enabled"),
-            version: row.get("version"),
-            created_at: row.get("created_at"),
-            updated_at: row.get("updated_at"),
-        }
-    }
-}
-
-impl From<Row> for IndexDefinitionEvent {
-    fn from(row: Row) -> Self {
-        Self {
-            id: row.get("id"),
-            tenant_id: row.get("tenant_id"),
-            bucket_id: row.get("bucket_id"),
-            bucket_name: row.get("bucket_name"),
-            index_id: row.get("index_id"),
-            index_name: row.get("index_name"),
-            event_type: row.get("event_type"),
-            index_version: row.get("index_version"),
-            definition: row.get("definition"),
-            created_at: row.get("created_at"),
-        }
-    }
-}
-
-impl From<Row> for IndexDiagnostic {
-    fn from(row: Row) -> Self {
-        Self {
-            id: row.get("id"),
-            tenant_id: row.get("tenant_id"),
-            bucket_id: row.get("bucket_id"),
-            bucket_name: row.get("bucket_name"),
-            index_id: row.get("index_id"),
-            index_name: row.get("index_name"),
-            object_key: row.get("object_key"),
-            version_id: row.get("version_id"),
-            severity: row.get("severity"),
-            code: row.get("code"),
-            message: row.get("message"),
-            details: row.get("details"),
-            created_at: row.get("created_at"),
-        }
-    }
+#[derive(Debug, Clone)]
+pub struct HfIngestionJob {
+    pub key_id: i64,
+    pub tenant_id: i64,
+    pub requester_app_id: i64,
+    pub repo: String,
+    pub revision: String,
+    pub target_bucket: String,
+    pub target_region: String,
+    pub target_prefix: String,
+    pub include_globs: Vec<String>,
+    pub exclude_globs: Vec<String>,
 }
 
 fn object_version_record_hash(input: ObjectVersionRecordHashInput<'_>) -> String {
@@ -553,103 +512,110 @@ fn canonical_json_bytes(value: &JsonValue) -> Vec<u8> {
     }
 }
 
-pub struct AppDetails {
-    pub id: i64,
-    pub client_secret_encrypted: Vec<u8>,
-    pub tenant_id: i64,
-}
-
-#[derive(Debug, serde::Serialize)]
-pub struct AdminUser {
-    pub id: i64,
-    pub username: String,
-    pub email: String,
-    pub password_hash: String,
-    pub is_active: bool,
-}
-
-#[derive(Debug, serde::Serialize)]
-pub struct AdminRole {
-    pub id: i32,
-    pub name: String,
-}
-
-impl From<Row> for AppDetails {
-    fn from(row: Row) -> Self {
-        Self {
-            id: row.get("id"),
-            client_secret_encrypted: row.get("client_secret_encrypted"),
-            tenant_id: row.get("tenant_id"),
-        }
-    }
-}
-
 impl Persistence {
-    pub fn new(
-        global_pool: Pool,
-        regional_pool: Pool,
-        event_publisher: Option<Sender<MetadataEvent>>,
-        config: &crate::config::Config,
-    ) -> Self {
-        Self {
-            global_pool,
-            regional_pool,
+    pub fn new(config: &Config, event_publisher: Option<Sender<MetadataEvent>>) -> Result<Self> {
+        let state_path = PathBuf::from(&config.storage_path)
+            .join("_anvil")
+            .join("meta")
+            .join("native-state.json");
+        if let Some(parent) = state_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut state = if state_path.exists() {
+            let bytes = std::fs::read(&state_path)?;
+            if bytes.is_empty() {
+                NativeState::default()
+            } else {
+                serde_json::from_slice(&bytes)?
+            }
+        } else {
+            NativeState::default()
+        };
+        if !config.region.is_empty() {
+            state.regions.insert(config.region.clone());
+        }
+        Ok(Self {
+            state_path,
+            state: Arc::new(RwLock::new(state)),
             cache: MetadataCache::new(config),
             event_publisher,
+        })
+    }
+
+    async fn persist_state(&self, state: NativeState) -> Result<()> {
+        if let Some(parent) = self.state_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
         }
+        let tmp = self.state_path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec_pretty(&state)?;
+        tokio::fs::write(&tmp, bytes).await?;
+        tokio::fs::rename(&tmp, &self.state_path).await?;
+        Ok(())
+    }
+
+    async fn persist_after_write(&self, state: &NativeState) -> Result<()> {
+        self.persist_state(state.clone()).await
+    }
+
+    async fn refresh_from_disk(&self) -> Result<()> {
+        let bytes = match tokio::fs::read(&self.state_path).await {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        *self.state.write().await = serde_json::from_slice(&bytes)?;
+        Ok(())
     }
 
     async fn publish_event(&self, event: MetadataEvent) {
-        if let Some(publisher) = &self.event_publisher {
-            if let Err(e) = publisher.send(event).await {
-                tracing::warn!("Failed to publish metadata event: {}", e);
-            }
+        if let Some(sender) = &self.event_publisher {
+            let _ = sender.send(event).await;
         }
-    }
-
-    pub async fn get_admin_user_by_username(&self, username: &str) -> Result<Option<AdminUser>> {
-        let client = self.global_pool.get().await?;
-        let row = client
-            .query_opt("SELECT id, username, email, password_hash, is_active FROM admin_users WHERE username = $1", &[&username])
-            .await?;
-        Ok(row.map(|r| AdminUser {
-            id: r.get("id"),
-            username: r.get("username"),
-            email: r.get("email"),
-            password_hash: r.get("password_hash"),
-            is_active: r.get("is_active"),
-        }))
-    }
-
-    pub async fn get_admin_user_by_id(&self, id: i64) -> Result<Option<AdminUser>> {
-        let client = self.global_pool.get().await?;
-        let row = client
-            .query_opt("SELECT id, username, email, password_hash, is_active FROM admin_users WHERE id = $1", &[&id])
-            .await?;
-        Ok(row.map(|r| AdminUser {
-            id: r.get("id"),
-            username: r.get("username"),
-            email: r.get("email"),
-            password_hash: r.get("password_hash"),
-            is_active: r.get("is_active"),
-        }))
-    }
-
-    pub async fn get_roles_for_admin_user(&self, user_id: i64) -> Result<Vec<String>> {
-        let client = self.global_pool.get().await?;
-        let rows = client.query(
-            "SELECT r.name FROM admin_roles r JOIN admin_user_roles ur ON r.id = ur.role_id WHERE ur.user_id = $1",
-            &[&user_id],
-        ).await?;
-        Ok(rows.into_iter().map(|r| r.get("name")).collect())
-    }
-
-    pub fn get_global_pool(&self) -> &Pool {
-        &self.global_pool
     }
 
     pub fn cache(&self) -> &MetadataCache {
         &self.cache
+    }
+
+    pub async fn get_admin_user_by_username(&self, username: &str) -> Result<Option<AdminUser>> {
+        Ok(self
+            .state
+            .read()
+            .await
+            .admin_users
+            .iter()
+            .find(|u| u.username == username)
+            .cloned())
+    }
+
+    pub async fn get_admin_user_by_id(&self, id: i64) -> Result<Option<AdminUser>> {
+        Ok(self
+            .state
+            .read()
+            .await
+            .admin_users
+            .iter()
+            .find(|u| u.id == id)
+            .cloned())
+    }
+
+    pub async fn get_roles_for_admin_user(&self, user_id: i64) -> Result<Vec<String>> {
+        let state = self.state.read().await;
+        let role_ids = state
+            .admin_user_roles
+            .iter()
+            .filter(|r| r.user_id == user_id)
+            .map(|r| r.role_id)
+            .collect::<HashSet<_>>();
+        Ok(state
+            .admin_roles
+            .iter()
+            .filter(|r| role_ids.contains(&r.id))
+            .map(|r| r.name.clone())
+            .collect())
     }
 
     pub async fn create_admin_user(
@@ -657,184 +623,168 @@ impl Persistence {
         username: &str,
         email: &str,
         password_hash: &str,
-        role: &str,
-    ) -> Result<()> {
-        let mut client = self.global_pool.get().await?;
-        let tx = client.transaction().await?;
-
-        let user_id: i64 = tx.query_one(
-            "INSERT INTO admin_users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id",
-            &[&username, &email, &password_hash],
-        ).await?.get(0);
-
-        let role_id: i32 = tx
-            .query_one("SELECT id FROM admin_roles WHERE name = $1", &[&role])
-            .await?
-            .get(0);
-
-        tx.execute(
-            "INSERT INTO admin_user_roles (user_id, role_id) VALUES ($1, $2)",
-            &[&user_id, &role_id],
-        )
-        .await?;
-
-        tx.commit().await?;
-        Ok(())
+        role_names: &[String],
+    ) -> Result<AdminUser> {
+        let mut state = self.state.write().await;
+        if state.admin_users.iter().any(|u| u.username == username) {
+            return Err(anyhow!("admin user already exists"));
+        }
+        let id = state.allocate_id();
+        let user = AdminUser {
+            id,
+            username: username.to_string(),
+            email: email.to_string(),
+            password_hash: password_hash.to_string(),
+            is_active: true,
+        };
+        state.admin_users.push(user.clone());
+        for role_name in role_names {
+            let role_id = match state
+                .admin_roles
+                .iter()
+                .find(|r| r.name == *role_name)
+                .map(|r| r.id)
+            {
+                Some(id) => id,
+                None => {
+                    let next = state.allocate_id() as i32;
+                    state.admin_roles.push(AdminRole {
+                        id: next,
+                        name: role_name.clone(),
+                    });
+                    next
+                }
+            };
+            state.admin_user_roles.push(AdminUserRole {
+                user_id: id,
+                role_id,
+            });
+        }
+        self.persist_after_write(&state).await?;
+        Ok(user)
     }
 
     pub async fn update_admin_user(
         &self,
         user_id: i64,
-        email: Option<String>,
-        password_hash: Option<String>,
-        role: Option<String>,
-        is_active: Option<bool>,
+        username: &str,
+        email: &str,
+        password_hash: Option<&str>,
+        is_active: bool,
+        role_names: &[String],
     ) -> Result<()> {
-        let client = self.global_pool.get().await?;
-        let mut query_parts = Vec::new();
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
-        let mut param_idx = 1;
-
-        if let Some(e) = email {
-            query_parts.push(format!("email = ${}", param_idx));
-            params.push(Box::new(e));
-            param_idx += 1;
+        let mut state = self.state.write().await;
+        let user = state
+            .admin_users
+            .iter_mut()
+            .find(|u| u.id == user_id)
+            .ok_or_else(|| anyhow!("admin user not found"))?;
+        user.username = username.to_string();
+        user.email = email.to_string();
+        if let Some(password_hash) = password_hash {
+            user.password_hash = password_hash.to_string();
         }
-        if let Some(p) = password_hash {
-            query_parts.push(format!("password_hash = ${}", param_idx));
-            params.push(Box::new(p));
-            param_idx += 1;
+        user.is_active = is_active;
+        state.admin_user_roles.retain(|r| r.user_id != user_id);
+        for role_name in role_names {
+            let role_id = match state
+                .admin_roles
+                .iter()
+                .find(|r| r.name == *role_name)
+                .map(|r| r.id)
+            {
+                Some(id) => id,
+                None => {
+                    let id = state.allocate_id() as i32;
+                    state.admin_roles.push(AdminRole {
+                        id,
+                        name: role_name.clone(),
+                    });
+                    id
+                }
+            };
+            state
+                .admin_user_roles
+                .push(AdminUserRole { user_id, role_id });
         }
-        if let Some(a) = is_active {
-            query_parts.push(format!("is_active = ${}", param_idx));
-            params.push(Box::new(a));
-            param_idx += 1;
-        }
-
-        if query_parts.is_empty() {
-            // Nothing to update
-            return Ok(());
-        }
-
-        let query = format!(
-            "UPDATE admin_users SET {} WHERE id = ${}",
-            query_parts.join(", "),
-            param_idx
-        );
-        params.push(Box::new(user_id));
-
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-        client.execute(&query, &param_refs).await?;
-
-        if let Some(r) = role {
-            let role_id: i32 = client
-                .query_one("SELECT id FROM admin_roles WHERE name = $1", &[&r])
-                .await?
-                .get(0);
-            client
-                .execute(
-                    "UPDATE admin_user_roles SET role_id = $1 WHERE user_id = $2",
-                    &[&role_id, &user_id],
-                )
-                .await?;
-        }
-
-        Ok(())
+        self.persist_after_write(&state).await
     }
 
     pub async fn delete_admin_user(&self, user_id: i64) -> Result<()> {
-        let client = self.global_pool.get().await?;
-        client
-            .execute("DELETE FROM admin_users WHERE id = $1", &[&user_id])
-            .await?;
-        Ok(())
+        let mut state = self.state.write().await;
+        state.admin_users.retain(|u| u.id != user_id);
+        state.admin_user_roles.retain(|r| r.user_id != user_id);
+        self.persist_after_write(&state).await
     }
 
     pub async fn list_admin_users(&self) -> Result<Vec<AdminUser>> {
-        let client = self.global_pool.get().await?;
-        let rows = client
-            .query(
-                "SELECT id, username, email, password_hash, is_active FROM admin_users",
-                &[],
-            )
-            .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| AdminUser {
-                id: r.get("id"),
-                username: r.get("username"),
-                email: r.get("email"),
-                password_hash: r.get("password_hash"),
-                is_active: r.get("is_active"),
-            })
-            .collect())
+        let mut users = self.state.read().await.admin_users.clone();
+        users.sort_by(|a, b| a.username.cmp(&b.username));
+        Ok(users)
     }
 
     pub async fn create_admin_role(&self, name: &str) -> Result<()> {
-        let client = self.global_pool.get().await?;
-        client
-            .execute("INSERT INTO admin_roles (name) VALUES ($1)", &[&name])
-            .await?;
-        Ok(())
+        let mut state = self.state.write().await;
+        if !state.admin_roles.iter().any(|r| r.name == name) {
+            let id = state.allocate_id() as i32;
+            state.admin_roles.push(AdminRole {
+                id,
+                name: name.to_string(),
+            });
+        }
+        self.persist_after_write(&state).await
     }
 
     pub async fn list_admin_roles(&self) -> Result<Vec<String>> {
-        let client = self.global_pool.get().await?;
-        let rows = client.query("SELECT name FROM admin_roles", &[]).await?;
-        Ok(rows.into_iter().map(|r| r.get("name")).collect())
+        let mut roles = self
+            .state
+            .read()
+            .await
+            .admin_roles
+            .iter()
+            .map(|r| r.name.clone())
+            .collect::<Vec<_>>();
+        roles.sort();
+        Ok(roles)
     }
 
     pub async fn get_admin_role_by_id(&self, id: i32) -> Result<Option<AdminRole>> {
-        let client = self.global_pool.get().await?;
-        let row = client
-            .query_opt("SELECT id, name FROM admin_roles WHERE id = $1", &[&id])
-            .await?;
-        Ok(row.map(|r| AdminRole {
-            id: r.get("id"),
-            name: r.get("name"),
-        }))
+        Ok(self
+            .state
+            .read()
+            .await
+            .admin_roles
+            .iter()
+            .find(|r| r.id == id)
+            .cloned())
     }
 
     pub async fn update_admin_role(&self, id: i32, name: &str) -> Result<()> {
-        let client = self.global_pool.get().await?;
-        client
-            .execute(
-                "UPDATE admin_roles SET name = $1 WHERE id = $2",
-                &[&name, &id],
-            )
-            .await?;
-        Ok(())
+        let mut state = self.state.write().await;
+        if let Some(role) = state.admin_roles.iter_mut().find(|r| r.id == id) {
+            role.name = name.to_string();
+        }
+        self.persist_after_write(&state).await
     }
 
     pub async fn delete_admin_role(&self, id: i32) -> Result<()> {
-        let client = self.global_pool.get().await?;
-        client
-            .execute("DELETE FROM admin_roles WHERE id = $1", &[&id])
-            .await?;
-        Ok(())
+        let mut state = self.state.write().await;
+        state.admin_roles.retain(|r| r.id != id);
+        state.admin_user_roles.retain(|r| r.role_id != id);
+        self.persist_after_write(&state).await
     }
 
     pub async fn list_policies(&self) -> Result<Vec<String>> {
-        let client = self.global_pool.get().await?;
-        let rows = client
-            .query("SELECT resource, action FROM policies", &[])
-            .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| {
-                format!(
-                    "{}:{}",
-                    r.get::<_, String>("action"),
-                    r.get::<_, String>("resource")
-                )
-            })
-            .collect())
+        let state = self.state.read().await;
+        let mut policies = state
+            .app_policies
+            .iter()
+            .map(|p| format!("{}:{}", p.action, p.resource))
+            .collect::<Vec<_>>();
+        policies.sort();
+        policies.dedup();
+        Ok(policies)
     }
-
-    // --- Model Registry Methods ---
 
     pub async fn create_model_artifact(
         &self,
@@ -843,15 +793,17 @@ impl Persistence {
         key: &str,
         manifest: &crate::anvil_api::ModelManifest,
     ) -> Result<()> {
-        let client = self.regional_pool.get().await?;
-        let manifest_json = serde_json::to_value(manifest)?;
-        client
-            .execute(
-                "INSERT INTO model_artifacts (artifact_id, bucket_id, key, manifest) VALUES ($1, $2, $3, $4)",
-                &[&artifact_id, &bucket_id, &key, &manifest_json],
-            )
-            .await?;
-        Ok(())
+        let mut state = self.state.write().await;
+        state
+            .model_artifacts
+            .retain(|r| r.artifact_id != artifact_id);
+        state.model_artifacts.push(ModelArtifactRecord {
+            artifact_id: artifact_id.to_string(),
+            bucket_id,
+            key: key.to_string(),
+            manifest: manifest.clone(),
+        });
+        self.persist_after_write(&state).await
     }
 
     pub async fn create_model_tensors(
@@ -859,47 +811,15 @@ impl Persistence {
         artifact_id: &str,
         tensors: &[crate::anvil_api::TensorIndexRow],
     ) -> Result<()> {
-        if tensors.is_empty() {
-            return Ok(());
-        }
-        let client = self.regional_pool.get().await?;
-        let sink = client.copy_in("COPY model_tensors (artifact_id, tensor_name, file_path, file_offset, byte_length, dtype, shape, layout, block_bytes, blocks) FROM STDIN").await?;
-
-        use bytes::Bytes;
-        use futures_util::SinkExt;
-        use std::pin::pin;
-
-        let mut writer = pin!(sink);
-
-        for tensor in tensors {
-            let shape_array = format!(
-                "{{{}}}",
-                tensor
-                    .shape
-                    .iter()
-                    .map(|i| i.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
-            let blocks_json = serde_json::to_string(&tensor.blocks)?;
-
-            let row_string = format!(
-                "{}	{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                artifact_id,
-                tensor.tensor_name,
-                tensor.file_path,
-                tensor.file_offset,
-                tensor.byte_length,
-                tensor.dtype,
-                shape_array,
-                tensor.layout,
-                tensor.block_bytes,
-                blocks_json
-            );
-            writer.send(Bytes::from(row_string)).await?;
-        }
-        writer.close().await?;
-        Ok(())
+        let mut state = self.state.write().await;
+        state.model_tensors.retain(|r| r.artifact_id != artifact_id);
+        state
+            .model_tensors
+            .extend(tensors.iter().cloned().map(|tensor| ModelTensorRecord {
+                artifact_id: artifact_id.to_string(),
+                tensor,
+            }));
+        self.persist_after_write(&state).await
     }
 
     pub async fn list_tensors(
@@ -908,37 +828,21 @@ impl Persistence {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<crate::anvil_api::TensorIndexRow>> {
-        let client = self.regional_pool.get().await?;
-        let rows = client
-            .query(
-                "SELECT tensor_name, file_path, file_offset, byte_length, dtype, shape, layout, block_bytes, blocks FROM model_tensors WHERE artifact_id = $1 ORDER BY tensor_name LIMIT $2 OFFSET $3",
-                &[&artifact_id, &limit, &offset],
-            )
-            .await?;
-
-        let tensors = rows
+        let mut tensors = self
+            .state
+            .read()
+            .await
+            .model_tensors
+            .iter()
+            .filter(|r| r.artifact_id == artifact_id)
+            .map(|r| r.tensor.clone())
+            .collect::<Vec<_>>();
+        tensors.sort_by(|a, b| a.tensor_name.cmp(&b.tensor_name));
+        Ok(tensors
             .into_iter()
-            .map(|row| {
-                let shape: Vec<i32> = row.get("shape");
-                let shape_u32: Vec<u32> = shape.into_iter().map(|i| i as u32).collect();
-                let file_offset: i64 = row.get("file_offset");
-                let byte_length: i64 = row.get("byte_length");
-                let dtype_str: String = row.get("dtype");
-                let block_bytes: i32 = row.get("block_bytes");
-                crate::anvil_api::TensorIndexRow {
-                    tensor_name: row.get("tensor_name"),
-                    file_path: row.get("file_path"),
-                    file_offset: file_offset as u64,
-                    byte_length: byte_length as u64,
-                    dtype: dtype_str.parse::<i32>().unwrap_or(0),
-                    shape: shape_u32,
-                    layout: row.get("layout"),
-                    block_bytes: block_bytes as u32,
-                    blocks: serde_json::from_value(row.get("blocks")).unwrap_or_default(),
-                }
-            })
-            .collect();
-        Ok(tensors)
+            .skip(offset.max(0) as usize)
+            .take(limit.max(0) as usize)
+            .collect())
     }
 
     pub async fn get_tensor_metadata(
@@ -946,56 +850,28 @@ impl Persistence {
         artifact_id: &str,
         tensor_name: &str,
     ) -> Result<Option<crate::anvil_api::TensorIndexRow>> {
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_opt(
-                "SELECT tensor_name, file_path, file_offset, byte_length, dtype, shape, layout, block_bytes, blocks FROM model_tensors WHERE artifact_id = $1 AND tensor_name = $2",
-                &[&artifact_id, &tensor_name],
-            )
-            .await?;
-
-        Ok(row.map(|row| {
-            let shape: Vec<i32> = row.get("shape");
-            let shape_u32: Vec<u32> = shape.into_iter().map(|i| i as u32).collect();
-            let file_offset: i64 = row.get("file_offset");
-            let byte_length: i64 = row.get("byte_length");
-            let dtype_str: String = row.get("dtype");
-            let block_bytes: i32 = row.get("block_bytes");
-            crate::anvil_api::TensorIndexRow {
-                tensor_name: row.get("tensor_name"),
-                file_path: row.get("file_path"),
-                file_offset: file_offset as u64,
-                byte_length: byte_length as u64,
-                dtype: dtype_str.parse::<i32>().unwrap_or(0),
-                shape: shape_u32,
-                layout: row.get("layout"),
-                block_bytes: block_bytes as u32,
-                blocks: serde_json::from_value(row.get("blocks")).unwrap_or_default(),
-            }
-        }))
+        Ok(self
+            .state
+            .read()
+            .await
+            .model_tensors
+            .iter()
+            .find(|r| r.artifact_id == artifact_id && r.tensor.tensor_name == tensor_name)
+            .map(|r| r.tensor.clone()))
     }
 
     pub async fn get_model_artifact(
         &self,
         artifact_id: &str,
     ) -> Result<Option<crate::anvil_api::ModelManifest>> {
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_opt(
-                "SELECT manifest FROM model_artifacts WHERE artifact_id = $1",
-                &[&artifact_id],
-            )
-            .await?;
-
-        match row {
-            Some(row) => {
-                let manifest_json: serde_json::Value = row.get("manifest");
-                let manifest: crate::anvil_api::ModelManifest =
-                    serde_json::from_value(manifest_json)?;
-                Ok(Some(manifest))
-            }
-            None => Ok(None),
-        }
+        Ok(self
+            .state
+            .read()
+            .await
+            .model_artifacts
+            .iter()
+            .find(|r| r.artifact_id == artifact_id)
+            .map(|r| r.manifest.clone()))
     }
 
     pub async fn get_tensor_metadata_recursive(
@@ -1003,103 +879,101 @@ impl Persistence {
         artifact_id: &str,
         tensor_name: &str,
     ) -> Result<Option<crate::anvil_api::TensorIndexRow>> {
-        // 1. Try to find the tensor in the current artifact.
-        if let Some(tensor) = self.get_tensor_metadata(artifact_id, tensor_name).await? {
-            return Ok(Some(tensor));
-        }
-
-        // 2. If not found, get the current artifact's manifest to find its base.
-        if let Some(manifest) = self.get_model_artifact(artifact_id).await? {
-            if !manifest.base_artifact_id.is_empty() {
-                // 3. If it has a base, recurse.
-                return Box::pin(
-                    self.get_tensor_metadata_recursive(&manifest.base_artifact_id, tensor_name),
-                )
-                .await;
+        let mut current = artifact_id.to_string();
+        let mut seen = HashSet::new();
+        while seen.insert(current.clone()) {
+            if let Some(tensor) = self.get_tensor_metadata(&current, tensor_name).await? {
+                return Ok(Some(tensor));
             }
+            let Some(manifest) = self.get_model_artifact(&current).await? else {
+                break;
+            };
+            if manifest.base_artifact_id.is_empty() {
+                break;
+            }
+            current = manifest.base_artifact_id;
         }
-
-        // 4. If we've reached the end of the chain, it's not found.
         Ok(None)
     }
 
-    // --- Global Methods ---
-
     pub async fn create_region(&self, name: &str) -> Result<bool> {
-        let client = self.global_pool.get().await?;
-        let n = client
-            .execute(
-                "INSERT INTO regions (name) VALUES ($1) ON CONFLICT (name) DO NOTHING",
-                &[&name],
-            )
-            .await?;
-        Ok(n == 1)
+        let mut state = self.state.write().await;
+        let inserted = state.regions.insert(name.to_string());
+        self.persist_after_write(&state).await?;
+        Ok(inserted)
     }
 
     pub async fn list_regions(&self) -> Result<Vec<String>> {
-        let client = self.global_pool.get().await?;
-        let rows = client
-            .query("SELECT name FROM regions ORDER BY name", &[])
-            .await?;
-        Ok(rows.into_iter().map(|r| r.get("name")).collect())
+        let mut regions = self
+            .state
+            .read()
+            .await
+            .regions
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        regions.sort();
+        Ok(regions)
     }
 
     pub async fn get_tenant_by_name(&self, name: &str) -> Result<Option<Tenant>> {
-        let client = self.global_pool.get().await?;
-        let row = client
-            .query_opt("SELECT id, name FROM tenants WHERE name = $1", &[&name])
-            .await?;
-        Ok(row.map(Into::into))
+        self.refresh_from_disk().await?;
+        Ok(self
+            .state
+            .read()
+            .await
+            .tenants
+            .iter()
+            .find(|t| t.name == name)
+            .cloned())
     }
 
     pub async fn list_tenants(&self) -> Result<Vec<Tenant>> {
-        let client = self.global_pool.get().await?;
-        let rows = client
-            .query("SELECT id, name FROM tenants ORDER BY name", &[])
-            .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        self.refresh_from_disk().await?;
+        Ok(self.state.read().await.tenants.clone())
     }
 
     pub async fn get_app_by_client_id(&self, client_id: &str) -> Result<Option<AppDetails>> {
-        let client = self.global_pool.get().await?;
-        let row = client
-            .query_opt(
-                "SELECT id, client_secret_encrypted, tenant_id FROM apps WHERE client_id = $1",
-                &[&client_id],
-            )
-            .await?;
-        Ok(row.map(Into::into))
+        self.refresh_from_disk().await?;
+        Ok(self
+            .state
+            .read()
+            .await
+            .apps
+            .iter()
+            .find(|a| a.client_id == client_id)
+            .map(|a| AppDetails {
+                id: a.id,
+                tenant_id: a.tenant_id,
+                client_secret_encrypted: a.client_secret_encrypted.clone(),
+            }))
     }
 
     pub async fn get_policies_for_app(&self, app_id: i64) -> Result<Vec<String>> {
-        let client = self.global_pool.get().await?;
-        let rows = client
-            .query(
-                "SELECT resource, action FROM policies WHERE app_id = $1",
-                &[&app_id],
-            )
-            .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| {
-                format!(
-                    "{}|{}",
-                    row.get::<_, String>("action"),
-                    row.get::<_, String>("resource")
-                )
-            })
+        self.refresh_from_disk().await?;
+        Ok(self
+            .state
+            .read()
+            .await
+            .app_policies
+            .iter()
+            .filter(|p| p.app_id == app_id)
+            .map(|p| format!("{}|{}", p.action, p.resource))
             .collect())
     }
 
-    pub async fn create_tenant(&self, name: &str, api_key: &str) -> Result<Tenant> {
-        let client = self.global_pool.get().await?;
-        let row = client
-            .query_one(
-                "INSERT INTO tenants (name, api_key) VALUES ($1, $2) RETURNING id, name",
-                &[&name, &api_key],
-            )
-            .await?;
-        Ok(row.into())
+    pub async fn create_tenant(&self, name: &str, _api_key: &str) -> Result<Tenant> {
+        let mut state = self.state.write().await;
+        if let Some(existing) = state.tenants.iter().find(|t| t.name == name).cloned() {
+            return Ok(existing);
+        }
+        let tenant = Tenant {
+            id: state.allocate_id(),
+            name: name.to_string(),
+        };
+        state.tenants.push(tenant.clone());
+        self.persist_after_write(&state).await?;
+        Ok(tenant)
     }
 
     pub async fn create_app(
@@ -1107,79 +981,115 @@ impl Persistence {
         tenant_id: i64,
         name: &str,
         client_id: &str,
-        client_secret_encrypted: &[u8],
+        encrypted_secret: &[u8],
     ) -> Result<App> {
-        let client = self.global_pool.get().await?;
-        let row = client
-            .query_one(
-                "INSERT INTO apps (tenant_id, name, client_id, client_secret_encrypted) VALUES ($1, $2, $3, $4) RETURNING id, name, client_id",
-                &[&tenant_id, &name, &client_id, &client_secret_encrypted],
-            )
-            .await?;
-        Ok(row.into())
+        let mut state = self.state.write().await;
+        if state
+            .apps
+            .iter()
+            .any(|a| a.tenant_id == tenant_id && a.name == name)
+        {
+            return Err(anyhow!("app already exists"));
+        }
+        let id = state.allocate_id();
+        let app = StoredApp {
+            id,
+            tenant_id,
+            name: name.to_string(),
+            client_id: client_id.to_string(),
+            client_secret_encrypted: encrypted_secret.to_vec(),
+        };
+        state.apps.push(app.clone());
+        self.persist_after_write(&state).await?;
+        Ok(App {
+            id,
+            name: app.name,
+            client_id: app.client_id,
+        })
     }
 
     pub async fn get_app_by_id(&self, id: i64) -> Result<Option<App>> {
-        let client = self.global_pool.get().await?;
-        let row = client
-            .query_opt("SELECT id, name, client_id FROM apps WHERE id = $1", &[&id])
-            .await?;
-        Ok(row.map(Into::into))
+        self.refresh_from_disk().await?;
+        Ok(self
+            .state
+            .read()
+            .await
+            .apps
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| App {
+                id: a.id,
+                name: a.name.clone(),
+                client_id: a.client_id.clone(),
+            }))
     }
 
     pub async fn get_app_by_name(&self, name: &str) -> Result<Option<App>> {
-        let client = self.global_pool.get().await?;
-        let row = client
-            .query_opt(
-                "SELECT id, name, client_id FROM apps WHERE name = $1",
-                &[&name],
-            )
-            .await?;
-        Ok(row.map(Into::into))
+        self.refresh_from_disk().await?;
+        Ok(self
+            .state
+            .read()
+            .await
+            .apps
+            .iter()
+            .find(|a| a.name == name)
+            .map(|a| App {
+                id: a.id,
+                name: a.name.clone(),
+                client_id: a.client_id.clone(),
+            }))
     }
 
     pub async fn list_apps_for_tenant(&self, tenant_id: i64) -> Result<Vec<App>> {
-        let client = self.global_pool.get().await?;
-        let rows = client
-            .query(
-                "SELECT id, name, client_id FROM apps WHERE tenant_id = $1 ORDER BY name",
-                &[&tenant_id],
-            )
-            .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        self.refresh_from_disk().await?;
+        Ok(self
+            .state
+            .read()
+            .await
+            .apps
+            .iter()
+            .filter(|a| a.tenant_id == tenant_id)
+            .map(|a| App {
+                id: a.id,
+                name: a.name.clone(),
+                client_id: a.client_id.clone(),
+            })
+            .collect())
     }
 
     pub async fn update_app_secret(&self, app_id: i64, new_encrypted_secret: &[u8]) -> Result<()> {
-        let client = self.global_pool.get().await?;
-        client
-            .execute(
-                "UPDATE apps SET client_secret_encrypted = $1 WHERE id = $2",
-                &[&new_encrypted_secret, &app_id],
-            )
-            .await?;
-        Ok(())
+        let mut state = self.state.write().await;
+        let app = state
+            .apps
+            .iter_mut()
+            .find(|a| a.id == app_id)
+            .ok_or_else(|| anyhow!("app not found"))?;
+        app.client_secret_encrypted = new_encrypted_secret.to_vec();
+        self.persist_after_write(&state).await
     }
 
     pub async fn grant_policy(&self, app_id: i64, resource: &str, action: &str) -> Result<()> {
-        let client = self.global_pool.get().await?;
-        client
-            .execute(
-                "INSERT INTO policies (app_id, resource, action) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-                &[&app_id, &resource, &action],
-            )
-            .await?;
-        Ok(())
+        let mut state = self.state.write().await;
+        if !state
+            .app_policies
+            .iter()
+            .any(|p| p.app_id == app_id && p.resource == resource && p.action == action)
+        {
+            state.app_policies.push(AppPolicy {
+                app_id,
+                resource: resource.to_string(),
+                action: action.to_string(),
+            });
+        }
+        self.persist_after_write(&state).await
     }
 
     pub async fn revoke_policy(&self, app_id: i64, resource: &str, action: &str) -> Result<()> {
-        let client = self.global_pool.get().await?;
-        client
-            .execute(
-                "DELETE FROM policies WHERE app_id = $1 AND resource = $2 AND action = $3",
-                &[&app_id, &resource, &action],
-            )
-            .await?;
-        Ok(())
+        let mut state = self.state.write().await;
+        state
+            .app_policies
+            .retain(|p| !(p.app_id == app_id && p.resource == resource && p.action == action));
+        self.persist_after_write(&state).await
     }
 
     pub async fn create_bucket(
@@ -1188,113 +1098,73 @@ impl Persistence {
         name: &str,
         region: &str,
     ) -> Result<Bucket, tonic::Status> {
-        tracing::debug!(
-            "[Persistence] ENTERING create_bucket: tenant_id={}, name={}, region={}",
-            tenant_id,
-            name,
-            region
-        );
-        let client = self
-            .global_pool
-            .get()
-            .await
-            .map_err(|e| tonic::Status::internal(format!("Failed to get DB client: {}", e)))?;
-        let result = client
-            .query_one(
-                "INSERT INTO buckets (tenant_id, name, region) VALUES ($1, $2, $3) RETURNING *",
-                &[&tenant_id, &name, &region],
-            )
-            .await;
-
-        match result {
-            Ok(row) => {
-                tracing::debug!("[Persistence] EXITING create_bucket: success");
-                let bucket: Bucket = row.into();
-                self.cache
-                    .insert_bucket(tenant_id, name.to_string(), bucket.clone())
-                    .await;
-                self.publish_event(MetadataEvent::BucketUpdated {
-                    tenant_id,
-                    name: name.to_string(),
-                })
-                .await;
-                Ok(bucket)
-            }
-            Err(e) => {
-                tracing::debug!("[Persistence] EXITING create_bucket: error");
-                if let Some(db_err) = e.as_db_error() {
-                    tracing::error!(?db_err, "Database error on create_bucket");
-                    if db_err.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION {
-                        return Err(tonic::Status::already_exists(
-                            "A bucket with that name already exists.",
-                        ));
-                    }
-                }
-                Err(tonic::Status::internal(e.to_string()))
-            }
+        let mut state = self.state.write().await;
+        if state.buckets.iter().any(|b| {
+            b.bucket.tenant_id == tenant_id && b.bucket.name == name && b.deleted_at.is_none()
+        }) {
+            return Err(tonic::Status::already_exists(
+                "A bucket with that name already exists.",
+            ));
         }
+        let bucket = Bucket {
+            id: state.allocate_id(),
+            tenant_id,
+            name: name.to_string(),
+            region: region.to_string(),
+            created_at: Utc::now(),
+            is_public_read: false,
+        };
+        state.buckets.push(StoredBucket {
+            bucket: bucket.clone(),
+            deleted_at: None,
+        });
+        self.cache
+            .insert_bucket(tenant_id, name.to_string(), bucket.clone())
+            .await;
+        self.persist_after_write(&state)
+            .await
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        self.publish_event(MetadataEvent::BucketUpdated {
+            tenant_id,
+            name: name.to_string(),
+        })
+        .await;
+        Ok(bucket)
     }
 
     pub async fn get_bucket_by_name(&self, tenant_id: i64, name: &str) -> Result<Option<Bucket>> {
-        // Check cache first
+        self.refresh_from_disk().await?;
         if let Some(bucket) = self.cache.get_bucket(tenant_id, name).await {
             return Ok(Some(bucket));
         }
-
-        let client = self.global_pool.get().await?;
-        // Removed region constraint
-        let row = client
-            .query_opt(
-            "SELECT id, name, region, created_at, is_public_read, tenant_id FROM buckets WHERE tenant_id = $1 AND name = $2 AND deleted_at IS NULL",
-                &[&tenant_id, &name],
-            )
-            .await?;
-
-        if let Some(row) = row {
-            let bucket: Bucket = row.into();
+        let bucket = self
+            .state
+            .read()
+            .await
+            .buckets
+            .iter()
+            .find(|b| {
+                b.bucket.tenant_id == tenant_id && b.bucket.name == name && b.deleted_at.is_none()
+            })
+            .map(|b| b.bucket.clone());
+        if let Some(bucket) = bucket.clone() {
             self.cache
-                .insert_bucket(tenant_id, name.to_string(), bucket.clone())
+                .insert_bucket(tenant_id, name.to_string(), bucket)
                 .await;
-            Ok(Some(bucket))
-        } else {
-            Ok(None)
         }
+        Ok(bucket)
     }
 
     pub async fn get_public_bucket_by_name(&self, name: &str) -> Result<Option<Bucket>> {
-        if let Some(bucket) = self.cache.get_bucket_by_name_only(name).await {
-            if bucket.is_public_read {
-                return Ok(Some(bucket));
-            }
-            // If cached but not public, return None (effectively hiding it)
-            return Ok(None);
-        }
-
-        let client = self.global_pool.get().await?;
-        let row = client
-            .query_opt(
-                "SELECT * FROM buckets WHERE name = $1 AND deleted_at IS NULL",
-                &[&name],
-            )
-            .await?;
-
-        if let Some(row) = row {
-            let bucket: Bucket = row.into();
-            // We cache it regardless of public status so we don't hit DB repeatedly for non-public buckets?
-            // Or only if public?
-            // My `buckets_by_name` cache is generic. It's better to cache it.
-            self.cache
-                .insert_bucket(bucket.tenant_id, name.to_string(), bucket.clone())
-                .await;
-
-            if bucket.is_public_read {
-                Ok(Some(bucket))
-            } else {
-                Ok(None)
-            }
-        } else {
-            Ok(None)
-        }
+        self.refresh_from_disk().await?;
+        Ok(self
+            .state
+            .read()
+            .await
+            .buckets
+            .iter()
+            .find(|b| b.bucket.name == name && b.deleted_at.is_none() && b.bucket.is_public_read)
+            .map(|b| b.bucket.clone()))
     }
 
     pub async fn set_bucket_public_access(
@@ -1303,23 +1173,21 @@ impl Persistence {
         bucket_name: &str,
         is_public: bool,
     ) -> Result<Bucket> {
-        let client = self.global_pool.get().await?;
-        let row = client
-            .query_one(
-                "UPDATE buckets SET is_public_read = $1 WHERE tenant_id = $2 AND name = $3 RETURNING *",
-                &[&is_public, &tenant_id, &bucket_name],
-            )
-            .await?;
-
-        let bucket: Bucket = row.into();
+        let mut state = self.state.write().await;
+        let bucket = state
+            .buckets
+            .iter_mut()
+            .find(|b| {
+                b.bucket.tenant_id == tenant_id
+                    && b.bucket.name == bucket_name
+                    && b.deleted_at.is_none()
+            })
+            .ok_or_else(|| anyhow!("bucket not found"))?;
+        bucket.bucket.is_public_read = is_public;
+        let out = bucket.bucket.clone();
         self.cache.invalidate_bucket(tenant_id, bucket_name).await;
-        self.publish_event(MetadataEvent::BucketUpdated {
-            tenant_id,
-            name: bucket_name.to_string(),
-        })
-        .await;
-
-        Ok(bucket)
+        self.persist_after_write(&state).await?;
+        Ok(out)
     }
 
     pub async fn set_bucket_public_access_by_name(
@@ -1327,118 +1195,59 @@ impl Persistence {
         bucket_name: &str,
         is_public: bool,
     ) -> Result<Bucket> {
-        let client = self.global_pool.get().await?;
-        let row = client
-            .query_one(
-                "UPDATE buckets SET is_public_read = $1 WHERE name = $2 RETURNING *",
-                &[&is_public, &bucket_name],
-            )
-            .await?;
-
-        let bucket: Bucket = row.into();
+        let mut state = self.state.write().await;
+        let bucket = state
+            .buckets
+            .iter_mut()
+            .find(|b| b.bucket.name == bucket_name && b.deleted_at.is_none())
+            .ok_or_else(|| anyhow!("bucket not found"))?;
+        bucket.bucket.is_public_read = is_public;
+        let out = bucket.bucket.clone();
         self.cache
-            .invalidate_bucket(bucket.tenant_id, bucket_name)
+            .invalidate_bucket(out.tenant_id, bucket_name)
             .await;
-        self.publish_event(MetadataEvent::BucketUpdated {
-            tenant_id: bucket.tenant_id,
-            name: bucket_name.to_string(),
-        })
-        .await;
-
-        Ok(bucket)
+        self.persist_after_write(&state).await?;
+        Ok(out)
     }
 
-    pub async fn soft_delete_bucket(
-        &self,
-        tenant_id: i64,
-        bucket_name: &str,
-    ) -> Result<Option<Bucket>> {
-        let client = self.global_pool.get().await?;
-        let row = client
-            .query_opt(
-                r#"UPDATE buckets SET deleted_at = now() WHERE tenant_id = $1 AND name = $2 AND deleted_at IS NULL RETURNING *"#,
-                &[&tenant_id, &bucket_name],
-            )
-            .await?;
-
-        if row.is_some() {
-            self.cache.invalidate_bucket(tenant_id, bucket_name).await;
-            self.publish_event(MetadataEvent::BucketUpdated {
-                tenant_id,
-                name: bucket_name.to_string(),
-            })
-            .await;
+    pub async fn soft_delete_bucket(&self, tenant_id: i64, name: &str) -> Result<Option<Bucket>> {
+        let mut state = self.state.write().await;
+        let mut deleted = None;
+        if let Some(stored) = state.buckets.iter_mut().find(|b| {
+            b.bucket.tenant_id == tenant_id && b.bucket.name == name && b.deleted_at.is_none()
+        }) {
+            stored.deleted_at = Some(Utc::now());
+            deleted = Some(stored.bucket.clone());
         }
-
-        Ok(row.map(Into::into))
+        self.cache.invalidate_bucket(tenant_id, name).await;
+        self.persist_after_write(&state).await?;
+        Ok(deleted)
     }
 
     pub async fn bucket_has_retained_objects_or_uploads(&self, bucket_id: i64) -> Result<bool> {
-        let client = self.regional_pool.get().await?;
-        let object_exists = client
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM objects WHERE bucket_id = $1)",
-                &[&bucket_id],
-            )
-            .await?
-            .get::<_, bool>(0);
-        if object_exists {
-            return Ok(true);
-        }
-
-        let active_upload_exists = client
-            .query_one(
-                r#"
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM multipart_uploads
-                    WHERE bucket_id = $1 AND completed_at IS NULL AND aborted_at IS NULL
-                )"#,
-                &[&bucket_id],
-            )
-            .await?
-            .get::<_, bool>(0);
-        Ok(active_upload_exists)
+        let state = self.state.read().await;
+        Ok(state.objects.iter().any(|o| o.bucket_id == bucket_id)
+            || state.multipart_uploads.iter().any(|u| {
+                u.bucket_id == bucket_id && u.completed_at.is_none() && u.aborted_at.is_none()
+            }))
     }
 
     pub async fn hard_delete_bucket_if_empty(&self, bucket_id: i64) -> Result<bool> {
-        if self
-            .bucket_has_retained_objects_or_uploads(bucket_id)
-            .await?
+        let mut state = self.state.write().await;
+        if state.objects.iter().any(|o| o.bucket_id == bucket_id)
+            || state.multipart_uploads.iter().any(|u| {
+                u.bucket_id == bucket_id && u.completed_at.is_none() && u.aborted_at.is_none()
+            })
         {
-            anyhow::bail!("bucket {} still has retained objects or uploads", bucket_id);
+            return Ok(false);
         }
-
-        let client = self.global_pool.get().await?;
-        let deleted = client
-            .query_opt(
-                r#"
-                DELETE FROM buckets
-                WHERE id = $1 AND deleted_at IS NOT NULL
-                RETURNING tenant_id, name"#,
-                &[&bucket_id],
-            )
-            .await?;
-
-        if let Some(row) = deleted {
-            let tenant_id: i64 = row.get("tenant_id");
-            let name: String = row.get("name");
-            self.cache.invalidate_bucket(tenant_id, &name).await;
-            return Ok(true);
+        let before = state.buckets.len();
+        state.buckets.retain(|b| b.bucket.id != bucket_id);
+        let removed = before != state.buckets.len();
+        if removed {
+            self.persist_after_write(&state).await?;
         }
-
-        let exists = client
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM buckets WHERE id = $1)",
-                &[&bucket_id],
-            )
-            .await?
-            .get::<_, bool>(0);
-        if exists {
-            anyhow::bail!("bucket {} has not been soft-deleted", bucket_id);
-        }
-
-        Ok(false)
+        Ok(removed)
     }
 
     pub async fn create_bucket_metadata_event(
@@ -1448,131 +1257,92 @@ impl Persistence {
         event_type: &str,
         bucket_metadata: JsonValue,
     ) -> Result<BucketMetadataEvent> {
-        let client = self.global_pool.get().await?;
-        let row = client
-            .query_one(
-                r#"
-                INSERT INTO bucket_metadata_events
-                    (tenant_id, bucket_id, bucket_name, event_type, bucket_metadata)
-                VALUES ($1, $2, $3, $4, $5)
-                RETURNING *"#,
-                &[
-                    &tenant_id,
-                    &bucket.id,
-                    &bucket.name,
-                    &event_type,
-                    &bucket_metadata,
-                ],
-            )
-            .await?;
-        Ok(row.into())
+        let mut state = self.state.write().await;
+        let event = BucketMetadataEvent {
+            id: state.allocate_id(),
+            tenant_id,
+            bucket_id: bucket.id,
+            bucket_name: bucket.name.clone(),
+            event_type: event_type.to_string(),
+            bucket_metadata,
+            created_at: Utc::now(),
+        };
+        state.bucket_events.push(event.clone());
+        self.persist_after_write(&state).await?;
+        Ok(event)
     }
 
     pub async fn list_bucket_metadata_events(
         &self,
         tenant_id: i64,
-        bucket_name: &str,
+        bucket_id: i64,
         after_cursor: i64,
         limit: i32,
     ) -> Result<Vec<BucketMetadataEvent>> {
-        let client = self.global_pool.get().await?;
-        let rows = client
-            .query(
-                r#"
-                SELECT *
-                FROM bucket_metadata_events
-                WHERE tenant_id = $1
-                  AND ($2 = '' OR bucket_name = $2)
-                  AND id > $3
-                ORDER BY id
-                LIMIT $4"#,
-                &[
-                    &tenant_id,
-                    &bucket_name,
-                    &after_cursor,
-                    &(if limit == 0 { 1000 } else { limit } as i64),
-                ],
-            )
-            .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        let mut events = self
+            .state
+            .read()
+            .await
+            .bucket_events
+            .iter()
+            .filter(|e| e.tenant_id == tenant_id && e.bucket_id == bucket_id && e.id > after_cursor)
+            .cloned()
+            .collect::<Vec<_>>();
+        events.sort_by_key(|e| e.id);
+        events.truncate(if limit == 0 {
+            1000
+        } else {
+            limit.max(1) as usize
+        });
+        Ok(events)
     }
 
     pub async fn list_buckets_for_tenant(&self, tenant_id: i64) -> Result<Vec<Bucket>> {
-        tracing::debug!(
-            "[Persistence] ENTERING list_buckets_for_tenant: tenant_id={}",
-            tenant_id
-        );
-        let client = self.global_pool.get().await?;
-        let rows = client
-            .query(
-                "SELECT * FROM buckets WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY name",
-                &[&tenant_id],
-            )
-            .await?;
-        let buckets: Vec<Bucket> = rows.into_iter().map(Into::into).collect();
-        tracing::debug!(
-            "[Persistence] EXITING list_buckets_for_tenant, found {} buckets",
-            buckets.len()
-        );
+        let mut buckets = self
+            .state
+            .read()
+            .await
+            .buckets
+            .iter()
+            .filter(|b| b.bucket.tenant_id == tenant_id && b.deleted_at.is_none())
+            .map(|b| b.bucket.clone())
+            .collect::<Vec<_>>();
+        buckets.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(buckets)
     }
-
-    // --- Regional Methods ---
 
     pub async fn active_index_policy_snapshot_hash(
         &self,
         tenant_id: i64,
         bucket_id: i64,
     ) -> Result<String> {
-        let client = self.regional_pool.get().await?;
-        let rows = client
-            .query(
-                r#"
-                SELECT name, kind, selector, extractor, authorization_mode, build_policy, version
-                FROM index_definitions
-                WHERE tenant_id = $1
-                  AND bucket_id = $2
-                  AND enabled
-                ORDER BY name, id"#,
-                &[&tenant_id, &bucket_id],
-            )
-            .await?;
-
-        let mut hasher = blake3::Hasher::new();
-        for row in rows {
-            let name: String = row.get("name");
-            let kind: String = row.get("kind");
-            let selector: JsonValue = row.get("selector");
-            let extractor: JsonValue = row.get("extractor");
-            let authorization_mode: String = row.get("authorization_mode");
-            let build_policy: JsonValue = row.get("build_policy");
-            let version: i64 = row.get("version");
-            hasher.update(name.as_bytes());
-            hasher.update(&[0]);
-            hasher.update(kind.as_bytes());
-            hasher.update(&[0]);
-            hasher.update(selector.to_string().as_bytes());
-            hasher.update(&[0]);
-            hasher.update(extractor.to_string().as_bytes());
-            hasher.update(&[0]);
-            hasher.update(authorization_mode.as_bytes());
-            hasher.update(&[0]);
-            hasher.update(build_policy.to_string().as_bytes());
-            hasher.update(&[0]);
-            hasher.update(&version.to_le_bytes());
-        }
-        Ok(hasher.finalize().to_hex().to_string())
+        let state = self.state.read().await;
+        let defs = state
+            .indexes
+            .iter()
+            .filter(|d| d.tenant_id == tenant_id && d.bucket_id == bucket_id && d.enabled)
+            .collect::<Vec<_>>();
+        Ok(blake3::hash(&serde_json::to_vec(
+            &defs
+                .iter()
+                .map(|d| (&d.name, &d.kind, d.version))
+                .collect::<Vec<_>>(),
+        )?)
+        .to_hex()
+        .to_string())
     }
 
     pub async fn latest_authz_revision(&self, tenant_id: i64) -> Result<i64> {
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_one(
-                "SELECT COALESCE(MAX(revision), 0)::BIGINT AS revision FROM authz_tuple_log WHERE tenant_id = $1",
-                &[&tenant_id],
-            )
-            .await?;
-        Ok(row.get("revision"))
+        Ok(self
+            .state
+            .read()
+            .await
+            .authz_tuples
+            .iter()
+            .filter(|r| r.tenant_id == tenant_id)
+            .map(|r| r.revision)
+            .max()
+            .unwrap_or(0))
     }
 
     pub async fn create_object(
@@ -1610,55 +1380,51 @@ impl Persistence {
             authz_revision,
             delete_marker: false,
         });
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_one(
-                r#"
-                INSERT INTO objects
-                    (tenant_id, bucket_id, key, content_hash, size, etag, version_id, mutation_id,
-                     content_type, user_meta, shard_map, inline_payload, index_policy_snapshot, user_metadata_hash,
-                     authz_revision, record_hash)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-                RETURNING *;"#,
-                &[
-                    &tenant_id,
-                    &bucket_id,
-                    &key,
-                    &content_hash,
-                    &size,
-                    &etag,
-                    &version_id,
-                    &mutation_id,
-                    &content_type,
-                    &user_meta,
-                    &shard_map,
-                    &inline_payload,
-                    &index_policy_snapshot,
-                    &user_metadata_hash,
-                    &authz_revision,
-                    &record_hash,
-                ],
-            )
-            .await?;
-        Ok(row.into())
+        let mut state = self.state.write().await;
+        let object = Object {
+            id: state.allocate_id(),
+            tenant_id,
+            bucket_id,
+            key: key.to_string(),
+            content_hash: content_hash.to_string(),
+            size,
+            etag: etag.to_string(),
+            content_type: content_type.map(ToOwned::to_owned),
+            version_id,
+            mutation_id,
+            index_policy_snapshot,
+            user_metadata_hash,
+            authz_revision,
+            record_hash,
+            created_at: Utc::now(),
+            deleted_at: None,
+            storage_class: None,
+            user_meta,
+            shard_map,
+            inline_payload,
+            checksum: None,
+        };
+        state.objects.push(object.clone());
+        self.persist_after_write(&state).await?;
+        Ok(object)
     }
 
     pub async fn get_object(&self, bucket_id: i64, key: &str) -> Result<Option<Object>> {
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_opt(
-                r#"SELECT * FROM objects WHERE bucket_id = $1 AND key = $2 ORDER BY created_at DESC, id DESC LIMIT 1"#,
-                &[&bucket_id, &key],
-            )
-            .await?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let object: Object = row.into();
-        if object.deleted_at.is_some() {
-            return Ok(None);
-        }
-        Ok(Some(object))
+        let mut versions = self
+            .state
+            .read()
+            .await
+            .objects
+            .iter()
+            .filter(|o| o.bucket_id == bucket_id && o.key == key)
+            .cloned()
+            .collect::<Vec<_>>();
+        versions.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(versions.last().filter(|o| o.deleted_at.is_none()).cloned())
     }
 
     pub async fn get_object_version(
@@ -1667,34 +1433,16 @@ impl Persistence {
         key: &str,
         version_id: uuid::Uuid,
     ) -> Result<Option<Object>> {
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_opt(
-                r#"SELECT * FROM objects WHERE bucket_id = $1 AND key = $2 AND version_id = $3"#,
-                &[&bucket_id, &key, &version_id],
-            )
-            .await?;
-        Ok(row.map(Into::into))
+        Ok(self
+            .state
+            .read()
+            .await
+            .objects
+            .iter()
+            .find(|o| o.bucket_id == bucket_id && o.key == key && o.version_id == version_id)
+            .cloned())
     }
 
-    /// List objects and (optionally) "common prefixes" (aka pseudo-folders).
-    ///
-    /// - When `delimiter` is empty: returns up to `limit` objects whose `key`
-    ///   starts with `prefix` and are lexicographically `> start_after`.
-    /// - When `delimiter` is non-empty: returns up to `limit` entries across the
-    ///   **merged, lexicographic** stream of:
-    ///     • objects that are the first-level children under `prefix` (no further delimiter),
-    ///     • common prefixes representing deeper descendants at that first level.
-    ///   The function still returns `(objects, common_prefixes)` separately, but the
-    ///   single `limit` applies to the merged stream (i.e., total returned =
-    ///   `objects.len() + common_prefixes.len() <= limit`).
-    ///
-    /// Notes:
-    /// - Avoids `ltree` cast errors by trimming/cleaning trailing slashes/dots,
-    ///   removing empty segments, and mapping invalid label characters.
-    /// - Uses `key_ltree <@ prefix_ltree` for proper descendant matching.
-    /// - Orders deterministically, and applies `LIMIT` after interleaving.
-    /// - Objects fetched by key are re-ordered by `key`.
     pub async fn list_objects(
         &self,
         bucket_id: i64,
@@ -1703,292 +1451,99 @@ impl Persistence {
         limit: i32,
         delimiter: &str,
     ) -> Result<(Vec<Object>, Vec<String>)> {
-        use regex::Regex;
-
-        // Helper: map an arbitrary key segment to a valid ltree label.
-        // Must mirror whatever you used when populating `objects.key_ltree`.
-        // Here we use a conservative mapping: A-Za-z0-9_ only; others -> "_".
-        fn ltree_labelize(seg: &str) -> String {
-            // If your ingestion uses a different normalization, replace this to match it.
-            let mut out = String::with_capacity(seg.len());
-            for (i, ch) in seg.chars().enumerate() {
-                let valid = ch.is_ascii_alphanumeric() || ch == '_';
-                if i == 0 {
-                    // label must start with alpha (ltree requirement). If not, prefix with 'x'
-                    if ch.is_ascii_alphabetic() {
-                        out.push(ch.to_ascii_lowercase());
-                    } else if valid {
-                        out.push('x');
-                        out.push(ch.to_ascii_lowercase());
-                    } else {
-                        out.push('x');
-                        out.push('_');
+        let state = self.state.read().await;
+        let mut latest: BTreeMap<String, Object> = BTreeMap::new();
+        for object in state.objects.iter().filter(|o| {
+            o.bucket_id == bucket_id
+                && o.key.starts_with(prefix)
+                && o.key.as_str() > start_after
+                && !crate::validation::is_reserved_internal_key(&o.key)
+        }) {
+            latest
+                .entry(object.key.clone())
+                .and_modify(|existing| {
+                    if (object.created_at, object.id) > (existing.created_at, existing.id) {
+                        *existing = object.clone();
                     }
-                } else {
-                    out.push(if valid { ch.to_ascii_lowercase() } else { '_' });
-                }
-            }
-            if out.is_empty() { "x".to_owned() } else { out }
+                })
+                .or_insert_with(|| object.clone());
         }
-
-        // Normalize `prefix` into an ltree dot-path that is safe to cast.
-        // - trim leading/trailing delimiters ('/')
-        // - collapse multiple slashes
-        // - drop empty segments
-        // - ltree-labelize each segment
-        // IMPORTANT: this must match how you built `key_ltree` at write time.
-        let slash_re = Regex::new(r"/+").unwrap();
-        let cleaned_prefix_slash = slash_re
-            .replace_all(prefix.trim_matches('/'), "/")
-            .to_string();
-
-        let prefix_segments: Vec<String> = cleaned_prefix_slash
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .map(ltree_labelize)
-            .collect();
-
-        let prefix_dot = prefix_segments.join(".");
-
-        // Fast path: no delimiter => simple ordered list of objects.
-        if delimiter.is_empty() {
-            let client = self.regional_pool.get().await?;
-            let rows = client
-                .query(
-                    r#"
-                    SELECT id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, inline_payload, checksum, deleted_at, key_ltree
-                    FROM (
-                      SELECT DISTINCT ON (key)
-                        id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, inline_payload, checksum, deleted_at, key_ltree
-                      FROM objects
-                      WHERE bucket_id = $1 AND key > $2 AND left(key, length($3)) = $3
-                        AND key !~ '^_anvil/(meta|index|authz|watch|personaldb|git|tmp)(/|$)'
-                      ORDER BY key, created_at DESC, id DESC
-                    ) latest
-                    WHERE deleted_at IS NULL
-                    ORDER BY key
-                    LIMIT $4"#,
-                    &[
-                        &bucket_id,
-                        &start_after,
-                        &prefix,
-                        &(limit as i64),
-                    ],
-                )
-                .await?;
-            let objects = rows.into_iter().map(Into::into).collect();
-            return Ok((objects, vec![]));
-        }
-
-        // Delimiter path: interleave first-level objects and prefixes and apply a single LIMIT.
-        let client = self.regional_pool.get().await?;
-
-        // We keep $4 as TEXT; cast to ltree with NULLIF in SQL to avoid "Unexpected end of input".
-        // When empty, treat as the root (nlevel = 0) and skip the <@ check.
-        let rows = client
-            .query(
-                r#"
-            WITH
-            params AS (
-              SELECT
-                $1::bigint AS bucket_id,
-                $2::text   AS start_after,
-                $3::int8   AS lim,
-                NULLIF($4::text, '')::ltree AS prefix_ltree,
-                $5::text AS prefix_text
-            ),
-            lvl AS (
-              SELECT COALESCE(nlevel(prefix_ltree), 0) AS p FROM params
-            ),
-            relevant AS (
-              SELECT o.key, o.key_ltree
-              FROM (
-                SELECT DISTINCT ON (key) key, key_ltree, deleted_at, bucket_id
-                FROM objects
-                WHERE bucket_id = $1
-                  AND key !~ '^_anvil/(meta|index|authz|watch|personaldb|git|tmp)(/|$)'
-                ORDER BY key, created_at DESC, id DESC
-              ) o, params p
-              WHERE o.bucket_id = p.bucket_id
-                AND o.deleted_at IS NULL
-                AND o.key > p.start_after
-                AND left(o.key, length(p.prefix_text)) = p.prefix_text
-                AND (p.prefix_ltree IS NULL OR o.key_ltree <@ p.prefix_ltree)
-            ),
-            children AS (
-              SELECT
-                key,
-                key_ltree,
-                subpath(
-                  key_ltree,
-                  0,
-                  (SELECT p FROM lvl) + 1
-                ) AS child_path,
-                nlevel(key_ltree) AS lvl
-              FROM relevant
-            ),
-            grouped AS (
-              SELECT
-                child_path,
-                MIN(key) AS min_key,
-                BOOL_OR(nlevel(key_ltree) > nlevel(child_path)) AS has_descendants_below,
-                COUNT(*) FILTER (WHERE key_ltree = child_path) AS exact_object_count
-              FROM children
-              GROUP BY child_path
-            ),
-            -- Build a unified, lexicographically sorted stream of rows, then LIMIT.
-            stream AS (
-              -- Common prefixes: return only those whose first visible key is > start_after
-              SELECT
-                ltree2text(g.child_path) AS sort_key,
-                NULL::text               AS object_key,
-                TRUE                     AS is_prefix
-              FROM grouped g, params p
-              WHERE g.has_descendants_below
-                AND g.min_key > p.start_after
-
-              UNION ALL
-
-              -- Objects that are exactly first-level children (no deeper slash beyond prefix)
-              SELECT
-                ltree2text(c.child_path) AS sort_key,
-                c.key                    AS object_key,
-                FALSE                    AS is_prefix
-              FROM children c
-              WHERE c.key_ltree = c.child_path
-            )
-            SELECT sort_key, object_key, is_prefix
-            FROM stream
-            ORDER BY sort_key, is_prefix DESC  -- object (false) before prefix (true) for same sort_key
-            LIMIT (SELECT lim FROM params)
-            "#,
-                &[&bucket_id, &start_after, &(limit as i64), &prefix_dot, &prefix],
-            )
-            .await?;
-
-        // Split the unified stream into object keys vs prefixes (preserving order).
-        let mut object_keys: Vec<String> = Vec::new();
-        let mut common_prefixes: Vec<String> = Vec::new();
-
-        for row in &rows {
-            let sort_key: String = row.get("sort_key"); // dot path
-            let is_prefix: bool = row.get("is_prefix");
-            let slash_path = sort_key.replace('.', "/");
-
-            if is_prefix {
-                // Convert to caller's delimiter at the very end.
-                let mut pref = if delimiter == "/" {
-                    format!("{}/", slash_path)
-                } else {
-                    // Replace slashes with requested delimiter and append delimiter once.
-                    let replaced = if slash_path.is_empty() {
-                        String::new()
-                    } else {
-                        slash_path.replace('/', delimiter)
-                    };
-                    format!("{}{}", replaced, delimiter)
-                };
-                // Ensure it still starts with the provided (string) prefix for nice UX
-                // (only when using non-'/' delimiters this might differ). This is optional:
-                if !prefix.is_empty() && !pref.starts_with(prefix) && delimiter == "/" {
-                    // For safety; usually unnecessary if keys are consistent.
-                    pref = format!("{}/", prefix.trim_end_matches('/'));
-                }
-                common_prefixes.push(pref);
-            } else {
-                let key: String = row.get("object_key");
-                object_keys.push(key);
-            }
-        }
-
-        // Fetch object rows (if any) with deterministic ordering.
-        let objects = if !object_keys.is_empty() {
-            let rows = client
-                .query(
-                    r#"
-                    SELECT id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, inline_payload, checksum, deleted_at, key_ltree
-                    FROM (
-                      SELECT DISTINCT ON (key)
-                        id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, inline_payload, checksum, deleted_at, key_ltree
-                      FROM objects
-                      WHERE bucket_id = $1 AND key = ANY($2)
-                        AND key !~ '^_anvil/(meta|index|authz|watch|personaldb|git|tmp)(/|$)'
-                      ORDER BY key, created_at DESC, id DESC
-                    ) latest
-                    WHERE deleted_at IS NULL
-                    ORDER BY key"#,
-                    &[&bucket_id, &object_keys],
-                )
-                .await?;
-            rows.into_iter().map(Into::into).collect()
+        let mut objects = latest
+            .into_values()
+            .filter(|o| o.deleted_at.is_none())
+            .collect::<Vec<_>>();
+        objects.sort_by(|a, b| a.key.cmp(&b.key));
+        let limit = if limit == 0 {
+            1000
         } else {
-            Vec::new()
+            limit.max(1) as usize
         };
-
-        Ok((objects, common_prefixes))
+        if delimiter.is_empty() {
+            objects.truncate(limit);
+            return Ok((objects, Vec::new()));
+        }
+        let mut object_by_key = BTreeMap::<String, Object>::new();
+        let mut prefixes = BTreeMap::<String, ()>::new();
+        for object in objects {
+            let suffix = &object.key[prefix.len()..];
+            if let Some(pos) = suffix.find(delimiter) {
+                prefixes.insert(
+                    format!("{}{}", prefix, &suffix[..pos + delimiter.len()]),
+                    (),
+                );
+            } else {
+                object_by_key.insert(object.key.clone(), object);
+            }
+        }
+        let mut merged = object_by_key
+            .keys()
+            .cloned()
+            .map(|k| (k, false))
+            .chain(prefixes.keys().cloned().map(|p| (p, true)))
+            .collect::<Vec<_>>();
+        merged.sort();
+        let mut out_objects = Vec::new();
+        let mut out_prefixes = Vec::new();
+        for (key, is_prefix) in merged.into_iter().take(limit) {
+            if is_prefix {
+                out_prefixes.push(key);
+            } else if let Some(object) = object_by_key.remove(&key) {
+                out_objects.push(object);
+            }
+        }
+        Ok((out_objects, out_prefixes))
     }
 
     pub async fn soft_delete_object(&self, bucket_id: i64, key: &str) -> Result<Option<Object>> {
-        let client = self.regional_pool.get().await?;
-        let source = client
-            .query_opt(
-                r#"
-                SELECT *
-                FROM objects
-                WHERE bucket_id = $1 AND key = $2
-                ORDER BY created_at DESC, id DESC
-                LIMIT 1"#,
-                &[&bucket_id, &key],
-            )
-            .await?;
-        let Some(source) = source else {
+        let mut state = self.state.write().await;
+        let Some(base) = state
+            .objects
+            .iter()
+            .filter(|o| o.bucket_id == bucket_id && o.key == key && o.deleted_at.is_none())
+            .max_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            })
+            .cloned()
+        else {
             return Ok(None);
         };
-        let source: Object = source.into();
-        let version_id = uuid::Uuid::new_v4();
-        let mutation_id = uuid::Uuid::new_v4();
-        let index_policy_snapshot = self
-            .active_index_policy_snapshot_hash(source.tenant_id, bucket_id)
-            .await?;
-        let authz_revision = self.latest_authz_revision(source.tenant_id).await?;
-        let user_metadata_hash = user_metadata_hash(None);
-        let record_hash = object_version_record_hash(ObjectVersionRecordHashInput {
-            tenant_id: source.tenant_id,
-            bucket_id,
-            key,
-            version_id,
-            mutation_id,
-            content_hash: "",
+        let now = Utc::now();
+        let object = Object {
+            id: state.allocate_id(),
+            mutation_id: uuid::Uuid::new_v4(),
+            version_id: uuid::Uuid::new_v4(),
+            content_hash: String::new(),
             size: 0,
-            etag: "",
-            content_type: None,
-            user_metadata_hash: &user_metadata_hash,
-            index_policy_snapshot: &index_policy_snapshot,
-            authz_revision,
-            delete_marker: true,
-        });
-        let row = client
-            .query_opt(
-                r#"
-                INSERT INTO objects
-                    (tenant_id, bucket_id, key, content_hash, size, etag, version_id, mutation_id,
-                     deleted_at, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash)
-                VALUES ($1, $2, $3, '', 0, '', $4, $5, now(), $6, $7, $8, $9)
-                RETURNING *"#,
-                &[
-                    &source.tenant_id,
-                    &bucket_id,
-                    &key,
-                    &version_id,
-                    &mutation_id,
-                    &index_policy_snapshot,
-                    &user_metadata_hash,
-                    &authz_revision,
-                    &record_hash,
-                ],
-            )
-            .await?;
-        Ok(row.map(Into::into))
+            etag: String::new(),
+            created_at: now,
+            deleted_at: Some(now),
+            ..base
+        };
+        state.objects.push(object.clone());
+        self.persist_after_write(&state).await?;
+        Ok(Some(object))
     }
 
     pub async fn delete_object_version(
@@ -1997,17 +1552,18 @@ impl Persistence {
         key: &str,
         version_id: uuid::Uuid,
     ) -> Result<Option<Object>> {
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_opt(
-                r#"
-                DELETE FROM objects
-                WHERE bucket_id = $1 AND key = $2 AND version_id = $3
-                RETURNING *"#,
-                &[&bucket_id, &key, &version_id],
-            )
-            .await?;
-        Ok(row.map(Into::into))
+        let mut state = self.state.write().await;
+        let Some(pos) = state
+            .objects
+            .iter()
+            .position(|o| o.bucket_id == bucket_id && o.key == key && o.version_id == version_id)
+        else {
+            return Ok(None);
+        };
+        let mut object = state.objects.remove(pos);
+        object.deleted_at = Some(Utc::now());
+        self.persist_after_write(&state).await?;
+        Ok(Some(object))
     }
 
     pub async fn list_object_versions(
@@ -2018,116 +1574,78 @@ impl Persistence {
         version_id_marker: Option<uuid::Uuid>,
         limit: i32,
     ) -> Result<ObjectVersionsPage> {
-        let client = self.regional_pool.get().await?;
-        let limit = limit.max(1) as i64;
-        let fetch_limit = limit + 1;
-        let rows = if let Some(version_id_marker) = version_id_marker {
-            let marker = client
-                .query_opt(
-                    r#"
-                    SELECT id, created_at
-                    FROM objects
-                    WHERE bucket_id = $1 AND key = $2 AND version_id = $3"#,
-                    &[&bucket_id, &key_marker, &version_id_marker],
-                )
-                .await?;
-            let Some(marker) = marker else {
-                return Ok(ObjectVersionsPage {
-                    versions: Vec::new(),
-                    is_truncated: false,
-                    next_key_marker: None,
-                    next_version_id_marker: None,
-                });
-            };
-            let marker_id: i64 = marker.get("id");
-            let marker_created_at: DateTime<Utc> = marker.get("created_at");
-            client
-                .query(
-                    r#"
-                    WITH ranked AS (
-                      SELECT
-                        id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, inline_payload, checksum, deleted_at, key_ltree,
-                        row_number() OVER (PARTITION BY key ORDER BY created_at DESC, id DESC) = 1 AS is_latest
-                      FROM objects
-                      WHERE bucket_id = $1 AND left(key, length($2)) = $2
-                        AND (
-                          key > $3
-                          OR (
-                            key = $3
-                            AND (
-                              created_at < $4
-                              OR (created_at = $4 AND id < $5)
-                            )
-                          )
-                        )
-                        AND key !~ '^_anvil/(meta|index|authz|watch|personaldb|git|tmp)(/|$)'
-                    )
-                    SELECT *
-                    FROM ranked
-                    ORDER BY key, created_at DESC, id DESC
-                    LIMIT $6"#,
-                    &[
-                        &bucket_id,
-                        &prefix,
-                        &key_marker,
-                        &marker_created_at,
-                        &marker_id,
-                        &fetch_limit,
-                    ],
-                )
-                .await?
-        } else {
-            client
-                .query(
-                    r#"
-                    WITH ranked AS (
-                      SELECT
-                        id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, inline_payload, checksum, deleted_at, key_ltree,
-                        row_number() OVER (PARTITION BY key ORDER BY created_at DESC, id DESC) = 1 AS is_latest
-                      FROM objects
-                      WHERE bucket_id = $1 AND key > $2 AND left(key, length($3)) = $3
-                        AND key !~ '^_anvil/(meta|index|authz|watch|personaldb|git|tmp)(/|$)'
-                    )
-                    SELECT *
-                    FROM ranked
-                    ORDER BY key, created_at DESC, id DESC
-                    LIMIT $4"#,
-                    &[&bucket_id, &key_marker, &prefix, &fetch_limit],
-                )
-                .await?
-        };
-
-        let mut versions: Vec<ObjectVersion> = rows
-            .into_iter()
-            .map(|row| {
-                let is_latest: bool = row.get("is_latest");
-                let object: Object = row.into();
-                ObjectVersion {
+        let state = self.state.read().await;
+        let mut by_key: BTreeMap<String, Vec<Object>> = BTreeMap::new();
+        for object in state
+            .objects
+            .iter()
+            .filter(|o| o.bucket_id == bucket_id && o.key.starts_with(prefix))
+        {
+            by_key
+                .entry(object.key.clone())
+                .or_default()
+                .push(object.clone());
+        }
+        let mut flat = Vec::new();
+        for versions in by_key.values_mut() {
+            versions.sort_by(|a, b| {
+                b.created_at
+                    .cmp(&a.created_at)
+                    .then_with(|| b.id.cmp(&a.id))
+            });
+            for (idx, object) in versions.iter().enumerate() {
+                flat.push(ObjectVersion {
+                    object: object.clone(),
                     is_delete_marker: object.deleted_at.is_some(),
-                    is_latest,
-                    object,
+                    is_latest: idx == 0,
+                });
+            }
+        }
+        flat.sort_by(|a, b| {
+            a.object
+                .key
+                .cmp(&b.object.key)
+                .then_with(|| b.object.created_at.cmp(&a.object.created_at))
+        });
+        if !key_marker.is_empty() {
+            let mut past_marker = version_id_marker.is_none();
+            flat.retain(|v| {
+                if v.object.key.as_str() < key_marker {
+                    return false;
                 }
-            })
-            .collect();
-        let is_truncated = versions.len() > limit as usize;
+                if v.object.key.as_str() > key_marker {
+                    return true;
+                }
+                if let Some(marker) = version_id_marker {
+                    if past_marker {
+                        return true;
+                    }
+                    if v.object.version_id == marker {
+                        past_marker = true;
+                    }
+                    return false;
+                }
+                true
+            });
+        }
+        let limit = if limit == 0 {
+            1000
+        } else {
+            limit.max(1) as usize
+        };
+        let is_truncated = flat.len() > limit;
         if is_truncated {
-            versions.truncate(limit as usize);
+            flat.truncate(limit);
         }
         let (next_key_marker, next_version_id_marker) = if is_truncated {
-            versions
-                .last()
-                .map(|version| {
-                    (
-                        Some(version.object.key.clone()),
-                        Some(version.object.version_id),
-                    )
-                })
+            flat.last()
+                .map(|v| (Some(v.object.key.clone()), Some(v.object.version_id)))
                 .unwrap_or((None, None))
         } else {
             (None, None)
         };
         Ok(ObjectVersionsPage {
-            versions,
+            versions: flat,
             is_truncated,
             next_key_marker,
             next_version_id_marker,
@@ -2140,42 +1658,43 @@ impl Persistence {
         bucket_id: i64,
         key: &str,
     ) -> Result<MultipartUpload> {
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_one(
-                r#"
-                INSERT INTO multipart_uploads (tenant_id, bucket_id, key, upload_id)
-                VALUES ($1, $2, $3, gen_random_uuid())
-                RETURNING *"#,
-                &[&tenant_id, &bucket_id, &key],
-            )
-            .await?;
-        Ok(row.into())
+        let mut state = self.state.write().await;
+        let upload = MultipartUpload {
+            id: state.allocate_id(),
+            tenant_id,
+            bucket_id,
+            key: key.to_string(),
+            upload_id: uuid::Uuid::new_v4(),
+            created_at: Utc::now(),
+            completed_at: None,
+            aborted_at: None,
+        };
+        state.multipart_uploads.push(upload.clone());
+        self.persist_after_write(&state).await?;
+        Ok(upload)
     }
 
     pub async fn get_active_multipart_upload(
         &self,
-        tenant_id: i64,
+        _tenant_id: i64,
         bucket_id: i64,
         key: &str,
         upload_id: uuid::Uuid,
     ) -> Result<Option<MultipartUpload>> {
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_opt(
-                r#"
-                SELECT *
-                FROM multipart_uploads
-                WHERE tenant_id = $1
-                  AND bucket_id = $2
-                  AND key = $3
-                  AND upload_id = $4
-                  AND completed_at IS NULL
-                  AND aborted_at IS NULL"#,
-                &[&tenant_id, &bucket_id, &key, &upload_id],
-            )
-            .await?;
-        Ok(row.map(Into::into))
+        Ok(self
+            .state
+            .read()
+            .await
+            .multipart_uploads
+            .iter()
+            .find(|u| {
+                u.bucket_id == bucket_id
+                    && u.key == key
+                    && u.upload_id == upload_id
+                    && u.completed_at.is_none()
+                    && u.aborted_at.is_none()
+            })
+            .cloned())
     }
 
     pub async fn upsert_multipart_part(
@@ -2186,42 +1705,49 @@ impl Persistence {
         size: i64,
         etag: &str,
     ) -> Result<MultipartUploadPart> {
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_one(
-                r#"
-                INSERT INTO multipart_upload_parts
-                    (upload_id, part_number, content_hash, size, etag)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (upload_id, part_number)
-                DO UPDATE SET
-                    content_hash = EXCLUDED.content_hash,
-                    size = EXCLUDED.size,
-                    etag = EXCLUDED.etag,
-                    created_at = now()
-                RETURNING *"#,
-                &[&upload_row_id, &part_number, &content_hash, &size, &etag],
-            )
-            .await?;
-        Ok(row.into())
+        let mut state = self.state.write().await;
+        if let Some(part) = state
+            .multipart_parts
+            .iter_mut()
+            .find(|p| p.upload_id == upload_row_id && p.part_number == part_number)
+        {
+            part.content_hash = content_hash.to_string();
+            part.size = size;
+            part.etag = etag.to_string();
+            part.created_at = Utc::now();
+            let out = part.clone();
+            self.persist_after_write(&state).await?;
+            return Ok(out);
+        }
+        let part = MultipartUploadPart {
+            id: state.allocate_id(),
+            upload_id: upload_row_id,
+            part_number,
+            content_hash: content_hash.to_string(),
+            size,
+            etag: etag.to_string(),
+            created_at: Utc::now(),
+        };
+        state.multipart_parts.push(part.clone());
+        self.persist_after_write(&state).await?;
+        Ok(part)
     }
 
     pub async fn list_multipart_parts(
         &self,
         upload_row_id: i64,
     ) -> Result<Vec<MultipartUploadPart>> {
-        let client = self.regional_pool.get().await?;
-        let rows = client
-            .query(
-                r#"
-                SELECT *
-                FROM multipart_upload_parts
-                WHERE upload_id = $1
-                ORDER BY part_number"#,
-                &[&upload_row_id],
-            )
-            .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        let mut parts = self
+            .state
+            .read()
+            .await
+            .multipart_parts
+            .iter()
+            .filter(|p| p.upload_id == upload_row_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        parts.sort_by_key(|p| p.part_number);
+        Ok(parts)
     }
 
     pub async fn list_multipart_parts_page(
@@ -2230,28 +1756,26 @@ impl Persistence {
         part_number_marker: i32,
         limit: i32,
     ) -> Result<MultipartPartsPage> {
-        let client = self.regional_pool.get().await?;
-        let requested_limit = if limit <= 0 { 1000 } else { limit.min(1000) } as i64;
-        let rows = client
-            .query(
-                r#"
-                SELECT *
-                FROM multipart_upload_parts
-                WHERE upload_id = $1
-                  AND part_number > $2
-                ORDER BY part_number
-                LIMIT $3"#,
-                &[&upload_row_id, &part_number_marker, &(requested_limit + 1)],
-            )
-            .await?;
-        let mut parts: Vec<MultipartUploadPart> = rows.into_iter().map(Into::into).collect();
-        let is_truncated = parts.len() as i64 > requested_limit;
+        let mut parts = self
+            .list_multipart_parts(upload_row_id)
+            .await?
+            .into_iter()
+            .filter(|p| p.part_number > part_number_marker)
+            .collect::<Vec<_>>();
+        let limit = if limit == 0 {
+            1000
+        } else {
+            limit.max(1) as usize
+        };
+        let is_truncated = parts.len() > limit;
         if is_truncated {
-            parts.truncate(requested_limit as usize);
+            parts.truncate(limit);
         }
-        let next_part_number_marker = is_truncated
-            .then(|| parts.last().map(|part| part.part_number))
-            .flatten();
+        let next_part_number_marker = if is_truncated {
+            parts.last().map(|p| p.part_number)
+        } else {
+            None
+        };
         Ok(MultipartPartsPage {
             parts,
             is_truncated,
@@ -2267,46 +1791,59 @@ impl Persistence {
         upload_id_marker: Option<uuid::Uuid>,
         limit: i32,
     ) -> Result<MultipartUploadsPage> {
-        let client = self.regional_pool.get().await?;
-        let requested_limit = if limit <= 0 { 1000 } else { limit.min(1000) } as i64;
-        let marker_text = upload_id_marker
-            .filter(|_| !key_marker.is_empty())
-            .map(|marker| marker.to_string())
-            .unwrap_or_default();
-        let rows = client
-            .query(
-                r#"
-                SELECT *
-                FROM multipart_uploads
-                WHERE bucket_id = $1
-                  AND left(key, length($2)) = $2
-                  AND (
-                      $3 = ''
-                      OR key > $3
-                      OR (key = $3 AND ($4 = '' OR upload_id::text > $4))
-                  )
-                  AND completed_at IS NULL
-                  AND aborted_at IS NULL
-                ORDER BY key, upload_id
-                LIMIT $5"#,
-                &[
-                    &bucket_id,
-                    &prefix,
-                    &key_marker,
-                    &marker_text,
-                    &(requested_limit + 1),
-                ],
-            )
-            .await?;
-        let mut uploads: Vec<MultipartUpload> = rows.into_iter().map(Into::into).collect();
-        let is_truncated = uploads.len() as i64 > requested_limit;
+        let mut uploads = self
+            .state
+            .read()
+            .await
+            .multipart_uploads
+            .iter()
+            .filter(|u| {
+                u.bucket_id == bucket_id
+                    && u.key.starts_with(prefix)
+                    && u.completed_at.is_none()
+                    && u.aborted_at.is_none()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        uploads.sort_by(|a, b| {
+            a.key
+                .cmp(&b.key)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        if !key_marker.is_empty() {
+            let mut past_marker = upload_id_marker.is_none();
+            uploads.retain(|u| {
+                if u.key.as_str() < key_marker {
+                    return false;
+                }
+                if u.key.as_str() > key_marker {
+                    return true;
+                }
+                if let Some(marker) = upload_id_marker {
+                    if past_marker {
+                        return true;
+                    }
+                    if u.upload_id == marker {
+                        past_marker = true;
+                    }
+                    return false;
+                }
+                true
+            });
+        }
+        let limit = if limit == 0 {
+            1000
+        } else {
+            limit.max(1) as usize
+        };
+        let is_truncated = uploads.len() > limit;
         if is_truncated {
-            uploads.truncate(requested_limit as usize);
+            uploads.truncate(limit);
         }
         let (next_key_marker, next_upload_id_marker) = if is_truncated {
             uploads
                 .last()
-                .map(|upload| (Some(upload.key.clone()), Some(upload.upload_id)))
+                .map(|u| (Some(u.key.clone()), Some(u.upload_id)))
                 .unwrap_or((None, None))
         } else {
             (None, None)
@@ -2320,44 +1857,40 @@ impl Persistence {
     }
 
     pub async fn complete_multipart_upload(&self, upload_row_id: i64) -> Result<()> {
-        let client = self.regional_pool.get().await?;
-        client
-            .execute(
-                r#"
-                UPDATE multipart_uploads
-                SET completed_at = now()
-                WHERE id = $1
-                  AND completed_at IS NULL
-                  AND aborted_at IS NULL"#,
-                &[&upload_row_id],
-            )
-            .await?;
-        Ok(())
+        let mut state = self.state.write().await;
+        if let Some(upload) = state
+            .multipart_uploads
+            .iter_mut()
+            .find(|u| u.id == upload_row_id)
+        {
+            upload.completed_at = Some(Utc::now());
+        }
+        self.persist_after_write(&state).await
     }
 
     pub async fn abort_multipart_upload(
         &self,
-        tenant_id: i64,
+        _tenant_id: i64,
         bucket_id: i64,
         key: &str,
         upload_id: uuid::Uuid,
     ) -> Result<bool> {
-        let client = self.regional_pool.get().await?;
-        let changed = client
-            .execute(
-                r#"
-                UPDATE multipart_uploads
-                SET aborted_at = now()
-                WHERE tenant_id = $1
-                  AND bucket_id = $2
-                  AND key = $3
-                  AND upload_id = $4
-                  AND completed_at IS NULL
-                  AND aborted_at IS NULL"#,
-                &[&tenant_id, &bucket_id, &key, &upload_id],
-            )
-            .await?;
-        Ok(changed > 0)
+        let mut state = self.state.write().await;
+        let mut updated = false;
+        if let Some(upload) = state.multipart_uploads.iter_mut().find(|u| {
+            u.bucket_id == bucket_id
+                && u.key == key
+                && u.upload_id == upload_id
+                && u.completed_at.is_none()
+                && u.aborted_at.is_none()
+        }) {
+            upload.aborted_at = Some(Utc::now());
+            updated = true;
+        }
+        if updated {
+            self.persist_after_write(&state).await?;
+        }
+        Ok(updated)
     }
 
     pub async fn create_object_watch_event(
@@ -2369,49 +1902,36 @@ impl Persistence {
         event_type: &str,
         is_delete_marker: bool,
     ) -> Result<ObjectWatchEvent> {
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_one(
-                r#"
-                INSERT INTO object_watch_events
-                    (tenant_id, bucket_id, bucket_name, key, event_type, version_id, etag, size, is_delete_marker)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                RETURNING *"#,
-                &[
-                    &tenant_id,
-                    &bucket_id,
-                    &bucket_name,
-                    &object.key,
-                    &event_type,
-                    &object.version_id,
-                    &object.etag,
-                    &object.size,
-                    &is_delete_marker,
-                ],
-            )
-            .await?;
-        Ok(row.into())
+        let mut state = self.state.write().await;
+        let event = ObjectWatchEvent {
+            id: state.allocate_id(),
+            tenant_id,
+            bucket_id,
+            bucket_name: bucket_name.to_string(),
+            key: object.key.clone(),
+            event_type: event_type.to_string(),
+            version_id: Some(object.version_id),
+            etag: Some(object.etag.clone()),
+            size: object.size,
+            is_delete_marker,
+            created_at: Utc::now(),
+        };
+        state.object_events.push(event.clone());
+        self.persist_after_write(&state).await?;
+        Ok(event)
     }
 
-    pub async fn latest_object_watch_cursor(
-        &self,
-        tenant_id: i64,
-        bucket_id: i64,
-        version_id: uuid::Uuid,
-    ) -> Result<Option<i64>> {
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_opt(
-                r#"
-                SELECT id
-                FROM object_watch_events
-                WHERE tenant_id = $1 AND bucket_id = $2 AND version_id = $3
-                ORDER BY id DESC
-                LIMIT 1"#,
-                &[&tenant_id, &bucket_id, &version_id],
-            )
-            .await?;
-        Ok(row.map(|row| row.get("id")))
+    pub async fn latest_object_watch_cursor(&self, tenant_id: i64, bucket_id: i64) -> Result<i64> {
+        Ok(self
+            .state
+            .read()
+            .await
+            .object_events
+            .iter()
+            .filter(|e| e.tenant_id == tenant_id && e.bucket_id == bucket_id)
+            .map(|e| e.id)
+            .max()
+            .unwrap_or(0))
     }
 
     pub async fn list_object_watch_events(
@@ -2422,28 +1942,27 @@ impl Persistence {
         after_cursor: i64,
         limit: i32,
     ) -> Result<Vec<ObjectWatchEvent>> {
-        let client = self.regional_pool.get().await?;
-        let rows = client
-            .query(
-                r#"
-                SELECT *
-                FROM object_watch_events
-                WHERE tenant_id = $1
-                  AND bucket_id = $2
-                  AND left(key, length($3)) = $3
-                  AND id > $4
-                ORDER BY id
-                LIMIT $5"#,
-                &[
-                    &tenant_id,
-                    &bucket_id,
-                    &prefix,
-                    &after_cursor,
-                    &(if limit == 0 { 1000 } else { limit } as i64),
-                ],
-            )
-            .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        let mut events = self
+            .state
+            .read()
+            .await
+            .object_events
+            .iter()
+            .filter(|e| {
+                e.tenant_id == tenant_id
+                    && e.bucket_id == bucket_id
+                    && e.key.starts_with(prefix)
+                    && e.id > after_cursor
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        events.sort_by_key(|e| e.id);
+        events.truncate(if limit == 0 {
+            1000
+        } else {
+            limit.max(1) as usize
+        });
+        Ok(events)
     }
 
     pub async fn create_append_stream(
@@ -2453,194 +1972,144 @@ impl Persistence {
         bucket_name: &str,
         stream_key: &str,
     ) -> Result<AppendStream> {
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_one(
-                r#"
-                INSERT INTO append_streams
-                    (tenant_id, bucket_id, bucket_name, stream_key, stream_id)
-                VALUES ($1, $2, $3, $4, gen_random_uuid())
-                RETURNING *"#,
-                &[&tenant_id, &bucket_id, &bucket_name, &stream_key],
-            )
-            .await?;
-        Ok(row.into())
+        let mut state = self.state.write().await;
+        let stream = AppendStream {
+            id: state.allocate_id(),
+            tenant_id,
+            bucket_id,
+            bucket_name: bucket_name.to_string(),
+            stream_key: stream_key.to_string(),
+            stream_id: uuid::Uuid::new_v4(),
+            created_at: Utc::now(),
+            sealed_at: None,
+            segment_hash: None,
+        };
+        state.append_streams.push(stream.clone());
+        self.persist_after_write(&state).await?;
+        Ok(stream)
     }
 
     pub async fn get_active_append_stream(
         &self,
-        tenant_id: i64,
+        _tenant_id: i64,
         bucket_id: i64,
         stream_key: &str,
         stream_id: uuid::Uuid,
     ) -> Result<Option<AppendStream>> {
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_opt(
-                r#"
-                SELECT *
-                FROM append_streams
-                WHERE tenant_id = $1
-                  AND bucket_id = $2
-                  AND stream_key = $3
-                  AND stream_id = $4
-                  AND sealed_at IS NULL"#,
-                &[&tenant_id, &bucket_id, &stream_key, &stream_id],
-            )
-            .await?;
-        Ok(row.map(Into::into))
+        Ok(self
+            .state
+            .read()
+            .await
+            .append_streams
+            .iter()
+            .find(|s| {
+                s.bucket_id == bucket_id
+                    && s.stream_key == stream_key
+                    && s.stream_id == stream_id
+                    && s.sealed_at.is_none()
+            })
+            .cloned())
     }
 
     pub async fn append_stream_record(
         &self,
-        append_stream_row_id: i64,
+        stream_row_id: i64,
         payload_hash: &str,
         payload_size: i64,
     ) -> Result<AppendStreamRecord> {
-        let mut client = self.regional_pool.get().await?;
-        let tx = client.transaction().await?;
-        let sequence: i64 = tx
-            .query_one(
-                r#"
-                SELECT COALESCE(MAX(record_sequence), 0) + 1
-                FROM append_stream_records
-                WHERE stream_id = $1"#,
-                &[&append_stream_row_id],
-            )
-            .await?
-            .get(0);
-        let row = tx
-            .query_one(
-                r#"
-                INSERT INTO append_stream_records
-                    (stream_id, record_sequence, payload_hash, payload_size)
-                VALUES ($1, $2, $3, $4)
-                RETURNING *"#,
-                &[
-                    &append_stream_row_id,
-                    &sequence,
-                    &payload_hash,
-                    &payload_size,
-                ],
-            )
-            .await?;
-        tx.commit().await?;
-        Ok(row.into())
+        let mut state = self.state.write().await;
+        let next_seq = state
+            .append_records
+            .iter()
+            .filter(|r| r.stream_id == stream_row_id)
+            .map(|r| r.record_sequence)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let record = AppendStreamRecord {
+            id: state.allocate_id(),
+            stream_id: stream_row_id,
+            record_sequence: next_seq,
+            payload_hash: payload_hash.to_string(),
+            payload_size,
+            created_at: Utc::now(),
+        };
+        state.append_records.push(record.clone());
+        self.persist_after_write(&state).await?;
+        Ok(record)
     }
 
     pub async fn list_append_stream_records(
         &self,
-        append_stream_row_id: i64,
+        stream_row_id: i64,
     ) -> Result<Vec<AppendStreamRecord>> {
-        let client = self.regional_pool.get().await?;
-        let rows = client
-            .query(
-                r#"
-                SELECT *
-                FROM append_stream_records
-                WHERE stream_id = $1
-                ORDER BY record_sequence"#,
-                &[&append_stream_row_id],
-            )
-            .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        let mut records = self
+            .state
+            .read()
+            .await
+            .append_records
+            .iter()
+            .filter(|r| r.stream_id == stream_row_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by_key(|r| r.record_sequence);
+        Ok(records)
     }
 
-    pub async fn seal_append_stream(
-        &self,
-        append_stream_row_id: i64,
-        segment_hash: &str,
-    ) -> Result<bool> {
-        let client = self.regional_pool.get().await?;
-        let changed = client
-            .execute(
-                r#"
-                UPDATE append_streams
-                SET sealed_at = now(), segment_hash = $2
-                WHERE id = $1 AND sealed_at IS NULL"#,
-                &[&append_stream_row_id, &segment_hash],
-            )
-            .await?;
-        Ok(changed > 0)
+    pub async fn seal_append_stream(&self, stream_row_id: i64, segment_hash: &str) -> Result<bool> {
+        let mut state = self.state.write().await;
+        let mut sealed = false;
+        if let Some(stream) = state
+            .append_streams
+            .iter_mut()
+            .find(|s| s.id == stream_row_id && s.sealed_at.is_none())
+        {
+            stream.sealed_at = Some(Utc::now());
+            stream.segment_hash = Some(segment_hash.to_string());
+            sealed = true;
+        }
+        if sealed {
+            self.persist_after_write(&state).await?;
+        }
+        Ok(sealed)
     }
 
     pub async fn compare_and_swap_manifest(
         &self,
         tenant_id: i64,
         bucket_id: i64,
-        bucket_name: &str,
-        manifest_key: &str,
+        _bucket_name: &str,
+        object_key: &str,
         expected_revision: i64,
-        manifest_json: JsonValue,
+        manifest: JsonValue,
         manifest_hash: &str,
     ) -> Result<Option<ManifestCasResult>> {
-        let mut client = self.regional_pool.get().await?;
-        let tx = client.transaction().await?;
-        let existing = tx
-            .query_opt(
-                r#"
-                SELECT revision
-                FROM object_manifests
-                WHERE bucket_id = $1 AND manifest_key = $2
-                FOR UPDATE"#,
-                &[&bucket_id, &manifest_key],
-            )
-            .await?;
-
-        let next_revision = match existing {
-            Some(row) => {
-                let current_revision: i64 = row.get("revision");
-                if current_revision != expected_revision {
-                    tx.rollback().await?;
-                    return Ok(None);
-                }
-                let next_revision = current_revision + 1;
-                tx.execute(
-                    r#"
-                    UPDATE object_manifests
-                    SET revision = $3,
-                        manifest_json = $4,
-                        manifest_hash = $5,
-                        updated_at = now()
-                    WHERE bucket_id = $1 AND manifest_key = $2"#,
-                    &[
-                        &bucket_id,
-                        &manifest_key,
-                        &next_revision,
-                        &manifest_json,
-                        &manifest_hash,
-                    ],
-                )
-                .await?;
-                next_revision
-            }
-            None => {
-                if expected_revision != 0 {
-                    tx.rollback().await?;
-                    return Ok(None);
-                }
-                tx.execute(
-                    r#"
-                    INSERT INTO object_manifests
-                        (tenant_id, bucket_id, bucket_name, manifest_key, revision, manifest_json, manifest_hash)
-                    VALUES ($1, $2, $3, $4, 1, $5, $6)"#,
-                    &[
-                        &tenant_id,
-                        &bucket_id,
-                        &bucket_name,
-                        &manifest_key,
-                        &manifest_json,
-                        &manifest_hash,
-                    ],
-                )
-                .await?;
-                1
-            }
-        };
-
-        tx.commit().await?;
+        let mut state = self.state.write().await;
+        let current = state
+            .manifests
+            .iter()
+            .filter(|m| {
+                m.tenant_id == tenant_id && m.bucket_id == bucket_id && m.object_key == object_key
+            })
+            .map(|m| m.revision)
+            .max()
+            .unwrap_or(0);
+        if expected_revision != current {
+            return Ok(None);
+        }
+        let revision = current + 1;
+        state.manifests.push(ManifestRecord {
+            tenant_id,
+            bucket_id,
+            object_key: object_key.to_string(),
+            revision,
+            manifest_hash: manifest_hash.to_string(),
+            manifest,
+            updated_at: Utc::now(),
+        });
+        self.persist_after_write(&state).await?;
         Ok(Some(ManifestCasResult {
-            revision: next_revision,
+            revision,
             manifest_hash: manifest_hash.to_string(),
         }))
     }
@@ -2658,70 +2127,49 @@ impl Persistence {
         operation: &str,
         written_by: &str,
         reason: &str,
-        record_hash: &str,
     ) -> Result<AuthzTupleRecord> {
-        let mut client = self.regional_pool.get().await?;
-        let tx = client.transaction().await?;
-        let row = tx
-            .query_one(
-                r#"
-                INSERT INTO authz_tuple_log
-                    (tenant_id, namespace, object_id, relation, subject_kind, subject_id,
-                     caveat_hash, operation, written_by, reason, record_hash)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                RETURNING *"#,
-                &[
-                    &tenant_id,
-                    &namespace,
-                    &object_id,
-                    &relation,
-                    &subject_kind,
-                    &subject_id,
-                    &caveat_hash,
-                    &operation,
-                    &written_by,
-                    &reason,
-                    &record_hash,
-                ],
-            )
-            .await?;
-        let record: AuthzTupleRecord = row.into();
-        tx.execute(
-            r#"
-            INSERT INTO authz_current_tuples
-                (tenant_id, namespace, object_id, relation, subject_kind, subject_id, caveat_hash,
-                 operation, revision, written_by, reason, record_hash, written_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-            ON CONFLICT (tenant_id, namespace, object_id, relation, subject_kind, subject_id, caveat_hash)
-            DO UPDATE SET
-                operation = EXCLUDED.operation,
-                revision = EXCLUDED.revision,
-                written_by = EXCLUDED.written_by,
-                reason = EXCLUDED.reason,
-                record_hash = EXCLUDED.record_hash,
-                written_at = EXCLUDED.written_at"#,
-            &[
-                &record.tenant_id,
-                &record.namespace,
-                &record.object_id,
-                &record.relation,
-                &record.subject_kind,
-                &record.subject_id,
-                &record.caveat_hash,
-                &record.operation,
-                &record.revision,
-                &record.written_by,
-                &record.reason,
-                &record.record_hash,
-                &record.written_at,
-            ],
-        )
-        .await?;
-        tx.commit().await?;
+        let mut state = self.state.write().await;
+        let revision = state
+            .authz_tuples
+            .iter()
+            .filter(|r| r.tenant_id == tenant_id)
+            .map(|r| r.revision)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let record_hash = blake3::hash(&canonical_json_bytes(&serde_json::json!([
+            tenant_id,
+            namespace,
+            object_id,
+            relation,
+            subject_kind,
+            subject_id,
+            caveat_hash,
+            operation,
+            revision
+        ])))
+        .to_hex()
+        .to_string();
+        let record = AuthzTupleRecord {
+            revision,
+            tenant_id,
+            namespace: namespace.to_string(),
+            object_id: object_id.to_string(),
+            relation: relation.to_string(),
+            subject_kind: subject_kind.to_string(),
+            subject_id: subject_id.to_string(),
+            caveat_hash: caveat_hash.to_string(),
+            operation: operation.to_string(),
+            written_by: written_by.to_string(),
+            reason: reason.to_string(),
+            record_hash,
+            written_at: Utc::now(),
+        };
+        state.authz_tuples.push(record.clone());
+        self.persist_after_write(&state).await?;
         Ok(record)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn check_authz_tuple(
         &self,
         tenant_id: i64,
@@ -2732,34 +2180,26 @@ impl Persistence {
         subject_id: &str,
         caveat_hash: &str,
     ) -> Result<Option<AuthzTupleRecord>> {
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_opt(
-                r#"
-                SELECT *
-                FROM authz_current_tuples
-                WHERE tenant_id = $1
-                  AND namespace = $2
-                  AND object_id = $3
-                  AND relation = $4
-                  AND subject_kind = $5
-                  AND subject_id = $6
-                  AND caveat_hash = $7"#,
-                &[
-                    &tenant_id,
-                    &namespace,
-                    &object_id,
-                    &relation,
-                    &subject_kind,
-                    &subject_id,
-                    &caveat_hash,
-                ],
-            )
-            .await?;
-        Ok(row.map(Into::into))
+        let latest = self
+            .state
+            .read()
+            .await
+            .authz_tuples
+            .iter()
+            .filter(|r| {
+                r.tenant_id == tenant_id
+                    && r.namespace == namespace
+                    && r.object_id == object_id
+                    && r.relation == relation
+                    && r.subject_kind == subject_kind
+                    && r.subject_id == subject_id
+                    && r.caveat_hash == caveat_hash
+            })
+            .max_by_key(|r| r.revision)
+            .cloned();
+        Ok(latest.filter(|r| r.operation == "add"))
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn check_authz_tuple_at_revision(
         &self,
         tenant_id: i64,
@@ -2771,35 +2211,25 @@ impl Persistence {
         caveat_hash: &str,
         revision: i64,
     ) -> Result<Option<AuthzTupleRecord>> {
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_opt(
-                r#"
-                SELECT *
-                FROM authz_tuple_log
-                WHERE tenant_id = $1
-                  AND namespace = $2
-                  AND object_id = $3
-                  AND relation = $4
-                  AND subject_kind = $5
-                  AND subject_id = $6
-                  AND caveat_hash = $7
-                  AND revision <= $8
-                ORDER BY revision DESC
-                LIMIT 1"#,
-                &[
-                    &tenant_id,
-                    &namespace,
-                    &object_id,
-                    &relation,
-                    &subject_kind,
-                    &subject_id,
-                    &caveat_hash,
-                    &revision,
-                ],
-            )
-            .await?;
-        Ok(row.map(Into::into))
+        let latest = self
+            .state
+            .read()
+            .await
+            .authz_tuples
+            .iter()
+            .filter(|r| {
+                r.tenant_id == tenant_id
+                    && r.revision <= revision
+                    && r.namespace == namespace
+                    && r.object_id == object_id
+                    && r.relation == relation
+                    && r.subject_kind == subject_kind
+                    && r.subject_id == subject_id
+                    && r.caveat_hash == caveat_hash
+            })
+            .max_by_key(|r| r.revision)
+            .cloned();
+        Ok(latest.filter(|r| r.operation == "add"))
     }
 
     pub async fn list_authz_tuple_log(
@@ -2809,26 +2239,26 @@ impl Persistence {
         namespace: &str,
         limit: i32,
     ) -> Result<Vec<AuthzTupleRecord>> {
-        let client = self.regional_pool.get().await?;
-        let rows = client
-            .query(
-                r#"
-                SELECT *
-                FROM authz_tuple_log
-                WHERE tenant_id = $1
-                  AND revision > $2
-                  AND ($3 = '' OR namespace = $3)
-                ORDER BY revision
-                LIMIT $4"#,
-                &[
-                    &tenant_id,
-                    &after_revision,
-                    &namespace,
-                    &(if limit == 0 { 1000 } else { limit } as i64),
-                ],
-            )
-            .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        let mut records = self
+            .state
+            .read()
+            .await
+            .authz_tuples
+            .iter()
+            .filter(|r| {
+                r.tenant_id == tenant_id
+                    && r.revision > after_revision
+                    && (namespace.is_empty() || r.namespace == namespace)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by_key(|r| r.revision);
+        records.truncate(if limit == 0 {
+            1000
+        } else {
+            limit.max(1) as usize
+        });
+        Ok(records)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2843,27 +2273,26 @@ impl Persistence {
         authorization_mode: &str,
         build_policy: JsonValue,
     ) -> Result<IndexDefinition> {
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_one(
-                r#"
-                INSERT INTO index_definitions
-                    (tenant_id, bucket_id, name, kind, selector, extractor, authorization_mode, build_policy)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                RETURNING *"#,
-                &[
-                    &tenant_id,
-                    &bucket_id,
-                    &name,
-                    &kind,
-                    &selector,
-                    &extractor,
-                    &authorization_mode,
-                    &build_policy,
-                ],
-            )
-            .await?;
-        Ok(row.into())
+        let mut state = self.state.write().await;
+        let now = Utc::now();
+        let index = IndexDefinition {
+            id: state.allocate_id(),
+            tenant_id,
+            bucket_id,
+            name: name.to_string(),
+            kind: kind.to_string(),
+            selector,
+            extractor,
+            authorization_mode: authorization_mode.to_string(),
+            build_policy,
+            enabled: true,
+            version: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        state.indexes.push(index.clone());
+        self.persist_after_write(&state).await?;
+        Ok(index)
     }
 
     pub async fn update_index_definition(
@@ -2876,31 +2305,24 @@ impl Persistence {
         authorization_mode: &str,
         build_policy: JsonValue,
     ) -> Result<Option<IndexDefinition>> {
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_opt(
-                r#"
-                UPDATE index_definitions
-                SET selector = $4,
-                    extractor = $5,
-                    authorization_mode = $6,
-                    build_policy = $7,
-                    version = version + 1,
-                    updated_at = now()
-                WHERE tenant_id = $1 AND bucket_id = $2 AND name = $3
-                RETURNING *"#,
-                &[
-                    &tenant_id,
-                    &bucket_id,
-                    &name,
-                    &selector,
-                    &extractor,
-                    &authorization_mode,
-                    &build_policy,
-                ],
-            )
-            .await?;
-        Ok(row.map(Into::into))
+        let mut state = self.state.write().await;
+        let out = if let Some(index) = state
+            .indexes
+            .iter_mut()
+            .find(|i| i.tenant_id == tenant_id && i.bucket_id == bucket_id && i.name == name)
+        {
+            index.selector = selector;
+            index.extractor = extractor;
+            index.authorization_mode = authorization_mode.to_string();
+            index.build_policy = build_policy;
+            index.version += 1;
+            index.updated_at = Utc::now();
+            Some(index.clone())
+        } else {
+            None
+        };
+        self.persist_after_write(&state).await?;
+        Ok(out)
     }
 
     pub async fn get_index_definition(
@@ -2909,19 +2331,14 @@ impl Persistence {
         bucket_id: i64,
         name: &str,
     ) -> Result<Option<IndexDefinition>> {
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_opt(
-                r#"
-                SELECT *
-                FROM index_definitions
-                WHERE tenant_id = $1
-                  AND bucket_id = $2
-                  AND name = $3"#,
-                &[&tenant_id, &bucket_id, &name],
-            )
-            .await?;
-        Ok(row.map(Into::into))
+        Ok(self
+            .state
+            .read()
+            .await
+            .indexes
+            .iter()
+            .find(|i| i.tenant_id == tenant_id && i.bucket_id == bucket_id && i.name == name)
+            .cloned())
     }
 
     pub async fn disable_index_definition(
@@ -2930,20 +2347,21 @@ impl Persistence {
         bucket_id: i64,
         name: &str,
     ) -> Result<Option<IndexDefinition>> {
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_opt(
-                r#"
-                UPDATE index_definitions
-                SET enabled = false,
-                    version = version + 1,
-                    updated_at = now()
-                WHERE tenant_id = $1 AND bucket_id = $2 AND name = $3
-                RETURNING *"#,
-                &[&tenant_id, &bucket_id, &name],
-            )
-            .await?;
-        Ok(row.map(Into::into))
+        let mut state = self.state.write().await;
+        let out = if let Some(index) = state
+            .indexes
+            .iter_mut()
+            .find(|i| i.tenant_id == tenant_id && i.bucket_id == bucket_id && i.name == name)
+        {
+            index.enabled = false;
+            index.version += 1;
+            index.updated_at = Utc::now();
+            Some(index.clone())
+        } else {
+            None
+        };
+        self.persist_after_write(&state).await?;
+        Ok(out)
     }
 
     pub async fn drop_index_definition(
@@ -2952,14 +2370,14 @@ impl Persistence {
         bucket_id: i64,
         name: &str,
     ) -> Result<Option<IndexDefinition>> {
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_opt(
-                "DELETE FROM index_definitions WHERE tenant_id = $1 AND bucket_id = $2 AND name = $3 RETURNING *",
-                &[&tenant_id, &bucket_id, &name],
-            )
-            .await?;
-        Ok(row.map(Into::into))
+        let mut state = self.state.write().await;
+        let pos = state
+            .indexes
+            .iter()
+            .position(|i| i.tenant_id == tenant_id && i.bucket_id == bucket_id && i.name == name);
+        let out = pos.map(|idx| state.indexes.remove(idx));
+        self.persist_after_write(&state).await?;
+        Ok(out)
     }
 
     pub async fn list_index_definitions(
@@ -2968,20 +2386,21 @@ impl Persistence {
         bucket_id: i64,
         include_disabled: bool,
     ) -> Result<Vec<IndexDefinition>> {
-        let client = self.regional_pool.get().await?;
-        let rows = client
-            .query(
-                r#"
-                SELECT *
-                FROM index_definitions
-                WHERE tenant_id = $1
-                  AND bucket_id = $2
-                  AND ($3 OR enabled)
-                ORDER BY name"#,
-                &[&tenant_id, &bucket_id, &include_disabled],
-            )
-            .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        let mut defs = self
+            .state
+            .read()
+            .await
+            .indexes
+            .iter()
+            .filter(|i| {
+                i.tenant_id == tenant_id
+                    && i.bucket_id == bucket_id
+                    && (include_disabled || i.enabled)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        defs.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(defs)
     }
 
     pub async fn create_index_definition_event(
@@ -2993,27 +2412,22 @@ impl Persistence {
         event_type: &str,
         definition: JsonValue,
     ) -> Result<IndexDefinitionEvent> {
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_one(
-                r#"
-                INSERT INTO index_definition_events
-                    (tenant_id, bucket_id, bucket_name, index_id, index_name, event_type, index_version, definition)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                RETURNING *"#,
-                &[
-                    &tenant_id,
-                    &bucket_id,
-                    &bucket_name,
-                    &index.id,
-                    &index.name,
-                    &event_type,
-                    &index.version,
-                    &definition,
-                ],
-            )
-            .await?;
-        Ok(row.into())
+        let mut state = self.state.write().await;
+        let event = IndexDefinitionEvent {
+            id: state.allocate_id(),
+            tenant_id,
+            bucket_id,
+            bucket_name: bucket_name.to_string(),
+            index_id: index.id,
+            index_name: index.name.clone(),
+            event_type: event_type.to_string(),
+            index_version: index.version,
+            definition,
+            created_at: Utc::now(),
+        };
+        state.index_events.push(event.clone());
+        self.persist_after_write(&state).await?;
+        Ok(event)
     }
 
     pub async fn list_index_definition_events(
@@ -3023,26 +2437,22 @@ impl Persistence {
         after_cursor: i64,
         limit: i32,
     ) -> Result<Vec<IndexDefinitionEvent>> {
-        let client = self.regional_pool.get().await?;
-        let rows = client
-            .query(
-                r#"
-                SELECT *
-                FROM index_definition_events
-                WHERE tenant_id = $1
-                  AND bucket_id = $2
-                  AND id > $3
-                ORDER BY id
-                LIMIT $4"#,
-                &[
-                    &tenant_id,
-                    &bucket_id,
-                    &after_cursor,
-                    &(if limit == 0 { 1000 } else { limit } as i64),
-                ],
-            )
-            .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        let mut events = self
+            .state
+            .read()
+            .await
+            .index_events
+            .iter()
+            .filter(|e| e.tenant_id == tenant_id && e.bucket_id == bucket_id && e.id > after_cursor)
+            .cloned()
+            .collect::<Vec<_>>();
+        events.sort_by_key(|e| e.id);
+        events.truncate(if limit == 0 {
+            1000
+        } else {
+            limit.max(1) as usize
+        });
+        Ok(events)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3060,31 +2470,25 @@ impl Persistence {
         message: &str,
         details: JsonValue,
     ) -> Result<IndexDiagnostic> {
-        let client = self.regional_pool.get().await?;
-        let row = client
-            .query_one(
-                r#"
-                INSERT INTO index_diagnostics
-                    (tenant_id, bucket_id, bucket_name, index_id, index_name, object_key,
-                     version_id, severity, code, message, details)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                RETURNING *"#,
-                &[
-                    &tenant_id,
-                    &bucket_id,
-                    &bucket_name,
-                    &index_id,
-                    &index_name,
-                    &object_key,
-                    &version_id,
-                    &severity,
-                    &code,
-                    &message,
-                    &details,
-                ],
-            )
-            .await?;
-        Ok(row.into())
+        let mut state = self.state.write().await;
+        let diagnostic = IndexDiagnostic {
+            id: state.allocate_id(),
+            tenant_id,
+            bucket_id,
+            bucket_name: bucket_name.to_string(),
+            index_id,
+            index_name: index_name.to_string(),
+            object_key: object_key.to_string(),
+            version_id,
+            severity: severity.to_string(),
+            code: code.to_string(),
+            message: message.to_string(),
+            details,
+            created_at: Utc::now(),
+        };
+        state.index_diagnostics.push(diagnostic.clone());
+        self.persist_after_write(&state).await?;
+        Ok(diagnostic)
     }
 
     pub async fn list_index_diagnostics(
@@ -3096,41 +2500,35 @@ impl Persistence {
         after_cursor: i64,
         limit: i32,
     ) -> Result<Vec<IndexDiagnostic>> {
-        let client = self.regional_pool.get().await?;
-        let rows = client
-            .query(
-                r#"
-                SELECT *
-                FROM index_diagnostics
-                WHERE tenant_id = $1
-                  AND bucket_id = $2
-                  AND ($3 = '' OR index_name = $3)
-                  AND ($4 = '' OR severity = $4)
-                  AND id > $5
-                ORDER BY id
-                LIMIT $6"#,
-                &[
-                    &tenant_id,
-                    &bucket_id,
-                    &index_name,
-                    &severity,
-                    &after_cursor,
-                    &(if limit == 0 { 1000 } else { limit } as i64),
-                ],
-            )
-            .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        let mut diagnostics = self
+            .state
+            .read()
+            .await
+            .index_diagnostics
+            .iter()
+            .filter(|d| {
+                d.tenant_id == tenant_id
+                    && d.bucket_id == bucket_id
+                    && d.id > after_cursor
+                    && (index_name.is_empty() || d.index_name == index_name)
+                    && (severity.is_empty() || d.severity == severity)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        diagnostics.sort_by_key(|d| d.id);
+        diagnostics.truncate(if limit == 0 {
+            1000
+        } else {
+            limit.max(1) as usize
+        });
+        Ok(diagnostics)
     }
 
     pub async fn hard_delete_object(&self, object_id: i64) -> Result<()> {
-        let client = self.regional_pool.get().await?;
-        client
-            .execute("DELETE FROM objects WHERE id = $1", &[&object_id])
-            .await?;
-        Ok(())
+        let mut state = self.state.write().await;
+        state.objects.retain(|o| o.id != object_id);
+        self.persist_after_write(&state).await
     }
-
-    // --- Task Queue Methods ---
 
     pub async fn enqueue_task(
         &self,
@@ -3138,40 +2536,50 @@ impl Persistence {
         payload: JsonValue,
         priority: i32,
     ) -> Result<()> {
-        let client = self.global_pool.get().await?;
-        client
-            .execute(
-                "INSERT INTO tasks (task_type, payload, priority) VALUES ($1, $2, $3)",
-                &[&task_type, &payload, &priority],
-            )
-            .await?;
-        Ok(())
+        let mut state = self.state.write().await;
+        let now = Utc::now();
+        let task = TaskRecord {
+            id: state.allocate_id(),
+            task_type,
+            payload,
+            priority,
+            status: crate::tasks::TaskStatus::Pending,
+            attempts: 0,
+            last_error: None,
+            scheduled_at: now,
+            created_at: now,
+            updated_at: now,
+        };
+        state.tasks.push(task);
+        self.persist_after_write(&state).await
     }
 
-    pub async fn claim_pending_tasks(&self, limit: i64) -> Result<Vec<Row>> {
-        let client = self.global_pool.get().await?;
-        let rows = client
-            .query(
-                r#"
-                WITH claimed AS (
-                    SELECT id
-                    FROM tasks
-                    WHERE status = 'pending'::task_status
-                      AND scheduled_at <= now()
-                    ORDER BY priority ASC, created_at ASC
-                    LIMIT $1
-                    FOR UPDATE SKIP LOCKED
-                )
-                UPDATE tasks
-                SET status = 'running'::task_status,
-                    updated_at = now()
-                FROM claimed
-                WHERE tasks.id = claimed.id
-                RETURNING tasks.id, tasks.task_type::text, tasks.payload, tasks.attempts"#,
-                &[&limit],
-            )
-            .await?;
-        Ok(rows)
+    pub async fn claim_pending_tasks(&self, limit: i64) -> Result<Vec<TaskRecord>> {
+        let mut state = self.state.write().await;
+        let now = Utc::now();
+        let mut indexes = state
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.status == crate::tasks::TaskStatus::Pending && t.scheduled_at <= now)
+            .map(|(idx, t)| (idx, t.priority, t.created_at))
+            .collect::<Vec<_>>();
+        indexes.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2)));
+        let mut out = Vec::new();
+        for (idx, _, _) in indexes.into_iter().take(limit.max(0) as usize) {
+            state.tasks[idx].status = crate::tasks::TaskStatus::Running;
+            state.tasks[idx].updated_at = now;
+            out.push(state.tasks[idx].clone());
+        }
+        if !out.is_empty() {
+            self.persist_after_write(&state).await?;
+        }
+        Ok(out)
+    }
+
+    pub async fn list_tasks(&self) -> Result<Vec<TaskRecord>> {
+        self.refresh_from_disk().await?;
+        Ok(self.state.read().await.tasks.clone())
     }
 
     pub async fn update_task_status(
@@ -3179,93 +2587,99 @@ impl Persistence {
         task_id: i64,
         status: crate::tasks::TaskStatus,
     ) -> Result<()> {
-        let client = self.global_pool.get().await?;
-        client
-            .execute(
-                "UPDATE tasks SET status = $1, updated_at = now() WHERE id = $2",
-                &[&status, &task_id],
-            )
-            .await?;
-        Ok(())
+        let mut state = self.state.write().await;
+        if let Some(task) = state.tasks.iter_mut().find(|t| t.id == task_id) {
+            task.status = status;
+            task.updated_at = Utc::now();
+        }
+        self.persist_after_write(&state).await
     }
 
     pub async fn fail_task(&self, task_id: i64, error: &str) -> Result<()> {
-        let client = self.global_pool.get().await?;
-        client
-            .execute(
-                r#"UPDATE tasks SET status = $1, last_error = $2, attempts = attempts + 1, scheduled_at = now() + (attempts * attempts * 10 * interval '1 second'), updated_at = now() WHERE id = $3"#,
-                &[&crate::tasks::TaskStatus::Failed, &error, &task_id],
-            )
-            .await?;
-        Ok(())
+        let mut state = self.state.write().await;
+        if let Some(task) = state.tasks.iter_mut().find(|t| t.id == task_id) {
+            task.status = crate::tasks::TaskStatus::Failed;
+            task.last_error = Some(error.to_string());
+            task.attempts += 1;
+            task.scheduled_at = Utc::now()
+                + chrono::Duration::seconds(i64::from(task.attempts * task.attempts * 10));
+            task.updated_at = Utc::now();
+        }
+        self.persist_after_write(&state).await
     }
 
-    // ---- Hugging Face Keys ----
     pub async fn hf_create_key(
         &self,
         name: &str,
         token_encrypted: &[u8],
         note: Option<&str>,
     ) -> Result<()> {
-        let client = self.global_pool.get().await?;
-        client
-            .execute(
-                "INSERT INTO huggingface_keys (name, token_encrypted, note) VALUES ($1,$2,$3)",
-                &[&name, &token_encrypted, &note],
-            )
-            .await?;
-        Ok(())
+        let mut state = self.state.write().await;
+        if state.hf_keys.iter().any(|k| k.name == name) {
+            return Err(anyhow!("hugging face key already exists"));
+        }
+        let now = Utc::now();
+        let key = HfKey {
+            id: state.allocate_id(),
+            name: name.to_string(),
+            token_encrypted: token_encrypted.to_vec(),
+            note: note.map(ToOwned::to_owned),
+            created_at: now,
+            updated_at: now,
+        };
+        state.hf_keys.push(key);
+        self.persist_after_write(&state).await
     }
 
     pub async fn hf_delete_key(&self, name: &str) -> Result<u64> {
-        let client = self.global_pool.get().await?;
-        let n = client
-            .execute("DELETE FROM huggingface_keys WHERE name=$1", &[&name])
-            .await?;
-        Ok(n)
+        let mut state = self.state.write().await;
+        let before = state.hf_keys.len();
+        state.hf_keys.retain(|k| k.name != name);
+        let deleted = before - state.hf_keys.len();
+        if deleted > 0 {
+            self.persist_after_write(&state).await?;
+        }
+        Ok(deleted as u64)
     }
 
     pub async fn hf_get_key_encrypted(&self, name: &str) -> Result<Option<(i64, Vec<u8>)>> {
-        let client = self.global_pool.get().await?;
-        if let Some(row) = client
-            .query_opt(
-                "SELECT id, token_encrypted FROM huggingface_keys WHERE name=$1",
-                &[&name],
-            )
-            .await?
-        {
-            let id: i64 = row.get(0);
-            let token: Vec<u8> = row.get(1);
-            Ok(Some((id, token)))
-        } else {
-            Ok(None)
-        }
+        Ok(self
+            .state
+            .read()
+            .await
+            .hf_keys
+            .iter()
+            .find(|k| k.name == name)
+            .map(|k| (k.id, k.token_encrypted.clone())))
+    }
+
+    pub async fn hf_get_key_encrypted_by_id(&self, id: i64) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .state
+            .read()
+            .await
+            .hf_keys
+            .iter()
+            .find(|key| key.id == id)
+            .map(|key| key.token_encrypted.clone()))
     }
 
     pub async fn hf_list_keys(
         &self,
-    ) -> Result<
-        Vec<(
-            String,
-            Option<String>,
-            chrono::DateTime<chrono::Utc>,
-            chrono::DateTime<chrono::Utc>,
-        )>,
-    > {
-        let client = self.global_pool.get().await?;
-        let rows = client
-            .query(
-                "SELECT name, note, created_at, updated_at FROM huggingface_keys ORDER BY name",
-                &[],
-            )
-            .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
-            .collect())
+    ) -> Result<Vec<(String, Option<String>, DateTime<Utc>, DateTime<Utc>)>> {
+        let mut keys = self
+            .state
+            .read()
+            .await
+            .hf_keys
+            .iter()
+            .map(|k| (k.name.clone(), k.note.clone(), k.created_at, k.updated_at))
+            .collect::<Vec<_>>();
+        keys.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(keys)
     }
 
-    // ---- Hugging Face Ingestion ----
+    #[allow(clippy::too_many_arguments)]
     pub async fn hf_create_ingestion(
         &self,
         key_id: i64,
@@ -3279,52 +2693,96 @@ impl Persistence {
         include_globs: &[String],
         exclude_globs: &[String],
     ) -> Result<i64> {
-        let client = self.global_pool.get().await?;
-        let row = client
-            .query_one(
-                r#"INSERT INTO hf_ingestions (key_id, tenant_id, requester_app_id, repo, revision, target_bucket, target_region, target_prefix, include_globs, exclude_globs) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id"#,
-                &[
-                    &key_id,
-                    &tenant_id,
-                    &requester_app_id,
-                    &repo,
-                    &revision,
-                    &target_bucket,
-                    &target_region,
-                    &target_prefix,
-                    &include_globs,
-                    &exclude_globs,
-                ],
-            )
-            .await?;
-        Ok(row.get(0))
+        let mut state = self.state.write().await;
+        let id = state.allocate_id();
+        state.hf_ingestions.push(HfIngestion {
+            id,
+            key_id,
+            tenant_id,
+            requester_app_id,
+            repo: repo.to_string(),
+            revision: revision.unwrap_or("main").to_string(),
+            target_bucket: target_bucket.to_string(),
+            target_region: target_region.to_string(),
+            target_prefix: target_prefix.unwrap_or_default().to_string(),
+            include_globs: include_globs.to_vec(),
+            exclude_globs: exclude_globs.to_vec(),
+            state: crate::tasks::HFIngestionState::Queued,
+            error: None,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+        });
+        self.persist_after_write(&state).await?;
+        Ok(id)
+    }
+
+    pub async fn hf_get_ingestion_job(&self, id: i64) -> Result<Option<HfIngestionJob>> {
+        Ok(self
+            .state
+            .read()
+            .await
+            .hf_ingestions
+            .iter()
+            .find(|h| h.id == id)
+            .map(|h| HfIngestionJob {
+                key_id: h.key_id,
+                tenant_id: h.tenant_id,
+                requester_app_id: h.requester_app_id,
+                repo: h.repo.clone(),
+                revision: h.revision.clone(),
+                target_bucket: h.target_bucket.clone(),
+                target_region: h.target_region.clone(),
+                target_prefix: h.target_prefix.clone(),
+                include_globs: h.include_globs.clone(),
+                exclude_globs: h.exclude_globs.clone(),
+            }))
     }
 
     pub async fn hf_update_ingestion_state(
         &self,
         id: i64,
-        state: crate::tasks::HFIngestionState,
+        state_value: crate::tasks::HFIngestionState,
         error: Option<&str>,
     ) -> Result<()> {
-        let client = self.global_pool.get().await?;
-        client
-            .execute(
-                r#"UPDATE hf_ingestions SET state=$2, error=$3, started_at=CASE WHEN $2='running'::hf_ingestion_state AND started_at IS NULL THEN now() ELSE started_at END, finished_at=CASE WHEN $2 IN ('completed'::hf_ingestion_state,'failed'::hf_ingestion_state,'canceled'::hf_ingestion_state) THEN now() ELSE finished_at END WHERE id=$1"#,
-                &[&id, &state, &error],
-            )
-            .await?;
-        Ok(())
+        let mut state = self.state.write().await;
+        if let Some(job) = state.hf_ingestions.iter_mut().find(|h| h.id == id) {
+            job.state = state_value;
+            job.error = error.map(ToOwned::to_owned);
+            if state_value == crate::tasks::HFIngestionState::Running && job.started_at.is_none() {
+                job.started_at = Some(Utc::now());
+            }
+            if matches!(
+                state_value,
+                crate::tasks::HFIngestionState::Completed
+                    | crate::tasks::HFIngestionState::Failed
+                    | crate::tasks::HFIngestionState::Canceled
+            ) {
+                job.finished_at = Some(Utc::now());
+            }
+        }
+        self.persist_after_write(&state).await
     }
 
     pub async fn hf_cancel_ingestion(&self, id: i64) -> Result<u64> {
-        let client = self.global_pool.get().await?;
-        let n = client
-            .execute(
-                "UPDATE hf_ingestions SET state=$2::hf_ingestion_state WHERE id=$1 AND state IN ('queued'::hf_ingestion_state,'running'::hf_ingestion_state)",
-                &[&id, &crate::tasks::HFIngestionState::Canceled],
-            )
-            .await?;
-        Ok(n)
+        let mut state = self.state.write().await;
+        let mut updated = 0;
+        if let Some(job) = state.hf_ingestions.iter_mut().find(|h| {
+            h.id == id
+                && matches!(
+                    h.state,
+                    crate::tasks::HFIngestionState::Queued
+                        | crate::tasks::HFIngestionState::Running
+                )
+        }) {
+            job.state = crate::tasks::HFIngestionState::Canceled;
+            job.finished_at = Some(Utc::now());
+            updated = 1;
+        }
+        if updated > 0 {
+            self.persist_after_write(&state).await?;
+        }
+        Ok(updated)
     }
 
     pub async fn hf_add_item(
@@ -3334,57 +2792,88 @@ impl Persistence {
         size: Option<i64>,
         etag: Option<&str>,
     ) -> Result<i64> {
-        let client = self.global_pool.get().await?;
-        let row = client
-            .query_one(
-                r#"INSERT INTO hf_ingestion_items (ingestion_id, path, size, etag) VALUES ($1, $2, $3, $4) ON CONFLICT (ingestion_id, path) DO UPDATE SET size = EXCLUDED.size RETURNING id"#,
-                &[&ingestion_id, &path, &size, &etag],
-            )
-            .await?;
-        Ok(row.get(0))
+        let mut state = self.state.write().await;
+        if let Some(item) = state
+            .hf_items
+            .iter_mut()
+            .find(|i| i.ingestion_id == ingestion_id && i.path == path)
+        {
+            item.size = size;
+            item.etag = etag.map(ToOwned::to_owned);
+            let id = item.id;
+            self.persist_after_write(&state).await?;
+            return Ok(id);
+        }
+        let id = state.allocate_id();
+        state.hf_items.push(HfIngestionItem {
+            id,
+            ingestion_id,
+            path: path.to_string(),
+            size,
+            etag: etag.map(ToOwned::to_owned),
+            state: crate::tasks::HFIngestionItemState::Queued,
+            error: None,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+        });
+        self.persist_after_write(&state).await?;
+        Ok(id)
     }
 
     pub async fn hf_update_item_state(
         &self,
         id: i64,
-        state: crate::tasks::HFIngestionItemState,
+        state_value: crate::tasks::HFIngestionItemState,
         error: Option<&str>,
     ) -> Result<()> {
-        let client = self.global_pool.get().await?;
-        client
-            .execute(
-                r#"UPDATE hf_ingestion_items SET state=$2, error=$3, started_at=CASE WHEN $2='downloading'::hf_item_state AND started_at IS NULL THEN now() ELSE started_at END, finished_at=CASE WHEN $2 IN ('stored'::hf_item_state,'failed'::hf_item_state,'skipped'::hf_item_state) THEN now() ELSE finished_at END WHERE id=$1"#,
-                &[&id, &state, &error],
-            )
-            .await?;
-        Ok(())
+        let mut state = self.state.write().await;
+        if let Some(item) = state.hf_items.iter_mut().find(|i| i.id == id) {
+            item.state = state_value;
+            item.error = error.map(ToOwned::to_owned);
+            if state_value == crate::tasks::HFIngestionItemState::Downloading
+                && item.started_at.is_none()
+            {
+                item.started_at = Some(Utc::now());
+            }
+            if matches!(
+                state_value,
+                crate::tasks::HFIngestionItemState::Stored
+                    | crate::tasks::HFIngestionItemState::Failed
+                    | crate::tasks::HFIngestionItemState::Skipped
+            ) {
+                item.finished_at = Some(Utc::now());
+            }
+        }
+        self.persist_after_write(&state).await
     }
 
     pub async fn hf_update_item_success(&self, id: i64, size: i64, etag: &str) -> Result<()> {
-        let client = self.global_pool.get().await?;
-        client
-            .execute(
-                r#"UPDATE hf_ingestion_items SET state='stored'::hf_item_state, size=$2, etag=$3, finished_at=now() WHERE id=$1"#,
-                &[&id, &size, &etag],
-            )
-            .await?;
-        Ok(())
+        let mut state = self.state.write().await;
+        if let Some(item) = state.hf_items.iter_mut().find(|i| i.id == id) {
+            item.state = crate::tasks::HFIngestionItemState::Stored;
+            item.size = Some(size);
+            item.etag = Some(etag.to_string());
+            item.finished_at = Some(Utc::now());
+        }
+        self.persist_after_write(&state).await
     }
 
     pub async fn hf_get_ingestion_items(
         &self,
         ingestion_id: i64,
     ) -> Result<Vec<(String, Option<i64>, Option<String>, Option<DateTime<Utc>>)>> {
-        let client = self.global_pool.get().await?;
-        let rows = client
-            .query(
-                "SELECT path, size, etag, finished_at FROM hf_ingestion_items WHERE ingestion_id=$1 AND state='stored'::hf_item_state",
-                &[&ingestion_id],
-            )
-            .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        Ok(self
+            .state
+            .read()
+            .await
+            .hf_items
+            .iter()
+            .filter(|i| {
+                i.ingestion_id == ingestion_id
+                    && i.state == crate::tasks::HFIngestionItemState::Stored
+            })
+            .map(|i| (i.path.clone(), i.size, i.etag.clone(), i.finished_at))
             .collect())
     }
 
@@ -3394,25 +2883,23 @@ impl Persistence {
         bucket: &str,
         prefix: &str,
     ) -> Result<Vec<(String, Option<i64>, Option<String>, Option<DateTime<Utc>>)>> {
-        let client = self.global_pool.get().await?;
-        let rows = client
-            .query(
-                r#"
-            SELECT i.path, i.size, i.etag, i.finished_at
-            FROM hf_ingestion_items i
-            JOIN hf_ingestions h ON i.ingestion_id = h.id
-            WHERE h.tenant_id = $1
-              AND h.target_bucket = $2
-              AND COALESCE(h.target_prefix, '') = $3
-              AND i.state = 'stored'::hf_item_state
-            ORDER BY i.finished_at ASC
-            "#,
-                &[&tenant_id, &bucket, &prefix],
-            )
-            .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        let state = self.state.read().await;
+        let ingestion_ids = state
+            .hf_ingestions
+            .iter()
+            .filter(|h| {
+                h.tenant_id == tenant_id && h.target_bucket == bucket && h.target_prefix == prefix
+            })
+            .map(|h| h.id)
+            .collect::<HashSet<_>>();
+        Ok(state
+            .hf_items
+            .iter()
+            .filter(|i| {
+                ingestion_ids.contains(&i.ingestion_id)
+                    && i.state == crate::tasks::HFIngestionItemState::Stored
+            })
+            .map(|i| (i.path.clone(), i.size, i.etag.clone(), i.finished_at))
             .collect())
     }
 
@@ -3426,48 +2913,63 @@ impl Persistence {
         i64,
         i64,
         Option<String>,
-        Option<chrono::DateTime<chrono::Utc>>,
-        Option<chrono::DateTime<chrono::Utc>>,
-        chrono::DateTime<chrono::Utc>,
+        Option<DateTime<Utc>>,
+        Option<DateTime<Utc>>,
+        DateTime<Utc>,
     )> {
-        let client = self.global_pool.get().await?;
-        let job = client
-            .query_one(
-                r#"SELECT state::text, error, created_at, started_at, finished_at FROM hf_ingestions WHERE id=$1"#,
-                &[&id],
-            )
-            .await?;
-        let mut state: String = job.get(0);
-        let err: Option<String> = job.get(1);
-        let created_at: chrono::DateTime<chrono::Utc> = job.get(2);
-        let started_at: Option<chrono::DateTime<chrono::Utc>> = job.get(3);
-        let finished_at: Option<chrono::DateTime<chrono::Utc>> = job.get(4);
-        let counts = client
-            .query_one(
-                r#"SELECT COUNT(*) FILTER (WHERE state::text='queued') AS queued, COUNT(*) FILTER (WHERE state::text='downloading') AS downloading, COUNT(*) FILTER (WHERE state::text='stored') AS stored, COUNT(*) FILTER (WHERE state::text='failed') AS failed FROM hf_ingestion_items WHERE ingestion_id=$1"#,
-                &[&id],
-            )
-            .await?;
-
-        let queued: i64 = counts.get(0);
-        let downloading: i64 = counts.get(1);
-        let stored: i64 = counts.get(2);
-        let failed: i64 = counts.get(3);
-
-        if state == "running" && queued == 0 && downloading == 0 && (stored > 0 || failed > 0) {
-            state = "completed".to_string();
-        }
-
+        let state = self.state.read().await;
+        let job = state
+            .hf_ingestions
+            .iter()
+            .find(|h| h.id == id)
+            .ok_or_else(|| anyhow!("ingestion not found"))?;
+        let queued = state
+            .hf_items
+            .iter()
+            .filter(|i| {
+                i.ingestion_id == id && i.state == crate::tasks::HFIngestionItemState::Queued
+            })
+            .count() as i64;
+        let downloading = state
+            .hf_items
+            .iter()
+            .filter(|i| {
+                i.ingestion_id == id && i.state == crate::tasks::HFIngestionItemState::Downloading
+            })
+            .count() as i64;
+        let stored = state
+            .hf_items
+            .iter()
+            .filter(|i| {
+                i.ingestion_id == id && i.state == crate::tasks::HFIngestionItemState::Stored
+            })
+            .count() as i64;
+        let failed = state
+            .hf_items
+            .iter()
+            .filter(|i| {
+                i.ingestion_id == id && i.state == crate::tasks::HFIngestionItemState::Failed
+            })
+            .count() as i64;
+        let state_text = if job.state == crate::tasks::HFIngestionState::Running
+            && queued == 0
+            && downloading == 0
+            && (stored > 0 || failed > 0)
+        {
+            "completed".to_string()
+        } else {
+            job.state.as_str().to_string()
+        };
         Ok((
-            state,
+            state_text,
             queued,
             downloading,
             stored,
             failed,
-            err,
-            started_at,
-            finished_at,
-            created_at,
+            job.error.clone(),
+            job.started_at,
+            job.finished_at,
+            job.created_at,
         ))
     }
 }

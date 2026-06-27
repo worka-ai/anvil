@@ -1,27 +1,44 @@
 ---
-slug: /reference/configuration
-title: 'Reference: Configuration'
-description: A detailed reference of all environment variables used to configure an Anvil node.
-tags: [reference, configuration, environment, variables]
+title: Configuration Reference
+description: Runtime configuration for Anvil nodes and administrative tooling.
 ---
 
-# Reference: Configuration
+# Configuration Reference
 
-Anvil is configured entirely through environment variables. The following is a reference for the most important variables required to launch and operate an Anvil node.
+Anvil stores object bytes, metadata journals, indexes, manifests, and local control state under the configured storage path. A node does not require an external metadata database.
 
-| Variable                        | Description                                                                 |
-| ------------------------------- | --------------------------------------------------------------------------- |
-| `GLOBAL_DATABASE_URL`           | **Required.** Connection URL for the global Postgres database.              |
-| `REGIONAL_DATABASE_URL`         | **Required.** Connection URL for the regional Postgres database.            |
-| `REGION`                        | **Required.** The name of the region this node belongs to.                  |
-| `JWT_SECRET`                    | **Required.** Secret key for minting and verifying JWTs.                    |
-| `ANVIL_SECRET_ENCRYPTION_KEY`   | **Required.** A 64-character hex-encoded string for AES-256 encryption. <br/><br/> **CRITICAL:** This key is used to encrypt sensitive data at rest. It **MUST** be a cryptographically secure, 64-character hexadecimal string (representing 32 bytes). Loss of this key will result in permanent data loss. <br/><br/> Generate a secure key with: <br/> `openssl rand -hex 32` |
-| `CLUSTER_SECRET`          | A shared secret to authenticate and encrypt inter-node gossip messages.     |
-| `API_LISTEN_ADDR`               | The local IP and port for the unified S3 Gateway and gRPC service (e.g., `0.0.0.0:50051`). |
-| `CLUSTER_LISTEN_ADDR`           | The local multiaddress for the QUIC P2P listener.                           |
-| `PUBLIC_CLUSTER_ADDRS`          | Comma-separated list of public-facing multiaddresses for this node.         |
-| `PUBLIC_API_ADDR`               | The public-facing address for the gRPC service.                             |
-| `BOOTSTRAP_ADDRS`               | Comma-separated list of bootstrap peer addresses for joining a cluster.     |
-| `INIT_CLUSTER`                  | Set to `true` for the first node in a cluster. Defaults to `false`.         |
-| `ENABLE_MDNS`                   | Set to `true` to enable local peer discovery via mDNS. Defaults to `true`.  |
-| `METADATA_CACHE_TTL_SECS`       | Time-to-live (in seconds) for cached global metadata (buckets, tenants, policies). Defaults to `300` (5 minutes). |
+## Node Variables
+
+| Variable | Required | Description |
+| --- | --- | --- |
+| `JWT_SECRET` | Yes | Secret used to sign access tokens. Use a strong value shared by nodes that must validate each other's tokens. |
+| `ANVIL_SECRET_ENCRYPTION_KEY` | Yes | Hex-encoded 32-byte key used to encrypt stored application secrets and other sensitive control-plane values. |
+| `REGION` | Yes | Logical region name for the node. |
+| `PUBLIC_API_ADDR` | Yes | Public gRPC endpoint advertised to clients and peers. |
+| `API_LISTEN_ADDR` | No | Local gRPC bind address. Defaults to `0.0.0.0:50051`. |
+| `CLUSTER_LISTEN_ADDR` | No | libp2p QUIC listen multiaddr. Defaults to `/ip4/0.0.0.0/udp/7443/quic-v1`. |
+| `PUBLIC_CLUSTER_ADDRS` | No | Comma-separated public libp2p multiaddrs for this node. |
+| `BOOTSTRAP_ADDRS` | No | Comma-separated peer multiaddrs used when joining an existing cluster. |
+| `INIT_CLUSTER` | No | Set to `true` for the first node that initializes a cluster. |
+| `ENABLE_MDNS` | No | Enables local peer discovery. Defaults to `true`; disable it for controlled deployments. |
+| `ANVIL_CLUSTER_SECRET` | No | Shared secret used for cluster message authentication. |
+| `METADATA_CACHE_TTL_SECS` | No | TTL for in-process metadata cache entries. Defaults to `300`. |
+| `STORAGE_PATH` | No | Directory containing Anvil-owned object bytes and metadata state. Defaults to `anvil-data`. |
+
+## Admin CLI Variables
+
+The admin CLI writes to the native storage path used by the target node.
+
+| Variable | Required | Description |
+| --- | --- | --- |
+| `ANVIL_SECRET_ENCRYPTION_KEY` | Yes | Same encryption key as the target node. |
+| `STORAGE_PATH` | No | Native storage path to mutate. Defaults to `anvil-data`; pass `--storage-path` explicitly for scripts. |
+
+Example:
+
+```bash
+cargo run -p anvil --bin admin -- \
+  --anvil-secret-encryption-key aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --storage-path /var/lib/anvil \
+  tenant create default
+```

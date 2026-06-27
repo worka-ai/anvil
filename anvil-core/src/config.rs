@@ -4,14 +4,6 @@ use clap::Parser;
 #[derive(Parser, Debug, Clone, Default)]
 #[command(version, about, long_about = None)]
 pub struct Config {
-    /// The connection URL for the global metadata database.
-    #[arg(long, env)]
-    pub global_database_url: String,
-
-    /// The connection URL for the regional metadata database.
-    #[arg(long, env)]
-    pub regional_database_url: String,
-
     /// The secret key used for signing JWTs.
     #[arg(long, env)]
     pub jwt_secret: String,

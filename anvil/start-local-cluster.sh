@@ -1,151 +1,93 @@
 #!/bin/bash
-#
-# This script sets up a local 3-node Anvil cluster without using Docker for the
-# Anvil nodes themselves. It allows a 4th node to be started from an IDE with
-# a debugger attached.
-#
-# Pre-requisites:
-#   - Docker installed and running (for the Postgres instance)
-#   - Rust/Cargo installed
-#   - `sqlx-cli` installed (`cargo install sqlx-cli`)
+# Start a local three-node Anvil cluster using only Anvil's native on-disk state.
 
-set -e
+set -euo pipefail
+
 echo "--- Anvil Local Cluster Setup ---"
-
-# --- Configuration ---
-PG_CONTAINER_NAME="anvil"
-PG_PASSWORD="worka"
-PG_USER="worka"
-PG_DB="worka"
-PG_PORT="5432"
-export DATABASE_URL="postgres://${PG_USER}:${PG_PASSWORD}@localhost:${PG_PORT}/${PG_DB}"
-
-# Generate a shared secret for the cluster
-export ANVIL_CLUSTER_SECRET=$(head -c 32 /dev/urandom | base64)
 
 NODE_COUNT=3
 STORAGE_BASE_DIR="$(pwd)/.anvil-local-data"
-
-
-# --- Cleanup previous runs ---
-echo "Cleaning up previous cluster..."
-pkill -f "anvil" || echo "No previous anvil processes to kill."
-if [ "$(docker ps -q -f name=^/${PG_CONTAINER_NAME}$)" ]; then
-    echo "Stopping existing Postgres container..."
-    docker stop "${PG_CONTAINER_NAME}" > /dev/null
-fi
-if [ "$(docker ps -aq -f status=exited -f name=^/${PG_CONTAINER_NAME}$)" ]; then
-    echo "Removing old Postgres container..."
-    docker rm "${PG_CONTAINER_NAME}" > /dev/null
-fi
-rm -rf "${STORAGE_BASE_DIR}"
-echo "Cleanup complete."
-
-
-# --- Start Dependencies ---
-echo "Starting Postgres in Docker..."
-docker run -d --name "${PG_CONTAINER_NAME}" \
-  -e POSTGRES_PASSWORD="${PG_PASSWORD}" \
-  -e POSTGRES_USER="${PG_USER}" \
-  -e POSTGRES_DB="${PG_DB}" \
-  -p "${PG_PORT}:5432" \
-  postgres:18-alpine > /dev/null
-
-# Wait for Postgres to be ready
-echo "Waiting for Postgres to accept connections..."
-until docker exec "${PG_CONTAINER_NAME}" pg_isready -U "${PG_USER}" -d "${PG_DB}" -q; do
-  sleep 1
-done
-echo "Postgres is ready."
-
-# --- Prepare Database ---
-echo "Running database migrations..."
-docker exec "${PG_CONTAINER_NAME}" psql "${DATABASE_URL}" -c "CREATE DATABASE ${PG_DB}" || echo "Database already exists."
-docker exec -i "${PG_CONTAINER_NAME}" psql "${DATABASE_URL}" < migrations_global/V1__initial_global_schema.sql
-docker exec -i "${PG_CONTAINER_NAME}" psql "${DATABASE_URL}" < migrations_regional/V1__initial_regional_schema.sql
-echo "Migrations applied."
-
-
-# --- Start Cluster Nodes ---
-echo "Starting ${NODE_COUNT} Anvil nodes..."
+JWT_SECRET="local-jwt-secret"
+ENCRYPTION_KEY="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+CLUSTER_SECRET="$(head -c 32 /dev/urandom | base64)"
+BOOTSTRAP_ADDR="/ip4/127.0.0.1/udp/7443/quic-v1"
 PIDS=""
-BOOTSTRAP_QUIC_ADDR="127.0.0.1:7443"
 
+cleanup() {
+  echo ""
+  echo "Shutting down cluster..."
+  for pid in $PIDS; do
+    kill "$pid" 2>/dev/null || true
+  done
+  echo "Shutdown complete."
+}
+trap cleanup INT TERM EXIT
+
+echo "Cleaning up previous cluster..."
+pkill -f "target/.*/anvil" || true
+rm -rf "${STORAGE_BASE_DIR}"
+mkdir -p "${STORAGE_BASE_DIR}"
+
+echo "Starting ${NODE_COUNT} Anvil nodes..."
 for i in $(seq 1 ${NODE_COUNT}); do
   QUIC_PORT=$((7443 + i - 1))
-  HTTP_PORT=$((9000 + i - 1))
   GRPC_PORT=$((50051 + i - 1))
   NODE_STORAGE_DIR="${STORAGE_BASE_DIR}/node-${i}"
   mkdir -p "${NODE_STORAGE_DIR}"
 
-  export ANVIL_BIND_QUIC="127.0.0.1:${QUIC_PORT}"
-  export ANVIL_BIND_HTTP="127.0.0.1:${HTTP_PORT}"
-  export ANVIL_BIND_GRPC="127.0.0.1:${GRPC_PORT}"
-  export ANVIL_STORAGE_PATH="${NODE_STORAGE_DIR}"
-  export ANVIL_ENABLE_MDNS="false"
-  export RUST_LOG="info,anvil=debug"
+  args=(
+    --jwt-secret "${JWT_SECRET}"
+    --anvil-secret-encryption-key "${ENCRYPTION_KEY}"
+    --cluster-secret "${CLUSTER_SECRET}"
+    --cluster-listen-addr "/ip4/127.0.0.1/udp/${QUIC_PORT}/quic-v1"
+    --public-cluster-addrs "/ip4/127.0.0.1/udp/${QUIC_PORT}/quic-v1"
+    --api-listen-addr "127.0.0.1:${GRPC_PORT}"
+    --public-api-addr "http://127.0.0.1:${GRPC_PORT}"
+    --region "local"
+    --enable-mdns false
+    --storage-path "${NODE_STORAGE_DIR}"
+  )
 
   if [ "$i" -eq 1 ]; then
-    export ANVIL_INIT_CLUSTER="true"
+    args+=(--init-cluster true)
   else
-    export ANVIL_INIT_CLUSTER="false"
-    export ANVIL_BOOTSTRAP_NODES="${BOOTSTRAP_QUIC_ADDR}"
+    args+=(--init-cluster false --bootstrap-addrs "${BOOTSTRAP_ADDR}")
   fi
 
-  echo "Starting Node ${i} (QUIC: ${QUIC_PORT}, HTTP: ${HTTP_PORT}, gRPC: ${GRPC_PORT})"
-#  cargo run --release -- --global-database-url "${DATABASE_URL}" --regional-database-url "${DATABASE_URL}" --jwt-secret "local-jwt-secret" --anvil-secret-encryption-key "a-very-secret-key-that-is-32-bytes" --public-grpc-addr "127.0.0.1:${GRPC_PORT}" --region "local" &
-  ../target/debug/anvil &
+  echo "Starting node ${i} (QUIC: ${QUIC_PORT}, gRPC: ${GRPC_PORT}, storage: ${NODE_STORAGE_DIR})"
+  RUST_LOG="info,anvil=debug" cargo run -p anvil -- "${args[@]}" &
   PIDS="$PIDS $!"
-  sleep 1 # Stagger startup
+  sleep 1
 done
 
-# --- Instructions for Debugger ---
 DEBUG_QUIC_PORT=$((7443 + NODE_COUNT))
-DEBUG_HTTP_PORT=$((9000 + NODE_COUNT))
 DEBUG_GRPC_PORT=$((50051 + NODE_COUNT))
 DEBUG_STORAGE_DIR="${STORAGE_BASE_DIR}/node-debug"
 mkdir -p "${DEBUG_STORAGE_DIR}"
 
-cat << EOF
+cat <<MSG
 
 --------------------------------------------------------------------
-✅ Local cluster started with ${NODE_COUNT} nodes.
+Local cluster started with ${NODE_COUNT} nodes.
 
-To start the 4th node with your debugger, create a run configuration
-in your IDE with the following environment variables and run it:
+To start a debugger-attached node, run:
 
-export RUST_LOG="info,anvil=debug"
-export ANVIL_DB_DSN="${DATABASE_URL}"
-export ANVIL_BIND_QUIC="127.0.0.1:${DEBUG_QUIC_PORT}"
-export ANVIL_BIND_HTTP="127.0.0.1:${DEBUG_HTTP_PORT}"
-export ANVIL_BIND_GRPC="127.0.0.1:${DEBUG_GRPC_PORT}"
-export ANVIL_STORAGE_PATH="${DEBUG_STORAGE_DIR}"
-export ANVIL_ENABLE_MDNS="false"
-export ANVIL_INIT_CLUSTER="false"
-export ANVIL_BOOTSTRAP_NODES="${BOOTSTRAP_QUIC_ADDR}"
-
-The command to run is simply: cargo run --release -- --global-database-url "${DATABASE_URL}" --regional-database-url "${DATABASE_URL}" --jwt-secret "local-jwt-secret" --anvil-secret-encryption-key "a-very-secret-key-that-is-32-bytes" --public-grpc-addr "127.0.0.1:${DEBUG_GRPC_PORT}" --region "local" --bootstrap-nodes "${BOOTSTRAP_QUIC_ADDR}"
+cargo run -p anvil -- \\
+  --jwt-secret "${JWT_SECRET}" \\
+  --anvil-secret-encryption-key "${ENCRYPTION_KEY}" \\
+  --cluster-secret "${CLUSTER_SECRET}" \\
+  --cluster-listen-addr "/ip4/127.0.0.1/udp/${DEBUG_QUIC_PORT}/quic-v1" \\
+  --public-cluster-addrs "/ip4/127.0.0.1/udp/${DEBUG_QUIC_PORT}/quic-v1" \\
+  --api-listen-addr "127.0.0.1:${DEBUG_GRPC_PORT}" \\
+  --public-api-addr "http://127.0.0.1:${DEBUG_GRPC_PORT}" \\
+  --region "local" \\
+  --enable-mdns false \\
+  --init-cluster false \\
+  --bootstrap-addrs "${BOOTSTRAP_ADDR}" \\
+  --storage-path "${DEBUG_STORAGE_DIR}"
 --------------------------------------------------------------------
 
-EOF
-
-# --- Shutdown ---
-cleanup() {
-    echo ""
-    echo "Shutting down cluster..."
-    for pid in $PIDS;
-    do
-        kill "$pid" 2>/dev/null
-    done
-    if [ "$(docker ps -q -f name=^/${PG_CONTAINER_NAME}$)" ]; then
-        echo "Stopping Postgres container..."
-        docker stop "${PG_CONTAINER_NAME}" > /dev/null
-    fi
-    echo "Shutdown complete."
-}
-
-trap cleanup INT
+MSG
 
 echo "Cluster is running. Press Ctrl+C to shut down all nodes."
-
 wait

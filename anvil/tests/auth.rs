@@ -12,16 +12,16 @@ async fn test_auth_flow_with_wildcard_scopes() {
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
-    let global_db_url = cluster.global_db_url.clone();
+    let admin_state_path = cluster.admin_state_path.clone();
 
     // Use the admin CLI to create app and grant policy
     let admin_args = &["run", "--bin", "admin", "--"];
     let app_output = Command::new("cargo")
         .args(admin_args.iter().chain(&[
-            "--global-database-url",
-            &global_db_url,
             "--anvil-secret-encryption-key",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--storage-path",
+            &admin_state_path,
             "app",
             "create",
             "--tenant-name",
@@ -51,10 +51,10 @@ async fn test_auth_flow_with_wildcard_scopes() {
             admin_args
                 .iter()
                 .chain(&[
-                    "--global-database-url",
-                    &global_db_url,
                     "--anvil-secret-encryption-key",
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "--storage-path",
+                    &admin_state_path,
                 ])
                 .chain(policy_args.iter()),
         )

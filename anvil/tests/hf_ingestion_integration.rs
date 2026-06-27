@@ -8,7 +8,7 @@ async fn hf_ingestion_single_file_integration() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
 
-    let token = get_auth_token(&cluster.global_db_url, &cluster.grpc_addrs[0]).await;
+    let token = get_auth_token(&cluster.admin_state_path, &cluster.grpc_addrs[0]).await;
 
     // Create a bucket via gRPC
     let mut bucket_client = anvil::anvil_api::bucket_service_client::BucketServiceClient::connect(
