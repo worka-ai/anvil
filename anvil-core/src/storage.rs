@@ -88,6 +88,15 @@ impl Storage {
             .join(format!("bucket-{bucket_id}.json"))
     }
 
+    pub fn object_watch_path(&self, tenant_id: i64, bucket_id: i64) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("watch")
+            .join("object")
+            .join(format!("tenant-{tenant_id}"))
+            .join(format!("bucket-{bucket_id}.anwatch"))
+    }
+
     pub fn relative_storage_path(&self, path: &Path) -> Result<String> {
         let relative = path.strip_prefix(&self.storage_path)?;
         Ok(relative.to_string_lossy().replace('\\', "/"))

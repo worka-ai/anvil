@@ -10,7 +10,7 @@ use crate::{
     placement::PlacementManager,
     sharding::ShardManager,
     storage::Storage,
-    validation,
+    validation, watch_log,
 };
 use futures_util::{Stream, StreamExt};
 use serde_json::Value as JsonValue;
@@ -1513,6 +1513,9 @@ impl ObjectManager {
                 event_type,
                 is_delete_marker,
             )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        watch_log::append_object_watch_record(&self.storage, bucket, object, &event)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         let _ = self.watch_tx.send(event);
