@@ -152,6 +152,68 @@ impl Storage {
             .join(database_id))
     }
 
+    pub fn personaldb_group_manifest_path(
+        &self,
+        tenant_id: i64,
+        database_id: &str,
+    ) -> Result<PathBuf> {
+        Ok(self
+            .personaldb_group_dir(tenant_id, database_id)?
+            .join("manifest.json"))
+    }
+
+    pub fn personaldb_committed_head_path(
+        &self,
+        tenant_id: i64,
+        database_id: &str,
+    ) -> Result<PathBuf> {
+        Ok(self
+            .personaldb_group_dir(tenant_id, database_id)?
+            .join("heads")
+            .join("committed.json"))
+    }
+
+    pub fn personaldb_snapshots_head_path(
+        &self,
+        tenant_id: i64,
+        database_id: &str,
+    ) -> Result<PathBuf> {
+        Ok(self
+            .personaldb_group_dir(tenant_id, database_id)?
+            .join("heads")
+            .join("snapshots.json"))
+    }
+
+    pub fn personaldb_snapshot_manifest_path(
+        &self,
+        tenant_id: i64,
+        database_id: &str,
+        log_index: u64,
+        state_hash: &str,
+    ) -> Result<PathBuf> {
+        ensure_hash_hex(state_hash, "personaldb snapshot state hash")?;
+        Ok(self
+            .personaldb_group_dir(tenant_id, database_id)?
+            .join("snapshots")
+            .join("manifests")
+            .join(format!("{log_index:020}-{state_hash}.json")))
+    }
+
+    pub fn personaldb_commit_certificate_path(
+        &self,
+        tenant_id: i64,
+        database_id: &str,
+        log_index: u64,
+        entry_hash: &str,
+    ) -> Result<PathBuf> {
+        ensure_hash_hex(entry_hash, "personaldb commit entry hash")?;
+        Ok(self
+            .personaldb_group_dir(tenant_id, database_id)?
+            .join("log")
+            .join("certificates")
+            .join(format!("{log_index:020}-{entry_hash}.certificate.json")))
+    }
+
     pub fn personaldb_log_segment_path(
         &self,
         tenant_id: i64,
