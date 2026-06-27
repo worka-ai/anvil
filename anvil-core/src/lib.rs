@@ -17,6 +17,7 @@ pub mod config;
 pub mod crypto;
 pub mod discovery;
 pub mod formats;
+pub mod index_journal;
 pub mod metadata_journal;
 pub mod middleware;
 pub mod object_manager;

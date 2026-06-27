@@ -1,6 +1,6 @@
 use crate::anvil_api::index_service_server::IndexService;
 use crate::anvil_api::*;
-use crate::{AppState, auth, permissions::AnvilAction, validation};
+use crate::{AppState, auth, bucket_journal, index_journal, permissions::AnvilAction, validation};
 use serde_json::{Value as JsonValue, json};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -188,14 +188,17 @@ impl IndexService for AppState {
         let bucket = self
             .get_index_bucket(claims.tenant_id, &req.bucket_name)
             .await?;
-        let indexes = self
-            .db
-            .list_index_definitions(claims.tenant_id, bucket.id, req.include_disabled)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .into_iter()
-            .map(|index| index_record(&bucket.name, index))
-            .collect::<Result<Vec<_>, _>>()?;
+        let indexes = index_journal::read_current_index_definition_events(
+            &self.storage,
+            claims.tenant_id,
+            bucket.id,
+            req.include_disabled,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .into_iter()
+        .map(|event| index_record_from_event(&event))
+        .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Response::new(ListIndexesResponse { indexes }))
     }
@@ -218,11 +221,15 @@ impl IndexService for AppState {
             .await?;
         let after_cursor = i64::try_from(req.after_cursor)
             .map_err(|_| Status::invalid_argument("after_cursor exceeds supported range"))?;
-        let snapshot = self
-            .db
-            .list_index_definition_events(claims.tenant_id, bucket.id, after_cursor, 1000)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let snapshot = index_journal::read_index_definition_events(
+            &self.storage,
+            claims.tenant_id,
+            bucket.id,
+            after_cursor,
+            1000,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
         let mut live = self.index_watch_tx.subscribe();
 
         let (tx, rx) = mpsc::channel(32);
@@ -330,8 +337,7 @@ impl AppState {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
-        self.db
-            .get_bucket_by_name(tenant_id, bucket_name)
+        bucket_journal::read_current_bucket(&self.storage, tenant_id, bucket_name)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))
@@ -354,6 +360,9 @@ impl AppState {
                 event_type,
                 index_definition_json(&bucket.name, index),
             )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        index_journal::append_index_definition_event(&self.storage, &event)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         let _ = self.index_watch_tx.send(event.clone());
