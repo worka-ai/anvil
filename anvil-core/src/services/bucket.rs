@@ -81,9 +81,22 @@ impl BucketService for AppState {
 
     async fn get_bucket_policy(
         &self,
-        _request: Request<GetBucketPolicyRequest>,
+        request: Request<GetBucketPolicyRequest>,
     ) -> Result<Response<GetBucketPolicyResponse>, Status> {
-        todo!()
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.get_ref();
+
+        let policy = self
+            .bucket_manager
+            .get_bucket_policy(claims.tenant_id, &req.bucket_name, &claims.scopes)
+            .await?;
+
+        Ok(Response::new(GetBucketPolicyResponse {
+            policy_json: policy.to_string(),
+        }))
     }
 
     async fn put_bucket_policy(

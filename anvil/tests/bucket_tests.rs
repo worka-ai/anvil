@@ -1,5 +1,8 @@
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
-use anvil::anvil_api::{CreateBucketRequest, DeleteBucketRequest, ListBucketsRequest};
+use anvil::anvil_api::{
+    CreateBucketRequest, DeleteBucketRequest, GetBucketPolicyRequest, ListBucketsRequest,
+    PutBucketPolicyRequest,
+};
 use anvil::tasks::TaskStatus;
 use std::time::Duration;
 use tonic::Request;
@@ -128,4 +131,67 @@ async fn test_list_buckets() {
     assert_eq!(list_res.buckets.len(), 2);
     assert!(list_res.buckets.iter().any(|b| b.name == bucket_name1));
     assert!(list_res.buckets.iter().any(|b| b.name == bucket_name2));
+}
+
+#[tokio::test]
+async fn test_get_bucket_policy_reflects_public_read_flag() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+
+    let bucket_name = "policy-bucket".to_string();
+    let mut create_req = Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
+    });
+    create_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client.create_bucket(create_req).await.unwrap();
+
+    let mut get_req = Request::new(GetBucketPolicyRequest {
+        bucket_name: bucket_name.clone(),
+    });
+    get_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let policy = bucket_client
+        .get_bucket_policy(get_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .policy_json;
+    let policy: serde_json::Value = serde_json::from_str(&policy).unwrap();
+    assert_eq!(policy["is_public_read"], false);
+
+    let mut put_req = Request::new(PutBucketPolicyRequest {
+        bucket_name: bucket_name.clone(),
+        policy_json: serde_json::json!({"is_public_read": true}).to_string(),
+    });
+    put_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client.put_bucket_policy(put_req).await.unwrap();
+
+    let mut get_req = Request::new(GetBucketPolicyRequest { bucket_name });
+    get_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let policy = bucket_client
+        .get_bucket_policy(get_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .policy_json;
+    let policy: serde_json::Value = serde_json::from_str(&policy).unwrap();
+    assert_eq!(policy["is_public_read"], true);
 }

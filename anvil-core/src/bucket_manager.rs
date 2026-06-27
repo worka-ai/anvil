@@ -100,6 +100,28 @@ impl BucketManager {
         Ok(buckets)
     }
 
+    pub async fn get_bucket_policy(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        scopes: &[String],
+    ) -> Result<serde_json::Value, Status> {
+        if !auth::is_authorized(AnvilAction::BucketRead, bucket_name, scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        let bucket = self
+            .db
+            .get_bucket_by_name(tenant_id, bucket_name)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Bucket not found"))?;
+
+        Ok(serde_json::json!({
+            "is_public_read": bucket.is_public_read,
+        }))
+    }
+
     pub async fn set_bucket_public_access(
         &self,
         bucket_name: &str,
