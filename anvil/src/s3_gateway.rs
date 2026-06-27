@@ -1479,6 +1479,9 @@ async fn get_object(
         .await
     {
         Ok((object, stream)) => {
+            if let Some(response) = evaluate_etag_preconditions(req.headers(), &object.etag) {
+                return response;
+            }
             let range = match requested_range {
                 Some(range_header) => match range_header.resolve(object.size as u64) {
                     Ok(range) => Some(range),
@@ -2212,6 +2215,9 @@ async fn head_object(
         .await
     {
         Ok(object) => {
+            if let Some(response) = evaluate_etag_preconditions(req.headers(), &object.etag) {
+                return response;
+            }
             let builder = Response::builder()
                 .status(200)
                 .header(
@@ -2277,6 +2283,54 @@ impl ByteRange {
     fn len(self) -> u64 {
         self.end - self.start + 1
     }
+}
+
+fn evaluate_etag_preconditions(
+    headers: &axum::http::HeaderMap,
+    current_etag: &str,
+) -> Option<Response> {
+    if let Some(value) = headers.get(axum::http::header::IF_MATCH) {
+        let value = value.to_str().unwrap_or_default();
+        if !etag_condition_matches(value, current_etag) {
+            return Some(precondition_failed_response());
+        }
+    }
+    if let Some(value) = headers.get(axum::http::header::IF_NONE_MATCH) {
+        let value = value.to_str().unwrap_or_default();
+        if etag_condition_matches(value, current_etag) {
+            return Some(
+                Response::builder()
+                    .status(axum::http::StatusCode::NOT_MODIFIED)
+                    .header("ETag", current_etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            );
+        }
+    }
+    None
+}
+
+fn etag_condition_matches(header_value: &str, current_etag: &str) -> bool {
+    header_value
+        .split(',')
+        .map(str::trim)
+        .any(|candidate| candidate == "*" || normalize_etag(candidate) == current_etag)
+}
+
+fn normalize_etag(value: &str) -> &str {
+    value
+        .strip_prefix("W/")
+        .unwrap_or(value)
+        .trim()
+        .trim_matches('"')
+}
+
+fn precondition_failed_response() -> Response {
+    s3_error(
+        "PreconditionFailed",
+        "At least one precondition did not hold",
+        axum::http::StatusCode::PRECONDITION_FAILED,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2437,6 +2491,12 @@ mod tests {
         headers
     }
 
+    fn etag_headers(name: axum::http::header::HeaderName, value: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(name, value.parse().unwrap());
+        headers
+    }
+
     #[test]
     fn reserved_namespace_guard_detects_object_keys() {
         assert!(request_targets_reserved_namespace(&request(
@@ -2496,6 +2556,40 @@ mod tests {
                 .unwrap()
                 .resolve(10)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn etag_preconditions_match_strong_weak_and_list_values() {
+        assert!(etag_condition_matches("\"abc\"", "abc"));
+        assert!(etag_condition_matches("W/\"abc\"", "abc"));
+        assert!(etag_condition_matches("\"nope\", \"abc\"", "abc"));
+        assert!(etag_condition_matches("*", "abc"));
+        assert!(!etag_condition_matches("\"nope\"", "abc"));
+    }
+
+    #[test]
+    fn etag_preconditions_return_s3_status_responses() {
+        let failed = evaluate_etag_preconditions(
+            &etag_headers(axum::http::header::IF_MATCH, "\"other\""),
+            "abc",
+        )
+        .expect("if-match mismatch should fail");
+        assert_eq!(failed.status(), axum::http::StatusCode::PRECONDITION_FAILED);
+
+        let not_modified = evaluate_etag_preconditions(
+            &etag_headers(axum::http::header::IF_NONE_MATCH, "\"abc\""),
+            "abc",
+        )
+        .expect("if-none-match match should return not modified");
+        assert_eq!(not_modified.status(), axum::http::StatusCode::NOT_MODIFIED);
+
+        assert!(
+            evaluate_etag_preconditions(
+                &etag_headers(axum::http::header::IF_NONE_MATCH, "\"other\""),
+                "abc",
+            )
+            .is_none()
         );
     }
 

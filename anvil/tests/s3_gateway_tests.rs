@@ -315,6 +315,37 @@ async fn test_s3_public_and_private_access() {
         head_metadata.get("purpose").map(String::as_str),
         Some("metadata-test")
     );
+    let private_etag = head_private.e_tag().expect("private ETag").to_string();
+    client
+        .get_object()
+        .bucket(&private_bucket)
+        .key(private_key)
+        .if_match(&private_etag)
+        .send()
+        .await
+        .expect("matching If-Match GET should succeed");
+    let if_match_mismatch = client
+        .get_object()
+        .bucket(&private_bucket)
+        .key(private_key)
+        .if_match("\"definitely-not-the-current-etag\"")
+        .send()
+        .await;
+    assert!(
+        if_match_mismatch.is_err(),
+        "mismatched If-Match GET should fail"
+    );
+    let if_none_match_hit = client
+        .head_object()
+        .bucket(&private_bucket)
+        .key(private_key)
+        .if_none_match(&private_etag)
+        .send()
+        .await;
+    assert!(
+        if_none_match_hit.is_err(),
+        "matching If-None-Match HEAD should return not modified"
+    );
 
     let utf8_key = "folder/my café document 📄.txt";
     let utf8_content = b"utf8 key over s3";
