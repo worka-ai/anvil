@@ -239,6 +239,25 @@ async fn test_s3_public_and_private_access() {
     let suffix_data = suffix_resp.body.collect().await.unwrap().into_bytes();
     assert_eq!(suffix_data.as_ref(), b"content");
 
+    let copied_key = "copied-private.txt";
+    client
+        .copy_object()
+        .bucket(&private_bucket)
+        .key(copied_key)
+        .copy_source(format!("{}/{}", private_bucket, private_key))
+        .send()
+        .await
+        .expect("copy object should succeed");
+    let copied_resp = client
+        .get_object()
+        .bucket(&private_bucket)
+        .key(copied_key)
+        .send()
+        .await
+        .expect("copied object should be readable");
+    let copied_data = copied_resp.body.collect().await.unwrap().into_bytes();
+    assert_eq!(copied_data.as_ref(), private_content);
+
     // 5b. S3 version listing returns overwritten versions and delete markers.
     client
         .put_object()

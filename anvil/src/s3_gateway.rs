@@ -100,7 +100,10 @@ fn request_targets_reserved_namespace(req: &Request) -> bool {
 
 fn percent_decode_query_component(value: &str) -> String {
     let value = value.replace('+', " ");
-    let bytes = value.as_bytes();
+    percent_decode(value.as_bytes())
+}
+
+fn percent_decode(bytes: &[u8]) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
@@ -676,6 +679,23 @@ async fn put_object(
             );
         }
     };
+    let copy_source = match req.headers().get("x-amz-copy-source") {
+        Some(value) => match value.to_str() {
+            Ok(value) => Some(value.to_owned()),
+            Err(_) => {
+                return s3_error(
+                    "InvalidArgument",
+                    "Invalid x-amz-copy-source",
+                    axum::http::StatusCode::BAD_REQUEST,
+                );
+            }
+        },
+        None => None,
+    };
+
+    if let Some(copy_source) = copy_source {
+        return copy_object(state, claims, bucket, key, copy_source).await;
+    }
 
     let body_stream = req.into_body().into_data_stream().map(|r| {
         r.map(|chunk| chunk.to_vec())
@@ -721,6 +741,142 @@ async fn put_object(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             ),
         },
+    }
+}
+
+async fn copy_object(
+    state: AppState,
+    claims: Claims,
+    destination_bucket: String,
+    destination_key: String,
+    copy_source: String,
+) -> Response {
+    let (source_bucket, source_key, source_version_id) = match parse_copy_source(&copy_source) {
+        Ok(source) => source,
+        Err(response) => return response,
+    };
+
+    let (_source_object, source_stream) = match state
+        .object_manager
+        .get_object(
+            Some(claims.clone()),
+            source_bucket,
+            source_key,
+            source_version_id,
+        )
+        .await
+    {
+        Ok(source) => source,
+        Err(status) => return copy_status_to_response(status, "NoSuchKey"),
+    };
+
+    match state
+        .object_manager
+        .put_object(
+            claims.tenant_id,
+            &destination_bucket,
+            &destination_key,
+            &claims.scopes,
+            source_stream,
+        )
+        .await
+    {
+        Ok(object) => {
+            let xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CopyObjectResult>\n  <LastModified>{}</LastModified>\n  <ETag>\"{}\"</ETag>\n</CopyObjectResult>\n",
+                object.created_at.to_rfc3339(),
+                object.etag
+            );
+            Response::builder()
+                .status(200)
+                .header("Content-Type", "application/xml")
+                .header("ETag", object.etag)
+                .header("x-amz-version-id", object.version_id.to_string())
+                .body(Body::from(xml))
+                .unwrap()
+        }
+        Err(status) => copy_status_to_response(status, "NoSuchBucket"),
+    }
+}
+
+fn parse_copy_source(value: &str) -> Result<(String, String, Option<uuid::Uuid>), Response> {
+    let value = value.trim_start_matches('/');
+    let (path, query) = value.split_once('?').unwrap_or((value, ""));
+    let Some((bucket, key)) = path.split_once('/') else {
+        return Err(s3_error(
+            "InvalidArgument",
+            "Invalid x-amz-copy-source",
+            axum::http::StatusCode::BAD_REQUEST,
+        ));
+    };
+    let bucket = percent_decode_path_component(bucket);
+    let key = percent_decode_path_component(key);
+    if bucket.is_empty() || key.is_empty() {
+        return Err(s3_error(
+            "InvalidArgument",
+            "Invalid x-amz-copy-source",
+            axum::http::StatusCode::BAD_REQUEST,
+        ));
+    }
+    let version_id = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find_map(|(name, value)| {
+            (name == "versionId" || name == "version-id")
+                .then(|| percent_decode_query_component(value))
+        })
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            uuid::Uuid::parse_str(&value).map_err(|_| {
+                s3_error(
+                    "InvalidArgument",
+                    "Invalid source versionId",
+                    axum::http::StatusCode::BAD_REQUEST,
+                )
+            })
+        })
+        .transpose()?;
+
+    Ok((bucket, key, version_id))
+}
+
+fn percent_decode_path_component(value: &str) -> String {
+    percent_decode(value.as_bytes())
+}
+
+fn copy_status_to_response(status: tonic::Status, not_found_code: &str) -> Response {
+    match status.code() {
+        tonic::Code::FailedPrecondition => {
+            if status.message().starts_with("Bucket is in region ") {
+                let region = status.message().trim_start_matches("Bucket is in region ");
+                return s3_redirect(region);
+            }
+            s3_error(
+                "PreconditionFailed",
+                status.message(),
+                axum::http::StatusCode::PRECONDITION_FAILED,
+            )
+        }
+        tonic::Code::NotFound => s3_error(
+            not_found_code,
+            status.message(),
+            axum::http::StatusCode::NOT_FOUND,
+        ),
+        tonic::Code::PermissionDenied => s3_error(
+            "AccessDenied",
+            status.message(),
+            axum::http::StatusCode::FORBIDDEN,
+        ),
+        tonic::Code::InvalidArgument => s3_error(
+            "InvalidArgument",
+            status.message(),
+            axum::http::StatusCode::BAD_REQUEST,
+        ),
+        _ => s3_error(
+            "InternalError",
+            status.message(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
@@ -1097,5 +1253,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body, b"cdefgh");
+    }
+
+    #[test]
+    fn copy_source_parser_accepts_encoded_bucket_key_and_version() {
+        let (bucket, key, version_id) = parse_copy_source(
+            "/source-bucket/path%20with%20space/file.txt?versionId=550e8400-e29b-41d4-a716-446655440000",
+        )
+        .unwrap();
+        assert_eq!(bucket, "source-bucket");
+        assert_eq!(key, "path with space/file.txt");
+        assert_eq!(
+            version_id.unwrap(),
+            uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()
+        );
+    }
+
+    #[test]
+    fn copy_source_parser_rejects_missing_key() {
+        assert!(parse_copy_source("/source-bucket").is_err());
     }
 }
