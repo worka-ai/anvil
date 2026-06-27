@@ -38,6 +38,7 @@ pub mod personaldb_heads;
 pub mod personaldb_projection;
 pub mod personaldb_row_index;
 pub mod personaldb_segment;
+pub mod personaldb_snapshot_store;
 pub mod personaldb_submit;
 pub mod personaldb_watch;
 pub mod placement;

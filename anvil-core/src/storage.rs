@@ -247,6 +247,21 @@ impl Storage {
             .join(format!("{log_index:020}-{state_hash}.json")))
     }
 
+    pub fn personaldb_snapshot_object_path(
+        &self,
+        tenant_id: i64,
+        database_id: &str,
+        log_index: u64,
+        state_hash: &str,
+    ) -> Result<PathBuf> {
+        ensure_hash_hex(state_hash, "personaldb snapshot state hash")?;
+        Ok(self
+            .personaldb_group_dir(tenant_id, database_id)?
+            .join("snapshots")
+            .join("objects")
+            .join(format!("{log_index:020}-{state_hash}.sqlite.zst")))
+    }
+
     pub fn personaldb_projection_manifest_path(
         &self,
         tenant_id: i64,
