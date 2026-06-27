@@ -115,7 +115,7 @@ pub fn app(state: AppState) -> Router {
 async fn reserved_namespace_guard(req: Request, next: Next) -> Response {
     if request_targets_reserved_namespace(&req) {
         return s3_error(
-            "AccessDenied",
+            "UnauthorizedReservedNamespace",
             "UnauthorizedReservedNamespace",
             axum::http::StatusCode::FORBIDDEN,
         );
@@ -775,7 +775,7 @@ async fn delete_objects(
             errors.push(DeleteObjectError {
                 key,
                 version_id: requested_version_id,
-                code: "AccessDenied".to_string(),
+                code: "UnauthorizedReservedNamespace".to_string(),
                 message: "UnauthorizedReservedNamespace".to_string(),
             });
             continue;

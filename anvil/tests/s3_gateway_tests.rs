@@ -14,11 +14,11 @@ use tokio::fs;
 
 use anvil_test_utils::*;
 
-fn assert_access_denied(error: impl std::fmt::Debug) {
+fn assert_reserved_namespace_error(error: impl std::fmt::Debug) {
     let rendered = format!("{error:?}");
     assert!(
-        rendered.contains("AccessDenied"),
-        "expected AccessDenied error, got {rendered}"
+        rendered.contains("UnauthorizedReservedNamespace"),
+        "expected UnauthorizedReservedNamespace error, got {rendered}"
     );
 }
 
@@ -448,7 +448,10 @@ async fn test_s3_public_and_private_access() {
         bulk_delete.errors()[0].key(),
         Some("_anvil/authz/bulk-delete")
     );
-    assert_eq!(bulk_delete.errors()[0].code(), Some("AccessDenied"));
+    assert_eq!(
+        bulk_delete.errors()[0].code(),
+        Some("UnauthorizedReservedNamespace")
+    );
 
     let bulk_deleted_get = client
         .get_object()
@@ -723,7 +726,13 @@ async fn test_s3_public_and_private_access() {
 
     let reserved_get = reqwest::get(&reserved_url).await.unwrap();
     assert_eq!(reserved_get.status(), 403);
-    assert!(reserved_get.text().await.unwrap().contains("AccessDenied"));
+    assert!(
+        reserved_get
+            .text()
+            .await
+            .unwrap()
+            .contains("UnauthorizedReservedNamespace")
+    );
 
     let reserved_head = reqwest::Client::new()
         .head(&reserved_url)
@@ -740,7 +749,7 @@ async fn test_s3_public_and_private_access() {
         .send()
         .await
         .expect_err("reserved namespace PUT must fail");
-    assert_access_denied(put_err);
+    assert_reserved_namespace_error(put_err);
 
     let forged_internal_token_put = reqwest::Client::new()
         .put(format!("{reserved_url}?internal_write_token=caller-forged"))
@@ -755,7 +764,7 @@ async fn test_s3_public_and_private_access() {
             .text()
             .await
             .unwrap()
-            .contains("AccessDenied")
+            .contains("UnauthorizedReservedNamespace")
     );
 
     let list_err = client
@@ -765,7 +774,7 @@ async fn test_s3_public_and_private_access() {
         .send()
         .await
         .expect_err("reserved namespace LIST must fail");
-    assert_access_denied(list_err);
+    assert_reserved_namespace_error(list_err);
 
     let delete_err = client
         .delete_object()
@@ -774,7 +783,7 @@ async fn test_s3_public_and_private_access() {
         .send()
         .await
         .expect_err("reserved namespace DELETE must fail");
-    assert_access_denied(delete_err);
+    assert_reserved_namespace_error(delete_err);
 
     // 9. Normal S3 DELETE remains compatible and idempotent.
     client
