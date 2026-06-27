@@ -250,6 +250,28 @@ impl Storage {
             .join(format!("{finding_id}.json")))
     }
 
+    pub fn index_partition_watch_path(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        index_id: &str,
+        partition_id: &str,
+    ) -> Result<PathBuf> {
+        ensure_safe_internal_component(index_id, "index id")?;
+        ensure_hash_hex(partition_id, "index partition id")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("watch")
+            .join("index")
+            .join(format!("tenant-{tenant_id}"))
+            .join(format!("bucket-{bucket_id}"))
+            .join("indexes")
+            .join(index_id)
+            .join("partitions")
+            .join(format!("{partition_id}.anwatch")))
+    }
+
     pub fn git_source_watch_path(&self, tenant_id: i64, repository_id: &str) -> Result<PathBuf> {
         ensure_safe_internal_component(repository_id, "git repository id")?;
         Ok(self
