@@ -3,7 +3,8 @@ use anvil::anvil_api::{GetAccessTokenRequest, SetPublicAccessRequest};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration,
+    BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier,
+    VersioningConfiguration,
 };
 use rand::random;
 use std::env::temp_dir;
@@ -339,6 +340,77 @@ async fn test_s3_public_and_private_access() {
         .expect("copied object should be readable");
     let copied_data = copied_resp.body.collect().await.unwrap().into_bytes();
     assert_eq!(copied_data.as_ref(), private_content);
+
+    client
+        .put_object()
+        .bucket(&private_bucket)
+        .key("bulk/one.txt")
+        .body(ByteStream::from_static(b"one"))
+        .send()
+        .await
+        .expect("put bulk/one.txt should succeed");
+    client
+        .put_object()
+        .bucket(&private_bucket)
+        .key("bulk/two.txt")
+        .body(ByteStream::from_static(b"two"))
+        .send()
+        .await
+        .expect("put bulk/two.txt should succeed");
+
+    let bulk_delete = client
+        .delete_objects()
+        .bucket(&private_bucket)
+        .delete(
+            Delete::builder()
+                .objects(
+                    ObjectIdentifier::builder()
+                        .key("bulk/one.txt")
+                        .build()
+                        .unwrap(),
+                )
+                .objects(
+                    ObjectIdentifier::builder()
+                        .key("bulk/two.txt")
+                        .build()
+                        .unwrap(),
+                )
+                .objects(
+                    ObjectIdentifier::builder()
+                        .key("bulk/missing.txt")
+                        .build()
+                        .unwrap(),
+                )
+                .objects(
+                    ObjectIdentifier::builder()
+                        .key("_anvil/authz/bulk-delete")
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("multi-object delete should return a DeleteResult");
+    assert_eq!(bulk_delete.deleted().len(), 3);
+    assert_eq!(bulk_delete.errors().len(), 1);
+    assert_eq!(
+        bulk_delete.errors()[0].key(),
+        Some("_anvil/authz/bulk-delete")
+    );
+    assert_eq!(bulk_delete.errors()[0].code(), Some("AccessDenied"));
+
+    let bulk_deleted_get = client
+        .get_object()
+        .bucket(&private_bucket)
+        .key("bulk/one.txt")
+        .send()
+        .await;
+    assert!(
+        bulk_deleted_get.is_err(),
+        "multi-object delete should make bulk/one.txt unreadable"
+    );
 
     client
         .put_object()

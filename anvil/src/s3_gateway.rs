@@ -45,6 +45,22 @@ struct CompleteMultipartUploadXmlPart {
     etag: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct DeleteObjectsXml {
+    #[serde(rename = "Object", default)]
+    objects: Vec<DeleteObjectsXmlObject>,
+    #[serde(rename = "Quiet")]
+    quiet: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteObjectsXmlObject {
+    #[serde(rename = "Key")]
+    key: String,
+    #[serde(rename = "VersionId")]
+    version_id: Option<String>,
+}
+
 fn s3_error(code: &str, message: &str, status: axum::http::StatusCode) -> Response {
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\n  <Code>{}</Code>\n  <Message>{}</Message>\n</Error>\n",
@@ -69,6 +85,7 @@ pub fn app(state: AppState) -> Router {
             put(create_bucket)
                 .delete(delete_bucket)
                 .head(head_bucket)
+                .post(post_bucket)
                 .get(list_objects),
         )
         .route(
@@ -76,6 +93,7 @@ pub fn app(state: AppState) -> Router {
             get(list_objects)
                 .put(create_bucket)
                 .delete(delete_bucket)
+                .post(post_bucket)
                 .head(head_bucket),
         )
         .route(
@@ -683,6 +701,232 @@ async fn list_objects(
             ),
         },
     }
+}
+
+async fn post_bucket(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+    req: Request,
+) -> Response {
+    let claims = match req.extensions().get::<Claims>().cloned() {
+        Some(claims) => claims,
+        None => {
+            return s3_error(
+                "AccessDenied",
+                "Missing credentials",
+                axum::http::StatusCode::FORBIDDEN,
+            );
+        }
+    };
+
+    if q.contains_key("delete") {
+        let bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return s3_error(
+                    "InvalidRequest",
+                    &format!("Failed to read DeleteObjects body: {error}"),
+                    axum::http::StatusCode::BAD_REQUEST,
+                );
+            }
+        };
+        return delete_objects(state, claims, bucket, bytes).await;
+    }
+
+    s3_error(
+        "InvalidArgument",
+        "Unsupported bucket POST operation",
+        axum::http::StatusCode::BAD_REQUEST,
+    )
+}
+
+async fn delete_objects(
+    state: AppState,
+    claims: Claims,
+    bucket: String,
+    body: axum::body::Bytes,
+) -> Response {
+    let request = match quick_xml::de::from_reader::<_, DeleteObjectsXml>(&body[..]) {
+        Ok(request) => request,
+        Err(error) => {
+            return s3_error(
+                "MalformedXML",
+                &format!("Invalid DeleteObjects body: {error}"),
+                axum::http::StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+
+    let quiet = request.quiet.unwrap_or(false);
+    let mut deleted = Vec::new();
+    let mut errors = Vec::new();
+
+    for object in request.objects {
+        let key = object.key;
+
+        if validation::is_reserved_internal_key(&key) {
+            errors.push(DeleteObjectError {
+                key,
+                version_id: object.version_id,
+                code: "AccessDenied".to_string(),
+                message: "UnauthorizedReservedNamespace".to_string(),
+            });
+            continue;
+        }
+
+        if object
+            .version_id
+            .as_deref()
+            .is_some_and(|version| !version.is_empty())
+        {
+            errors.push(DeleteObjectError {
+                key,
+                version_id: object.version_id,
+                code: "NotImplemented".to_string(),
+                message: "Version-specific multi-object delete is not supported".to_string(),
+            });
+            continue;
+        }
+
+        match state
+            .object_manager
+            .delete_object(claims.tenant_id, &bucket, &key, &claims.scopes)
+            .await
+        {
+            Ok(delete_marker) => {
+                if !quiet {
+                    deleted.push(DeletedObject {
+                        key,
+                        version_id: None,
+                        delete_marker: Some(true),
+                        delete_marker_version_id: Some(delete_marker.version_id.to_string()),
+                    });
+                }
+            }
+            Err(status) if status.code() == tonic::Code::NotFound => {
+                if !quiet {
+                    deleted.push(DeletedObject {
+                        key,
+                        version_id: None,
+                        delete_marker: None,
+                        delete_marker_version_id: None,
+                    });
+                }
+            }
+            Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+                if status.message().starts_with("Bucket is in region ") {
+                    let region = status.message().trim_start_matches("Bucket is in region ");
+                    return s3_redirect(region);
+                }
+                errors.push(DeleteObjectError::from_status(
+                    key,
+                    object.version_id,
+                    status,
+                ));
+            }
+            Err(status) => {
+                errors.push(DeleteObjectError::from_status(
+                    key,
+                    object.version_id,
+                    status,
+                ));
+            }
+        }
+    }
+
+    delete_objects_result_response(deleted, errors)
+}
+
+#[derive(Debug)]
+struct DeletedObject {
+    key: String,
+    version_id: Option<String>,
+    delete_marker: Option<bool>,
+    delete_marker_version_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct DeleteObjectError {
+    key: String,
+    version_id: Option<String>,
+    code: String,
+    message: String,
+}
+
+impl DeleteObjectError {
+    fn from_status(key: String, version_id: Option<String>, status: tonic::Status) -> Self {
+        let code = match status.code() {
+            tonic::Code::PermissionDenied => "AccessDenied",
+            tonic::Code::InvalidArgument => "InvalidArgument",
+            tonic::Code::NotFound => "NoSuchKey",
+            tonic::Code::Unimplemented => "NotImplemented",
+            _ => "InternalError",
+        };
+        Self {
+            key,
+            version_id,
+            code: code.to_string(),
+            message: status.message().to_string(),
+        }
+    }
+}
+
+fn delete_objects_result_response(
+    deleted: Vec<DeletedObject>,
+    errors: Vec<DeleteObjectError>,
+) -> Response {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n",
+    );
+
+    for object in deleted {
+        xml.push_str("  <Deleted>\n");
+        xml.push_str(&format!("    <Key>{}</Key>\n", xml_escape(&object.key)));
+        if let Some(version_id) = object.version_id {
+            xml.push_str(&format!(
+                "    <VersionId>{}</VersionId>\n",
+                xml_escape(&version_id)
+            ));
+        }
+        if let Some(delete_marker) = object.delete_marker {
+            xml.push_str(&format!(
+                "    <DeleteMarker>{}</DeleteMarker>\n",
+                if delete_marker { "true" } else { "false" }
+            ));
+        }
+        if let Some(version_id) = object.delete_marker_version_id {
+            xml.push_str(&format!(
+                "    <DeleteMarkerVersionId>{}</DeleteMarkerVersionId>\n",
+                xml_escape(&version_id)
+            ));
+        }
+        xml.push_str("  </Deleted>\n");
+    }
+
+    for error in errors {
+        xml.push_str("  <Error>\n");
+        xml.push_str(&format!("    <Key>{}</Key>\n", xml_escape(&error.key)));
+        if let Some(version_id) = error.version_id {
+            xml.push_str(&format!(
+                "    <VersionId>{}</VersionId>\n",
+                xml_escape(&version_id)
+            ));
+        }
+        xml.push_str(&format!("    <Code>{}</Code>\n", xml_escape(&error.code)));
+        xml.push_str(&format!(
+            "    <Message>{}</Message>\n",
+            xml_escape(&error.message)
+        ));
+        xml.push_str("  </Error>\n");
+    }
+
+    xml.push_str("</DeleteResult>\n");
+    Response::builder()
+        .status(200)
+        .header("Content-Type", "application/xml")
+        .body(Body::from(xml))
+        .unwrap()
 }
 
 async fn get_bucket_location_response(state: AppState, claims: Claims, bucket: &str) -> Response {
