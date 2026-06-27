@@ -22,6 +22,7 @@ pub mod error_codes;
 pub mod formats;
 pub mod full_text_segment;
 pub mod git_source_index;
+pub mod git_source_query;
 pub mod index_journal;
 pub mod metadata_journal;
 pub mod middleware;

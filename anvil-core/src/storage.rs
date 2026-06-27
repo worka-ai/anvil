@@ -355,6 +355,19 @@ impl Storage {
             .join(format!("generation-{generation:020}-{source_hash}.angit")))
     }
 
+    pub fn git_source_index_dir(&self, tenant_id: i64, repository_id: &str) -> Result<PathBuf> {
+        ensure_safe_internal_component(repository_id, "git repository id")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("git")
+            .join("tenants")
+            .join(format!("tenant-{tenant_id}"))
+            .join("repositories")
+            .join(repository_id)
+            .join("indexes"))
+    }
+
     pub fn full_text_segment_path(
         &self,
         index_id: &str,
