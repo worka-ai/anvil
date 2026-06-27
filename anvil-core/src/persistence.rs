@@ -42,9 +42,6 @@ struct NativeState {
     indexes: Vec<IndexDefinition>,
     index_events: Vec<IndexDefinitionEvent>,
     index_diagnostics: Vec<IndexDiagnostic>,
-    admin_users: Vec<AdminUser>,
-    admin_roles: Vec<AdminRole>,
-    admin_user_roles: Vec<AdminUserRole>,
     hf_keys: Vec<HfKey>,
     hf_ingestions: Vec<HfIngestion>,
     hf_items: Vec<HfIngestionItem>,
@@ -68,12 +65,6 @@ struct ManifestRecord {
     manifest_hash: String,
     manifest: JsonValue,
     updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AdminUserRole {
-    user_id: i64,
-    role_id: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -560,41 +551,21 @@ impl Persistence {
     }
 
     pub async fn get_admin_user_by_username(&self, username: &str) -> Result<Option<AdminUser>> {
-        Ok(self
-            .state
-            .read()
-            .await
-            .admin_users
-            .iter()
-            .find(|u| u.username == username)
-            .cloned())
+        Ok(control_journal::read_control_state(&self.storage)
+            .await?
+            .admin_user_by_username(username))
     }
 
     pub async fn get_admin_user_by_id(&self, id: i64) -> Result<Option<AdminUser>> {
-        Ok(self
-            .state
-            .read()
-            .await
-            .admin_users
-            .iter()
-            .find(|u| u.id == id)
-            .cloned())
+        Ok(control_journal::read_control_state(&self.storage)
+            .await?
+            .admin_user_by_id(id))
     }
 
     pub async fn get_roles_for_admin_user(&self, user_id: i64) -> Result<Vec<String>> {
-        let state = self.state.read().await;
-        let role_ids = state
-            .admin_user_roles
-            .iter()
-            .filter(|r| r.user_id == user_id)
-            .map(|r| r.role_id)
-            .collect::<HashSet<_>>();
-        Ok(state
-            .admin_roles
-            .iter()
-            .filter(|r| role_ids.contains(&r.id))
-            .map(|r| r.name.clone())
-            .collect())
+        Ok(control_journal::read_control_state(&self.storage)
+            .await?
+            .roles_for_admin_user(user_id))
     }
 
     pub async fn create_admin_user(
@@ -604,43 +575,14 @@ impl Persistence {
         password_hash: &str,
         role_names: &[String],
     ) -> Result<AdminUser> {
-        let mut state = self.state.write().await;
-        if state.admin_users.iter().any(|u| u.username == username) {
-            return Err(anyhow!("admin user already exists"));
-        }
-        let id = state.allocate_id();
-        let user = AdminUser {
-            id,
-            username: username.to_string(),
-            email: email.to_string(),
-            password_hash: password_hash.to_string(),
-            is_active: true,
-        };
-        state.admin_users.push(user.clone());
-        for role_name in role_names {
-            let role_id = match state
-                .admin_roles
-                .iter()
-                .find(|r| r.name == *role_name)
-                .map(|r| r.id)
-            {
-                Some(id) => id,
-                None => {
-                    let next = state.allocate_id() as i32;
-                    state.admin_roles.push(AdminRole {
-                        id: next,
-                        name: role_name.clone(),
-                    });
-                    next
-                }
-            };
-            state.admin_user_roles.push(AdminUserRole {
-                user_id: id,
-                role_id,
-            });
-        }
-        self.persist_after_write(&state).await?;
-        Ok(user)
+        control_journal::create_admin_user(
+            &self.storage,
+            username,
+            email,
+            password_hash,
+            role_names,
+        )
+        .await
     }
 
     pub async fn update_admin_user(
@@ -652,105 +594,50 @@ impl Persistence {
         is_active: bool,
         role_names: &[String],
     ) -> Result<()> {
-        let mut state = self.state.write().await;
-        let user = state
-            .admin_users
-            .iter_mut()
-            .find(|u| u.id == user_id)
-            .ok_or_else(|| anyhow!("admin user not found"))?;
-        user.username = username.to_string();
-        user.email = email.to_string();
-        if let Some(password_hash) = password_hash {
-            user.password_hash = password_hash.to_string();
-        }
-        user.is_active = is_active;
-        state.admin_user_roles.retain(|r| r.user_id != user_id);
-        for role_name in role_names {
-            let role_id = match state
-                .admin_roles
-                .iter()
-                .find(|r| r.name == *role_name)
-                .map(|r| r.id)
-            {
-                Some(id) => id,
-                None => {
-                    let id = state.allocate_id() as i32;
-                    state.admin_roles.push(AdminRole {
-                        id,
-                        name: role_name.clone(),
-                    });
-                    id
-                }
-            };
-            state
-                .admin_user_roles
-                .push(AdminUserRole { user_id, role_id });
-        }
-        self.persist_after_write(&state).await
+        control_journal::update_admin_user(
+            &self.storage,
+            user_id,
+            username,
+            email,
+            password_hash,
+            is_active,
+            role_names,
+        )
+        .await
     }
 
     pub async fn delete_admin_user(&self, user_id: i64) -> Result<()> {
-        let mut state = self.state.write().await;
-        state.admin_users.retain(|u| u.id != user_id);
-        state.admin_user_roles.retain(|r| r.user_id != user_id);
-        self.persist_after_write(&state).await
+        control_journal::delete_admin_user(&self.storage, user_id).await
     }
 
     pub async fn list_admin_users(&self) -> Result<Vec<AdminUser>> {
-        let mut users = self.state.read().await.admin_users.clone();
-        users.sort_by(|a, b| a.username.cmp(&b.username));
-        Ok(users)
+        Ok(control_journal::read_control_state(&self.storage)
+            .await?
+            .admin_users())
     }
 
     pub async fn create_admin_role(&self, name: &str) -> Result<()> {
-        let mut state = self.state.write().await;
-        if !state.admin_roles.iter().any(|r| r.name == name) {
-            let id = state.allocate_id() as i32;
-            state.admin_roles.push(AdminRole {
-                id,
-                name: name.to_string(),
-            });
-        }
-        self.persist_after_write(&state).await
+        control_journal::create_admin_role(&self.storage, name).await
     }
 
     pub async fn list_admin_roles(&self) -> Result<Vec<String>> {
-        let mut roles = self
-            .state
-            .read()
-            .await
-            .admin_roles
-            .iter()
-            .map(|r| r.name.clone())
-            .collect::<Vec<_>>();
-        roles.sort();
-        Ok(roles)
+        Ok(control_journal::read_control_state(&self.storage)
+            .await?
+            .admin_roles())
     }
 
     pub async fn get_admin_role_by_id(&self, id: i32) -> Result<Option<AdminRole>> {
-        Ok(self
-            .state
-            .read()
-            .await
-            .admin_roles
-            .iter()
-            .find(|r| r.id == id)
-            .cloned())
+        Ok(control_journal::read_control_state(&self.storage)
+            .await?
+            .admin_role_by_id(id))
     }
 
     pub async fn update_admin_role(&self, id: i32, name: &str) -> Result<()> {
-        let mut state = self.state.write().await;
-        if let Some(role) = state.admin_roles.iter_mut().find(|r| r.id == id) {
-            role.name = name.to_string();
-        }
-        self.persist_after_write(&state).await
+        control_journal::update_admin_role(&self.storage, id, name).await
     }
 
     pub async fn delete_admin_role(&self, id: i32) -> Result<()> {
-        let mut state = self.state.write().await;
-        state.admin_roles.retain(|r| r.id != id);
-        state.admin_user_roles.retain(|r| r.role_id != id);
-        self.persist_after_write(&state).await
+        control_journal::delete_admin_role(&self.storage, id).await
     }
 
     pub async fn list_policies(&self) -> Result<Vec<String>> {

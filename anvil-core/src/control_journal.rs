@@ -2,7 +2,7 @@ use crate::formats::{
     BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, Hash32, JournalFrame, JournalRecordKind,
     hash32, validate_journal_chain,
 };
-use crate::persistence::{App, AppDetails, Tenant};
+use crate::persistence::{AdminRole, AdminUser, App, AppDetails, Tenant};
 use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -51,6 +51,24 @@ enum ControlEventBody {
         resource: String,
         action: String,
     },
+    AdminRoleUpsert {
+        id: i32,
+        name: String,
+    },
+    AdminRoleDelete {
+        id: i32,
+    },
+    AdminUserUpsert {
+        id: i64,
+        username: String,
+        email: String,
+        password_hash: String,
+        is_active: bool,
+        role_ids: Vec<i32>,
+    },
+    AdminUserDelete {
+        id: i64,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -60,6 +78,9 @@ pub struct ControlState {
     tenants: BTreeMap<i64, Tenant>,
     apps: BTreeMap<i64, StoredControlApp>,
     app_policies: BTreeSet<StoredControlPolicy>,
+    admin_roles: BTreeMap<i32, AdminRole>,
+    admin_users: BTreeMap<i64, AdminUser>,
+    admin_user_roles: BTreeMap<i64, BTreeSet<i32>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +166,55 @@ impl ControlState {
         policies.sort();
         policies.dedup();
         policies
+    }
+
+    pub fn admin_user_by_username(&self, username: &str) -> Option<AdminUser> {
+        self.admin_users
+            .values()
+            .find(|user| user.username == username)
+            .cloned()
+    }
+
+    pub fn admin_user_by_id(&self, id: i64) -> Option<AdminUser> {
+        self.admin_users.get(&id).cloned()
+    }
+
+    pub fn roles_for_admin_user(&self, user_id: i64) -> Vec<String> {
+        let mut roles = self
+            .admin_user_roles
+            .get(&user_id)
+            .into_iter()
+            .flat_map(|ids| ids.iter())
+            .filter_map(|id| self.admin_roles.get(id))
+            .map(|role| role.name.clone())
+            .collect::<Vec<_>>();
+        roles.sort();
+        roles
+    }
+
+    pub fn admin_users(&self) -> Vec<AdminUser> {
+        let mut users = self.admin_users.values().cloned().collect::<Vec<_>>();
+        users.sort_by(|a, b| a.username.cmp(&b.username));
+        users
+    }
+
+    pub fn admin_roles(&self) -> Vec<String> {
+        let mut roles = self
+            .admin_roles
+            .values()
+            .map(|role| role.name.clone())
+            .collect::<Vec<_>>();
+        roles.sort();
+        roles
+    }
+
+    pub fn admin_role_by_id(&self, id: i32) -> Option<AdminRole> {
+        self.admin_roles.get(&id).cloned()
+    }
+
+    fn next_admin_role_id(&self) -> Result<i32> {
+        let next = self.allocate_id();
+        i32::try_from(next).map_err(|_| anyhow!("admin role id overflow"))
     }
 }
 
@@ -293,6 +363,153 @@ pub async fn revoke_policy(
             action: action.to_string(),
         },
         policy_key_hash(app_id, resource, action),
+    )
+    .await
+}
+
+pub async fn create_admin_user(
+    storage: &Storage,
+    username: &str,
+    email: &str,
+    password_hash: &str,
+    role_names: &[String],
+) -> Result<AdminUser> {
+    require_nonempty(username, "username")?;
+    let mut state = read_control_state(storage).await?;
+    if state.admin_user_by_username(username).is_some() {
+        return Err(anyhow!("admin user already exists"));
+    }
+    let role_ids = ensure_admin_roles(storage, &mut state, role_names).await?;
+    let user = AdminUser {
+        id: state.allocate_id(),
+        username: username.to_string(),
+        email: email.to_string(),
+        password_hash: password_hash.to_string(),
+        is_active: true,
+    };
+    append_control_event(
+        storage,
+        ControlEventBody::AdminUserUpsert {
+            id: user.id,
+            username: user.username.clone(),
+            email: user.email.clone(),
+            password_hash: user.password_hash.clone(),
+            is_active: user.is_active,
+            role_ids,
+        },
+        admin_user_key_hash(user.id),
+    )
+    .await?;
+    Ok(user)
+}
+
+pub async fn update_admin_user(
+    storage: &Storage,
+    user_id: i64,
+    username: &str,
+    email: &str,
+    password_hash: Option<&str>,
+    is_active: bool,
+    role_names: &[String],
+) -> Result<()> {
+    require_nonempty(username, "username")?;
+    let mut state = read_control_state(storage).await?;
+    let existing = state
+        .admin_user_by_id(user_id)
+        .ok_or_else(|| anyhow!("admin user not found"))?;
+    let role_ids = ensure_admin_roles(storage, &mut state, role_names).await?;
+    append_control_event(
+        storage,
+        ControlEventBody::AdminUserUpsert {
+            id: user_id,
+            username: username.to_string(),
+            email: email.to_string(),
+            password_hash: password_hash.unwrap_or(&existing.password_hash).to_string(),
+            is_active,
+            role_ids,
+        },
+        admin_user_key_hash(user_id),
+    )
+    .await
+}
+
+pub async fn delete_admin_user(storage: &Storage, user_id: i64) -> Result<()> {
+    append_control_event(
+        storage,
+        ControlEventBody::AdminUserDelete { id: user_id },
+        admin_user_key_hash(user_id),
+    )
+    .await
+}
+
+pub async fn create_admin_role(storage: &Storage, name: &str) -> Result<()> {
+    require_nonempty(name, "admin role")?;
+    let state = read_control_state(storage).await?;
+    if state.admin_roles.values().any(|role| role.name == name) {
+        return Ok(());
+    }
+    let id = state.next_admin_role_id()?;
+    append_admin_role_upsert(storage, id, name).await
+}
+
+pub async fn update_admin_role(storage: &Storage, id: i32, name: &str) -> Result<()> {
+    require_nonempty(name, "admin role")?;
+    let state = read_control_state(storage).await?;
+    if state.admin_roles.contains_key(&id) {
+        append_admin_role_upsert(storage, id, name).await?;
+    }
+    Ok(())
+}
+
+pub async fn delete_admin_role(storage: &Storage, id: i32) -> Result<()> {
+    append_control_event(
+        storage,
+        ControlEventBody::AdminRoleDelete { id },
+        admin_role_key_hash(id),
+    )
+    .await
+}
+
+async fn ensure_admin_roles(
+    storage: &Storage,
+    state: &mut ControlState,
+    role_names: &[String],
+) -> Result<Vec<i32>> {
+    let mut role_ids = Vec::new();
+    for role_name in role_names {
+        require_nonempty(role_name, "admin role")?;
+        if let Some(role) = state
+            .admin_roles
+            .values()
+            .find(|role| role.name == *role_name)
+        {
+            role_ids.push(role.id);
+            continue;
+        }
+        let id = state.next_admin_role_id()?;
+        append_admin_role_upsert(storage, id, role_name).await?;
+        apply_event(
+            state,
+            ControlEventBody::AdminRoleUpsert {
+                id,
+                name: role_name.clone(),
+            },
+        );
+        role_ids.push(id);
+    }
+    role_ids.sort_unstable();
+    role_ids.dedup();
+    Ok(role_ids)
+}
+
+async fn append_admin_role_upsert(storage: &Storage, id: i32, name: &str) -> Result<()> {
+    append_control_event(
+        storage,
+        ControlEventBody::AdminRoleUpsert {
+            id,
+            name: name.to_string(),
+        },
+        admin_role_key_hash(id),
     )
     .await
 }
@@ -456,6 +673,43 @@ fn apply_event(state: &mut ControlState, event: ControlEventBody) {
                 action,
             });
         }
+        ControlEventBody::AdminRoleUpsert { id, name } => {
+            state.next_id = state.next_id.max(i64::from(id));
+            state.admin_roles.insert(id, AdminRole { id, name });
+        }
+        ControlEventBody::AdminRoleDelete { id } => {
+            state.admin_roles.remove(&id);
+            for role_ids in state.admin_user_roles.values_mut() {
+                role_ids.remove(&id);
+            }
+        }
+        ControlEventBody::AdminUserUpsert {
+            id,
+            username,
+            email,
+            password_hash,
+            is_active,
+            role_ids,
+        } => {
+            state.next_id = state.next_id.max(id);
+            state.admin_users.insert(
+                id,
+                AdminUser {
+                    id,
+                    username,
+                    email,
+                    password_hash,
+                    is_active,
+                },
+            );
+            state
+                .admin_user_roles
+                .insert(id, role_ids.into_iter().collect());
+        }
+        ControlEventBody::AdminUserDelete { id } => {
+            state.admin_users.remove(&id);
+            state.admin_user_roles.remove(&id);
+        }
     }
 }
 
@@ -485,6 +739,14 @@ fn app_id_key_hash(app_id: i64) -> Hash32 {
 
 fn policy_key_hash(app_id: i64, resource: &str, action: &str) -> Hash32 {
     hash32(format!("policy\0{app_id}\0{resource}\0{action}").as_bytes())
+}
+
+fn admin_user_key_hash(user_id: i64) -> Hash32 {
+    hash32(format!("admin_user\0{user_id}").as_bytes())
+}
+
+fn admin_role_key_hash(role_id: i32) -> Hash32 {
+    hash32(format!("admin_role\0{role_id}").as_bytes())
 }
 
 fn require_nonempty(value: &str, field: &'static str) -> Result<()> {
@@ -559,6 +821,57 @@ mod tests {
             create_app(&storage, tenant.id, "demo", "client-b", b"secret-b")
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn control_journal_replays_admin_users_roles_and_assignments() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+
+        create_admin_role(&storage, "viewer").await.unwrap();
+        let user = create_admin_user(
+            &storage,
+            "alice",
+            "alice@example.test",
+            "hash-a",
+            &["viewer".to_string(), "operator".to_string()],
+        )
+        .await
+        .unwrap();
+        update_admin_user(
+            &storage,
+            user.id,
+            "alice",
+            "alice@new.example.test",
+            Some("hash-b"),
+            false,
+            &["operator".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let replayed = read_control_state(&storage).await.unwrap();
+        let alice = replayed.admin_user_by_username("alice").unwrap();
+        assert_eq!(alice.email, "alice@new.example.test");
+        assert_eq!(alice.password_hash, "hash-b");
+        assert!(!alice.is_active);
+        assert_eq!(
+            replayed.roles_for_admin_user(user.id),
+            vec!["operator".to_string()]
+        );
+        assert_eq!(
+            replayed.admin_roles(),
+            vec!["operator".to_string(), "viewer".to_string()]
+        );
+
+        delete_admin_user(&storage, user.id).await.unwrap();
+        assert!(
+            read_control_state(&storage)
+                .await
+                .unwrap()
+                .admin_user_by_id(user.id)
+                .is_none()
         );
     }
 }
