@@ -1,12 +1,13 @@
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
+use anvil::anvil_api::index_service_client::IndexServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::{
     self, AppendStreamRecordRequest, CompareAndSwapManifestRequest, CompleteMultipartPart,
     CompleteMultipartRequest, ComposeObjectRequest, ComposeObjectSource, CopyObjectRequest,
-    CreateAppendStreamRequest, CreateBucketRequest, DeleteObjectRequest, GetObjectRequest,
-    HeadObjectRequest, InitiateMultipartRequest, ListObjectVersionsRequest, ListObjectsRequest,
-    ObjectMetadata, PatchJsonObjectRequest, PutObjectRequest, SealAppendStreamSegmentRequest,
-    UploadPartMetadata, UploadPartRequest, WatchPrefixRequest,
+    CreateAppendStreamRequest, CreateBucketRequest, CreateIndexRequest, DeleteObjectRequest,
+    GetObjectRequest, HeadObjectRequest, InitiateMultipartRequest, ListObjectVersionsRequest,
+    ListObjectsRequest, ObjectMetadata, PatchJsonObjectRequest, PutObjectRequest,
+    SealAppendStreamSegmentRequest, UploadPartMetadata, UploadPartRequest, WatchPrefixRequest,
 };
 use futures_util::StreamExt;
 use std::time::Duration;
@@ -208,6 +209,116 @@ async fn test_head_object() {
     // 3. Assert metadata is correct
     assert_eq!(head_res.etag, put_res.etag);
     assert_eq!(head_res.size, content.len() as i64);
+}
+
+#[tokio::test]
+async fn test_object_version_records_index_policy_snapshot_and_mutation_metadata() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut index_client = IndexServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+
+    let bucket_name = "object-policy-snapshot-bucket".to_string();
+    let object_key = "docs/policy-snapshot.txt".to_string();
+    let content = b"policy snapshot content";
+
+    let mut create_bucket = Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
+    });
+    create_bucket.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client.create_bucket(create_bucket).await.unwrap();
+
+    let mut create_index = Request::new(CreateIndexRequest {
+        bucket_name: bucket_name.clone(),
+        name: "body-text".to_string(),
+        kind: "full_text".to_string(),
+        selector_json: serde_json::json!({"selector": "object_body_utf8"}).to_string(),
+        extractor_json: serde_json::json!({"encoding": "utf8"}).to_string(),
+        authorization_mode: "inherit_object".to_string(),
+        build_policy_json: serde_json::json!({"require_index_success": false}).to_string(),
+    });
+    create_index.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    index_client.create_index(create_index).await.unwrap();
+
+    let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
+    let bucket = cluster.states[0]
+        .db
+        .get_bucket_by_name(claims.tenant_id, &bucket_name)
+        .await
+        .unwrap()
+        .expect("bucket exists");
+    let expected_policy_hash = cluster.states[0]
+        .db
+        .active_index_policy_snapshot_hash(claims.tenant_id, bucket.id)
+        .await
+        .unwrap();
+
+    let chunks = vec![
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                ObjectMetadata {
+                    bucket_name: bucket_name.clone(),
+                    object_key: object_key.clone(),
+                },
+            )),
+        },
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                content.to_vec(),
+            )),
+        },
+    ];
+    let mut put_req = Request::new(tokio_stream::iter(chunks));
+    put_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let put_res = object_client
+        .put_object(put_req)
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(put_res.index_policy_snapshot, expected_policy_hash);
+    assert_eq!(put_res.payload_hash, put_res.etag);
+    assert!(!put_res.mutation_id.is_empty());
+    assert!(!put_res.record_hash.is_empty());
+
+    let mut head_req = Request::new(HeadObjectRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: object_key.clone(),
+        version_id: None,
+    });
+    head_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let head_res = object_client
+        .head_object(head_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(head_res.version_id, put_res.version_id);
+    assert_eq!(head_res.mutation_id, put_res.mutation_id);
+    assert_eq!(head_res.record_hash, put_res.record_hash);
+    assert_eq!(head_res.index_policy_snapshot, expected_policy_hash);
 }
 
 #[tokio::test]

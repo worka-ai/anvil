@@ -59,6 +59,12 @@ impl ObjectService for AppState {
         Ok(Response::new(PutObjectResponse {
             etag: object.etag,
             version_id: object.version_id.to_string(),
+            mutation_id: object.mutation_id.to_string(),
+            payload_hash: object.content_hash,
+            record_hash: object.record_hash,
+            authz_revision: u64::try_from(object.authz_revision)
+                .map_err(|_| Status::internal("Invalid authz revision"))?,
+            index_policy_snapshot: object.index_policy_snapshot,
         }))
     }
 
@@ -161,6 +167,12 @@ impl ObjectService for AppState {
             etag: object.etag,
             size: object.size,
             last_modified: object.created_at.to_string(),
+            version_id: object.version_id.to_string(),
+            mutation_id: object.mutation_id.to_string(),
+            record_hash: object.record_hash,
+            authz_revision: u64::try_from(object.authz_revision)
+                .map_err(|_| Status::internal("Invalid authz revision"))?,
+            index_policy_snapshot: object.index_policy_snapshot,
         }))
     }
 

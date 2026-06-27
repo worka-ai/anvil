@@ -211,6 +211,11 @@ message ObjectMetadata {
 message PutObjectResponse {
     string etag = 1;
     string version_id = 2;
+    string mutation_id = 3;
+    string payload_hash = 4;
+    string record_hash = 5;
+    uint64 authz_revision = 6;
+    string index_policy_snapshot = 7;
 }
 
 message GetObjectRequest {
@@ -250,6 +255,11 @@ message HeadObjectResponse {
     string etag = 1;
     int64 size = 2;
     string last_modified = 3;
+    string version_id = 4;
+    string mutation_id = 5;
+    string record_hash = 6;
+    uint64 authz_revision = 7;
+    string index_policy_snapshot = 8;
 }
 
 message ListObjectsRequest {

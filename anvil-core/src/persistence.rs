@@ -62,6 +62,10 @@ pub struct Object {
     pub etag: String,
     pub content_type: Option<String>,
     pub version_id: uuid::Uuid,
+    pub mutation_id: uuid::Uuid,
+    pub index_policy_snapshot: String,
+    pub authz_revision: i64,
+    pub record_hash: String,
     pub created_at: DateTime<Utc>,
     pub deleted_at: Option<DateTime<Utc>>,
     pub storage_class: Option<i16>,
@@ -75,6 +79,20 @@ pub struct ObjectVersion {
     pub object: Object,
     pub is_delete_marker: bool,
     pub is_latest: bool,
+}
+
+struct ObjectVersionRecordHashInput<'a> {
+    tenant_id: i64,
+    bucket_id: i64,
+    key: &'a str,
+    version_id: uuid::Uuid,
+    mutation_id: uuid::Uuid,
+    content_hash: &'a str,
+    size: i64,
+    etag: &'a str,
+    index_policy_snapshot: &'a str,
+    authz_revision: i64,
+    delete_marker: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -268,6 +286,10 @@ impl From<Row> for Object {
             etag: row.get("etag"),
             content_type: row.get("content_type"),
             version_id: row.get("version_id"),
+            mutation_id: row.get("mutation_id"),
+            index_policy_snapshot: row.get("index_policy_snapshot"),
+            authz_revision: row.get("authz_revision"),
+            record_hash: row.get("record_hash"),
             created_at: row.get("created_at"),
             deleted_at: row.get("deleted_at"),
             storage_class: row.get("storage_class"),
@@ -429,6 +451,22 @@ impl From<Row> for IndexDiagnostic {
             created_at: row.get("created_at"),
         }
     }
+}
+
+fn object_version_record_hash(input: ObjectVersionRecordHashInput<'_>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&input.tenant_id.to_le_bytes());
+    hasher.update(&input.bucket_id.to_le_bytes());
+    hasher.update(input.key.as_bytes());
+    hasher.update(input.version_id.as_bytes());
+    hasher.update(input.mutation_id.as_bytes());
+    hasher.update(input.content_hash.as_bytes());
+    hasher.update(&input.size.to_le_bytes());
+    hasher.update(input.etag.as_bytes());
+    hasher.update(input.index_policy_snapshot.as_bytes());
+    hasher.update(&input.authz_revision.to_le_bytes());
+    hasher.update(&[u8::from(input.delete_marker)]);
+    hasher.finalize().to_hex().to_string()
 }
 
 pub struct AppDetails {
@@ -1300,6 +1338,62 @@ impl Persistence {
 
     // --- Regional Methods ---
 
+    pub async fn active_index_policy_snapshot_hash(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+    ) -> Result<String> {
+        let client = self.regional_pool.get().await?;
+        let rows = client
+            .query(
+                r#"
+                SELECT name, kind, selector, extractor, authorization_mode, build_policy, version
+                FROM index_definitions
+                WHERE tenant_id = $1
+                  AND bucket_id = $2
+                  AND enabled
+                ORDER BY name, id"#,
+                &[&tenant_id, &bucket_id],
+            )
+            .await?;
+
+        let mut hasher = blake3::Hasher::new();
+        for row in rows {
+            let name: String = row.get("name");
+            let kind: String = row.get("kind");
+            let selector: JsonValue = row.get("selector");
+            let extractor: JsonValue = row.get("extractor");
+            let authorization_mode: String = row.get("authorization_mode");
+            let build_policy: JsonValue = row.get("build_policy");
+            let version: i64 = row.get("version");
+            hasher.update(name.as_bytes());
+            hasher.update(&[0]);
+            hasher.update(kind.as_bytes());
+            hasher.update(&[0]);
+            hasher.update(selector.to_string().as_bytes());
+            hasher.update(&[0]);
+            hasher.update(extractor.to_string().as_bytes());
+            hasher.update(&[0]);
+            hasher.update(authorization_mode.as_bytes());
+            hasher.update(&[0]);
+            hasher.update(build_policy.to_string().as_bytes());
+            hasher.update(&[0]);
+            hasher.update(&version.to_le_bytes());
+        }
+        Ok(hasher.finalize().to_hex().to_string())
+    }
+
+    pub async fn latest_authz_revision(&self, tenant_id: i64) -> Result<i64> {
+        let client = self.regional_pool.get().await?;
+        let row = client
+            .query_one(
+                "SELECT COALESCE(MAX(revision), 0)::BIGINT AS revision FROM authz_tuple_log WHERE tenant_id = $1",
+                &[&tenant_id],
+            )
+            .await?;
+        Ok(row.get("revision"))
+    }
+
     pub async fn create_object(
         &self,
         tenant_id: i64,
@@ -1310,11 +1404,48 @@ impl Persistence {
         etag: &str,
         shard_map: Option<JsonValue>,
     ) -> Result<Object> {
+        let version_id = uuid::Uuid::new_v4();
+        let mutation_id = uuid::Uuid::new_v4();
+        let index_policy_snapshot = self
+            .active_index_policy_snapshot_hash(tenant_id, bucket_id)
+            .await?;
+        let authz_revision = self.latest_authz_revision(tenant_id).await?;
+        let record_hash = object_version_record_hash(ObjectVersionRecordHashInput {
+            tenant_id,
+            bucket_id,
+            key,
+            version_id,
+            mutation_id,
+            content_hash,
+            size,
+            etag,
+            index_policy_snapshot: &index_policy_snapshot,
+            authz_revision,
+            delete_marker: false,
+        });
         let client = self.regional_pool.get().await?;
         let row = client
             .query_one(
-                r#"INSERT INTO objects (tenant_id, bucket_id, key, content_hash, size, etag, version_id, shard_map) VALUES ($1, $2, $3, $4, $5, $6, gen_random_uuid(), $7) RETURNING *;"#,
-                &[&tenant_id, &bucket_id, &key, &content_hash, &size, &etag, &shard_map],
+                r#"
+                INSERT INTO objects
+                    (tenant_id, bucket_id, key, content_hash, size, etag, version_id, mutation_id,
+                     shard_map, index_policy_snapshot, authz_revision, record_hash)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                RETURNING *;"#,
+                &[
+                    &tenant_id,
+                    &bucket_id,
+                    &key,
+                    &content_hash,
+                    &size,
+                    &etag,
+                    &version_id,
+                    &mutation_id,
+                    &shard_map,
+                    &index_policy_snapshot,
+                    &authz_revision,
+                    &record_hash,
+                ],
             )
             .await?;
         Ok(row.into())
@@ -1433,10 +1564,10 @@ impl Persistence {
             let rows = client
                 .query(
                     r#"
-                    SELECT id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
+                    SELECT id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
                     FROM (
                       SELECT DISTINCT ON (key)
-                        id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
+                        id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
                       FROM objects
                       WHERE bucket_id = $1 AND key > $2 AND key LIKE $3
                       ORDER BY key, created_at DESC, id DESC
@@ -1579,10 +1710,10 @@ impl Persistence {
             let rows = client
                 .query(
                     r#"
-                    SELECT id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
+                    SELECT id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
                     FROM (
                       SELECT DISTINCT ON (key)
-                        id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
+                        id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree
                       FROM objects
                       WHERE bucket_id = $1 AND key = ANY($2)
                       ORDER BY key, created_at DESC, id DESC
@@ -1602,17 +1733,58 @@ impl Persistence {
 
     pub async fn soft_delete_object(&self, bucket_id: i64, key: &str) -> Result<Option<Object>> {
         let client = self.regional_pool.get().await?;
-        let row = client
+        let source = client
             .query_opt(
                 r#"
-                INSERT INTO objects (tenant_id, bucket_id, key, content_hash, size, etag, version_id, deleted_at)
-                SELECT tenant_id, bucket_id, key, '', 0, '', gen_random_uuid(), now()
+                SELECT *
                 FROM objects
                 WHERE bucket_id = $1 AND key = $2
                 ORDER BY created_at DESC, id DESC
-                LIMIT 1
-                RETURNING *"#,
+                LIMIT 1"#,
                 &[&bucket_id, &key],
+            )
+            .await?;
+        let Some(source) = source else {
+            return Ok(None);
+        };
+        let source: Object = source.into();
+        let version_id = uuid::Uuid::new_v4();
+        let mutation_id = uuid::Uuid::new_v4();
+        let index_policy_snapshot = self
+            .active_index_policy_snapshot_hash(source.tenant_id, bucket_id)
+            .await?;
+        let authz_revision = self.latest_authz_revision(source.tenant_id).await?;
+        let record_hash = object_version_record_hash(ObjectVersionRecordHashInput {
+            tenant_id: source.tenant_id,
+            bucket_id,
+            key,
+            version_id,
+            mutation_id,
+            content_hash: "",
+            size: 0,
+            etag: "",
+            index_policy_snapshot: &index_policy_snapshot,
+            authz_revision,
+            delete_marker: true,
+        });
+        let row = client
+            .query_opt(
+                r#"
+                INSERT INTO objects
+                    (tenant_id, bucket_id, key, content_hash, size, etag, version_id, mutation_id,
+                     deleted_at, index_policy_snapshot, authz_revision, record_hash)
+                VALUES ($1, $2, $3, '', 0, '', $4, $5, now(), $6, $7, $8)
+                RETURNING *"#,
+                &[
+                    &source.tenant_id,
+                    &bucket_id,
+                    &key,
+                    &version_id,
+                    &mutation_id,
+                    &index_policy_snapshot,
+                    &authz_revision,
+                    &record_hash,
+                ],
             )
             .await?;
         Ok(row.map(Into::into))
@@ -1631,7 +1803,7 @@ impl Persistence {
                 r#"
                 WITH ranked AS (
                   SELECT
-                    id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree,
+                    id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, checksum, deleted_at, key_ltree,
                     row_number() OVER (PARTITION BY key ORDER BY created_at DESC, id DESC) = 1 AS is_latest
                   FROM objects
                   WHERE bucket_id = $1 AND key > $2 AND key LIKE $3
