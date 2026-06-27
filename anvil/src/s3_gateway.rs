@@ -4,6 +4,7 @@ use crate::s3_auth::{aws_chunked_decoder, sigv4_auth};
 use anvil_core::auth;
 use anvil_core::object_manager::ObjectWriteOptions;
 use anvil_core::permissions::AnvilAction;
+use anvil_core::persistence::Object;
 use anvil_core::validation;
 use axum::{
     Router,
@@ -592,32 +593,16 @@ async fn list_objects(
         )
         .await
     {
-        Ok((mut objects, mut common_prefixes)) => {
+        Ok((objects, common_prefixes)) => {
             // Basic ListObjectsV2 XML
             let requested_max_keys = if max_keys <= 0 {
                 1000
             } else {
                 max_keys as usize
             };
-            let total_count = objects.len() + common_prefixes.len();
-            let is_truncated = total_count > requested_max_keys;
-            let mut next_continuation_token = None;
-            if is_truncated {
-                while objects.len() + common_prefixes.len() > requested_max_keys {
-                    if let Some(prefix) = common_prefixes.pop() {
-                        next_continuation_token = Some(prefix);
-                    } else if let Some(object) = objects.pop() {
-                        next_continuation_token = Some(object.key);
-                    }
-                }
-                if next_continuation_token.is_none() {
-                    next_continuation_token = objects
-                        .last()
-                        .map(|object| object.key.clone())
-                        .or_else(|| common_prefixes.last().cloned());
-                }
-            }
-            let key_count = (objects.len() + common_prefixes.len()) as i32;
+            let (entries, is_truncated, next_continuation_token) =
+                paginate_list_bucket_entries(objects, common_prefixes, requested_max_keys);
+            let key_count = entries.len() as i32;
             let mut xml = String::from(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">
 ",
@@ -642,22 +627,26 @@ async fn list_objects(
                     xml_escape(&token)
                 ));
             }
-            for o in objects {
-                xml.push_str("  <Contents>\n");
-                xml.push_str(&format!("    <Key>{}</Key>\n", xml_escape(&o.key)));
-                xml.push_str(&format!(
-                    "    <LastModified>{}</LastModified>\n",
-                    o.created_at.to_rfc3339()
-                ));
-                xml.push_str(&format!("    <ETag>\"{}\"</ETag>\n", o.etag));
-                xml.push_str(&format!("    <Size>{}</Size>\n", o.size));
-                xml.push_str("    <StorageClass>STANDARD</StorageClass>\n");
-                xml.push_str("  </Contents>\n");
-            }
-            for p in common_prefixes {
-                xml.push_str("  <CommonPrefixes>\n");
-                xml.push_str(&format!("    <Prefix>{}</Prefix>\n", xml_escape(&p)));
-                xml.push_str("  </CommonPrefixes>\n");
+            for entry in entries {
+                match entry {
+                    ListBucketEntry::Object(o) => {
+                        xml.push_str("  <Contents>\n");
+                        xml.push_str(&format!("    <Key>{}</Key>\n", xml_escape(&o.key)));
+                        xml.push_str(&format!(
+                            "    <LastModified>{}</LastModified>\n",
+                            o.created_at.to_rfc3339()
+                        ));
+                        xml.push_str(&format!("    <ETag>\"{}\"</ETag>\n", o.etag));
+                        xml.push_str(&format!("    <Size>{}</Size>\n", o.size));
+                        xml.push_str("    <StorageClass>STANDARD</StorageClass>\n");
+                        xml.push_str("  </Contents>\n");
+                    }
+                    ListBucketEntry::Prefix(p) => {
+                        xml.push_str("  <CommonPrefixes>\n");
+                        xml.push_str(&format!("    <Prefix>{}</Prefix>\n", xml_escape(&p)));
+                        xml.push_str("  </CommonPrefixes>\n");
+                    }
+                }
             }
             xml.push_str("</ListBucketResult>\n");
 
@@ -1238,6 +1227,55 @@ fn s3_status_to_response_for_auth(
     }
 }
 
+#[derive(Debug)]
+enum ListBucketEntry {
+    Object(Object),
+    Prefix(String),
+}
+
+fn paginate_list_bucket_entries(
+    objects: Vec<Object>,
+    common_prefixes: Vec<String>,
+    requested_max_keys: usize,
+) -> (Vec<ListBucketEntry>, bool, Option<String>) {
+    let mut entries = objects
+        .into_iter()
+        .map(ListBucketEntry::Object)
+        .chain(common_prefixes.into_iter().map(ListBucketEntry::Prefix))
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        left.marker()
+            .cmp(right.marker())
+            .then_with(|| left.kind_order().cmp(&right.kind_order()))
+    });
+
+    let is_truncated = entries.len() > requested_max_keys;
+    if is_truncated {
+        entries.truncate(requested_max_keys);
+    }
+    let next_continuation_token = is_truncated
+        .then(|| entries.last().map(|entry| entry.marker().to_string()))
+        .flatten();
+
+    (entries, is_truncated, next_continuation_token)
+}
+
+impl ListBucketEntry {
+    fn marker(&self) -> &str {
+        match self {
+            Self::Object(object) => &object.key,
+            Self::Prefix(prefix) => prefix,
+        }
+    }
+
+    fn kind_order(&self) -> u8 {
+        match self {
+            Self::Object(_) => 0,
+            Self::Prefix(_) => 1,
+        }
+    }
+}
+
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -1278,6 +1316,76 @@ fn add_s3_user_metadata_headers(
         }
     }
     builder
+}
+
+#[cfg(test)]
+mod list_bucket_pagination_tests {
+    use super::*;
+    use chrono::Utc;
+
+    #[test]
+    fn list_bucket_pagination_uses_last_returned_entry_as_continuation_token() {
+        let (entries, is_truncated, token) = paginate_list_bucket_entries(
+            vec![object("page/a.txt"), object("page/b.txt")],
+            Vec::new(),
+            1,
+        );
+
+        assert!(is_truncated);
+        assert_eq!(token.as_deref(), Some("page/a.txt"));
+        assert_eq!(
+            entries
+                .iter()
+                .map(ListBucketEntry::marker)
+                .collect::<Vec<_>>(),
+            vec!["page/a.txt"]
+        );
+    }
+
+    #[test]
+    fn list_bucket_pagination_merges_objects_and_common_prefixes_before_truncating() {
+        let (entries, is_truncated, token) = paginate_list_bucket_entries(
+            vec![object("root/b.txt")],
+            vec!["root/a/".to_string(), "root/c/".to_string()],
+            2,
+        );
+
+        assert!(is_truncated);
+        assert_eq!(token.as_deref(), Some("root/b.txt"));
+        assert_eq!(
+            entries
+                .iter()
+                .map(ListBucketEntry::marker)
+                .collect::<Vec<_>>(),
+            vec!["root/a/", "root/b.txt"]
+        );
+    }
+
+    fn object(key: &str) -> Object {
+        Object {
+            id: 0,
+            tenant_id: 0,
+            bucket_id: 0,
+            key: key.to_string(),
+            content_hash: String::new(),
+            size: 0,
+            etag: String::new(),
+            content_type: None,
+            version_id: uuid::Uuid::nil(),
+            mutation_id: uuid::Uuid::nil(),
+            index_policy_snapshot: String::new(),
+            user_metadata_hash: String::new(),
+            authz_revision: 0,
+            record_hash: String::new(),
+            created_at: Utc::now(),
+            deleted_at: None,
+            storage_class: None,
+            user_meta: None,
+            shard_map: None,
+            inline_payload: None,
+            checksum: None,
+        }
+    }
 }
 
 async fn readiness_check(State(state): State<AppState>) -> Response {
