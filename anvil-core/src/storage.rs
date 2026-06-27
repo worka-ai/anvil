@@ -75,6 +75,16 @@ impl Storage {
             .join("definitions.anjournal")
     }
 
+    pub fn task_lease_path(&self, task_id: &str) -> Result<PathBuf> {
+        ensure_safe_internal_component(task_id, "task id")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("tasks")
+            .join("leases")
+            .join(format!("{task_id}.json")))
+    }
+
     pub fn authz_tuple_journal_path(&self, tenant_id: i64) -> PathBuf {
         self.authz_tuple_segment_dir(tenant_id)
             .join("tuples.anjournal")
