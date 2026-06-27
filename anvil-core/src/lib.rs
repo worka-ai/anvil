@@ -48,6 +48,7 @@ pub struct AppState {
     pub object_manager: object_manager::ObjectManager,
     pub config: Arc<Config>,
     pub authz_watch_tx: broadcast::Sender<persistence::AuthzTupleRecord>,
+    pub index_watch_tx: broadcast::Sender<persistence::IndexDefinitionEvent>,
 }
 
 impl AppState {
@@ -67,6 +68,7 @@ impl AppState {
         let placer = placement::PlacementManager::default();
         let (object_watch_tx, _object_watch_rx) = tokio::sync::broadcast::channel(1024);
         let (authz_watch_tx, _authz_watch_rx) = tokio::sync::broadcast::channel(1024);
+        let (index_watch_tx, _index_watch_rx) = tokio::sync::broadcast::channel(1024);
 
         let bucket_manager = bucket_manager::BucketManager::new(db.clone());
         let object_manager = object_manager::ObjectManager::new(
@@ -93,6 +95,7 @@ impl AppState {
             object_manager,
             config: arc_config,
             authz_watch_tx,
+            index_watch_tx,
         })
     }
 }

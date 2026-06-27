@@ -173,6 +173,7 @@ fn action_covers_required(token_action: &AnvilAction, required_action: &AnvilAct
                 | AnvilAction::IndexRead
                 | AnvilAction::IndexUpdate
                 | AnvilAction::IndexDelete
+                | AnvilAction::IndexWatch
         ),
         _ => token_action == required_action, // Exact match for specific actions
     }

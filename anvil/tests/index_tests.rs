@@ -2,9 +2,10 @@ use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::index_service_client::IndexServiceClient;
 use anvil::anvil_api::{
     CreateBucketRequest, CreateIndexRequest, DisableIndexRequest, DropIndexRequest,
-    ListIndexesRequest, UpdateIndexRequest,
+    ListIndexesRequest, UpdateIndexRequest, WatchIndexDefinitionRequest,
 };
 use anvil_test_utils::*;
+use futures_util::StreamExt;
 use std::time::Duration;
 use tonic::Request;
 
@@ -184,6 +185,35 @@ async fn test_index_definition_lifecycle() {
         .into_inner()
         .indexes;
     assert!(after_drop.is_empty());
+
+    let mut watch = index_client
+        .watch_index_definition(authorized(
+            WatchIndexDefinitionRequest {
+                bucket_name: "index-definition-bucket".to_string(),
+                after_cursor: 0,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut events = Vec::new();
+    for _ in 0..4 {
+        events.push(watch.next().await.unwrap().unwrap());
+    }
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        vec!["create", "update", "disable", "drop"]
+    );
+    assert!(
+        events
+            .windows(2)
+            .all(|pair| pair[0].cursor < pair[1].cursor)
+    );
+    assert_eq!(events[3].index.as_ref().unwrap().name, "docs-full-text");
 }
 
 #[tokio::test]

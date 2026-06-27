@@ -167,6 +167,20 @@ pub struct IndexDefinition {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct IndexDefinitionEvent {
+    pub id: i64,
+    pub tenant_id: i64,
+    pub bucket_id: i64,
+    pub bucket_name: String,
+    pub index_id: i64,
+    pub index_name: String,
+    pub event_type: String,
+    pub index_version: i64,
+    pub definition: JsonValue,
+    pub created_at: DateTime<Utc>,
+}
+
 // Manual row-to-struct mapping
 impl From<Row> for Tenant {
     fn from(row: Row) -> Self {
@@ -334,6 +348,23 @@ impl From<Row> for IndexDefinition {
             version: row.get("version"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
+        }
+    }
+}
+
+impl From<Row> for IndexDefinitionEvent {
+    fn from(row: Row) -> Self {
+        Self {
+            id: row.get("id"),
+            tenant_id: row.get("tenant_id"),
+            bucket_id: row.get("bucket_id"),
+            bucket_name: row.get("bucket_name"),
+            index_id: row.get("index_id"),
+            index_name: row.get("index_name"),
+            event_type: row.get("event_type"),
+            index_version: row.get("index_version"),
+            definition: row.get("definition"),
+            created_at: row.get("created_at"),
         }
     }
 }
@@ -2176,15 +2207,15 @@ impl Persistence {
         tenant_id: i64,
         bucket_id: i64,
         name: &str,
-    ) -> Result<bool> {
+    ) -> Result<Option<IndexDefinition>> {
         let client = self.regional_pool.get().await?;
-        let changed = client
-            .execute(
-                "DELETE FROM index_definitions WHERE tenant_id = $1 AND bucket_id = $2 AND name = $3",
+        let row = client
+            .query_opt(
+                "DELETE FROM index_definitions WHERE tenant_id = $1 AND bucket_id = $2 AND name = $3 RETURNING *",
                 &[&tenant_id, &bucket_id, &name],
             )
             .await?;
-        Ok(changed > 0)
+        Ok(row.map(Into::into))
     }
 
     pub async fn list_index_definitions(
@@ -2204,6 +2235,67 @@ impl Persistence {
                   AND ($3 OR enabled)
                 ORDER BY name"#,
                 &[&tenant_id, &bucket_id, &include_disabled],
+            )
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn create_index_definition_event(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        bucket_name: &str,
+        index: &IndexDefinition,
+        event_type: &str,
+        definition: JsonValue,
+    ) -> Result<IndexDefinitionEvent> {
+        let client = self.regional_pool.get().await?;
+        let row = client
+            .query_one(
+                r#"
+                INSERT INTO index_definition_events
+                    (tenant_id, bucket_id, bucket_name, index_id, index_name, event_type, index_version, definition)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                RETURNING *"#,
+                &[
+                    &tenant_id,
+                    &bucket_id,
+                    &bucket_name,
+                    &index.id,
+                    &index.name,
+                    &event_type,
+                    &index.version,
+                    &definition,
+                ],
+            )
+            .await?;
+        Ok(row.into())
+    }
+
+    pub async fn list_index_definition_events(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        after_cursor: i64,
+        limit: i32,
+    ) -> Result<Vec<IndexDefinitionEvent>> {
+        let client = self.regional_pool.get().await?;
+        let rows = client
+            .query(
+                r#"
+                SELECT *
+                FROM index_definition_events
+                WHERE tenant_id = $1
+                  AND bucket_id = $2
+                  AND id > $3
+                ORDER BY id
+                LIMIT $4"#,
+                &[
+                    &tenant_id,
+                    &bucket_id,
+                    &after_cursor,
+                    &(if limit == 0 { 1000 } else { limit } as i64),
+                ],
             )
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())

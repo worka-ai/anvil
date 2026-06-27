@@ -57,6 +57,7 @@ pub enum AnvilAction {
     IndexRead,
     IndexUpdate,
     IndexDelete,
+    IndexWatch,
 
     // Internal actions
     InternalPutShard,
@@ -118,6 +119,7 @@ impl fmt::Display for AnvilAction {
             AnvilAction::IndexRead => "index:read",
             AnvilAction::IndexUpdate => "index:update",
             AnvilAction::IndexDelete => "index:delete",
+            AnvilAction::IndexWatch => "index:watch",
 
             // Internal actions
             AnvilAction::InternalPutShard => "internal:put_shard",
@@ -184,6 +186,7 @@ impl FromStr for AnvilAction {
             "index:read" => Ok(AnvilAction::IndexRead),
             "index:update" => Ok(AnvilAction::IndexUpdate),
             "index:delete" => Ok(AnvilAction::IndexDelete),
+            "index:watch" => Ok(AnvilAction::IndexWatch),
 
             // Internal actions
             "internal:put_shard" => Ok(AnvilAction::InternalPutShard),
@@ -218,6 +221,7 @@ mod tests {
             AnvilAction::PolicyGrant,
             AnvilAction::AuthzCheck,
             AnvilAction::IndexCreate,
+            AnvilAction::IndexWatch,
             AnvilAction::InternalPutShard,
             AnvilAction::InternalDeleteShard,
         ];
