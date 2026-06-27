@@ -287,6 +287,17 @@ impl Storage {
             .join(format!("{derived_index_id}.anwatch")))
     }
 
+    pub fn authz_namespace_watch_path(&self, tenant_id: i64, namespace: &str) -> Result<PathBuf> {
+        ensure_safe_internal_component(namespace, "authorization namespace")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("watch")
+            .join("authz-namespace")
+            .join(format!("tenant-{tenant_id}"))
+            .join(format!("{namespace}.anwatch")))
+    }
+
     pub fn git_source_watch_path(&self, tenant_id: i64, repository_id: &str) -> Result<PathBuf> {
         ensure_safe_internal_component(repository_id, "git repository id")?;
         Ok(self
