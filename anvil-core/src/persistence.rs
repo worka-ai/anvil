@@ -1912,8 +1912,9 @@ impl Persistence {
         reason: &str,
         record_hash: &str,
     ) -> Result<AuthzTupleRecord> {
-        let client = self.regional_pool.get().await?;
-        let row = client
+        let mut client = self.regional_pool.get().await?;
+        let tx = client.transaction().await?;
+        let row = tx
             .query_one(
                 r#"
                 INSERT INTO authz_tuple_log
@@ -1936,7 +1937,40 @@ impl Persistence {
                 ],
             )
             .await?;
-        Ok(row.into())
+        let record: AuthzTupleRecord = row.into();
+        tx.execute(
+            r#"
+            INSERT INTO authz_current_tuples
+                (tenant_id, namespace, object_id, relation, subject_kind, subject_id, caveat_hash,
+                 operation, revision, written_by, reason, record_hash, written_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            ON CONFLICT (tenant_id, namespace, object_id, relation, subject_kind, subject_id, caveat_hash)
+            DO UPDATE SET
+                operation = EXCLUDED.operation,
+                revision = EXCLUDED.revision,
+                written_by = EXCLUDED.written_by,
+                reason = EXCLUDED.reason,
+                record_hash = EXCLUDED.record_hash,
+                written_at = EXCLUDED.written_at"#,
+            &[
+                &record.tenant_id,
+                &record.namespace,
+                &record.object_id,
+                &record.relation,
+                &record.subject_kind,
+                &record.subject_id,
+                &record.caveat_hash,
+                &record.operation,
+                &record.revision,
+                &record.written_by,
+                &record.reason,
+                &record.record_hash,
+                &record.written_at,
+            ],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1955,16 +1989,14 @@ impl Persistence {
             .query_opt(
                 r#"
                 SELECT *
-                FROM authz_tuple_log
+                FROM authz_current_tuples
                 WHERE tenant_id = $1
                   AND namespace = $2
                   AND object_id = $3
                   AND relation = $4
                   AND subject_kind = $5
                   AND subject_id = $6
-                  AND caveat_hash = $7
-                ORDER BY revision DESC
-                LIMIT 1"#,
+                  AND caveat_hash = $7"#,
                 &[
                     &tenant_id,
                     &namespace,
