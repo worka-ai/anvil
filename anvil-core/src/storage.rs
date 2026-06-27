@@ -75,6 +75,14 @@ impl Storage {
             .join("definitions.anjournal")
     }
 
+    pub fn authz_tuple_journal_path(&self, tenant_id: i64) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("authz")
+            .join(format!("tenant-{tenant_id}"))
+            .join("tuples.anjournal")
+    }
+
     pub fn metadata_segment_path(
         &self,
         tenant_id: i64,

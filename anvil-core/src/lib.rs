@@ -9,6 +9,7 @@ use tokio::sync::{RwLock, broadcast};
 
 // The modules we've created
 pub mod auth;
+pub mod authz_journal;
 pub mod bucket_journal;
 pub mod bucket_manager;
 pub mod cache;

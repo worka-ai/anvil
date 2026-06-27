@@ -1,7 +1,7 @@
 use crate::anvil_api::auth_service_server::AuthService;
 use crate::anvil_api::*;
 use crate::{
-    AppState, auth,
+    AppState, auth, authz_journal,
     bucket_journal::{self, BucketJournalMutation},
     crypto,
     permissions::AnvilAction,
@@ -240,6 +240,9 @@ impl AuthService for AppState {
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        authz_journal::append_authz_tuple_record(&self.storage, &record)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
         let _ = self.authz_watch_tx.send(record.clone());
 
         Ok(Response::new(WriteAuthzTupleResponse {
@@ -269,9 +272,7 @@ impl AuthService for AppState {
             return Err(Status::permission_denied("Permission denied"));
         }
         let consistency = AuthzConsistency::from_request(&req.consistency, &req.zookie)?;
-        let latest_revision = self
-            .db
-            .latest_authz_revision(claims.tenant_id)
+        let latest_revision = authz_journal::latest_authz_revision(&self.storage, claims.tenant_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         if let Some(required_revision) = consistency.required_revision()
@@ -282,36 +283,34 @@ impl AuthService for AppState {
 
         let (record, response_revision) = match consistency {
             AuthzConsistency::Exact(revision) => {
-                let record = self
-                    .db
-                    .check_authz_tuple_at_revision(
-                        claims.tenant_id,
-                        &req.namespace,
-                        &req.object_id,
-                        &req.relation,
-                        &req.subject_kind,
-                        &req.subject_id,
-                        &req.caveat_hash,
-                        revision,
-                    )
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
+                let record = authz_journal::check_authz_tuple_at_revision(
+                    &self.storage,
+                    claims.tenant_id,
+                    &req.namespace,
+                    &req.object_id,
+                    &req.relation,
+                    &req.subject_kind,
+                    &req.subject_id,
+                    &req.caveat_hash,
+                    revision,
+                )
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
                 (record, revision)
             }
             AuthzConsistency::Latest | AuthzConsistency::AtLeast(_) => {
-                let record = self
-                    .db
-                    .check_authz_tuple(
-                        claims.tenant_id,
-                        &req.namespace,
-                        &req.object_id,
-                        &req.relation,
-                        &req.subject_kind,
-                        &req.subject_id,
-                        &req.caveat_hash,
-                    )
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
+                let record = authz_journal::check_authz_tuple(
+                    &self.storage,
+                    claims.tenant_id,
+                    &req.namespace,
+                    &req.object_id,
+                    &req.relation,
+                    &req.subject_kind,
+                    &req.subject_id,
+                    &req.caveat_hash,
+                )
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
                 (record, latest_revision)
             }
         };
@@ -352,11 +351,15 @@ impl AuthService for AppState {
         let after_revision = i64::try_from(req.after_revision)
             .map_err(|_| Status::invalid_argument("after_revision exceeds supported range"))?;
         let mut live = self.authz_watch_tx.subscribe();
-        let snapshot = self
-            .db
-            .list_authz_tuple_log(claims.tenant_id, after_revision, &req.namespace, 1000)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let snapshot = authz_journal::list_authz_tuple_log(
+            &self.storage,
+            claims.tenant_id,
+            after_revision,
+            &req.namespace,
+            1000,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
 
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
