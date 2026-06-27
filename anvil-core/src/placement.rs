@@ -70,8 +70,6 @@ mod tests {
         }
 
         let object_key1 = uuid::Uuid::new_v4().to_string();
-        let object_key2 = uuid::Uuid::new_v4().to_string();
-
         // Calculate placement twice for the same key
         let placement1 = manager
             .calculate_placement(&object_key1, &cluster_state, 3)
@@ -84,16 +82,22 @@ mod tests {
         assert_eq!(placement1, placement2, "Placement should be deterministic");
         assert_eq!(placement1.len(), 3, "Should return 3 nodes");
 
-        // Calculate placement for a different key
-        let placement3 = manager
-            .calculate_placement(&object_key2, &cluster_state, 3)
-            .await;
-        assert_eq!(placement3.len(), 3, "Should return 3 nodes");
-
-        // Assert that the placement for a different key is different
-        assert_ne!(
-            placement1, placement3,
-            "Placement for different keys should be different"
+        // A single different key can legitimately choose the same top-N set, so
+        // sample a small batch and assert that rendezvous scores vary.
+        let mut saw_different_placement = false;
+        for i in 0..32 {
+            let placement = manager
+                .calculate_placement(&format!("object-key-{i}"), &cluster_state, 3)
+                .await;
+            assert_eq!(placement.len(), 3, "Should return 3 nodes");
+            if placement != placement1 {
+                saw_different_placement = true;
+                break;
+            }
+        }
+        assert!(
+            saw_different_placement,
+            "Placement should vary across a batch of different keys"
         );
     }
 }

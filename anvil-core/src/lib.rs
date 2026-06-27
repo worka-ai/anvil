@@ -15,6 +15,7 @@ pub mod cluster;
 pub mod config;
 pub mod crypto;
 pub mod discovery;
+pub mod formats;
 pub mod middleware;
 pub mod object_manager;
 pub mod permissions;
