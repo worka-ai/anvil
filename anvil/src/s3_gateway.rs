@@ -10,9 +10,11 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, put},
 };
+use futures_core::Stream;
 use futures_util::stream::StreamExt;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::pin::Pin;
 
 #[derive(Deserialize)]
 struct CreateBucketConfiguration {
@@ -573,6 +575,10 @@ async fn get_object(
         Ok(version_id) => version_id,
         Err(response) => return response,
     };
+    let requested_range = match parse_http_range(req.headers(), None) {
+        Ok(range) => range,
+        Err(response) => return response,
+    };
 
     match state
         .object_manager
@@ -580,14 +586,38 @@ async fn get_object(
         .await
     {
         Ok((object, stream)) => {
-            let body = Body::from_stream(stream.map(|r| r.map_err(|e| axum::Error::new(e))));
-            Response::builder()
-                .status(200)
+            let range = match requested_range {
+                Some(range_header) => match range_header.resolve(object.size as u64) {
+                    Ok(range) => Some(range),
+                    Err(response) => return response,
+                },
+                None => None,
+            };
+            let (status, content_length, body_stream) = match range {
+                Some(range) => (
+                    axum::http::StatusCode::PARTIAL_CONTENT,
+                    range.len() as i64,
+                    slice_stream_by_range(stream, range),
+                ),
+                None => (axum::http::StatusCode::OK, object.size, stream),
+            };
+            let mut builder = Response::builder()
+                .status(status)
                 .header("Content-Type", object.content_type.unwrap_or_default())
-                .header("Content-Length", object.size)
+                .header("Content-Length", content_length)
                 .header("ETag", object.etag)
-                .header("x-amz-version-id", object.version_id.to_string())
-                .body(body)
+                .header("Accept-Ranges", "bytes")
+                .header("x-amz-version-id", object.version_id.to_string());
+            if let Some(range) = range {
+                builder = builder.header(
+                    "Content-Range",
+                    format!("bytes {}-{}/{}", range.start, range.end, object.size),
+                );
+            }
+            builder
+                .body(Body::from_stream(
+                    body_stream.map(|r| r.map_err(|e| axum::Error::new(e))),
+                ))
                 .unwrap()
         }
         Err(status) => match status.code() {
@@ -778,6 +808,7 @@ async fn head_object(
             .header("Content-Type", object.content_type.unwrap_or_default())
             .header("Content-Length", object.size)
             .header("ETag", object.etag)
+            .header("Accept-Ranges", "bytes")
             .header("x-amz-version-id", object.version_id.to_string())
             .body(Body::empty())
             .unwrap(),
@@ -822,6 +853,145 @@ async fn head_object(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ByteRange {
+    start: u64,
+    end: u64,
+}
+
+impl ByteRange {
+    fn len(self) -> u64 {
+        self.end - self.start + 1
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestedByteRange {
+    FromStart { start: u64, end: Option<u64> },
+    Suffix { len: u64 },
+}
+
+impl RequestedByteRange {
+    fn resolve(self, object_size: u64) -> Result<ByteRange, Response> {
+        if object_size == 0 {
+            return Err(invalid_range_response(object_size));
+        }
+        match self {
+            Self::FromStart { start, end } => {
+                if start >= object_size {
+                    return Err(invalid_range_response(object_size));
+                }
+                let end = end.unwrap_or(object_size - 1).min(object_size - 1);
+                if end < start {
+                    return Err(invalid_range_response(object_size));
+                }
+                Ok(ByteRange { start, end })
+            }
+            Self::Suffix { len } => {
+                if len == 0 {
+                    return Err(invalid_range_response(object_size));
+                }
+                let len = len.min(object_size);
+                Ok(ByteRange {
+                    start: object_size - len,
+                    end: object_size - 1,
+                })
+            }
+        }
+    }
+}
+
+fn parse_http_range(
+    headers: &axum::http::HeaderMap,
+    object_size: Option<u64>,
+) -> Result<Option<RequestedByteRange>, Response> {
+    let Some(value) = headers.get(axum::http::header::RANGE) else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| {
+        s3_error(
+            "InvalidRange",
+            "Invalid Range header",
+            axum::http::StatusCode::RANGE_NOT_SATISFIABLE,
+        )
+    })?;
+    if value.contains(',') {
+        return Err(invalid_range_response(object_size.unwrap_or(0)));
+    }
+    let Some(spec) = value.strip_prefix("bytes=") else {
+        return Err(invalid_range_response(object_size.unwrap_or(0)));
+    };
+    let Some((start, end)) = spec.split_once('-') else {
+        return Err(invalid_range_response(object_size.unwrap_or(0)));
+    };
+    if start.is_empty() && end.is_empty() {
+        return Err(invalid_range_response(object_size.unwrap_or(0)));
+    }
+    let requested = if start.is_empty() {
+        RequestedByteRange::Suffix {
+            len: end
+                .parse()
+                .map_err(|_| invalid_range_response(object_size.unwrap_or(0)))?,
+        }
+    } else {
+        RequestedByteRange::FromStart {
+            start: start
+                .parse()
+                .map_err(|_| invalid_range_response(object_size.unwrap_or(0)))?,
+            end: if end.is_empty() {
+                None
+            } else {
+                Some(
+                    end.parse()
+                        .map_err(|_| invalid_range_response(object_size.unwrap_or(0)))?,
+                )
+            },
+        }
+    };
+    Ok(Some(requested))
+}
+
+fn invalid_range_response(object_size: u64) -> Response {
+    Response::builder()
+        .status(axum::http::StatusCode::RANGE_NOT_SATISFIABLE)
+        .header("Content-Range", format!("bytes */{}", object_size))
+        .header("Content-Type", "application/xml")
+        .body(Body::from(format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\n  <Code>InvalidRange</Code>\n  <Message>Invalid Range header</Message>\n</Error>\n"
+        )))
+        .unwrap()
+}
+
+fn slice_stream_by_range(
+    mut stream: Pin<Box<dyn Stream<Item = Result<Vec<u8>, tonic::Status>> + Send + 'static>>,
+    range: ByteRange,
+) -> Pin<Box<dyn Stream<Item = Result<Vec<u8>, tonic::Status>> + Send + 'static>> {
+    Box::pin(async_stream::try_stream! {
+        let mut offset = 0u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            let chunk_len = chunk.len() as u64;
+            if chunk_len == 0 {
+                continue;
+            }
+            let chunk_start = offset;
+            let chunk_end = offset + chunk_len - 1;
+            offset += chunk_len;
+
+            if chunk_end < range.start {
+                continue;
+            }
+            if chunk_start > range.end {
+                break;
+            }
+
+            let from = range.start.saturating_sub(chunk_start) as usize;
+            let to_exclusive = (range.end.min(chunk_end) - chunk_start + 1) as usize;
+            yield chunk[from..to_exclusive].to_vec();
+        }
+    })
+}
+
 fn parse_s3_version_id(q: &HashMap<String, String>) -> Result<Option<uuid::Uuid>, Response> {
     q.get("versionId")
         .or_else(|| q.get("version-id"))
@@ -841,9 +1011,16 @@ fn parse_s3_version_id(q: &HashMap<String, String>) -> Result<Option<uuid::Uuid>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::TryStreamExt;
 
     fn request(uri: &str) -> Request {
         Request::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    fn range_headers(value: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(axum::http::header::RANGE, value.parse().unwrap());
+        headers
     }
 
     #[test]
@@ -870,5 +1047,55 @@ mod tests {
         assert!(!request_targets_reserved_namespace(&request(
             "/bucket?prefix=customer%2F_anvil%2Fauthz%2F"
         )));
+    }
+
+    #[test]
+    fn range_parser_resolves_standard_and_suffix_ranges() {
+        let standard = parse_http_range(&range_headers("bytes=2-5"), Some(10))
+            .unwrap()
+            .unwrap()
+            .resolve(10)
+            .unwrap();
+        assert_eq!(standard, ByteRange { start: 2, end: 5 });
+
+        let open_ended = parse_http_range(&range_headers("bytes=7-"), Some(10))
+            .unwrap()
+            .unwrap()
+            .resolve(10)
+            .unwrap();
+        assert_eq!(open_ended, ByteRange { start: 7, end: 9 });
+
+        let suffix = parse_http_range(&range_headers("bytes=-4"), Some(10))
+            .unwrap()
+            .unwrap()
+            .resolve(10)
+            .unwrap();
+        assert_eq!(suffix, ByteRange { start: 6, end: 9 });
+    }
+
+    #[test]
+    fn range_parser_rejects_multi_ranges_and_unsatisfied_ranges() {
+        assert!(parse_http_range(&range_headers("bytes=0-1,4-5"), Some(10)).is_err());
+        assert!(
+            parse_http_range(&range_headers("bytes=20-30"), Some(10))
+                .unwrap()
+                .unwrap()
+                .resolve(10)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn range_stream_slices_across_chunk_boundaries() {
+        let stream = Box::pin(futures_util::stream::iter(vec![
+            Ok(b"abc".to_vec()),
+            Ok(b"defg".to_vec()),
+            Ok(b"hij".to_vec()),
+        ]));
+        let body = slice_stream_by_range(stream, ByteRange { start: 2, end: 7 })
+            .try_concat()
+            .await
+            .unwrap();
+        assert_eq!(body, b"cdefgh");
     }
 }

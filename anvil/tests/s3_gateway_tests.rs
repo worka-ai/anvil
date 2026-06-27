@@ -215,6 +215,30 @@ async fn test_s3_public_and_private_access() {
     let data = resp.body.collect().await.unwrap().into_bytes();
     assert_eq!(data.as_ref(), private_content);
 
+    let range_resp = client
+        .get_object()
+        .bucket(&private_bucket)
+        .key(private_key)
+        .range("bytes=5-8")
+        .send()
+        .await
+        .expect("range GET should succeed");
+    assert_eq!(range_resp.content_range(), Some("bytes 5-8/23"));
+    let range_data = range_resp.body.collect().await.unwrap().into_bytes();
+    assert_eq!(range_data.as_ref(), b"is p");
+
+    let suffix_resp = client
+        .get_object()
+        .bucket(&private_bucket)
+        .key(private_key)
+        .range("bytes=-7")
+        .send()
+        .await
+        .expect("suffix range GET should succeed");
+    assert_eq!(suffix_resp.content_range(), Some("bytes 16-22/23"));
+    let suffix_data = suffix_resp.body.collect().await.unwrap().into_bytes();
+    assert_eq!(suffix_data.as_ref(), b"content");
+
     // 5b. S3 version listing returns overwritten versions and delete markers.
     client
         .put_object()
