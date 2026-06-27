@@ -74,6 +74,14 @@ struct ObjectVersionBody {
     index_policy_snapshot: String,
     record_hash: String,
     storage_class: Option<i16>,
+    #[serde(default)]
+    user_meta: Option<serde_json::Value>,
+    #[serde(default)]
+    shard_map: Option<serde_json::Value>,
+    #[serde(default)]
+    inline_payload: Option<Vec<u8>>,
+    #[serde(default)]
+    checksum: Option<Vec<u8>>,
     delete_marker: bool,
     created_at: String,
     deleted_at: Option<String>,
@@ -135,6 +143,10 @@ pub async fn append_object_mutation(
         index_policy_snapshot: object.index_policy_snapshot.clone(),
         record_hash: object.record_hash.clone(),
         storage_class: object.storage_class,
+        user_meta: object.user_meta.clone(),
+        shard_map: object.shard_map.clone(),
+        inline_payload: object.inline_payload.clone(),
+        checksum: object.checksum.clone(),
         delete_marker: mutation.is_delete_marker(),
         created_at: object.created_at.to_rfc3339(),
         deleted_at: object.deleted_at.map(|ts| ts.to_rfc3339()),
@@ -206,6 +218,12 @@ pub struct RecoveredObjectMetadataPartition {
     pub manifest: PartitionManifest,
     pub metadata_records: Vec<SegmentRecord>,
     pub directory_records: Vec<SegmentRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeObjectListing {
+    pub objects: Vec<Object>,
+    pub common_prefixes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -480,6 +498,153 @@ pub async fn recover_object_metadata_partition(
     })
 }
 
+pub async fn read_current_object(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+    object_key: &str,
+) -> Result<Option<Object>> {
+    Ok(read_current_objects(storage, bucket, manifest_signing_key)
+        .await?
+        .into_iter()
+        .find(|object| object.key == object_key))
+}
+
+pub async fn list_current_objects(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+    prefix: &str,
+    start_after: &str,
+    limit: i32,
+    delimiter: &str,
+) -> Result<NativeObjectListing> {
+    let mut objects = read_current_objects(storage, bucket, manifest_signing_key).await?;
+    objects.retain(|object| object.key.starts_with(prefix) && object.key.as_str() > start_after);
+    objects.sort_by(|left, right| left.key.cmp(&right.key));
+
+    let limit = limit.max(1) as usize;
+    if delimiter.is_empty() {
+        objects.truncate(limit);
+        return Ok(NativeObjectListing {
+            objects,
+            common_prefixes: Vec::new(),
+        });
+    }
+
+    enum ListingEntry {
+        Object(Object),
+        CommonPrefix(String),
+    }
+
+    let mut merged = std::collections::BTreeMap::<String, ListingEntry>::new();
+    for object in objects {
+        let suffix = &object.key[prefix.len()..];
+        if let Some(position) = suffix.find(delimiter) {
+            let common_prefix = format!("{}{}", prefix, &suffix[..position + delimiter.len()]);
+            merged
+                .entry(common_prefix.clone())
+                .or_insert(ListingEntry::CommonPrefix(common_prefix));
+        } else {
+            merged.insert(object.key.clone(), ListingEntry::Object(object));
+        }
+        if merged.len() >= limit {
+            break;
+        }
+    }
+
+    let mut listing = NativeObjectListing {
+        objects: Vec::new(),
+        common_prefixes: Vec::new(),
+    };
+    for (_, entry) in merged.into_iter().take(limit) {
+        match entry {
+            ListingEntry::Object(object) => listing.objects.push(object),
+            ListingEntry::CommonPrefix(common_prefix) => {
+                listing.common_prefixes.push(common_prefix)
+            }
+        }
+    }
+    Ok(listing)
+}
+
+pub async fn read_current_objects(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+) -> Result<Vec<Object>> {
+    let mut body_records = Vec::<(usize, ObjectVersionBody)>::new();
+    let mut order = 0usize;
+    let mut compacted_through_sequence = 0u64;
+
+    let manifest_path = storage.metadata_manifest_path(bucket.tenant_id, bucket.id);
+    if tokio::fs::metadata(&manifest_path).await.is_ok() {
+        let recovered = recover_object_metadata_partition(storage, bucket, manifest_signing_key)
+            .await
+            .with_context(|| {
+                format!(
+                    "recover object metadata partition from {}",
+                    manifest_path.display()
+                )
+            })?;
+        compacted_through_sequence = recovered.manifest.compacted_through_sequence;
+        for record in recovered.metadata_records {
+            let body: ObjectVersionBody = serde_json::from_slice(&record.value)?;
+            body_records.push((order, body));
+            order += 1;
+        }
+    }
+
+    let journal_path = storage.metadata_journal_path(bucket.tenant_id, bucket.id);
+    if tokio::fs::metadata(&journal_path).await.is_ok() {
+        let journal_bytes = tokio::fs::read(&journal_path)
+            .await
+            .with_context(|| format!("read metadata journal {}", journal_path.display()))?;
+        let (_, frames) = decode_journal_file(&journal_bytes)?;
+        for frame in frames {
+            if frame.partition_sequence <= compacted_through_sequence {
+                continue;
+            }
+            if matches!(
+                frame.record_kind,
+                JournalRecordKind::ObjectVersion | JournalRecordKind::DeleteMarker
+            ) {
+                let body: ObjectVersionBody = serde_json::from_slice(&frame.body)?;
+                body_records.push((order, body));
+                order += 1;
+            }
+        }
+    }
+
+    let mut versions_by_key =
+        std::collections::BTreeMap::<String, Vec<(usize, ObjectVersionBody)>>::new();
+    for (order, body) in body_records {
+        let versions = versions_by_key.entry(body.object_key.clone()).or_default();
+        if body.event == "delete_version" {
+            versions.retain(|(_, existing)| existing.version_id != body.version_id);
+        } else {
+            versions.push((order, body));
+        }
+    }
+
+    let mut current = Vec::new();
+    for versions in versions_by_key.values_mut() {
+        versions.sort_by(|(left_order, left), (right_order, right)| {
+            parse_body_timestamp(&left.created_at)
+                .ok()
+                .cmp(&parse_body_timestamp(&right.created_at).ok())
+                .then_with(|| left_order.cmp(right_order))
+        });
+        if let Some((_, body)) = versions.last() {
+            if !body.delete_marker && body.deleted_at.is_none() {
+                current.push(object_from_body(body)?);
+            }
+        }
+    }
+    current.sort_by(|left, right| left.key.cmp(&right.key));
+    Ok(current)
+}
+
 async fn write_segment_file(
     path: &Path,
     family: FileFamily,
@@ -671,6 +836,40 @@ fn decode_segment_body_records(body: &SegmentBody) -> Result<Vec<SegmentRecord>>
         records.extend(block.decode_uncompressed_records()?);
     }
     Ok(records)
+}
+
+fn object_from_body(body: &ObjectVersionBody) -> Result<Object> {
+    Ok(Object {
+        id: 0,
+        tenant_id: body.tenant_id,
+        bucket_id: body.bucket_id,
+        key: body.object_key.clone(),
+        content_hash: body.content_hash.clone(),
+        size: body.size,
+        etag: body.etag.clone(),
+        content_type: body.content_type.clone(),
+        version_id: uuid::Uuid::parse_str(&body.version_id)?,
+        mutation_id: uuid::Uuid::parse_str(&body.mutation_id)?,
+        index_policy_snapshot: body.index_policy_snapshot.clone(),
+        user_metadata_hash: body.user_metadata_hash.clone(),
+        authz_revision: body.authz_revision,
+        record_hash: body.record_hash.clone(),
+        created_at: parse_body_timestamp(&body.created_at)?,
+        deleted_at: body
+            .deleted_at
+            .as_deref()
+            .map(parse_body_timestamp)
+            .transpose()?,
+        storage_class: body.storage_class,
+        user_meta: body.user_meta.clone(),
+        shard_map: body.shard_map.clone(),
+        inline_payload: body.inline_payload.clone(),
+        checksum: body.checksum.clone(),
+    })
+}
+
+fn parse_body_timestamp(value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    Ok(chrono::DateTime::parse_from_rfc3339(value)?.with_timezone(&chrono::Utc))
 }
 
 fn segment_header(
@@ -893,6 +1092,12 @@ mod tests {
         assert_eq!(frames[1].previous_record_hash, frames[0].record_hash);
         assert_eq!(frames[2].previous_record_hash, frames[1].record_hash);
         validate_journal_chain(&frames).unwrap();
+
+        let current = read_current_objects(&storage, &bucket, b"unused without manifest")
+            .await
+            .unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].key, first.key);
     }
 
     #[tokio::test]
@@ -954,6 +1159,17 @@ mod tests {
                 .resolve_relative_storage_path("../escape.anseg")
                 .is_err()
         );
+        let current = read_current_objects(&storage, &bucket, signing_key)
+            .await
+            .unwrap();
+        assert_eq!(current.len(), 2);
+        assert_eq!(current[0].key, second.key);
+        assert_eq!(current[0].version_id, second.version_id);
+        let listed = list_current_objects(&storage, &bucket, signing_key, "docs/", "", 10, "/")
+            .await
+            .unwrap();
+        assert_eq!(listed.objects.len(), 2);
+        assert!(listed.common_prefixes.is_empty());
 
         let metadata_bytes = tokio::fs::read(&sealed.metadata_path).await.unwrap();
         let metadata_body =

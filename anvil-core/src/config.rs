@@ -59,6 +59,10 @@ pub struct Config {
     /// TTL for metadata cache entries in seconds.
     #[arg(long, env, default_value_t = 300)]
     pub metadata_cache_ttl_secs: u64,
+
+    /// Directory used for Anvil-owned object bytes, metadata journals, indexes, and manifests.
+    #[arg(long, env, default_value = "anvil-data")]
+    pub storage_path: String,
 }
 impl Config {
     #[allow(unused)]

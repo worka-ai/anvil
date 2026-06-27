@@ -15,6 +15,7 @@ use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::ops::Deref;
+use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -153,6 +154,7 @@ pub struct TestCluster {
     pub global_db_name: String,
     pub regional_db_names: Vec<String>,
     pub config: Arc<anvil_core::config::Config>,
+    pub storage_path: PathBuf,
     maint_client: Option<tokio_postgres::Client>,
 }
 
@@ -184,6 +186,8 @@ impl TestCluster {
                 .try_init();
         });
 
+        let storage_path =
+            std::env::temp_dir().join(format!("anvil-test-storage-{}", uuid::Uuid::new_v4()));
         let config = Arc::new(anvil_core::config::Config {
             global_database_url: "".to_string(),
             regional_database_url: "".to_string(),
@@ -200,6 +204,7 @@ impl TestCluster {
             bootstrap_addrs: vec![],
             init_cluster: false,
             enable_mdns: false,
+            storage_path: storage_path.to_string_lossy().into_owned(),
         });
 
         let unique_regions: HashSet<String> = regions.iter().map(|s| s.to_string()).collect();
@@ -261,6 +266,7 @@ impl TestCluster {
             global_db_name,
             regional_db_names,
             config,
+            storage_path,
             maint_client: Some(maint_client),
         }
     }
@@ -395,6 +401,16 @@ impl Drop for TestCluster {
         // Abort all spawned Anvil nodes
         for node in self.nodes.drain(..) {
             node.abort();
+        }
+
+        if let Err(e) = std::fs::remove_dir_all(&self.storage_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "Failed to remove test storage {}: {}",
+                    self.storage_path.display(),
+                    e
+                );
+            }
         }
 
         // Drop the isolated test databases

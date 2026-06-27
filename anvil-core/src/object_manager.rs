@@ -1215,12 +1215,15 @@ impl ObjectManager {
                 }
                 Ok(object)
             }
-            None => self
-                .db
-                .get_object(bucket.id, object_key)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-                .ok_or_else(|| Status::not_found("Object not found")),
+            None => metadata_journal::read_current_object(
+                &self.storage,
+                &bucket,
+                &self.encryption_key,
+                object_key,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Object not found")),
         }
     }
 
@@ -1254,16 +1257,18 @@ impl ObjectManager {
             }
         }
 
-        self.db
-            .list_objects(
-                bucket.id,
-                prefix,
-                start_after,
-                if limit == 0 { 1000 } else { limit },
-                delimiter,
-            )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))
+        let listing = metadata_journal::list_current_objects(
+            &self.storage,
+            &bucket,
+            &self.encryption_key,
+            prefix,
+            start_after,
+            if limit == 0 { 1000 } else { limit },
+            delimiter,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+        Ok((listing.objects, listing.common_prefixes))
     }
 
     pub async fn list_object_versions(

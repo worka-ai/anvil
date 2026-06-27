@@ -23,6 +23,7 @@ async fn test_cluster_gossip() {
         enable_mdns: true, // Enable for this specific gossip test
         cluster_secret: Some("test-secret".to_string()),
         metadata_cache_ttl_secs: 1,
+        storage_path: "anvil-data".to_string(),
     });
     // 1. Create two swarms
     let mut swarm1 = create_swarm(config.clone()).await.unwrap();
@@ -121,6 +122,7 @@ async fn test_cluster_gossip_invalid_secret() {
         enable_mdns: true,
         cluster_secret: Some("secret-1".to_string()),
         metadata_cache_ttl_secs: 1,
+        storage_path: "anvil-data".to_string(),
     });
     let config2 = Arc::new(anvil::config::Config {
         global_database_url: "".to_string(),
@@ -138,6 +140,7 @@ async fn test_cluster_gossip_invalid_secret() {
         enable_mdns: true,
         cluster_secret: Some("secret-2".to_string()),
         metadata_cache_ttl_secs: 1,
+        storage_path: "anvil-data".to_string(),
     });
 
     let mut swarm1 = create_swarm(config1).await.unwrap();

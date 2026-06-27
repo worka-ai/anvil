@@ -63,7 +63,7 @@ impl AppState {
     ) -> Result<Self> {
         let arc_config = Arc::new(config);
         let jwt_manager = Arc::new(JwtManager::new(arc_config.jwt_secret.clone()));
-        let storage = storage::Storage::new().await?;
+        let storage = storage::Storage::new_at(&arc_config.storage_path).await?;
         let cluster_state = Arc::new(RwLock::new(HashMap::new()));
         let db =
             persistence::Persistence::new(global_pool, regional_pool, event_publisher, &arc_config);
