@@ -57,6 +57,11 @@ struct DeleteObjectPayload {
     shard_map: Option<Vec<String>>,
 }
 
+#[derive(Deserialize)]
+struct DeleteBucketPayload {
+    bucket_id: i64,
+}
+
 pub async fn run(
     persistence: Persistence,
     cluster_state: ClusterState,
@@ -64,7 +69,7 @@ pub async fn run(
     object_manager: ObjectManager,
 ) -> Result<()> {
     loop {
-        let tasks = match persistence.fetch_pending_tasks_for_update(10).await {
+        let tasks = match persistence.claim_pending_tasks(10).await {
             Ok(rows) => rows
                 .into_iter()
                 .map(Task::try_from)
@@ -87,13 +92,9 @@ pub async fn run(
             let jm = jwt_manager.clone();
             let om = object_manager.clone();
             tokio::spawn(async move {
-                if let Err(e) = p.update_task_status(task.id, TaskStatus::Running).await {
-                    error!("Failed to mark task {} as running: {}", task.id, e);
-                    return;
-                }
-
                 let result = match task.task_type {
                     TaskType::DeleteObject => handle_delete_object(&p, &cs, &jm, &task).await,
+                    TaskType::DeleteBucket => handle_delete_bucket(&p, &task).await,
                     TaskType::HFIngestion => handle_hf_ingestion(&p, &om, &task).await,
                     _ => {
                         warn!("Unhandled task type: {:?}", task.task_type);
@@ -553,5 +554,26 @@ async fn handle_delete_object(
         "Successfully processed DeleteObject task for object {}",
         payload.object_id
     );
+    Ok(())
+}
+
+async fn handle_delete_bucket(persistence: &Persistence, task: &Task) -> Result<()> {
+    let payload: DeleteBucketPayload = serde_json::from_value(task.payload.clone())?;
+    let deleted = persistence
+        .hard_delete_bucket_if_empty(payload.bucket_id)
+        .await?;
+
+    if deleted {
+        info!(
+            "Successfully processed DeleteBucket task for bucket {}",
+            payload.bucket_id
+        );
+    } else {
+        info!(
+            "DeleteBucket task for bucket {} was already applied",
+            payload.bucket_id
+        );
+    }
+
     Ok(())
 }

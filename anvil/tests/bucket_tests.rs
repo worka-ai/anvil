@@ -7,10 +7,42 @@ use anvil::anvil_api::{
 };
 use anvil::tasks::TaskStatus;
 use futures_util::StreamExt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tonic::Request;
 
 use anvil_test_utils::*;
+
+#[tokio::test]
+async fn test_task_claim_marks_tasks_running_before_execution() {
+    let cluster = TestCluster::new(&["test-region-1"]).await;
+    let db = &cluster.states[0].db;
+
+    db.enqueue_task(
+        anvil::tasks::TaskType::DeleteBucket,
+        serde_json::json!({ "bucket_id": 123_i64 }),
+        100,
+    )
+    .await
+    .unwrap();
+
+    let claimed = db.claim_pending_tasks(10).await.unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].get::<_, i64>("id"), 1);
+
+    let claimed_again = db.claim_pending_tasks(10).await.unwrap();
+    assert!(
+        claimed_again.is_empty(),
+        "running tasks must not be claimed again"
+    );
+
+    let client = db.get_global_pool().get().await.unwrap();
+    let status: TaskStatus = client
+        .query_one("SELECT status FROM tasks WHERE id = 1", &[])
+        .await
+        .unwrap()
+        .get("status");
+    assert_eq!(status, TaskStatus::Running);
+}
 
 #[tokio::test]
 async fn test_delete_bucket_soft_deletes_and_enqueues_task() {
@@ -75,15 +107,65 @@ async fn test_delete_bucket_soft_deletes_and_enqueues_task() {
     let client = global_pool.get().await.unwrap();
     let row = client
         .query_one(
-            "SELECT task_type, status FROM tasks WHERE payload->>'bucket_id' IS NOT NULL",
+            "SELECT task_type, status, payload FROM tasks WHERE payload->>'bucket_id' IS NOT NULL",
             &[],
         )
         .await
         .unwrap();
     let task_type: anvil::tasks::TaskType = row.get("task_type");
     let status: TaskStatus = row.get("status");
+    let payload: serde_json::Value = row.get("payload");
+    let bucket_id = payload
+        .get("bucket_id")
+        .and_then(|value| value.as_i64())
+        .expect("delete bucket task payload should contain bucket_id");
     assert!(matches!(task_type, anvil::tasks::TaskType::DeleteBucket));
-    assert_eq!(status, TaskStatus::Pending);
+    assert!(matches!(
+        status,
+        TaskStatus::Pending | TaskStatus::Running | TaskStatus::Completed
+    ));
+
+    // 5. The background worker must apply the queued deletion so the bucket
+    // name can be reused without leaving a permanently soft-deleted row behind.
+    let start = Instant::now();
+    loop {
+        let row = client
+            .query_one(
+                "SELECT status FROM tasks WHERE payload->>'bucket_id' = $1",
+                &[&bucket_id.to_string()],
+            )
+            .await
+            .unwrap();
+        let status: TaskStatus = row.get("status");
+        if status == TaskStatus::Completed {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(12),
+            "delete bucket task did not complete"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let exists: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM buckets WHERE id = $1)",
+            &[&bucket_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!exists, "delete bucket task should hard-delete bucket row");
+
+    let mut recreate_req = Request::new(CreateBucketRequest {
+        bucket_name,
+        region: "test-region-1".to_string(),
+    });
+    recreate_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client.create_bucket(recreate_req).await.unwrap();
 }
 
 #[tokio::test]

@@ -1401,6 +1401,46 @@ impl Persistence {
         Ok(active_upload_exists)
     }
 
+    pub async fn hard_delete_bucket_if_empty(&self, bucket_id: i64) -> Result<bool> {
+        if self
+            .bucket_has_retained_objects_or_uploads(bucket_id)
+            .await?
+        {
+            anyhow::bail!("bucket {} still has retained objects or uploads", bucket_id);
+        }
+
+        let client = self.global_pool.get().await?;
+        let deleted = client
+            .query_opt(
+                r#"
+                DELETE FROM buckets
+                WHERE id = $1 AND deleted_at IS NOT NULL
+                RETURNING tenant_id, name"#,
+                &[&bucket_id],
+            )
+            .await?;
+
+        if let Some(row) = deleted {
+            let tenant_id: i64 = row.get("tenant_id");
+            let name: String = row.get("name");
+            self.cache.invalidate_bucket(tenant_id, &name).await;
+            return Ok(true);
+        }
+
+        let exists = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM buckets WHERE id = $1)",
+                &[&bucket_id],
+            )
+            .await?
+            .get::<_, bool>(0);
+        if exists {
+            anyhow::bail!("bucket {} has not been soft-deleted", bucket_id);
+        }
+
+        Ok(false)
+    }
+
     pub async fn create_bucket_metadata_event(
         &self,
         tenant_id: i64,
@@ -3108,11 +3148,26 @@ impl Persistence {
         Ok(())
     }
 
-    pub async fn fetch_pending_tasks_for_update(&self, limit: i64) -> Result<Vec<Row>> {
+    pub async fn claim_pending_tasks(&self, limit: i64) -> Result<Vec<Row>> {
         let client = self.global_pool.get().await?;
         let rows = client
             .query(
-                r#"SELECT id, task_type::text, payload, attempts FROM tasks WHERE status = 'pending'::task_status AND scheduled_at <= now() ORDER BY priority ASC, created_at ASC LIMIT $1 FOR UPDATE SKIP LOCKED"#,
+                r#"
+                WITH claimed AS (
+                    SELECT id
+                    FROM tasks
+                    WHERE status = 'pending'::task_status
+                      AND scheduled_at <= now()
+                    ORDER BY priority ASC, created_at ASC
+                    LIMIT $1
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE tasks
+                SET status = 'running'::task_status,
+                    updated_at = now()
+                FROM claimed
+                WHERE tasks.id = claimed.id
+                RETURNING tasks.id, tasks.task_type::text, tasks.payload, tasks.attempts"#,
                 &[&limit],
             )
             .await?;
