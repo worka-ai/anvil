@@ -486,6 +486,81 @@ fn delta_encode_positions(positions: &[u32]) -> Vec<u32> {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bm25Config {
+    pub k1: f32,
+    pub b: f32,
+}
+
+impl Default for Bm25Config {
+    fn default() -> Self {
+        Self { k1: 1.2, b: 0.75 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bm25FieldStats {
+    pub document_count: u32,
+    pub average_field_length: f32,
+}
+
+impl Bm25FieldStats {
+    pub fn from_field_lengths(lengths: &[u32]) -> Self {
+        if lengths.is_empty() {
+            return Self {
+                document_count: 0,
+                average_field_length: 0.0,
+            };
+        }
+        let total = lengths
+            .iter()
+            .fold(0u64, |sum, length| sum.saturating_add(*length as u64));
+        Self {
+            document_count: lengths.len().min(u32::MAX as usize) as u32,
+            average_field_length: total as f32 / lengths.len() as f32,
+        }
+    }
+}
+
+pub fn bm25_score(
+    term_frequency: u16,
+    document_frequency: u32,
+    field_length: u32,
+    stats: Bm25FieldStats,
+    config: Bm25Config,
+) -> f32 {
+    if term_frequency == 0
+        || document_frequency == 0
+        || stats.document_count == 0
+        || stats.average_field_length <= 0.0
+    {
+        return 0.0;
+    }
+
+    let document_count = stats.document_count as f32;
+    let document_frequency = document_frequency.min(stats.document_count) as f32;
+    let idf = (1.0 + (document_count - document_frequency + 0.5) / (document_frequency + 0.5)).ln();
+    let tf = term_frequency as f32;
+    let field_length = field_length as f32;
+    let denominator =
+        tf + config.k1 * (1.0 - config.b + config.b * (field_length / stats.average_field_length));
+    idf * ((tf * (config.k1 + 1.0)) / denominator)
+}
+
+pub fn tokenized_field_lengths(
+    documents: &[FullTextDocument<'_>],
+    config: &TokenizerConfig,
+) -> Vec<u32> {
+    documents
+        .iter()
+        .map(|document| {
+            tokenize_text(document.text, config)
+                .len()
+                .min(u32::MAX as usize) as u32
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,5 +701,46 @@ mod tests {
         let (decoded, used) = Posting::decode(&built.postings_bytes[..alpha_postings_len]).unwrap();
         assert_eq!(used, alpha_postings_len);
         assert_eq!(decoded, *alpha);
+    }
+
+    #[test]
+    fn bm25_field_stats_are_derived_from_tokenized_lengths() {
+        let config = TokenizerConfig::default();
+        let documents = [
+            FullTextDocument {
+                document_id: 1,
+                field_id: 1,
+                object_version_id: [1; 16],
+                authz_label_hash: [1; 32],
+                text: "short field",
+            },
+            FullTextDocument {
+                document_id: 2,
+                field_id: 1,
+                object_version_id: [2; 16],
+                authz_label_hash: [2; 32],
+                text: "longer field with more tokens",
+            },
+        ];
+        let lengths = tokenized_field_lengths(&documents, &config);
+        assert_eq!(lengths, vec![2, 5]);
+        let stats = Bm25FieldStats::from_field_lengths(&lengths);
+        assert_eq!(stats.document_count, 2);
+        assert_eq!(stats.average_field_length, 3.5);
+    }
+
+    #[test]
+    fn bm25_score_increases_with_frequency_and_rarity() {
+        let stats = Bm25FieldStats {
+            document_count: 100,
+            average_field_length: 10.0,
+        };
+        let common_once = bm25_score(1, 80, 10, stats, Bm25Config::default());
+        let common_twice = bm25_score(2, 80, 10, stats, Bm25Config::default());
+        let rare_once = bm25_score(1, 5, 10, stats, Bm25Config::default());
+
+        assert!(common_twice > common_once);
+        assert!(rare_once > common_once);
+        assert_eq!(bm25_score(0, 5, 10, stats, Bm25Config::default()), 0.0);
     }
 }
