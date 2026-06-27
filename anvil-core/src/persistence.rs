@@ -10,6 +10,7 @@ use std::{
 use tokio::sync::{RwLock, mpsc::Sender};
 
 use crate::{
+    authz_journal,
     bucket_journal::{self, BucketJournalMutation},
     cache::MetadataCache,
     cluster::MetadataEvent,
@@ -37,7 +38,6 @@ struct NativeState {
     append_streams: Vec<AppendStream>,
     append_records: Vec<AppendStreamRecord>,
     manifests: Vec<ManifestRecord>,
-    authz_tuples: Vec<AuthzTupleRecord>,
     indexes: Vec<IndexDefinition>,
     index_events: Vec<IndexDefinitionEvent>,
     index_diagnostics: Vec<IndexDiagnostic>,
@@ -1141,16 +1141,7 @@ impl Persistence {
     }
 
     pub async fn latest_authz_revision(&self, tenant_id: i64) -> Result<i64> {
-        Ok(self
-            .state
-            .read()
-            .await
-            .authz_tuples
-            .iter()
-            .filter(|r| r.tenant_id == tenant_id)
-            .map(|r| r.revision)
-            .max()
-            .unwrap_or(0))
+        authz_journal::latest_authz_revision(&self.storage, tenant_id).await
     }
 
     pub async fn create_object(
@@ -1936,46 +1927,22 @@ impl Persistence {
         written_by: &str,
         reason: &str,
     ) -> Result<AuthzTupleRecord> {
-        let mut state = self.state.write().await;
-        let revision = state
-            .authz_tuples
-            .iter()
-            .filter(|r| r.tenant_id == tenant_id)
-            .map(|r| r.revision)
-            .max()
-            .unwrap_or(0)
-            + 1;
-        let record_hash = blake3::hash(&canonical_json_bytes(&serde_json::json!([
-            tenant_id,
-            namespace,
-            object_id,
-            relation,
-            subject_kind,
-            subject_id,
-            caveat_hash,
-            operation,
-            revision
-        ])))
-        .to_hex()
-        .to_string();
-        let record = AuthzTupleRecord {
-            revision,
-            tenant_id,
-            namespace: namespace.to_string(),
-            object_id: object_id.to_string(),
-            relation: relation.to_string(),
-            subject_kind: subject_kind.to_string(),
-            subject_id: subject_id.to_string(),
-            caveat_hash: caveat_hash.to_string(),
-            operation: operation.to_string(),
-            written_by: written_by.to_string(),
-            reason: reason.to_string(),
-            record_hash,
-            written_at: Utc::now(),
-        };
-        state.authz_tuples.push(record.clone());
-        self.persist_after_write(&state).await?;
-        Ok(record)
+        authz_journal::write_authz_tuple(
+            &self.storage,
+            authz_journal::AuthzTupleWrite {
+                tenant_id,
+                namespace,
+                object_id,
+                relation,
+                subject_kind,
+                subject_id,
+                caveat_hash,
+                operation,
+                written_by,
+                reason,
+            },
+        )
+        .await
     }
 
     pub async fn check_authz_tuple(
@@ -1988,24 +1955,17 @@ impl Persistence {
         subject_id: &str,
         caveat_hash: &str,
     ) -> Result<Option<AuthzTupleRecord>> {
-        let latest = self
-            .state
-            .read()
-            .await
-            .authz_tuples
-            .iter()
-            .filter(|r| {
-                r.tenant_id == tenant_id
-                    && r.namespace == namespace
-                    && r.object_id == object_id
-                    && r.relation == relation
-                    && r.subject_kind == subject_kind
-                    && r.subject_id == subject_id
-                    && r.caveat_hash == caveat_hash
-            })
-            .max_by_key(|r| r.revision)
-            .cloned();
-        Ok(latest.filter(|r| r.operation == "add"))
+        authz_journal::check_authz_tuple(
+            &self.storage,
+            tenant_id,
+            namespace,
+            object_id,
+            relation,
+            subject_kind,
+            subject_id,
+            caveat_hash,
+        )
+        .await
     }
 
     pub async fn check_authz_tuple_at_revision(
@@ -2019,25 +1979,18 @@ impl Persistence {
         caveat_hash: &str,
         revision: i64,
     ) -> Result<Option<AuthzTupleRecord>> {
-        let latest = self
-            .state
-            .read()
-            .await
-            .authz_tuples
-            .iter()
-            .filter(|r| {
-                r.tenant_id == tenant_id
-                    && r.revision <= revision
-                    && r.namespace == namespace
-                    && r.object_id == object_id
-                    && r.relation == relation
-                    && r.subject_kind == subject_kind
-                    && r.subject_id == subject_id
-                    && r.caveat_hash == caveat_hash
-            })
-            .max_by_key(|r| r.revision)
-            .cloned();
-        Ok(latest.filter(|r| r.operation == "add"))
+        authz_journal::check_authz_tuple_at_revision(
+            &self.storage,
+            tenant_id,
+            namespace,
+            object_id,
+            relation,
+            subject_kind,
+            subject_id,
+            caveat_hash,
+            revision,
+        )
+        .await
     }
 
     pub async fn list_authz_tuple_log(
@@ -2047,26 +2000,18 @@ impl Persistence {
         namespace: &str,
         limit: i32,
     ) -> Result<Vec<AuthzTupleRecord>> {
-        let mut records = self
-            .state
-            .read()
-            .await
-            .authz_tuples
-            .iter()
-            .filter(|r| {
-                r.tenant_id == tenant_id
-                    && r.revision > after_revision
-                    && (namespace.is_empty() || r.namespace == namespace)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        records.sort_by_key(|r| r.revision);
-        records.truncate(if limit == 0 {
-            1000
-        } else {
-            limit.max(1) as usize
-        });
-        Ok(records)
+        authz_journal::list_authz_tuple_log(
+            &self.storage,
+            tenant_id,
+            after_revision,
+            namespace,
+            if limit == 0 {
+                1000
+            } else {
+                limit.max(1) as usize
+            },
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
