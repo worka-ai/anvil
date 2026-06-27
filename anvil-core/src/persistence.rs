@@ -15,7 +15,7 @@ use crate::{
     cache::MetadataCache,
     cluster::MetadataEvent,
     config::Config,
-    control_journal, model_journal,
+    control_journal, index_journal, model_journal,
     storage::Storage,
     task_journal,
 };
@@ -39,8 +39,6 @@ struct NativeState {
     append_streams: Vec<AppendStream>,
     append_records: Vec<AppendStreamRecord>,
     manifests: Vec<ManifestRecord>,
-    indexes: Vec<IndexDefinition>,
-    index_events: Vec<IndexDefinitionEvent>,
     index_diagnostics: Vec<IndexDiagnostic>,
     hf_keys: Vec<HfKey>,
     hf_ingestions: Vec<HfIngestion>,
@@ -950,12 +948,13 @@ impl Persistence {
         tenant_id: i64,
         bucket_id: i64,
     ) -> Result<String> {
-        let state = self.state.read().await;
-        let defs = state
-            .indexes
-            .iter()
-            .filter(|d| d.tenant_id == tenant_id && d.bucket_id == bucket_id && d.enabled)
-            .collect::<Vec<_>>();
+        let defs = index_journal::read_current_index_definitions(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            false,
+        )
+        .await?;
         Ok(blake3::hash(&serde_json::to_vec(
             &defs
                 .iter()
@@ -1852,10 +1851,10 @@ impl Persistence {
         authorization_mode: &str,
         build_policy: JsonValue,
     ) -> Result<IndexDefinition> {
-        let mut state = self.state.write().await;
         let now = Utc::now();
-        let index = IndexDefinition {
-            id: state.allocate_id(),
+        Ok(IndexDefinition {
+            id: index_journal::next_index_definition_id(&self.storage, tenant_id, bucket_id)
+                .await?,
             tenant_id,
             bucket_id,
             name: name.to_string(),
@@ -1868,10 +1867,7 @@ impl Persistence {
             version: 1,
             created_at: now,
             updated_at: now,
-        };
-        state.indexes.push(index.clone());
-        self.persist_after_write(&state).await?;
-        Ok(index)
+        })
     }
 
     pub async fn update_index_definition(
@@ -1884,24 +1880,19 @@ impl Persistence {
         authorization_mode: &str,
         build_policy: JsonValue,
     ) -> Result<Option<IndexDefinition>> {
-        let mut state = self.state.write().await;
-        let out = if let Some(index) = state
-            .indexes
-            .iter_mut()
-            .find(|i| i.tenant_id == tenant_id && i.bucket_id == bucket_id && i.name == name)
-        {
-            index.selector = selector;
-            index.extractor = extractor;
-            index.authorization_mode = authorization_mode.to_string();
-            index.build_policy = build_policy;
-            index.version += 1;
-            index.updated_at = Utc::now();
-            Some(index.clone())
-        } else {
-            None
+        let Some(mut index) =
+            index_journal::read_current_index_definition(&self.storage, tenant_id, bucket_id, name)
+                .await?
+        else {
+            return Ok(None);
         };
-        self.persist_after_write(&state).await?;
-        Ok(out)
+        index.selector = selector;
+        index.extractor = extractor;
+        index.authorization_mode = authorization_mode.to_string();
+        index.build_policy = build_policy;
+        index.version += 1;
+        index.updated_at = Utc::now();
+        Ok(Some(index))
     }
 
     pub async fn get_index_definition(
@@ -1910,14 +1901,8 @@ impl Persistence {
         bucket_id: i64,
         name: &str,
     ) -> Result<Option<IndexDefinition>> {
-        Ok(self
-            .state
-            .read()
+        index_journal::read_current_index_definition(&self.storage, tenant_id, bucket_id, name)
             .await
-            .indexes
-            .iter()
-            .find(|i| i.tenant_id == tenant_id && i.bucket_id == bucket_id && i.name == name)
-            .cloned())
     }
 
     pub async fn disable_index_definition(
@@ -1926,21 +1911,16 @@ impl Persistence {
         bucket_id: i64,
         name: &str,
     ) -> Result<Option<IndexDefinition>> {
-        let mut state = self.state.write().await;
-        let out = if let Some(index) = state
-            .indexes
-            .iter_mut()
-            .find(|i| i.tenant_id == tenant_id && i.bucket_id == bucket_id && i.name == name)
-        {
-            index.enabled = false;
-            index.version += 1;
-            index.updated_at = Utc::now();
-            Some(index.clone())
-        } else {
-            None
+        let Some(mut index) =
+            index_journal::read_current_index_definition(&self.storage, tenant_id, bucket_id, name)
+                .await?
+        else {
+            return Ok(None);
         };
-        self.persist_after_write(&state).await?;
-        Ok(out)
+        index.enabled = false;
+        index.version += 1;
+        index.updated_at = Utc::now();
+        Ok(Some(index))
     }
 
     pub async fn drop_index_definition(
@@ -1949,14 +1929,8 @@ impl Persistence {
         bucket_id: i64,
         name: &str,
     ) -> Result<Option<IndexDefinition>> {
-        let mut state = self.state.write().await;
-        let pos = state
-            .indexes
-            .iter()
-            .position(|i| i.tenant_id == tenant_id && i.bucket_id == bucket_id && i.name == name);
-        let out = pos.map(|idx| state.indexes.remove(idx));
-        self.persist_after_write(&state).await?;
-        Ok(out)
+        index_journal::read_current_index_definition(&self.storage, tenant_id, bucket_id, name)
+            .await
     }
 
     pub async fn list_index_definitions(
@@ -1965,21 +1939,13 @@ impl Persistence {
         bucket_id: i64,
         include_disabled: bool,
     ) -> Result<Vec<IndexDefinition>> {
-        let mut defs = self
-            .state
-            .read()
-            .await
-            .indexes
-            .iter()
-            .filter(|i| {
-                i.tenant_id == tenant_id
-                    && i.bucket_id == bucket_id
-                    && (include_disabled || i.enabled)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        defs.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(defs)
+        index_journal::read_current_index_definitions(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            include_disabled,
+        )
+        .await
     }
 
     pub async fn create_index_definition_event(
@@ -1989,11 +1955,22 @@ impl Persistence {
         bucket_name: &str,
         index: &IndexDefinition,
         event_type: &str,
-        definition: JsonValue,
     ) -> Result<IndexDefinitionEvent> {
-        let mut state = self.state.write().await;
         let event = IndexDefinitionEvent {
-            id: state.allocate_id(),
+            id: index_journal::read_index_definition_events(
+                &self.storage,
+                tenant_id,
+                bucket_id,
+                0,
+                0,
+            )
+            .await?
+            .into_iter()
+            .map(|event| event.id)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("index definition cursor overflow"))?,
             tenant_id,
             bucket_id,
             bucket_name: bucket_name.to_string(),
@@ -2001,11 +1978,23 @@ impl Persistence {
             index_name: index.name.clone(),
             event_type: event_type.to_string(),
             index_version: index.version,
-            definition,
+            definition: serde_json::json!({
+                "index_id": index.id,
+                "bucket_name": bucket_name,
+                "name": index.name,
+                "kind": index.kind,
+                "selector_json": index.selector.to_string(),
+                "extractor_json": index.extractor.to_string(),
+                "authorization_mode": index.authorization_mode,
+                "build_policy_json": index.build_policy.to_string(),
+                "enabled": index.enabled,
+                "version": index.version,
+                "created_at": index.created_at.to_rfc3339(),
+                "updated_at": index.updated_at.to_rfc3339(),
+            }),
             created_at: Utc::now(),
         };
-        state.index_events.push(event.clone());
-        self.persist_after_write(&state).await?;
+        index_journal::append_index_definition_event(&self.storage, &event).await?;
         Ok(event)
     }
 
@@ -2016,25 +2005,20 @@ impl Persistence {
         after_cursor: i64,
         limit: i32,
     ) -> Result<Vec<IndexDefinitionEvent>> {
-        let mut events = self
-            .state
-            .read()
-            .await
-            .index_events
-            .iter()
-            .filter(|e| e.tenant_id == tenant_id && e.bucket_id == bucket_id && e.id > after_cursor)
-            .cloned()
-            .collect::<Vec<_>>();
-        events.sort_by_key(|e| e.id);
-        events.truncate(if limit == 0 {
-            1000
-        } else {
-            limit.max(1) as usize
-        });
-        Ok(events)
+        index_journal::read_index_definition_events(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            after_cursor,
+            if limit == 0 {
+                1000
+            } else {
+                limit.max(1) as usize
+            },
+        )
+        .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn create_index_diagnostic(
         &self,
         tenant_id: i64,

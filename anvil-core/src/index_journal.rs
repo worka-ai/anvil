@@ -164,6 +164,48 @@ pub async fn read_current_index_definition_events(
     Ok(events)
 }
 
+pub async fn read_current_index_definitions(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+    include_disabled: bool,
+) -> Result<Vec<IndexDefinition>> {
+    read_current_index_definition_events(storage, tenant_id, bucket_id, include_disabled)
+        .await?
+        .into_iter()
+        .map(|event| index_definition_from_event(&event))
+        .collect()
+}
+
+pub async fn read_current_index_definition(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+    name: &str,
+) -> Result<Option<IndexDefinition>> {
+    Ok(
+        read_current_index_definitions(storage, tenant_id, bucket_id, true)
+            .await?
+            .into_iter()
+            .find(|index| index.name == name),
+    )
+}
+
+pub async fn next_index_definition_id(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+) -> Result<i64> {
+    read_all_index_definition_events(storage, tenant_id, bucket_id)
+        .await?
+        .into_iter()
+        .map(|event| event.index_id)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("index definition id overflow"))
+}
+
 async fn read_all_index_definition_events(
     storage: &Storage,
     tenant_id: i64,
@@ -278,9 +320,66 @@ fn index_definition_json(bucket_name: &str, index: &IndexDefinition) -> JsonValu
         "build_policy_json": index.build_policy.to_string(),
         "enabled": index.enabled,
         "version": index.version,
-        "created_at": index.created_at.to_string(),
-        "updated_at": index.updated_at.to_string(),
+        "created_at": index.created_at.to_rfc3339(),
+        "updated_at": index.updated_at.to_rfc3339(),
     })
+}
+
+fn index_definition_from_event(event: &IndexDefinitionEvent) -> Result<IndexDefinition> {
+    let definition = &event.definition;
+    let field = |name: &'static str| -> Result<&JsonValue> {
+        definition
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("index definition missing {name}"))
+    };
+    let string_field = |name: &'static str| -> Result<String> {
+        field(name)?
+            .as_str()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("index definition field {name} is not a string"))
+    };
+    let json_string_field = |name: &'static str| -> Result<JsonValue> {
+        let raw = string_field(name)?;
+        serde_json::from_str(&raw)
+            .with_context(|| format!("parse index definition JSON field {name}"))
+    };
+    Ok(IndexDefinition {
+        id: field("index_id")?
+            .as_i64()
+            .ok_or_else(|| anyhow::anyhow!("index_id is not an integer"))?,
+        tenant_id: event.tenant_id,
+        bucket_id: event.bucket_id,
+        name: string_field("name")?,
+        kind: string_field("kind")?,
+        selector: json_string_field("selector_json")?,
+        extractor: json_string_field("extractor_json")?,
+        authorization_mode: string_field("authorization_mode")?,
+        build_policy: json_string_field("build_policy_json")?,
+        enabled: field("enabled")?
+            .as_bool()
+            .ok_or_else(|| anyhow::anyhow!("enabled is not a bool"))?,
+        version: field("version")?
+            .as_i64()
+            .ok_or_else(|| anyhow::anyhow!("version is not an integer"))?,
+        created_at: parse_definition_time(definition.get("created_at"), event.created_at)?,
+        updated_at: parse_definition_time(definition.get("updated_at"), event.created_at)?,
+    })
+}
+
+fn parse_definition_time(
+    value: Option<&JsonValue>,
+    fallback: chrono::DateTime<chrono::Utc>,
+) -> Result<chrono::DateTime<chrono::Utc>> {
+    let Some(value) = value.and_then(JsonValue::as_str) else {
+        return Ok(fallback);
+    };
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .or_else(|_| {
+            chrono::DateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S %Z")
+                .map(|value| value.with_timezone(&chrono::Utc))
+        })
+        .or(Ok(fallback))
 }
 
 #[cfg(test)]
