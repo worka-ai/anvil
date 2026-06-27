@@ -1706,7 +1706,7 @@ impl Persistence {
                       SELECT DISTINCT ON (key)
                         id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, inline_payload, checksum, deleted_at, key_ltree
                       FROM objects
-                      WHERE bucket_id = $1 AND key > $2 AND key LIKE $3
+                      WHERE bucket_id = $1 AND key > $2 AND left(key, length($3)) = $3
                         AND key !~ '^_anvil/(meta|index|authz|watch|personaldb|git|tmp)(/|$)'
                       ORDER BY key, created_at DESC, id DESC
                     ) latest
@@ -1716,7 +1716,7 @@ impl Persistence {
                     &[
                         &bucket_id,
                         &start_after,
-                        &format!(r#"{}%"#, prefix),
+                        &prefix,
                         &(limit as i64),
                     ],
                 )
@@ -1739,7 +1739,8 @@ impl Persistence {
                 $1::bigint AS bucket_id,
                 $2::text   AS start_after,
                 $3::int8   AS lim,
-                NULLIF($4::text, '')::ltree AS prefix_ltree
+                NULLIF($4::text, '')::ltree AS prefix_ltree,
+                $5::text AS prefix_text
             ),
             lvl AS (
               SELECT COALESCE(nlevel(prefix_ltree), 0) AS p FROM params
@@ -1756,6 +1757,7 @@ impl Persistence {
               WHERE o.bucket_id = p.bucket_id
                 AND o.deleted_at IS NULL
                 AND o.key > p.start_after
+                AND left(o.key, length(p.prefix_text)) = p.prefix_text
                 AND (p.prefix_ltree IS NULL OR o.key_ltree <@ p.prefix_ltree)
             ),
             children AS (
@@ -1805,7 +1807,7 @@ impl Persistence {
             ORDER BY sort_key, is_prefix DESC  -- object (false) before prefix (true) for same sort_key
             LIMIT (SELECT lim FROM params)
             "#,
-                &[&bucket_id, &start_after, &(limit as i64), &prefix_dot],
+                &[&bucket_id, &start_after, &(limit as i64), &prefix_dot, &prefix],
             )
             .await?;
 
@@ -1964,7 +1966,6 @@ impl Persistence {
         let client = self.regional_pool.get().await?;
         let limit = limit.max(1) as i64;
         let fetch_limit = limit + 1;
-        let prefix_like = format!(r#"{}%"#, prefix);
         let rows = if let Some(version_id_marker) = version_id_marker {
             let marker = client
                 .query_opt(
@@ -1993,7 +1994,7 @@ impl Persistence {
                         id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, inline_payload, checksum, deleted_at, key_ltree,
                         row_number() OVER (PARTITION BY key ORDER BY created_at DESC, id DESC) = 1 AS is_latest
                       FROM objects
-                      WHERE bucket_id = $1 AND key LIKE $2
+                      WHERE bucket_id = $1 AND left(key, length($2)) = $2
                         AND (
                           key > $3
                           OR (
@@ -2012,7 +2013,7 @@ impl Persistence {
                     LIMIT $6"#,
                     &[
                         &bucket_id,
-                        &prefix_like,
+                        &prefix,
                         &key_marker,
                         &marker_created_at,
                         &marker_id,
@@ -2029,14 +2030,14 @@ impl Persistence {
                         id, tenant_id, bucket_id, key, content_hash, size, etag, content_type, version_id, mutation_id, index_policy_snapshot, user_metadata_hash, authz_revision, record_hash, created_at, storage_class, user_meta, shard_map, inline_payload, checksum, deleted_at, key_ltree,
                         row_number() OVER (PARTITION BY key ORDER BY created_at DESC, id DESC) = 1 AS is_latest
                       FROM objects
-                      WHERE bucket_id = $1 AND key > $2 AND key LIKE $3
+                      WHERE bucket_id = $1 AND key > $2 AND left(key, length($3)) = $3
                         AND key !~ '^_anvil/(meta|index|authz|watch|personaldb|git|tmp)(/|$)'
                     )
                     SELECT *
                     FROM ranked
                     ORDER BY key, created_at DESC, id DESC
                     LIMIT $4"#,
-                    &[&bucket_id, &key_marker, &prefix_like, &fetch_limit],
+                    &[&bucket_id, &key_marker, &prefix, &fetch_limit],
                 )
                 .await?
         };
@@ -2182,7 +2183,7 @@ impl Persistence {
                 SELECT *
                 FROM multipart_uploads
                 WHERE bucket_id = $1
-                  AND key LIKE $2
+                  AND left(key, length($2)) = $2
                   AND key > $3
                   AND completed_at IS NULL
                   AND aborted_at IS NULL
@@ -2190,7 +2191,7 @@ impl Persistence {
                 LIMIT $4"#,
                 &[
                     &bucket_id,
-                    &format!(r#"{}%"#, prefix),
+                    &prefix,
                     &key_marker,
                     &(if limit == 0 { 1000 } else { limit } as i64),
                 ],
@@ -2310,14 +2311,14 @@ impl Persistence {
                 FROM object_watch_events
                 WHERE tenant_id = $1
                   AND bucket_id = $2
-                  AND key LIKE $3
+                  AND left(key, length($3)) = $3
                   AND id > $4
                 ORDER BY id
                 LIMIT $5"#,
                 &[
                     &tenant_id,
                     &bucket_id,
-                    &format!(r#"{}%"#, prefix),
+                    &prefix,
                     &after_cursor,
                     &(if limit == 0 { 1000 } else { limit } as i64),
                 ],

@@ -350,6 +350,38 @@ async fn test_s3_public_and_private_access() {
         "list_objects_v2 should include the UTF-8 key"
     );
 
+    let literal_prefix = "literal/a%_";
+    let literal_key = "literal/a%_object.txt";
+    let wildcard_decoy_key = "literal/abc-object.txt";
+    client
+        .put_object()
+        .bucket(&private_bucket)
+        .key(literal_key)
+        .body(ByteStream::from_static(b"literal wildcard key"))
+        .send()
+        .await
+        .expect("put literal wildcard-like key should succeed");
+    client
+        .put_object()
+        .bucket(&private_bucket)
+        .key(wildcard_decoy_key)
+        .body(ByteStream::from_static(b"decoy key"))
+        .send()
+        .await
+        .expect("put wildcard decoy key should succeed");
+    let literal_prefix_listing = client
+        .list_objects_v2()
+        .bucket(&private_bucket)
+        .prefix(literal_prefix)
+        .send()
+        .await
+        .expect("literal wildcard-like prefix listing should succeed");
+    assert_eq!(literal_prefix_listing.contents().len(), 1);
+    assert_eq!(
+        literal_prefix_listing.contents()[0].key(),
+        Some(literal_key)
+    );
+
     client
         .put_object()
         .bucket(&public_bucket)

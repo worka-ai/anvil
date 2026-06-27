@@ -377,6 +377,53 @@ async fn test_utf8_object_keys_with_spaces_round_trip() {
     assert_eq!(list_res.objects.len(), 1);
     assert_eq!(list_res.objects[0].key, object_key);
 
+    let literal_prefix = "literal/a%_";
+    let literal_key = "literal/a%_object.txt";
+    let wildcard_decoy_key = "literal/abc-object.txt";
+    for (key, body) in [
+        (literal_key, b"literal wildcard key".to_vec()),
+        (wildcard_decoy_key, b"decoy key".to_vec()),
+    ] {
+        let chunks = vec![
+            PutObjectRequest {
+                data: Some(anvil_api::put_object_request::Data::Metadata(
+                    ObjectMetadata {
+                        bucket_name: bucket_name.clone(),
+                        object_key: key.to_string(),
+                    },
+                )),
+            },
+            PutObjectRequest {
+                data: Some(anvil_api::put_object_request::Data::Chunk(body)),
+            },
+        ];
+        let mut put_req = Request::new(tokio_stream::iter(chunks));
+        put_req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+        object_client.put_object(put_req).await.unwrap();
+    }
+
+    let mut wildcard_prefix_req = Request::new(ListObjectsRequest {
+        bucket_name: bucket_name.clone(),
+        prefix: literal_prefix.to_string(),
+        delimiter: String::new(),
+        start_after: String::new(),
+        max_keys: 10,
+    });
+    wildcard_prefix_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let wildcard_prefix_list = object_client
+        .list_objects(wildcard_prefix_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(wildcard_prefix_list.objects.len(), 1);
+    assert_eq!(wildcard_prefix_list.objects[0].key, literal_key);
+
     let mut get_req = Request::new(GetObjectRequest {
         bucket_name,
         object_key,
