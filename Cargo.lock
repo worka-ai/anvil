@@ -262,6 +262,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "axum",
  "axum-extra",
+ "base64 0.22.1",
  "blake3",
  "bytes",
  "chrono",

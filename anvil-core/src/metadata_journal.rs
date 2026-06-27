@@ -7,9 +7,14 @@ use crate::formats::{
 use crate::persistence::{Bucket, Object};
 use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
+use base64::Engine;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectJournalMutation {
@@ -192,6 +197,50 @@ pub struct SealedObjectMetadataSegments {
     pub directory_path: PathBuf,
     pub metadata_record_count: usize,
     pub directory_record_count: usize,
+    pub manifest_path: PathBuf,
+    pub manifest_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PartitionManifest {
+    pub format_version: u16,
+    pub partition_family: String,
+    pub partition_id: String,
+    pub generation: u64,
+    pub fence_token: u64,
+    pub sealed_journals: Vec<ManifestJournalRef>,
+    pub active_journal: Option<ManifestJournalRef>,
+    pub segments: Vec<ManifestSegmentRef>,
+    pub compacted_through_sequence: u64,
+    pub last_record_hash: String,
+    pub published_at: String,
+    pub manifest_hash: Option<String>,
+    pub manifest_signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManifestJournalRef {
+    pub path: String,
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+    pub last_record_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManifestSegmentRef {
+    pub family: String,
+    pub path: String,
+    pub generation: u64,
+    pub record_count: u64,
+    pub file_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WrittenSegment {
+    family: FileFamily,
+    path: PathBuf,
+    record_count: u64,
+    file_hash: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -210,6 +259,7 @@ struct SegmentHeader {
 pub async fn seal_object_journal_segments(
     storage: &Storage,
     bucket: &Bucket,
+    manifest_signing_key: &[u8],
 ) -> Result<SealedObjectMetadataSegments> {
     let journal_path = storage.metadata_journal_path(bucket.tenant_id, bucket.id);
     let journal_bytes = tokio::fs::read(&journal_path)
@@ -248,7 +298,7 @@ pub async fn seal_object_journal_segments(
     let metadata_path = storage.metadata_segment_path(bucket.tenant_id, bucket.id, generation);
     let directory_path = storage.directory_segment_path(bucket.tenant_id, bucket.id, generation);
 
-    write_segment_file(
+    let metadata_segment = write_segment_file(
         &metadata_path,
         FileFamily::MetadataSegment,
         segment_header(
@@ -260,11 +310,22 @@ pub async fn seal_object_journal_segments(
         &metadata_records,
     )
     .await?;
-    write_segment_file(
+    let directory_segment = write_segment_file(
         &directory_path,
         FileFamily::DirectorySegment,
         segment_header(bucket, generation, "directory", "tenant_bucket_prefix_key"),
         &directory_records,
+    )
+    .await?;
+    let manifest_path = storage.metadata_manifest_path(bucket.tenant_id, bucket.id);
+    let manifest = write_partition_manifest(
+        storage,
+        bucket,
+        generation,
+        &frames,
+        &[metadata_segment, directory_segment],
+        manifest_signing_key,
+        &manifest_path,
     )
     .await?;
 
@@ -274,6 +335,11 @@ pub async fn seal_object_journal_segments(
         directory_path,
         metadata_record_count: metadata_records.len(),
         directory_record_count: directory_records.len(),
+        manifest_path,
+        manifest_hash: manifest
+            .manifest_hash
+            .clone()
+            .ok_or_else(|| anyhow!("partition manifest hash was not set"))?,
     })
 }
 
@@ -308,7 +374,7 @@ async fn write_segment_file(
     family: FileFamily,
     header: SegmentHeader,
     records: &[SegmentRecord],
-) -> Result<()> {
+) -> Result<WrittenSegment> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -334,7 +400,148 @@ async fn write_segment_file(
     file.write_all(&body).await?;
     file.write_all(&footer.encode()).await?;
     file.sync_data().await?;
+    Ok(WrittenSegment {
+        family,
+        path: path.to_path_buf(),
+        record_count: records.len() as u64,
+        file_hash: hex::encode(footer.file_hash),
+    })
+}
+
+async fn write_partition_manifest(
+    storage: &Storage,
+    bucket: &Bucket,
+    generation: u64,
+    frames: &[JournalFrame],
+    segments: &[WrittenSegment],
+    manifest_signing_key: &[u8],
+    manifest_path: &Path,
+) -> Result<PartitionManifest> {
+    if manifest_signing_key.is_empty() {
+        return Err(anyhow!("partition manifest signing key must not be empty"));
+    }
+    if let Some(parent) = manifest_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let last_record_hash = frames
+        .last()
+        .map(|frame| hex::encode(frame.record_hash))
+        .ok_or_else(|| anyhow!("partition manifest requires at least one journal frame"))?;
+    let journal_ref = ManifestJournalRef {
+        path: storage
+            .relative_storage_path(&storage.metadata_journal_path(bucket.tenant_id, bucket.id))?,
+        first_sequence: frames
+            .first()
+            .map(|frame| frame.partition_sequence)
+            .unwrap_or(0),
+        last_sequence: generation,
+        last_record_hash: last_record_hash.clone(),
+    };
+    let segment_refs = segments
+        .iter()
+        .map(|segment| {
+            Ok(ManifestSegmentRef {
+                family: file_family_name(segment.family).to_string(),
+                path: storage.relative_storage_path(&segment.path)?,
+                generation,
+                record_count: segment.record_count,
+                file_hash: segment.file_hash.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut manifest = PartitionManifest {
+        format_version: 1,
+        partition_family: "object_metadata".to_string(),
+        partition_id: hex::encode(partition_id(bucket.tenant_id, bucket.id)),
+        generation,
+        fence_token: 0,
+        sealed_journals: vec![journal_ref],
+        active_journal: None,
+        segments: segment_refs,
+        compacted_through_sequence: generation,
+        last_record_hash,
+        published_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        manifest_hash: None,
+        manifest_signature: None,
+    };
+    let manifest_hash = compute_manifest_hash(&manifest)?;
+    let manifest_signature = sign_manifest(&manifest_hash, &manifest, manifest_signing_key)?;
+    manifest.manifest_hash = Some(manifest_hash);
+    manifest.manifest_signature = Some(manifest_signature);
+    let encoded = serde_json::to_vec_pretty(&manifest)?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(manifest_path)
+        .await?;
+    file.write_all(&encoded).await?;
+    file.sync_data().await?;
+    Ok(manifest)
+}
+
+pub fn decode_partition_manifest(
+    input: &[u8],
+    manifest_signing_key: &[u8],
+) -> Result<PartitionManifest> {
+    let manifest: PartitionManifest = serde_json::from_slice(input)?;
+    verify_partition_manifest(&manifest, manifest_signing_key)?;
+    Ok(manifest)
+}
+
+pub fn verify_partition_manifest(
+    manifest: &PartitionManifest,
+    manifest_signing_key: &[u8],
+) -> Result<()> {
+    let expected_hash = compute_manifest_hash(manifest)?;
+    if manifest.manifest_hash.as_deref() != Some(expected_hash.as_str()) {
+        return Err(anyhow!("partition manifest hash mismatch"));
+    }
+    let expected_signature = sign_manifest(&expected_hash, manifest, manifest_signing_key)?;
+    if manifest.manifest_signature.as_deref() != Some(expected_signature.as_str()) {
+        return Err(anyhow!("partition manifest signature mismatch"));
+    }
     Ok(())
+}
+
+fn compute_manifest_hash(manifest: &PartitionManifest) -> Result<String> {
+    let mut unsigned = manifest.clone();
+    unsigned.manifest_hash = None;
+    unsigned.manifest_signature = None;
+    Ok(hex::encode(hash32(&serde_json::to_vec(&unsigned)?)))
+}
+
+fn sign_manifest(
+    manifest_hash: &str,
+    manifest: &PartitionManifest,
+    manifest_signing_key: &[u8],
+) -> Result<String> {
+    if manifest_signing_key.is_empty() {
+        return Err(anyhow!("partition manifest signing key must not be empty"));
+    }
+    let mut mac = HmacSha256::new_from_slice(manifest_signing_key)?;
+    mac.update(manifest_hash.as_bytes());
+    mac.update(b"\0");
+    mac.update(manifest.partition_id.as_bytes());
+    mac.update(b"\0");
+    mac.update(&manifest.generation.to_le_bytes());
+    mac.update(&manifest.fence_token.to_le_bytes());
+    Ok(base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
+}
+
+fn file_family_name(family: FileFamily) -> &'static str {
+    match family {
+        FileFamily::MetadataJournal => "metadata_journal",
+        FileFamily::MetadataSegment => "metadata_segment",
+        FileFamily::DirectorySegment => "directory_segment",
+        FileFamily::FullTextSegment => "full_text_segment",
+        FileFamily::VectorSegment => "vector_segment",
+        FileFamily::AuthzTupleSegment => "authz_tuple_segment",
+        FileFamily::WatchSegment => "watch_segment",
+        FileFamily::PersonalDbLogSegment => "personaldb_log_segment",
+        FileFamily::PersonalDbRowIndex => "personaldb_row_index",
+        FileFamily::GitSourceIndex => "git_source_index",
+    }
 }
 
 fn segment_header(
@@ -578,12 +785,34 @@ mod tests {
             .await
             .unwrap();
 
-        let sealed = seal_object_journal_segments(&storage, &bucket)
+        let signing_key = b"manifest signing key";
+        let sealed = seal_object_journal_segments(&storage, &bucket, signing_key)
             .await
             .unwrap();
         assert_eq!(sealed.generation, 6);
         assert_eq!(sealed.metadata_record_count, 3);
         assert_eq!(sealed.directory_record_count, 2);
+        assert_eq!(
+            sealed.manifest_path,
+            storage.metadata_manifest_path(bucket.tenant_id, bucket.id)
+        );
+
+        let manifest_bytes = tokio::fs::read(&sealed.manifest_path).await.unwrap();
+        let manifest = decode_partition_manifest(&manifest_bytes, signing_key).unwrap();
+        assert_eq!(manifest.generation, sealed.generation);
+        assert_eq!(
+            manifest.manifest_hash.as_deref(),
+            Some(sealed.manifest_hash.as_str())
+        );
+        assert_eq!(manifest.sealed_journals.len(), 1);
+        assert_eq!(manifest.segments.len(), 2);
+        assert_eq!(manifest.segments[0].family, "metadata_segment");
+        assert_eq!(manifest.segments[1].family, "directory_segment");
+        assert!(manifest.active_journal.is_none());
+
+        let mut tampered_manifest = manifest.clone();
+        tampered_manifest.generation += 1;
+        assert!(verify_partition_manifest(&tampered_manifest, signing_key).is_err());
 
         let metadata_bytes = tokio::fs::read(&sealed.metadata_path).await.unwrap();
         let metadata_body =

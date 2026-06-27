@@ -79,6 +79,20 @@ impl Storage {
             .join(format!("generation-{generation:020}.andir"))
     }
 
+    pub fn metadata_manifest_path(&self, tenant_id: i64, bucket_id: i64) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("meta")
+            .join("manifests")
+            .join(format!("tenant-{tenant_id}"))
+            .join(format!("bucket-{bucket_id}.json"))
+    }
+
+    pub fn relative_storage_path(&self, path: &Path) -> Result<String> {
+        let relative = path.strip_prefix(&self.storage_path)?;
+        Ok(relative.to_string_lossy().replace('\\', "/"))
+    }
+
     fn get_shard_path(&self, object_hash: &str, shard_index: u32) -> PathBuf {
         self.storage_path
             .join(format!("{}-{:02}", object_hash, shard_index))
