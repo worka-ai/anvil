@@ -1,7 +1,9 @@
 use crate::{
     auth,
+    bucket_journal::{self, BucketJournalMutation},
     permissions::AnvilAction,
     persistence::{Bucket, Persistence},
+    storage::Storage,
     tasks::TaskType,
     validation,
 };
@@ -10,11 +12,12 @@ use tonic::Status;
 #[derive(Debug, Clone)]
 pub struct BucketManager {
     db: Persistence,
+    storage: Storage,
 }
 
 impl BucketManager {
-    pub fn new(db: Persistence) -> Self {
-        Self { db }
+    pub fn new(db: Persistence, storage: Storage) -> Self {
+        Self { db, storage }
     }
 
     pub async fn create_bucket(
@@ -41,6 +44,13 @@ impl BucketManager {
             .create_bucket(tenant_id, bucket_name, region)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        bucket_journal::append_bucket_mutation(
+            &self.storage,
+            &bucket,
+            BucketJournalMutation::Create,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
 
         tracing::debug!(
             "[manager] EXITING create_bucket for bucket: {}",
@@ -59,12 +69,11 @@ impl BucketManager {
             return Err(Status::permission_denied("Permission denied"));
         }
 
-        let existing_bucket = self
-            .db
-            .get_bucket_by_name(tenant_id, bucket_name)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Bucket not found"))?;
+        let existing_bucket =
+            bucket_journal::read_current_bucket(&self.storage, tenant_id, bucket_name)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::not_found("Bucket not found"))?;
         if self
             .db
             .bucket_has_retained_objects_or_uploads(existing_bucket.id)
@@ -80,6 +89,13 @@ impl BucketManager {
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
+        bucket_journal::append_bucket_mutation(
+            &self.storage,
+            &bucket,
+            BucketJournalMutation::Delete,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
 
         // Enqueue a task for physical deletion
         let payload = serde_json::json!({ "bucket_id": bucket.id });
@@ -104,12 +120,10 @@ impl BucketManager {
         }
 
         tracing::debug!(
-            "[manager] Calling DB to list buckets for tenant: {}",
+            "[manager] Reading bucket metadata journal for tenant: {}",
             tenant_id
         );
-        let buckets = self
-            .db
-            .list_buckets_for_tenant(tenant_id)
+        let buckets = bucket_journal::read_current_buckets(&self.storage, tenant_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -130,9 +144,7 @@ impl BucketManager {
             return Err(Status::permission_denied("Permission denied"));
         }
 
-        let bucket = self
-            .db
-            .get_bucket_by_name(tenant_id, bucket_name)
+        let bucket = bucket_journal::read_current_bucket(&self.storage, tenant_id, bucket_name)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
@@ -158,6 +170,13 @@ impl BucketManager {
             .set_bucket_public_access(tenant_id, bucket_name, is_public)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        bucket_journal::append_bucket_mutation(
+            &self.storage,
+            &bucket,
+            BucketJournalMutation::Update,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(bucket)
     }

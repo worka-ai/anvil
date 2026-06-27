@@ -1,7 +1,9 @@
 use anvil::crypto;
 use anvil::persistence::Persistence;
 use anvil::{create_pool, migrations, run_migrations};
+use anvil_core::bucket_journal::{self, BucketJournalMutation};
 use anvil_core::permissions::AnvilAction;
+use anvil_core::storage::Storage;
 use clap::{Parser, Subcommand};
 use tracing::info;
 
@@ -22,6 +24,9 @@ struct SharedConfig {
 
     #[arg(long, env)]
     pub anvil_secret_encryption_key: String,
+
+    #[arg(long, env, default_value = "anvil-data")]
+    pub storage_path: String,
 }
 
 #[derive(Subcommand)]
@@ -133,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
     let mut config = anvil_core::config::Config::default();
     config.global_database_url = shared_config.global_database_url;
     config.anvil_secret_encryption_key = shared_config.anvil_secret_encryption_key;
+    config.storage_path = shared_config.storage_path;
     // Set a dummy region and public_api_addr, as admin CLI doesn't use them,
     // but Persistence::new needs a full Config.
     config.region = "admin-cli-region".to_string();
@@ -241,9 +247,16 @@ async fn main() -> anyhow::Result<()> {
         },
         Commands::Bucket { command } => match command {
             BucketCommands::SetPublicAccess { bucket, allow } => {
-                persistence
+                let updated = persistence
                     .set_bucket_public_access_by_name(bucket, *allow)
                     .await?;
+                let storage = Storage::new_at(&config.storage_path).await?;
+                bucket_journal::append_bucket_mutation(
+                    &storage,
+                    &updated,
+                    BucketJournalMutation::Update,
+                )
+                .await?;
                 info!(
                     "Set public read access for bucket '{}' to {}",
                     bucket, allow

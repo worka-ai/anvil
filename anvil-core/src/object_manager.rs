@@ -2,7 +2,7 @@ use crate::{
     anvil_api::{
         CommitShardRequest, GetShardRequest, PutShardRequest, internal_anvil_service_client,
     },
-    auth,
+    auth, bucket_journal,
     cluster::ClusterState,
     metadata_journal::{self, ObjectJournalMutation},
     permissions::AnvilAction,
@@ -285,19 +285,7 @@ impl ObjectManager {
                 .map_err(|e| Status::internal(e.to_string()))?;
         }
 
-        let bucket = self
-            .db
-            .get_bucket_by_name(tenant_id, bucket_name)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Bucket not found"))?;
-
-        if bucket.region != self.region {
-            return Err(Status::failed_precondition(format!(
-                "Bucket is in region {}",
-                bucket.region
-            )));
-        }
+        let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
         let shard_map_json = if nodes.len() > 1 {
             let peer_ids: Vec<String> = nodes.iter().map(|p| p.to_base58()).collect();
             Some(serde_json::json!(peer_ids))
@@ -1072,19 +1060,7 @@ impl ObjectManager {
             return Err(Status::permission_denied("Permission denied"));
         }
 
-        let bucket = self
-            .db
-            .get_bucket_by_name(tenant_id, bucket_name)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Bucket not found"))?;
-
-        if bucket.region != self.region {
-            return Err(Status::failed_precondition(format!(
-                "Bucket is in region {}",
-                bucket.region
-            )));
-        }
+        let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
 
         let delete_marker = self
             .db
@@ -1481,15 +1457,11 @@ impl ObjectManager {
         bucket_name: &str,
     ) -> Result<Bucket, Status> {
         let bucket = match claims {
-            Some(c) => self
-                .db
-                .get_bucket_by_name(c.tenant_id, bucket_name)
+            Some(c) => bucket_journal::read_current_bucket(&self.storage, c.tenant_id, bucket_name)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?
                 .ok_or_else(|| Status::not_found("Bucket not found for this tenant")),
-            None => self
-                .db
-                .get_public_bucket_by_name(bucket_name)
+            None => bucket_journal::read_public_bucket_by_name(&self.storage, bucket_name)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?
                 .ok_or_else(|| Status::not_found("Public bucket not found")),
@@ -1558,9 +1530,7 @@ impl ObjectManager {
     }
 
     async fn get_tenant_bucket(&self, tenant_id: i64, bucket_name: &str) -> Result<Bucket, Status> {
-        let bucket = self
-            .db
-            .get_bucket_by_name(tenant_id, bucket_name)
+        let bucket = bucket_journal::read_current_bucket(&self.storage, tenant_id, bucket_name)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;

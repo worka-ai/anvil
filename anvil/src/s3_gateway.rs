@@ -2,6 +2,7 @@ use crate::AppState;
 use crate::auth::Claims;
 use crate::s3_auth::{aws_chunked_decoder, sigv4_auth};
 use anvil_core::auth;
+use anvil_core::bucket_journal;
 use anvil_core::object_manager::ObjectWriteOptions;
 use anvil_core::permissions::AnvilAction;
 use anvil_core::persistence::Object;
@@ -335,7 +336,7 @@ async fn get_bucket_versioning_response(state: AppState, claims: Claims, bucket:
         );
     }
 
-    match state.db.get_bucket_by_name(claims.tenant_id, bucket).await {
+    match bucket_journal::read_current_bucket(&state.storage, claims.tenant_id, bucket).await {
         Ok(Some(_)) => {
             let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Status>Enabled</Status>\n</VersioningConfiguration>\n";
             Response::builder()
@@ -371,7 +372,7 @@ async fn put_bucket_versioning_response(
         );
     }
 
-    match state.db.get_bucket_by_name(claims.tenant_id, bucket).await {
+    match bucket_journal::read_current_bucket(&state.storage, claims.tenant_id, bucket).await {
         Ok(Some(_)) => {}
         Ok(None) => {
             return s3_error(
@@ -504,10 +505,7 @@ async fn head_bucket(
         }
     };
 
-    match state
-        .db
-        .get_bucket_by_name(claims.tenant_id, &bucket_name)
-        .await
+    match bucket_journal::read_current_bucket(&state.storage, claims.tenant_id, &bucket_name).await
     {
         Ok(Some(bucket)) => {
             if bucket.region != state.region {
@@ -974,7 +972,7 @@ async fn get_bucket_location_response(state: AppState, claims: Claims, bucket: &
         );
     }
 
-    match state.db.get_bucket_by_name(claims.tenant_id, bucket).await {
+    match bucket_journal::read_current_bucket(&state.storage, claims.tenant_id, bucket).await {
         Ok(Some(bucket)) => {
             let xml = format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{}</LocationConstraint>\n",

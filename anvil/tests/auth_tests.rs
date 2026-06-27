@@ -667,6 +667,8 @@ async fn test_admin_cli_set_public_access() {
             &cluster.global_db_url,
             "--anvil-secret-encryption-key",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--storage-path",
+            cluster.storage_path.to_str().unwrap(),
             "bucket",
             "set-public-access",
             "--bucket",

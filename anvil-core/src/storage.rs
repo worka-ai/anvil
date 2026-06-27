@@ -49,6 +49,23 @@ impl Storage {
             .join(format!("bucket-{bucket_id}.anjournal"))
     }
 
+    pub fn bucket_metadata_journal_path(&self, tenant_id: i64) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("meta")
+            .join("journals")
+            .join(format!("tenant-{tenant_id}"))
+            .join("buckets.anjournal")
+    }
+
+    pub fn global_bucket_metadata_journal_path(&self) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("meta")
+            .join("journals")
+            .join("buckets.anjournal")
+    }
+
     pub fn metadata_segment_path(
         &self,
         tenant_id: i64,

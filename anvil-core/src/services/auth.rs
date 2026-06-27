@@ -1,6 +1,11 @@
 use crate::anvil_api::auth_service_server::AuthService;
 use crate::anvil_api::*;
-use crate::{AppState, auth, crypto, permissions::AnvilAction};
+use crate::{
+    AppState, auth,
+    bucket_journal::{self, BucketJournalMutation},
+    crypto,
+    permissions::AnvilAction,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -164,10 +169,18 @@ impl AuthService for AppState {
             ));
         }
 
-        self.db
+        let bucket = self
+            .db
             .set_bucket_public_access(claims.tenant_id, &req.bucket, req.allow_public_read)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        bucket_journal::append_bucket_mutation(
+            &self.storage,
+            &bucket,
+            BucketJournalMutation::Update,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(SetPublicAccessResponse {}))
     }

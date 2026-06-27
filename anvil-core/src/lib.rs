@@ -9,6 +9,7 @@ use tokio::sync::{RwLock, broadcast};
 
 // The modules we've created
 pub mod auth;
+pub mod bucket_journal;
 pub mod bucket_manager;
 pub mod cache;
 pub mod cluster;
@@ -74,7 +75,7 @@ impl AppState {
         let (authz_watch_tx, _authz_watch_rx) = tokio::sync::broadcast::channel(1024);
         let (index_watch_tx, _index_watch_rx) = tokio::sync::broadcast::channel(1024);
 
-        let bucket_manager = bucket_manager::BucketManager::new(db.clone());
+        let bucket_manager = bucket_manager::BucketManager::new(db.clone(), storage.clone());
         let object_manager = object_manager::ObjectManager::new(
             db.clone(),
             placer.clone(),
