@@ -179,6 +179,17 @@ async fn test_s3_public_and_private_access() {
         .build();
     let client = Client::from_conf(config);
 
+    let location = client
+        .get_bucket_location()
+        .bucket(&private_bucket)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        format!("{:?}", location.location_constraint()).contains("test-region-1"),
+        "bucket location response should include the stored bucket region"
+    );
+
     let unauthenticated_list_buckets = reqwest::get(format!("{}/", http_base)).await.unwrap();
     assert_eq!(unauthenticated_list_buckets.status(), 403);
 

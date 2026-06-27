@@ -1,6 +1,8 @@
 use crate::AppState;
 use crate::auth::Claims;
 use crate::s3_auth::{aws_chunked_decoder, sigv4_auth};
+use anvil_core::auth;
+use anvil_core::permissions::AnvilAction;
 use anvil_core::validation;
 use axum::{
     Router,
@@ -347,6 +349,20 @@ async fn list_objects(
         return list_multipart_uploads_response(state, claims, &bucket, &q).await;
     }
 
+    if q.contains_key("location") {
+        let claims = match claims {
+            Some(claims) => claims,
+            None => {
+                return s3_error(
+                    "AccessDenied",
+                    "Missing credentials",
+                    axum::http::StatusCode::FORBIDDEN,
+                );
+            }
+        };
+        return get_bucket_location_response(state, claims, &bucket).await;
+    }
+
     let prefix = q.get("prefix").cloned().unwrap_or_default();
     let continuation_token = q
         .get("continuation-token")
@@ -490,6 +506,41 @@ async fn list_objects(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             ),
         },
+    }
+}
+
+async fn get_bucket_location_response(state: AppState, claims: Claims, bucket: &str) -> Response {
+    if !auth::is_authorized(AnvilAction::BucketRead, bucket, &claims.scopes) {
+        return s3_error(
+            "AccessDenied",
+            "Permission denied",
+            axum::http::StatusCode::FORBIDDEN,
+        );
+    }
+
+    match state.db.get_bucket_by_name(claims.tenant_id, bucket).await {
+        Ok(Some(bucket)) => {
+            let xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{}</LocationConstraint>\n",
+                xml_escape(&bucket.region)
+            );
+            Response::builder()
+                .status(200)
+                .header("Content-Type", "application/xml")
+                .header("x-amz-bucket-region", bucket.region)
+                .body(Body::from(xml))
+                .unwrap()
+        }
+        Ok(None) => s3_error(
+            "NoSuchBucket",
+            "The specified bucket does not exist",
+            axum::http::StatusCode::NOT_FOUND,
+        ),
+        Err(e) => s3_error(
+            "InternalError",
+            &e.to_string(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
