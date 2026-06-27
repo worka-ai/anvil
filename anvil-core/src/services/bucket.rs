@@ -1,7 +1,7 @@
 use crate::anvil_api::bucket_service_server::BucketService;
 use crate::anvil_api::*;
-use crate::{AppState, auth, permissions::AnvilAction, validation};
-use serde_json::{Value as JsonValue, json};
+use crate::{AppState, auth, bucket_journal, permissions::AnvilAction, validation};
+use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -168,11 +168,15 @@ impl BucketService for AppState {
         }
         let after_cursor = i64::try_from(req.after_cursor)
             .map_err(|_| Status::invalid_argument("after_cursor exceeds supported range"))?;
-        let snapshot = self
-            .db
-            .list_bucket_metadata_events(claims.tenant_id, &req.bucket_name, after_cursor, 1000)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let snapshot = bucket_journal::list_bucket_metadata_events(
+            &self.storage,
+            claims.tenant_id,
+            &req.bucket_name,
+            after_cursor,
+            1000,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
         let mut live = self.bucket_watch_tx.subscribe();
 
         let (tx, rx) = mpsc::channel(32);
@@ -234,29 +238,22 @@ impl AppState {
         event_type: &str,
         deleted: bool,
     ) -> Result<crate::persistence::BucketMetadataEvent, Status> {
-        let event = self
-            .db
-            .create_bucket_metadata_event(
-                tenant_id,
-                bucket,
-                event_type,
-                bucket_metadata_json(bucket, deleted),
-            )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let event =
+            bucket_journal::latest_bucket_metadata_event(&self.storage, tenant_id, &bucket.name)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::internal("Bucket metadata journal event not found"))?;
+        if event.event_type != event_type {
+            tracing::debug!(
+                expected = event_type,
+                actual = event.event_type,
+                deleted,
+                "bucket metadata journal event type differs from service hint"
+            );
+        }
         let _ = self.bucket_watch_tx.send(event.clone());
         Ok(event)
     }
-}
-
-fn bucket_metadata_json(bucket: &crate::persistence::Bucket, deleted: bool) -> JsonValue {
-    json!({
-        "name": bucket.name,
-        "creation_date": bucket.created_at.to_string(),
-        "region": bucket.region,
-        "is_public_read": bucket.is_public_read,
-        "deleted": deleted,
-    })
 }
 
 fn bucket_metadata_event_response(

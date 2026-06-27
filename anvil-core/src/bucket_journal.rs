@@ -2,10 +2,11 @@ use crate::formats::{
     BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, Hash32, JournalFrame, JournalRecordKind,
     hash32, validate_journal_chain,
 };
-use crate::persistence::Bucket;
+use crate::persistence::{Bucket, BucketMetadataEvent};
 use crate::storage::Storage;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value as JsonValue, json};
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
 
@@ -47,6 +48,8 @@ struct BucketJournalBody {
     is_public_read: bool,
     mutation_id: String,
     created_at: String,
+    #[serde(default)]
+    emitted_at: Option<String>,
 }
 
 pub async fn append_bucket_mutation(
@@ -114,6 +117,7 @@ async fn append_bucket_mutation_to_path(
         is_public_read: bucket.is_public_read,
         mutation_id: mutation_id.to_string(),
         created_at: bucket.created_at.to_rfc3339(),
+        emitted_at: Some(chrono::Utc::now().to_rfc3339()),
     })?;
     let frame = JournalFrame::new(
         JournalRecordKind::BucketMetadata,
@@ -148,6 +152,48 @@ pub async fn read_current_bucket(
 
 pub async fn read_current_buckets(storage: &Storage, tenant_id: i64) -> Result<Vec<Bucket>> {
     read_current_buckets_from_path(storage.bucket_metadata_journal_path(tenant_id)).await
+}
+
+pub async fn latest_bucket_metadata_event(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_name: &str,
+) -> Result<Option<BucketMetadataEvent>> {
+    Ok(
+        list_bucket_metadata_events(storage, tenant_id, bucket_name, 0, 0)
+            .await?
+            .into_iter()
+            .max_by_key(|event| event.id),
+    )
+}
+
+pub async fn list_bucket_metadata_events(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_name: &str,
+    after_cursor: i64,
+    limit: usize,
+) -> Result<Vec<BucketMetadataEvent>> {
+    let path = storage.bucket_metadata_journal_path(tenant_id);
+    let frames = read_bucket_journal_frames_at_path(path.as_path()).await?;
+    let mut events = Vec::new();
+    for frame in frames {
+        if frame.record_kind != JournalRecordKind::BucketMetadata {
+            continue;
+        }
+        if frame.partition_sequence <= after_cursor as u64 {
+            continue;
+        }
+        let body: BucketJournalBody = serde_json::from_slice(&frame.body)?;
+        if !bucket_name.is_empty() && body.bucket_name != bucket_name {
+            continue;
+        }
+        events.push(bucket_event_from_body(frame.partition_sequence, body)?);
+        if limit > 0 && events.len() >= limit {
+            break;
+        }
+    }
+    Ok(events)
 }
 
 async fn read_current_buckets_from_path(path: std::path::PathBuf) -> Result<Vec<Bucket>> {
@@ -269,6 +315,46 @@ fn bucket_key_hash(tenant_id: i64, bucket_name: &str) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/bucket/{bucket_name}").as_bytes())
 }
 
+fn bucket_event_from_body(sequence: u64, body: BucketJournalBody) -> Result<BucketMetadataEvent> {
+    let id = i64::try_from(sequence).context("bucket metadata cursor exceeds i64")?;
+    let bucket_created_at =
+        chrono::DateTime::parse_from_rfc3339(&body.created_at)?.with_timezone(&chrono::Utc);
+    let event_created_at = body
+        .emitted_at
+        .as_deref()
+        .map(chrono::DateTime::parse_from_rfc3339)
+        .transpose()?
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .unwrap_or(bucket_created_at);
+    let deleted = body.event == "delete";
+    Ok(BucketMetadataEvent {
+        id,
+        tenant_id: body.tenant_id,
+        bucket_id: body.bucket_id,
+        bucket_name: body.bucket_name.clone(),
+        event_type: bucket_event_type(&body.event).to_string(),
+        bucket_metadata: bucket_metadata_json(&body, deleted),
+        created_at: event_created_at,
+    })
+}
+
+fn bucket_event_type(event: &str) -> &str {
+    match event {
+        "update" => "policy_update",
+        other => other,
+    }
+}
+
+fn bucket_metadata_json(body: &BucketJournalBody, deleted: bool) -> JsonValue {
+    json!({
+        "name": body.bucket_name,
+        "creation_date": body.created_at,
+        "region": body.region,
+        "is_public_read": body.is_public_read,
+        "deleted": deleted,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +417,40 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn bucket_journal_lists_watch_events_from_native_log() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let private = bucket(1, "watched-bucket", false);
+        let public = bucket(1, "watched-bucket", true);
+        append_bucket_mutation(&storage, &private, BucketJournalMutation::Create)
+            .await
+            .unwrap();
+        append_bucket_mutation(&storage, &public, BucketJournalMutation::Update)
+            .await
+            .unwrap();
+
+        let all = list_bucket_metadata_events(&storage, 42, "", 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].event_type, "create");
+        assert_eq!(all[1].event_type, "policy_update");
+        assert!(all[1].bucket_metadata["is_public_read"].as_bool().unwrap());
+
+        let after_first = list_bucket_metadata_events(&storage, 42, "", 1, 10)
+            .await
+            .unwrap();
+        assert_eq!(after_first.len(), 1);
+        assert_eq!(after_first[0].id, 2);
+
+        let latest = latest_bucket_metadata_event(&storage, 42, "watched-bucket")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.id, 2);
+        assert_eq!(latest.bucket_name, "watched-bucket");
     }
 }
