@@ -197,6 +197,35 @@ impl Storage {
             .join(format!("{diagnostic_id}.json")))
     }
 
+    pub fn derived_index_proof_dir(&self, index_id: &str) -> Result<PathBuf> {
+        ensure_safe_internal_component(index_id, "derived index id")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("index")
+            .join("proofs")
+            .join(index_id))
+    }
+
+    pub fn derived_index_proof_head_path(&self, index_id: &str) -> Result<PathBuf> {
+        Ok(self
+            .derived_index_proof_dir(index_id)?
+            .join("heads")
+            .join("latest.json"))
+    }
+
+    pub fn derived_index_proof_path(
+        &self,
+        index_id: &str,
+        generation: u64,
+        proof_hash: &str,
+    ) -> Result<PathBuf> {
+        ensure_hash_hex(proof_hash, "derived index proof hash")?;
+        Ok(self
+            .derived_index_proof_dir(index_id)?
+            .join(format!("generation-{generation:020}-{proof_hash}.json")))
+    }
+
     pub fn git_source_watch_path(&self, tenant_id: i64, repository_id: &str) -> Result<PathBuf> {
         ensure_safe_internal_component(repository_id, "git repository id")?;
         Ok(self

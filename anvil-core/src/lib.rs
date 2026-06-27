@@ -17,6 +17,7 @@ pub mod cache;
 pub mod cluster;
 pub mod config;
 pub mod crypto;
+pub mod derived_index_proof;
 pub mod diagnostic_store;
 pub mod discovery;
 pub mod error_codes;
