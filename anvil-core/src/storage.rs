@@ -93,6 +93,23 @@ impl Storage {
         Ok(relative.to_string_lossy().replace('\\', "/"))
     }
 
+    pub fn resolve_relative_storage_path(&self, relative: &str) -> Result<PathBuf> {
+        let path = Path::new(relative);
+        if path.is_absolute() {
+            anyhow::bail!("storage-relative path must not be absolute");
+        }
+
+        let mut clean = PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::Normal(part) => clean.push(part),
+                std::path::Component::CurDir => {}
+                _ => anyhow::bail!("storage-relative path must not escape storage root"),
+            }
+        }
+        Ok(self.storage_path.join(clean))
+    }
+
     fn get_shard_path(&self, object_hash: &str, shard_index: u32) -> PathBuf {
         self.storage_path
             .join(format!("{}-{:02}", object_hash, shard_index))

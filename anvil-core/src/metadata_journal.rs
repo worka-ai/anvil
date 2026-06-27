@@ -201,6 +201,13 @@ pub struct SealedObjectMetadataSegments {
     pub manifest_hash: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredObjectMetadataPartition {
+    pub manifest: PartitionManifest,
+    pub metadata_records: Vec<SegmentRecord>,
+    pub directory_records: Vec<SegmentRecord>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PartitionManifest {
     pub format_version: u16,
@@ -344,6 +351,14 @@ pub async fn seal_object_journal_segments(
 }
 
 pub fn decode_segment_file(input: &[u8], expected_family: FileFamily) -> Result<SegmentBody> {
+    let (body, _) = decode_segment_file_with_footer(input, expected_family)?;
+    Ok(body)
+}
+
+fn decode_segment_file_with_footer(
+    input: &[u8],
+    expected_family: FileFamily,
+) -> Result<(SegmentBody, BinaryFileFooter)> {
     let header = BinaryEnvelopeHeader::decode(input)?;
     if header.family != expected_family {
         return Err(anyhow!("segment file family mismatch"));
@@ -366,7 +381,103 @@ pub fn decode_segment_file(input: &[u8], expected_family: FileFamily) -> Result<
     let body = &input[header_len..footer_start];
     let footer = BinaryFileFooter::decode(&input[footer_start..])?;
     footer.verify(&input[..header_len], body)?;
-    SegmentBody::decode(body).map_err(Into::into)
+    let body = SegmentBody::decode(body)?;
+    Ok((body, footer))
+}
+
+pub async fn recover_object_metadata_partition(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+) -> Result<RecoveredObjectMetadataPartition> {
+    let manifest_path = storage.metadata_manifest_path(bucket.tenant_id, bucket.id);
+    let manifest_bytes = tokio::fs::read(&manifest_path)
+        .await
+        .with_context(|| format!("read partition manifest {}", manifest_path.display()))?;
+    let manifest = decode_partition_manifest(&manifest_bytes, manifest_signing_key)?;
+    let expected_partition_id = hex::encode(partition_id(bucket.tenant_id, bucket.id));
+    if manifest.partition_family != "object_metadata" {
+        return Err(anyhow!("partition manifest family mismatch"));
+    }
+    if manifest.partition_id != expected_partition_id {
+        return Err(anyhow!("partition manifest id mismatch"));
+    }
+
+    let mut metadata_records = Vec::new();
+    let mut directory_latest = std::collections::BTreeMap::<Vec<u8>, SegmentRecord>::new();
+    for segment in &manifest.segments {
+        let family = file_family_from_manifest_name(&segment.family)?;
+        let segment_path = storage.resolve_relative_storage_path(&segment.path)?;
+        let bytes = tokio::fs::read(&segment_path)
+            .await
+            .with_context(|| format!("read partition segment {}", segment_path.display()))?;
+        let (body, footer) = decode_segment_file_with_footer(&bytes, family)?;
+        if hex::encode(footer.file_hash) != segment.file_hash {
+            return Err(anyhow!("partition segment file hash mismatch"));
+        }
+        if footer.record_count != segment.record_count {
+            return Err(anyhow!("partition segment record count mismatch"));
+        }
+
+        let mut records = decode_segment_body_records(&body)?;
+        match family {
+            FileFamily::MetadataSegment => metadata_records.append(&mut records),
+            FileFamily::DirectorySegment => {
+                for record in records {
+                    directory_latest.insert(record.key.clone(), record);
+                }
+            }
+            _ => {
+                return Err(anyhow!(
+                    "unexpected segment family in object metadata manifest"
+                ));
+            }
+        }
+    }
+
+    if let Some(active_journal) = &manifest.active_journal {
+        let journal_path = storage.resolve_relative_storage_path(&active_journal.path)?;
+        let journal_bytes = tokio::fs::read(&journal_path)
+            .await
+            .with_context(|| format!("read active journal {}", journal_path.display()))?;
+        let (_, frames) = decode_journal_file(&journal_bytes)?;
+        let first = frames
+            .first()
+            .ok_or_else(|| anyhow!("active journal manifest entry points at an empty journal"))?;
+        let last = frames
+            .last()
+            .ok_or_else(|| anyhow!("active journal manifest entry points at an empty journal"))?;
+        if first.partition_sequence != active_journal.first_sequence
+            || last.partition_sequence != active_journal.last_sequence
+            || hex::encode(last.record_hash) != active_journal.last_record_hash
+        {
+            return Err(anyhow!("active journal manifest reference mismatch"));
+        }
+        for frame in frames {
+            match frame.record_kind {
+                JournalRecordKind::ObjectVersion | JournalRecordKind::DeleteMarker => {
+                    let body: ObjectVersionBody = serde_json::from_slice(&frame.body)?;
+                    metadata_records.push(SegmentRecord::new(
+                        metadata_segment_key(&body),
+                        frame.body.clone(),
+                    ));
+                }
+                JournalRecordKind::DirectoryEntry => {
+                    let body: DirectoryEntryBody = serde_json::from_slice(&frame.body)?;
+                    let record = SegmentRecord::new(directory_segment_key(&body), frame.body);
+                    directory_latest.insert(record.key.clone(), record);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    metadata_records.sort_by(|left, right| left.key.cmp(&right.key));
+    Ok(RecoveredObjectMetadataPartition {
+        manifest,
+        metadata_records,
+        directory_records: directory_latest.into_values().collect(),
+    })
 }
 
 async fn write_segment_file(
@@ -542,6 +653,24 @@ fn file_family_name(family: FileFamily) -> &'static str {
         FileFamily::PersonalDbRowIndex => "personaldb_row_index",
         FileFamily::GitSourceIndex => "git_source_index",
     }
+}
+
+fn file_family_from_manifest_name(name: &str) -> Result<FileFamily> {
+    match name {
+        "metadata_segment" => Ok(FileFamily::MetadataSegment),
+        "directory_segment" => Ok(FileFamily::DirectorySegment),
+        other => Err(anyhow!(
+            "unsupported segment family in partition manifest: {other}"
+        )),
+    }
+}
+
+fn decode_segment_body_records(body: &SegmentBody) -> Result<Vec<SegmentRecord>> {
+    let mut records = Vec::new();
+    for block in &body.data_blocks {
+        records.extend(block.decode_uncompressed_records()?);
+    }
+    Ok(records)
 }
 
 fn segment_header(
@@ -814,6 +943,18 @@ mod tests {
         tampered_manifest.generation += 1;
         assert!(verify_partition_manifest(&tampered_manifest, signing_key).is_err());
 
+        let recovered = recover_object_metadata_partition(&storage, &bucket, signing_key)
+            .await
+            .unwrap();
+        assert_eq!(recovered.manifest.generation, sealed.generation);
+        assert_eq!(recovered.metadata_records.len(), 3);
+        assert_eq!(recovered.directory_records.len(), 2);
+        assert!(
+            storage
+                .resolve_relative_storage_path("../escape.anseg")
+                .is_err()
+        );
+
         let metadata_bytes = tokio::fs::read(&sealed.metadata_path).await.unwrap();
         let metadata_body =
             decode_segment_file(&metadata_bytes, FileFamily::MetadataSegment).unwrap();
@@ -837,6 +978,18 @@ mod tests {
         let latest_a: DirectoryEntryBody =
             serde_json::from_slice(&directory_records[0].value).unwrap();
         assert_eq!(latest_a.version_id, second.version_id.to_string());
+
+        let mut corrupted_metadata = tokio::fs::read(&sealed.metadata_path).await.unwrap();
+        let body_byte = corrupted_metadata.len() - COMMON_FOOTER_LEN - 1;
+        corrupted_metadata[body_byte] ^= 1;
+        tokio::fs::write(&sealed.metadata_path, corrupted_metadata)
+            .await
+            .unwrap();
+        assert!(
+            recover_object_metadata_partition(&storage, &bucket, signing_key)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
