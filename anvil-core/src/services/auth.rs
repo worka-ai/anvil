@@ -1,8 +1,8 @@
 use crate::anvil_api::auth_service_server::AuthService;
 use crate::anvil_api::*;
 use crate::{
-    AppState, auth, authz_derived_lag_watch, authz_journal, authz_namespace_watch, crypto,
-    permissions::AnvilAction,
+    AppState, auth, authz_derived_lag_watch, authz_journal, authz_namespace_watch,
+    authz_userset_index, crypto, permissions::AnvilAction,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -222,6 +222,32 @@ impl AuthService for AppState {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         let _ = self.authz_watch_tx.send(record.clone());
+        let derived = authz_userset_index::rebuild_derived_userset_index(
+            &self.storage,
+            claims.tenant_id,
+            authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+        let processed_revision = revision_to_u64(record.revision)?;
+        authz_derived_lag_watch::append_authz_derived_lag_watch_record(
+            &self.storage,
+            claims.tenant_id,
+            u128::from(processed_revision),
+            mutation_id_from_record_hash(&record.record_hash),
+            authz_derived_lag_watch::AuthzDerivedLagWatchPayload {
+                derived_index_id: authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID.to_string(),
+                derived_index_kind: "userset".to_string(),
+                processed_revision: derived.processed_revision,
+                latest_revision: processed_revision,
+                source_cursor: u128::from(processed_revision),
+                source_manifest_hash: derived.source_records_hash,
+                generation: derived.generation,
+                emitted_at: chrono::Utc::now().to_rfc3339(),
+            },
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(WriteAuthzTupleResponse {
             revision: revision_to_u64(record.revision)?,
@@ -675,6 +701,15 @@ fn split_u128(value: u128) -> (u64, u64) {
 
 fn join_u128(low: u64, high: u64) -> u128 {
     u128::from(low) | (u128::from(high) << 64)
+}
+
+fn mutation_id_from_record_hash(record_hash: &str) -> [u8; 16] {
+    let mut mutation_id = [0; 16];
+    if let Ok(bytes) = hex::decode(record_hash) {
+        let len = bytes.len().min(mutation_id.len());
+        mutation_id[..len].copy_from_slice(&bytes[..len]);
+    }
+    mutation_id
 }
 
 #[cfg(test)]

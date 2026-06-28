@@ -235,6 +235,18 @@ impl Storage {
             .join(format!("generation-{generation:020}.anauthz"))
     }
 
+    pub fn authz_derived_userset_index_path(
+        &self,
+        tenant_id: i64,
+        derived_index_id: &str,
+    ) -> Result<PathBuf> {
+        ensure_safe_internal_component(derived_index_id, "authorization derived userset index id")?;
+        Ok(self
+            .authz_tuple_segment_dir(tenant_id)
+            .join("derived-usersets")
+            .join(format!("{derived_index_id}.json")))
+    }
+
     pub fn metadata_segment_path(
         &self,
         tenant_id: i64,

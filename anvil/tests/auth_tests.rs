@@ -13,6 +13,7 @@ use anvil::authz_derived_lag_watch::{
 use anvil::authz_namespace_watch::{
     AuthzNamespaceWatchPayload, append_authz_namespace_watch_record,
 };
+use anvil::authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID;
 use futures_util::StreamExt;
 use std::time::Duration;
 use tonic::Request;
@@ -600,6 +601,30 @@ async fn test_authz_permission_resolves_nested_usersets() {
         .into_inner();
     assert!(!latest_after_remove.allowed);
     assert_eq!(latest_after_remove.zookie, remove.zookie);
+
+    let mut lag_request = Request::new(WatchAuthzDerivedLagRequest {
+        derived_index_id: DEFAULT_DERIVED_USERSET_INDEX_ID.to_string(),
+        after_cursor_low: 0,
+        after_cursor_high: 0,
+    });
+    add_bearer(&mut lag_request, &token);
+    let mut lag_stream = auth_client
+        .watch_authz_derived_lag(lag_request)
+        .await
+        .unwrap()
+        .into_inner();
+    for expected_revision in 1..=4 {
+        let event = tokio::time::timeout(Duration::from_secs(5), lag_stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.derived_index_id, DEFAULT_DERIVED_USERSET_INDEX_ID);
+        assert_eq!(event.derived_index_kind, "userset");
+        assert_eq!(event.processed_revision, expected_revision);
+        assert_eq!(event.latest_revision, expected_revision);
+        assert_eq!(event.revision_lag, 0);
+    }
 }
 
 #[tokio::test]

@@ -1,4 +1,7 @@
 use crate::authz_segment;
+use crate::authz_userset_index::{
+    DEFAULT_DERIVED_USERSET_INDEX_ID, lookup_derived_userset_index_at_revision,
+};
 use crate::formats::{
     BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, Hash32, JournalFrame, JournalRecordKind,
     hash32, validate_journal_chain,
@@ -261,6 +264,24 @@ pub async fn resolve_permission_at_revision(
     caveat_hash: &str,
     revision: i64,
 ) -> Result<bool> {
+    if revision >= 0
+        && let Some(allowed) = lookup_derived_userset_index_at_revision(
+            storage,
+            tenant_id,
+            DEFAULT_DERIVED_USERSET_INDEX_ID,
+            namespace,
+            object_id,
+            relation,
+            subject_kind,
+            subject_id,
+            caveat_hash,
+            revision as u64,
+        )
+        .await?
+    {
+        return Ok(allowed);
+    }
+
     let current = current_authz_view_at_revision(storage, tenant_id, revision).await?;
     let subject = SubjectRef {
         kind: subject_kind.to_string(),
