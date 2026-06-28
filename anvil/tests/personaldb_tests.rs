@@ -118,7 +118,7 @@ async fn personaldb_group_create_get_and_catch_up_are_native_api_backed() {
 }
 
 #[tokio::test]
-async fn personaldb_submit_is_authorized_decoded_and_reaches_commit_serialization_gate() {
+async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
@@ -165,32 +165,85 @@ async fn personaldb_submit_is_authorized_decoded_and_reaches_commit_serializatio
         .unwrap_err();
     assert_eq!(malformed.code(), Code::InvalidArgument);
 
-    let unavailable = client
+    let committed = client
         .submit_personal_db_changeset(authorized(
             valid_submit_request(&database_id, &genesis_hash),
             &token,
         ))
         .await
-        .unwrap_err();
-    assert_eq!(unavailable.code(), Code::FailedPrecondition);
-    assert!(
-        unavailable
-            .message()
-            .contains("PersonalDbCommitSerializationUnavailable")
-    );
+        .unwrap()
+        .into_inner();
+    assert_eq!(committed.log_index, 1);
+    assert_eq!(committed.changeset_payload_hash.len(), 64);
+    assert_eq!(committed.verified_envelope_hash.len(), 64);
+    assert_eq!(committed.certificate_hash.len(), 64);
+    assert_eq!(committed.watch_cursor_low, 1);
+    assert_eq!(committed.watch_cursor_high, 0);
+    assert_eq!(committed.certificate.as_ref().unwrap().log_index, 1);
+    assert_eq!(committed.committed_head.as_ref().unwrap().log_index, 1);
 
     let fetched = client
         .get_personal_db_group(authorized(
             GetPersonalDbGroupRequest {
                 tenant_id: 1,
-                database_id,
+                database_id: database_id.clone(),
             },
             &token,
         ))
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(fetched.committed_head.unwrap().log_index, 0);
+    assert_eq!(fetched.committed_head.unwrap().log_index, 1);
+
+    let caught_up = client
+        .catch_up_personal_db(authorized(
+            PersonalDbCatchUpRequest {
+                tenant_id: 1,
+                database_id: database_id.clone(),
+                principal: "test-app".to_string(),
+                replica_id: "replica-a".to_string(),
+                have_log_index: 0,
+                have_log_hash: genesis_hash,
+                max_entries: 10,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!caught_up.snapshot_required);
+    assert_eq!(caught_up.entries.len(), 1);
+    assert_eq!(
+        caught_up.entries[0].log_record.as_ref().unwrap().log_index,
+        1
+    );
+    assert_eq!(
+        caught_up.entries[0].changeset_bytes,
+        sqlite_insert_changeset()
+    );
+    assert_eq!(
+        caught_up.entries[0].certificate.as_ref().unwrap().log_index,
+        1
+    );
+
+    let watch = client
+        .watch_personal_db_group(authorized(
+            WatchPersonalDbGroupRequest {
+                tenant_id: 1,
+                database_id: database_id.clone(),
+                after_cursor_low: 0,
+                after_cursor_high: 0,
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    let mut stream = watch.into_inner();
+    let event = stream.next().await.unwrap().unwrap();
+    assert_eq!(event.database_id, database_id);
+    assert_eq!(event.event_type, "commit");
+    assert_eq!(event.log_index, 1);
+    assert_eq!(event.log_hash, committed.log_hash);
 }
 
 #[tokio::test]

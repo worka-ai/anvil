@@ -4,24 +4,34 @@ use crate::{
     AppState,
     anvil_personaldb_sqlite_changeset::iterate_changeset,
     auth, authz_journal,
+    formats::{Hash32, personaldb::PersonalDbLogRecord as CorePersonalDbLogRecord},
     permissions::AnvilAction,
     personaldb_catchup::{
         PersonalDbCatchUpRequest as CoreCatchUpRequest,
         PersonalDbCatchUpResponse as CoreCatchUpResponse, PersonalDbSnapshotRestoreReason,
         personaldb_catch_up,
     },
-    personaldb_control::PersonalDbGroupManifest,
+    personaldb_commit_store::{
+        write_personaldb_changeset_payload, write_personaldb_commit_certificate,
+    },
+    personaldb_control::{PersonalDbCommitCertificate, PersonalDbGroupManifest},
     personaldb_envelope::{PersonalDbEnvelopeDerivationInput, derive_verified_mutation_envelope},
     personaldb_heads::{
         PersonalDbCommittedHead, PersonalDbSnapshotsHead, read_personaldb_committed_head,
         read_personaldb_group_manifest, write_personaldb_committed_head,
         write_personaldb_group_manifest,
     },
+    personaldb_row_index::{PersonalDbRowIndexWrite, write_personaldb_row_index},
+    personaldb_segment::{PersonalDbLogSegmentWrite, write_personaldb_log_segment},
     personaldb_submit::{
         SubmitPersonalDbChangeset as CoreSubmitChangeset, default_max_changeset_size,
         validate_submit_personaldb_changeset,
     },
-    personaldb_watch::{PersonalDbGroupWatchEvent, list_personaldb_group_watch_events},
+    personaldb_watch::{
+        PersonalDbGroupWatchEvent, PersonalDbGroupWatchPayload,
+        append_personaldb_group_watch_record, latest_personaldb_group_watch_cursor,
+        list_personaldb_group_watch_events,
+    },
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -219,26 +229,229 @@ impl PersonalDbService for AppState {
                 u64::try_from(revision)
                     .map_err(|_| Status::internal("Invalid authorization revision"))
             })?;
-        let _envelope = derive_verified_mutation_envelope(PersonalDbEnvelopeDerivationInput {
+        let proposed_log_index = validated
+            .request
+            .base_log_index
+            .checked_add(1)
+            .ok_or_else(|| Status::failed_precondition("PersonalDB log index overflow"))?;
+        let updated_at = chrono::Utc::now();
+        let envelope = derive_verified_mutation_envelope(PersonalDbEnvelopeDerivationInput {
             tenant_id: claims.tenant_id,
             database_id: &validated.request.database_id,
             principal: &validated.request.principal,
             base_log_index: validated.request.base_log_index,
-            proposed_log_index: validated.request.base_log_index + 1,
+            proposed_log_index,
             changeset_payload_hash: validated.changeset_payload_hash,
             schema_hash: &manifest.schema_hash,
             policy_epoch: manifest.active_policy_epoch,
             authz_revision,
             changes: &changes,
-            updated_at_nanos: chrono::Utc::now()
+            updated_at_nanos: updated_at
                 .timestamp_nanos_opt()
                 .ok_or_else(|| Status::internal("Invalid current timestamp"))?,
         })
         .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let envelope_hash = envelope.envelope_hash32().map_err(internal_status)?;
+        let previous_log_hash = hex32_status(&committed_head.log_hash, "committed head log hash")?;
+        let schema_hash = hex32_status(&manifest.schema_hash, "schema hash")?;
+        let payload_paths = write_personaldb_changeset_payload(
+            &self.storage,
+            claims.tenant_id,
+            &validated.request.database_id,
+            proposed_log_index,
+            validated.changeset_payload_hash,
+            &validated.request.changeset_bytes,
+        )
+        .await
+        .map_err(internal_status)?;
+        let payload_ref = self
+            .storage
+            .relative_storage_path(&payload_paths.by_index_path)
+            .map_err(internal_status)?
+            .into_bytes();
 
-        Err(Status::failed_precondition(
-            "PersonalDbCommitSerializationUnavailable",
-        ))
+        let provisional_record = CorePersonalDbLogRecord::new(
+            proposed_log_index,
+            validated.request.client_log_epoch,
+            validated.request.membership_epoch,
+            validated.request.policy_epoch,
+            previous_log_hash,
+            validated.changeset_payload_hash,
+            envelope_hash,
+            [0; 32],
+            payload_ref.clone(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let witnessed_at = now_rfc3339();
+        let certificate = PersonalDbCommitCertificate {
+            format_version: 1,
+            tenant_id: claims.tenant_id.to_string(),
+            database_id: validated.request.database_id.clone(),
+            log_index: proposed_log_index,
+            previous_log_hash: hex::encode(previous_log_hash),
+            entry_hash: hex::encode(provisional_record.entry_hash),
+            changeset_payload_hash: hex::encode(validated.changeset_payload_hash),
+            verified_envelope_hash: hex::encode(envelope_hash),
+            client_log_epoch: validated.request.client_log_epoch,
+            membership_epoch: validated.request.membership_epoch,
+            policy_epoch: validated.request.policy_epoch,
+            leader_replica_id: validated.request.leader_replica_id.clone(),
+            voter_acks_hash: hex::encode(validated.voter_acks_hash),
+            authz_revision,
+            witness_node_id: claims.sub.clone(),
+            witnessed_at,
+            certificate_hash: None,
+            witness_signature: None,
+        }
+        .seal(signing_key)
+        .map_err(internal_status)?;
+        let certificate_path = write_personaldb_commit_certificate(
+            &self.storage,
+            claims.tenant_id,
+            &validated.request.database_id,
+            &certificate,
+            signing_key,
+        )
+        .await
+        .map_err(internal_status)?;
+        let certificate_hash = hex32_status(
+            certificate
+                .certificate_hash
+                .as_deref()
+                .ok_or_else(|| Status::internal("PersonalDB certificate hash missing"))?,
+            "certificate hash",
+        )?;
+        let certificate_ref = self
+            .storage
+            .relative_storage_path(&certificate_path)
+            .map_err(internal_status)?
+            .into_bytes();
+        let record = CorePersonalDbLogRecord::new(
+            proposed_log_index,
+            validated.request.client_log_epoch,
+            validated.request.membership_epoch,
+            validated.request.policy_epoch,
+            previous_log_hash,
+            validated.changeset_payload_hash,
+            envelope_hash,
+            certificate_hash,
+            payload_ref,
+            certificate_ref,
+            Vec::new(),
+        );
+        let segment_path = write_personaldb_log_segment(
+            &self.storage,
+            PersonalDbLogSegmentWrite {
+                tenant_id: claims.tenant_id,
+                database_id: &validated.request.database_id,
+                schema_hash,
+                source_fence_token: 0,
+                records: std::slice::from_ref(&record),
+            },
+        )
+        .await
+        .map_err(internal_status)?;
+        let mut row_index_generation = committed_head.row_index_generation;
+        let row_index_records = envelope.row_index_upserts().map_err(internal_status)?;
+        if !row_index_records.is_empty() {
+            row_index_generation = row_index_generation
+                .checked_add(1)
+                .ok_or_else(|| Status::failed_precondition("PersonalDB row index overflow"))?;
+            write_personaldb_row_index(
+                &self.storage,
+                PersonalDbRowIndexWrite {
+                    tenant_id: claims.tenant_id,
+                    database_id: &validated.request.database_id,
+                    generation: row_index_generation,
+                    source_hash: record.entry_hash,
+                    records: &row_index_records,
+                },
+            )
+            .await
+            .map_err(internal_status)?;
+        }
+        let committed_head = PersonalDbCommittedHead {
+            format_version: 1,
+            tenant_id: claims.tenant_id.to_string(),
+            database_id: validated.request.database_id.clone(),
+            log_index: proposed_log_index,
+            log_hash: hex::encode(record.entry_hash),
+            segment_path: self
+                .storage
+                .relative_storage_path(&segment_path)
+                .map_err(internal_status)?,
+            row_index_generation,
+            policy_epoch: manifest.active_policy_epoch,
+            membership_epoch: manifest.active_membership_epoch,
+            schema_hash: manifest.schema_hash.clone(),
+            updated_at: now_rfc3339(),
+            updated_by_node: claims.sub.clone(),
+            head_hash: None,
+            head_signature: None,
+        }
+        .seal(signing_key)
+        .map_err(internal_status)?;
+        write_personaldb_committed_head(
+            &self.storage,
+            claims.tenant_id,
+            &validated.request.database_id,
+            &committed_head,
+            signing_key,
+        )
+        .await
+        .map_err(internal_status)?;
+
+        let watch_cursor = latest_personaldb_group_watch_cursor(
+            &self.storage,
+            claims.tenant_id,
+            &validated.request.database_id,
+        )
+        .await
+        .map_err(internal_status)?
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| Status::internal("PersonalDB watch cursor overflow"))?;
+        let watch_payload = PersonalDbGroupWatchPayload {
+            database_id: validated.request.database_id.clone(),
+            event_type: "commit".to_string(),
+            log_index: proposed_log_index,
+            log_hash: hex::encode(record.entry_hash),
+            changeset_payload_hash: hex::encode(validated.changeset_payload_hash),
+            certificate_hash: hex::encode(certificate_hash),
+            committed_head_hash: committed_head.head_hash.clone().unwrap_or_default(),
+            emitted_at: now_rfc3339(),
+        };
+        let mutation_id = *uuid::Uuid::new_v4().as_bytes();
+        append_personaldb_group_watch_record(
+            &self.storage,
+            claims.tenant_id,
+            &validated.request.database_id,
+            watch_cursor,
+            mutation_id,
+            authz_revision,
+            watch_payload.clone(),
+        )
+        .await
+        .map_err(internal_status)?;
+        let _ = self.personaldb_watch_tx.send(PersonalDbGroupWatchEvent {
+            cursor: watch_cursor,
+            mutation_id,
+            authz_revision,
+            payload: watch_payload,
+        });
+        let (watch_cursor_low, watch_cursor_high) = split_u128(watch_cursor);
+        Ok(Response::new(SubmitPersonalDbChangesetResponse {
+            log_index: proposed_log_index,
+            log_hash: hex::encode(record.entry_hash),
+            changeset_payload_hash: hex::encode(validated.changeset_payload_hash),
+            verified_envelope_hash: hex::encode(envelope_hash),
+            certificate_hash: hex::encode(certificate_hash),
+            certificate: Some(certificate_record(certificate)),
+            committed_head: Some(committed_head_record(committed_head)),
+            watch_cursor_low,
+            watch_cursor_high,
+        }))
     }
 
     async fn catch_up_personal_db(
@@ -563,6 +776,14 @@ fn validate_hex32(value: &str, field: &'static str) -> Result<(), Status> {
         return Err(Status::invalid_argument(format!("{field} must be hex32")));
     }
     Ok(())
+}
+
+fn hex32_status(value: &str, field: &'static str) -> Result<Hash32, Status> {
+    validate_hex32(value, field)?;
+    hex::decode(value)
+        .map_err(|_| Status::invalid_argument(format!("{field} must be hex32")))?
+        .try_into()
+        .map_err(|_| Status::invalid_argument(format!("{field} must be hex32")))
 }
 
 fn personaldb_resource(tenant_id: i64, database_id: &str) -> String {
