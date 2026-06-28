@@ -1,7 +1,7 @@
 use crate::anvil_api::repair_service_server::RepairService;
 use crate::anvil_api::*;
 use crate::{
-    AppState, auth, index_repair,
+    AppState, auth, authz_repair, index_repair,
     permissions::AnvilAction,
     repair_finding::{RepairFinding, RepairSubjectRef},
 };
@@ -87,6 +87,43 @@ impl RepairService for AppState {
             .map(repair_finding_record)
             .collect();
         Ok(Response::new(ListRepairFindingsResponse { findings }))
+    }
+
+    async fn repair_authz_derived_index(
+        &self,
+        request: Request<RepairAuthzDerivedIndexRequest>,
+    ) -> Result<Response<RepairAuthzDerivedIndexResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        validate_component(&req.derived_index_id, "derived_index_id")?;
+
+        let resource = format!("tenant-{}/authz/{}", claims.tenant_id, req.derived_index_id);
+        if !auth::is_authorized(AnvilAction::RepairRun, &resource, &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        let report = self
+            .persistence
+            .repair_authz_derived_userset_index(
+                claims.tenant_id,
+                &req.derived_index_id,
+                req.rebuild,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(RepairAuthzDerivedIndexResponse {
+            status: authz_repair::status_name(&report.status).to_string(),
+            derived_index_id: report.derived_index_id,
+            processed_revision: report.processed_revision,
+            latest_revision: report.latest_revision,
+            source_records_hash: report.source_records_hash,
+            reason: authz_repair::status_reason(&report.status),
+            finding: report.finding.as_ref().map(repair_finding_record),
+        }))
     }
 }
 

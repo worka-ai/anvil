@@ -82,6 +82,7 @@ service IndexService {
 
 service RepairService {
   rpc RepairIndex(RepairIndexRequest) returns (RepairIndexResponse);
+  rpc RepairAuthzDerivedIndex(RepairAuthzDerivedIndexRequest) returns (RepairAuthzDerivedIndexResponse);
   rpc ListRepairFindings(ListRepairFindingsRequest) returns (ListRepairFindingsResponse);
 }
 
@@ -337,6 +338,21 @@ message RepairIndexResponse {
     string reason = 7;
     RepairFindingRecord finding = 8;
     IndexBuildRecord build = 9;
+}
+
+message RepairAuthzDerivedIndexRequest {
+    string derived_index_id = 1;
+    bool rebuild = 2;
+}
+
+message RepairAuthzDerivedIndexResponse {
+    string status = 1;
+    string derived_index_id = 2;
+    uint64 processed_revision = 3;
+    uint64 latest_revision = 4;
+    string source_records_hash = 5;
+    string reason = 6;
+    RepairFindingRecord finding = 7;
 }
 
 message ListRepairFindingsRequest {

@@ -13,6 +13,7 @@ pub mod auth;
 pub mod authz_derived_lag_watch;
 pub mod authz_journal;
 pub mod authz_namespace_watch;
+pub mod authz_repair;
 pub mod authz_segment;
 pub mod authz_userset_index;
 pub mod bucket_journal;

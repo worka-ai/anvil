@@ -1,12 +1,13 @@
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
+use anvil::anvil_api::repair_service_client::RepairServiceClient;
 use anvil::anvil_api::{
     CheckPermissionRequest, CreateBucketRequest, GetAccessTokenRequest, GetObjectRequest,
     GrantAccessRequest, ListBucketsRequest, ListObjectVersionsRequest, ListObjectsRequest,
-    ObjectMetadata, PutObjectRequest, RevokeAccessRequest, SetPublicAccessRequest,
-    WatchAuthzDerivedLagRequest, WatchAuthzNamespaceRequest, WatchAuthzTupleLogRequest,
-    WriteAuthzTupleRequest,
+    ListRepairFindingsRequest, ObjectMetadata, PutObjectRequest, RepairAuthzDerivedIndexRequest,
+    RevokeAccessRequest, SetPublicAccessRequest, WatchAuthzDerivedLagRequest,
+    WatchAuthzNamespaceRequest, WatchAuthzTupleLogRequest, WriteAuthzTupleRequest,
 };
 use anvil::authz_derived_lag_watch::{
     AuthzDerivedLagWatchPayload, append_authz_derived_lag_watch_record,
@@ -1111,6 +1112,106 @@ async fn test_authz_derived_lag_watch_streams_snapshot_and_new_events() {
     assert_eq!(live.cursor_low, 2);
     assert_eq!(live.revision_lag, 0);
     assert_eq!(live.generation, 2);
+}
+
+#[tokio::test]
+async fn test_repair_authz_derived_index_rebuilds_from_tuple_log() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut repair_client = RepairServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    let mut direct_grant = Request::new(write_authz_tuple_request(
+        "document",
+        "repair-alpha",
+        "viewer",
+        "user",
+        "alice",
+        "add",
+    ));
+    add_bearer(&mut direct_grant, &token);
+    auth_client.write_authz_tuple(direct_grant).await.unwrap();
+
+    let path = cluster.states[0]
+        .storage
+        .authz_derived_userset_index_path(1, DEFAULT_DERIVED_USERSET_INDEX_ID)
+        .unwrap();
+    tokio::fs::remove_file(&path)
+        .await
+        .expect("remove derived userset index to force repair");
+
+    let mut repair_request = Request::new(RepairAuthzDerivedIndexRequest {
+        derived_index_id: DEFAULT_DERIVED_USERSET_INDEX_ID.to_string(),
+        rebuild: true,
+    });
+    add_bearer(&mut repair_request, &token);
+    let repaired = repair_client
+        .repair_authz_derived_index(repair_request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(repaired.status, "rebuilt_derived_index");
+    assert_eq!(repaired.reason, "AuthzDerivedIndexMissing");
+    assert_eq!(repaired.latest_revision, 1);
+    assert_eq!(repaired.processed_revision, 1);
+    assert_eq!(
+        repaired.derived_index_id,
+        DEFAULT_DERIVED_USERSET_INDEX_ID.to_string()
+    );
+    assert!(repaired.finding.is_some());
+
+    let mut check = Request::new(check_permission_request(
+        "document",
+        "repair-alpha",
+        "viewer",
+        "user",
+        "alice",
+        "exact",
+        "authz:1",
+    ));
+    add_bearer(&mut check, &token);
+    let allowed = auth_client
+        .check_permission(check)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(allowed.allowed);
+
+    let mut list_findings = Request::new(ListRepairFindingsRequest {
+        scope_kind: "authz".to_string(),
+        scope_id: "tenant-1".to_string(),
+        limit: 10,
+    });
+    add_bearer(&mut list_findings, &token);
+    let findings = repair_client
+        .list_repair_findings(list_findings)
+        .await
+        .unwrap()
+        .into_inner()
+        .findings;
+    assert!(findings.iter().any(|finding| {
+        finding.code == "AuthzDerivedIndexMissing"
+            && finding.proposed_action == "RebuildDerivedIndex"
+    }));
+
+    let mut second_repair = Request::new(RepairAuthzDerivedIndexRequest {
+        derived_index_id: DEFAULT_DERIVED_USERSET_INDEX_ID.to_string(),
+        rebuild: false,
+    });
+    add_bearer(&mut second_repair, &token);
+    let up_to_date = repair_client
+        .repair_authz_derived_index(second_repair)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(up_to_date.status, "up_to_date");
+    assert!(up_to_date.finding.is_none());
 }
 
 fn namespace_watch_payload(authz_revision: u64) -> AuthzNamespaceWatchPayload {

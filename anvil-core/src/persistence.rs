@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use tokio::sync::mpsc::Sender;
 
 use crate::{
-    append_journal, authz_journal,
+    append_journal, authz_journal, authz_repair,
     bucket_journal::{self, BucketJournalMutation},
     cache::MetadataCache,
     cluster::MetadataEvent,
@@ -2484,6 +2484,24 @@ impl Persistence {
             findings.truncate(limit);
         }
         Ok(findings)
+    }
+
+    pub async fn repair_authz_derived_userset_index(
+        &self,
+        tenant_id: i64,
+        derived_index_id: &str,
+        rebuild: bool,
+    ) -> Result<authz_repair::AuthzDerivedIndexRepairReport> {
+        let permit = self.authz_write_permit(tenant_id).await?;
+        authz_repair::repair_authz_derived_userset_index(
+            &self.storage,
+            tenant_id,
+            derived_index_id,
+            rebuild,
+            permit.fence_token,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]

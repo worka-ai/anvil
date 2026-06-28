@@ -104,10 +104,18 @@ pub async fn rebuild_derived_userset_index(
     tenant_id: i64,
     derived_index_id: &str,
 ) -> Result<AuthzDerivedUsersetIndex> {
-    let records = authz_journal::list_authz_tuple_log(storage, tenant_id, 0, "", 0).await?;
-    let index = build_derived_userset_index_from_records(tenant_id, derived_index_id, records)?;
+    let index = build_expected_derived_userset_index(storage, tenant_id, derived_index_id).await?;
     write_derived_userset_index(storage, &index).await?;
     Ok(index)
+}
+
+pub async fn build_expected_derived_userset_index(
+    storage: &Storage,
+    tenant_id: i64,
+    derived_index_id: &str,
+) -> Result<AuthzDerivedUsersetIndex> {
+    let records = authz_journal::list_authz_tuple_log(storage, tenant_id, 0, "", 0).await?;
+    build_derived_userset_index_from_records(tenant_id, derived_index_id, records)
 }
 
 pub async fn read_derived_userset_index(
