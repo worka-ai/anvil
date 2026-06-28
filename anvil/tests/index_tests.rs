@@ -1,9 +1,10 @@
+use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::index_service_client::IndexServiceClient;
 use anvil::anvil_api::{
     CreateBucketRequest, CreateIndexRequest, DisableIndexRequest, DropIndexRequest,
     ListIndexDiagnosticsRequest, ListIndexesRequest, QueryIndexRequest, UpdateIndexRequest,
-    WatchIndexDefinitionRequest,
+    WatchIndexDefinitionRequest, WriteAuthzTupleRequest,
 };
 use anvil::formats::full_text::{FullTextDocument, build_full_text_postings};
 use anvil::formats::vector::{VectorMetric, VectorModality, VectorPayload, VectorRecord};
@@ -998,23 +999,25 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
     assert_eq!(response.hits[0].object_key, "docs/allowed.txt");
     assert_eq!(response.hits[0].document_id, 1);
 
-    anvil::authz_journal::write_authz_tuple(
-        &cluster.states[0].storage,
-        anvil::authz_journal::AuthzTupleWrite {
-            tenant_id: claims.tenant_id,
-            namespace: "object",
-            object_id: &format!("{bucket_name}/docs/denied.txt"),
-            relation: "reader",
-            subject_kind: "app",
-            subject_id: "tuple-index-reader",
-            caveat_hash: "",
-            operation: "add",
-            written_by: "test",
-            reason: "index query inherited object authz test",
-        },
-    )
-    .await
-    .unwrap();
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    auth_client
+        .write_authz_tuple(authorized(
+            WriteAuthzTupleRequest {
+                namespace: "object".to_string(),
+                object_id: format!("{bucket_name}/docs/denied.txt"),
+                relation: "reader".to_string(),
+                subject_kind: "app".to_string(),
+                subject_id: "tuple-index-reader".to_string(),
+                caveat_hash: "".to_string(),
+                operation: "add".to_string(),
+                reason: "index query inherited object authz test".to_string(),
+            },
+            &cluster.token,
+        ))
+        .await
+        .unwrap();
     let tuple_token = cluster.states[0]
         .jwt_manager
         .mint_token(

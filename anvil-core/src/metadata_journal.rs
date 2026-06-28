@@ -106,7 +106,7 @@ struct DirectoryEntryBody {
     deleted_at: Option<String>,
 }
 
-pub async fn append_object_mutation(
+async fn append_object_mutation(
     storage: &Storage,
     bucket: &Bucket,
     object: &Object,
@@ -115,7 +115,7 @@ pub async fn append_object_mutation(
     append_object_mutation_inner(storage, bucket, object, mutation, 0).await
 }
 
-pub async fn append_object_mutation_with_permit(
+pub(crate) async fn append_object_mutation_with_permit(
     storage: &Storage,
     bucket: &Bucket,
     object: &Object,
@@ -308,7 +308,7 @@ struct SegmentHeader {
     bloom_bits_per_key: u8,
 }
 
-pub async fn seal_object_journal_segments(
+async fn seal_object_journal_segments(
     storage: &Storage,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
@@ -316,7 +316,7 @@ pub async fn seal_object_journal_segments(
     seal_object_journal_segments_inner(storage, bucket, manifest_signing_key, 0).await
 }
 
-pub async fn seal_object_journal_segments_with_permit(
+pub(crate) async fn seal_object_journal_segments_with_permit(
     storage: &Storage,
     bucket: &Bucket,
     manifest_signing_key: &[u8],

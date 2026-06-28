@@ -53,7 +53,7 @@ struct BucketJournalBody {
     emitted_at: Option<String>,
 }
 
-pub async fn append_bucket_mutation(
+async fn append_bucket_mutation(
     storage: &Storage,
     bucket: &Bucket,
     mutation: BucketJournalMutation,
@@ -76,7 +76,7 @@ pub async fn append_bucket_mutation(
     .await
 }
 
-pub async fn append_bucket_mutation_with_permits(
+pub(crate) async fn append_bucket_mutation_with_permits(
     storage: &Storage,
     bucket: &Bucket,
     mutation: BucketJournalMutation,

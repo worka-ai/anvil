@@ -27,14 +27,14 @@ struct IndexDiagnosticBody {
     diagnostic: IndexDiagnostic,
 }
 
-pub async fn write_index_diagnostic(
+async fn write_index_diagnostic(
     storage: &Storage,
     diagnostic: IndexDiagnostic,
 ) -> Result<IndexDiagnostic> {
     write_index_diagnostic_inner(storage, diagnostic, 0).await
 }
 
-pub async fn write_index_diagnostic_with_permit(
+pub(crate) async fn write_index_diagnostic_with_permit(
     storage: &Storage,
     diagnostic: IndexDiagnostic,
     permit: &PartitionWritePermit,

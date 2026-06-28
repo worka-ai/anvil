@@ -232,11 +232,11 @@ pub async fn read_control_state(storage: &Storage) -> Result<ControlState> {
     Ok(state)
 }
 
-pub async fn create_region(storage: &Storage, name: &str) -> Result<bool> {
+async fn create_region(storage: &Storage, name: &str) -> Result<bool> {
     create_region_inner(storage, name, 0).await
 }
 
-pub async fn create_region_with_permit(
+pub(crate) async fn create_region_with_permit(
     storage: &Storage,
     name: &str,
     permit: &PartitionWritePermit,
@@ -264,11 +264,11 @@ async fn create_region_inner(storage: &Storage, name: &str, fence_token: u64) ->
     Ok(true)
 }
 
-pub async fn create_tenant(storage: &Storage, name: &str) -> Result<Tenant> {
+async fn create_tenant(storage: &Storage, name: &str) -> Result<Tenant> {
     create_tenant_inner(storage, name, 0).await
 }
 
-pub async fn create_tenant_with_permit(
+pub(crate) async fn create_tenant_with_permit(
     storage: &Storage,
     name: &str,
     permit: &PartitionWritePermit,
@@ -301,7 +301,7 @@ async fn create_tenant_inner(storage: &Storage, name: &str, fence_token: u64) ->
     Ok(tenant)
 }
 
-pub async fn create_app(
+async fn create_app(
     storage: &Storage,
     tenant_id: i64,
     name: &str,
@@ -311,7 +311,7 @@ pub async fn create_app(
     create_app_inner(storage, tenant_id, name, client_id, encrypted_secret, 0).await
 }
 
-pub async fn create_app_with_permit(
+pub(crate) async fn create_app_with_permit(
     storage: &Storage,
     tenant_id: i64,
     name: &str,
@@ -371,15 +371,11 @@ async fn create_app_inner(
     Ok(app)
 }
 
-pub async fn update_app_secret(
-    storage: &Storage,
-    app_id: i64,
-    encrypted_secret: &[u8],
-) -> Result<()> {
+async fn update_app_secret(storage: &Storage, app_id: i64, encrypted_secret: &[u8]) -> Result<()> {
     update_app_secret_inner(storage, app_id, encrypted_secret, 0).await
 }
 
-pub async fn update_app_secret_with_permit(
+pub(crate) async fn update_app_secret_with_permit(
     storage: &Storage,
     app_id: i64,
     encrypted_secret: &[u8],
@@ -412,16 +408,11 @@ async fn update_app_secret_inner(
     .await
 }
 
-pub async fn grant_policy(
-    storage: &Storage,
-    app_id: i64,
-    resource: &str,
-    action: &str,
-) -> Result<()> {
+async fn grant_policy(storage: &Storage, app_id: i64, resource: &str, action: &str) -> Result<()> {
     grant_policy_inner(storage, app_id, resource, action, 0).await
 }
 
-pub async fn grant_policy_with_permit(
+pub(crate) async fn grant_policy_with_permit(
     storage: &Storage,
     app_id: i64,
     resource: &str,
@@ -457,16 +448,11 @@ async fn grant_policy_inner(
     .await
 }
 
-pub async fn revoke_policy(
-    storage: &Storage,
-    app_id: i64,
-    resource: &str,
-    action: &str,
-) -> Result<()> {
+async fn revoke_policy(storage: &Storage, app_id: i64, resource: &str, action: &str) -> Result<()> {
     revoke_policy_inner(storage, app_id, resource, action, 0).await
 }
 
-pub async fn revoke_policy_with_permit(
+pub(crate) async fn revoke_policy_with_permit(
     storage: &Storage,
     app_id: i64,
     resource: &str,
@@ -498,7 +484,7 @@ async fn revoke_policy_inner(
     .await
 }
 
-pub async fn create_admin_user(
+async fn create_admin_user(
     storage: &Storage,
     username: &str,
     email: &str,
@@ -508,7 +494,7 @@ pub async fn create_admin_user(
     create_admin_user_inner(storage, username, email, password_hash, role_names, 0).await
 }
 
-pub async fn create_admin_user_with_permit(
+pub(crate) async fn create_admin_user_with_permit(
     storage: &Storage,
     username: &str,
     email: &str,
@@ -567,7 +553,7 @@ async fn create_admin_user_inner(
     Ok(user)
 }
 
-pub async fn update_admin_user(
+async fn update_admin_user(
     storage: &Storage,
     user_id: i64,
     username: &str,
@@ -590,7 +576,7 @@ pub async fn update_admin_user(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn update_admin_user_with_permit(
+pub(crate) async fn update_admin_user_with_permit(
     storage: &Storage,
     user_id: i64,
     username: &str,
@@ -648,11 +634,11 @@ async fn update_admin_user_inner(
     .await
 }
 
-pub async fn delete_admin_user(storage: &Storage, user_id: i64) -> Result<()> {
+async fn delete_admin_user(storage: &Storage, user_id: i64) -> Result<()> {
     delete_admin_user_inner(storage, user_id, 0).await
 }
 
-pub async fn delete_admin_user_with_permit(
+pub(crate) async fn delete_admin_user_with_permit(
     storage: &Storage,
     user_id: i64,
     permit: &PartitionWritePermit,
@@ -672,11 +658,11 @@ async fn delete_admin_user_inner(storage: &Storage, user_id: i64, fence_token: u
     .await
 }
 
-pub async fn create_admin_role(storage: &Storage, name: &str) -> Result<()> {
+async fn create_admin_role(storage: &Storage, name: &str) -> Result<()> {
     create_admin_role_inner(storage, name, 0).await
 }
 
-pub async fn create_admin_role_with_permit(
+pub(crate) async fn create_admin_role_with_permit(
     storage: &Storage,
     name: &str,
     permit: &PartitionWritePermit,
@@ -696,11 +682,11 @@ async fn create_admin_role_inner(storage: &Storage, name: &str, fence_token: u64
     append_admin_role_upsert(storage, id, name, fence_token).await
 }
 
-pub async fn update_admin_role(storage: &Storage, id: i32, name: &str) -> Result<()> {
+async fn update_admin_role(storage: &Storage, id: i32, name: &str) -> Result<()> {
     update_admin_role_inner(storage, id, name, 0).await
 }
 
-pub async fn update_admin_role_with_permit(
+pub(crate) async fn update_admin_role_with_permit(
     storage: &Storage,
     id: i32,
     name: &str,
@@ -725,11 +711,11 @@ async fn update_admin_role_inner(
     Ok(())
 }
 
-pub async fn delete_admin_role(storage: &Storage, id: i32) -> Result<()> {
+async fn delete_admin_role(storage: &Storage, id: i32) -> Result<()> {
     delete_admin_role_inner(storage, id, 0).await
 }
 
-pub async fn delete_admin_role_with_permit(
+pub(crate) async fn delete_admin_role_with_permit(
     storage: &Storage,
     id: i32,
     permit: &PartitionWritePermit,
@@ -1191,7 +1177,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_journal_with_permit_writes_fenced_frames_and_header() {
+    pub(crate) async fn control_journal_with_permit_writes_fenced_frames_and_header() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, "node-a").await;
@@ -1272,7 +1258,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_journal_with_permit_rejects_stale_fence() {
+    pub(crate) async fn control_journal_with_permit_rejects_stale_fence() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, "node-a").await;

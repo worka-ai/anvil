@@ -31,7 +31,7 @@ pub struct DecodedAuthzSegment {
     pub records: Vec<AuthzTupleRecord>,
 }
 
-pub async fn write_authz_tuple_segment(
+async fn write_authz_tuple_segment(
     storage: &Storage,
     tenant_id: i64,
     records: &[AuthzTupleRecord],
@@ -39,7 +39,7 @@ pub async fn write_authz_tuple_segment(
     write_authz_tuple_segment_inner(storage, tenant_id, records, 0).await
 }
 
-pub async fn write_authz_tuple_segment_with_fence(
+pub(crate) async fn write_authz_tuple_segment_with_fence(
     storage: &Storage,
     tenant_id: i64,
     records: &[AuthzTupleRecord],

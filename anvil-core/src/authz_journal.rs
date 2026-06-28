@@ -52,14 +52,14 @@ pub struct AuthzTupleWrite<'a> {
     pub reason: &'a str,
 }
 
-pub async fn write_authz_tuple(
+async fn write_authz_tuple(
     storage: &Storage,
     input: AuthzTupleWrite<'_>,
 ) -> Result<AuthzTupleRecord> {
     write_authz_tuple_inner(storage, input, 0).await
 }
 
-pub async fn write_authz_tuple_with_permit(
+pub(crate) async fn write_authz_tuple_with_permit(
     storage: &Storage,
     input: AuthzTupleWrite<'_>,
     permit: &PartitionWritePermit,
@@ -111,11 +111,11 @@ async fn write_authz_tuple_inner(
     Ok(record)
 }
 
-pub async fn append_authz_tuple_record(storage: &Storage, record: &AuthzTupleRecord) -> Result<()> {
+async fn append_authz_tuple_record(storage: &Storage, record: &AuthzTupleRecord) -> Result<()> {
     append_authz_tuple_record_inner(storage, record, 0).await
 }
 
-pub async fn append_authz_tuple_record_with_permit(
+pub(crate) async fn append_authz_tuple_record_with_permit(
     storage: &Storage,
     record: &AuthzTupleRecord,
     permit: &PartitionWritePermit,
@@ -605,7 +605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authz_write_with_permit_allocates_revision_under_fence() {
+    pub(crate) async fn authz_write_with_permit_allocates_revision_under_fence() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let permit = ready_authz_permit(&storage, 42, "node-a").await;

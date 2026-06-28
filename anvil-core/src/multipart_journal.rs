@@ -59,7 +59,7 @@ struct MultipartState {
     parts: BTreeMap<(i64, i32), MultipartUploadPart>,
 }
 
-pub async fn create_multipart_upload(
+async fn create_multipart_upload(
     storage: &Storage,
     tenant_id: i64,
     bucket_id: i64,
@@ -68,7 +68,7 @@ pub async fn create_multipart_upload(
     create_multipart_upload_inner(storage, tenant_id, bucket_id, key, 0).await
 }
 
-pub async fn create_multipart_upload_with_permit(
+pub(crate) async fn create_multipart_upload_with_permit(
     storage: &Storage,
     tenant_id: i64,
     bucket_id: i64,
@@ -146,7 +146,7 @@ pub async fn has_active_multipart_upload(storage: &Storage, bucket_id: i64) -> R
     Ok(false)
 }
 
-pub async fn upsert_multipart_part(
+async fn upsert_multipart_part(
     storage: &Storage,
     upload_row_id: i64,
     part_number: i32,
@@ -166,7 +166,7 @@ pub async fn upsert_multipart_part(
     .await
 }
 
-pub async fn upsert_multipart_part_with_permit(
+pub(crate) async fn upsert_multipart_part_with_permit(
     storage: &Storage,
     upload_row_id: i64,
     part_number: i32,
@@ -350,11 +350,11 @@ pub async fn list_active_multipart_uploads(
     })
 }
 
-pub async fn complete_multipart_upload(storage: &Storage, upload_row_id: i64) -> Result<()> {
+async fn complete_multipart_upload(storage: &Storage, upload_row_id: i64) -> Result<()> {
     complete_multipart_upload_inner(storage, upload_row_id, None).await
 }
 
-pub async fn complete_multipart_upload_with_permit(
+pub(crate) async fn complete_multipart_upload_with_permit(
     storage: &Storage,
     upload_row_id: i64,
     permit: &PartitionWritePermit,
@@ -390,7 +390,7 @@ async fn complete_multipart_upload_inner(
     .await
 }
 
-pub async fn abort_multipart_upload(
+async fn abort_multipart_upload(
     storage: &Storage,
     tenant_id: i64,
     bucket_id: i64,
@@ -400,7 +400,7 @@ pub async fn abort_multipart_upload(
     abort_multipart_upload_inner(storage, tenant_id, bucket_id, key, upload_id, 0).await
 }
 
-pub async fn abort_multipart_upload_with_permit(
+pub(crate) async fn abort_multipart_upload_with_permit(
     storage: &Storage,
     tenant_id: i64,
     bucket_id: i64,
@@ -711,7 +711,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multipart_journal_with_permit_writes_fenced_frames_and_header() {
+    pub(crate) async fn multipart_journal_with_permit_writes_fenced_frames_and_header() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, 1, 2, "node-a").await;
@@ -748,7 +748,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multipart_journal_with_permit_rejects_stale_fence() {
+    pub(crate) async fn multipart_journal_with_permit_rejects_stale_fence() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, 1, 2, "node-a").await;

@@ -42,7 +42,7 @@ struct ModelState {
     tensors: BTreeMap<String, Vec<TensorIndexRow>>,
 }
 
-pub async fn create_model_artifact(
+async fn create_model_artifact(
     storage: &Storage,
     artifact_id: &str,
     bucket_id: i64,
@@ -52,7 +52,7 @@ pub async fn create_model_artifact(
     create_model_artifact_inner(storage, artifact_id, bucket_id, key, manifest, 0).await
 }
 
-pub async fn create_model_artifact_with_permit(
+pub(crate) async fn create_model_artifact_with_permit(
     storage: &Storage,
     artifact_id: &str,
     bucket_id: i64,
@@ -88,7 +88,7 @@ async fn create_model_artifact_inner(
     .await
 }
 
-pub async fn create_model_tensors(
+async fn create_model_tensors(
     storage: &Storage,
     artifact_id: &str,
     tensors: &[TensorIndexRow],
@@ -96,7 +96,7 @@ pub async fn create_model_tensors(
     create_model_tensors_inner(storage, artifact_id, tensors, 0).await
 }
 
-pub async fn create_model_tensors_with_permit(
+pub(crate) async fn create_model_tensors_with_permit(
     storage: &Storage,
     artifact_id: &str,
     tensors: &[TensorIndexRow],
@@ -412,7 +412,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_journal_with_permit_writes_fenced_frames_and_header() {
+    pub(crate) async fn model_journal_with_permit_writes_fenced_frames_and_header() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, "node-a").await;
@@ -452,7 +452,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_journal_with_permit_rejects_stale_fence() {
+    pub(crate) async fn model_journal_with_permit_rejects_stale_fence() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, "node-a").await;

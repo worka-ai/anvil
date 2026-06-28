@@ -55,7 +55,7 @@ struct AppendState {
     records: BTreeMap<(i64, i64), AppendStreamRecord>,
 }
 
-pub async fn create_append_stream(
+async fn create_append_stream(
     storage: &Storage,
     tenant_id: i64,
     bucket_id: i64,
@@ -65,7 +65,7 @@ pub async fn create_append_stream(
     create_append_stream_inner(storage, tenant_id, bucket_id, bucket_name, stream_key, 0).await
 }
 
-pub async fn create_append_stream_with_permit(
+pub(crate) async fn create_append_stream_with_permit(
     storage: &Storage,
     tenant_id: i64,
     bucket_id: i64,
@@ -138,7 +138,7 @@ pub async fn get_active_append_stream(
         }))
 }
 
-pub async fn append_stream_record(
+async fn append_stream_record(
     storage: &Storage,
     stream_row_id: i64,
     payload_hash: &str,
@@ -147,7 +147,7 @@ pub async fn append_stream_record(
     append_stream_record_inner(storage, stream_row_id, payload_hash, payload_size, None).await
 }
 
-pub async fn append_stream_record_with_permit(
+pub(crate) async fn append_stream_record_with_permit(
     storage: &Storage,
     stream_row_id: i64,
     payload_hash: &str,
@@ -227,7 +227,7 @@ pub async fn list_append_stream_records(
     Ok(records)
 }
 
-pub async fn seal_append_stream(
+async fn seal_append_stream(
     storage: &Storage,
     stream_row_id: i64,
     segment_hash: &str,
@@ -235,7 +235,7 @@ pub async fn seal_append_stream(
     seal_append_stream_inner(storage, stream_row_id, segment_hash, None).await
 }
 
-pub async fn seal_append_stream_with_permit(
+pub(crate) async fn seal_append_stream_with_permit(
     storage: &Storage,
     stream_row_id: i64,
     segment_hash: &str,
@@ -543,7 +543,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_journal_with_permit_writes_fenced_frames_and_header() {
+    pub(crate) async fn append_journal_with_permit_writes_fenced_frames_and_header() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, 1, 2, "node-a").await;
@@ -579,7 +579,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_journal_with_permit_rejects_stale_fence() {
+    pub(crate) async fn append_journal_with_permit_rejects_stale_fence() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, 1, 2, "node-a").await;

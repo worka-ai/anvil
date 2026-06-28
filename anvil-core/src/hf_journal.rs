@@ -58,7 +58,7 @@ struct HfState {
     items: BTreeMap<i64, HfIngestionItem>,
 }
 
-pub async fn create_key(
+async fn create_key(
     storage: &Storage,
     name: &str,
     token_encrypted: &[u8],
@@ -67,7 +67,7 @@ pub async fn create_key(
     create_key_inner(storage, name, token_encrypted, note, 0).await
 }
 
-pub async fn create_key_with_permit(
+pub(crate) async fn create_key_with_permit(
     storage: &Storage,
     name: &str,
     token_encrypted: &[u8],
@@ -110,11 +110,11 @@ async fn create_key_inner(
     .await
 }
 
-pub async fn delete_key(storage: &Storage, name: &str) -> Result<u64> {
+async fn delete_key(storage: &Storage, name: &str) -> Result<u64> {
     delete_key_inner(storage, name, 0).await
 }
 
-pub async fn delete_key_with_permit(
+pub(crate) async fn delete_key_with_permit(
     storage: &Storage,
     name: &str,
     permit: &PartitionWritePermit,
@@ -173,7 +173,7 @@ pub async fn list_keys(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn create_ingestion(
+async fn create_ingestion(
     storage: &Storage,
     key_id: i64,
     tenant_id: i64,
@@ -204,7 +204,7 @@ pub async fn create_ingestion(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn create_ingestion_with_permit(
+pub(crate) async fn create_ingestion_with_permit(
     storage: &Storage,
     key_id: i64,
     tenant_id: i64,
@@ -303,7 +303,7 @@ pub async fn get_ingestion_job(storage: &Storage, id: i64) -> Result<Option<HfIn
         }))
 }
 
-pub async fn update_ingestion_state(
+async fn update_ingestion_state(
     storage: &Storage,
     id: i64,
     state_value: crate::tasks::HFIngestionState,
@@ -312,7 +312,7 @@ pub async fn update_ingestion_state(
     update_ingestion_state_inner(storage, id, state_value, error, 0).await
 }
 
-pub async fn update_ingestion_state_with_permit(
+pub(crate) async fn update_ingestion_state_with_permit(
     storage: &Storage,
     id: i64,
     state_value: crate::tasks::HFIngestionState,
@@ -359,11 +359,11 @@ async fn update_ingestion_state_inner(
     .await
 }
 
-pub async fn cancel_ingestion(storage: &Storage, id: i64) -> Result<u64> {
+async fn cancel_ingestion(storage: &Storage, id: i64) -> Result<u64> {
     cancel_ingestion_inner(storage, id, 0).await
 }
 
-pub async fn cancel_ingestion_with_permit(
+pub(crate) async fn cancel_ingestion_with_permit(
     storage: &Storage,
     id: i64,
     permit: &PartitionWritePermit,
@@ -398,7 +398,7 @@ async fn cancel_ingestion_inner(storage: &Storage, id: i64, fence_token: u64) ->
     Ok(1)
 }
 
-pub async fn add_item(
+async fn add_item(
     storage: &Storage,
     ingestion_id: i64,
     path: &str,
@@ -408,7 +408,7 @@ pub async fn add_item(
     add_item_inner(storage, ingestion_id, path, size, etag, 0).await
 }
 
-pub async fn add_item_with_permit(
+pub(crate) async fn add_item_with_permit(
     storage: &Storage,
     ingestion_id: i64,
     path: &str,
@@ -466,7 +466,7 @@ async fn add_item_inner(
     Ok(id)
 }
 
-pub async fn update_item_state(
+async fn update_item_state(
     storage: &Storage,
     id: i64,
     state_value: crate::tasks::HFIngestionItemState,
@@ -475,7 +475,7 @@ pub async fn update_item_state(
     update_item_state_inner(storage, id, state_value, error, 0).await
 }
 
-pub async fn update_item_state_with_permit(
+pub(crate) async fn update_item_state_with_permit(
     storage: &Storage,
     id: i64,
     state_value: crate::tasks::HFIngestionItemState,
@@ -522,11 +522,11 @@ async fn update_item_state_inner(
     .await
 }
 
-pub async fn update_item_success(storage: &Storage, id: i64, size: i64, etag: &str) -> Result<()> {
+async fn update_item_success(storage: &Storage, id: i64, size: i64, etag: &str) -> Result<()> {
     update_item_success_inner(storage, id, size, etag, 0).await
 }
 
-pub async fn update_item_success_with_permit(
+pub(crate) async fn update_item_success_with_permit(
     storage: &Storage,
     id: i64,
     size: i64,
@@ -937,7 +937,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hf_journal_with_permit_writes_fenced_frames_and_header() {
+    pub(crate) async fn hf_journal_with_permit_writes_fenced_frames_and_header() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, "node-a").await;
@@ -1015,7 +1015,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hf_journal_with_permit_rejects_stale_fence() {
+    pub(crate) async fn hf_journal_with_permit_rejects_stale_fence() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, "node-a").await;

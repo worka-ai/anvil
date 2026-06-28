@@ -53,7 +53,7 @@ struct TaskQueueState {
     tasks: BTreeMap<i64, TaskRecord>,
 }
 
-pub async fn enqueue_task(
+async fn enqueue_task(
     storage: &Storage,
     task_type: TaskType,
     payload: JsonValue,
@@ -62,7 +62,7 @@ pub async fn enqueue_task(
     enqueue_task_inner(storage, task_type, payload, priority, 0).await
 }
 
-pub async fn enqueue_task_with_permit(
+pub(crate) async fn enqueue_task_with_permit(
     storage: &Storage,
     task_type: TaskType,
     payload: JsonValue,
@@ -99,11 +99,11 @@ async fn enqueue_task_inner(
     append_task_event(storage, TaskJournalBody::Enqueued { task }, fence_token).await
 }
 
-pub async fn claim_pending_tasks(storage: &Storage, limit: i64) -> Result<Vec<TaskRecord>> {
+async fn claim_pending_tasks(storage: &Storage, limit: i64) -> Result<Vec<TaskRecord>> {
     claim_pending_tasks_inner(storage, limit, 0).await
 }
 
-pub async fn claim_pending_tasks_with_permit(
+pub(crate) async fn claim_pending_tasks_with_permit(
     storage: &Storage,
     limit: i64,
     permit: &PartitionWritePermit,
@@ -159,11 +159,11 @@ pub async fn list_tasks(storage: &Storage) -> Result<Vec<TaskRecord>> {
     Ok(read_task_queue_state(storage).await?.tasks())
 }
 
-pub async fn update_task_status(storage: &Storage, task_id: i64, status: TaskStatus) -> Result<()> {
+async fn update_task_status(storage: &Storage, task_id: i64, status: TaskStatus) -> Result<()> {
     update_task_status_inner(storage, task_id, status, 0).await
 }
 
-pub async fn update_task_status_with_permit(
+pub(crate) async fn update_task_status_with_permit(
     storage: &Storage,
     task_id: i64,
     status: TaskStatus,
@@ -200,11 +200,11 @@ async fn update_task_status_inner(
     .await
 }
 
-pub async fn fail_task(storage: &Storage, task_id: i64, error: &str) -> Result<()> {
+async fn fail_task(storage: &Storage, task_id: i64, error: &str) -> Result<()> {
     fail_task_inner(storage, task_id, error, 0).await
 }
 
-pub async fn fail_task_with_permit(
+pub(crate) async fn fail_task_with_permit(
     storage: &Storage,
     task_id: i64,
     error: &str,
@@ -494,7 +494,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_journal_with_permit_writes_fenced_frames_and_header() {
+    pub(crate) async fn task_journal_with_permit_writes_fenced_frames_and_header() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, "node-a").await;
@@ -542,7 +542,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_journal_with_permit_rejects_stale_fence() {
+    pub(crate) async fn task_journal_with_permit_rejects_stale_fence() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, "node-a").await;

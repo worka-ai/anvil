@@ -35,7 +35,7 @@ struct ManifestBody {
     updated_at: DateTime<Utc>,
 }
 
-pub async fn compare_and_swap_manifest(
+async fn compare_and_swap_manifest(
     storage: &Storage,
     tenant_id: i64,
     bucket_id: i64,
@@ -58,7 +58,7 @@ pub async fn compare_and_swap_manifest(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn compare_and_swap_manifest_with_permit(
+pub(crate) async fn compare_and_swap_manifest_with_permit(
     storage: &Storage,
     tenant_id: i64,
     bucket_id: i64,
@@ -307,7 +307,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manifest_cas_with_permit_writes_fenced_frame_and_header() {
+    pub(crate) async fn manifest_cas_with_permit_writes_fenced_frame_and_header() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, 1, 2, "node-a").await;
@@ -344,7 +344,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manifest_cas_with_permit_rejects_stale_fence() {
+    pub(crate) async fn manifest_cas_with_permit_rejects_stale_fence() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, 1, 2, "node-a").await;

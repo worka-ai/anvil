@@ -37,14 +37,14 @@ struct IndexEventBody {
     created_at: String,
 }
 
-pub async fn append_index_definition_event(
+async fn append_index_definition_event(
     storage: &Storage,
     event: &IndexDefinitionEvent,
 ) -> Result<()> {
     append_index_definition_event_inner(storage, event, 0).await
 }
 
-pub async fn append_index_definition_event_with_permit(
+pub(crate) async fn append_index_definition_event_with_permit(
     storage: &Storage,
     event: &IndexDefinitionEvent,
     permit: &PartitionWritePermit,
@@ -110,7 +110,7 @@ async fn append_index_definition_event_inner(
     Ok(())
 }
 
-pub async fn write_index_definition_event(
+async fn write_index_definition_event(
     storage: &Storage,
     bucket: &Bucket,
     index: &IndexDefinition,
@@ -119,7 +119,7 @@ pub async fn write_index_definition_event(
     write_index_definition_event_inner(storage, bucket, index, event_type, 0).await
 }
 
-pub async fn write_index_definition_event_with_permit(
+pub(crate) async fn write_index_definition_event_with_permit(
     storage: &Storage,
     bucket: &Bucket,
     index: &IndexDefinition,
@@ -661,7 +661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn index_write_with_permit_allocates_cursor_under_fence() {
+    pub(crate) async fn index_write_with_permit_allocates_cursor_under_fence() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let permit = ready_index_permit(&storage, "node-a").await;
