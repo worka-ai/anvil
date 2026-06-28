@@ -7,7 +7,9 @@ use crate::{
     cluster::ClusterState,
     metadata_journal,
     permissions::AnvilAction,
-    persistence::{Bucket, Object, ObjectWatchEvent, Persistence},
+    persistence::{
+        Bucket, Object, ObjectVersion, ObjectVersionsPage, ObjectWatchEvent, Persistence,
+    },
     placement::PlacementManager,
     sharding::ShardManager,
     storage::{ExternalChunkManifest, Storage},
@@ -1277,23 +1279,39 @@ impl ObjectManager {
             .get_authorized_bucket(claims.as_ref(), bucket_name)
             .await?;
         if !bucket.is_public_read {
-            let claims = claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
+            let claims = claims
+                .as_ref()
+                .ok_or_else(|| Status::permission_denied("Permission denied"))?;
             if !auth::is_authorized(AnvilAction::ObjectList, bucket_name, &claims.scopes) {
                 return Err(Status::permission_denied("Permission denied"));
             }
         }
 
-        let listing = metadata_journal::list_current_objects(
+        let mut objects = metadata_journal::read_current_directory_objects(
             &self.storage,
             &bucket,
             &self.encryption_key,
-            prefix,
-            start_after,
-            if limit == 0 { 1000 } else { limit },
-            delimiter,
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
+        objects.retain(|object| {
+            object.key.starts_with(prefix)
+                && object.key.as_str() > start_after
+                && !validation::is_reserved_internal_key(&object.key)
+        });
+        objects.sort_by(|left, right| left.key.cmp(&right.key));
+
+        if !bucket.is_public_read {
+            let claims = claims
+                .as_ref()
+                .expect("private bucket listing has claims after authorization");
+            objects = self
+                .filter_objects_visible_to_reader(claims, bucket_name, objects, None)
+                .await?;
+        }
+
+        let listing =
+            visible_object_listing(objects, prefix, normalized_list_limit(limit), delimiter);
         Ok((listing.objects, listing.common_prefixes))
     }
 
@@ -1335,23 +1353,41 @@ impl ObjectManager {
             .get_authorized_bucket(claims.as_ref(), bucket_name)
             .await?;
         if !bucket.is_public_read {
-            let claims = claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
+            let claims = claims
+                .as_ref()
+                .ok_or_else(|| Status::permission_denied("Permission denied"))?;
             if !auth::is_authorized(AnvilAction::ObjectList, bucket_name, &claims.scopes) {
                 return Err(Status::permission_denied("Permission denied"));
             }
         }
 
-        metadata_journal::read_object_versions(
-            &self.storage,
+        if bucket.is_public_read {
+            return metadata_journal::read_object_versions(
+                &self.storage,
+                &bucket,
+                &self.encryption_key,
+                prefix,
+                key_marker,
+                version_id_marker,
+                normalized_list_limit(limit),
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()));
+        }
+
+        let claims = claims
+            .as_ref()
+            .expect("private bucket version listing has claims after authorization");
+        self.list_visible_object_versions(
+            claims,
+            bucket_name,
             &bucket,
-            &self.encryption_key,
             prefix,
             key_marker,
             version_id_marker,
-            if limit == 0 { 1000 } else { limit },
+            normalized_list_limit(limit),
         )
         .await
-        .map_err(|e| Status::internal(e.to_string()))
     }
 
     pub async fn current_object_for_write_precondition(
@@ -1549,6 +1585,104 @@ impl ObjectManager {
         .map_err(|e| Status::internal(e.to_string()))
     }
 
+    async fn filter_objects_visible_to_reader(
+        &self,
+        claims: &auth::Claims,
+        bucket_name: &str,
+        objects: Vec<Object>,
+        authz_revision: Option<i64>,
+    ) -> Result<Vec<Object>, Status> {
+        let mut visible = Vec::new();
+        for object in objects {
+            if self
+                .object_read_allowed(claims, bucket_name, &object.key, authz_revision)
+                .await?
+            {
+                visible.push(object);
+            }
+        }
+        Ok(visible)
+    }
+
+    async fn list_visible_object_versions(
+        &self,
+        claims: &auth::Claims,
+        bucket_name: &str,
+        bucket: &Bucket,
+        prefix: &str,
+        key_marker: &str,
+        version_id_marker: Option<uuid::Uuid>,
+        limit: i32,
+    ) -> Result<ObjectVersionsPage, Status> {
+        let requested_limit = normalized_list_limit(limit).max(1) as usize;
+        let visible_target = requested_limit.saturating_add(1);
+        let page_limit = i32::try_from(visible_target.max(100)).unwrap_or(i32::MAX);
+        let mut visible = Vec::<ObjectVersion>::new();
+        let mut current_key_marker = key_marker.to_string();
+        let mut current_version_marker = version_id_marker;
+
+        loop {
+            let page = metadata_journal::read_object_versions(
+                &self.storage,
+                bucket,
+                &self.encryption_key,
+                prefix,
+                &current_key_marker,
+                current_version_marker,
+                page_limit,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+            for version in page.versions {
+                if self
+                    .object_read_allowed(claims, bucket_name, &version.object.key, None)
+                    .await?
+                {
+                    visible.push(version);
+                    if visible.len() >= visible_target {
+                        break;
+                    }
+                }
+            }
+
+            if visible.len() >= visible_target || !page.is_truncated {
+                break;
+            }
+
+            let Some(next_key_marker) = page.next_key_marker else {
+                break;
+            };
+            current_key_marker = next_key_marker;
+            current_version_marker = page.next_version_id_marker;
+        }
+
+        let is_truncated = visible.len() > requested_limit;
+        if is_truncated {
+            visible.truncate(requested_limit);
+        }
+        let (next_key_marker, next_version_id_marker) = if is_truncated {
+            visible
+                .last()
+                .map(|version| {
+                    (
+                        Some(version.object.key.clone()),
+                        Some(version.object.version_id),
+                    )
+                })
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
+
+        Ok(ObjectVersionsPage {
+            versions: visible,
+            is_truncated,
+            next_key_marker,
+            next_version_id_marker,
+        })
+    }
+
     async fn publish_object_watch_event(
         &self,
         tenant_id: i64,
@@ -1616,6 +1750,60 @@ impl ObjectManager {
 
         Ok(bucket)
     }
+}
+
+fn normalized_list_limit(limit: i32) -> i32 {
+    if limit <= 0 { 1000 } else { limit }
+}
+
+fn visible_object_listing(
+    objects: Vec<Object>,
+    prefix: &str,
+    limit: i32,
+    delimiter: &str,
+) -> metadata_journal::NativeObjectListing {
+    let limit = limit.max(1) as usize;
+    if delimiter.is_empty() {
+        return metadata_journal::NativeObjectListing {
+            objects: objects.into_iter().take(limit).collect(),
+            common_prefixes: Vec::new(),
+        };
+    }
+
+    enum ListingEntry {
+        Object(Object),
+        CommonPrefix(String),
+    }
+
+    let mut merged = std::collections::BTreeMap::<String, ListingEntry>::new();
+    for object in objects {
+        let suffix = &object.key[prefix.len()..];
+        if let Some(position) = suffix.find(delimiter) {
+            let common_prefix = format!("{}{}", prefix, &suffix[..position + delimiter.len()]);
+            merged
+                .entry(common_prefix.clone())
+                .or_insert(ListingEntry::CommonPrefix(common_prefix));
+        } else {
+            merged.insert(object.key.clone(), ListingEntry::Object(object));
+        }
+        if merged.len() >= limit {
+            break;
+        }
+    }
+
+    let mut listing = metadata_journal::NativeObjectListing {
+        objects: Vec::new(),
+        common_prefixes: Vec::new(),
+    };
+    for (_, entry) in merged.into_iter().take(limit) {
+        match entry {
+            ListingEntry::Object(object) => listing.objects.push(object),
+            ListingEntry::CommonPrefix(common_prefix) => {
+                listing.common_prefixes.push(common_prefix)
+            }
+        }
+    }
+    listing
 }
 
 async fn collect_stream_bytes(

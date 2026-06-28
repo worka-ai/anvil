@@ -3,9 +3,10 @@ use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::{
     CheckPermissionRequest, CreateBucketRequest, GetAccessTokenRequest, GetObjectRequest,
-    GrantAccessRequest, ListBucketsRequest, ObjectMetadata, PutObjectRequest, RevokeAccessRequest,
-    SetPublicAccessRequest, WatchAuthzDerivedLagRequest, WatchAuthzNamespaceRequest,
-    WatchAuthzTupleLogRequest, WriteAuthzTupleRequest,
+    GrantAccessRequest, ListBucketsRequest, ListObjectVersionsRequest, ListObjectsRequest,
+    ObjectMetadata, PutObjectRequest, RevokeAccessRequest, SetPublicAccessRequest,
+    WatchAuthzDerivedLagRequest, WatchAuthzNamespaceRequest, WatchAuthzTupleLogRequest,
+    WriteAuthzTupleRequest,
 };
 use anvil::authz_derived_lag_watch::{
     AuthzDerivedLagWatchPayload, append_authz_derived_lag_watch_record,
@@ -142,6 +143,33 @@ fn add_bearer<T>(request: &mut Request<T>, token: &str) {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
+}
+
+async fn put_test_object(
+    object_client: &mut ObjectServiceClient<tonic::transport::Channel>,
+    token: &str,
+    bucket_name: &str,
+    object_key: &str,
+    payload: &[u8],
+) {
+    let chunks = vec![
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                ObjectMetadata {
+                    bucket_name: bucket_name.to_string(),
+                    object_key: object_key.to_string(),
+                },
+            )),
+        },
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                payload.to_vec(),
+            )),
+        },
+    ];
+    let mut request = Request::new(tokio_stream::iter(chunks));
+    add_bearer(&mut request, token);
+    object_client.put_object(request).await.unwrap();
 }
 
 fn write_authz_tuple_request(
@@ -767,6 +795,193 @@ async fn test_object_read_uses_relationship_authorization_before_streaming_bytes
         panic!("second get_object response must be payload bytes");
     };
     assert_eq!(bytes, payload);
+}
+
+#[tokio::test]
+async fn test_object_list_and_versions_filter_entries_by_read_relationship() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let bucket_name = "relationship-list-bucket".to_string();
+    let allowed_key = "docs/allowed.txt".to_string();
+    let denied_key = "docs/denied.txt".to_string();
+    let visible_nested_key = "visible/nested.txt".to_string();
+    let hidden_nested_key = "hidden/nested.txt".to_string();
+
+    let mut bucket_client = BucketServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut object_client = ObjectServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    let mut create_bucket = Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
+    });
+    add_bearer(&mut create_bucket, &token);
+    bucket_client.create_bucket(create_bucket).await.unwrap();
+
+    put_test_object(
+        &mut object_client,
+        &token,
+        &bucket_name,
+        &allowed_key,
+        b"allowed-v1",
+    )
+    .await;
+    put_test_object(
+        &mut object_client,
+        &token,
+        &bucket_name,
+        &denied_key,
+        b"denied",
+    )
+    .await;
+    put_test_object(
+        &mut object_client,
+        &token,
+        &bucket_name,
+        &allowed_key,
+        b"allowed-v2",
+    )
+    .await;
+    put_test_object(
+        &mut object_client,
+        &token,
+        &bucket_name,
+        &visible_nested_key,
+        b"visible",
+    )
+    .await;
+    put_test_object(
+        &mut object_client,
+        &token,
+        &bucket_name,
+        &hidden_nested_key,
+        b"hidden",
+    )
+    .await;
+
+    let (reader_app_id, reader_client_id, reader_client_secret) =
+        create_app_with_id(&cluster.admin_state_path, "relationship-list-reader-app");
+    grant_policy(
+        &cluster.admin_state_path,
+        "relationship-list-reader-app",
+        "object:list",
+        &bucket_name,
+    );
+    let reader_token = get_token_for_scopes(
+        &cluster.grpc_addrs[0],
+        &reader_client_id,
+        &reader_client_secret,
+        vec![format!("object:list|{bucket_name}")],
+    )
+    .await;
+
+    let mut ungranted_list = Request::new(ListObjectsRequest {
+        bucket_name: bucket_name.clone(),
+        prefix: String::new(),
+        delimiter: String::new(),
+        start_after: String::new(),
+        max_keys: 100,
+    });
+    add_bearer(&mut ungranted_list, &reader_token);
+    let ungranted_list = object_client
+        .list_objects(ungranted_list)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(ungranted_list.objects.is_empty());
+    assert!(ungranted_list.common_prefixes.is_empty());
+
+    for key in [&allowed_key, &visible_nested_key] {
+        let mut grant_reader = Request::new(write_authz_tuple_request(
+            "object",
+            &format!("{bucket_name}/{key}"),
+            "reader",
+            "app",
+            &reader_app_id,
+            "add",
+        ));
+        add_bearer(&mut grant_reader, &token);
+        auth_client.write_authz_tuple(grant_reader).await.unwrap();
+    }
+
+    let mut list_docs = Request::new(ListObjectsRequest {
+        bucket_name: bucket_name.clone(),
+        prefix: "docs/".to_string(),
+        delimiter: String::new(),
+        start_after: String::new(),
+        max_keys: 100,
+    });
+    add_bearer(&mut list_docs, &reader_token);
+    let list_docs = object_client
+        .list_objects(list_docs)
+        .await
+        .unwrap()
+        .into_inner();
+    let listed_keys = list_docs
+        .objects
+        .iter()
+        .map(|object| object.key.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(listed_keys, vec![allowed_key.as_str()]);
+
+    let mut delimiter_list = Request::new(ListObjectsRequest {
+        bucket_name: bucket_name.clone(),
+        prefix: String::new(),
+        delimiter: "/".to_string(),
+        start_after: String::new(),
+        max_keys: 100,
+    });
+    add_bearer(&mut delimiter_list, &reader_token);
+    let delimiter_list = object_client
+        .list_objects(delimiter_list)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(delimiter_list.common_prefixes, vec!["docs/", "visible/"]);
+    assert!(
+        !delimiter_list
+            .common_prefixes
+            .iter()
+            .any(|prefix| prefix == "hidden/")
+    );
+
+    let mut list_versions = Request::new(ListObjectVersionsRequest {
+        bucket_name: bucket_name.clone(),
+        prefix: String::new(),
+        key_marker: String::new(),
+        max_keys: 100,
+        version_id_marker: String::new(),
+    });
+    add_bearer(&mut list_versions, &reader_token);
+    let list_versions = object_client
+        .list_object_versions(list_versions)
+        .await
+        .unwrap()
+        .into_inner();
+    let version_keys = list_versions
+        .versions
+        .iter()
+        .map(|version| version.key.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        version_keys,
+        vec![
+            allowed_key.as_str(),
+            allowed_key.as_str(),
+            visible_nested_key.as_str()
+        ]
+    );
+    assert!(!version_keys.contains(&denied_key.as_str()));
+    assert!(!version_keys.contains(&hidden_nested_key.as_str()));
+    assert!(!list_versions.is_truncated);
 }
 
 #[tokio::test]

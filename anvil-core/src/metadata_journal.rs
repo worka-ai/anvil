@@ -795,7 +795,7 @@ pub async fn list_current_objects(
     Ok(listing)
 }
 
-async fn read_current_directory_objects(
+pub(crate) async fn read_current_directory_objects(
     storage: &Storage,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
