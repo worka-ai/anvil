@@ -39,7 +39,7 @@ pub async fn start_node(
     let worker_state = state.clone();
     tokio::spawn(async move {
         if let Err(e) = anvil_core::worker::run(
-            worker_state.db.clone(),
+            worker_state.persistence.clone(),
             worker_state.cluster.clone(),
             worker_state.jwt_manager.clone(),
             worker_state.object_manager.clone(),
@@ -100,7 +100,7 @@ pub async fn start_node(
         state.cluster.clone(),
         state.config.public_api_addr.clone(),
         state.config.cluster_secret.clone(),
-        state.db.cache().clone(),
+        state.persistence.cache().clone(),
         outbound_events_rx,
     ));
     let server_task =

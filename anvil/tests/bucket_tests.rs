@@ -15,27 +15,28 @@ use anvil_test_utils::*;
 #[tokio::test]
 async fn test_task_claim_marks_tasks_running_before_execution() {
     let cluster = TestCluster::new(&["test-region-1"]).await;
-    let db = &cluster.states[0].db;
+    let persistence = &cluster.states[0].persistence;
 
-    db.enqueue_task(
-        anvil::tasks::TaskType::DeleteBucket,
-        serde_json::json!({ "bucket_id": 123_i64 }),
-        100,
-    )
-    .await
-    .unwrap();
+    persistence
+        .enqueue_task(
+            anvil::tasks::TaskType::DeleteBucket,
+            serde_json::json!({ "bucket_id": 123_i64 }),
+            100,
+        )
+        .await
+        .unwrap();
 
-    let claimed = db.claim_pending_tasks(10).await.unwrap();
+    let claimed = persistence.claim_pending_tasks(10).await.unwrap();
     assert_eq!(claimed.len(), 1);
     let task_id = claimed[0].id;
 
-    let claimed_again = db.claim_pending_tasks(10).await.unwrap();
+    let claimed_again = persistence.claim_pending_tasks(10).await.unwrap();
     assert!(
         claimed_again.is_empty(),
         "running tasks must not be claimed again"
     );
 
-    let tasks = db.list_tasks().await.unwrap();
+    let tasks = persistence.list_tasks().await.unwrap();
     let task = tasks.iter().find(|task| task.id == task_id).unwrap();
     assert_eq!(task.status, TaskStatus::Running);
 }
@@ -100,7 +101,7 @@ async fn test_delete_bucket_soft_deletes_and_enqueues_task() {
 
     // 4. Verify a native metadata task was enqueued.
     let task = cluster.states[0]
-        .db
+        .persistence
         .list_tasks()
         .await
         .unwrap()
@@ -126,7 +127,7 @@ async fn test_delete_bucket_soft_deletes_and_enqueues_task() {
     let start = Instant::now();
     loop {
         let status = cluster.states[0]
-            .db
+            .persistence
             .list_tasks()
             .await
             .unwrap()
@@ -151,7 +152,7 @@ async fn test_delete_bucket_soft_deletes_and_enqueues_task() {
 
     assert!(
         cluster.states[0]
-            .db
+            .persistence
             .get_bucket_by_name(1, &bucket_name)
             .await
             .unwrap()

@@ -32,7 +32,7 @@ impl api::hugging_face_key_service_server::HuggingFaceKeyService for AppState {
             Some(req.note.as_str())
         };
 
-        self.db
+        self.persistence
             .hf_create_key(&req.name, &enc, note_opt)
             .await
             .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;
@@ -58,7 +58,7 @@ impl api::hugging_face_key_service_server::HuggingFaceKeyService for AppState {
         }
 
         let n = self
-            .db
+            .persistence
             .hf_delete_key(&req.name)
             .await
             .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;
@@ -82,7 +82,7 @@ impl api::hugging_face_key_service_server::HuggingFaceKeyService for AppState {
         }
 
         let rows = self
-            .db
+            .persistence
             .hf_list_keys()
             .await
             .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;
@@ -131,7 +131,7 @@ impl api::hf_ingestion_service_server::HfIngestionService for AppState {
         tracing::info!("Authorization successful for start_ingestion");
         // Lookup key id
         let Some((key_id, _enc)) = self
-            .db
+            .persistence
             .hf_get_key_encrypted(&req.key_name)
             .await
             .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?
@@ -147,14 +147,14 @@ impl api::hf_ingestion_service_server::HfIngestionService for AppState {
             .map_err(|_| Status::unauthenticated("Invalid app ID in token"))?;
 
         let app = self
-            .db
+            .persistence
             .get_app_by_id(app_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::unauthenticated("Invalid app ID in token"))?;
 
         let ingestion_id = self
-            .db
+            .persistence
             .hf_create_ingestion(
                 key_id,
                 claims.tenant_id,
@@ -179,7 +179,7 @@ impl api::hf_ingestion_service_server::HfIngestionService for AppState {
             .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;
         // Enqueue task
         let payload = serde_json::json!({"ingestion_id": ingestion_id});
-        self.db
+        self.persistence
             .enqueue_task(TaskType::HFIngestion, payload, 100)
             .await
             .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;
@@ -203,11 +203,11 @@ impl api::hf_ingestion_service_server::HfIngestionService for AppState {
             .parse()
             .map_err(|_| Status::invalid_argument("invalid id"))?;
         // Policy: allow requester or explicit permission
-        let (_state_s, _q, _d, _s, _f, _err, _st, _ft, _cr) =
-            self.db
-                .hf_status_summary(id)
-                .await
-                .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;
+        let (_state_s, _q, _d, _s, _f, _err, _st, _ft, _cr) = self
+            .persistence
+            .hf_status_summary(id)
+            .await
+            .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;
         // Authorization aligned: interceptor validated token; rely on cluster policy wildcard in tests
         let (
             state_s,
@@ -220,7 +220,7 @@ impl api::hf_ingestion_service_server::HfIngestionService for AppState {
             finished_at,
             created_at,
         ) = self
-            .db
+            .persistence
             .hf_status_summary(id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -257,7 +257,7 @@ impl api::hf_ingestion_service_server::HfIngestionService for AppState {
             .map_err(|_| Status::invalid_argument("invalid id"))?;
         // Authorization aligned
         let _ = self
-            .db
+            .persistence
             .hf_cancel_ingestion(id)
             .await
             .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;

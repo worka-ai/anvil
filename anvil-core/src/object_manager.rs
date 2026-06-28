@@ -25,7 +25,7 @@ const INLINE_PAYLOAD_MAX_BYTES: i64 = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ObjectManager {
-    db: Persistence,
+    persistence: Persistence,
     placer: PlacementManager,
     cluster: ClusterState,
     sharder: ShardManager,
@@ -101,7 +101,7 @@ pub struct ManifestCasResult {
 impl ObjectManager {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        db: Persistence,
+        persistence: Persistence,
         placer: PlacementManager,
         cluster: ClusterState,
         sharder: ShardManager,
@@ -114,7 +114,7 @@ impl ObjectManager {
         let encryption_key = hex::decode(anvil_secret_encryption_key)
             .expect("ANVIL_SECRET_ENCRYPTION_KEY must be a valid hex string");
         Self {
-            db,
+            persistence,
             placer,
             cluster,
             sharder,
@@ -294,7 +294,7 @@ impl ObjectManager {
         };
 
         let object = self
-            .db
+            .persistence
             .create_object(
                 tenant_id,
                 bucket.id,
@@ -327,7 +327,7 @@ impl ObjectManager {
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
 
         let upload = self
-            .db
+            .persistence
             .create_multipart_upload(tenant_id, bucket.id, object_key)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -348,7 +348,7 @@ impl ObjectManager {
         validate_multipart_part_number(part_number)?;
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
         let upload = self
-            .db
+            .persistence
             .get_active_multipart_upload(tenant_id, bucket.id, object_key, upload_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
@@ -365,7 +365,7 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))?;
 
         let part = self
-            .db
+            .persistence
             .upsert_multipart_part(
                 upload.id,
                 part_number,
@@ -399,13 +399,13 @@ impl ObjectManager {
 
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
         let upload = self
-            .db
+            .persistence
             .get_active_multipart_upload(tenant_id, bucket.id, object_key, upload_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Multipart upload not found"))?;
         let stored_parts = self
-            .db
+            .persistence
             .list_multipart_parts(upload.id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -456,7 +456,7 @@ impl ObjectManager {
             )
             .await?;
 
-        self.db
+        self.persistence
             .complete_multipart_upload(upload.id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -475,7 +475,7 @@ impl ObjectManager {
         self.validate_write_request(bucket_name, object_key, scopes)?;
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
         let aborted = self
-            .db
+            .persistence
             .abort_multipart_upload(tenant_id, bucket.id, object_key, upload_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -499,12 +499,12 @@ impl ObjectManager {
         self.validate_write_request(bucket_name, object_key, scopes)?;
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
         let upload = self
-            .db
+            .persistence
             .get_active_multipart_upload(tenant_id, bucket.id, object_key, upload_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Multipart upload not found"))?;
-        self.db
+        self.persistence
             .list_multipart_parts_page(upload.id, part_number_marker, limit)
             .await
             .map_err(|e| Status::internal(e.to_string()))
@@ -534,7 +534,7 @@ impl ObjectManager {
         }
 
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
-        self.db
+        self.persistence
             .list_active_multipart_uploads(bucket.id, prefix, key_marker, upload_id_marker, limit)
             .await
             .map_err(|e| Status::internal(e.to_string()))
@@ -597,7 +597,7 @@ impl ObjectManager {
         self.validate_write_request(bucket_name, stream_key, scopes)?;
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
         let stream = self
-            .db
+            .persistence
             .create_append_stream(tenant_id, bucket.id, &bucket.name, stream_key)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -616,7 +616,7 @@ impl ObjectManager {
         self.validate_write_request(bucket_name, stream_key, scopes)?;
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
         let stream = self
-            .db
+            .persistence
             .get_active_append_stream(tenant_id, bucket.id, stream_key, stream_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
@@ -628,7 +628,7 @@ impl ObjectManager {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         let record = self
-            .db
+            .persistence
             .append_stream_record(stream.id, &payload_hash, payload.len() as i64)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -652,13 +652,13 @@ impl ObjectManager {
         self.validate_write_request(bucket_name, stream_key, scopes)?;
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
         let stream = self
-            .db
+            .persistence
             .get_active_append_stream(tenant_id, bucket.id, stream_key, stream_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Append stream not found"))?;
         let records = self
-            .db
+            .persistence
             .list_append_stream_records(stream.id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -676,7 +676,7 @@ impl ObjectManager {
         }
         let segment_hash = hasher.finalize().to_hex().to_string();
         let sealed = self
-            .db
+            .persistence
             .seal_append_stream(stream.id, &segment_hash)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -712,7 +712,7 @@ impl ObjectManager {
         let manifest_hash = blake3::hash(&manifest_bytes).to_hex().to_string();
 
         let result = self
-            .db
+            .persistence
             .compare_and_swap_manifest(
                 tenant_id,
                 bucket.id,
@@ -1066,7 +1066,7 @@ impl ObjectManager {
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
 
         let delete_marker = self
-            .db
+            .persistence
             .soft_delete_object(bucket.id, object_key)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
@@ -1113,7 +1113,7 @@ impl ObjectManager {
         }
 
         let deleted = self
-            .db
+            .persistence
             .delete_object_version(bucket.id, object_key, version_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
@@ -1475,7 +1475,7 @@ impl ObjectManager {
         is_delete_marker: bool,
     ) -> Result<(), Status> {
         let event = self
-            .db
+            .persistence
             .create_object_watch_event(
                 tenant_id,
                 bucket.id,

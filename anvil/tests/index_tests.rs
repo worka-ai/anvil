@@ -268,7 +268,7 @@ async fn test_query_full_text_index_reads_latest_segment() {
 
     let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
     let bucket = cluster.states[0]
-        .db
+        .persistence
         .get_bucket_by_name(claims.tenant_id, &bucket_name)
         .await
         .unwrap()
@@ -279,7 +279,7 @@ async fn test_query_full_text_index_reads_latest_segment() {
         created.index_id as i64,
     );
     let indexed_object = cluster.states[0]
-        .db
+        .persistence
         .create_object(
             claims.tenant_id,
             bucket.id,
@@ -407,7 +407,7 @@ async fn test_query_vector_index_reads_latest_segment() {
 
     let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
     let bucket = cluster.states[0]
-        .db
+        .persistence
         .get_bucket_by_name(claims.tenant_id, &bucket_name)
         .await
         .unwrap()
@@ -418,7 +418,7 @@ async fn test_query_vector_index_reads_latest_segment() {
         created.index_id as i64,
     );
     let first_object = cluster.states[0]
-        .db
+        .persistence
         .create_object(
             claims.tenant_id,
             bucket.id,
@@ -434,7 +434,7 @@ async fn test_query_vector_index_reads_latest_segment() {
         .await
         .unwrap();
     let second_object = cluster.states[0]
-        .db
+        .persistence
         .create_object(
             claims.tenant_id,
             bucket.id,
@@ -571,13 +571,13 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
 
     let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
     let bucket = cluster.states[0]
-        .db
+        .persistence
         .get_bucket_by_name(claims.tenant_id, &bucket_name)
         .await
         .unwrap()
         .expect("bucket exists");
     let first_object = cluster.states[0]
-        .db
+        .persistence
         .create_object(
             claims.tenant_id,
             bucket.id,
@@ -593,7 +593,7 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
         .await
         .unwrap();
     let second_object = cluster.states[0]
-        .db
+        .persistence
         .create_object(
             claims.tenant_id,
             bucket.id,
@@ -760,13 +760,13 @@ async fn test_query_inherit_object_vector_filters_results_by_object_read_scope()
 
     let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
     let bucket = cluster.states[0]
-        .db
+        .persistence
         .get_bucket_by_name(claims.tenant_id, &bucket_name)
         .await
         .unwrap()
         .expect("bucket exists");
     let allowed_object = cluster.states[0]
-        .db
+        .persistence
         .create_object(
             claims.tenant_id,
             bucket.id,
@@ -782,7 +782,7 @@ async fn test_query_inherit_object_vector_filters_results_by_object_read_scope()
         .await
         .unwrap();
     let denied_object = cluster.states[0]
-        .db
+        .persistence
         .create_object(
             claims.tenant_id,
             bucket.id,
@@ -918,13 +918,13 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
 
     let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
     let bucket = cluster.states[0]
-        .db
+        .persistence
         .get_bucket_by_name(claims.tenant_id, &bucket_name)
         .await
         .unwrap()
         .expect("bucket exists");
     let allowed_object = cluster.states[0]
-        .db
+        .persistence
         .create_object(
             claims.tenant_id,
             bucket.id,
@@ -940,7 +940,7 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
         .await
         .unwrap();
     let denied_object = cluster.states[0]
-        .db
+        .persistence
         .create_object(
             claims.tenant_id,
             bucket.id,
@@ -1277,13 +1277,13 @@ async fn test_list_index_diagnostics_filters_by_index_and_severity() {
 
     let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
     let bucket = cluster.states[0]
-        .db
+        .persistence
         .get_bucket_by_name(claims.tenant_id, &bucket_name)
         .await
         .unwrap()
         .expect("bucket exists");
     cluster.states[0]
-        .db
+        .persistence
         .create_index_diagnostic(
             claims.tenant_id,
             bucket.id,
@@ -1300,7 +1300,7 @@ async fn test_list_index_diagnostics_filters_by_index_and_severity() {
         .await
         .unwrap();
     cluster.states[0]
-        .db
+        .persistence
         .create_index_diagnostic(
             claims.tenant_id,
             bucket.id,

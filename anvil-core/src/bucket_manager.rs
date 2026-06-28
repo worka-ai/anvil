@@ -10,13 +10,16 @@ use tonic::Status;
 
 #[derive(Debug, Clone)]
 pub struct BucketManager {
-    db: Persistence,
+    persistence: Persistence,
     storage: Storage,
 }
 
 impl BucketManager {
-    pub fn new(db: Persistence, storage: Storage) -> Self {
-        Self { db, storage }
+    pub fn new(persistence: Persistence, storage: Storage) -> Self {
+        Self {
+            persistence,
+            storage,
+        }
     }
 
     pub async fn create_bucket(
@@ -39,7 +42,7 @@ impl BucketManager {
 
         tracing::debug!("[manager] Creating bucket metadata: {}", bucket_name);
         let bucket = self
-            .db
+            .persistence
             .create_bucket(tenant_id, bucket_name, region)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -67,7 +70,7 @@ impl BucketManager {
                 .map_err(|e| Status::internal(e.to_string()))?
                 .ok_or_else(|| Status::not_found("Bucket not found"))?;
         if self
-            .db
+            .persistence
             .bucket_has_retained_objects_or_uploads(existing_bucket.id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
@@ -76,7 +79,7 @@ impl BucketManager {
         }
 
         let bucket = self
-            .db
+            .persistence
             .soft_delete_bucket(tenant_id, bucket_name)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
@@ -84,7 +87,7 @@ impl BucketManager {
 
         // Enqueue a task for physical deletion
         let payload = serde_json::json!({ "bucket_id": bucket.id });
-        self.db
+        self.persistence
             .enqueue_task(TaskType::DeleteBucket, payload, 100)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -151,7 +154,7 @@ impl BucketManager {
         }
 
         let bucket = self
-            .db
+            .persistence
             .set_bucket_public_access(tenant_id, bucket_name, is_public)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;

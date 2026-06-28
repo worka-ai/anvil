@@ -1213,13 +1213,13 @@ async fn run_s3_public_and_private_access() {
     assert_reserved_namespace_error(list_err);
 
     let bucket = cluster.states[0]
-        .db
+        .persistence
         .get_bucket_by_name(1, &public_bucket)
         .await
         .unwrap()
         .expect("public bucket metadata should exist");
     cluster.states[0]
-        .db
+        .persistence
         .create_object(
             bucket.tenant_id,
             bucket.id,

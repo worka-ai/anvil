@@ -119,15 +119,15 @@ impl TestCluster {
                 .to_string_lossy()
                 .into_owned();
             let state = AppState::new(node_config, None).await.unwrap();
-            state.db.create_region(region_name).await.unwrap();
+            state.persistence.create_region(region_name).await.unwrap();
             let tenant = state
-                .db
+                .persistence
                 .create_tenant("default", "default-key")
                 .await
                 .unwrap();
             let encryption_key = hex::decode(&state.config.anvil_secret_encryption_key).unwrap();
             if state
-                .db
+                .persistence
                 .get_app_by_client_id("test-app")
                 .await
                 .unwrap()
@@ -136,17 +136,21 @@ impl TestCluster {
                 let encrypted_secret =
                     anvil::crypto::encrypt(b"test-secret", &encryption_key).unwrap();
                 let app = state
-                    .db
+                    .persistence
                     .create_app(tenant.id, "test-app", "test-app", &encrypted_secret)
                     .await
                     .unwrap();
-                state.db.grant_policy(app.id, "*", "*").await.unwrap();
+                state
+                    .persistence
+                    .grant_policy(app.id, "*", "*")
+                    .await
+                    .unwrap();
             }
             states.push(state);
         }
         for region in unique_regions {
             for state in &states {
-                state.db.create_region(&region).await.unwrap();
+                state.persistence.create_region(&region).await.unwrap();
             }
         }
 

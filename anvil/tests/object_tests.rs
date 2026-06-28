@@ -498,7 +498,7 @@ async fn test_listing_omits_reserved_internal_object_keys() {
     object_client.put_object(put_req).await.unwrap();
 
     let bucket = cluster.states[0]
-        .db
+        .persistence
         .get_bucket_by_name(1, &bucket_name)
         .await
         .unwrap()
@@ -506,7 +506,7 @@ async fn test_listing_omits_reserved_internal_object_keys() {
     let bucket_id = bucket.id;
     let tenant_id = bucket.tenant_id;
     cluster.states[0]
-        .db
+        .persistence
         .create_object(
             tenant_id,
             bucket_id,
@@ -723,14 +723,14 @@ async fn test_inline_payload_threshold_is_recorded_and_readable() {
         .into_inner();
 
     let bucket_id = cluster.states[0]
-        .db
+        .persistence
         .get_bucket_by_name(1, &bucket_name)
         .await
         .unwrap()
         .expect("bucket metadata should exist")
         .id;
     let inline_object = cluster.states[0]
-        .db
+        .persistence
         .get_object_version(
             bucket_id,
             &inline_key,
@@ -745,7 +745,7 @@ async fn test_inline_payload_threshold_is_recorded_and_readable() {
     );
 
     let external_object = cluster.states[0]
-        .db
+        .persistence
         .get_object_version(
             bucket_id,
             &external_key,
@@ -827,13 +827,13 @@ async fn test_object_version_records_index_policy_snapshot_and_mutation_metadata
 
     let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
     let bucket = cluster.states[0]
-        .db
+        .persistence
         .get_bucket_by_name(claims.tenant_id, &bucket_name)
         .await
         .unwrap()
         .expect("bucket exists");
     let expected_policy_hash = cluster.states[0]
-        .db
+        .persistence
         .active_index_policy_snapshot_hash(claims.tenant_id, bucket.id)
         .await
         .unwrap();

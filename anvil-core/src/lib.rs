@@ -79,7 +79,7 @@ pub mod anvil_api {
 // Our application state, which will hold the persistence layer, storage engine, etc.
 #[derive(Clone, Debug)]
 pub struct AppState {
-    pub db: persistence::Persistence,
+    pub persistence: persistence::Persistence,
     pub storage: storage::Storage,
     pub cluster: ClusterState,
     pub sharder: sharding::ShardManager,
@@ -104,9 +104,9 @@ impl AppState {
         let jwt_manager = Arc::new(JwtManager::new(arc_config.jwt_secret.clone()));
         let storage = storage::Storage::new_at(&arc_config.storage_path).await?;
         let cluster_state = Arc::new(RwLock::new(HashMap::new()));
-        let db = persistence::Persistence::new(&arc_config, event_publisher)?;
+        let persistence = persistence::Persistence::new(&arc_config, event_publisher)?;
         if !arc_config.region.is_empty() {
-            db.create_region(&arc_config.region).await?;
+            persistence.create_region(&arc_config.region).await?;
         }
         let sharder = sharding::ShardManager::new();
         let placer = placement::PlacementManager::default();
@@ -116,9 +116,10 @@ impl AppState {
         let (index_watch_tx, _index_watch_rx) = tokio::sync::broadcast::channel(1024);
         let (personaldb_watch_tx, _personaldb_watch_rx) = tokio::sync::broadcast::channel(1024);
 
-        let bucket_manager = bucket_manager::BucketManager::new(db.clone(), storage.clone());
+        let bucket_manager =
+            bucket_manager::BucketManager::new(persistence.clone(), storage.clone());
         let object_manager = object_manager::ObjectManager::new(
-            db.clone(),
+            persistence.clone(),
             placer.clone(),
             cluster_state.clone(),
             sharder.clone(),
@@ -130,7 +131,7 @@ impl AppState {
         );
 
         Ok(Self {
-            db,
+            persistence,
             storage,
             cluster: cluster_state,
             sharder,

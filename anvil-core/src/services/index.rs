@@ -48,7 +48,7 @@ impl IndexService for AppState {
         validate_index_definition_shape(&req.kind, &build_policy)?;
 
         let index = self
-            .db
+            .persistence
             .create_index_definition(
                 claims.tenant_id,
                 bucket.id,
@@ -92,7 +92,7 @@ impl IndexService for AppState {
         let build_policy = parse_json_field("build_policy_json", &req.build_policy_json)?;
         validate_authorization_mode(&req.authorization_mode)?;
         let existing = self
-            .db
+            .persistence
             .get_index_definition(claims.tenant_id, bucket.id, &req.name)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
@@ -100,7 +100,7 @@ impl IndexService for AppState {
         validate_index_definition_shape(&existing.kind, &build_policy)?;
 
         let index = self
-            .db
+            .persistence
             .update_index_definition(
                 claims.tenant_id,
                 bucket.id,
@@ -140,7 +140,7 @@ impl IndexService for AppState {
             .get_index_bucket(claims.tenant_id, &req.bucket_name)
             .await?;
         let index = self
-            .db
+            .persistence
             .disable_index_definition(claims.tenant_id, bucket.id, &req.name)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
@@ -172,7 +172,7 @@ impl IndexService for AppState {
             .get_index_bucket(claims.tenant_id, &req.bucket_name)
             .await?;
         let index = self
-            .db
+            .persistence
             .drop_index_definition(claims.tenant_id, bucket.id, &req.name)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
@@ -231,7 +231,7 @@ impl IndexService for AppState {
             .get_index_bucket(claims.tenant_id, &req.bucket_name)
             .await?;
         let index = self
-            .db
+            .persistence
             .get_index_definition(claims.tenant_id, bucket.id, &req.index_name)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
@@ -355,7 +355,7 @@ impl IndexService for AppState {
         let limit = i32::try_from(req.limit)
             .map_err(|_| Status::invalid_argument("limit exceeds supported range"))?;
         let diagnostics = self
-            .db
+            .persistence
             .list_index_diagnostics(
                 claims.tenant_id,
                 bucket.id,
@@ -773,7 +773,7 @@ impl AppState {
     ) -> Result<Option<(String, String)>, Status> {
         let version_id = uuid::Uuid::from_bytes(version_bytes);
         let object = self
-            .db
+            .persistence
             .get_object_version_by_id(bucket_id, version_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;

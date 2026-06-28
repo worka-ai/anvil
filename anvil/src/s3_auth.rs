@@ -136,7 +136,11 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         }
     };
 
-    let app_details = match state.db.get_app_by_client_id(&parsed.access_key_id).await {
+    let app_details = match state
+        .persistence
+        .get_app_by_client_id(&parsed.access_key_id)
+        .await
+    {
         Ok(Some(d)) => d,
         _ => {
             warn!(access_key_id = %parsed.access_key_id, "SigV4 auth failed: Invalid access key");
@@ -297,7 +301,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
     info!(access_key_id = %parsed.access_key_id, "SigV4 authentication successful");
 
     // Attach claims and continue
-    let scopes = match state.db.get_policies_for_app(app_details.id).await {
+    let scopes = match state.persistence.get_policies_for_app(app_details.id).await {
         Ok(s) => s,
         Err(e) => {
             warn!(error = %e, access_key_id = %parsed.access_key_id, "Failed to fetch policies for app");

@@ -19,7 +19,7 @@ impl AuthService for AppState {
 
         // 1. Verify credentials
         let app_details = self
-            .db
+            .persistence
             .get_app_by_client_id(&req.client_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
@@ -39,7 +39,7 @@ impl AuthService for AppState {
         }
 
         let allowed_scopes = self
-            .db
+            .persistence
             .get_policies_for_app(app_details.id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -103,12 +103,12 @@ impl AuthService for AppState {
         }
 
         let app = self
-            .db
+            .persistence
             .get_app_by_name(&req.grantee_app_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Grantee app not found"))?;
-        self.db
+        self.persistence
             .grant_policy(app.id, &req.resource, &req.action)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -133,13 +133,13 @@ impl AuthService for AppState {
         }
 
         let app = self
-            .db
+            .persistence
             .get_app_by_name(&req.grantee_app_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Grantee app not found"))?;
 
-        self.db
+        self.persistence
             .revoke_policy(app.id, &req.resource, &req.action)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -164,7 +164,7 @@ impl AuthService for AppState {
             ));
         }
 
-        self.db
+        self.persistence
             .set_bucket_public_access(claims.tenant_id, &req.bucket, req.allow_public_read)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
