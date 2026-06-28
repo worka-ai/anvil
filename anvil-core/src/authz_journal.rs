@@ -8,6 +8,7 @@ use crate::persistence::AuthzTupleRecord;
 use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
 
@@ -248,6 +249,33 @@ pub async fn check_authz_tuple_at_revision(
         .max_by_key(|record| record.revision))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_permission_at_revision(
+    storage: &Storage,
+    tenant_id: i64,
+    namespace: &str,
+    object_id: &str,
+    relation: &str,
+    subject_kind: &str,
+    subject_id: &str,
+    caveat_hash: &str,
+    revision: i64,
+) -> Result<bool> {
+    let current = current_authz_view_at_revision(storage, tenant_id, revision).await?;
+    let subject = SubjectRef {
+        kind: subject_kind.to_string(),
+        id: subject_id.to_string(),
+        caveat_hash: caveat_hash.to_string(),
+    };
+    let userset = UsersetRef {
+        namespace: namespace.to_string(),
+        object_id: object_id.to_string(),
+        relation: relation.to_string(),
+    };
+    let mut visited = BTreeSet::new();
+    resolve_userset(&current, &userset, &subject, &mut visited)
+}
+
 pub async fn list_authz_tuple_log(
     storage: &Storage,
     tenant_id: i64,
@@ -264,6 +292,130 @@ pub async fn list_authz_tuple_log(
         records.truncate(limit);
     }
     Ok(records)
+}
+
+async fn current_authz_view_at_revision(
+    storage: &Storage,
+    tenant_id: i64,
+    revision: i64,
+) -> Result<BTreeMap<TupleViewKey, AuthzTupleRecord>> {
+    let mut records = read_all_authz_tuple_records(storage, tenant_id).await?;
+    records.retain(|record| record.revision <= revision);
+    records.sort_by_key(|record| record.revision);
+    let mut current = BTreeMap::new();
+    for record in records {
+        current.insert(TupleViewKey::from(&record), record);
+    }
+    Ok(current)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TupleViewKey {
+    namespace: String,
+    object_id: String,
+    relation: String,
+    subject_kind: String,
+    subject_id: String,
+    caveat_hash: String,
+}
+
+impl From<&AuthzTupleRecord> for TupleViewKey {
+    fn from(record: &AuthzTupleRecord) -> Self {
+        Self {
+            namespace: record.namespace.clone(),
+            object_id: record.object_id.clone(),
+            relation: record.relation.clone(),
+            subject_kind: record.subject_kind.clone(),
+            subject_id: record.subject_id.clone(),
+            caveat_hash: record.caveat_hash.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubjectRef {
+    kind: String,
+    id: String,
+    caveat_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct UsersetRef {
+    namespace: String,
+    object_id: String,
+    relation: String,
+}
+
+fn resolve_userset(
+    current: &BTreeMap<TupleViewKey, AuthzTupleRecord>,
+    userset: &UsersetRef,
+    subject: &SubjectRef,
+    visited: &mut BTreeSet<UsersetRef>,
+) -> Result<bool> {
+    if !visited.insert(userset.clone()) {
+        return Ok(false);
+    }
+
+    let direct_key = TupleViewKey {
+        namespace: userset.namespace.clone(),
+        object_id: userset.object_id.clone(),
+        relation: userset.relation.clone(),
+        subject_kind: subject.kind.clone(),
+        subject_id: subject.id.clone(),
+        caveat_hash: subject.caveat_hash.clone(),
+    };
+    if current
+        .get(&direct_key)
+        .is_some_and(|record| record.operation == "add")
+    {
+        visited.remove(userset);
+        return Ok(true);
+    }
+
+    for record in current.values() {
+        if record.namespace != userset.namespace
+            || record.object_id != userset.object_id
+            || record.relation != userset.relation
+            || record.subject_kind != "userset"
+            || record.operation != "add"
+            || !record.caveat_hash.is_empty()
+        {
+            continue;
+        }
+        let Some(next) = parse_userset_subject(&record.subject_id)? else {
+            continue;
+        };
+        if resolve_userset(current, &next, subject, visited)? {
+            visited.remove(userset);
+            return Ok(true);
+        }
+    }
+
+    visited.remove(userset);
+    Ok(false)
+}
+
+fn parse_userset_subject(value: &str) -> Result<Option<UsersetRef>> {
+    let Some((namespace, rest)) = value.split_once('/') else {
+        return Ok(None);
+    };
+    let Some((object_id, relation)) = rest.rsplit_once('#') else {
+        return Ok(None);
+    };
+    if namespace.is_empty()
+        || object_id.is_empty()
+        || relation.is_empty()
+        || namespace.chars().any(char::is_control)
+        || object_id.chars().any(char::is_control)
+        || relation.chars().any(char::is_control)
+    {
+        return Err(anyhow!("invalid userset subject reference"));
+    }
+    Ok(Some(UsersetRef {
+        namespace: namespace.to_string(),
+        object_id: object_id.to_string(),
+        relation: relation.to_string(),
+    }))
 }
 
 async fn read_all_authz_tuple_records(
@@ -471,6 +623,37 @@ mod tests {
         }
     }
 
+    fn tuple(
+        revision: i64,
+        namespace: &str,
+        object_id: &str,
+        relation: &str,
+        subject_kind: &str,
+        subject_id: &str,
+        operation: &str,
+    ) -> AuthzTupleRecord {
+        AuthzTupleRecord {
+            revision,
+            tenant_id: 42,
+            namespace: namespace.to_string(),
+            object_id: object_id.to_string(),
+            relation: relation.to_string(),
+            subject_kind: subject_kind.to_string(),
+            subject_id: subject_id.to_string(),
+            caveat_hash: String::new(),
+            operation: operation.to_string(),
+            written_by: "tester".to_string(),
+            reason: "test".to_string(),
+            record_hash: hex::encode(hash32(
+                format!(
+                    "record-{revision}-{namespace}-{object_id}-{relation}-{subject_kind}-{subject_id}-{operation}"
+                )
+                .as_bytes(),
+            )),
+            written_at: Utc::now(),
+        }
+    }
+
     async fn ready_authz_permit(
         storage: &Storage,
         tenant_id: i64,
@@ -541,6 +724,128 @@ mod tests {
             .unwrap();
         assert_eq!(watched.len(), 2);
         assert_eq!(watched[1].revision, 2);
+    }
+
+    #[tokio::test]
+    async fn authz_resolves_direct_and_nested_userset_tuples() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        for record in [
+            tuple(1, "group", "engineering", "member", "user", "alice", "add"),
+            tuple(
+                2,
+                "folder",
+                "platform",
+                "viewer",
+                "userset",
+                "group/engineering#member",
+                "add",
+            ),
+            tuple(
+                3,
+                "document",
+                "alpha",
+                "viewer",
+                "userset",
+                "folder/platform#viewer",
+                "add",
+            ),
+        ] {
+            append_authz_tuple_record(&storage, &record).await.unwrap();
+        }
+
+        assert!(
+            resolve_permission_at_revision(
+                &storage, 42, "document", "alpha", "viewer", "user", "alice", "", 3
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !resolve_permission_at_revision(
+                &storage, 42, "document", "alpha", "viewer", "user", "bob", "", 3
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn authz_userset_removal_and_cycles_do_not_grant_access() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        for record in [
+            tuple(1, "group", "engineering", "member", "user", "alice", "add"),
+            tuple(
+                2,
+                "folder",
+                "platform",
+                "viewer",
+                "userset",
+                "group/engineering#member",
+                "add",
+            ),
+            tuple(
+                3,
+                "document",
+                "alpha",
+                "viewer",
+                "userset",
+                "folder/platform#viewer",
+                "add",
+            ),
+            tuple(
+                4,
+                "folder",
+                "platform",
+                "viewer",
+                "userset",
+                "group/engineering#member",
+                "remove",
+            ),
+            tuple(
+                5,
+                "group",
+                "a",
+                "member",
+                "userset",
+                "group/b#member",
+                "add",
+            ),
+            tuple(
+                6,
+                "group",
+                "b",
+                "member",
+                "userset",
+                "group/a#member",
+                "add",
+            ),
+        ] {
+            append_authz_tuple_record(&storage, &record).await.unwrap();
+        }
+
+        assert!(
+            resolve_permission_at_revision(
+                &storage, 42, "document", "alpha", "viewer", "user", "alice", "", 3
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !resolve_permission_at_revision(
+                &storage, 42, "document", "alpha", "viewer", "user", "alice", "", 4
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !resolve_permission_at_revision(
+                &storage, 42, "group", "a", "member", "user", "alice", "", 6
+            )
+            .await
+            .unwrap()
+        );
     }
 
     #[tokio::test]

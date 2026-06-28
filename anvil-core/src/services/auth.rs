@@ -259,51 +259,32 @@ impl AuthService for AppState {
             return Err(Status::failed_precondition("AuthzRevisionUnavailable"));
         }
 
-        let (record, response_revision) = match consistency {
-            AuthzConsistency::Exact(revision) => {
-                let record = authz_journal::check_authz_tuple_at_revision(
-                    &self.storage,
-                    claims.tenant_id,
-                    &req.namespace,
-                    &req.object_id,
-                    &req.relation,
-                    &req.subject_kind,
-                    &req.subject_id,
-                    &req.caveat_hash,
-                    revision,
-                )
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-                (record, revision)
-            }
-            AuthzConsistency::Latest | AuthzConsistency::AtLeast(_) => {
-                let record = authz_journal::check_authz_tuple(
-                    &self.storage,
-                    claims.tenant_id,
-                    &req.namespace,
-                    &req.object_id,
-                    &req.relation,
-                    &req.subject_kind,
-                    &req.subject_id,
-                    &req.caveat_hash,
-                )
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-                (record, latest_revision)
-            }
+        let response_revision = match consistency {
+            AuthzConsistency::Exact(revision) => revision,
+            AuthzConsistency::Latest | AuthzConsistency::AtLeast(_) => latest_revision,
         };
-        let allowed = record
-            .as_ref()
-            .is_some_and(|record| record.operation == "add");
+        let allowed = authz_journal::resolve_permission_at_revision(
+            &self.storage,
+            claims.tenant_id,
+            &req.namespace,
+            &req.object_id,
+            &req.relation,
+            &req.subject_kind,
+            &req.subject_id,
+            &req.caveat_hash,
+            response_revision,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(CheckPermissionResponse {
             allowed,
             revision: revision_to_u64(response_revision)?,
             zookie: zookie(response_revision),
             explanation_ref: if allowed {
-                "direct_tuple_match".to_string()
+                "tuple_or_userset_match".to_string()
             } else {
-                "no_current_tuple".to_string()
+                "no_current_tuple_or_userset".to_string()
             },
         }))
     }

@@ -99,6 +99,54 @@ async fn try_get_token_for_scopes(
         .map(|r| r.into_inner().access_token)
 }
 
+fn add_bearer<T>(request: &mut Request<T>, token: &str) {
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+}
+
+fn write_authz_tuple_request(
+    namespace: &str,
+    object_id: &str,
+    relation: &str,
+    subject_kind: &str,
+    subject_id: &str,
+    operation: &str,
+) -> WriteAuthzTupleRequest {
+    WriteAuthzTupleRequest {
+        namespace: namespace.to_string(),
+        object_id: object_id.to_string(),
+        relation: relation.to_string(),
+        subject_kind: subject_kind.to_string(),
+        subject_id: subject_id.to_string(),
+        caveat_hash: String::new(),
+        operation: operation.to_string(),
+        reason: "test".to_string(),
+    }
+}
+
+fn check_permission_request(
+    namespace: &str,
+    object_id: &str,
+    relation: &str,
+    subject_kind: &str,
+    subject_id: &str,
+    consistency: &str,
+    zookie: &str,
+) -> CheckPermissionRequest {
+    CheckPermissionRequest {
+        namespace: namespace.to_string(),
+        object_id: object_id.to_string(),
+        relation: relation.to_string(),
+        subject_kind: subject_kind.to_string(),
+        subject_id: subject_id.to_string(),
+        caveat_hash: String::new(),
+        consistency: consistency.to_string(),
+        zookie: zookie.to_string(),
+    }
+}
+
 #[tokio::test]
 async fn test_grant_and_revoke_access() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
@@ -442,6 +490,116 @@ async fn test_authz_tuple_write_check_and_watch() {
         .await
         .unwrap_err();
     assert_eq!(unavailable.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn test_authz_permission_resolves_nested_usersets() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    let tuples = [
+        write_authz_tuple_request("group", "engineering", "member", "user", "alice", "add"),
+        write_authz_tuple_request(
+            "folder",
+            "platform",
+            "viewer",
+            "userset",
+            "group/engineering#member",
+            "add",
+        ),
+        write_authz_tuple_request(
+            "document",
+            "alpha",
+            "viewer",
+            "userset",
+            "folder/platform#viewer",
+            "add",
+        ),
+    ];
+    let mut zookies = Vec::new();
+    for tuple in tuples {
+        let mut request = Request::new(tuple);
+        add_bearer(&mut request, &token);
+        let response = auth_client
+            .write_authz_tuple(request)
+            .await
+            .unwrap()
+            .into_inner();
+        zookies.push(response.zookie);
+    }
+
+    let mut allowed_request = Request::new(check_permission_request(
+        "document", "alpha", "viewer", "user", "alice", "latest", "",
+    ));
+    add_bearer(&mut allowed_request, &token);
+    let allowed = auth_client
+        .check_permission(allowed_request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(allowed.allowed);
+    assert_eq!(allowed.explanation_ref, "tuple_or_userset_match");
+
+    let mut denied_request = Request::new(check_permission_request(
+        "document", "alpha", "viewer", "user", "bob", "latest", "",
+    ));
+    add_bearer(&mut denied_request, &token);
+    let denied = auth_client
+        .check_permission(denied_request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!denied.allowed);
+    assert_eq!(denied.explanation_ref, "no_current_tuple_or_userset");
+
+    let mut remove_request = Request::new(write_authz_tuple_request(
+        "folder",
+        "platform",
+        "viewer",
+        "userset",
+        "group/engineering#member",
+        "remove",
+    ));
+    add_bearer(&mut remove_request, &token);
+    let remove = auth_client
+        .write_authz_tuple(remove_request)
+        .await
+        .unwrap()
+        .into_inner();
+
+    let mut exact_before_remove = Request::new(check_permission_request(
+        "document",
+        "alpha",
+        "viewer",
+        "user",
+        "alice",
+        "exact",
+        &zookies[2],
+    ));
+    add_bearer(&mut exact_before_remove, &token);
+    let exact_before_remove = auth_client
+        .check_permission(exact_before_remove)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(exact_before_remove.allowed);
+
+    let mut latest_after_remove = Request::new(check_permission_request(
+        "document", "alpha", "viewer", "user", "alice", "latest", "",
+    ));
+    add_bearer(&mut latest_after_remove, &token);
+    let latest_after_remove = auth_client
+        .check_permission(latest_after_remove)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!latest_after_remove.allowed);
+    assert_eq!(latest_after_remove.zookie, remove.zookie);
 }
 
 #[tokio::test]

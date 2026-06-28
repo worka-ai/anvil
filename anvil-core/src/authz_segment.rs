@@ -283,6 +283,7 @@ fn subject_kind_code(subject_kind: &str) -> Result<u8> {
         "public" => Ok(4),
         "anonymous" => Ok(5),
         "app" => Ok(6),
+        "userset" => Ok(7),
         other => Err(anyhow!("unsupported authz subject kind {other}")),
     }
 }
@@ -295,6 +296,7 @@ fn subject_kind_from_code(code: u8) -> Result<&'static str> {
         4 => Ok("public"),
         5 => Ok("anonymous"),
         6 => Ok("app"),
+        7 => Ok("userset"),
         other => Err(anyhow!("unsupported authz subject kind code {other}")),
     }
 }
