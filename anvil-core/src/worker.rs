@@ -38,6 +38,15 @@ struct ObjectMetadataCompactionPayload {
     bucket_id: i64,
 }
 
+#[derive(Deserialize)]
+struct IndexBuildPayload {
+    tenant_id: i64,
+    bucket_id: i64,
+    index_id: i64,
+    index_version: i64,
+    source_cursor: u128,
+}
+
 pub async fn run(
     persistence: Persistence,
     cluster_state: ClusterState,
@@ -108,6 +117,7 @@ async fn execute_task_with_lease(
         TaskType::ObjectMetadataCompaction => {
             handle_object_metadata_compaction(persistence, task).await?
         }
+        TaskType::IndexBuild => handle_index_build(persistence, task).await?,
         TaskType::HFIngestion => {
             handle_hf_ingestion(persistence, object_manager, task, encryption_key).await?
         }
@@ -118,6 +128,40 @@ async fn execute_task_with_lease(
     persistence
         .checkpoint_task_execution_lease(&lease, lease.source_cursor)
         .await?;
+    Ok(())
+}
+
+async fn handle_index_build(persistence: &Persistence, task: &Task) -> anyhow::Result<()> {
+    let payload: IndexBuildPayload = serde_json::from_value(task.payload.clone())?;
+    match persistence
+        .build_full_text_index_task(
+            payload.tenant_id,
+            payload.bucket_id,
+            payload.index_id,
+            payload.index_version,
+            payload.source_cursor,
+        )
+        .await?
+    {
+        Some(outcome) => {
+            info!(
+                index_id = payload.index_id,
+                index_storage_id = %outcome.index_storage_id,
+                generation = outcome.generation,
+                document_count = outcome.document_count,
+                source_cursor = outcome.source_cursor,
+                segment_hash = %outcome.segment_hash,
+                "Index build task completed"
+            );
+        }
+        None => {
+            info!(
+                index_id = payload.index_id,
+                index_version = payload.index_version,
+                "Index build task skipped because the index is absent, disabled, stale, or unsupported"
+            );
+        }
+    }
     Ok(())
 }
 

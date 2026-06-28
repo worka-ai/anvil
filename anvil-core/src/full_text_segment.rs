@@ -112,17 +112,32 @@ pub async fn write_full_text_segment(
         last_hash,
     );
 
+    let tmp_path = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("full-text-segment"),
+        uuid::Uuid::new_v4()
+    ));
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
-        .create(true)
+        .create_new(true)
         .truncate(true)
-        .open(&path)
+        .open(&tmp_path)
         .await
-        .with_context(|| format!("create full text segment {}", path.display()))?;
+        .with_context(|| format!("create temporary full text segment {}", tmp_path.display()))?;
     file.write_all(&encoded_header).await?;
     file.write_all(&body).await?;
     file.write_all(&footer.encode()).await?;
     file.sync_data().await?;
+    drop(file);
+    tokio::fs::rename(&tmp_path, &path).await.with_context(|| {
+        format!(
+            "publish full text segment {} to {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
     Ok(path)
 }
 

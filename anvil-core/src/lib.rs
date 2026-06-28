@@ -31,6 +31,7 @@ pub mod git_source_index;
 pub mod git_source_query;
 pub mod git_source_watch;
 pub mod hf_journal;
+pub mod index_builder;
 pub mod index_diagnostic_journal;
 pub mod index_journal;
 pub mod index_partition_watch;

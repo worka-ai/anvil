@@ -11,8 +11,8 @@ use crate::{
     cache::MetadataCache,
     cluster::MetadataEvent,
     config::Config,
-    control_journal, hf_journal, index_diagnostic_journal, index_journal, manifest_journal,
-    metadata_journal, model_journal, multipart_journal,
+    control_journal, hf_journal, index_builder, index_diagnostic_journal, index_journal,
+    manifest_journal, metadata_journal, model_journal, multipart_journal,
     partition_fence::{
         PartitionOwnerStatus, PartitionRecoveryAcquire, PartitionWritePermit,
         acquire_partition_recovery, publish_partition_ready, read_partition_owner,
@@ -1331,6 +1331,7 @@ impl Persistence {
             &self.partition_owner_signing_key,
         )
         .await?;
+        self.enqueue_index_builds_for_bucket(&bucket).await?;
         self.enqueue_object_metadata_compaction_if_due(&bucket)
             .await?;
         Ok(object)
@@ -1462,6 +1463,7 @@ impl Persistence {
             &self.partition_owner_signing_key,
         )
         .await?;
+        self.enqueue_index_builds_for_bucket(&bucket).await?;
         self.enqueue_object_metadata_compaction_if_due(&bucket)
             .await?;
         Ok(Some(object))
@@ -1509,6 +1511,7 @@ impl Persistence {
             &self.partition_owner_signing_key,
         )
         .await?;
+        self.enqueue_index_builds_for_bucket(&bucket).await?;
         self.enqueue_object_metadata_compaction_if_due(&bucket)
             .await?;
         Ok(Some(object))
@@ -2214,6 +2217,98 @@ impl Persistence {
         .await
     }
 
+    pub async fn enqueue_index_build_for_index(
+        &self,
+        bucket: &Bucket,
+        index: &IndexDefinition,
+    ) -> Result<bool> {
+        if !index.enabled || index.kind != "full_text" {
+            return Ok(false);
+        }
+        let stats = metadata_journal::active_object_journal_stats(
+            &self.storage,
+            bucket,
+            &self.partition_owner_signing_key,
+        )
+        .await?;
+        if stats.last_sequence == 0 {
+            return Ok(false);
+        }
+        self.enqueue_task_if_absent(
+            crate::tasks::TaskType::IndexBuild,
+            serde_json::json!({
+                "tenant_id": bucket.tenant_id,
+                "bucket_id": bucket.id,
+                "index_id": index.id,
+                "index_version": index.version,
+                "source_cursor": stats.last_sequence,
+            }),
+            40,
+        )
+        .await
+    }
+
+    pub async fn enqueue_index_builds_for_bucket(&self, bucket: &Bucket) -> Result<usize> {
+        let indexes = index_journal::read_current_index_definitions(
+            &self.storage,
+            bucket.tenant_id,
+            bucket.id,
+            false,
+        )
+        .await?;
+        let mut scheduled = 0usize;
+        for index in indexes {
+            if self.enqueue_index_build_for_index(bucket, &index).await? {
+                scheduled = scheduled.saturating_add(1);
+            }
+        }
+        Ok(scheduled)
+    }
+
+    pub async fn build_full_text_index_task(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        index_id: i64,
+        index_version: i64,
+        source_cursor: u128,
+    ) -> Result<Option<index_builder::IndexBuildOutcome>> {
+        let Some(bucket) =
+            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        else {
+            return Ok(None);
+        };
+        if bucket.tenant_id != tenant_id {
+            return Err(anyhow!("index build bucket tenant mismatch"));
+        }
+        let Some(index) = index_journal::read_current_index_definitions(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            true,
+        )
+        .await?
+        .into_iter()
+        .find(|index| index.id == index_id) else {
+            return Ok(None);
+        };
+        if !index.enabled || index.version != index_version {
+            return Ok(None);
+        }
+        if index.kind != "full_text" {
+            return Ok(None);
+        }
+        index_builder::build_full_text_index(
+            &self.storage,
+            &bucket,
+            &index,
+            &self.partition_owner_signing_key,
+            source_cursor,
+        )
+        .await
+        .map(Some)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_index_diagnostic(
         &self,
@@ -2395,6 +2490,20 @@ impl Persistence {
                         bucket.id,
                     )),
                     source_cursor: u128::from(stats.last_sequence),
+                })
+            }
+            crate::tasks::TaskType::IndexBuild => {
+                let tenant_id = task_payload_i64(task, "tenant_id")?;
+                let bucket_id = task_payload_i64(task, "bucket_id")?;
+                let index_id = task_payload_i64(task, "index_id")?;
+                let source_cursor = task_payload_u128(task, "source_cursor")?;
+                Ok(TaskLeaseTarget {
+                    partition_family: "index".to_string(),
+                    partition_id: hex::encode(crate::formats::hash32(
+                        format!("tenant/{tenant_id}/bucket/{bucket_id}/index/{index_id}")
+                            .as_bytes(),
+                    )),
+                    source_cursor,
                 })
             }
             _ => Ok(TaskLeaseTarget {
@@ -2684,6 +2793,19 @@ fn task_payload_i64(task: &TaskRecord, field: &'static str) -> Result<i64> {
         .get(field)
         .and_then(JsonValue::as_i64)
         .ok_or_else(|| anyhow!("task {} payload must include integer {field}", task.id))
+}
+
+fn task_payload_u128(task: &TaskRecord, field: &'static str) -> Result<u128> {
+    task.payload
+        .get(field)
+        .and_then(JsonValue::as_u64)
+        .map(u128::from)
+        .ok_or_else(|| {
+            anyhow!(
+                "task {} payload must include unsigned integer {field}",
+                task.id
+            )
+        })
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@ pub enum TaskType {
     DeleteObject,
     DeleteBucket,
     ObjectMetadataCompaction,
+    IndexBuild,
     RebalanceShard,
     HFIngestion,
 }
@@ -14,6 +15,7 @@ impl TaskType {
             Self::DeleteObject => "DELETE_OBJECT",
             Self::DeleteBucket => "DELETE_BUCKET",
             Self::ObjectMetadataCompaction => "OBJECT_METADATA_COMPACTION",
+            Self::IndexBuild => "INDEX_BUILD",
             Self::RebalanceShard => "REBALANCE_SHARD",
             Self::HFIngestion => "HF_INGESTION",
         }

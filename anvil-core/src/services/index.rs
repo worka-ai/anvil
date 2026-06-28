@@ -63,6 +63,10 @@ impl IndexService for AppState {
             .map_err(|e| Status::internal(e.to_string()))?;
         self.publish_index_definition_event(&bucket, &index, "create")
             .await?;
+        self.persistence
+            .enqueue_index_build_for_index(&bucket, &index)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(IndexDefinitionResponse {
             index: Some(index_record(&bucket.name, index)?),
@@ -115,6 +119,10 @@ impl IndexService for AppState {
             .ok_or_else(|| Status::not_found("Index definition not found"))?;
         self.publish_index_definition_event(&bucket, &index, "update")
             .await?;
+        self.persistence
+            .enqueue_index_build_for_index(&bucket, &index)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(IndexDefinitionResponse {
             index: Some(index_record(&bucket.name, index)?),
