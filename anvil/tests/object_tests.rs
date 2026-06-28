@@ -1292,6 +1292,110 @@ async fn test_copy_object_creates_independent_destination_version() {
 }
 
 #[tokio::test]
+async fn test_private_object_read_denied_before_payload_load() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr).await.unwrap();
+
+    let bucket_name = "test-denied-before-payload-load".to_string();
+    let object_key = "private/missing-payload.bin".to_string();
+
+    let mut create_req = Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
+    });
+    create_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client.create_bucket(create_req).await.unwrap();
+
+    let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
+    let bucket = cluster.states[0]
+        .persistence
+        .get_bucket_by_name(claims.tenant_id, &bucket_name)
+        .await
+        .unwrap()
+        .expect("bucket exists");
+    cluster.states[0]
+        .persistence
+        .create_object(
+            claims.tenant_id,
+            bucket.id,
+            &object_key,
+            &hex::encode([42; 32]),
+            999,
+            "etag-missing-payload",
+            Some("application/octet-stream"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let limited_token = cluster.states[0]
+        .jwt_manager
+        .mint_token(
+            "limited-object-reader".to_string(),
+            vec![format!("object:list|{bucket_name}")],
+            claims.tenant_id,
+        )
+        .unwrap();
+
+    let mut denied_req = Request::new(GetObjectRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: object_key.clone(),
+        version_id: None,
+    });
+    denied_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", limited_token).parse().unwrap(),
+    );
+    let denied = object_client
+        .get_object(denied_req)
+        .await
+        .expect_err("read without object:read scope must be denied before payload load");
+    assert_eq!(denied.code(), Code::PermissionDenied);
+    assert_eq!(denied.message(), "Permission denied");
+
+    let mut allowed_req = Request::new(GetObjectRequest {
+        bucket_name,
+        object_key,
+        version_id: None,
+    });
+    allowed_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let mut stream = object_client
+        .get_object(allowed_req)
+        .await
+        .unwrap()
+        .into_inner();
+    let metadata = stream.next().await.unwrap().unwrap().data.unwrap();
+    match metadata {
+        anvil_api::get_object_response::Data::Metadata(metadata) => {
+            assert_eq!(metadata.content_length, 999);
+        }
+        anvil_api::get_object_response::Data::Chunk(_) => panic!("first response must be metadata"),
+    }
+    let payload_error = stream
+        .next()
+        .await
+        .expect("authorized read should attempt payload load")
+        .expect_err("missing payload must be reported to authorized readers");
+    assert_eq!(payload_error.code(), Code::NotFound);
+    assert!(payload_error.message().contains("Object data unavailable"));
+}
+
+#[tokio::test]
 async fn test_watch_prefix_streams_snapshot_and_live_events() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;

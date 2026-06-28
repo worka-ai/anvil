@@ -106,7 +106,14 @@ impl ObjectService for AppState {
                 return; // Client disconnected
             }
 
-            while let Some(Ok(chunk)) = data_stream.next().await {
+            while let Some(chunk_result) = data_stream.next().await {
+                let chunk = match chunk_result {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        let _ = tx.send(Err(error)).await;
+                        break;
+                    }
+                };
                 if tx
                     .send(Ok(GetObjectResponse {
                         data: Some(get_object_response::Data::Chunk(chunk.to_vec())),
