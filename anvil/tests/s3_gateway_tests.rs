@@ -1,5 +1,6 @@
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::{GetAccessTokenRequest, SetPublicAccessRequest};
+use anvil::storage::{DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES, ExternalChunkManifest};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
@@ -252,6 +253,110 @@ async fn test_s3_put_write_etag_preconditions() {
 #[test]
 fn test_s3_public_and_private_access() {
     run_large_s3_gateway_test(Box::pin(run_s3_public_and_private_access()));
+}
+
+#[test]
+fn test_s3_large_object_uses_external_chunks_and_ranges_across_chunk_boundary() {
+    run_large_s3_gateway_test(Box::pin(async {
+        let mut cluster = TestCluster::new(&["test-region-1"]).await;
+        cluster.start_and_converge(Duration::from_secs(5)).await;
+
+        let app_name = format!("s3-large-chunks-{}", uuid::Uuid::new_v4());
+        let (client_id, client_secret) = create_app(&cluster.admin_state_path, &app_name);
+        grant_wildcard_policy(&cluster.admin_state_path, &app_name);
+
+        let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
+        let client = s3_client(http_base, &client_id, &client_secret);
+        let bucket_name = format!("s3-large-chunks-{}", uuid::Uuid::new_v4());
+        let object_key = "large/chunked.bin";
+        let object_len = DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES + 257;
+        let content = (0..object_len)
+            .map(|idx| (idx % 251) as u8)
+            .collect::<Vec<_>>();
+
+        client
+            .create_bucket()
+            .bucket(&bucket_name)
+            .send()
+            .await
+            .expect("S3 CreateBucket should succeed");
+
+        client
+            .put_object()
+            .bucket(&bucket_name)
+            .key(object_key)
+            .body(ByteStream::from(content.clone()))
+            .send()
+            .await
+            .expect("large S3 PUT should succeed");
+
+        let bucket_id = cluster.states[0]
+            .persistence
+            .get_bucket_by_name(1, &bucket_name)
+            .await
+            .unwrap()
+            .expect("bucket metadata should exist")
+            .id;
+        let object = cluster.states[0]
+            .persistence
+            .get_object(bucket_id, object_key)
+            .await
+            .unwrap()
+            .expect("large object metadata should exist");
+        assert!(object.inline_payload.is_none());
+        let manifest: ExternalChunkManifest = serde_json::from_value(
+            object
+                .shard_map
+                .clone()
+                .expect("large object should record external chunk manifest"),
+        )
+        .expect("external chunk manifest should decode");
+        assert_eq!(manifest.kind, "external_chunks_v1");
+        assert_eq!(manifest.chunk_size, DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES);
+        assert_eq!(manifest.chunks.len(), 2);
+        assert_eq!(manifest.chunks[0].plaintext_length as usize, DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES);
+        assert_eq!(manifest.chunks[1].plaintext_length as usize, 257);
+        for record in &manifest.chunks {
+            assert!(record.storage_ref.starts_with("_anvil/payloads/chunks/"));
+            let chunk_path = cluster.states[0].storage.external_chunk_path(
+                &object.content_hash,
+                record.chunk_index,
+                &record.payload_chunk_hash,
+            );
+            assert!(
+                chunk_path.exists(),
+                "external chunk path should exist: {}",
+                chunk_path.display()
+            );
+        }
+
+        let full_resp = client
+            .get_object()
+            .bucket(&bucket_name)
+            .key(object_key)
+            .send()
+            .await
+            .expect("large S3 GET should succeed");
+        let full = full_resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(full.as_ref(), content.as_slice());
+
+        let range_start = DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES - 8;
+        let range_end = DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES + 8;
+        let range_resp = client
+            .get_object()
+            .bucket(&bucket_name)
+            .key(object_key)
+            .range(format!("bytes={range_start}-{range_end}"))
+            .send()
+            .await
+            .expect("S3 range GET across external chunk boundary should succeed");
+        assert_eq!(
+            range_resp.content_range(),
+            Some(format!("bytes {range_start}-{range_end}/{object_len}").as_str())
+        );
+        let ranged = range_resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(ranged.as_ref(), &content[range_start..=range_end]);
+    }));
 }
 
 async fn run_s3_public_and_private_access() {
