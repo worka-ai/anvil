@@ -3,6 +3,7 @@ use crate::formats::{
     BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, Hash32, JournalFrame, JournalRecordKind,
     hash32, validate_journal_chain,
 };
+use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
 use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -13,7 +14,7 @@ use tokio::io::AsyncWriteExt;
 #[derive(Debug, Serialize)]
 struct ModelJournalHeader<'a> {
     partition_family: &'static str,
-    partition_id: &'static str,
+    partition_id: String,
     fence_token: u64,
     first_sequence: u64,
     created_at: &'a str,
@@ -48,6 +49,30 @@ pub async fn create_model_artifact(
     key: &str,
     manifest: &ModelManifest,
 ) -> Result<()> {
+    create_model_artifact_inner(storage, artifact_id, bucket_id, key, manifest, 0).await
+}
+
+pub async fn create_model_artifact_with_permit(
+    storage: &Storage,
+    artifact_id: &str,
+    bucket_id: i64,
+    key: &str,
+    manifest: &ModelManifest,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<()> {
+    let fence_token = validate_model_write(storage, permit, partition_owner_signing_key).await?;
+    create_model_artifact_inner(storage, artifact_id, bucket_id, key, manifest, fence_token).await
+}
+
+async fn create_model_artifact_inner(
+    storage: &Storage,
+    artifact_id: &str,
+    bucket_id: i64,
+    key: &str,
+    manifest: &ModelManifest,
+    fence_token: u64,
+) -> Result<()> {
     require_nonempty(artifact_id, "artifact_id")?;
     require_nonempty(key, "model key")?;
     append_model_event(
@@ -58,6 +83,7 @@ pub async fn create_model_artifact(
             key: key.to_string(),
             manifest: manifest.clone(),
         },
+        fence_token,
     )
     .await
 }
@@ -67,6 +93,26 @@ pub async fn create_model_tensors(
     artifact_id: &str,
     tensors: &[TensorIndexRow],
 ) -> Result<()> {
+    create_model_tensors_inner(storage, artifact_id, tensors, 0).await
+}
+
+pub async fn create_model_tensors_with_permit(
+    storage: &Storage,
+    artifact_id: &str,
+    tensors: &[TensorIndexRow],
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<()> {
+    let fence_token = validate_model_write(storage, permit, partition_owner_signing_key).await?;
+    create_model_tensors_inner(storage, artifact_id, tensors, fence_token).await
+}
+
+async fn create_model_tensors_inner(
+    storage: &Storage,
+    artifact_id: &str,
+    tensors: &[TensorIndexRow],
+    fence_token: u64,
+) -> Result<()> {
     require_nonempty(artifact_id, "artifact_id")?;
     append_model_event(
         storage,
@@ -74,6 +120,7 @@ pub async fn create_model_tensors(
             artifact_id: artifact_id.to_string(),
             tensors: tensors.to_vec(),
         },
+        fence_token,
     )
     .await
 }
@@ -148,12 +195,16 @@ async fn read_model_state(storage: &Storage) -> Result<ModelState> {
     Ok(state)
 }
 
-async fn append_model_event(storage: &Storage, event: ModelEventBody) -> Result<()> {
+async fn append_model_event(
+    storage: &Storage,
+    event: ModelEventBody,
+    fence_token: u64,
+) -> Result<()> {
     let path = storage.model_metadata_journal_path();
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    ensure_journal_header(&path).await?;
+    ensure_journal_header(&path, fence_token).await?;
     let previous = read_model_journal_frames_at_path(path.as_path())
         .await
         .unwrap_or_default();
@@ -170,7 +221,7 @@ async fn append_model_event(storage: &Storage, event: ModelEventBody) -> Result<
     let frame = JournalFrame::new(
         JournalRecordKind::ModelMetadata,
         sequence,
-        0,
+        fence_token,
         *mutation_id.as_bytes(),
         key_hash,
         previous_hash,
@@ -186,15 +237,15 @@ async fn append_model_event(storage: &Storage, event: ModelEventBody) -> Result<
     Ok(())
 }
 
-async fn ensure_journal_header(path: &Path) -> Result<()> {
+async fn ensure_journal_header(path: &Path, fence_token: u64) -> Result<()> {
     if tokio::fs::try_exists(path).await? {
         return Ok(());
     }
     let created_at = chrono::Utc::now().to_rfc3339();
     let header_json = serde_json::to_vec(&ModelJournalHeader {
         partition_family: "model_metadata",
-        partition_id: "global",
-        fence_token: 0,
+        partition_id: hex::encode(model_partition_id()),
+        fence_token,
         first_sequence: 1,
         created_at: &created_at,
         codec: "none",
@@ -254,6 +305,29 @@ fn event_key_hash(event: &ModelEventBody) -> Hash32 {
     hash32(format!("model\0{artifact_id}").as_bytes())
 }
 
+fn model_partition_id() -> Hash32 {
+    hash32(b"model_metadata/global")
+}
+
+async fn validate_model_write(
+    storage: &Storage,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<u64> {
+    require_model_permit(permit)?;
+    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
+    Ok(permit.fence_token)
+}
+
+fn require_model_permit(permit: &PartitionWritePermit) -> Result<()> {
+    if permit.partition_family != "model_metadata"
+        || permit.partition_id != hex::encode(model_partition_id())
+    {
+        anyhow::bail!("model metadata write permit targets a different partition");
+    }
+    Ok(())
+}
+
 fn require_nonempty(value: &str, field: &'static str) -> Result<()> {
     if value.is_empty() {
         return Err(anyhow!("{field} must not be empty"));
@@ -264,7 +338,12 @@ fn require_nonempty(value: &str, field: &'static str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::partition_fence::{
+        PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
+    };
     use tempfile::tempdir;
+
+    const KEY: &[u8] = b"model metadata partition owner key";
 
     fn manifest(base: &str) -> ModelManifest {
         ModelManifest {
@@ -330,5 +409,106 @@ mod tests {
                 .tensor_name,
             "z"
         );
+    }
+
+    #[tokio::test]
+    async fn model_journal_with_permit_writes_fenced_frames_and_header() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let owner = ready_owner(&storage, "node-a").await;
+        let permit = owner.write_permit().unwrap();
+
+        create_model_artifact_with_permit(
+            &storage,
+            "artifact-a",
+            1,
+            "models/a",
+            &manifest(""),
+            &permit,
+            KEY,
+        )
+        .await
+        .unwrap();
+        create_model_tensors_with_permit(&storage, "artifact-a", &[tensor("z")], &permit, KEY)
+            .await
+            .unwrap();
+
+        let journal = tokio::fs::read(storage.model_metadata_journal_path())
+            .await
+            .unwrap();
+        let header = BinaryEnvelopeHeader::decode(&journal).unwrap();
+        let header_json: serde_json::Value = serde_json::from_slice(&header.header_json).unwrap();
+        assert_eq!(header_json["partition_family"], "model_metadata");
+        assert_eq!(header_json["partition_id"], permit.partition_id);
+        assert_eq!(header_json["fence_token"], permit.fence_token);
+
+        let frames = decode_journal_file(&journal).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.fence_token == permit.fence_token)
+        );
+    }
+
+    #[tokio::test]
+    async fn model_journal_with_permit_rejects_stale_fence() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let owner = ready_owner(&storage, "node-a").await;
+        let stale_permit = owner.write_permit().unwrap();
+        let newer = ready_owner(&storage, "node-b").await;
+        assert!(newer.fence_token > stale_permit.fence_token);
+
+        let err = create_model_artifact_with_permit(
+            &storage,
+            "artifact-a",
+            1,
+            "models/a",
+            &manifest(""),
+            &stale_permit,
+            KEY,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("write permit owner is not current")
+        );
+    }
+
+    async fn ready_owner(
+        storage: &Storage,
+        owner_node_id: &str,
+    ) -> crate::partition_fence::PartitionOwnerState {
+        let family = "model_metadata".to_string();
+        let id = hex::encode(model_partition_id());
+        let recovering = acquire_partition_recovery(
+            storage,
+            PartitionRecoveryAcquire {
+                partition_family: family.clone(),
+                partition_id: id.clone(),
+                owner_node_id: owner_node_id.to_string(),
+                recovered_through_sequence: 0,
+                recovered_manifest_hash: hex::encode([0; 32]),
+                now_nanos: 100,
+            },
+            KEY,
+        )
+        .await
+        .unwrap();
+        publish_partition_ready(
+            storage,
+            &family,
+            &id,
+            owner_node_id,
+            recovering.fence_token,
+            0,
+            &hex::encode([1; 32]),
+            200,
+            KEY,
+        )
+        .await
+        .unwrap()
     }
 }
