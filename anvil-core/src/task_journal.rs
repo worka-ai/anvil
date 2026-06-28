@@ -46,13 +46,6 @@ enum TaskJournalBody {
         scheduled_at: DateTime<Utc>,
         updated_at: DateTime<Utc>,
     },
-    PayloadUpdated {
-        task_id: i64,
-        payload: JsonValue,
-        priority: i32,
-        scheduled_at: DateTime<Utc>,
-        updated_at: DateTime<Utc>,
-    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -114,32 +107,29 @@ pub(crate) async fn enqueue_index_build_task_with_permit(
     validate_index_build_payload(&payload)?;
     let state = read_task_queue_state(storage).await?;
     let now = Utc::now();
-    if let Some(existing) = state.pending_index_build_task_for_payload(&payload) {
-        let mut updated_payload = existing.payload.clone();
-        let existing_cursor = json_u128(&existing.payload, "source_cursor").unwrap_or(0);
-        let requested_cursor = json_u128(&payload, "source_cursor")
-            .ok_or_else(|| anyhow!("index build source_cursor must be a nonnegative integer"))?;
-        let merged_cursor = existing_cursor.max(requested_cursor);
-        if existing.priority != priority
-            || existing_cursor != merged_cursor
-            || !matches!(existing.status, TaskStatus::Pending)
-        {
-            updated_payload["source_cursor"] = serde_json::json!(merged_cursor);
+    let requested_cursor = json_u128(&payload, "source_cursor")
+        .ok_or_else(|| anyhow!("index build source_cursor must be a nonnegative integer"))?;
+    let existing = state.index_build_tasks_for_payload(&payload);
+    if existing.iter().any(|task| {
+        matches!(task.status, TaskStatus::Pending | TaskStatus::Failed)
+            && task.priority == priority
+            && json_u128(&task.payload, "source_cursor").unwrap_or(0) >= requested_cursor
+    }) {
+        return Ok(false);
+    }
+    for task in existing {
+        if matches!(task.status, TaskStatus::Pending | TaskStatus::Failed) {
             append_task_event(
                 storage,
-                TaskJournalBody::PayloadUpdated {
-                    task_id: existing.id,
-                    payload: updated_payload,
-                    priority,
-                    scheduled_at: now,
+                TaskJournalBody::StatusUpdated {
+                    task_id: task.id,
+                    status: TaskStatus::Completed,
                     updated_at: now,
                 },
                 permit.fence_token,
             )
             .await?;
-            return Ok(true);
         }
-        return Ok(false);
     }
     enqueue_task_inner(
         storage,
@@ -501,22 +491,6 @@ impl TaskQueueState {
                     task.updated_at = updated_at;
                 }
             }
-            TaskJournalBody::PayloadUpdated {
-                task_id,
-                payload,
-                priority,
-                scheduled_at,
-                updated_at,
-            } => {
-                if let Some(task) = self.tasks.get_mut(&task_id) {
-                    task.payload = payload;
-                    task.priority = priority;
-                    task.status = TaskStatus::Pending;
-                    task.last_error = None;
-                    task.scheduled_at = scheduled_at;
-                    task.updated_at = updated_at;
-                }
-            }
         }
     }
 
@@ -542,23 +516,28 @@ impl TaskQueueState {
         })
     }
 
-    fn pending_index_build_task_for_payload(&self, payload: &JsonValue) -> Option<TaskRecord> {
-        let key = index_build_key(payload)?;
-        self.tasks
+    fn index_build_tasks_for_payload(&self, payload: &JsonValue) -> Vec<TaskRecord> {
+        let Some(key) = index_build_key(payload) else {
+            return Vec::new();
+        };
+        let mut tasks = self
+            .tasks
             .values()
             .filter(|task| {
                 task.task_type == TaskType::IndexBuild
                     && matches!(task.status, TaskStatus::Pending | TaskStatus::Failed)
                     && index_build_key(&task.payload).as_ref() == Some(&key)
             })
-            .max_by(|left, right| {
-                json_u128(&left.payload, "source_cursor")
-                    .unwrap_or(0)
-                    .cmp(&json_u128(&right.payload, "source_cursor").unwrap_or(0))
-                    .then_with(|| left.created_at.cmp(&right.created_at))
-                    .then_with(|| left.id.cmp(&right.id))
-            })
             .cloned()
+            .collect::<Vec<_>>();
+        tasks.sort_by(|left, right| {
+            json_u128(&left.payload, "source_cursor")
+                .unwrap_or(0)
+                .cmp(&json_u128(&right.payload, "source_cursor").unwrap_or(0))
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        tasks
     }
 
     fn running_index_build_keys(&self) -> BTreeSet<IndexBuildKey> {
@@ -577,10 +556,7 @@ fn event_key_hash(event: &TaskJournalBody) -> Hash32 {
         TaskJournalBody::Enqueued { task } => hash32(format!("task/{}", task.id).as_bytes()),
         TaskJournalBody::Claimed { task_id, .. }
         | TaskJournalBody::StatusUpdated { task_id, .. }
-        | TaskJournalBody::Failed { task_id, .. }
-        | TaskJournalBody::PayloadUpdated { task_id, .. } => {
-            hash32(format!("task/{task_id}").as_bytes())
-        }
+        | TaskJournalBody::Failed { task_id, .. } => hash32(format!("task/{task_id}").as_bytes()),
     }
 }
 
@@ -797,7 +773,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_journal_coalesces_index_build_tasks_by_index_identity() {
+    async fn task_journal_supersedes_pending_index_build_tasks_by_index_identity() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, "node-a").await;
@@ -826,11 +802,53 @@ mod tests {
             enqueue_index_build_task_with_permit(&storage, payload_cursor_5, 40, &permit, KEY,)
                 .await
                 .unwrap(),
-            "newer cursor should update the pending task instead of creating another"
+            "newer cursor should supersede the pending task with admitted task events"
         );
         let tasks = list_tasks(&storage).await.unwrap();
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].payload["source_cursor"], json!(5));
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].status, TaskStatus::Completed);
+        assert_eq!(tasks[0].payload["source_cursor"], json!(2));
+        assert_eq!(tasks[1].status, TaskStatus::Pending);
+        assert_eq!(tasks[1].payload["source_cursor"], json!(5));
+
+        assert!(
+            !enqueue_index_build_task_with_permit(
+                &storage,
+                json!({
+                    "tenant_id": 1,
+                    "bucket_id": 7,
+                    "index_id": 9,
+                    "index_version": 3,
+                    "source_cursor": 4,
+                }),
+                40,
+                &permit,
+                KEY,
+            )
+            .await
+            .unwrap(),
+            "older cursor is already covered by the pending build"
+        );
+
+        let claimed = claim_pending_tasks_with_permit(&storage, 10, &permit, KEY)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].payload["source_cursor"], json!(5));
+
+        let journal = tokio::fs::read(storage.task_queue_journal_path())
+            .await
+            .unwrap();
+        for frame in decode_journal_file(&journal).unwrap() {
+            let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+            assert!(
+                matches!(
+                    body["event"].as_str(),
+                    Some("enqueued" | "claimed" | "status_updated" | "failed")
+                ),
+                "unexpected task queue event: {body:?}"
+            );
+        }
     }
 
     #[tokio::test]
