@@ -557,6 +557,20 @@ pub async fn read_object_version(
     selected.as_ref().map(object_from_body).transpose()
 }
 
+pub async fn read_object_version_by_id(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+    version_id: uuid::Uuid,
+) -> Result<Option<Object>> {
+    let body_records = read_object_version_bodies(storage, bucket, manifest_signing_key).await?;
+    Ok(body_records
+        .into_iter()
+        .find(|(_, body)| body.version_id == version_id.to_string())
+        .map(|(_, body)| object_from_body(&body))
+        .transpose()?)
+}
+
 pub async fn list_current_objects(
     storage: &Storage,
     bucket: &Bucket,

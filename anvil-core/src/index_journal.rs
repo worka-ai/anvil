@@ -206,6 +206,10 @@ pub async fn next_index_definition_id(
         .ok_or_else(|| anyhow::anyhow!("index definition id overflow"))
 }
 
+pub fn index_storage_id(tenant_id: i64, bucket_id: i64, index_id: i64) -> String {
+    format!("tenant-{tenant_id}-bucket-{bucket_id}-index-{index_id}")
+}
+
 async fn read_all_index_definition_events(
     storage: &Storage,
     tenant_id: i64,

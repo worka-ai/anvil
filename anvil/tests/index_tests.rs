@@ -2,9 +2,15 @@ use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::index_service_client::IndexServiceClient;
 use anvil::anvil_api::{
     CreateBucketRequest, CreateIndexRequest, DisableIndexRequest, DropIndexRequest,
-    ListIndexDiagnosticsRequest, ListIndexesRequest, UpdateIndexRequest,
+    ListIndexDiagnosticsRequest, ListIndexesRequest, QueryIndexRequest, UpdateIndexRequest,
     WatchIndexDefinitionRequest,
 };
+use anvil::formats::full_text::{FullTextDocument, build_full_text_postings};
+use anvil::formats::vector::{
+    HnswGraph, LayerBlock, NodeAdjacency, VectorMetric, VectorModality, VectorPayload, VectorRecord,
+};
+use anvil::full_text_segment::{FullTextSegmentWrite, write_full_text_segment};
+use anvil::vector_segment::{VectorSegmentEntry, VectorSegmentWrite, write_vector_segment};
 use anvil_test_utils::*;
 use futures_util::StreamExt;
 use std::time::Duration;
@@ -215,6 +221,354 @@ async fn test_index_definition_lifecycle() {
             .all(|pair| pair[0].cursor < pair[1].cursor)
     );
     assert_eq!(events[3].index.as_ref().unwrap().name, "docs-full-text");
+}
+
+#[tokio::test]
+async fn test_query_full_text_index_reads_latest_segment() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
+
+    let bucket_name = "index-query-full-text-bucket".to_string();
+    bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let created = index_client
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket_name: bucket_name.clone(),
+                name: "body".to_string(),
+                kind: "full_text".to_string(),
+                selector_json: serde_json::json!({"selector": "object_body_utf8"}).to_string(),
+                extractor_json: serde_json::json!({"encoding": "utf8"}).to_string(),
+                authorization_mode: "index_only".to_string(),
+                build_policy_json: serde_json::json!({"positions": true}).to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .index
+        .expect("created index");
+
+    let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
+    let bucket = cluster.states[0]
+        .db
+        .get_bucket_by_name(claims.tenant_id, &bucket_name)
+        .await
+        .unwrap()
+        .expect("bucket exists");
+    let index_storage_id = anvil::index_journal::index_storage_id(
+        claims.tenant_id,
+        bucket.id,
+        created.index_id as i64,
+    );
+    let indexed_object = cluster.states[0]
+        .db
+        .create_object(
+            claims.tenant_id,
+            bucket.id,
+            "docs/alpha.txt",
+            &hex::encode([1; 32]),
+            15,
+            "etag-alpha",
+            Some("text/plain"),
+            None,
+            None,
+            Some(b"alpha beta beta".to_vec()),
+        )
+        .await
+        .unwrap();
+    let postings = build_full_text_postings(
+        &[
+            FullTextDocument {
+                document_id: 11,
+                field_id: 1,
+                object_version_id: *indexed_object.version_id.as_bytes(),
+                authz_label_hash: [1; 32],
+                text: "alpha beta beta",
+            },
+            FullTextDocument {
+                document_id: 22,
+                field_id: 1,
+                object_version_id: [22; 16],
+                authz_label_hash: [2; 32],
+                text: "gamma delta",
+            },
+        ],
+        &Default::default(),
+    );
+    write_full_text_segment(
+        &cluster.states[0].storage,
+        FullTextSegmentWrite {
+            index_id: &index_storage_id,
+            generation: 7,
+            tokenizer: serde_json::json!({}),
+            scorer: serde_json::json!({"kind": "bm25"}),
+            source_cursor: 44,
+            authz_revision: 55,
+            built_postings: &postings,
+            document_table: b"",
+        },
+    )
+    .await
+    .unwrap();
+
+    let response = index_client
+        .query_index(authorized(
+            QueryIndexRequest {
+                bucket_name,
+                index_name: "body".to_string(),
+                query_text: "alpha beta".to_string(),
+                query_vector: vec![],
+                limit: 10,
+                phrase: false,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.index_kind, "full_text");
+    assert_eq!(response.index_generation, 7);
+    assert_eq!(response.authz_revision, 55);
+    assert_eq!(response.hits.len(), 1);
+    assert_eq!(response.hits[0].kind, "full_text");
+    assert_eq!(response.hits[0].object_key, "docs/alpha.txt");
+    assert_eq!(response.hits[0].document_id, 11);
+    assert!(response.hits[0].score > 0.0);
+}
+
+#[tokio::test]
+async fn test_query_vector_index_reads_latest_segment() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
+
+    let bucket_name = "index-query-vector-bucket".to_string();
+    bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let created = index_client
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket_name: bucket_name.clone(),
+                name: "embedding".to_string(),
+                kind: "vector".to_string(),
+                selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
+                extractor_json: serde_json::json!({"source": "object_body_utf8"}).to_string(),
+                authorization_mode: "index_only".to_string(),
+                build_policy_json: serde_json::json!({
+                    "dimension": 2,
+                    "metric": "cosine",
+                    "modality": "text",
+                    "embedding_model": "test-embedding",
+                    "chunking": {"kind": "whole_object"}
+                })
+                .to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .index
+        .expect("created index");
+
+    let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
+    let bucket = cluster.states[0]
+        .db
+        .get_bucket_by_name(claims.tenant_id, &bucket_name)
+        .await
+        .unwrap()
+        .expect("bucket exists");
+    let index_storage_id = anvil::index_journal::index_storage_id(
+        claims.tenant_id,
+        bucket.id,
+        created.index_id as i64,
+    );
+    let first_object = cluster.states[0]
+        .db
+        .create_object(
+            claims.tenant_id,
+            bucket.id,
+            "docs/vector-a.txt",
+            &hex::encode([2; 32]),
+            8,
+            "etag-vector-a",
+            Some("text/plain"),
+            None,
+            None,
+            Some(b"vector a".to_vec()),
+        )
+        .await
+        .unwrap();
+    let second_object = cluster.states[0]
+        .db
+        .create_object(
+            claims.tenant_id,
+            bucket.id,
+            "docs/vector-b.txt",
+            &hex::encode([3; 32]),
+            8,
+            "etag-vector-b",
+            Some("text/plain"),
+            None,
+            None,
+            Some(b"vector b".to_vec()),
+        )
+        .await
+        .unwrap();
+    let graph = HnswGraph {
+        node_count: 2,
+        layers: vec![LayerBlock {
+            layer_index: 0,
+            node_adjacencies: vec![NodeAdjacency {
+                vector_id: 1,
+                neighbors: vec![2],
+            }],
+        }],
+    };
+    write_vector_segment(
+        &cluster.states[0].storage,
+        VectorSegmentWrite {
+            index_id: &index_storage_id,
+            generation: 3,
+            dimension: 2,
+            metric: VectorMetric::Cosine,
+            embedding_model: "test-embedding",
+            modality: VectorModality::Text,
+            hnsw_m: 32,
+            hnsw_ef_construction: 200,
+            source_cursor: 20,
+            authz_revision: 21,
+            entries: &[
+                vector_entry(1, *first_object.version_id.as_bytes(), vec![1.0, 0.0]),
+                vector_entry(2, *second_object.version_id.as_bytes(), vec![0.0, 1.0]),
+            ],
+            hnsw_graph: &graph,
+            deleted_bitset: &[0],
+        },
+    )
+    .await
+    .unwrap();
+
+    let response = index_client
+        .query_index(authorized(
+            QueryIndexRequest {
+                bucket_name,
+                index_name: "embedding".to_string(),
+                query_text: String::new(),
+                query_vector: vec![1.0, 0.0],
+                limit: 2,
+                phrase: false,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.index_kind, "vector");
+    assert_eq!(response.index_generation, 3);
+    assert_eq!(response.authz_revision, 21);
+    assert_eq!(
+        response
+            .hits
+            .iter()
+            .map(|hit| (hit.vector_id, hit.object_key.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(1, "docs/vector-a.txt"), (2, "docs/vector-b.txt")]
+    );
+}
+
+#[tokio::test]
+async fn test_query_inherit_object_index_fails_closed_until_authz_filter_is_available() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
+
+    let bucket_name = "index-query-inherit-object-bucket".to_string();
+    bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    index_client
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket_name: bucket_name.clone(),
+                name: "body".to_string(),
+                kind: "full_text".to_string(),
+                selector_json: serde_json::json!({"selector": "object_body_utf8"}).to_string(),
+                extractor_json: serde_json::json!({"encoding": "utf8"}).to_string(),
+                authorization_mode: "inherit_object".to_string(),
+                build_policy_json: serde_json::json!({"positions": true}).to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let err = index_client
+        .query_index(authorized(
+            QueryIndexRequest {
+                bucket_name,
+                index_name: "body".to_string(),
+                query_text: "alpha".to_string(),
+                query_vector: vec![],
+                limit: 10,
+                phrase: false,
+            },
+            &token,
+        ))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("AuthzRevisionUnavailable"));
 }
 
 #[tokio::test]
@@ -496,4 +850,30 @@ async fn test_list_index_diagnostics_filters_by_index_and_severity() {
         .diagnostics;
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].severity, "error");
+}
+
+fn vector_entry(
+    vector_id: u64,
+    object_version_id: [u8; 16],
+    values: Vec<f32>,
+) -> VectorSegmentEntry {
+    VectorSegmentEntry {
+        record: VectorRecord {
+            vector_id,
+            object_version_id,
+            chunk_id: vector_id as u32,
+            modality: VectorModality::Text as u8,
+            metric: VectorMetric::Cosine as u8,
+            dimension: 2,
+            vector_payload_offset: 0,
+            source_start: vector_id * 10,
+            source_len: 10,
+            authz_label_hash: [1; 32],
+            metadata_filter_bits: 0,
+        },
+        payload: VectorPayload {
+            dimension: 2,
+            values,
+        },
+    }
 }

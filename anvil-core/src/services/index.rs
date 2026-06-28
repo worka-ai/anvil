@@ -1,6 +1,15 @@
 use crate::anvil_api::index_service_server::IndexService;
 use crate::anvil_api::*;
-use crate::{AppState, auth, bucket_journal, index_journal, permissions::AnvilAction, validation};
+use crate::{
+    AppState, auth, bucket_journal,
+    formats::{
+        full_text::{Bm25Config, FullTextIndexDefinition},
+        vector::VectorMetric,
+    },
+    full_text_segment, index_journal,
+    permissions::AnvilAction,
+    search_query, validation, vector_segment,
+};
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -203,6 +212,43 @@ impl IndexService for AppState {
         Ok(Response::new(ListIndexesResponse { indexes }))
     }
 
+    async fn query_index(
+        &self,
+        request: Request<QueryIndexRequest>,
+    ) -> Result<Response<QueryIndexResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        validate_index_name(&req.index_name)?;
+        if !auth::is_authorized(AnvilAction::IndexRead, &req.bucket_name, &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+        let bucket = self
+            .get_index_bucket(claims.tenant_id, &req.bucket_name)
+            .await?;
+        let index = self
+            .db
+            .get_index_definition(claims.tenant_id, bucket.id, &req.index_name)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .filter(|index| index.enabled)
+            .ok_or_else(|| Status::not_found("Index definition not found"))?;
+
+        if index.authorization_mode == "inherit_object" {
+            return Err(Status::failed_precondition("AuthzRevisionUnavailable"));
+        }
+
+        match index.kind.as_str() {
+            "full_text" => self.query_full_text_index(&bucket, &index, req).await,
+            "vector" => self.query_vector_index(&bucket, &index, req).await,
+            "hybrid" => Err(Status::failed_precondition("IndexUnavailable")),
+            _ => Err(Status::failed_precondition("IndexDoesNotSupportQuery")),
+        }
+    }
+
     async fn watch_index_definition(
         &self,
         request: Request<WatchIndexDefinitionRequest>,
@@ -356,6 +402,171 @@ impl AppState {
         let _ = self.index_watch_tx.send(event.clone());
         Ok(event)
     }
+
+    async fn query_full_text_index(
+        &self,
+        bucket: &crate::persistence::Bucket,
+        index: &crate::persistence::IndexDefinition,
+        req: QueryIndexRequest,
+    ) -> Result<Response<QueryIndexResponse>, Status> {
+        if req.query_text.trim().is_empty() {
+            return Err(Status::invalid_argument("query_text is required"));
+        }
+        if !req.query_vector.is_empty() {
+            return Err(Status::invalid_argument(
+                "query_vector is not valid for full_text indexes",
+            ));
+        }
+        let definition = FullTextIndexDefinition::from_json(&index.build_policy)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let index_storage_id =
+            index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
+        let Some(segment) =
+            full_text_segment::read_latest_full_text_segment(&self.storage, &index_storage_id)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+        else {
+            return Err(Status::failed_precondition("IndexUnavailable"));
+        };
+        let search_hits = search_query::query_full_text_segment(
+            &segment,
+            search_query::FullTextSegmentQuery {
+                query: &req.query_text,
+                tokenizer: &definition.tokenizer,
+                positions_enabled: definition.positions_enabled,
+                phrase: req.phrase,
+                bm25: Bm25Config::default(),
+                authorized_labels: None,
+                limit: query_limit(req.limit),
+            },
+        )
+        .map_err(|e| Status::failed_precondition(format!("{e:?}")))?;
+        let mut hits = Vec::with_capacity(search_hits.len());
+        for hit in search_hits {
+            let (object_version_id, object_key) = self
+                .object_ref_for_query_hit(bucket.id, hit.object_version_id)
+                .await?;
+            hits.push(IndexQueryHit {
+                kind: "full_text".to_string(),
+                score: hit.score,
+                object_key,
+                object_version_id,
+                document_id: hit.document_id,
+                field_id: u32::from(hit.field_id),
+                vector_id: 0,
+                chunk_id: 0,
+                source_start: 0,
+                source_len: 0,
+                metadata_json: serde_json::json!({
+                    "bucket_name": bucket.name,
+                    "matched_terms": hit.matched_terms,
+                    "authz_label_hash": hex::encode(hit.authz_label_hash),
+                })
+                .to_string(),
+            });
+        }
+
+        Ok(Response::new(QueryIndexResponse {
+            hits,
+            index_kind: index.kind.clone(),
+            index_generation: segment.header.generation,
+            authz_revision: segment.header.authz_revision,
+            scoring_recipe_json: serde_json::json!({"kind": "bm25", "k1": 1.2, "b": 0.75})
+                .to_string(),
+        }))
+    }
+
+    async fn query_vector_index(
+        &self,
+        bucket: &crate::persistence::Bucket,
+        index: &crate::persistence::IndexDefinition,
+        req: QueryIndexRequest,
+    ) -> Result<Response<QueryIndexResponse>, Status> {
+        if !req.query_text.is_empty() {
+            return Err(Status::invalid_argument(
+                "query_text is not valid for vector indexes",
+            ));
+        }
+        if req.query_vector.is_empty() {
+            return Err(Status::invalid_argument("query_vector is required"));
+        }
+        let index_storage_id =
+            index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
+        let Some(segment) =
+            vector_segment::read_latest_vector_segment(&self.storage, &index_storage_id)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+        else {
+            return Err(Status::failed_precondition("IndexUnavailable"));
+        };
+        if req.query_vector.len() != usize::from(segment.header.dimension) {
+            return Err(Status::invalid_argument("query_vector dimension mismatch"));
+        }
+        let metric = VectorMetric::from_name(&segment.header.metric)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let search_hits = search_query::query_vector_segment(
+            &segment,
+            &req.query_vector,
+            metric,
+            None,
+            query_limit(req.limit),
+        )
+        .map_err(|e| Status::internal(e.to_string()))?;
+        let mut hits = Vec::with_capacity(search_hits.len());
+        for hit in search_hits {
+            let (object_version_id, object_key) = self
+                .object_ref_for_query_hit(bucket.id, hit.object_version_id)
+                .await?;
+            hits.push(IndexQueryHit {
+                kind: "vector".to_string(),
+                score: hit.score,
+                object_key,
+                object_version_id,
+                document_id: 0,
+                field_id: 0,
+                vector_id: hit.vector_id,
+                chunk_id: hit.chunk_id,
+                source_start: hit.source_start,
+                source_len: hit.source_len,
+                metadata_json: serde_json::json!({
+                    "bucket_name": bucket.name,
+                    "metric": segment.header.metric,
+                    "modality": segment.header.modality,
+                })
+                .to_string(),
+            });
+        }
+
+        Ok(Response::new(QueryIndexResponse {
+            hits,
+            index_kind: index.kind.clone(),
+            index_generation: segment.header.generation,
+            authz_revision: segment.header.authz_revision,
+            scoring_recipe_json: serde_json::json!({
+                "kind": "vector",
+                "metric": segment.header.metric,
+                "max_candidate_multiplier": 20
+            })
+            .to_string(),
+        }))
+    }
+
+    async fn object_ref_for_query_hit(
+        &self,
+        bucket_id: i64,
+        version_bytes: [u8; 16],
+    ) -> Result<(String, String), Status> {
+        let version_id = uuid::Uuid::from_bytes(version_bytes);
+        let object = self
+            .db
+            .get_object_version_by_id(bucket_id, version_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok((
+            version_id.to_string(),
+            object.map(|object| object.key).unwrap_or_default(),
+        ))
+    }
 }
 
 fn parse_json_field(name: &str, value: &str) -> Result<JsonValue, Status> {
@@ -409,6 +620,13 @@ fn validate_diagnostic_severity(value: &str) -> Result<(), Status> {
     match value {
         "info" | "warning" | "error" => Ok(()),
         _ => Err(Status::invalid_argument("Invalid diagnostic severity")),
+    }
+}
+
+fn query_limit(value: u32) -> usize {
+    match value {
+        0 => 10,
+        other => other.min(1000) as usize,
     }
 }
 

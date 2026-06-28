@@ -74,6 +74,7 @@ service IndexService {
   rpc DisableIndex(DisableIndexRequest) returns (IndexDefinitionResponse);
   rpc DropIndex(DropIndexRequest) returns (DropIndexResponse);
   rpc ListIndexes(ListIndexesRequest) returns (ListIndexesResponse);
+  rpc QueryIndex(QueryIndexRequest) returns (QueryIndexResponse);
   rpc WatchIndexDefinition(WatchIndexDefinitionRequest) returns (stream WatchIndexDefinitionResponse);
   rpc ListIndexDiagnostics(ListIndexDiagnosticsRequest) returns (ListIndexDiagnosticsResponse);
 }
@@ -135,6 +136,37 @@ message IndexDefinitionResponse {
 
 message ListIndexesResponse {
     repeated IndexDefinitionRecord indexes = 1;
+}
+
+message QueryIndexRequest {
+    string bucket_name = 1;
+    string index_name = 2;
+    string query_text = 3;
+    repeated float query_vector = 4;
+    uint32 limit = 5;
+    bool phrase = 6;
+}
+
+message IndexQueryHit {
+    string kind = 1;
+    float score = 2;
+    string object_key = 3;
+    string object_version_id = 4;
+    uint64 document_id = 5;
+    uint32 field_id = 6;
+    uint64 vector_id = 7;
+    uint32 chunk_id = 8;
+    uint64 source_start = 9;
+    uint32 source_len = 10;
+    string metadata_json = 11;
+}
+
+message QueryIndexResponse {
+    repeated IndexQueryHit hits = 1;
+    string index_kind = 2;
+    uint64 index_generation = 3;
+    uint64 authz_revision = 4;
+    string scoring_recipe_json = 5;
 }
 
 message WatchIndexDefinitionRequest {

@@ -986,6 +986,19 @@ impl Persistence {
         metadata_journal::read_object_version(&self.storage, &bucket, &[], key, version_id).await
     }
 
+    pub async fn get_object_version_by_id(
+        &self,
+        bucket_id: i64,
+        version_id: uuid::Uuid,
+    ) -> Result<Option<Object>> {
+        let Some(bucket) =
+            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        else {
+            return Ok(None);
+        };
+        metadata_journal::read_object_version_by_id(&self.storage, &bucket, &[], version_id).await
+    }
+
     pub async fn list_objects(
         &self,
         bucket_id: i64,
