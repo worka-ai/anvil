@@ -13,6 +13,7 @@ use futures_util::StreamExt;
 use std::time::Duration;
 use tonic::Request;
 
+use anvil::storage::{DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES, ExternalChunkManifest};
 use anvil_test_utils::*;
 
 #[tokio::test]
@@ -695,22 +696,24 @@ async fn test_inline_payload_threshold_is_recorded_and_readable() {
         .unwrap()
         .into_inner();
 
-    let external_content = vec![9_u8; 64 * 1024 + 1];
-    let external_chunks = vec![
-        PutObjectRequest {
-            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
-                ObjectMetadata {
-                    bucket_name: bucket_name.clone(),
-                    object_key: external_key.clone(),
-                },
-            )),
-        },
-        PutObjectRequest {
-            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
-                external_content.clone(),
-            )),
-        },
-    ];
+    let external_content = vec![9_u8; DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES + 123];
+    let mut external_chunks = vec![PutObjectRequest {
+        data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+            ObjectMetadata {
+                bucket_name: bucket_name.clone(),
+                object_key: external_key.clone(),
+            },
+        )),
+    }];
+    external_chunks.extend(
+        external_content
+            .chunks(1024 * 1024)
+            .map(|chunk| PutObjectRequest {
+                data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                    chunk.to_vec(),
+                )),
+            }),
+    );
     let mut external_put_req = Request::new(tokio_stream::iter(external_chunks));
     external_put_req.metadata_mut().insert(
         "authorization",
@@ -755,6 +758,39 @@ async fn test_inline_payload_threshold_is_recorded_and_readable() {
         .unwrap()
         .expect("external object version should exist");
     assert!(external_object.inline_payload.is_none());
+    let manifest: ExternalChunkManifest = serde_json::from_value(
+        external_object
+            .shard_map
+            .clone()
+            .expect("external object should record chunk manifest"),
+    )
+    .expect("external chunk manifest should decode");
+    assert_eq!(manifest.kind, "external_chunks_v1");
+    assert_eq!(manifest.chunk_size, DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES);
+    assert_eq!(manifest.chunks.len(), 2);
+    assert_eq!(
+        manifest
+            .chunks
+            .iter()
+            .map(|chunk| chunk.plaintext_length as usize)
+            .sum::<usize>(),
+        external_content.len()
+    );
+    for (idx, record) in manifest.chunks.iter().enumerate() {
+        assert_eq!(record.chunk_index, idx as u64);
+        assert_eq!(record.compression, "none");
+        assert!(record.storage_ref.starts_with("_anvil/payloads/chunks/"));
+        let path = cluster.states[0].storage.external_chunk_path(
+            &external_object.content_hash,
+            record.chunk_index,
+            &record.payload_chunk_hash,
+        );
+        assert!(
+            path.exists(),
+            "external chunk path should exist: {}",
+            path.display()
+        );
+    }
 
     let mut get_req = Request::new(GetObjectRequest {
         bucket_name: bucket_name.clone(),
@@ -777,6 +813,28 @@ async fn test_inline_payload_threshold_is_recorded_and_readable() {
         }
     }
     assert_eq!(downloaded, inline_content);
+
+    let mut external_get_req = Request::new(GetObjectRequest {
+        bucket_name,
+        object_key: external_key,
+        version_id: Some(external_put.version_id),
+    });
+    external_get_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let mut external_stream = object_client
+        .get_object(external_get_req)
+        .await
+        .unwrap()
+        .into_inner();
+    let mut external_downloaded = Vec::new();
+    while let Some(chunk) = external_stream.next().await {
+        if let anvil_api::get_object_response::Data::Chunk(bytes) = chunk.unwrap().data.unwrap() {
+            external_downloaded.extend_from_slice(&bytes);
+        }
+    }
+    assert_eq!(external_downloaded, external_content);
 }
 
 #[tokio::test]

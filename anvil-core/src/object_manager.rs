@@ -9,7 +9,7 @@ use crate::{
     persistence::{Bucket, Object, ObjectWatchEvent, Persistence},
     placement::PlacementManager,
     sharding::ShardManager,
-    storage::Storage,
+    storage::{ExternalChunkManifest, Storage},
     validation, watch_log,
 };
 use futures_util::{Stream, StreamExt};
@@ -22,6 +22,12 @@ use tonic::Status;
 use tracing::info;
 
 const INLINE_PAYLOAD_MAX_BYTES: i64 = 64 * 1024;
+
+#[derive(Debug, Clone, Default)]
+struct CommittedPayload {
+    inline_payload: Option<Vec<u8>>,
+    chunk_manifest: Option<ExternalChunkManifest>,
+}
 
 #[derive(Debug, Clone)]
 pub struct ObjectManager {
@@ -55,12 +61,12 @@ pub struct ObjectWriteOptions {
     pub user_metadata: Option<JsonValue>,
 }
 
-async fn commit_temp_object_or_inline(
+async fn commit_temp_payload(
     storage: &Storage,
     temp_path: &std::path::Path,
     total_bytes: i64,
     content_hash: &str,
-) -> Result<Option<Vec<u8>>, Status> {
+) -> Result<CommittedPayload, Status> {
     if total_bytes <= INLINE_PAYLOAD_MAX_BYTES {
         let payload = tokio::fs::read(temp_path)
             .await
@@ -68,15 +74,21 @@ async fn commit_temp_object_or_inline(
         tokio::fs::remove_file(temp_path)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        return Ok(Some(payload));
+        return Ok(CommittedPayload {
+            inline_payload: Some(payload),
+            chunk_manifest: None,
+        });
     }
 
-    info!("Committing whole object");
-    storage
-        .commit_whole_object(temp_path, content_hash)
+    info!("Committing external object chunks");
+    let chunk_manifest = storage
+        .commit_external_chunks(temp_path, content_hash)
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
-    Ok(None)
+    Ok(CommittedPayload {
+        inline_payload: None,
+        chunk_manifest: Some(chunk_manifest),
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -169,7 +181,7 @@ impl ObjectManager {
 
         let total_bytes;
         let content_hash;
-        let mut inline_payload = None;
+        let mut committed_payload = CommittedPayload::default();
 
         if nodes.len() < self.sharder.total_shards() {
             if nodes.len() >= 1 {
@@ -181,13 +193,9 @@ impl ObjectManager {
                     .map_err(|e| Status::internal(e.to_string()))?;
                 total_bytes = bytes;
                 content_hash = hash;
-                inline_payload = commit_temp_object_or_inline(
-                    &self.storage,
-                    &temp_path,
-                    total_bytes,
-                    &content_hash,
-                )
-                .await?;
+                committed_payload =
+                    commit_temp_payload(&self.storage, &temp_path, total_bytes, &content_hash)
+                        .await?;
             } else {
                 // No peers known; fallback to single-node path as well
                 let (temp_path, bytes, hash) = self
@@ -197,13 +205,9 @@ impl ObjectManager {
                     .map_err(|e| Status::internal(e.to_string()))?;
                 total_bytes = bytes;
                 content_hash = hash;
-                inline_payload = commit_temp_object_or_inline(
-                    &self.storage,
-                    &temp_path,
-                    total_bytes,
-                    &content_hash,
-                )
-                .await?;
+                committed_payload =
+                    commit_temp_payload(&self.storage, &temp_path, total_bytes, &content_hash)
+                        .await?;
             }
         } else {
             // Distributed case: stream and erasure code stripes.
@@ -290,7 +294,12 @@ impl ObjectManager {
             let peer_ids: Vec<String> = nodes.iter().map(|p| p.to_base58()).collect();
             Some(serde_json::json!(peer_ids))
         } else {
-            None
+            committed_payload
+                .chunk_manifest
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|e| Status::internal(e.to_string()))?
         };
 
         let object = self
@@ -305,7 +314,7 @@ impl ObjectManager {
                 options.content_type.as_deref(),
                 options.user_metadata,
                 shard_map_json,
-                inline_payload,
+                committed_payload.inline_payload,
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -858,6 +867,60 @@ impl ObjectManager {
                 for chunk in inline_payload.chunks(1024 * 64) {
                     if tx.send(Ok(chunk.to_vec())).await.is_err() {
                         break;
+                    }
+                }
+                return;
+            }
+
+            if let Some(manifest) = object_clone
+                .shard_map
+                .as_ref()
+                .and_then(external_chunk_manifest_from_shard_map)
+            {
+                for expected_index in 0..manifest.chunks.len() {
+                    let record = &manifest.chunks[expected_index];
+                    if record.chunk_index != expected_index as u64 {
+                        let _ = tx
+                            .send(Err(Status::internal(
+                                "Object data unavailable: invalid external chunk order",
+                            )))
+                            .await;
+                        return;
+                    }
+                    let chunk = match app_state
+                        .storage
+                        .retrieve_external_chunk(&record.storage_ref)
+                        .await
+                    {
+                        Ok(chunk) => chunk,
+                        Err(error) => {
+                            let _ = tx.send(Err(Status::not_found(error.to_string()))).await;
+                            return;
+                        }
+                    };
+                    if chunk.len() as u64 != record.plaintext_length {
+                        let _ = tx
+                            .send(Err(Status::internal(
+                                "Object data unavailable: external chunk length mismatch",
+                            )))
+                            .await;
+                        return;
+                    }
+                    let actual_hash = blake3::hash(&chunk).to_hex().to_string();
+                    if actual_hash != record.payload_chunk_hash
+                        || actual_hash != record.storage_chunk_hash
+                    {
+                        let _ = tx
+                            .send(Err(Status::internal(
+                                "Object data unavailable: external chunk hash mismatch",
+                            )))
+                            .await;
+                        return;
+                    }
+                    for part in chunk.chunks(1024 * 64) {
+                        if tx.send(Ok(part.to_vec())).await.is_err() {
+                            return;
+                        }
                     }
                 }
                 return;
@@ -1577,6 +1640,11 @@ fn validate_multipart_part_number(part_number: i32) -> Result<(), Status> {
             "Multipart part number must be between 1 and 10000",
         ))
     }
+}
+
+fn external_chunk_manifest_from_shard_map(value: &JsonValue) -> Option<ExternalChunkManifest> {
+    let manifest = serde_json::from_value::<ExternalChunkManifest>(value.clone()).ok()?;
+    (manifest.kind == "external_chunks_v1").then_some(manifest)
 }
 
 fn trim_s3_etag(value: &str) -> &str {

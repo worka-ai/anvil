@@ -1,12 +1,34 @@
 use anyhow::Result;
 use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::info;
 
 const STORAGE_DIR: &str = "anvil-data";
 const TEMP_DIR: &str = "tmp";
+pub const DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalChunkManifest {
+    pub kind: String,
+    pub chunk_size: usize,
+    pub chunks: Vec<ExternalChunkRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalChunkRecord {
+    pub chunk_index: u64,
+    pub plaintext_length: u64,
+    pub ciphertext_length: u64,
+    pub payload_chunk_hash: String,
+    pub storage_chunk_hash: String,
+    pub compression: String,
+    pub base_nonce: String,
+    pub mac: String,
+    pub storage_ref: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct Storage {
@@ -723,6 +745,20 @@ impl Storage {
         self.storage_path.join(object_hash)
     }
 
+    pub fn external_chunk_path(
+        &self,
+        object_hash: &str,
+        chunk_index: u64,
+        chunk_hash: &str,
+    ) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("payloads")
+            .join("chunks")
+            .join(object_hash)
+            .join(format!("{chunk_index:020}-{chunk_hash}.chunk"))
+    }
+
     pub async fn store_whole_object(&self, object_hash: &str, data: &[u8]) -> Result<()> {
         let file_path = self.get_whole_object_path(object_hash);
         let mut file = fs::File::create(file_path).await?;
@@ -774,6 +810,11 @@ impl Storage {
         let file_path = self.get_whole_object_path(object_hash);
         let data = fs::read(file_path).await?;
         Ok(data)
+    }
+
+    pub async fn retrieve_external_chunk(&self, storage_ref: &str) -> Result<Vec<u8>> {
+        let path = self.resolve_relative_storage_path(storage_ref)?;
+        Ok(fs::read(path).await?)
     }
 
     pub async fn delete_shard(&self, object_hash: &str, shard_index: u32) -> Result<()> {
@@ -829,6 +870,71 @@ impl Storage {
         fs::rename(temp_path, final_path).await?;
         info!("File renamed successfully");
         Ok(())
+    }
+
+    pub async fn commit_external_chunks(
+        &self,
+        temp_path: &Path,
+        final_object_hash: &str,
+    ) -> Result<ExternalChunkManifest> {
+        ensure_hash_hex(final_object_hash, "final object hash")?;
+        let mut source = fs::File::open(temp_path).await?;
+        let mut buffer = vec![0_u8; DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES];
+        let mut chunk_index = 0_u64;
+        let mut chunks = Vec::new();
+
+        loop {
+            let mut filled = 0usize;
+            while filled < buffer.len() {
+                let read = source.read(&mut buffer[filled..]).await?;
+                if read == 0 {
+                    break;
+                }
+                filled += read;
+            }
+            if filled == 0 {
+                break;
+            }
+
+            let chunk_bytes = &buffer[..filled];
+            let payload_chunk_hash = blake3::hash(chunk_bytes).to_hex().to_string();
+            let final_path =
+                self.external_chunk_path(final_object_hash, chunk_index, &payload_chunk_hash);
+            if let Some(parent) = final_path.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            if fs::metadata(&final_path).await.is_err() {
+                let tmp_path = self.temp_path.join(format!(
+                    "chunk-{final_object_hash}-{chunk_index:020}-{payload_chunk_hash}"
+                ));
+                let mut out = fs::File::create(&tmp_path).await?;
+                out.write_all(chunk_bytes).await?;
+                out.flush().await?;
+                fs::rename(tmp_path, &final_path).await?;
+            }
+            let storage_ref = self.relative_storage_path(&final_path)?;
+            chunks.push(ExternalChunkRecord {
+                chunk_index,
+                plaintext_length: filled as u64,
+                ciphertext_length: filled as u64,
+                payload_chunk_hash: payload_chunk_hash.clone(),
+                storage_chunk_hash: payload_chunk_hash,
+                compression: "none".to_string(),
+                base_nonce: String::new(),
+                mac: String::new(),
+                storage_ref,
+            });
+            chunk_index = chunk_index
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("external chunk index overflow"))?;
+        }
+
+        fs::remove_file(temp_path).await?;
+        Ok(ExternalChunkManifest {
+            kind: "external_chunks_v1".to_string(),
+            chunk_size: DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES,
+            chunks,
+        })
     }
 }
 
