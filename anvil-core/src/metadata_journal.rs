@@ -97,10 +97,30 @@ struct DirectoryEntryBody {
     bucket_name: String,
     object_key: String,
     event: String,
+    #[serde(default)]
+    id: i64,
     version_id: String,
     mutation_id: String,
+    #[serde(default)]
+    content_hash: String,
     size: i64,
     etag: String,
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    user_metadata_hash: String,
+    #[serde(default)]
+    authz_revision: i64,
+    #[serde(default)]
+    index_policy_snapshot: String,
+    #[serde(default)]
+    record_hash: String,
+    #[serde(default)]
+    storage_class: Option<i16>,
+    #[serde(default)]
+    user_meta: Option<serde_json::Value>,
+    #[serde(default)]
+    shard_map: Option<serde_json::Value>,
     delete_marker: bool,
     created_at: String,
     deleted_at: Option<String>,
@@ -195,10 +215,20 @@ async fn append_object_mutation_inner(
         bucket_name: bucket.name.clone(),
         object_key: object.key.clone(),
         event: mutation.event_name().to_string(),
+        id: object.id,
         version_id: object.version_id.to_string(),
         mutation_id: object.mutation_id.to_string(),
+        content_hash: object.content_hash.clone(),
         size: object.size,
         etag: object.etag.clone(),
+        content_type: object.content_type.clone(),
+        user_metadata_hash: object.user_metadata_hash.clone(),
+        authz_revision: object.authz_revision,
+        index_policy_snapshot: object.index_policy_snapshot.clone(),
+        record_hash: object.record_hash.clone(),
+        storage_class: object.storage_class,
+        user_meta: object.user_meta.clone(),
+        shard_map: object.shard_map.clone(),
         delete_marker: mutation.is_delete_marker(),
         created_at: object.created_at.to_rfc3339(),
         deleted_at: object.deleted_at.map(|ts| ts.to_rfc3339()),
@@ -555,6 +585,80 @@ pub async fn recover_object_metadata_partition(
     })
 }
 
+async fn recover_object_directory_partition(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+) -> Result<(
+    PartitionManifest,
+    std::collections::BTreeMap<Vec<u8>, DirectoryEntryBody>,
+)> {
+    let manifest_path = storage.metadata_manifest_path(bucket.tenant_id, bucket.id);
+    let manifest_bytes = tokio::fs::read(&manifest_path)
+        .await
+        .with_context(|| format!("read partition manifest {}", manifest_path.display()))?;
+    let manifest = decode_partition_manifest(&manifest_bytes, manifest_signing_key)?;
+    let expected_partition_id =
+        hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id));
+    if manifest.partition_family != "object_metadata" {
+        return Err(anyhow!("partition manifest family mismatch"));
+    }
+    if manifest.partition_id != expected_partition_id {
+        return Err(anyhow!("partition manifest id mismatch"));
+    }
+
+    let mut directory_latest = std::collections::BTreeMap::<Vec<u8>, DirectoryEntryBody>::new();
+    for segment in &manifest.segments {
+        let family = file_family_from_manifest_name(&segment.family)?;
+        if family != FileFamily::DirectorySegment {
+            continue;
+        }
+        let segment_path = storage.resolve_relative_storage_path(&segment.path)?;
+        let bytes = tokio::fs::read(&segment_path)
+            .await
+            .with_context(|| format!("read directory segment {}", segment_path.display()))?;
+        let (body, footer) = decode_segment_file_with_footer(&bytes, FileFamily::DirectorySegment)?;
+        if hex::encode(footer.file_hash) != segment.file_hash {
+            return Err(anyhow!("directory segment file hash mismatch"));
+        }
+        if footer.record_count != segment.record_count {
+            return Err(anyhow!("directory segment record count mismatch"));
+        }
+        for record in decode_segment_body_records(&body)? {
+            let entry: DirectoryEntryBody = serde_json::from_slice(&record.value)?;
+            directory_latest.insert(record.key, entry);
+        }
+    }
+
+    if let Some(active_journal) = &manifest.active_journal {
+        let journal_path = storage.resolve_relative_storage_path(&active_journal.path)?;
+        let journal_bytes = tokio::fs::read(&journal_path)
+            .await
+            .with_context(|| format!("read active journal {}", journal_path.display()))?;
+        let (_, frames) = decode_journal_file(&journal_bytes)?;
+        let first = frames
+            .first()
+            .ok_or_else(|| anyhow!("active journal manifest entry points at an empty journal"))?;
+        let last = frames
+            .last()
+            .ok_or_else(|| anyhow!("active journal manifest entry points at an empty journal"))?;
+        if first.partition_sequence != active_journal.first_sequence
+            || last.partition_sequence != active_journal.last_sequence
+            || hex::encode(last.record_hash) != active_journal.last_record_hash
+        {
+            return Err(anyhow!("active journal manifest reference mismatch"));
+        }
+        for frame in frames {
+            if frame.record_kind == JournalRecordKind::DirectoryEntry {
+                let body: DirectoryEntryBody = serde_json::from_slice(&frame.body)?;
+                directory_latest.insert(directory_segment_key(&body), body);
+            }
+        }
+    }
+
+    Ok((manifest, directory_latest))
+}
+
 pub async fn next_object_id(
     storage: &Storage,
     bucket: &Bucket,
@@ -634,7 +738,7 @@ pub async fn list_current_objects(
     limit: i32,
     delimiter: &str,
 ) -> Result<NativeObjectListing> {
-    let mut objects = read_current_objects(storage, bucket, manifest_signing_key).await?;
+    let mut objects = read_current_directory_objects(storage, bucket, manifest_signing_key).await?;
     objects.retain(|object| {
         object.key.starts_with(prefix)
             && object.key.as_str() > start_after
@@ -685,6 +789,57 @@ pub async fn list_current_objects(
         }
     }
     Ok(listing)
+}
+
+async fn read_current_directory_objects(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+) -> Result<Vec<Object>> {
+    let mut directory_records = std::collections::BTreeMap::<Vec<u8>, DirectoryEntryBody>::new();
+    let mut compacted_through_sequence = 0u64;
+
+    let manifest_path = storage.metadata_manifest_path(bucket.tenant_id, bucket.id);
+    if tokio::fs::metadata(&manifest_path).await.is_ok() {
+        let (manifest, recovered_directory) =
+            recover_object_directory_partition(storage, bucket, manifest_signing_key)
+                .await
+                .with_context(|| {
+                    format!(
+                        "recover object directory partition from {}",
+                        manifest_path.display()
+                    )
+                })?;
+        compacted_through_sequence = manifest.compacted_through_sequence;
+        directory_records.extend(recovered_directory);
+    }
+
+    let journal_path = storage.metadata_journal_path(bucket.tenant_id, bucket.id);
+    if tokio::fs::metadata(&journal_path).await.is_ok() {
+        let journal_bytes = tokio::fs::read(&journal_path)
+            .await
+            .with_context(|| format!("read metadata journal {}", journal_path.display()))?;
+        let (_, frames) = decode_journal_file(&journal_bytes)?;
+        for frame in frames {
+            if frame.partition_sequence <= compacted_through_sequence {
+                continue;
+            }
+            if frame.record_kind == JournalRecordKind::DirectoryEntry {
+                let body: DirectoryEntryBody = serde_json::from_slice(&frame.body)?;
+                directory_records.insert(directory_segment_key(&body), body);
+            }
+        }
+    }
+
+    let mut current = Vec::new();
+    for body in directory_records.into_values() {
+        if body.delete_marker || body.deleted_at.is_some() {
+            continue;
+        }
+        current.push(object_from_directory_body(&body)?);
+    }
+    current.sort_by(|left, right| left.key.cmp(&right.key));
+    Ok(current)
 }
 
 pub async fn read_current_objects(
@@ -1131,6 +1286,36 @@ fn object_from_body(body: &ObjectVersionBody) -> Result<Object> {
         shard_map: body.shard_map.clone(),
         inline_payload: body.inline_payload.clone(),
         checksum: body.checksum.clone(),
+    })
+}
+
+fn object_from_directory_body(body: &DirectoryEntryBody) -> Result<Object> {
+    Ok(Object {
+        id: body.id,
+        tenant_id: body.tenant_id,
+        bucket_id: body.bucket_id,
+        key: body.object_key.clone(),
+        content_hash: body.content_hash.clone(),
+        size: body.size,
+        etag: body.etag.clone(),
+        content_type: body.content_type.clone(),
+        version_id: uuid::Uuid::parse_str(&body.version_id)?,
+        mutation_id: uuid::Uuid::parse_str(&body.mutation_id)?,
+        index_policy_snapshot: body.index_policy_snapshot.clone(),
+        user_metadata_hash: body.user_metadata_hash.clone(),
+        authz_revision: body.authz_revision,
+        record_hash: body.record_hash.clone(),
+        created_at: parse_body_timestamp(&body.created_at)?,
+        deleted_at: body
+            .deleted_at
+            .as_deref()
+            .map(parse_body_timestamp)
+            .transpose()?,
+        storage_class: body.storage_class,
+        user_meta: body.user_meta.clone(),
+        shard_map: body.shard_map.clone(),
+        inline_payload: None,
+        checksum: None,
     })
 }
 
@@ -1719,6 +1904,84 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(
+            read_current_objects(&storage, &bucket, signing_key)
+                .await
+                .is_err()
+        );
+        let directory_listing =
+            list_current_objects(&storage, &bucket, signing_key, "docs/", "", 10, "/")
+                .await
+                .unwrap();
+        assert_eq!(
+            directory_listing
+                .objects
+                .iter()
+                .map(|object| object.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["docs/a.txt", "docs/b.txt"]
+        );
+        assert_eq!(directory_listing.objects[0].version_id, second.version_id);
+    }
+
+    #[tokio::test]
+    async fn prefix_list_uses_directory_segment_plus_active_directory_journal() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let bucket = sample_bucket();
+        let first = sample_object(1, "docs/a.txt", false);
+        let second = sample_object(2, "docs/b.txt", false);
+        let nested = sample_object(3, "docs/nested/c.txt", false);
+
+        append_object_mutation(&storage, &bucket, &first, ObjectJournalMutation::Put)
+            .await
+            .unwrap();
+        append_object_mutation(&storage, &bucket, &second, ObjectJournalMutation::Put)
+            .await
+            .unwrap();
+        append_object_mutation(&storage, &bucket, &nested, ObjectJournalMutation::Put)
+            .await
+            .unwrap();
+
+        let signing_key = b"manifest signing key";
+        seal_object_journal_segments(&storage, &bucket, signing_key)
+            .await
+            .unwrap();
+
+        let replacement = sample_object(4, "docs/a.txt", false);
+        let delete_nested = sample_object(5, "docs/nested/c.txt", true);
+        append_object_mutation(&storage, &bucket, &replacement, ObjectJournalMutation::Put)
+            .await
+            .unwrap();
+        append_object_mutation(
+            &storage,
+            &bucket,
+            &delete_nested,
+            ObjectJournalMutation::DeleteMarker,
+        )
+        .await
+        .unwrap();
+
+        let listing = list_current_objects(&storage, &bucket, signing_key, "docs/", "", 10, "/")
+            .await
+            .unwrap();
+        assert_eq!(
+            listing
+                .objects
+                .iter()
+                .map(|object| object.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["docs/a.txt", "docs/b.txt"]
+        );
+        assert_eq!(listing.objects[0].version_id, replacement.version_id);
+        assert_eq!(listing.objects[0].content_hash, replacement.content_hash);
+        assert!(listing.common_prefixes.is_empty());
+
+        let nested_listing =
+            list_current_objects(&storage, &bucket, signing_key, "docs/nested/", "", 10, "/")
+                .await
+                .unwrap();
+        assert!(nested_listing.objects.is_empty());
     }
 
     #[tokio::test]
