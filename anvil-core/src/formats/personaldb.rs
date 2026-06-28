@@ -49,7 +49,7 @@ impl PersonalDbLogRecord {
             inline_certificate_json,
             entry_hash: [0; 32],
         };
-        record.entry_hash = hash32(&record.bytes_without_hash());
+        record.entry_hash = hash32(&record.chain_hash_material());
         record
     }
 
@@ -100,28 +100,26 @@ impl PersonalDbLogRecord {
             });
         }
         let entry_hash = input[hash_start..record_end].try_into().unwrap();
-        if hash32(&input[..hash_start]) != entry_hash {
+        let record = Self {
+            log_index: u64::from_le_bytes(input[0..8].try_into().unwrap()),
+            client_log_epoch: u64::from_le_bytes(input[8..16].try_into().unwrap()),
+            membership_epoch: u64::from_le_bytes(input[16..24].try_into().unwrap()),
+            policy_epoch: u64::from_le_bytes(input[24..32].try_into().unwrap()),
+            previous_log_hash: input[32..64].try_into().unwrap(),
+            changeset_payload_hash: input[64..96].try_into().unwrap(),
+            verified_envelope_hash: input[96..128].try_into().unwrap(),
+            certificate_hash: input[128..160].try_into().unwrap(),
+            payload_ref: input[payload_ref_start..certificate_ref_start].to_vec(),
+            certificate_ref: input[certificate_ref_start..inline_certificate_start].to_vec(),
+            inline_certificate_json: input[inline_certificate_start..hash_start].to_vec(),
+            entry_hash,
+        };
+        if hash32(&record.chain_hash_material()) != entry_hash {
             return Err(FormatError::HashMismatch {
                 context: "personaldb log record",
             });
         }
-        Ok((
-            Self {
-                log_index: u64::from_le_bytes(input[0..8].try_into().unwrap()),
-                client_log_epoch: u64::from_le_bytes(input[8..16].try_into().unwrap()),
-                membership_epoch: u64::from_le_bytes(input[16..24].try_into().unwrap()),
-                policy_epoch: u64::from_le_bytes(input[24..32].try_into().unwrap()),
-                previous_log_hash: input[32..64].try_into().unwrap(),
-                changeset_payload_hash: input[64..96].try_into().unwrap(),
-                verified_envelope_hash: input[96..128].try_into().unwrap(),
-                certificate_hash: input[128..160].try_into().unwrap(),
-                payload_ref: input[payload_ref_start..certificate_ref_start].to_vec(),
-                certificate_ref: input[certificate_ref_start..inline_certificate_start].to_vec(),
-                inline_certificate_json: input[inline_certificate_start..hash_start].to_vec(),
-                entry_hash,
-            },
-            record_end,
-        ))
+        Ok((record, record_end))
     }
 
     fn bytes_without_hash(&self) -> Vec<u8> {
@@ -145,6 +143,20 @@ impl PersonalDbLogRecord {
         out.extend_from_slice(&self.payload_ref);
         out.extend_from_slice(&self.certificate_ref);
         out.extend_from_slice(&self.inline_certificate_json);
+        out
+    }
+
+    fn chain_hash_material(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 * 4 + 32 * 3 + 2 + self.payload_ref.len());
+        out.extend_from_slice(&self.log_index.to_le_bytes());
+        out.extend_from_slice(&self.client_log_epoch.to_le_bytes());
+        out.extend_from_slice(&self.membership_epoch.to_le_bytes());
+        out.extend_from_slice(&self.policy_epoch.to_le_bytes());
+        out.extend_from_slice(&self.previous_log_hash);
+        out.extend_from_slice(&self.changeset_payload_hash);
+        out.extend_from_slice(&self.verified_envelope_hash);
+        out.extend_from_slice(&(self.payload_ref.len() as u16).to_le_bytes());
+        out.extend_from_slice(&self.payload_ref);
         out
     }
 }
@@ -378,6 +390,20 @@ mod tests {
         let (decoded, used) = PersonalDbLogRecord::decode(&encoded).unwrap();
         assert_eq!(used, encoded.len());
         assert_eq!(decoded, first);
+        let with_different_certificate = PersonalDbLogRecord::new(
+            1,
+            10,
+            20,
+            30,
+            [0; 32],
+            [1; 32],
+            [2; 32],
+            [99; 32],
+            b"objects/changeset-1".to_vec(),
+            b"objects/cert-1b".to_vec(),
+            br#"{"certificate":99}"#.to_vec(),
+        );
+        assert_eq!(with_different_certificate.entry_hash, first.entry_hash);
         validate_personaldb_log_chain(&[first.clone(), second.clone()]).unwrap();
 
         let invalid = PersonalDbLogRecord {

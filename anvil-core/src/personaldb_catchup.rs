@@ -343,6 +343,9 @@ async fn load_certificate(
     if certificate.log_index != record.log_index {
         return Err(anyhow!("personaldb commit certificate log index mismatch"));
     }
+    if certificate.entry_hash != hex::encode(record.entry_hash) {
+        return Err(anyhow!("personaldb commit certificate entry hash mismatch"));
+    }
     if hex::decode(&certificate.changeset_payload_hash)?.as_slice() != record.changeset_payload_hash
     {
         return Err(anyhow!(
@@ -583,13 +586,30 @@ mod tests {
                 .await
                 .unwrap();
 
+                let payload_ref = storage
+                    .relative_storage_path(&payload_paths.by_index_path)
+                    .unwrap()
+                    .into_bytes();
+                let provisional_record = PersonalDbLogRecord::new(
+                    log_index,
+                    1,
+                    1,
+                    1,
+                    previous,
+                    payload_hash,
+                    [8; 32],
+                    [0; 32],
+                    payload_ref.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                );
                 let certificate = PersonalDbCommitCertificate {
                     format_version: 1,
                     tenant_id: "3".to_string(),
                     database_id: "db-alpha".to_string(),
                     log_index,
                     previous_log_hash: hex::encode(previous),
-                    entry_hash: hex::encode([log_index as u8; 32]),
+                    entry_hash: hex::encode(provisional_record.entry_hash),
                     changeset_payload_hash: hex::encode(payload_hash),
                     verified_envelope_hash: hex::encode([8; 32]),
                     client_log_epoch: 1,
@@ -620,10 +640,7 @@ mod tests {
                     payload_hash,
                     [8; 32],
                     certificate_hash,
-                    storage
-                        .relative_storage_path(&payload_paths.by_index_path)
-                        .unwrap()
-                        .into_bytes(),
+                    payload_ref,
                     storage
                         .relative_storage_path(&certificate_path)
                         .unwrap()
