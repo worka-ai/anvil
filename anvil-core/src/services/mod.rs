@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod bucket;
+pub mod git_source;
 pub mod huggingface;
 pub mod index;
 pub mod internal;
@@ -8,6 +9,7 @@ pub mod personaldb;
 
 use crate::anvil_api::{
     auth_service_server::AuthServiceServer, bucket_service_server::BucketServiceServer,
+    git_source_service_server::GitSourceServiceServer,
     hf_ingestion_service_server::HfIngestionServiceServer,
     hugging_face_key_service_server::HuggingFaceKeyServiceServer,
     index_service_server::IndexServiceServer,
@@ -58,6 +60,10 @@ pub fn create_grpc_router(state: AppState, auth_interceptor: AuthInterceptorFn) 
         auth_closure.clone(),
     ))
     .add_service(IndexServiceServer::with_interceptor(
+        state.clone(),
+        auth_closure.clone(),
+    ))
+    .add_service(GitSourceServiceServer::with_interceptor(
         state.clone(),
         auth_closure.clone(),
     ))

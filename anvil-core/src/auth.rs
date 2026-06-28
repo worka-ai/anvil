@@ -189,6 +189,10 @@ fn action_covers_required(token_action: &AnvilAction, required_action: &AnvilAct
                 | AnvilAction::PersonalDbUpdate
                 | AnvilAction::PersonalDbDelete
         ),
+        AnvilAction::GitSourceAll => matches!(
+            required_action,
+            AnvilAction::GitSourceRead | AnvilAction::GitSourceWrite | AnvilAction::GitSourceWatch
+        ),
         _ => token_action == required_action, // Exact match for specific actions
     }
 }
@@ -305,6 +309,26 @@ mod tests {
             AnvilAction::ObjectWrite,
             "images-bucket/users/456/avatar.jpg", // 456 does not match 123/*
             &no_wildcard
+        ));
+    }
+
+    #[test]
+    fn git_source_wildcard_covers_git_source_actions() {
+        let token_scopes = vec!["git_source:*|repository:repo-alpha".to_string()];
+        assert!(is_authorized(
+            AnvilAction::GitSourceWatch,
+            "repository:repo-alpha",
+            &token_scopes
+        ));
+        assert!(is_authorized(
+            AnvilAction::GitSourceRead,
+            "repository:repo-alpha",
+            &token_scopes
+        ));
+        assert!(!is_authorized(
+            AnvilAction::IndexWatch,
+            "repository:repo-alpha",
+            &token_scopes
         ));
     }
 

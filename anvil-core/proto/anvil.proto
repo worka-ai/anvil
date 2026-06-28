@@ -80,6 +80,10 @@ service IndexService {
   rpc ListIndexDiagnostics(ListIndexDiagnosticsRequest) returns (ListIndexDiagnosticsResponse);
 }
 
+service GitSourceService {
+  rpc WatchGitSource(WatchGitSourceRequest) returns (stream WatchGitSourceResponse);
+}
+
 message CreateIndexRequest {
     string bucket_name = 1;
     string name = 2;
@@ -232,6 +236,25 @@ message IndexDiagnosticRecord {
 
 message ListIndexDiagnosticsResponse {
     repeated IndexDiagnosticRecord diagnostics = 1;
+}
+
+message WatchGitSourceRequest {
+    string repository_id = 1;
+    uint64 after_cursor_low = 2;
+    uint64 after_cursor_high = 3;
+}
+
+message WatchGitSourceResponse {
+    uint64 cursor_low = 1;
+    uint64 cursor_high = 2;
+    string repository_id = 3;
+    string event_type = 4;
+    uint64 generation = 5;
+    string source_hash = 6;
+    string index_path = 7;
+    string pack_object_version_id = 8;
+    uint64 authz_revision = 9;
+    string emitted_at = 10;
 }
 
 // Object Service

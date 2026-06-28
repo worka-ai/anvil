@@ -18,6 +18,7 @@ pub enum AnvilAction {
     AuthzAll,       // Matches authz:*
     IndexAll,       // Matches index:*
     PersonalDbAll,  // Matches personaldb:*
+    GitSourceAll,   // Matches git_source:*
 
     // Bucket actions
     BucketCreate,
@@ -70,6 +71,11 @@ pub enum AnvilAction {
     PersonalDbUpdate,
     PersonalDbDelete,
 
+    // Git source actions
+    GitSourceRead,
+    GitSourceWrite,
+    GitSourceWatch,
+
     // Internal actions
     InternalPutShard,
     InternalGetShard,
@@ -91,6 +97,7 @@ impl fmt::Display for AnvilAction {
             AnvilAction::AuthzAll => "authz:*",
             AnvilAction::IndexAll => "index:*",
             AnvilAction::PersonalDbAll => "personaldb:*",
+            AnvilAction::GitSourceAll => "git_source:*",
 
             // Bucket actions
             AnvilAction::BucketCreate => "bucket:create",
@@ -143,6 +150,11 @@ impl fmt::Display for AnvilAction {
             AnvilAction::PersonalDbUpdate => "personaldb:update",
             AnvilAction::PersonalDbDelete => "personaldb:delete",
 
+            // Git source actions
+            AnvilAction::GitSourceRead => "git_source:read",
+            AnvilAction::GitSourceWrite => "git_source:write",
+            AnvilAction::GitSourceWatch => "git_source:watch",
+
             // Internal actions
             AnvilAction::InternalPutShard => "internal:put_shard",
             AnvilAction::InternalGetShard => "internal:get_shard",
@@ -169,6 +181,7 @@ impl FromStr for AnvilAction {
             "authz:*" => Ok(AnvilAction::AuthzAll),
             "index:*" => Ok(AnvilAction::IndexAll),
             "personaldb:*" => Ok(AnvilAction::PersonalDbAll),
+            "git_source:*" => Ok(AnvilAction::GitSourceAll),
 
             // Bucket actions
             "bucket:create" => Ok(AnvilAction::BucketCreate),
@@ -221,6 +234,11 @@ impl FromStr for AnvilAction {
             "personaldb:update" => Ok(AnvilAction::PersonalDbUpdate),
             "personaldb:delete" => Ok(AnvilAction::PersonalDbDelete),
 
+            // Git source actions
+            "git_source:read" => Ok(AnvilAction::GitSourceRead),
+            "git_source:write" => Ok(AnvilAction::GitSourceWrite),
+            "git_source:watch" => Ok(AnvilAction::GitSourceWatch),
+
             // Internal actions
             "internal:put_shard" => Ok(AnvilAction::InternalPutShard),
             "internal:get_shard" => Ok(AnvilAction::InternalGetShard),
@@ -248,6 +266,7 @@ mod tests {
             AnvilAction::AuthzAll,
             AnvilAction::IndexAll,
             AnvilAction::PersonalDbAll,
+            AnvilAction::GitSourceAll,
             AnvilAction::BucketCreate,
             AnvilAction::BucketWatch,
             AnvilAction::ObjectWrite,
@@ -261,6 +280,9 @@ mod tests {
             AnvilAction::PersonalDbRead,
             AnvilAction::PersonalDbCommit,
             AnvilAction::PersonalDbWatch,
+            AnvilAction::GitSourceRead,
+            AnvilAction::GitSourceWrite,
+            AnvilAction::GitSourceWatch,
             AnvilAction::InternalPutShard,
             AnvilAction::InternalDeleteShard,
         ];
