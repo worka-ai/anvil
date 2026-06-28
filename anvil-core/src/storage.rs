@@ -93,6 +93,32 @@ impl Storage {
             .join("definitions.anjournal")
     }
 
+    pub fn append_journal_path(&self, tenant_id: i64, bucket_id: i64) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("append")
+            .join(format!("tenant-{tenant_id}"))
+            .join(format!("bucket-{bucket_id}"))
+            .join("streams.anjournal")
+    }
+
+    pub async fn append_journal_paths(&self) -> anyhow::Result<Vec<PathBuf>> {
+        collect_bucket_partition_journals(
+            self.storage_path.join("_anvil").join("append"),
+            "streams.anjournal",
+        )
+        .await
+    }
+
+    pub fn manifest_cas_journal_path(&self, tenant_id: i64, bucket_id: i64) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("manifest")
+            .join(format!("tenant-{tenant_id}"))
+            .join(format!("bucket-{bucket_id}"))
+            .join("cas.anjournal")
+    }
+
     pub fn multipart_journal_path(&self, tenant_id: i64, bucket_id: i64) -> PathBuf {
         self.storage_path
             .join("_anvil")
@@ -103,26 +129,11 @@ impl Storage {
     }
 
     pub async fn multipart_journal_paths(&self) -> anyhow::Result<Vec<PathBuf>> {
-        let mut paths = Vec::new();
-        let root = self.storage_path.join("_anvil").join("multipart");
-        if tokio::fs::metadata(&root).await.is_err() {
-            return Ok(paths);
-        }
-        let mut tenants = tokio::fs::read_dir(&root).await?;
-        while let Some(tenant) = tenants.next_entry().await? {
-            let mut buckets = match tokio::fs::read_dir(tenant.path()).await {
-                Ok(entries) => entries,
-                Err(_) => continue,
-            };
-            while let Some(bucket) = buckets.next_entry().await? {
-                let path = bucket.path().join("uploads.anjournal");
-                if tokio::fs::metadata(&path).await.is_ok() {
-                    paths.push(path);
-                }
-            }
-        }
-        paths.sort();
-        Ok(paths)
+        collect_bucket_partition_journals(
+            self.storage_path.join("_anvil").join("multipart"),
+            "uploads.anjournal",
+        )
+        .await
     }
 
     pub fn index_diagnostic_journal_path(&self, tenant_id: i64, bucket_id: i64) -> PathBuf {
@@ -871,4 +882,29 @@ mod tests {
             .await
             .unwrap();
     }
+}
+
+async fn collect_bucket_partition_journals(
+    root: PathBuf,
+    file_name: &str,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    if tokio::fs::metadata(&root).await.is_err() {
+        return Ok(paths);
+    }
+    let mut tenants = tokio::fs::read_dir(&root).await?;
+    while let Some(tenant) = tenants.next_entry().await? {
+        let mut buckets = match tokio::fs::read_dir(tenant.path()).await {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        while let Some(bucket) = buckets.next_entry().await? {
+            let path = bucket.path().join(file_name);
+            if tokio::fs::metadata(&path).await.is_ok() {
+                paths.push(path);
+            }
+        }
+    }
+    paths.sort();
+    Ok(paths)
 }

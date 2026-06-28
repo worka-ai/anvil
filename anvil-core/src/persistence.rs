@@ -6,13 +6,13 @@ use std::{collections::HashSet, path::PathBuf, sync::Arc};
 use tokio::sync::{RwLock, mpsc::Sender};
 
 use crate::{
-    authz_journal,
+    append_journal, authz_journal,
     bucket_journal::{self, BucketJournalMutation},
     cache::MetadataCache,
     cluster::MetadataEvent,
     config::Config,
-    control_journal, index_diagnostic_journal, index_journal, metadata_journal, model_journal,
-    multipart_journal,
+    control_journal, index_diagnostic_journal, index_journal, manifest_journal, metadata_journal,
+    model_journal, multipart_journal,
     storage::Storage,
     task_journal, watch_log,
 };
@@ -29,9 +29,6 @@ pub struct Persistence {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct NativeState {
     next_id: i64,
-    append_streams: Vec<AppendStream>,
-    append_records: Vec<AppendStreamRecord>,
-    manifests: Vec<ManifestRecord>,
     hf_keys: Vec<HfKey>,
     hf_ingestions: Vec<HfIngestion>,
     hf_items: Vec<HfIngestionItem>,
@@ -42,17 +39,6 @@ impl NativeState {
         self.next_id += 1;
         self.next_id
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ManifestRecord {
-    tenant_id: i64,
-    bucket_id: i64,
-    object_key: String,
-    revision: i64,
-    manifest_hash: String,
-    manifest: JsonValue,
-    updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1361,43 +1347,31 @@ impl Persistence {
         bucket_name: &str,
         stream_key: &str,
     ) -> Result<AppendStream> {
-        let mut state = self.state.write().await;
-        let stream = AppendStream {
-            id: state.allocate_id(),
+        append_journal::create_append_stream(
+            &self.storage,
             tenant_id,
             bucket_id,
-            bucket_name: bucket_name.to_string(),
-            stream_key: stream_key.to_string(),
-            stream_id: uuid::Uuid::new_v4(),
-            created_at: Utc::now(),
-            sealed_at: None,
-            segment_hash: None,
-        };
-        state.append_streams.push(stream.clone());
-        self.persist_after_write(&state).await?;
-        Ok(stream)
+            bucket_name,
+            stream_key,
+        )
+        .await
     }
 
     pub async fn get_active_append_stream(
         &self,
-        _tenant_id: i64,
+        tenant_id: i64,
         bucket_id: i64,
         stream_key: &str,
         stream_id: uuid::Uuid,
     ) -> Result<Option<AppendStream>> {
-        Ok(self
-            .state
-            .read()
-            .await
-            .append_streams
-            .iter()
-            .find(|s| {
-                s.bucket_id == bucket_id
-                    && s.stream_key == stream_key
-                    && s.stream_id == stream_id
-                    && s.sealed_at.is_none()
-            })
-            .cloned())
+        append_journal::get_active_append_stream(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            stream_key,
+            stream_id,
+        )
+        .await
     }
 
     pub async fn append_stream_record(
@@ -1406,61 +1380,24 @@ impl Persistence {
         payload_hash: &str,
         payload_size: i64,
     ) -> Result<AppendStreamRecord> {
-        let mut state = self.state.write().await;
-        let next_seq = state
-            .append_records
-            .iter()
-            .filter(|r| r.stream_id == stream_row_id)
-            .map(|r| r.record_sequence)
-            .max()
-            .unwrap_or(0)
-            + 1;
-        let record = AppendStreamRecord {
-            id: state.allocate_id(),
-            stream_id: stream_row_id,
-            record_sequence: next_seq,
-            payload_hash: payload_hash.to_string(),
+        append_journal::append_stream_record(
+            &self.storage,
+            stream_row_id,
+            payload_hash,
             payload_size,
-            created_at: Utc::now(),
-        };
-        state.append_records.push(record.clone());
-        self.persist_after_write(&state).await?;
-        Ok(record)
+        )
+        .await
     }
 
     pub async fn list_append_stream_records(
         &self,
         stream_row_id: i64,
     ) -> Result<Vec<AppendStreamRecord>> {
-        let mut records = self
-            .state
-            .read()
-            .await
-            .append_records
-            .iter()
-            .filter(|r| r.stream_id == stream_row_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        records.sort_by_key(|r| r.record_sequence);
-        Ok(records)
+        append_journal::list_append_stream_records(&self.storage, stream_row_id).await
     }
 
     pub async fn seal_append_stream(&self, stream_row_id: i64, segment_hash: &str) -> Result<bool> {
-        let mut state = self.state.write().await;
-        let mut sealed = false;
-        if let Some(stream) = state
-            .append_streams
-            .iter_mut()
-            .find(|s| s.id == stream_row_id && s.sealed_at.is_none())
-        {
-            stream.sealed_at = Some(Utc::now());
-            stream.segment_hash = Some(segment_hash.to_string());
-            sealed = true;
-        }
-        if sealed {
-            self.persist_after_write(&state).await?;
-        }
-        Ok(sealed)
+        append_journal::seal_append_stream(&self.storage, stream_row_id, segment_hash).await
     }
 
     pub async fn compare_and_swap_manifest(
@@ -1473,34 +1410,16 @@ impl Persistence {
         manifest: JsonValue,
         manifest_hash: &str,
     ) -> Result<Option<ManifestCasResult>> {
-        let mut state = self.state.write().await;
-        let current = state
-            .manifests
-            .iter()
-            .filter(|m| {
-                m.tenant_id == tenant_id && m.bucket_id == bucket_id && m.object_key == object_key
-            })
-            .map(|m| m.revision)
-            .max()
-            .unwrap_or(0);
-        if expected_revision != current {
-            return Ok(None);
-        }
-        let revision = current + 1;
-        state.manifests.push(ManifestRecord {
+        manifest_journal::compare_and_swap_manifest(
+            &self.storage,
             tenant_id,
             bucket_id,
-            object_key: object_key.to_string(),
-            revision,
-            manifest_hash: manifest_hash.to_string(),
+            object_key,
+            expected_revision,
             manifest,
-            updated_at: Utc::now(),
-        });
-        self.persist_after_write(&state).await?;
-        Ok(Some(ManifestCasResult {
-            revision,
-            manifest_hash: manifest_hash.to_string(),
-        }))
+            manifest_hash,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
