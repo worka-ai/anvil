@@ -197,6 +197,7 @@ dependencies = [
  "reed-solomon-erasure",
  "regex",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

@@ -1,7 +1,9 @@
 use crate::anvil_api::personal_db_service_server::PersonalDbService;
 use crate::anvil_api::*;
 use crate::{
-    AppState, auth,
+    AppState,
+    anvil_personaldb_sqlite_changeset::iterate_changeset,
+    auth, authz_journal,
     permissions::AnvilAction,
     personaldb_catchup::{
         PersonalDbCatchUpRequest as CoreCatchUpRequest,
@@ -9,6 +11,7 @@ use crate::{
         personaldb_catch_up,
     },
     personaldb_control::PersonalDbGroupManifest,
+    personaldb_envelope::{PersonalDbEnvelopeDerivationInput, derive_verified_mutation_envelope},
     personaldb_heads::{
         PersonalDbCommittedHead, PersonalDbSnapshotsHead, read_personaldb_committed_head,
         read_personaldb_group_manifest, write_personaldb_committed_head,
@@ -207,8 +210,34 @@ impl PersonalDbService for AppState {
             ));
         }
 
+        let changes = iterate_changeset(&validated.request.changeset_bytes)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let authz_revision = authz_journal::latest_authz_revision(&self.storage, claims.tenant_id)
+            .await
+            .map_err(internal_status)
+            .and_then(|revision| {
+                u64::try_from(revision)
+                    .map_err(|_| Status::internal("Invalid authorization revision"))
+            })?;
+        let _envelope = derive_verified_mutation_envelope(PersonalDbEnvelopeDerivationInput {
+            tenant_id: claims.tenant_id,
+            database_id: &validated.request.database_id,
+            principal: &validated.request.principal,
+            base_log_index: validated.request.base_log_index,
+            proposed_log_index: validated.request.base_log_index + 1,
+            changeset_payload_hash: validated.changeset_payload_hash,
+            schema_hash: &manifest.schema_hash,
+            policy_epoch: manifest.active_policy_epoch,
+            authz_revision,
+            changes: &changes,
+            updated_at_nanos: chrono::Utc::now()
+                .timestamp_nanos_opt()
+                .ok_or_else(|| Status::internal("Invalid current timestamp"))?,
+        })
+        .map_err(|err| Status::invalid_argument(err.to_string()))?;
+
         Err(Status::failed_precondition(
-            "PersonalDbSqliteChangesetDecoderUnavailable",
+            "PersonalDbCommitSerializationUnavailable",
         ))
     }
 

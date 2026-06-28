@@ -7,6 +7,7 @@ use anvil::formats::hash32;
 use anvil::personaldb_watch::{PersonalDbGroupWatchPayload, append_personaldb_group_watch_record};
 use anvil_test_utils::*;
 use futures_util::StreamExt;
+use rusqlite::{Connection, session::Session};
 use std::time::Duration;
 use tonic::{Code, Request};
 
@@ -117,7 +118,7 @@ async fn personaldb_group_create_get_and_catch_up_are_native_api_backed() {
 }
 
 #[tokio::test]
-async fn personaldb_submit_is_authorized_validated_and_does_not_commit_without_decoder() {
+async fn personaldb_submit_is_authorized_decoded_and_reaches_commit_serialization_gate() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
@@ -155,6 +156,15 @@ async fn personaldb_submit_is_authorized_validated_and_does_not_commit_without_d
         .unwrap_err();
     assert_eq!(permission_denied.code(), Code::PermissionDenied);
 
+    let malformed = client
+        .submit_personal_db_changeset(authorized(
+            malformed_submit_request(&database_id, &genesis_hash),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(malformed.code(), Code::InvalidArgument);
+
     let unavailable = client
         .submit_personal_db_changeset(authorized(
             valid_submit_request(&database_id, &genesis_hash),
@@ -166,7 +176,7 @@ async fn personaldb_submit_is_authorized_validated_and_does_not_commit_without_d
     assert!(
         unavailable
             .message()
-            .contains("PersonalDbSqliteChangesetDecoderUnavailable")
+            .contains("PersonalDbCommitSerializationUnavailable")
     );
 
     let fetched = client
@@ -258,7 +268,26 @@ async fn personaldb_group_watch_streams_reserved_internal_events_through_native_
 }
 
 fn valid_submit_request(database_id: &str, genesis_hash: &str) -> SubmitPersonalDbChangesetRequest {
-    let changeset_bytes = b"sqlite changeset bytes".to_vec();
+    let changeset_bytes = sqlite_insert_changeset();
+    submit_request(database_id, genesis_hash, changeset_bytes)
+}
+
+fn malformed_submit_request(
+    database_id: &str,
+    genesis_hash: &str,
+) -> SubmitPersonalDbChangesetRequest {
+    submit_request(
+        database_id,
+        genesis_hash,
+        b"not a sqlite changeset".to_vec(),
+    )
+}
+
+fn submit_request(
+    database_id: &str,
+    genesis_hash: &str,
+    changeset_bytes: Vec<u8>,
+) -> SubmitPersonalDbChangesetRequest {
     SubmitPersonalDbChangesetRequest {
         tenant_id: 1,
         database_id: database_id.to_string(),
@@ -282,4 +311,27 @@ fn valid_submit_request(database_id: &str, genesis_hash: &str) -> SubmitPersonal
         changeset_bytes,
         client_debug_metadata_json: String::new(),
     }
+}
+
+fn sqlite_insert_changeset() -> Vec<u8> {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "CREATE TABLE items(
+            id INTEGER PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL,
+            payload BLOB
+        );",
+    )
+    .unwrap();
+    let mut session = Session::new(&db).unwrap();
+    session.attach::<&str>(None).unwrap();
+    db.execute(
+        "INSERT INTO items (id, name, payload) VALUES (1, 'alpha', ?1)",
+        [vec![1_u8, 2, 3]],
+    )
+    .unwrap();
+    let mut output = Vec::new();
+    session.changeset_strm(&mut output).unwrap();
+    assert!(!output.is_empty());
+    output
 }
