@@ -38,7 +38,9 @@ pub async fn run(
     cluster_state: ClusterState,
     jwt_manager: Arc<JwtManager>,
     object_manager: ObjectManager,
+    anvil_secret_encryption_key: String,
 ) -> Result<()> {
+    let encryption_key = Arc::new(hex::decode(anvil_secret_encryption_key)?);
     loop {
         let tasks = match persistence.claim_pending_tasks(10).await {
             Ok(tasks) => tasks,
@@ -59,11 +61,14 @@ pub async fn run(
             let cs = cluster_state.clone();
             let jm = jwt_manager.clone();
             let om = object_manager.clone();
+            let encryption_key = encryption_key.clone();
             tokio::spawn(async move {
                 let result = match task.task_type {
                     TaskType::DeleteObject => handle_delete_object(&p, &cs, &jm, &task).await,
                     TaskType::DeleteBucket => handle_delete_bucket(&p, &task).await,
-                    TaskType::HFIngestion => handle_hf_ingestion(&p, &om, &task).await,
+                    TaskType::HFIngestion => {
+                        handle_hf_ingestion(&p, &om, &task, &encryption_key).await
+                    }
                     _ => {
                         warn!("Unhandled task type: {:?}", task.task_type);
                         Ok(())
@@ -94,6 +99,7 @@ async fn handle_hf_ingestion(
     persistence: &Persistence,
     object_manager: &ObjectManager,
     task: &Task,
+    encryption_key: &[u8],
 ) -> anyhow::Result<()> {
     use globset::{Glob, GlobSetBuilder};
     use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
@@ -136,12 +142,7 @@ async fn handle_hf_ingestion(
             .hf_get_key_encrypted_by_id(key_id)
             .await?
             .ok_or_else(|| anyhow!("hugging face key not found"))?;
-        let enc_key_hex = std::env::var("ANVIL_SECRET_ENCRYPTION_KEY").unwrap_or_default();
-        if enc_key_hex.is_empty() {
-            anyhow::bail!("missing encryption key in worker");
-        }
-        let enc_key = hex::decode(enc_key_hex)?;
-        let token_bytes = crate::crypto::decrypt(&token_encrypted, &enc_key)?;
+        let token_bytes = crate::crypto::decrypt(&token_encrypted, encryption_key)?;
         let token = String::from_utf8(token_bytes)?;
         debug!("Decrypted token.");
 
