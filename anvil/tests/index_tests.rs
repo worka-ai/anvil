@@ -820,7 +820,7 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
     let response = index_client
         .query_index(authorized(
             QueryIndexRequest {
-                bucket_name,
+                bucket_name: bucket_name.clone(),
                 index_name: "body".to_string(),
                 query_text: "alpha".to_string(),
                 query_vector: vec![],
@@ -836,6 +836,51 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
     assert_eq!(response.hits.len(), 1);
     assert_eq!(response.hits[0].object_key, "docs/allowed.txt");
     assert_eq!(response.hits[0].document_id, 1);
+
+    anvil::authz_journal::write_authz_tuple(
+        &cluster.states[0].storage,
+        anvil::authz_journal::AuthzTupleWrite {
+            tenant_id: claims.tenant_id,
+            namespace: "object",
+            object_id: &format!("{bucket_name}/docs/denied.txt"),
+            relation: "reader",
+            subject_kind: "app",
+            subject_id: "tuple-index-reader",
+            caveat_hash: "",
+            operation: "add",
+            written_by: "test",
+            reason: "index query inherited object authz test",
+        },
+    )
+    .await
+    .unwrap();
+    let tuple_token = cluster.states[0]
+        .jwt_manager
+        .mint_token(
+            "tuple-index-reader".to_string(),
+            vec![format!("index:read|{bucket_name}")],
+            claims.tenant_id,
+        )
+        .unwrap();
+    let tuple_response = index_client
+        .query_index(authorized(
+            QueryIndexRequest {
+                bucket_name,
+                index_name: "body".to_string(),
+                query_text: "alpha".to_string(),
+                query_vector: vec![],
+                limit: 10,
+                phrase: false,
+            },
+            &tuple_token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(tuple_response.hits.len(), 1);
+    assert_eq!(tuple_response.hits[0].object_key, "docs/denied.txt");
+    assert_eq!(tuple_response.hits[0].document_id, 2);
 }
 
 #[tokio::test]

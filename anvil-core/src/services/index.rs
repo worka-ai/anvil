@@ -1,7 +1,7 @@
 use crate::anvil_api::index_service_server::IndexService;
 use crate::anvil_api::*;
 use crate::{
-    AppState, auth, bucket_journal,
+    AppState, auth, authz_journal, bucket_journal,
     formats::{
         full_text::{Bm25Config, FullTextIndexDefinition},
         vector::VectorMetric,
@@ -452,7 +452,16 @@ impl AppState {
                 None if index.authorization_mode == "inherit_object" => continue,
                 None => (String::new(), String::new()),
             };
-            if !query_hit_visible(claims, &index.authorization_mode, &bucket.name, &object_key) {
+            if !self
+                .query_hit_visible(
+                    claims,
+                    &index.authorization_mode,
+                    &bucket.name,
+                    &object_key,
+                    segment.header.authz_revision,
+                )
+                .await?
+            {
                 continue;
             }
             hits.push(IndexQueryHit {
@@ -536,7 +545,16 @@ impl AppState {
                 None if index.authorization_mode == "inherit_object" => continue,
                 None => (String::new(), String::new()),
             };
-            if !query_hit_visible(claims, &index.authorization_mode, &bucket.name, &object_key) {
+            if !self
+                .query_hit_visible(
+                    claims,
+                    &index.authorization_mode,
+                    &bucket.name,
+                    &object_key,
+                    segment.header.authz_revision,
+                )
+                .await?
+            {
                 continue;
             }
             hits.push(IndexQueryHit {
@@ -588,6 +606,45 @@ impl AppState {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(object.map(|object| (version_id.to_string(), object.key)))
+    }
+
+    async fn query_hit_visible(
+        &self,
+        claims: &auth::Claims,
+        authorization_mode: &str,
+        bucket_name: &str,
+        object_key: &str,
+        authz_revision: u64,
+    ) -> Result<bool, Status> {
+        match authorization_mode {
+            "inherit_object" => {
+                if object_key.is_empty() {
+                    return Ok(false);
+                }
+                let object_resource = format!("{bucket_name}/{object_key}");
+                if auth::is_authorized(AnvilAction::ObjectRead, &object_resource, &claims.scopes) {
+                    return Ok(true);
+                }
+                let revision = i64::try_from(authz_revision)
+                    .map_err(|_| Status::internal("Invalid authz revision"))?;
+                let record = authz_journal::check_authz_tuple_at_revision(
+                    &self.storage,
+                    claims.tenant_id,
+                    "object",
+                    &object_resource,
+                    "reader",
+                    "app",
+                    &claims.sub,
+                    "",
+                    revision,
+                )
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+                Ok(record.is_some_and(|record| record.operation == "add"))
+            }
+            "index_only" | "public" => Ok(true),
+            _ => Ok(false),
+        }
     }
 }
 
@@ -658,26 +715,6 @@ fn internal_candidate_limit(value: u32, authorization_mode: &str) -> usize {
         limit.saturating_mul(20)
     } else {
         limit
-    }
-}
-
-fn query_hit_visible(
-    claims: &auth::Claims,
-    authorization_mode: &str,
-    bucket_name: &str,
-    object_key: &str,
-) -> bool {
-    match authorization_mode {
-        "inherit_object" => {
-            !object_key.is_empty()
-                && auth::is_authorized(
-                    AnvilAction::ObjectRead,
-                    &format!("{bucket_name}/{object_key}"),
-                    &claims.scopes,
-                )
-        }
-        "index_only" | "public" => true,
-        _ => false,
     }
 }
 
