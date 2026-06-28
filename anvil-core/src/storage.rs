@@ -73,6 +73,10 @@ impl Storage {
         })
     }
 
+    pub fn temp_dir_path(&self) -> &Path {
+        &self.temp_path
+    }
+
     pub fn control_journal_path(&self) -> PathBuf {
         self.storage_path
             .join("_anvil")

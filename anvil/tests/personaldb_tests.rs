@@ -4,8 +4,8 @@ use anvil::anvil_api::{
     PersonalDbVoterAck, SubmitPersonalDbChangesetRequest, WatchPersonalDbGroupRequest,
 };
 use anvil::formats::hash32;
-use anvil::personaldb_watch::{PersonalDbGroupWatchPayload, append_personaldb_group_watch_record};
 use anvil::personaldb_row_index::read_personaldb_row_index;
+use anvil::personaldb_watch::{PersonalDbGroupWatchPayload, append_personaldb_group_watch_record};
 use anvil_test_utils::*;
 use futures_util::StreamExt;
 use rusqlite::{Connection, session::Session};
@@ -208,7 +208,14 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
     assert_eq!(committed.watch_cursor_high, 0);
     assert_eq!(committed.certificate.as_ref().unwrap().log_index, 1);
     assert_eq!(committed.committed_head.as_ref().unwrap().log_index, 1);
-    assert_eq!(committed.committed_head.as_ref().unwrap().row_index_generation, 1);
+    assert_eq!(
+        committed
+            .committed_head
+            .as_ref()
+            .unwrap()
+            .row_index_generation,
+        1
+    );
 
     let row_index_path = cluster.states[0]
         .storage

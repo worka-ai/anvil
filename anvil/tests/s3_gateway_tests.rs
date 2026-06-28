@@ -314,7 +314,10 @@ fn test_s3_large_object_uses_external_chunks_and_ranges_across_chunk_boundary() 
         assert_eq!(manifest.kind, "external_chunks_v1");
         assert_eq!(manifest.chunk_size, DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES);
         assert_eq!(manifest.chunks.len(), 2);
-        assert_eq!(manifest.chunks[0].plaintext_length as usize, DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES);
+        assert_eq!(
+            manifest.chunks[0].plaintext_length as usize,
+            DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES
+        );
         assert_eq!(manifest.chunks[1].plaintext_length as usize, 257);
         for record in &manifest.chunks {
             assert!(record.storage_ref.starts_with("_anvil/payloads/chunks/"));

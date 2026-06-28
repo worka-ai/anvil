@@ -1,4 +1,4 @@
-use crate::{auth::AuthenticatedBearerToken, AppState};
+use crate::{AppState, auth::AuthenticatedBearerToken};
 use http::Uri;
 use tonic::{Request, Status};
 
