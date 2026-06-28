@@ -838,6 +838,183 @@ async fn test_repair_rebuilds_missing_full_text_segment_from_base_journal() {
 }
 
 #[tokio::test]
+async fn test_repair_rebuilds_missing_vector_segment_from_base_journal() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let persistence = &cluster.states[0].persistence;
+    let tenant_id = 1;
+    let bucket_name = format!("vector-index-repair-{}", uuid::Uuid::new_v4());
+    let bucket = persistence
+        .create_bucket(tenant_id, &bucket_name, "test-region-1")
+        .await
+        .unwrap();
+    let vector_payload = br#"{"vector":[1.0,0.0],"source_start":4,"source_len":12}"#;
+    persistence
+        .create_object(
+            tenant_id,
+            bucket.id,
+            "vectors/repair.json",
+            &hex::encode(anvil::formats::hash32(vector_payload)),
+            i64::try_from(vector_payload.len()).unwrap(),
+            "etag-vector-repair",
+            Some("application/json"),
+            None,
+            None,
+            Some(vector_payload.to_vec()),
+        )
+        .await
+        .unwrap();
+    persistence
+        .compact_object_metadata(bucket.id)
+        .await
+        .unwrap()
+        .expect("object metadata compaction writes manifest segments");
+    tokio::fs::remove_file(
+        cluster.states[0]
+            .storage
+            .metadata_journal_path(tenant_id, bucket.id),
+    )
+    .await
+    .expect("remove active journal so repair must read manifest segments");
+
+    let index = persistence
+        .create_index_definition(
+            tenant_id,
+            bucket.id,
+            "embedding",
+            "vector",
+            serde_json::json!({"prefix": "vectors/"}),
+            serde_json::json!({"source": "object_body_json_vector"}),
+            "index_only",
+            serde_json::json!({
+                "dimension": 2,
+                "metric": "cosine",
+                "modality": "text",
+                "embedding_model": "test-explicit-vector",
+                "chunking": {"kind": "whole_object"}
+            }),
+        )
+        .await
+        .unwrap();
+    persistence
+        .create_index_definition_event(tenant_id, bucket.id, &bucket.name, &index, "create")
+        .await
+        .unwrap();
+    assert!(
+        persistence
+            .enqueue_index_build_for_index(&bucket, &index)
+            .await
+            .unwrap(),
+        "compacted source manifest must still schedule a vector index build"
+    );
+    let source_cursor = persistence
+        .list_tasks()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|task| {
+            task.task_type == anvil::tasks::TaskType::IndexBuild
+                && task.payload["index_id"] == serde_json::json!(index.id)
+        })
+        .and_then(|task| task.payload["source_cursor"].as_u64())
+        .expect("index build task records source cursor");
+
+    persistence
+        .build_index_task(
+            tenant_id,
+            bucket.id,
+            index.id,
+            index.version,
+            u128::from(source_cursor),
+        )
+        .await
+        .unwrap()
+        .expect("initial vector index build succeeds");
+    let index_storage_id = anvil::index_journal::index_storage_id(tenant_id, bucket.id, index.id);
+    let signing_key = hex::decode(&cluster.states[0].config.anvil_secret_encryption_key).unwrap();
+    let proof = anvil::derived_index_proof::read_latest_derived_index_proof(
+        &cluster.states[0].storage,
+        &index_storage_id,
+        &signing_key,
+    )
+    .await
+    .unwrap()
+    .expect("proof exists before deleting segment");
+    assert!(!proof.segment_hashes.is_empty());
+    let segment_path = anvil::vector_segment::latest_vector_segment_path(
+        &cluster.states[0].storage,
+        &index_storage_id,
+    )
+    .await
+    .unwrap()
+    .expect("latest vector segment path exists");
+    tokio::fs::remove_file(&segment_path)
+        .await
+        .expect("remove vector segment to force repair");
+    assert!(
+        anvil::vector_segment::read_latest_vector_segment(
+            &cluster.states[0].storage,
+            &index_storage_id
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "segment deletion must remove the queryable vector derived index"
+    );
+
+    let mut repair_client = RepairServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let report = repair_client
+        .repair_index(authorized(
+            RepairIndexRequest {
+                bucket_name: bucket_name.clone(),
+                index_name: "embedding".to_string(),
+                rebuild: true,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(report.status, "rebuilt_derived_index");
+    assert_eq!(report.reason, "DerivedIndexSegmentMissing");
+    assert_eq!(report.index_storage_id, index_storage_id);
+    assert_eq!(report.source_cursor_low, source_cursor);
+    assert_eq!(report.source_cursor_high, 0);
+    assert!(report.finding.is_some());
+    assert!(report.build.is_some());
+
+    let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
+    let response = index_client
+        .query_index(authorized(
+            QueryIndexRequest {
+                bucket_name,
+                index_name: "embedding".to_string(),
+                query_text: String::new(),
+                query_vector: vec![1.0, 0.0],
+                limit: 10,
+                phrase: false,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.index_kind, "vector");
+    assert!(response.index_generation >= 1);
+    assert!(
+        response
+            .hits
+            .iter()
+            .any(|hit| hit.object_key == "vectors/repair.json"),
+        "rebuilt vector index must be queryable from base metadata and payload journals"
+    );
+}
+
+#[tokio::test]
 async fn test_index_build_followup_waits_for_running_build_and_catches_up_after_restart() {
     let cluster = TestCluster::new(&["test-region-1"]).await;
     let persistence = &cluster.states[0].persistence;
