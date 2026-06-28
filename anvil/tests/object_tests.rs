@@ -1,13 +1,15 @@
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::index_service_client::IndexServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
+use anvil::anvil_api::repair_service_client::RepairServiceClient;
 use anvil::anvil_api::{
     self, AppendStreamRecordRequest, CompareAndSwapManifestRequest, CompleteMultipartPart,
     CompleteMultipartRequest, ComposeObjectRequest, ComposeObjectSource, CopyObjectRequest,
     CreateAppendStreamRequest, CreateBucketRequest, CreateIndexRequest, DeleteObjectRequest,
     GetObjectRequest, HeadObjectRequest, InitiateMultipartRequest, ListObjectVersionsRequest,
     ListObjectsRequest, ObjectMetadata, PatchJsonObjectRequest, PutObjectRequest,
-    SealAppendStreamSegmentRequest, UploadPartMetadata, UploadPartRequest, WatchPrefixRequest,
+    RepairDirectoryIndexRequest, SealAppendStreamSegmentRequest, UploadPartMetadata,
+    UploadPartRequest, WatchPrefixRequest,
 };
 use futures_util::StreamExt;
 use std::time::Duration;
@@ -16,6 +18,15 @@ use tonic::Request;
 use anvil::storage::{DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES, ExternalChunkManifest};
 use anvil_test_utils::*;
 use tonic::{Code, Status};
+
+fn authorized<T>(message: T, token: &str) -> Request<T> {
+    let mut request = Request::new(message);
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {token}").parse().expect("valid token"),
+    );
+    request
+}
 
 fn assert_reserved_namespace_status<T>(result: Result<T, Status>) {
     let err = match result {
@@ -26,6 +37,119 @@ fn assert_reserved_namespace_status<T>(result: Result<T, Status>) {
     assert!(
         err.message().contains("UnauthorizedReservedNamespace"),
         "expected UnauthorizedReservedNamespace, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_repair_rebuilds_missing_directory_segment_from_metadata_journal() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let persistence = &cluster.states[0].persistence;
+    let tenant_id = 1;
+    let bucket_name = format!("directory-repair-{}", uuid::Uuid::new_v4());
+    let bucket = persistence
+        .create_bucket(tenant_id, &bucket_name, "test-region-1")
+        .await
+        .unwrap();
+    persistence
+        .create_object(
+            tenant_id,
+            bucket.id,
+            "docs/a.txt",
+            &hex::encode([41; 32]),
+            12,
+            "etag-a",
+            Some("text/plain"),
+            None,
+            None,
+            Some(b"directory-a".to_vec()),
+        )
+        .await
+        .unwrap();
+    persistence
+        .create_object(
+            tenant_id,
+            bucket.id,
+            "docs/b.txt",
+            &hex::encode([42; 32]),
+            12,
+            "etag-b",
+            Some("text/plain"),
+            None,
+            None,
+            Some(b"directory-b".to_vec()),
+        )
+        .await
+        .unwrap();
+    let sealed = persistence
+        .compact_object_metadata(bucket.id)
+        .await
+        .unwrap()
+        .expect("object metadata compaction writes directory segment");
+    tokio::fs::remove_file(&sealed.directory_path)
+        .await
+        .expect("remove directory segment to force repair");
+
+    let mut repair_client = RepairServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let report = repair_client
+        .repair_directory_index(authorized(
+            RepairDirectoryIndexRequest {
+                bucket_name: bucket_name.clone(),
+                rebuild: false,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(report.status, "needs_repair");
+    assert_eq!(report.reason, "DirectoryIndexInvalid");
+    assert_eq!(report.expected_entry_count, 2);
+    assert!(report.finding.is_some());
+
+    let rebuilt = repair_client
+        .repair_directory_index(authorized(
+            RepairDirectoryIndexRequest {
+                bucket_name: bucket_name.clone(),
+                rebuild: true,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(rebuilt.status, "rebuilt_directory_index");
+    assert_eq!(rebuilt.reason, "DirectoryIndexInvalid");
+    assert_eq!(rebuilt.expected_entry_count, 2);
+    assert!(!rebuilt.rebuilt_manifest_hash.is_empty());
+
+    let mut object_client = ObjectServiceClient::connect(grpc_addr).await.unwrap();
+    let listed = object_client
+        .list_objects(authorized(
+            ListObjectsRequest {
+                bucket_name,
+                prefix: "docs/".to_string(),
+                start_after: String::new(),
+                max_keys: 10,
+                delimiter: String::new(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        listed
+            .objects
+            .iter()
+            .map(|object| object.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["docs/a.txt", "docs/b.txt"]
     );
 }
 

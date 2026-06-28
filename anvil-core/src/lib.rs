@@ -26,6 +26,7 @@ pub mod crypto;
 pub mod derived_index_catchup;
 pub mod derived_index_proof;
 pub mod diagnostic_store;
+pub mod directory_repair;
 pub mod discovery;
 pub mod error_codes;
 pub mod formats;

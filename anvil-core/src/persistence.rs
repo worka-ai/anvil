@@ -11,8 +11,9 @@ use crate::{
     cache::MetadataCache,
     cluster::MetadataEvent,
     config::Config,
-    control_journal, hf_journal, index_builder, index_diagnostic_journal, index_journal,
-    index_repair, manifest_journal, metadata_journal, model_journal, multipart_journal,
+    control_journal, directory_repair, hf_journal, index_builder, index_diagnostic_journal,
+    index_journal, index_repair, manifest_journal, metadata_journal, model_journal,
+    multipart_journal,
     partition_fence::{
         PartitionOwnerStatus, PartitionRecoveryAcquire, PartitionWritePermit,
         acquire_partition_recovery, publish_partition_ready, read_partition_owner,
@@ -2481,6 +2482,29 @@ impl Persistence {
             finding,
             build,
         })
+    }
+
+    pub async fn repair_directory_index(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        rebuild: bool,
+    ) -> Result<directory_repair::DirectoryIndexRepairReport> {
+        let bucket = self
+            .get_bucket_by_name(tenant_id, bucket_name)
+            .await?
+            .ok_or_else(|| anyhow!("bucket not found"))?;
+        let permit = self
+            .object_metadata_write_permit(bucket.tenant_id, bucket.id)
+            .await?;
+        directory_repair::repair_directory_index(
+            &self.storage,
+            &bucket,
+            rebuild,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn list_repair_findings(

@@ -82,6 +82,7 @@ service IndexService {
 
 service RepairService {
   rpc RepairIndex(RepairIndexRequest) returns (RepairIndexResponse);
+  rpc RepairDirectoryIndex(RepairDirectoryIndexRequest) returns (RepairDirectoryIndexResponse);
   rpc RepairAuthzDerivedIndex(RepairAuthzDerivedIndexRequest) returns (RepairAuthzDerivedIndexResponse);
   rpc RepairPersonalDbLogChain(RepairPersonalDbLogChainRequest) returns (RepairPersonalDbLogChainResponse);
   rpc ListRepairFindings(ListRepairFindingsRequest) returns (ListRepairFindingsResponse);
@@ -339,6 +340,25 @@ message RepairIndexResponse {
     string reason = 7;
     RepairFindingRecord finding = 8;
     IndexBuildRecord build = 9;
+}
+
+message RepairDirectoryIndexRequest {
+    string bucket_name = 1;
+    bool rebuild = 2;
+}
+
+message RepairDirectoryIndexResponse {
+    string status = 1;
+    string bucket_name = 2;
+    uint64 source_cursor_low = 3;
+    uint64 source_cursor_high = 4;
+    uint64 expected_entry_count = 5;
+    uint64 actual_entry_count = 6;
+    string expected_snapshot_hash = 7;
+    string actual_snapshot_hash = 8;
+    string reason = 9;
+    RepairFindingRecord finding = 10;
+    string rebuilt_manifest_hash = 11;
 }
 
 message RepairAuthzDerivedIndexRequest {

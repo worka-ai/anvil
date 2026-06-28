@@ -284,6 +284,19 @@ pub struct NativeObjectListing {
     pub common_prefixes: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryIndexSnapshot {
+    pub entry_count: usize,
+    pub snapshot_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryIndexComparison {
+    pub source_cursor: u128,
+    pub expected: DirectoryIndexSnapshot,
+    pub actual: DirectoryIndexSnapshot,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ActiveObjectJournalStats {
     pub uncompacted_frame_count: u64,
@@ -874,6 +887,129 @@ pub async fn read_current_objects_through_sequence(
     current_objects_from_version_bodies(body_records)
 }
 
+pub async fn compare_directory_index_to_metadata(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+) -> Result<DirectoryIndexComparison> {
+    let stats = active_object_journal_stats(storage, bucket, manifest_signing_key).await?;
+    let source_cursor = u128::from(stats.last_sequence.max(stats.compacted_through_sequence));
+    Ok(DirectoryIndexComparison {
+        source_cursor,
+        expected: expected_directory_index_snapshot_from_metadata(
+            storage,
+            bucket,
+            manifest_signing_key,
+        )
+        .await?,
+        actual: current_directory_index_snapshot_from_index(storage, bucket, manifest_signing_key)
+            .await?,
+    })
+}
+
+pub async fn expected_directory_index_snapshot_from_metadata(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+) -> Result<DirectoryIndexSnapshot> {
+    let expected_entries =
+        expected_directory_entries_from_metadata(storage, bucket, manifest_signing_key).await?;
+    directory_index_snapshot(&expected_entries)
+}
+
+pub async fn current_directory_index_snapshot_from_index(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+) -> Result<DirectoryIndexSnapshot> {
+    let actual_entries =
+        current_directory_entries_from_index(storage, bucket, manifest_signing_key).await?;
+    directory_index_snapshot(&actual_entries)
+}
+
+pub async fn rebuild_directory_index_from_metadata_with_permit(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<SealedObjectMetadataSegments> {
+    require_object_metadata_permit(bucket, permit)?;
+    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
+    let body_records =
+        read_object_version_bodies_from_metadata_only(storage, bucket, manifest_signing_key)
+            .await?;
+    let frames = read_all_metadata_journal_frames(storage, bucket).await?;
+    let generation = frames
+        .last()
+        .map(|frame| frame.partition_sequence)
+        .ok_or_else(|| anyhow!("metadata journal has no frames to rebuild directory index"))?;
+
+    let mut metadata_records = body_records
+        .iter()
+        .map(|(_, body)| {
+            Ok(SegmentRecord::new(
+                metadata_segment_key(body),
+                serde_json::to_vec(body)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    metadata_records.sort_by(|left, right| left.key.cmp(&right.key));
+
+    let directory_entries = directory_entries_from_object_version_bodies(body_records)?;
+    let directory_records = directory_entries
+        .into_iter()
+        .map(|(key, body)| Ok(SegmentRecord::new(key, serde_json::to_vec(&body)?)))
+        .collect::<Result<Vec<_>>>()?;
+
+    let metadata_path = storage.metadata_segment_path(bucket.tenant_id, bucket.id, generation);
+    let directory_path = storage.directory_segment_path(bucket.tenant_id, bucket.id, generation);
+    let metadata_segment = write_segment_file(
+        &metadata_path,
+        FileFamily::MetadataSegment,
+        segment_header(
+            bucket,
+            generation,
+            "object_metadata",
+            "tenant_bucket_key_version",
+        ),
+        &metadata_records,
+    )
+    .await?;
+    let directory_segment = write_segment_file(
+        &directory_path,
+        FileFamily::DirectorySegment,
+        segment_header(bucket, generation, "directory", "tenant_bucket_prefix_key"),
+        &directory_records,
+    )
+    .await?;
+    let manifest_path = storage.metadata_manifest_path(bucket.tenant_id, bucket.id);
+    let manifest = write_partition_manifest(
+        storage,
+        bucket,
+        generation,
+        &frames,
+        &[metadata_segment, directory_segment],
+        manifest_signing_key,
+        &manifest_path,
+        permit.fence_token,
+    )
+    .await?;
+
+    Ok(SealedObjectMetadataSegments {
+        generation,
+        metadata_path,
+        directory_path,
+        metadata_record_count: metadata_records.len(),
+        directory_record_count: directory_records.len(),
+        manifest_path,
+        manifest_hash: manifest
+            .manifest_hash
+            .clone()
+            .ok_or_else(|| anyhow!("partition manifest hash was not set"))?,
+    })
+}
+
 fn current_objects_from_version_bodies(
     body_records: Vec<(usize, ObjectVersionBody)>,
 ) -> Result<Vec<Object>> {
@@ -1075,6 +1211,202 @@ async fn read_object_version_bodies_inner(
         }
     }
     Ok(body_records)
+}
+
+async fn read_object_version_bodies_from_metadata_only(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+) -> Result<Vec<(usize, ObjectVersionBody)>> {
+    let mut body_records = Vec::<(usize, ObjectVersionBody)>::new();
+    let mut order = 0usize;
+    let mut compacted_through_sequence = 0u64;
+
+    let manifest_path = storage.metadata_manifest_path(bucket.tenant_id, bucket.id);
+    if tokio::fs::metadata(&manifest_path).await.is_ok() {
+        let manifest_bytes = tokio::fs::read(&manifest_path)
+            .await
+            .with_context(|| format!("read partition manifest {}", manifest_path.display()))?;
+        let manifest = decode_partition_manifest(&manifest_bytes, manifest_signing_key)?;
+        let expected_partition_id =
+            hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id));
+        if manifest.partition_family != "object_metadata" {
+            return Err(anyhow!("partition manifest family mismatch"));
+        }
+        if manifest.partition_id != expected_partition_id {
+            return Err(anyhow!("partition manifest id mismatch"));
+        }
+        compacted_through_sequence = manifest.compacted_through_sequence;
+        for segment in &manifest.segments {
+            let family = file_family_from_manifest_name(&segment.family)?;
+            if family != FileFamily::MetadataSegment {
+                continue;
+            }
+            let segment_path = storage.resolve_relative_storage_path(&segment.path)?;
+            let bytes = tokio::fs::read(&segment_path)
+                .await
+                .with_context(|| format!("read metadata segment {}", segment_path.display()))?;
+            let (body, footer) =
+                decode_segment_file_with_footer(&bytes, FileFamily::MetadataSegment)?;
+            if hex::encode(footer.file_hash) != segment.file_hash {
+                return Err(anyhow!("metadata segment file hash mismatch"));
+            }
+            if footer.record_count != segment.record_count {
+                return Err(anyhow!("metadata segment record count mismatch"));
+            }
+            for record in decode_segment_body_records(&body)? {
+                let body: ObjectVersionBody = serde_json::from_slice(&record.value)?;
+                body_records.push((order, body));
+                order += 1;
+            }
+        }
+    }
+
+    let journal_path = storage.metadata_journal_path(bucket.tenant_id, bucket.id);
+    if tokio::fs::metadata(&journal_path).await.is_ok() {
+        let journal_bytes = tokio::fs::read(&journal_path)
+            .await
+            .with_context(|| format!("read metadata journal {}", journal_path.display()))?;
+        let (_, frames) = decode_journal_file(&journal_bytes)?;
+        for frame in frames {
+            if frame.partition_sequence <= compacted_through_sequence {
+                continue;
+            }
+            if matches!(
+                frame.record_kind,
+                JournalRecordKind::ObjectVersion | JournalRecordKind::DeleteMarker
+            ) {
+                let body: ObjectVersionBody = serde_json::from_slice(&frame.body)?;
+                body_records.push((order, body));
+                order += 1;
+            }
+        }
+    }
+    Ok(body_records)
+}
+
+async fn current_directory_entries_from_index(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+) -> Result<std::collections::BTreeMap<Vec<u8>, DirectoryEntryBody>> {
+    let mut directory_records = std::collections::BTreeMap::<Vec<u8>, DirectoryEntryBody>::new();
+    let mut compacted_through_sequence = 0u64;
+
+    let manifest_path = storage.metadata_manifest_path(bucket.tenant_id, bucket.id);
+    if tokio::fs::metadata(&manifest_path).await.is_ok() {
+        let (manifest, recovered_directory) =
+            recover_object_directory_partition(storage, bucket, manifest_signing_key)
+                .await
+                .with_context(|| {
+                    format!(
+                        "recover object directory partition from {}",
+                        manifest_path.display()
+                    )
+                })?;
+        compacted_through_sequence = manifest.compacted_through_sequence;
+        directory_records.extend(recovered_directory);
+    }
+
+    let journal_path = storage.metadata_journal_path(bucket.tenant_id, bucket.id);
+    if tokio::fs::metadata(&journal_path).await.is_ok() {
+        let journal_bytes = tokio::fs::read(&journal_path)
+            .await
+            .with_context(|| format!("read metadata journal {}", journal_path.display()))?;
+        let (_, frames) = decode_journal_file(&journal_bytes)?;
+        for frame in frames {
+            if frame.partition_sequence <= compacted_through_sequence {
+                continue;
+            }
+            if frame.record_kind == JournalRecordKind::DirectoryEntry {
+                let body: DirectoryEntryBody = serde_json::from_slice(&frame.body)?;
+                directory_records.insert(directory_segment_key(&body), body);
+            }
+        }
+    }
+    Ok(directory_records)
+}
+
+async fn expected_directory_entries_from_metadata(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+) -> Result<std::collections::BTreeMap<Vec<u8>, DirectoryEntryBody>> {
+    directory_entries_from_object_version_bodies(
+        read_object_version_bodies_from_metadata_only(storage, bucket, manifest_signing_key)
+            .await?,
+    )
+}
+
+fn directory_entries_from_object_version_bodies(
+    body_records: Vec<(usize, ObjectVersionBody)>,
+) -> Result<std::collections::BTreeMap<Vec<u8>, DirectoryEntryBody>> {
+    let mut versions_by_key = object_versions_by_key(body_records);
+    let mut entries = std::collections::BTreeMap::<Vec<u8>, DirectoryEntryBody>::new();
+    for versions in versions_by_key.values_mut() {
+        sort_versions_for_key(versions);
+        if let Some((_, body)) = versions.last() {
+            let directory = directory_entry_from_object_version_body(body);
+            entries.insert(directory_segment_key(&directory), directory);
+        }
+    }
+    Ok(entries)
+}
+
+fn directory_entry_from_object_version_body(body: &ObjectVersionBody) -> DirectoryEntryBody {
+    DirectoryEntryBody {
+        tenant_id: body.tenant_id,
+        bucket_id: body.bucket_id,
+        bucket_name: body.bucket_name.clone(),
+        object_key: body.object_key.clone(),
+        event: body.event.clone(),
+        id: body.id,
+        version_id: body.version_id.clone(),
+        mutation_id: body.mutation_id.clone(),
+        content_hash: body.content_hash.clone(),
+        size: body.size,
+        etag: body.etag.clone(),
+        content_type: body.content_type.clone(),
+        user_metadata_hash: body.user_metadata_hash.clone(),
+        authz_revision: body.authz_revision,
+        index_policy_snapshot: body.index_policy_snapshot.clone(),
+        record_hash: body.record_hash.clone(),
+        storage_class: body.storage_class,
+        user_meta: body.user_meta.clone(),
+        shard_map: body.shard_map.clone(),
+        delete_marker: body.delete_marker,
+        created_at: body.created_at.clone(),
+        deleted_at: body.deleted_at.clone(),
+    }
+}
+
+fn directory_index_snapshot(
+    entries: &std::collections::BTreeMap<Vec<u8>, DirectoryEntryBody>,
+) -> Result<DirectoryIndexSnapshot> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"anvil.directory_index.snapshot.v1");
+    for (key, body) in entries {
+        hasher.update(&(key.len() as u64).to_le_bytes());
+        hasher.update(key);
+        let body = serde_json::to_vec(body)?;
+        hasher.update(&(body.len() as u64).to_le_bytes());
+        hasher.update(&body);
+    }
+    Ok(DirectoryIndexSnapshot {
+        entry_count: entries.len(),
+        snapshot_hash: hasher.finalize().to_hex().to_string(),
+    })
+}
+
+async fn read_all_metadata_journal_frames(
+    storage: &Storage,
+    bucket: &Bucket,
+) -> Result<Vec<JournalFrame>> {
+    let journal_path = storage.metadata_journal_path(bucket.tenant_id, bucket.id);
+    let journal_bytes = tokio::fs::read(&journal_path)
+        .await
+        .with_context(|| format!("read metadata journal {}", journal_path.display()))?;
+    Ok(decode_journal_file(&journal_bytes)?.1)
 }
 
 fn object_versions_by_key(

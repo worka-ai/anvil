@@ -1,7 +1,7 @@
 use crate::anvil_api::repair_service_server::RepairService;
 use crate::anvil_api::*;
 use crate::{
-    AppState, auth, authz_repair, index_repair,
+    AppState, auth, authz_repair, directory_repair, index_repair,
     permissions::AnvilAction,
     personaldb_repair,
     repair_finding::{RepairFinding, RepairSubjectRef},
@@ -59,6 +59,55 @@ impl RepairService for AppState {
                     segment_hashes: build.segment_hashes.clone(),
                 }
             }),
+        }))
+    }
+
+    async fn repair_directory_index(
+        &self,
+        request: Request<RepairDirectoryIndexRequest>,
+    ) -> Result<Response<RepairDirectoryIndexResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        validate_component(&req.bucket_name, "bucket_name")?;
+
+        if !auth::is_authorized(AnvilAction::RepairRun, &req.bucket_name, &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        let report = self
+            .persistence
+            .repair_directory_index(claims.tenant_id, &req.bucket_name, req.rebuild)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let (source_cursor_low, source_cursor_high) = split_u128(report.source_cursor);
+        Ok(Response::new(RepairDirectoryIndexResponse {
+            status: directory_repair::status_name(&report.status).to_string(),
+            bucket_name: report.bucket_name,
+            source_cursor_low,
+            source_cursor_high,
+            expected_entry_count: report.expected.entry_count as u64,
+            actual_entry_count: report
+                .actual
+                .as_ref()
+                .map(|snapshot| snapshot.entry_count as u64)
+                .unwrap_or_default(),
+            expected_snapshot_hash: report.expected.snapshot_hash,
+            actual_snapshot_hash: report
+                .actual
+                .as_ref()
+                .map(|snapshot| snapshot.snapshot_hash.clone())
+                .unwrap_or_default(),
+            reason: directory_repair::status_reason(&report.status),
+            finding: report.finding.as_ref().map(repair_finding_record),
+            rebuilt_manifest_hash: report
+                .rebuilt
+                .as_ref()
+                .map(|rebuilt| rebuilt.manifest_hash.clone())
+                .unwrap_or_default(),
         }))
     }
 
