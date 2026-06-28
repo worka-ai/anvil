@@ -31,6 +31,9 @@ use crate::{
         write_projection_definition,
     },
     personaldb_projection_builder::{ProjectionBuildInput, build_projection_changeset},
+    personaldb_projection_writeback::{
+        ProjectionWriteBackInput, build_projection_writeback_changeset,
+    },
     personaldb_row_index::{PersonalDbRowIndexWrite, write_personaldb_row_index},
     personaldb_schema::{
         read_personaldb_schema_sql, validate_changeset_tables_registered, validate_schema_sql,
@@ -348,7 +351,7 @@ impl PersonalDbService for AppState {
         .map_err(internal_status)?;
         if !projection_definitions.is_empty() {
             return self
-                .reject_personaldb_projection_writeback(core_request, actor, projection_definitions)
+                .handle_personaldb_projection_writeback(core_request, actor, projection_definitions)
                 .await;
         }
         let source_database_id = core_request.database_id.clone();
@@ -365,18 +368,7 @@ impl PersonalDbService for AppState {
             committed.authz_revision,
         )
         .await?;
-        let (watch_cursor_low, watch_cursor_high) = split_u128(committed.watch_cursor);
-        Ok(Response::new(SubmitPersonalDbChangesetResponse {
-            log_index: committed.log_index,
-            log_hash: committed.log_hash,
-            changeset_payload_hash: committed.changeset_payload_hash,
-            verified_envelope_hash: committed.verified_envelope_hash,
-            certificate_hash: committed.certificate_hash,
-            certificate: Some(certificate_record(committed.certificate)),
-            committed_head: Some(committed_head_record(committed.committed_head)),
-            watch_cursor_low,
-            watch_cursor_high,
-        }))
+        Ok(submit_changeset_response(committed))
     }
 
     async fn catch_up_personal_db(
@@ -545,7 +537,7 @@ impl AppState {
         self.config.anvil_secret_encryption_key.as_bytes()
     }
 
-    async fn reject_personaldb_projection_writeback(
+    async fn handle_personaldb_projection_writeback(
         &self,
         request: CoreSubmitChangeset,
         actor: PersonalDbCommitActor,
@@ -576,10 +568,139 @@ impl AppState {
             WriteBackPolicy::Deny => Err(projection_writeback_rejected(
                 "projection write-back is denied by projection policy",
             )),
-            WriteBackPolicy::AllowMappedColumns { .. } => Err(projection_writeback_rejected(
-                "projection write-back translation is not available for this projection",
-            )),
+            WriteBackPolicy::AllowMappedColumns { .. } => {
+                self.commit_personaldb_projection_writeback(validated.request, actor, definition)
+                    .await
+            }
         }
+    }
+
+    async fn commit_personaldb_projection_writeback(
+        &self,
+        request: CoreSubmitChangeset,
+        actor: PersonalDbCommitActor,
+        definition: ProjectionDefinition,
+    ) -> Result<Response<SubmitPersonalDbChangesetResponse>, Status> {
+        let signing_key = self.personaldb_signing_key();
+        let projection_manifest = read_personaldb_group_manifest(
+            &self.storage,
+            actor.tenant_id,
+            &definition.database_id,
+            signing_key,
+        )
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::not_found("PersonalDB projection group not found"))?;
+        let projection_head = read_personaldb_committed_head(
+            &self.storage,
+            actor.tenant_id,
+            &definition.database_id,
+            signing_key,
+        )
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::failed_precondition("PersonalDB projection head missing"))?;
+        if projection_head.log_index != request.base_log_index
+            || projection_head.log_hash != request.base_log_hash
+        {
+            return Err(projection_writeback_rejected(
+                "projection write-back base does not match projection head",
+            ));
+        }
+        let target_schema_sql = read_personaldb_schema_sql(
+            &self.storage,
+            actor.tenant_id,
+            &definition.database_id,
+            &projection_manifest.schema_hash,
+        )
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::failed_precondition("PersonalDB projection schema SQL missing"))?;
+        let source_database_id = single_projection_writeback_source(&definition)?;
+        let source_manifest = read_personaldb_group_manifest(
+            &self.storage,
+            actor.tenant_id,
+            &source_database_id,
+            signing_key,
+        )
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::not_found("PersonalDB source group not found"))?;
+        let source_head = read_personaldb_committed_head(
+            &self.storage,
+            actor.tenant_id,
+            &source_database_id,
+            signing_key,
+        )
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::failed_precondition("PersonalDB source head missing"))?;
+        let source_schema_sql = read_personaldb_schema_sql(
+            &self.storage,
+            actor.tenant_id,
+            &source_database_id,
+            &source_manifest.schema_hash,
+        )
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::failed_precondition("PersonalDB source schema SQL missing"))?;
+        let writeback = build_projection_writeback_changeset(ProjectionWriteBackInput {
+            source_schema_sql: &source_schema_sql,
+            target_schema_sql: &target_schema_sql,
+            definition: &definition,
+            projection_changeset_bytes: &request.changeset_bytes,
+        })
+        .map_err(|err| projection_writeback_rejected_owned(err.to_string()))?;
+        if writeback.source_database_id != source_database_id {
+            return Err(projection_writeback_rejected(
+                "projection write-back source binding changed during translation",
+            ));
+        }
+        let payload_hash = hash32(&writeback.changeset_bytes);
+        let source_request = CoreSubmitChangeset {
+            tenant_id: actor.tenant_id,
+            database_id: source_database_id.clone(),
+            principal: request.principal,
+            session_token: request.session_token,
+            request_id: format!(
+                "projection-writeback:{}:{}",
+                definition.projection_id, request.request_id
+            ),
+            idempotency_key: format!(
+                "projection-writeback:{}:{}",
+                definition.projection_id, request.idempotency_key
+            ),
+            base_log_index: source_head.log_index,
+            base_log_hash: source_head.log_hash.clone(),
+            client_log_epoch: source_head.log_index.saturating_add(1),
+            membership_epoch: source_manifest.active_membership_epoch,
+            policy_epoch: source_manifest.active_policy_epoch,
+            leader_replica_id: request.leader_replica_id,
+            voter_acks: vec![crate::personaldb_submit::PersonalDbVoterAck {
+                replica_id: "projection-writeback".to_string(),
+                log_index: source_head.log_index.saturating_add(1),
+                log_hash: hex::encode(payload_hash),
+                signature: "projection-writeback".to_string(),
+            }],
+            changeset_payload_hash: hex::encode(payload_hash),
+            changeset_bytes: writeback.changeset_bytes,
+            client_debug_metadata: request.client_debug_metadata,
+        };
+        let source_changeset_bytes = source_request.changeset_bytes.clone();
+        let tenant_id = actor.tenant_id;
+        let committed = self
+            .commit_personaldb_changeset(source_request, actor)
+            .await?;
+        self.build_personaldb_projections_for_source_commit(
+            tenant_id,
+            &source_database_id,
+            &source_changeset_bytes,
+            committed.log_index,
+            &committed.log_hash,
+            committed.authz_revision,
+        )
+        .await?;
+        Ok(submit_changeset_response(committed))
     }
 
     async fn commit_personaldb_changeset(
@@ -1458,6 +1579,44 @@ fn projection_writeback_rejected(reason: &'static str) -> Status {
         "{}: {reason}",
         AnvilErrorCode::PersonalDbProjectionWriteBackRejected
     ))
+}
+
+fn projection_writeback_rejected_owned(reason: String) -> Status {
+    Status::failed_precondition(format!(
+        "{}: {reason}",
+        AnvilErrorCode::PersonalDbProjectionWriteBackRejected
+    ))
+}
+
+fn single_projection_writeback_source(definition: &ProjectionDefinition) -> Result<String, Status> {
+    let sources = definition
+        .table_mappings
+        .iter()
+        .map(|mapping| mapping.source_database_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if sources.len() != 1 {
+        return Err(projection_writeback_rejected(
+            "projection write-back has ambiguous source database bindings",
+        ));
+    }
+    Ok(sources.into_iter().next().expect("one source database"))
+}
+
+fn submit_changeset_response(
+    committed: CommittedPersonalDbChangeset,
+) -> Response<SubmitPersonalDbChangesetResponse> {
+    let (watch_cursor_low, watch_cursor_high) = split_u128(committed.watch_cursor);
+    Response::new(SubmitPersonalDbChangesetResponse {
+        log_index: committed.log_index,
+        log_hash: committed.log_hash,
+        changeset_payload_hash: committed.changeset_payload_hash,
+        verified_envelope_hash: committed.verified_envelope_hash,
+        certificate_hash: committed.certificate_hash,
+        certificate: Some(certificate_record(committed.certificate)),
+        committed_head: Some(committed_head_record(committed.committed_head)),
+        watch_cursor_low,
+        watch_cursor_high,
+    })
 }
 
 fn projection_response(
