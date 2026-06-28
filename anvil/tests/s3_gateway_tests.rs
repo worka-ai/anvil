@@ -623,6 +623,97 @@ async fn test_s3_put_triggers_full_text_index_build() {
 }
 
 #[tokio::test]
+async fn test_s3_put_metadata_field_triggers_full_text_index_build() {
+    let mut cluster = TestCluster::new(&["s3-metadata-index-region"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let app_name = format!("s3-metadata-index-{}", uuid::Uuid::new_v4());
+    let (client_id, client_secret) = create_app(&cluster.admin_state_path, &app_name);
+    grant_wildcard_policy(&cluster.admin_state_path, &app_name);
+
+    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
+    let client = s3_client(http_base, &client_id, &client_secret);
+    let bucket = format!("s3-metadata-index-{}", uuid::Uuid::new_v4());
+    client
+        .create_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("S3 CreateBucket should succeed");
+
+    let mut index_client = IndexServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    index_client
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket_name: bucket.clone(),
+                name: "owner".to_string(),
+                kind: "full_text".to_string(),
+                selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
+                extractor_json: serde_json::json!({
+                    "source": "metadata_field",
+                    "field": "owner"
+                })
+                .to_string(),
+                authorization_mode: "index_only".to_string(),
+                build_policy_json: serde_json::json!({"positions": true}).to_string(),
+            },
+            &cluster.token,
+        ))
+        .await
+        .unwrap();
+
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key("docs/s3-metadata.txt")
+        .metadata("owner", "alice portfolio")
+        .body(ByteStream::from_static(
+            b"body intentionally does not contain the indexed owner",
+        ))
+        .send()
+        .await
+        .expect("S3 PUT should succeed");
+
+    let mut indexed = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline {
+        let query = index_client
+            .query_index(authorized(
+                QueryIndexRequest {
+                    bucket_name: bucket.clone(),
+                    index_name: "owner".to_string(),
+                    query_text: "alice portfolio".to_string(),
+                    query_vector: vec![],
+                    limit: 10,
+                    phrase: false,
+                },
+                &cluster.token,
+            ))
+            .await;
+        if let Ok(query) = query {
+            let response = query.into_inner();
+            if response
+                .hits
+                .iter()
+                .any(|hit| hit.object_key == "docs/s3-metadata.txt")
+            {
+                indexed = Some(response);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let response =
+        indexed.expect("S3 metadata field should be searchable after index task completes");
+    assert_eq!(response.index_kind, "full_text");
+    assert!(response.index_generation >= 1);
+    assert_eq!(response.hits[0].object_key, "docs/s3-metadata.txt");
+}
+
+#[tokio::test]
 async fn test_s3_put_triggers_vector_index_build() {
     let mut cluster = TestCluster::new(&["s3-vector-index-region"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;

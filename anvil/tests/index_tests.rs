@@ -334,6 +334,111 @@ async fn test_full_text_index_builds_from_object_write_task() {
 }
 
 #[tokio::test]
+async fn test_full_text_index_build_extracts_json_pointer_from_object_write_task() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut index_client = IndexServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr).await.unwrap();
+
+    let bucket_name = format!("json-pointer-index-build-{}", uuid::Uuid::new_v4());
+    bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    index_client
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket_name: bucket_name.clone(),
+                name: "summary".to_string(),
+                kind: "full_text".to_string(),
+                selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
+                extractor_json: serde_json::json!({
+                    "source": "json_pointer",
+                    "pointer": "/summary"
+                })
+                .to_string(),
+                authorization_mode: "index_only".to_string(),
+                build_policy_json: serde_json::json!({"positions": true}).to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let chunks = vec![
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                ObjectMetadata {
+                    bucket_name: bucket_name.clone(),
+                    object_key: "docs/report.json".to_string(),
+                },
+            )),
+        },
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                br#"{"summary":"quarterly tenant retention analysis","body":"ignored"}"#.to_vec(),
+            )),
+        },
+    ];
+    let mut put_req = Request::new(tokio_stream::iter(chunks));
+    put_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {token}").parse().expect("valid token"),
+    );
+    object_client.put_object(put_req).await.unwrap();
+
+    let mut final_response = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline {
+        let response = index_client
+            .query_index(authorized(
+                QueryIndexRequest {
+                    bucket_name: bucket_name.clone(),
+                    index_name: "summary".to_string(),
+                    query_text: "tenant retention".to_string(),
+                    query_vector: vec![],
+                    limit: 10,
+                    phrase: false,
+                },
+                &token,
+            ))
+            .await;
+        if let Ok(response) = response {
+            let response = response.into_inner();
+            if response
+                .hits
+                .iter()
+                .any(|hit| hit.object_key == "docs/report.json")
+            {
+                final_response = Some(response);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let response =
+        final_response.expect("json_pointer text extraction should make object searchable");
+    assert_eq!(response.index_kind, "full_text");
+    assert_eq!(response.hits[0].object_key, "docs/report.json");
+    assert!(response.hits[0].score > 0.0);
+}
+
+#[tokio::test]
 async fn test_vector_index_builds_from_object_write_task() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;

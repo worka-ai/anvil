@@ -57,6 +57,24 @@ struct OwnedFullTextDocument {
 }
 
 #[derive(Debug, Clone)]
+struct ExtractedTextField {
+    text: String,
+}
+
+#[derive(Debug, Clone)]
+struct TextExtractionDiagnostic {
+    code: String,
+    message: String,
+    details: JsonValue,
+}
+
+#[derive(Debug, Clone)]
+struct TextExtraction {
+    fields: Vec<ExtractedTextField>,
+    diagnostics: Vec<TextExtractionDiagnostic>,
+}
+
+#[derive(Debug, Clone)]
 struct OwnedVectorDocument {
     vector_id: u64,
     object_version_id: [u8; 16],
@@ -100,6 +118,7 @@ pub async fn build_full_text_index(
         metadata_journal::read_current_objects(storage, bucket, partition_owner_signing_key)
             .await?;
     let mut owned_documents = Vec::new();
+    let mut diagnostics = Vec::new();
     for object in objects {
         if object.deleted_at.is_some() || !selector_matches(&index.selector, &object) {
             continue;
@@ -107,12 +126,44 @@ pub async fn build_full_text_index(
         let Some(payload) = read_object_payload(storage, &object).await? else {
             continue;
         };
-        let Ok(payload_text) = String::from_utf8(payload) else {
-            continue;
+        let payload_text = match String::from_utf8(payload) {
+            Ok(text) => text,
+            Err(error) => {
+                diagnostics.push(IndexBuildDiagnostic {
+                    object_key: object.key.clone(),
+                    version_id: Some(object.version_id),
+                    severity: "error".to_string(),
+                    code: "TextPayloadNotUtf8".to_string(),
+                    message: "object body is not valid UTF-8 for text extraction".to_string(),
+                    details: serde_json::json!({ "error": error.to_string() }),
+                });
+                continue;
+            }
         };
         let extracted = extract_text_fields(&index.extractor, &object, &payload_text);
-        for (field_idx, text) in extracted.into_iter().enumerate() {
-            if text.trim().is_empty() {
+        let diagnostic_count = extracted.diagnostics.len();
+        for diagnostic in extracted.diagnostics {
+            diagnostics.push(IndexBuildDiagnostic {
+                object_key: object.key.clone(),
+                version_id: Some(object.version_id),
+                severity: "warning".to_string(),
+                code: diagnostic.code,
+                message: diagnostic.message,
+                details: diagnostic.details,
+            });
+        }
+        if extracted.fields.is_empty() && diagnostic_count == 0 {
+            diagnostics.push(IndexBuildDiagnostic {
+                object_key: object.key.clone(),
+                version_id: Some(object.version_id),
+                severity: "warning".to_string(),
+                code: "TextExtractionEmpty".to_string(),
+                message: "text extractor produced no fields for object version".to_string(),
+                details: serde_json::json!({ "extractor": index.extractor }),
+            });
+        }
+        for (field_idx, field) in extracted.fields.into_iter().enumerate() {
+            if field.text.trim().is_empty() {
                 continue;
             }
             let field_id = u16::try_from(field_idx.saturating_add(1)).unwrap_or(u16::MAX);
@@ -123,7 +174,7 @@ pub async fn build_full_text_index(
                 authz_label_hash: object_authz_label_hash(bucket, &object),
                 authz_revision: object.authz_revision,
                 object_key: object.key.clone(),
-                text,
+                text: field.text,
             });
         }
     }
@@ -224,7 +275,7 @@ pub async fn build_full_text_index(
         item_count: owned_documents.len(),
         source_cursor,
         segment_hashes: vec![segment_hash],
-        diagnostics: Vec::new(),
+        diagnostics,
     })
 }
 
@@ -812,37 +863,174 @@ fn selector_matches(selector: &JsonValue, object: &Object) -> bool {
     true
 }
 
-fn extract_text_fields(extractor: &JsonValue, object: &Object, payload_text: &str) -> Vec<String> {
-    if let Some(fields) = extractor.get("fields").and_then(JsonValue::as_array) {
-        return fields
-            .iter()
-            .filter_map(|field| {
-                let source = field
-                    .get("source")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or("object_body_utf8");
-                extract_text_source(source, object, payload_text)
-            })
-            .collect();
+fn extract_text_fields(
+    extractor: &JsonValue,
+    object: &Object,
+    payload_text: &str,
+) -> TextExtraction {
+    let mut fields = Vec::new();
+    let mut diagnostics = Vec::new();
+    if let Some(field_specs) = extractor.get("fields").and_then(JsonValue::as_array) {
+        for (idx, field) in field_specs.iter().enumerate() {
+            let source = field
+                .get("source")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("object_body_utf8");
+            match extract_text_source(source, field, object, payload_text) {
+                Ok(Some(text)) => fields.push(ExtractedTextField { text }),
+                Ok(None) => {}
+                Err(diagnostic) => diagnostics.push(TextExtractionDiagnostic {
+                    details: merge_details(
+                        diagnostic.details,
+                        serde_json::json!({ "field_index": idx }),
+                    ),
+                    ..diagnostic
+                }),
+            }
+        }
+        return TextExtraction {
+            fields,
+            diagnostics,
+        };
     }
     if let Some(source) = extractor.get("source").and_then(JsonValue::as_str) {
-        return extract_text_source(source, object, payload_text)
-            .into_iter()
-            .collect();
+        match extract_text_source(source, extractor, object, payload_text) {
+            Ok(Some(text)) => fields.push(ExtractedTextField { text }),
+            Ok(None) => {}
+            Err(diagnostic) => diagnostics.push(diagnostic),
+        }
+        return TextExtraction {
+            fields,
+            diagnostics,
+        };
     }
     if extractor.get("encoding").and_then(JsonValue::as_str) == Some("utf8") {
-        return vec![payload_text.to_string()];
+        fields.push(ExtractedTextField {
+            text: payload_text.to_string(),
+        });
+        return TextExtraction {
+            fields,
+            diagnostics,
+        };
     }
-    vec![payload_text.to_string()]
+    fields.push(ExtractedTextField {
+        text: payload_text.to_string(),
+    });
+    TextExtraction {
+        fields,
+        diagnostics,
+    }
 }
 
-fn extract_text_source(source: &str, object: &Object, payload_text: &str) -> Option<String> {
+fn extract_text_source(
+    source: &str,
+    extractor: &JsonValue,
+    object: &Object,
+    payload_text: &str,
+) -> Result<Option<String>, TextExtractionDiagnostic> {
     match source {
-        "object_body_utf8" | "utf8" | "body" => Some(payload_text.to_string()),
-        "object_key" | "key" => Some(object.key.clone()),
-        "content_type" => object.content_type.clone(),
-        _ => None,
+        "object_body_utf8" | "utf8" | "body" => Ok(Some(payload_text.to_string())),
+        "object_key" | "key" => Ok(Some(object.key.clone())),
+        "content_type" => Ok(object.content_type.clone()),
+        "json_pointer" => extract_json_pointer_text(extractor, payload_text),
+        "metadata_field" => extract_metadata_field_text(extractor, object),
+        other => Err(TextExtractionDiagnostic {
+            code: "UnsupportedTextExtractor".to_string(),
+            message: format!("unsupported text extractor source `{other}`"),
+            details: serde_json::json!({ "source": other }),
+        }),
     }
+}
+
+fn extract_json_pointer_text(
+    extractor: &JsonValue,
+    payload_text: &str,
+) -> Result<Option<String>, TextExtractionDiagnostic> {
+    let pointer = extractor
+        .get("json_pointer")
+        .or_else(|| extractor.get("pointer"))
+        .or_else(|| extractor.get("path"))
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| TextExtractionDiagnostic {
+            code: "JsonPointerMissing".to_string(),
+            message: "json_pointer text extractor requires a JSON pointer".to_string(),
+            details: serde_json::json!({ "extractor": extractor }),
+        })?;
+    let body = serde_json::from_str::<JsonValue>(payload_text).map_err(|error| {
+        TextExtractionDiagnostic {
+            code: "JsonPointerDecodeFailed".to_string(),
+            message: "object body is not valid JSON for json_pointer text extraction".to_string(),
+            details: serde_json::json!({ "pointer": pointer, "error": error.to_string() }),
+        }
+    })?;
+    let Some(value) = body.pointer(pointer) else {
+        return Err(TextExtractionDiagnostic {
+            code: "JsonPointerNotFound".to_string(),
+            message: "JSON pointer did not match a value in the object body".to_string(),
+            details: serde_json::json!({ "pointer": pointer }),
+        });
+    };
+    Ok(json_value_to_text(value))
+}
+
+fn extract_metadata_field_text(
+    extractor: &JsonValue,
+    object: &Object,
+) -> Result<Option<String>, TextExtractionDiagnostic> {
+    let field = extractor
+        .get("field")
+        .or_else(|| extractor.get("metadata_field"))
+        .or_else(|| extractor.get("key"))
+        .or_else(|| extractor.get("path"))
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| TextExtractionDiagnostic {
+            code: "MetadataFieldMissing".to_string(),
+            message: "metadata_field text extractor requires a field name".to_string(),
+            details: serde_json::json!({ "extractor": extractor }),
+        })?;
+    let Some(metadata) = object.user_meta.as_ref() else {
+        return Err(TextExtractionDiagnostic {
+            code: "MetadataFieldNotFound".to_string(),
+            message: "object has no user metadata for metadata_field text extraction".to_string(),
+            details: serde_json::json!({ "field": field }),
+        });
+    };
+    let value = if field.starts_with('/') {
+        metadata.pointer(field)
+    } else {
+        metadata.get(field)
+    };
+    let Some(value) = value else {
+        return Err(TextExtractionDiagnostic {
+            code: "MetadataFieldNotFound".to_string(),
+            message: "metadata field did not match a value in object user metadata".to_string(),
+            details: serde_json::json!({ "field": field }),
+        });
+    };
+    Ok(json_value_to_text(value))
+}
+
+fn json_value_to_text(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::Null => None,
+        JsonValue::String(value) => Some(value.clone()),
+        JsonValue::Number(value) => Some(value.to_string()),
+        JsonValue::Bool(value) => Some(value.to_string()),
+        JsonValue::Array(_) | JsonValue::Object(_) => Some(value.to_string()),
+    }
+}
+
+fn merge_details(left: JsonValue, right: JsonValue) -> JsonValue {
+    let mut merged = serde_json::Map::new();
+    if let JsonValue::Object(values) = left {
+        merged.extend(values);
+    } else if !left.is_null() {
+        merged.insert("details".to_string(), left);
+    }
+    if let JsonValue::Object(values) = right {
+        merged.extend(values);
+    }
+    JsonValue::Object(merged)
 }
 
 async fn read_object_payload(storage: &Storage, object: &Object) -> Result<Option<Vec<u8>>> {
@@ -940,7 +1128,56 @@ mod tests {
             &object,
             "alpha body",
         );
-        assert_eq!(fields, vec!["alpha body", "docs/a.txt", "text/plain"]);
+        assert_eq!(
+            fields
+                .fields
+                .into_iter()
+                .map(|field| field.text)
+                .collect::<Vec<_>>(),
+            vec!["alpha body", "docs/a.txt", "text/plain"]
+        );
+        assert!(fields.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn extractor_supports_json_pointer_and_metadata_fields() {
+        let mut object = object("docs/a.json", Some("application/json"));
+        object.user_meta = Some(serde_json::json!({
+            "owner": "alice",
+            "nested": {"department": "legal"}
+        }));
+        let fields = extract_text_fields(
+            &serde_json::json!({
+                "fields": [
+                    {"source": "json_pointer", "pointer": "/summary"},
+                    {"source": "metadata_field", "field": "owner"},
+                    {"source": "metadata_field", "field": "/nested/department"}
+                ]
+            }),
+            &object,
+            r#"{"summary":"lease renewal due","ignored":true}"#,
+        );
+        assert_eq!(
+            fields
+                .fields
+                .into_iter()
+                .map(|field| field.text)
+                .collect::<Vec<_>>(),
+            vec!["lease renewal due", "alice", "legal"]
+        );
+        assert!(fields.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn extractor_reports_missing_json_pointer() {
+        let object = object("docs/a.json", Some("application/json"));
+        let fields = extract_text_fields(
+            &serde_json::json!({"source": "json_pointer", "pointer": "/missing"}),
+            &object,
+            r#"{"summary":"present"}"#,
+        );
+        assert!(fields.fields.is_empty());
+        assert_eq!(fields.diagnostics[0].code, "JsonPointerNotFound");
     }
 
     fn object(key: &str, content_type: Option<&str>) -> Object {
