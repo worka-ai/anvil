@@ -2,6 +2,7 @@ use crate::formats::{
     BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, Hash32, JournalFrame, JournalRecordKind,
     hash32, validate_journal_chain,
 };
+use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
 use crate::persistence::TaskRecord;
 use crate::storage::Storage;
 use crate::tasks::{TaskStatus, TaskType};
@@ -16,7 +17,7 @@ use tokio::io::AsyncWriteExt;
 #[derive(Debug, Serialize)]
 struct TaskJournalHeader<'a> {
     partition_family: &'static str,
-    partition_id: &'static str,
+    partition_id: String,
     fence_token: u64,
     first_sequence: u64,
     created_at: &'a str,
@@ -58,6 +59,29 @@ pub async fn enqueue_task(
     payload: JsonValue,
     priority: i32,
 ) -> Result<()> {
+    enqueue_task_inner(storage, task_type, payload, priority, 0).await
+}
+
+pub async fn enqueue_task_with_permit(
+    storage: &Storage,
+    task_type: TaskType,
+    payload: JsonValue,
+    priority: i32,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<()> {
+    require_task_queue_permit(permit)?;
+    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
+    enqueue_task_inner(storage, task_type, payload, priority, permit.fence_token).await
+}
+
+async fn enqueue_task_inner(
+    storage: &Storage,
+    task_type: TaskType,
+    payload: JsonValue,
+    priority: i32,
+    fence_token: u64,
+) -> Result<()> {
     let state = read_task_queue_state(storage).await?;
     let now = Utc::now();
     let task = TaskRecord {
@@ -72,10 +96,29 @@ pub async fn enqueue_task(
         created_at: now,
         updated_at: now,
     };
-    append_task_event(storage, TaskJournalBody::Enqueued { task }).await
+    append_task_event(storage, TaskJournalBody::Enqueued { task }, fence_token).await
 }
 
 pub async fn claim_pending_tasks(storage: &Storage, limit: i64) -> Result<Vec<TaskRecord>> {
+    claim_pending_tasks_inner(storage, limit, 0).await
+}
+
+pub async fn claim_pending_tasks_with_permit(
+    storage: &Storage,
+    limit: i64,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<Vec<TaskRecord>> {
+    require_task_queue_permit(permit)?;
+    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
+    claim_pending_tasks_inner(storage, limit, permit.fence_token).await
+}
+
+async fn claim_pending_tasks_inner(
+    storage: &Storage,
+    limit: i64,
+    fence_token: u64,
+) -> Result<Vec<TaskRecord>> {
     let state = read_task_queue_state(storage).await?;
     let now = Utc::now();
     let mut tasks = state
@@ -98,6 +141,7 @@ pub async fn claim_pending_tasks(storage: &Storage, limit: i64) -> Result<Vec<Ta
                 task_id: task.id,
                 updated_at: now,
             },
+            fence_token,
         )
         .await?;
     }
@@ -116,6 +160,27 @@ pub async fn list_tasks(storage: &Storage) -> Result<Vec<TaskRecord>> {
 }
 
 pub async fn update_task_status(storage: &Storage, task_id: i64, status: TaskStatus) -> Result<()> {
+    update_task_status_inner(storage, task_id, status, 0).await
+}
+
+pub async fn update_task_status_with_permit(
+    storage: &Storage,
+    task_id: i64,
+    status: TaskStatus,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<()> {
+    require_task_queue_permit(permit)?;
+    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
+    update_task_status_inner(storage, task_id, status, permit.fence_token).await
+}
+
+async fn update_task_status_inner(
+    storage: &Storage,
+    task_id: i64,
+    status: TaskStatus,
+    fence_token: u64,
+) -> Result<()> {
     if !read_task_queue_state(storage)
         .await?
         .tasks
@@ -130,11 +195,33 @@ pub async fn update_task_status(storage: &Storage, task_id: i64, status: TaskSta
             status,
             updated_at: Utc::now(),
         },
+        fence_token,
     )
     .await
 }
 
 pub async fn fail_task(storage: &Storage, task_id: i64, error: &str) -> Result<()> {
+    fail_task_inner(storage, task_id, error, 0).await
+}
+
+pub async fn fail_task_with_permit(
+    storage: &Storage,
+    task_id: i64,
+    error: &str,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<()> {
+    require_task_queue_permit(permit)?;
+    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
+    fail_task_inner(storage, task_id, error, permit.fence_token).await
+}
+
+async fn fail_task_inner(
+    storage: &Storage,
+    task_id: i64,
+    error: &str,
+    fence_token: u64,
+) -> Result<()> {
     let Some(task) = read_task_queue_state(storage)
         .await?
         .tasks
@@ -155,6 +242,7 @@ pub async fn fail_task(storage: &Storage, task_id: i64, error: &str) -> Result<(
             scheduled_at: now + chrono::Duration::seconds(retry_delay),
             updated_at: now,
         },
+        fence_token,
     )
     .await
 }
@@ -172,12 +260,16 @@ async fn read_task_queue_state(storage: &Storage) -> Result<TaskQueueState> {
     Ok(state)
 }
 
-async fn append_task_event(storage: &Storage, event: TaskJournalBody) -> Result<()> {
+async fn append_task_event(
+    storage: &Storage,
+    event: TaskJournalBody,
+    fence_token: u64,
+) -> Result<()> {
     let path = storage.task_queue_journal_path();
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    ensure_journal_header(&path).await?;
+    ensure_journal_header(&path, fence_token).await?;
     let previous = read_task_journal_frames_at_path(path.as_path())
         .await
         .unwrap_or_default();
@@ -194,7 +286,7 @@ async fn append_task_event(storage: &Storage, event: TaskJournalBody) -> Result<
     let frame = JournalFrame::new(
         JournalRecordKind::TaskQueue,
         sequence,
-        0,
+        fence_token,
         *mutation_id.as_bytes(),
         key_hash,
         previous_hash,
@@ -210,15 +302,15 @@ async fn append_task_event(storage: &Storage, event: TaskJournalBody) -> Result<
     Ok(())
 }
 
-async fn ensure_journal_header(path: &Path) -> Result<()> {
+async fn ensure_journal_header(path: &Path, fence_token: u64) -> Result<()> {
     if tokio::fs::try_exists(path).await? {
         return Ok(());
     }
     let created_at = Utc::now().to_rfc3339();
     let header_json = serde_json::to_vec(&TaskJournalHeader {
         partition_family: "task_queue",
-        partition_id: "global",
-        fence_token: 0,
+        partition_id: hex::encode(task_queue_partition_id()),
+        fence_token,
         first_sequence: 1,
         created_at: &created_at,
         codec: "none",
@@ -337,11 +429,29 @@ fn event_key_hash(event: &TaskJournalBody) -> Hash32 {
     }
 }
 
+fn task_queue_partition_id() -> Hash32 {
+    hash32(b"task_queue/global")
+}
+
+fn require_task_queue_permit(permit: &PartitionWritePermit) -> Result<()> {
+    if permit.partition_family != "task_queue"
+        || permit.partition_id != hex::encode(task_queue_partition_id())
+    {
+        anyhow::bail!("task queue write permit targets a different partition");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::partition_fence::{
+        PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
+    };
     use serde_json::json;
     use tempfile::tempdir;
+
+    const KEY: &[u8] = b"task queue partition owner key";
 
     #[tokio::test]
     async fn task_journal_claims_and_replays_queue_state() {
@@ -381,5 +491,113 @@ mod tests {
         assert_eq!(tasks[1].status, TaskStatus::Failed);
         assert_eq!(tasks[1].attempts, 1);
         assert_eq!(tasks[1].last_error.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn task_journal_with_permit_writes_fenced_frames_and_header() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let owner = ready_owner(&storage, "node-a").await;
+        let permit = owner.write_permit().unwrap();
+
+        enqueue_task_with_permit(
+            &storage,
+            TaskType::DeleteBucket,
+            json!({"bucket_id": 7}),
+            100,
+            &permit,
+            KEY,
+        )
+        .await
+        .unwrap();
+        let claimed = claim_pending_tasks_with_permit(&storage, 1, &permit, KEY)
+            .await
+            .unwrap();
+        update_task_status_with_permit(
+            &storage,
+            claimed[0].id,
+            TaskStatus::Completed,
+            &permit,
+            KEY,
+        )
+        .await
+        .unwrap();
+
+        let journal = tokio::fs::read(storage.task_queue_journal_path())
+            .await
+            .unwrap();
+        let header = BinaryEnvelopeHeader::decode(&journal).unwrap();
+        let header_json: serde_json::Value = serde_json::from_slice(&header.header_json).unwrap();
+        assert_eq!(header_json["partition_family"], "task_queue");
+        assert_eq!(header_json["partition_id"], permit.partition_id);
+        assert_eq!(header_json["fence_token"], permit.fence_token);
+
+        let frames = decode_journal_file(&journal).unwrap();
+        assert_eq!(frames.len(), 3);
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.fence_token == permit.fence_token)
+        );
+    }
+
+    #[tokio::test]
+    async fn task_journal_with_permit_rejects_stale_fence() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let owner = ready_owner(&storage, "node-a").await;
+        let stale_permit = owner.write_permit().unwrap();
+        let newer = ready_owner(&storage, "node-b").await;
+        assert!(newer.fence_token > stale_permit.fence_token);
+
+        let err = enqueue_task_with_permit(
+            &storage,
+            TaskType::DeleteBucket,
+            json!({"bucket_id": 7}),
+            100,
+            &stale_permit,
+            KEY,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("write permit owner is not current")
+        );
+    }
+
+    async fn ready_owner(
+        storage: &Storage,
+        owner_node_id: &str,
+    ) -> crate::partition_fence::PartitionOwnerState {
+        let family = "task_queue".to_string();
+        let id = hex::encode(task_queue_partition_id());
+        let recovering = acquire_partition_recovery(
+            storage,
+            PartitionRecoveryAcquire {
+                partition_family: family.clone(),
+                partition_id: id.clone(),
+                owner_node_id: owner_node_id.to_string(),
+                recovered_through_sequence: 0,
+                recovered_manifest_hash: hex::encode([0; 32]),
+                now_nanos: 100,
+            },
+            KEY,
+        )
+        .await
+        .unwrap();
+        publish_partition_ready(
+            storage,
+            &family,
+            &id,
+            owner_node_id,
+            recovering.fence_token,
+            0,
+            &hex::encode([1; 32]),
+            200,
+            KEY,
+        )
+        .await
+        .unwrap()
     }
 }
