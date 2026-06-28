@@ -1,6 +1,8 @@
 use crate::anvil_api::git_source_service_server::GitSourceService;
 use crate::anvil_api::*;
-use crate::{AppState, auth, git_source_watch, permissions::AnvilAction};
+use crate::{
+    AppState, auth, git_source_index, git_source_query, git_source_watch, permissions::AnvilAction,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -10,6 +12,76 @@ impl GitSourceService for AppState {
     type WatchGitSourceStream = std::pin::Pin<
         Box<dyn futures_core::Stream<Item = Result<WatchGitSourceResponse, Status>> + Send>,
     >;
+
+    async fn get_git_object(
+        &self,
+        request: Request<GetGitObjectRequest>,
+    ) -> Result<Response<GetGitObjectResponse>, Status> {
+        let claims = authorize_git_source_read(&request)?;
+        let req = request.into_inner();
+        validate_component("repository_id", &req.repository_id)?;
+        ensure_git_source_read(&claims, &req.repository_id)?;
+        let object_id = parse_git_hex_id("object_id", &req.object_id)?;
+        let index = self
+            .latest_git_source_index(claims.tenant_id, &req.repository_id)
+            .await?;
+        let locations = git_source_query::get_git_object(&index, &object_id)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?
+            .into_iter()
+            .map(git_blob_location)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Response::new(GetGitObjectResponse { locations }))
+    }
+
+    async fn get_git_blob_by_path(
+        &self,
+        request: Request<GetGitBlobByPathRequest>,
+    ) -> Result<Response<GetGitBlobByPathResponse>, Status> {
+        let claims = authorize_git_source_read(&request)?;
+        let req = request.into_inner();
+        validate_component("repository_id", &req.repository_id)?;
+        ensure_git_source_read(&claims, &req.repository_id)?;
+        let commit_id = parse_git_hex_id("commit_id", &req.commit_id)?;
+        let index = self
+            .latest_git_source_index(claims.tenant_id, &req.repository_id)
+            .await?;
+        let location = git_source_query::get_git_blob_by_path(&index, &commit_id, &req.tree_path)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?
+            .ok_or_else(|| Status::not_found("Git blob path not found"))?;
+
+        Ok(Response::new(GetGitBlobByPathResponse {
+            location: Some(git_blob_location(location)?),
+        }))
+    }
+
+    async fn list_git_tree(
+        &self,
+        request: Request<ListGitTreeRequest>,
+    ) -> Result<Response<ListGitTreeResponse>, Status> {
+        let claims = authorize_git_source_read(&request)?;
+        let req = request.into_inner();
+        validate_component("repository_id", &req.repository_id)?;
+        ensure_git_source_read(&claims, &req.repository_id)?;
+        let commit_id = parse_git_hex_id("commit_id", &req.commit_id)?;
+        let index = self
+            .latest_git_source_index(claims.tenant_id, &req.repository_id)
+            .await?;
+        let mut entries = git_source_query::list_git_tree(&index, &commit_id, &req.prefix)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let limit = usize::try_from(req.limit)
+            .map_err(|_| Status::invalid_argument("limit exceeds supported range"))?;
+        if limit > 0 && entries.len() > limit {
+            entries.truncate(limit);
+        }
+
+        Ok(Response::new(ListGitTreeResponse {
+            entries: entries
+                .into_iter()
+                .map(git_tree_entry_record)
+                .collect::<Result<Vec<_>, _>>()?,
+        }))
+    }
 
     async fn watch_git_source(
         &self,
@@ -83,6 +155,37 @@ impl GitSourceService for AppState {
     }
 }
 
+impl AppState {
+    async fn latest_git_source_index(
+        &self,
+        tenant_id: i64,
+        repository_id: &str,
+    ) -> Result<git_source_index::DecodedGitSourceIndex, Status> {
+        git_source_query::read_latest_git_source_index(&self.storage, tenant_id, repository_id)
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?
+            .ok_or_else(|| Status::not_found("Git source index not found"))
+    }
+}
+
+fn authorize_git_source_read<T>(request: &Request<T>) -> Result<auth::Claims, Status> {
+    let claims = request
+        .extensions()
+        .get::<auth::Claims>()
+        .cloned()
+        .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+    Ok(claims)
+}
+
+fn ensure_git_source_read(claims: &auth::Claims, repository_id: &str) -> Result<(), Status> {
+    let resource = git_source_resource(repository_id);
+    if auth::is_authorized(AnvilAction::GitSourceRead, &resource, &claims.scopes) {
+        Ok(())
+    } else {
+        Err(Status::permission_denied("Permission denied"))
+    }
+}
+
 fn git_source_resource(repository_id: &str) -> String {
     format!("repository:{repository_id}")
 }
@@ -99,6 +202,41 @@ fn validate_component(name: &str, value: &str) -> Result<(), Status> {
         )));
     }
     Ok(())
+}
+
+fn parse_git_hex_id(name: &str, value: &str) -> Result<Vec<u8>, Status> {
+    if value.len() != 40 && value.len() != 64 {
+        return Err(Status::invalid_argument(format!(
+            "{name} must be a SHA-1 or SHA-256 hex object id"
+        )));
+    }
+    hex::decode(value).map_err(|_| Status::invalid_argument(format!("{name} must be hex")))
+}
+
+fn git_blob_location(
+    location: git_source_query::GitObjectLookup,
+) -> Result<GitBlobLocation, Status> {
+    Ok(GitBlobLocation {
+        repository_id: location.repository_id,
+        commit_id: hex::encode(location.commit_id),
+        object_id: hex::encode(location.object_id),
+        tree_path: location.tree_path,
+        blob_start: location.blob_start,
+        blob_len: location.blob_len,
+        pack_object_version_id: uuid::Uuid::from_bytes(location.pack_object_version_id).to_string(),
+    })
+}
+
+fn git_tree_entry_record(
+    entry: git_source_query::GitTreeEntry,
+) -> Result<GitTreeEntryRecord, Status> {
+    Ok(GitTreeEntryRecord {
+        tree_path: entry.tree_path,
+        object_id: hex::encode(entry.object_id),
+        blob_start: entry.blob_start,
+        blob_len: entry.blob_len,
+        pack_object_version_id: uuid::Uuid::from_bytes(entry.pack_object_version_id).to_string(),
+    })
 }
 
 fn watch_git_source_response(

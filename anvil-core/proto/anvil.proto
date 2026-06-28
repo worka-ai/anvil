@@ -81,7 +81,58 @@ service IndexService {
 }
 
 service GitSourceService {
+  rpc GetGitObject(GetGitObjectRequest) returns (GetGitObjectResponse);
+  rpc GetGitBlobByPath(GetGitBlobByPathRequest) returns (GetGitBlobByPathResponse);
+  rpc ListGitTree(ListGitTreeRequest) returns (ListGitTreeResponse);
   rpc WatchGitSource(WatchGitSourceRequest) returns (stream WatchGitSourceResponse);
+}
+
+message GetGitObjectRequest {
+    string repository_id = 1;
+    string object_id = 2;
+}
+
+message GetGitObjectResponse {
+    repeated GitBlobLocation locations = 1;
+}
+
+message GetGitBlobByPathRequest {
+    string repository_id = 1;
+    string commit_id = 2;
+    string tree_path = 3;
+}
+
+message GetGitBlobByPathResponse {
+    GitBlobLocation location = 1;
+}
+
+message ListGitTreeRequest {
+    string repository_id = 1;
+    string commit_id = 2;
+    string prefix = 3;
+    uint32 limit = 4;
+}
+
+message ListGitTreeResponse {
+    repeated GitTreeEntryRecord entries = 1;
+}
+
+message GitBlobLocation {
+    string repository_id = 1;
+    string commit_id = 2;
+    string object_id = 3;
+    string tree_path = 4;
+    uint64 blob_start = 5;
+    uint64 blob_len = 6;
+    string pack_object_version_id = 7;
+}
+
+message GitTreeEntryRecord {
+    string tree_path = 1;
+    string object_id = 2;
+    uint64 blob_start = 3;
+    uint64 blob_len = 4;
+    string pack_object_version_id = 5;
 }
 
 message CreateIndexRequest {
