@@ -81,10 +81,37 @@ service IndexService {
 }
 
 service GitSourceService {
+  rpc PutGitPack(stream PutGitPackRequest) returns (PutGitPackResponse);
   rpc GetGitObject(GetGitObjectRequest) returns (GetGitObjectResponse);
   rpc GetGitBlobByPath(GetGitBlobByPathRequest) returns (GetGitBlobByPathResponse);
   rpc ListGitTree(ListGitTreeRequest) returns (ListGitTreeResponse);
   rpc WatchGitSource(WatchGitSourceRequest) returns (stream WatchGitSourceResponse);
+}
+
+message PutGitPackRequest {
+    oneof data {
+        GitPackMetadata metadata = 1;
+        bytes chunk = 2;
+    }
+}
+
+message GitPackMetadata {
+    string repository_id = 1;
+    string bucket_name = 2;
+}
+
+message PutGitPackResponse {
+    string repository_id = 1;
+    string bucket_name = 2;
+    string object_key = 3;
+    string version_id = 4;
+    string payload_hash = 5;
+    uint64 generation = 6;
+    string source_hash = 7;
+    string index_path = 8;
+    uint64 record_count = 9;
+    uint64 watch_cursor_low = 10;
+    uint64 watch_cursor_high = 11;
 }
 
 message GetGitObjectRequest {

@@ -1,12 +1,16 @@
 use anvil::anvil_api::git_source_service_client::GitSourceServiceClient;
 use anvil::anvil_api::{
-    GetGitBlobByPathRequest, GetGitObjectRequest, ListGitTreeRequest, WatchGitSourceRequest,
+    GetGitBlobByPathRequest, GetGitObjectRequest, GitPackMetadata, ListGitTreeRequest,
+    PutGitPackRequest, WatchGitSourceRequest, put_git_pack_request,
 };
 use anvil::formats::git::{GitHashAlgorithm, GitSourceRecord};
 use anvil::git_source_index::{GitSourceIndexWrite, write_git_source_index};
 use anvil::git_source_watch::{GitSourceWatchPayload, append_git_source_watch_record};
 use anvil_test_utils::TestCluster;
+use flate2::{Compression, write::ZlibEncoder};
 use futures_util::StreamExt;
+use sha1::{Digest, Sha1};
+use std::io::Write;
 use std::time::Duration;
 use tonic::Request;
 
@@ -190,6 +194,85 @@ async fn test_git_source_query_apis_use_latest_index_and_enforce_read_authz() {
     assert_eq!(denied.code(), tonic::Code::PermissionDenied);
 }
 
+#[tokio::test]
+async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+    cluster
+        .create_bucket("git-source-packs", "test-region-1")
+        .await;
+
+    let pack = minimal_git_pack();
+    let mut client = GitSourceServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut request = Request::new(tokio_stream::iter(vec![
+        PutGitPackRequest {
+            data: Some(put_git_pack_request::Data::Metadata(GitPackMetadata {
+                repository_id: "repo-alpha".to_string(),
+                bucket_name: "git-source-packs".to_string(),
+            })),
+        },
+        PutGitPackRequest {
+            data: Some(put_git_pack_request::Data::Chunk(pack.clone())),
+        },
+    ]));
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", cluster.token).parse().unwrap(),
+    );
+    let response = client.put_git_pack(request).await.unwrap().into_inner();
+    assert_eq!(response.repository_id, "repo-alpha");
+    assert_eq!(response.bucket_name, "git-source-packs");
+    assert!(
+        response
+            .object_key
+            .starts_with("git-source/repo-alpha/packs/")
+    );
+    assert_eq!(response.generation, 1);
+    assert_eq!(
+        response.source_hash,
+        blake3::hash(&pack).to_hex().to_string()
+    );
+    assert_eq!(response.record_count, 1);
+    assert_eq!(response.watch_cursor_low, 1);
+    assert_eq!(response.watch_cursor_high, 0);
+
+    let blob = client
+        .get_git_blob_by_path(authorized(
+            GetGitBlobByPathRequest {
+                repository_id: "repo-alpha".to_string(),
+                commit_id: minimal_pack_commit_id_hex(),
+                tree_path: "README.md".to_string(),
+            },
+            &cluster.token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .location
+        .expect("indexed blob");
+    assert_eq!(blob.tree_path, "README.md");
+    assert_eq!(blob.pack_object_version_id, response.version_id);
+
+    let s3 = cluster
+        .get_s3_client("test-region-1", "test-app", "test-secret")
+        .await;
+    let got = s3
+        .get_object()
+        .bucket("git-source-packs")
+        .key(&response.object_key)
+        .send()
+        .await
+        .unwrap()
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+    assert_eq!(got.as_ref(), pack.as_slice());
+}
+
 fn authorized<T>(message: T, token: &str) -> Request<T> {
     let mut request = Request::new(message);
     request.metadata_mut().insert(
@@ -197,6 +280,100 @@ fn authorized<T>(message: T, token: &str) -> Request<T> {
         format!("Bearer {token}").parse().expect("valid token"),
     );
     request
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TestGitKind {
+    Commit,
+    Tree,
+    Blob,
+}
+
+impl TestGitKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Commit => "commit",
+            Self::Tree => "tree",
+            Self::Blob => "blob",
+        }
+    }
+
+    fn pack_kind(self) -> u8 {
+        match self {
+            Self::Commit => 1,
+            Self::Tree => 2,
+            Self::Blob => 3,
+        }
+    }
+}
+
+fn minimal_git_pack() -> Vec<u8> {
+    let (_commit_id, pack) = minimal_git_pack_with_commit();
+    pack
+}
+
+fn minimal_pack_commit_id_hex() -> String {
+    let (commit_id, _pack) = minimal_git_pack_with_commit();
+    hex::encode(commit_id)
+}
+
+fn minimal_git_pack_with_commit() -> (Vec<u8>, Vec<u8>) {
+    let blob = b"hello\n".to_vec();
+    let blob_id = test_git_object_id(TestGitKind::Blob, &blob);
+    let mut tree = Vec::new();
+    tree.extend_from_slice(b"100644 README.md\0");
+    tree.extend_from_slice(&blob_id);
+    let tree_id = test_git_object_id(TestGitKind::Tree, &tree);
+    let commit = format!(
+        "tree {}\nauthor A <a@example.test> 0 +0000\ncommitter A <a@example.test> 0 +0000\n\ninitial\n",
+        hex::encode(&tree_id)
+    )
+    .into_bytes();
+    let commit_id = test_git_object_id(TestGitKind::Commit, &commit);
+    let objects = vec![
+        (TestGitKind::Commit, commit),
+        (TestGitKind::Tree, tree),
+        (TestGitKind::Blob, blob),
+    ];
+    let mut pack = Vec::new();
+    pack.extend_from_slice(b"PACK");
+    pack.extend_from_slice(&2_u32.to_be_bytes());
+    pack.extend_from_slice(&(objects.len() as u32).to_be_bytes());
+    for (kind, data) in objects {
+        write_test_pack_object(&mut pack, kind, &data);
+    }
+    let mut hasher = Sha1::new();
+    hasher.update(&pack);
+    pack.extend_from_slice(&hasher.finalize());
+    (commit_id, pack)
+}
+
+fn write_test_pack_object(pack: &mut Vec<u8>, kind: TestGitKind, data: &[u8]) {
+    let mut size = data.len() as u64;
+    let mut first = (kind.pack_kind() << 4) | ((size as u8) & 0x0f);
+    size >>= 4;
+    if size != 0 {
+        first |= 0x80;
+    }
+    pack.push(first);
+    while size != 0 {
+        let mut byte = (size as u8) & 0x7f;
+        size >>= 7;
+        if size != 0 {
+            byte |= 0x80;
+        }
+        pack.push(byte);
+    }
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data).unwrap();
+    pack.extend_from_slice(&encoder.finish().unwrap());
+}
+
+fn test_git_object_id(kind: TestGitKind, data: &[u8]) -> Vec<u8> {
+    let mut hasher = Sha1::new();
+    hasher.update(format!("{} {}\0", kind.name(), data.len()).as_bytes());
+    hasher.update(data);
+    hasher.finalize().to_vec()
 }
 
 fn git_record(commit: u8, object: u8, path: &str, start: u64, len: u64) -> GitSourceRecord {

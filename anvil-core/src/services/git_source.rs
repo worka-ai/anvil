@@ -1,8 +1,12 @@
 use crate::anvil_api::git_source_service_server::GitSourceService;
 use crate::anvil_api::*;
+use crate::object_manager::ObjectWriteOptions;
 use crate::{
-    AppState, auth, git_source_index, git_source_query, git_source_watch, permissions::AnvilAction,
+    AppState, auth, authz_journal, git_pack, git_source_index, git_source_query, git_source_watch,
+    permissions::AnvilAction,
 };
+use futures_util::StreamExt;
+use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -12,6 +16,129 @@ impl GitSourceService for AppState {
     type WatchGitSourceStream = std::pin::Pin<
         Box<dyn futures_core::Stream<Item = Result<WatchGitSourceResponse, Status>> + Send>,
     >;
+
+    async fn put_git_pack(
+        &self,
+        request: Request<tonic::Streaming<PutGitPackRequest>>,
+    ) -> Result<Response<PutGitPackResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let (metadata, pack_bytes) = collect_git_pack_stream(request.into_inner()).await?;
+        validate_component("repository_id", &metadata.repository_id)?;
+        if metadata.bucket_name.is_empty() {
+            return Err(Status::invalid_argument("bucket_name must not be empty"));
+        }
+        let resource = git_source_resource(&metadata.repository_id);
+        if !auth::is_authorized(AnvilAction::GitSourceWrite, &resource, &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        let source_hash = blake3::hash(&pack_bytes);
+        let source_hash_hex = source_hash.to_hex().to_string();
+        git_pack::build_git_source_index_from_pack(&metadata.repository_id, &pack_bytes, [0; 16])
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let object_key = format!(
+            "git-source/{}/packs/{}.pack",
+            metadata.repository_id, source_hash_hex
+        );
+        let object_scope = vec![format!(
+            "object:write|{}/{}",
+            metadata.bucket_name, object_key
+        )];
+        let pack_object = self
+            .object_manager
+            .put_object(
+                claims.tenant_id,
+                &metadata.bucket_name,
+                &object_key,
+                &object_scope,
+                tokio_stream::iter(vec![Ok(pack_bytes.clone())]),
+                ObjectWriteOptions {
+                    content_type: Some("application/x-git-packed-objects".to_string()),
+                    user_metadata: Some(json!({
+                        "object_kind": "git_pack",
+                        "repository_id": metadata.repository_id.clone(),
+                    })),
+                },
+            )
+            .await?;
+
+        let parsed = git_pack::build_git_source_index_from_pack(
+            &metadata.repository_id,
+            &pack_bytes,
+            *pack_object.version_id.as_bytes(),
+        )
+        .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let generation = self
+            .next_git_source_generation(claims.tenant_id, &metadata.repository_id)
+            .await?;
+        let index_path = git_source_index::write_git_source_index(
+            &self.storage,
+            git_source_index::GitSourceIndexWrite {
+                tenant_id: claims.tenant_id,
+                repository_id: &metadata.repository_id,
+                generation,
+                source_hash: parsed.pack_hash,
+                hash_algorithm: parsed.hash_algorithm,
+                records: &parsed.records,
+            },
+        )
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
+        let authz_revision = authz_journal::latest_authz_revision(&self.storage, claims.tenant_id)
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?;
+        let authz_revision = u64::try_from(authz_revision)
+            .map_err(|_| Status::internal("Invalid authorization revision"))?;
+        let watch_cursor = git_source_watch::latest_git_source_watch_cursor(
+            &self.storage,
+            claims.tenant_id,
+            &metadata.repository_id,
+        )
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| Status::internal("Git source watch cursor overflow"))?;
+        let payload = git_source_watch::GitSourceWatchPayload {
+            repository_id: metadata.repository_id.clone(),
+            event_type: "index_published".to_string(),
+            generation,
+            source_hash: source_hash_hex.clone(),
+            index_path: index_path.to_string_lossy().into_owned(),
+            pack_object_version_id: Some(pack_object.version_id.to_string()),
+            emitted_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        };
+        git_source_watch::append_git_source_watch_record(
+            &self.storage,
+            claims.tenant_id,
+            &metadata.repository_id,
+            watch_cursor,
+            *pack_object.mutation_id.as_bytes(),
+            authz_revision,
+            payload,
+        )
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
+
+        let (watch_cursor_low, watch_cursor_high) = split_u128(watch_cursor);
+        Ok(Response::new(PutGitPackResponse {
+            repository_id: metadata.repository_id,
+            bucket_name: metadata.bucket_name,
+            object_key,
+            version_id: pack_object.version_id.to_string(),
+            payload_hash: pack_object.content_hash,
+            generation,
+            source_hash: source_hash_hex,
+            index_path: index_path.to_string_lossy().into_owned(),
+            record_count: parsed.records.len() as u64,
+            watch_cursor_low,
+            watch_cursor_high,
+        }))
+    }
 
     async fn get_git_object(
         &self,
@@ -166,6 +293,54 @@ impl AppState {
             .map_err(|err| Status::internal(err.to_string()))?
             .ok_or_else(|| Status::not_found("Git source index not found"))
     }
+
+    async fn next_git_source_generation(
+        &self,
+        tenant_id: i64,
+        repository_id: &str,
+    ) -> Result<u64, Status> {
+        let Some(index) =
+            git_source_query::read_latest_git_source_index(&self.storage, tenant_id, repository_id)
+                .await
+                .map_err(|err| Status::internal(err.to_string()))?
+        else {
+            return Ok(1);
+        };
+        index
+            .header
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| Status::internal("Git source generation overflow"))
+    }
+}
+
+async fn collect_git_pack_stream(
+    mut stream: tonic::Streaming<PutGitPackRequest>,
+) -> Result<(GitPackMetadata, Vec<u8>), Status> {
+    let metadata = match stream.next().await {
+        Some(Ok(chunk)) => match chunk.data {
+            Some(put_git_pack_request::Data::Metadata(metadata)) => metadata,
+            _ => return Err(Status::invalid_argument("First chunk must be metadata")),
+        },
+        Some(Err(err)) => return Err(err),
+        None => return Err(Status::invalid_argument("Empty Git pack stream")),
+    };
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk?.data {
+            Some(put_git_pack_request::Data::Chunk(data)) => bytes.extend_from_slice(&data),
+            Some(put_git_pack_request::Data::Metadata(_)) => {
+                return Err(Status::invalid_argument(
+                    "Git pack metadata must only appear once",
+                ));
+            }
+            None => {}
+        }
+    }
+    if bytes.is_empty() {
+        return Err(Status::invalid_argument("Git pack bytes must not be empty"));
+    }
+    Ok((metadata, bytes))
 }
 
 fn authorize_git_source_read<T>(request: &Request<T>) -> Result<auth::Claims, Status> {

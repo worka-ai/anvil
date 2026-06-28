@@ -84,6 +84,7 @@ reed-solomon-erasure = "6.0.0"
 ahash = "0.8.12"
 futures ="0.3.31"
 fallible-streaming-iterator = "0.1"
+flate2 = "1"
 jsonwebtoken = "9.3.1"
 argon2 = "0.5.3"
 chrono = { version = "0.4.42", features = ["serde"] }
@@ -92,6 +93,7 @@ rand_core = { version = "0.9.3", features = ["os_rng"] }
 axum = { version = "0.8.5", features = ["http1"] }
 quick-xml = { version = "0.38.3", features = ["serialize"] }
 sha2 = "0.10.9"
+sha1 = "0.10.6"
 hex = "0.4.3"
 hmac = "0.12.1"
 axum-extra = { version = "0.10.2", features = ["typed-header"] }
