@@ -1,21 +1,54 @@
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::{
-    self, CreateBucketRequest, GetObjectRequest, ListObjectsRequest, ObjectMetadata,
-    PutObjectRequest,
+    self, CreateBucketRequest, GetObjectRequest, ListObjectsRequest, NativeMutationContext,
+    ObjectMetadata, PutObjectRequest,
 };
 use futures_util::StreamExt;
 use std::path::Path;
 use std::time::Duration;
-use tokio::fs;
 use tonic::Code;
 
 use anvil_test_utils::*;
 
+fn count_shard_files(root: &Path, object_hash: &str) -> usize {
+    let mut count = 0;
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            count += count_shard_files(&path, object_hash);
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(&format!("{object_hash}-")))
+        {
+            count += 1;
+        }
+    }
+
+    count
+}
+
+fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
+    NativeMutationContext {
+        tenant_id: 1,
+        bucket_id,
+        principal: "test-app".to_string(),
+        request_id: format!("{tag}-request"),
+        precondition: "none".to_string(),
+        authz_zookie_optional: String::new(),
+        idempotency_key: format!("{tag}-idempotency"),
+    }
+}
+
 #[tokio::test]
 async fn test_distributed_put_and_get() {
-    let num_nodes = 6;
-    let mut cluster = TestCluster::new(&["test-region-1"; 6]).await;
+    let regions = ["test-region-1"; 6];
+    let mut cluster = TestCluster::new(&regions).await;
     cluster.start_and_converge(Duration::from_secs(20)).await;
 
     let token = cluster.token.clone();
@@ -33,10 +66,12 @@ async fn test_distributed_put_and_get() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client
+    let bucket_id = bucket_client
         .create_bucket(create_bucket_req)
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let mut object_client = ObjectServiceClient::connect(client_addr).await.unwrap();
     let object_key = "my-distributed-object".to_string();
@@ -45,6 +80,7 @@ async fn test_distributed_put_and_get() {
     let metadata = ObjectMetadata {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
+        mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
     };
     let mut chunks = vec![PutObjectRequest {
         data: Some(anvil_api::put_object_request::Data::Metadata(metadata)),
@@ -100,15 +136,12 @@ async fn test_distributed_put_and_get() {
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let mut shards_found = 0;
-    for i in 0..num_nodes {
-        let shard_path = format!("anvil-data/{}-{:02}", object_hash, i);
-        if Path::new(&shard_path).exists() {
-            shards_found += 1;
-            fs::remove_file(shard_path).await.unwrap();
-        }
-    }
-    assert!(shards_found > 0);
+    let shards_found = count_shard_files(&cluster.storage_path, &object_hash);
+    assert!(
+        shards_found > 0,
+        "expected distributed shards for {object_hash} under {}",
+        cluster.storage_path.display()
+    );
 }
 
 #[tokio::test]
@@ -131,10 +164,12 @@ async fn test_single_node_put() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client
+    let bucket_id = bucket_client
         .create_bucket(create_bucket_req)
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let mut object_client = ObjectServiceClient::connect(client_addr).await.unwrap();
     let object_key = "single-node-object".to_string();
@@ -143,6 +178,7 @@ async fn test_single_node_put() {
     let metadata = ObjectMetadata {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
+        mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
     };
     let chunks = vec![
         PutObjectRequest {
@@ -200,15 +236,18 @@ async fn test_multi_region_list_and_isolation() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client_east
+    let bucket_id = bucket_client_east
         .create_bucket(create_bucket_req)
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let object_key = "regional-object".to_string();
     let metadata = ObjectMetadata {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
+        mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
     };
     let chunks = vec![
         PutObjectRequest {

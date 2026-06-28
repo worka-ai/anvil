@@ -1,12 +1,26 @@
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
-use anvil::anvil_api::{CreateBucketRequest, GetObjectRequest, ObjectMetadata, PutObjectRequest};
+use anvil::anvil_api::{
+    CreateBucketRequest, GetObjectRequest, NativeMutationContext, ObjectMetadata, PutObjectRequest,
+};
 use futures::stream::StreamExt;
 use std::time::Duration;
 use tokio::time::timeout;
 use tonic::Request;
 
 use anvil_test_utils::*;
+
+fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
+    NativeMutationContext {
+        tenant_id: 1,
+        bucket_id,
+        principal: "test-app".to_string(),
+        request_id: format!("{tag}-request"),
+        precondition: "none".to_string(),
+        authz_zookie_optional: String::new(),
+        idempotency_key: format!("{tag}-idempotency"),
+    }
+}
 
 #[tokio::test]
 async fn test_distributed_reconstruction_on_node_failure() {
@@ -31,10 +45,12 @@ async fn test_distributed_reconstruction_on_node_failure() {
         "authorization",
         format!("Bearer {}", cluster.token).parse().unwrap(),
     );
-    bucket_client
+    let bucket_id = bucket_client
         .create_bucket(create_bucket_req)
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let object_key = "reconstruction-object".to_string();
     let content = (0..1024 * 256).map(|i| (i % 256) as u8).collect::<Vec<_>>();
@@ -43,6 +59,7 @@ async fn test_distributed_reconstruction_on_node_failure() {
     let metadata = ObjectMetadata {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
+        mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
     };
     let mut chunks = vec![PutObjectRequest {
         data: Some(anvil::anvil_api::put_object_request::Data::Metadata(

@@ -9,6 +9,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 tonic = { version = "0.14.2", default-features = false, features = ["transport", "tls-native-roots"] }
 prost = "0.14.1"
 anyhow = "1.0"
+base64 = "0.22"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 confy = "0.6.1"
@@ -16,6 +17,7 @@ dialoguer = "0.11.0"
 tokio-stream = "0.1"
 anvil = { path = "../anvil" }
 tempfile = "3.10.1"
+uuid = { version = "1.18", features = ["v4"] }
 
 [build-dependencies]
 tonic-build = "0.14.2"

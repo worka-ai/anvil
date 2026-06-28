@@ -5,9 +5,10 @@ use anvil::anvil_api::repair_service_client::RepairServiceClient;
 use anvil::anvil_api::{
     CheckPermissionRequest, CreateBucketRequest, GetAccessTokenRequest, GetObjectRequest,
     GrantAccessRequest, ListBucketsRequest, ListObjectVersionsRequest, ListObjectsRequest,
-    ListRepairFindingsRequest, ObjectMetadata, PutObjectRequest, RepairAuthzDerivedIndexRequest,
-    RevokeAccessRequest, SetPublicAccessRequest, WatchAuthzDerivedLagRequest,
-    WatchAuthzNamespaceRequest, WatchAuthzTupleLogRequest, WriteAuthzTupleRequest,
+    ListRepairFindingsRequest, NativeMutationContext, ObjectMetadata, PutObjectRequest,
+    RepairAuthzDerivedIndexRequest, RevokeAccessRequest, SetPublicAccessRequest,
+    WatchAuthzDerivedLagRequest, WatchAuthzNamespaceRequest, WatchAuthzTupleLogRequest,
+    WriteAuthzTupleRequest,
 };
 use anvil::authz_derived_lag_watch::{
     AuthzDerivedLagWatchPayload, append_authz_derived_lag_watch_record,
@@ -146,9 +147,22 @@ fn add_bearer<T>(request: &mut Request<T>, token: &str) {
     );
 }
 
+fn native_mutation_context(bucket_id: i64, principal: &str, tag: &str) -> NativeMutationContext {
+    NativeMutationContext {
+        tenant_id: 1,
+        bucket_id,
+        principal: principal.to_string(),
+        request_id: format!("{tag}-request"),
+        precondition: "none".to_string(),
+        authz_zookie_optional: String::new(),
+        idempotency_key: format!("{tag}-idempotency"),
+    }
+}
+
 async fn put_test_object(
     object_client: &mut ObjectServiceClient<tonic::transport::Channel>,
     token: &str,
+    bucket_id: i64,
     bucket_name: &str,
     object_key: &str,
     payload: &[u8],
@@ -159,6 +173,11 @@ async fn put_test_object(
                 ObjectMetadata {
                     bucket_name: bucket_name.to_string(),
                     object_key: object_key.to_string(),
+                    mutation_context: Some(native_mutation_context(
+                        bucket_id,
+                        "test-app",
+                        "put-test-object",
+                    )),
                 },
             )),
         },
@@ -718,7 +737,12 @@ async fn test_object_read_uses_relationship_authorization_before_streaming_bytes
         region: "test-region-1".to_string(),
     });
     add_bearer(&mut create_bucket, &token);
-    bucket_client.create_bucket(create_bucket).await.unwrap();
+    let bucket_id = bucket_client
+        .create_bucket(create_bucket)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let put_chunks = vec![
         PutObjectRequest {
@@ -726,6 +750,11 @@ async fn test_object_read_uses_relationship_authorization_before_streaming_bytes
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key: object_key.clone(),
+                    mutation_context: Some(native_mutation_context(
+                        bucket_id,
+                        "test-app",
+                        "object-metadata",
+                    )),
                 },
             )),
         },
@@ -825,11 +854,17 @@ async fn test_object_list_and_versions_filter_entries_by_read_relationship() {
         region: "test-region-1".to_string(),
     });
     add_bearer(&mut create_bucket, &token);
-    bucket_client.create_bucket(create_bucket).await.unwrap();
+    let bucket_id = bucket_client
+        .create_bucket(create_bucket)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     put_test_object(
         &mut object_client,
         &token,
+        bucket_id,
         &bucket_name,
         &allowed_key,
         b"allowed-v1",
@@ -838,6 +873,7 @@ async fn test_object_list_and_versions_filter_entries_by_read_relationship() {
     put_test_object(
         &mut object_client,
         &token,
+        bucket_id,
         &bucket_name,
         &denied_key,
         b"denied",
@@ -846,6 +882,7 @@ async fn test_object_list_and_versions_filter_entries_by_read_relationship() {
     put_test_object(
         &mut object_client,
         &token,
+        bucket_id,
         &bucket_name,
         &allowed_key,
         b"allowed-v2",
@@ -854,6 +891,7 @@ async fn test_object_list_and_versions_filter_entries_by_read_relationship() {
     put_test_object(
         &mut object_client,
         &token,
+        bucket_id,
         &bucket_name,
         &visible_nested_key,
         b"visible",
@@ -862,6 +900,7 @@ async fn test_object_list_and_versions_filter_entries_by_read_relationship() {
     put_test_object(
         &mut object_client,
         &token,
+        bucket_id,
         &bucket_name,
         &hidden_nested_key,
         b"hidden",
@@ -1269,15 +1308,22 @@ async fn test_set_public_access_and_get() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client
+    let bucket_id = bucket_client
         .create_bucket(create_bucket_req)
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     // Put an object
     let metadata = ObjectMetadata {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
+        mutation_context: Some(native_mutation_context(
+            bucket_id,
+            "test-app",
+            "object-metadata",
+        )),
     };
     let chunks = vec![
         PutObjectRequest {
@@ -1450,14 +1496,21 @@ async fn test_admin_cli_set_public_access() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client
+    let bucket_id = bucket_client
         .create_bucket(create_bucket_req)
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let metadata = ObjectMetadata {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
+        mutation_context: Some(native_mutation_context(
+            bucket_id,
+            "test-app",
+            "object-metadata",
+        )),
     };
     let chunks = vec![
         PutObjectRequest {

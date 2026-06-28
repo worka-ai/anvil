@@ -1,7 +1,7 @@
 use crate::anvil_api::object_service_server::ObjectService;
 use crate::anvil_api::*;
 use crate::object_manager::ObjectWriteOptions;
-use crate::{AppState, auth, authz_journal, watch_log};
+use crate::{AppState, auth, authz_journal, bucket_journal, watch_log};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -28,15 +28,17 @@ impl ObjectService for AppState {
 
         let mut stream = request.into_inner();
 
-        let (bucket_name, object_key) = match stream.next().await {
+        let (bucket_name, object_key, mutation_context) = match stream.next().await {
             Some(Ok(chunk)) => match chunk.data {
                 Some(put_object_request::Data::Metadata(meta)) => {
-                    (meta.bucket_name, meta.object_key)
+                    (meta.bucket_name, meta.object_key, meta.mutation_context)
                 }
                 _ => return Err(Status::invalid_argument("First chunk must be metadata")),
             },
             _ => return Err(Status::invalid_argument("Empty stream")),
         };
+        validate_native_mutation_context(self, &claims, &bucket_name, mutation_context.as_ref())
+            .await?;
 
         let data_stream = stream.map(|chunk_result| match chunk_result {
             Ok(chunk) => match chunk.data {
@@ -141,6 +143,13 @@ impl ObjectService for AppState {
             .get::<auth::Claims>()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.get_ref();
+        validate_native_mutation_context(
+            self,
+            claims,
+            &req.bucket_name,
+            req.mutation_context.as_ref(),
+        )
+        .await?;
 
         let deleted =
             if let Some(version_id) = parse_optional_version_id(req.version_id.as_deref())? {
@@ -308,6 +317,13 @@ impl ObjectService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
+        validate_native_mutation_context(
+            self,
+            &claims,
+            &req.destination_bucket_name,
+            req.mutation_context.as_ref(),
+        )
+        .await?;
 
         let object = self
             .object_manager
@@ -346,6 +362,13 @@ impl ObjectService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
+        validate_native_mutation_context(
+            self,
+            &claims,
+            &req.destination_bucket_name,
+            req.mutation_context.as_ref(),
+        )
+        .await?;
 
         let mut sources = Vec::with_capacity(req.sources.len());
         for source in req.sources {
@@ -391,6 +414,13 @@ impl ObjectService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
+        validate_native_mutation_context(
+            self,
+            &claims,
+            &req.bucket_name,
+            req.mutation_context.as_ref(),
+        )
+        .await?;
 
         let object = self
             .object_manager
@@ -428,6 +458,13 @@ impl ObjectService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
+        validate_native_mutation_context(
+            self,
+            &claims,
+            &req.bucket_name,
+            req.mutation_context.as_ref(),
+        )
+        .await?;
         let result = self
             .object_manager
             .compare_and_swap_manifest(
@@ -530,6 +567,13 @@ impl ObjectService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
+        validate_native_mutation_context(
+            self,
+            &claims,
+            &req.bucket_name,
+            req.mutation_context.as_ref(),
+        )
+        .await?;
         let result = self
             .object_manager
             .create_append_stream(
@@ -562,6 +606,13 @@ impl ObjectService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
+        validate_native_mutation_context(
+            self,
+            &claims,
+            &req.bucket_name,
+            req.mutation_context.as_ref(),
+        )
+        .await?;
         let stream_id = uuid::Uuid::parse_str(&req.stream_id)
             .map_err(|_| Status::invalid_argument("Invalid stream_id"))?;
         let record = self
@@ -599,6 +650,13 @@ impl ObjectService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
+        validate_native_mutation_context(
+            self,
+            &claims,
+            &req.bucket_name,
+            req.mutation_context.as_ref(),
+        )
+        .await?;
         let version_id = req.stream_id.clone();
         let stream_id = uuid::Uuid::parse_str(&req.stream_id)
             .map_err(|_| Status::invalid_argument("Invalid stream_id"))?;
@@ -636,6 +694,13 @@ impl ObjectService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
+        validate_native_mutation_context(
+            self,
+            &claims,
+            &req.bucket_name,
+            req.mutation_context.as_ref(),
+        )
+        .await?;
 
         let result = self
             .object_manager
@@ -678,6 +743,13 @@ impl ObjectService for AppState {
             Some(Err(status)) => return Err(status),
             None => return Err(Status::invalid_argument("Empty stream")),
         };
+        validate_native_mutation_context(
+            self,
+            &claims,
+            &metadata.bucket_name,
+            metadata.mutation_context.as_ref(),
+        )
+        .await?;
 
         let part_version_id = metadata.part_number.to_string();
         let upload_id = uuid::Uuid::parse_str(&metadata.upload_id)
@@ -725,6 +797,13 @@ impl ObjectService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
+        validate_native_mutation_context(
+            self,
+            &claims,
+            &req.bucket_name,
+            req.mutation_context.as_ref(),
+        )
+        .await?;
         let upload_id = uuid::Uuid::parse_str(&req.upload_id)
             .map_err(|_| Status::invalid_argument("Invalid upload_id"))?;
         let parts = req
@@ -772,6 +851,13 @@ impl ObjectService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
+        validate_native_mutation_context(
+            self,
+            &claims,
+            &req.bucket_name,
+            req.mutation_context.as_ref(),
+        )
+        .await?;
         let upload_id = uuid::Uuid::parse_str(&req.upload_id)
             .map_err(|_| Status::invalid_argument("Invalid upload_id"))?;
 
@@ -796,6 +882,76 @@ impl ObjectService for AppState {
             watch_cursor: result.receipt.watch_cursor,
         }))
     }
+}
+
+async fn validate_native_mutation_context(
+    state: &AppState,
+    claims: &auth::Claims,
+    bucket_name: &str,
+    context: Option<&NativeMutationContext>,
+) -> Result<(), Status> {
+    let context =
+        context.ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?;
+    if context.tenant_id != claims.tenant_id {
+        return Err(Status::permission_denied("Native mutation tenant mismatch"));
+    }
+    if context.principal != claims.sub {
+        return Err(Status::permission_denied(
+            "Native mutation principal mismatch",
+        ));
+    }
+    require_native_context_field("request_id", &context.request_id)?;
+    require_native_context_field("precondition", &context.precondition)?;
+    require_native_context_field("idempotency_key", &context.idempotency_key)?;
+    if context.bucket_id <= 0 {
+        return Err(Status::invalid_argument(
+            "Native mutation bucket_id is required",
+        ));
+    }
+
+    let bucket = bucket_journal::read_current_bucket(&state.storage, claims.tenant_id, bucket_name)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found("BucketNotFound"))?;
+    if bucket.id != context.bucket_id {
+        return Err(Status::permission_denied("Native mutation bucket mismatch"));
+    }
+
+    if let Some(required_revision) = parse_authz_zookie(&context.authz_zookie_optional)? {
+        let latest = authz_journal::latest_authz_revision(&state.storage, claims.tenant_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if latest < required_revision {
+            return Err(Status::failed_precondition("AuthzRevisionUnavailable"));
+        }
+    }
+
+    Ok(())
+}
+
+fn require_native_context_field(name: &str, value: &str) -> Result<(), Status> {
+    if value.trim().is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "Native mutation {name} is required"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_authz_zookie(value: &str) -> Result<Option<i64>, Status> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let revision = value
+        .strip_prefix("authz:")
+        .unwrap_or(value)
+        .parse::<i64>()
+        .map_err(|_| Status::invalid_argument("Invalid authz_zookie_optional"))?;
+    if revision < 0 {
+        return Err(Status::invalid_argument("Invalid authz_zookie_optional"));
+    }
+    Ok(Some(revision))
 }
 
 async fn latest_authz_revision(state: &AppState, tenant_id: i64) -> Result<u64, Status> {

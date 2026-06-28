@@ -476,6 +476,7 @@ fn bucket_event_type(event: &str) -> &str {
 
 fn bucket_metadata_json(body: &BucketJournalBody, deleted: bool) -> JsonValue {
     json!({
+        "bucket_id": body.bucket_id,
         "name": body.bucket_name,
         "creation_date": body.created_at,
         "region": body.region,

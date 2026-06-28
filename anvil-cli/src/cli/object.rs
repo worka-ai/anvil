@@ -1,7 +1,10 @@
 use crate::context::Context;
 use anvil::anvil_api as api;
+use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::Subcommand;
+use serde::Deserialize;
 use tokio_stream::iter;
 
 #[derive(Subcommand)]
@@ -27,6 +30,55 @@ fn parse_s3_path(path: &str) -> anyhow::Result<(String, String)> {
     Ok((parts[0].to_string(), parts[1].to_string()))
 }
 
+#[derive(Debug, Deserialize)]
+struct NativeTokenClaims {
+    sub: String,
+    tenant_id: i64,
+}
+
+fn decode_native_token_claims(token: &str) -> anyhow::Result<NativeTokenClaims> {
+    let payload = token
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| anyhow::anyhow!("access token is not a JWT"))?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+async fn native_mutation_context(
+    ctx: &Context,
+    token: &str,
+    bucket_name: &str,
+    tag: &str,
+) -> anyhow::Result<api::NativeMutationContext> {
+    let claims = decode_native_token_claims(token)?;
+    let mut bucket_client = BucketServiceClient::connect(ctx.profile.host.clone()).await?;
+    let mut request = tonic::Request::new(api::ListBucketsRequest {});
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let bucket_id = bucket_client
+        .list_buckets(request)
+        .await?
+        .into_inner()
+        .buckets
+        .into_iter()
+        .find(|bucket| bucket.name == bucket_name)
+        .map(|bucket| bucket.bucket_id)
+        .ok_or_else(|| anyhow::anyhow!("bucket '{bucket_name}' not found"))?;
+
+    Ok(api::NativeMutationContext {
+        tenant_id: claims.tenant_id,
+        bucket_id,
+        principal: claims.sub,
+        request_id: format!("{tag}-{}", uuid::Uuid::new_v4()),
+        precondition: "none".to_string(),
+        authz_zookie_optional: String::new(),
+        idempotency_key: uuid::Uuid::new_v4().to_string(),
+    })
+}
+
 pub async fn handle_object_command(command: &ObjectCommands, ctx: &Context) -> anyhow::Result<()> {
     let mut client = ObjectServiceClient::connect(ctx.profile.host.clone()).await?;
     let token = ctx.get_bearer_token().await?;
@@ -34,9 +86,11 @@ pub async fn handle_object_command(command: &ObjectCommands, ctx: &Context) -> a
     match command {
         ObjectCommands::Put { src, dest } => {
             let (bucket, key) = parse_s3_path(dest)?;
+            let mutation_context = native_mutation_context(ctx, &token, &bucket, "put").await?;
             let metadata = api::ObjectMetadata {
                 bucket_name: bucket,
                 object_key: key,
+                mutation_context: Some(mutation_context),
             };
             let file_chunks = tokio::fs::read(src).await?;
             let chunks = vec![
@@ -86,10 +140,12 @@ pub async fn handle_object_command(command: &ObjectCommands, ctx: &Context) -> a
         }
         ObjectCommands::Rm { path } => {
             let (bucket, key) = parse_s3_path(path)?;
+            let mutation_context = native_mutation_context(ctx, &token, &bucket, "rm").await?;
             let mut request = tonic::Request::new(api::DeleteObjectRequest {
                 bucket_name: bucket,
                 object_key: key,
                 version_id: None,
+                mutation_context: Some(mutation_context),
             });
             request.metadata_mut().insert(
                 "authorization",

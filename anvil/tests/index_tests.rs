@@ -5,9 +5,10 @@ use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::repair_service_client::RepairServiceClient;
 use anvil::anvil_api::{
     CreateBucketRequest, CreateIndexRequest, DisableIndexRequest, DropIndexRequest,
-    ListIndexDiagnosticsRequest, ListIndexesRequest, ListRepairFindingsRequest, ObjectMetadata,
-    PutObjectRequest, QueryIndexRequest, RepairIndexRequest, UpdateIndexRequest,
-    WatchIndexDefinitionRequest, WatchIndexPartitionRequest, WriteAuthzTupleRequest,
+    ListIndexDiagnosticsRequest, ListIndexesRequest, ListRepairFindingsRequest,
+    NativeMutationContext, ObjectMetadata, PutObjectRequest, QueryIndexRequest, RepairIndexRequest,
+    UpdateIndexRequest, WatchIndexDefinitionRequest, WatchIndexPartitionRequest,
+    WriteAuthzTupleRequest,
 };
 use anvil::formats::full_text::{FullTextDocument, build_full_text_postings};
 use anvil::formats::vector::{VectorMetric, VectorModality, VectorPayload, VectorRecord};
@@ -26,6 +27,18 @@ fn authorized<T>(message: T, token: &str) -> Request<T> {
         format!("Bearer {token}").parse().expect("valid token"),
     );
     request
+}
+
+fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
+    NativeMutationContext {
+        tenant_id: 1,
+        bucket_id,
+        principal: "test-app".to_string(),
+        request_id: format!("{tag}-request"),
+        precondition: "none".to_string(),
+        authz_zookie_optional: String::new(),
+        idempotency_key: format!("{tag}-idempotency"),
+    }
 }
 
 #[tokio::test]
@@ -268,12 +281,20 @@ async fn test_full_text_index_builds_from_object_write_task() {
         .await
         .unwrap();
 
+    let bucket_id = cluster.states[0]
+        .persistence
+        .get_bucket_by_name(1, &bucket_name)
+        .await
+        .unwrap()
+        .expect("bucket metadata should exist")
+        .id;
     let chunks = vec![
         PutObjectRequest {
             data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key: "docs/alpha.txt".to_string(),
+                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
                 },
             )),
         },
@@ -413,12 +434,20 @@ async fn test_full_text_index_build_extracts_json_pointer_from_object_write_task
         .await
         .unwrap();
 
+    let bucket_id = cluster.states[0]
+        .persistence
+        .get_bucket_by_name(1, &bucket_name)
+        .await
+        .unwrap()
+        .expect("bucket metadata should exist")
+        .id;
     let chunks = vec![
         PutObjectRequest {
             data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key: "docs/report.json".to_string(),
+                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
                 },
             )),
         },
@@ -1212,12 +1241,20 @@ async fn test_vector_index_builds_from_object_write_task() {
         .await
         .unwrap();
 
+    let bucket_id = cluster.states[0]
+        .persistence
+        .get_bucket_by_name(1, &bucket_name)
+        .await
+        .unwrap()
+        .expect("bucket metadata should exist")
+        .id;
     let chunks = vec![
         PutObjectRequest {
             data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key: "docs/vector.json".to_string(),
+                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
                 },
             )),
         },
@@ -1460,12 +1497,20 @@ async fn test_vector_index_build_records_dimension_mismatch_diagnostic() {
         .await
         .unwrap();
 
+    let bucket_id = cluster.states[0]
+        .persistence
+        .get_bucket_by_name(1, &bucket_name)
+        .await
+        .unwrap()
+        .expect("bucket metadata should exist")
+        .id;
     let chunks = vec![
         PutObjectRequest {
             data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key: "docs/bad-vector.json".to_string(),
+                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
                 },
             )),
         },
@@ -1596,12 +1641,20 @@ async fn test_hybrid_index_builds_text_and_vector_segments_from_object_write_tas
         .unwrap();
 
     let body = br#"{"body":"lease dashboard summary","embedding":[0.0,1.0]}"#.to_vec();
+    let bucket_id = cluster.states[0]
+        .persistence
+        .get_bucket_by_name(1, &bucket_name)
+        .await
+        .unwrap()
+        .expect("bucket metadata should exist")
+        .id;
     let chunks = vec![
         PutObjectRequest {
             data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key: "docs/hybrid.json".to_string(),
+                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
                 },
             )),
         },

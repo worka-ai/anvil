@@ -7,9 +7,9 @@ use anvil::anvil_api::{
     CompleteMultipartPart, CompleteMultipartRequest, ComposeObjectRequest, ComposeObjectSource,
     CopyObjectRequest, CreateAppendStreamRequest, CreateBucketRequest, CreateIndexRequest,
     DeleteObjectRequest, GetObjectRequest, HeadObjectRequest, InitiateMultipartRequest,
-    ListObjectVersionsRequest, ListObjectsRequest, ObjectMetadata, PatchJsonObjectRequest,
-    PutObjectRequest, RepairDirectoryIndexRequest, SealAppendStreamSegmentRequest,
-    UploadPartMetadata, UploadPartRequest, WatchPrefixRequest,
+    ListObjectVersionsRequest, ListObjectsRequest, NativeMutationContext, ObjectMetadata,
+    PatchJsonObjectRequest, PutObjectRequest, RepairDirectoryIndexRequest,
+    SealAppendStreamSegmentRequest, UploadPartMetadata, UploadPartRequest, WatchPrefixRequest,
 };
 use futures_util::StreamExt;
 use std::time::Duration;
@@ -40,6 +40,42 @@ fn assert_reserved_namespace_status<T>(result: Result<T, Status>) {
     );
 }
 
+fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
+    NativeMutationContext {
+        tenant_id: 1,
+        bucket_id,
+        principal: "test-app".to_string(),
+        request_id: format!("{tag}-request"),
+        precondition: "none".to_string(),
+        authz_zookie_optional: String::new(),
+        idempotency_key: format!("{tag}-idempotency"),
+    }
+}
+
+fn put_object_chunks(
+    bucket_name: &str,
+    object_key: &str,
+    payload: &[u8],
+    mutation_context: Option<NativeMutationContext>,
+) -> Vec<PutObjectRequest> {
+    vec![
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                ObjectMetadata {
+                    bucket_name: bucket_name.to_string(),
+                    object_key: object_key.to_string(),
+                    mutation_context,
+                },
+            )),
+        },
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                payload.to_vec(),
+            )),
+        },
+    ]
+}
+
 macro_rules! assert_native_mutation_response {
     ($response:expr) => {{
         assert!(!$response.mutation_id.is_empty());
@@ -47,6 +83,146 @@ macro_rules! assert_native_mutation_response {
         assert!(!$response.record_hash.is_empty());
         assert!($response.watch_cursor > 0);
     }};
+}
+
+#[tokio::test]
+async fn test_native_mutations_require_valid_context() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr).await.unwrap();
+    let bucket_name = format!("native-context-{}", uuid::Uuid::new_v4());
+
+    let mut create_req = Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
+    });
+    create_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
+
+    let mut missing_context_req = Request::new(tokio_stream::iter(put_object_chunks(
+        &bucket_name,
+        "missing-context.txt",
+        b"missing",
+        None,
+    )));
+    missing_context_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let err = object_client
+        .put_object(missing_context_req)
+        .await
+        .expect_err("native mutation without context must fail");
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert!(err.message().contains("Missing native mutation context"));
+
+    let mut wrong_principal = native_mutation_context(bucket_id, "wrong-principal");
+    wrong_principal.principal = "other-app".to_string();
+    let mut wrong_principal_req = Request::new(tokio_stream::iter(put_object_chunks(
+        &bucket_name,
+        "wrong-principal.txt",
+        b"wrong",
+        Some(wrong_principal),
+    )));
+    wrong_principal_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let err = object_client
+        .put_object(wrong_principal_req)
+        .await
+        .expect_err("native mutation with mismatched principal must fail");
+    assert_eq!(err.code(), Code::PermissionDenied);
+    assert!(err.message().contains("principal mismatch"));
+
+    let mut wrong_tenant = native_mutation_context(bucket_id, "wrong-tenant");
+    wrong_tenant.tenant_id = 2;
+    let mut wrong_tenant_req = Request::new(tokio_stream::iter(put_object_chunks(
+        &bucket_name,
+        "wrong-tenant.txt",
+        b"wrong",
+        Some(wrong_tenant),
+    )));
+    wrong_tenant_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let err = object_client
+        .put_object(wrong_tenant_req)
+        .await
+        .expect_err("native mutation with mismatched tenant must fail");
+    assert_eq!(err.code(), Code::PermissionDenied);
+    assert!(err.message().contains("tenant mismatch"));
+
+    let mut wrong_bucket = native_mutation_context(bucket_id + 1, "wrong-bucket");
+    let mut wrong_bucket_req = Request::new(tokio_stream::iter(put_object_chunks(
+        &bucket_name,
+        "wrong-bucket.txt",
+        b"wrong",
+        Some(wrong_bucket.clone()),
+    )));
+    wrong_bucket_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let err = object_client
+        .put_object(wrong_bucket_req)
+        .await
+        .expect_err("native mutation with mismatched bucket must fail");
+    assert_eq!(err.code(), Code::PermissionDenied);
+    assert!(err.message().contains("bucket mismatch"));
+
+    wrong_bucket.bucket_id = bucket_id;
+    wrong_bucket.request_id.clear();
+    let mut blank_field_req = Request::new(tokio_stream::iter(put_object_chunks(
+        &bucket_name,
+        "blank-request-id.txt",
+        b"wrong",
+        Some(wrong_bucket),
+    )));
+    blank_field_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let err = object_client
+        .put_object(blank_field_req)
+        .await
+        .expect_err("native mutation with blank request_id must fail");
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert!(err.message().contains("request_id"));
+
+    let mut stale_zookie = native_mutation_context(bucket_id, "stale-zookie");
+    stale_zookie.authz_zookie_optional = "authz:999999".to_string();
+    let mut stale_zookie_req = Request::new(tokio_stream::iter(put_object_chunks(
+        &bucket_name,
+        "stale-zookie.txt",
+        b"wrong",
+        Some(stale_zookie),
+    )));
+    stale_zookie_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let err = object_client
+        .put_object(stale_zookie_req)
+        .await
+        .expect_err("native mutation with unavailable authz revision must fail");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert!(err.message().contains("AuthzRevisionUnavailable"));
 }
 
 #[tokio::test]
@@ -187,12 +363,18 @@ async fn test_delete_object_creates_delete_marker() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_req).await.unwrap();
+    let bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     // 1. Put an object
     let metadata = ObjectMetadata {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
+        mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
     };
     let chunks = vec![
         PutObjectRequest {
@@ -239,6 +421,7 @@ async fn test_delete_object_creates_delete_marker() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         version_id: None,
+        mutation_context: Some(native_mutation_context(bucket_id, "delete-object")),
     });
     del_req.metadata_mut().insert(
         "authorization",
@@ -321,7 +504,12 @@ async fn test_delete_object_specific_version_removes_only_that_version() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_req).await.unwrap();
+    let bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let first_chunks = vec![
         PutObjectRequest {
@@ -329,6 +517,7 @@ async fn test_delete_object_specific_version_removes_only_that_version() {
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key: object_key.clone(),
+                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
                 },
             )),
         },
@@ -355,6 +544,7 @@ async fn test_delete_object_specific_version_removes_only_that_version() {
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key: object_key.clone(),
+                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
                 },
             )),
         },
@@ -423,6 +613,7 @@ async fn test_delete_object_specific_version_removes_only_that_version() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         version_id: Some(first_put.version_id.clone()),
+        mutation_context: Some(native_mutation_context(bucket_id, "delete-object")),
     });
     delete_req.metadata_mut().insert(
         "authorization",
@@ -478,7 +669,12 @@ async fn test_utf8_object_keys_with_spaces_round_trip() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_req).await.unwrap();
+    let bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let chunks = vec![
         PutObjectRequest {
@@ -486,6 +682,7 @@ async fn test_utf8_object_keys_with_spaces_round_trip() {
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key: object_key.clone(),
+                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
                 },
             )),
         },
@@ -537,6 +734,10 @@ async fn test_utf8_object_keys_with_spaces_round_trip() {
                     ObjectMetadata {
                         bucket_name: bucket_name.clone(),
                         object_key: key.to_string(),
+                        mutation_context: Some(native_mutation_context(
+                            bucket_id,
+                            "object-metadata",
+                        )),
                     },
                 )),
             },
@@ -620,7 +821,12 @@ async fn test_listing_omits_reserved_internal_object_keys() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_req).await.unwrap();
+    let bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let chunks = vec![
         PutObjectRequest {
@@ -628,6 +834,7 @@ async fn test_listing_omits_reserved_internal_object_keys() {
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key: visible_key.clone(),
+                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
                 },
             )),
         },
@@ -737,7 +944,12 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_req).await.unwrap();
+    let bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let visible_chunks = vec![
         PutObjectRequest {
@@ -745,6 +957,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key: visible_key.clone(),
+                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
                 },
             )),
         },
@@ -767,6 +980,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key: reserved_key.clone(),
+                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
                 },
             )),
         },
@@ -809,6 +1023,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         bucket_name: bucket_name.clone(),
         object_key: reserved_key.clone(),
         version_id: None,
+        mutation_context: Some(native_mutation_context(bucket_id, "delete-object")),
     });
     delete_req.metadata_mut().insert(
         "authorization",
@@ -848,6 +1063,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         source_version_id: None,
         destination_bucket_name: bucket_name.clone(),
         destination_object_key: "visible/copied-from-reserved.json".to_string(),
+        mutation_context: Some(native_mutation_context(bucket_id, "copy-object")),
     });
     copy_from_reserved.metadata_mut().insert(
         "authorization",
@@ -861,6 +1077,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         source_version_id: None,
         destination_bucket_name: bucket_name.clone(),
         destination_object_key: reserved_key.clone(),
+        mutation_context: Some(native_mutation_context(bucket_id, "copy-object")),
     });
     copy_to_reserved.metadata_mut().insert(
         "authorization",
@@ -876,6 +1093,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         }],
         destination_bucket_name: bucket_name.clone(),
         destination_object_key: reserved_key.clone(),
+        mutation_context: Some(native_mutation_context(bucket_id, "compose-object")),
     });
     compose_to_reserved.metadata_mut().insert(
         "authorization",
@@ -888,6 +1106,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         object_key: reserved_key.clone(),
         base_version_id: None,
         merge_patch_json: r#"{"patched":true}"#.to_string(),
+        mutation_context: Some(native_mutation_context(bucket_id, "patch-json-object")),
     });
     patch_reserved.metadata_mut().insert(
         "authorization",
@@ -900,6 +1119,10 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         manifest_key: reserved_key.clone(),
         expected_revision: 0,
         manifest_json: "{}".to_string(),
+        mutation_context: Some(native_mutation_context(
+            bucket_id,
+            "compare-and-swap-manifest",
+        )),
     });
     manifest_reserved.metadata_mut().insert(
         "authorization",
@@ -914,6 +1137,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
     let mut multipart_reserved = Request::new(InitiateMultipartRequest {
         bucket_name: bucket_name.clone(),
         object_key: reserved_key.clone(),
+        mutation_context: Some(native_mutation_context(bucket_id, "initiate-multipart")),
     });
     multipart_reserved.metadata_mut().insert(
         "authorization",
@@ -928,6 +1152,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
     let mut create_append_reserved = Request::new(CreateAppendStreamRequest {
         bucket_name: bucket_name.clone(),
         stream_key: reserved_key.clone(),
+        mutation_context: Some(native_mutation_context(bucket_id, "create-append-stream")),
     });
     create_append_reserved.metadata_mut().insert(
         "authorization",
@@ -944,6 +1169,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         stream_key: reserved_key.clone(),
         stream_id: uuid::Uuid::new_v4().to_string(),
         payload: b"reserved append payload".to_vec(),
+        mutation_context: Some(native_mutation_context(bucket_id, "append-stream-record")),
     });
     append_record_reserved.metadata_mut().insert(
         "authorization",
@@ -959,6 +1185,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         bucket_name: bucket_name.clone(),
         stream_key: reserved_key.clone(),
         stream_id: uuid::Uuid::new_v4().to_string(),
+        mutation_context: Some(native_mutation_context(bucket_id, "seal-append-stream")),
     });
     seal_append_reserved.metadata_mut().insert(
         "authorization",
@@ -1008,12 +1235,18 @@ async fn test_head_object() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_req).await.unwrap();
+    let bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     // 1. Put an object
     let metadata = ObjectMetadata {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
+        mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
     };
     let chunks = vec![
         PutObjectRequest {
@@ -1085,7 +1318,12 @@ async fn test_inline_payload_threshold_is_recorded_and_readable() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_req).await.unwrap();
+    let bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let inline_content = vec![7_u8; 64 * 1024];
     let inline_chunks = vec![
@@ -1094,6 +1332,7 @@ async fn test_inline_payload_threshold_is_recorded_and_readable() {
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key: inline_key.clone(),
+                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
                 },
             )),
         },
@@ -1120,6 +1359,7 @@ async fn test_inline_payload_threshold_is_recorded_and_readable() {
             ObjectMetadata {
                 bucket_name: bucket_name.clone(),
                 object_key: external_key.clone(),
+                mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
             },
         )),
     }];
@@ -1284,7 +1524,12 @@ async fn test_object_version_records_index_policy_snapshot_and_mutation_metadata
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_bucket).await.unwrap();
+    let bucket_id = bucket_client
+        .create_bucket(create_bucket)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let mut create_index = Request::new(CreateIndexRequest {
         bucket_name: bucket_name.clone(),
@@ -1320,6 +1565,7 @@ async fn test_object_version_records_index_policy_snapshot_and_mutation_metadata
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key: object_key.clone(),
+                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
                 },
             )),
         },
@@ -1392,11 +1638,17 @@ async fn test_copy_object_creates_independent_destination_version() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_req).await.unwrap();
+    let bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let metadata = ObjectMetadata {
         bucket_name: bucket_name.clone(),
         object_key: source_key.clone(),
+        mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
     };
     let chunks = vec![
         PutObjectRequest {
@@ -1427,6 +1679,7 @@ async fn test_copy_object_creates_independent_destination_version() {
         source_version_id: Some(put_res.version_id.clone()),
         destination_bucket_name: bucket_name.clone(),
         destination_object_key: destination_key.clone(),
+        mutation_context: Some(native_mutation_context(bucket_id, "copy-object")),
     });
     copy_req.metadata_mut().insert(
         "authorization",
@@ -1495,7 +1748,12 @@ async fn test_private_object_read_denied_before_payload_load() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_req).await.unwrap();
+    let _bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
     let bucket = cluster.states[0]
@@ -1604,11 +1862,17 @@ async fn test_watch_prefix_streams_snapshot_and_live_events() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_req).await.unwrap();
+    let bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let metadata = ObjectMetadata {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
+        mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
     };
     let chunks = vec![
         PutObjectRequest {
@@ -1659,6 +1923,7 @@ async fn test_watch_prefix_streams_snapshot_and_live_events() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         version_id: None,
+        mutation_context: Some(native_mutation_context(bucket_id, "delete-object")),
     });
     delete_req.metadata_mut().insert(
         "authorization",
@@ -1702,11 +1967,17 @@ async fn test_append_stream_records_are_ordered_and_sealable() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_req).await.unwrap();
+    let bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let mut create_stream_req = Request::new(CreateAppendStreamRequest {
         bucket_name: bucket_name.clone(),
         stream_key: stream_key.clone(),
+        mutation_context: Some(native_mutation_context(bucket_id, "create-append-stream")),
     });
     create_stream_req.metadata_mut().insert(
         "authorization",
@@ -1726,6 +1997,7 @@ async fn test_append_stream_records_are_ordered_and_sealable() {
         stream_key: stream_key.clone(),
         stream_id: stream_id.clone(),
         payload: b"first".to_vec(),
+        mutation_context: Some(native_mutation_context(bucket_id, "append-stream-record")),
     });
     first_req.metadata_mut().insert(
         "authorization",
@@ -1747,6 +2019,7 @@ async fn test_append_stream_records_are_ordered_and_sealable() {
         stream_key: stream_key.clone(),
         stream_id: stream_id.clone(),
         payload: b"second".to_vec(),
+        mutation_context: Some(native_mutation_context(bucket_id, "append-stream-record")),
     });
     second_req.metadata_mut().insert(
         "authorization",
@@ -1765,6 +2038,7 @@ async fn test_append_stream_records_are_ordered_and_sealable() {
         bucket_name: bucket_name.clone(),
         stream_key: stream_key.clone(),
         stream_id: stream_id.clone(),
+        mutation_context: Some(native_mutation_context(bucket_id, "seal-append-stream")),
     });
     seal_req.metadata_mut().insert(
         "authorization",
@@ -1786,6 +2060,7 @@ async fn test_append_stream_records_are_ordered_and_sealable() {
         stream_key,
         stream_id,
         payload: b"must fail".to_vec(),
+        mutation_context: Some(native_mutation_context(bucket_id, "append-stream-record")),
     });
     append_after_seal.metadata_mut().insert(
         "authorization",
@@ -1823,13 +2098,22 @@ async fn test_compare_and_swap_manifest_enforces_expected_revision() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_req).await.unwrap();
+    let bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let mut create_manifest = Request::new(CompareAndSwapManifestRequest {
         bucket_name: bucket_name.clone(),
         manifest_key: manifest_key.clone(),
         expected_revision: 0,
         manifest_json: serde_json::json!({"generation": 1}).to_string(),
+        mutation_context: Some(native_mutation_context(
+            bucket_id,
+            "compare-and-swap-manifest",
+        )),
     });
     create_manifest.metadata_mut().insert(
         "authorization",
@@ -1850,6 +2134,10 @@ async fn test_compare_and_swap_manifest_enforces_expected_revision() {
         manifest_key: manifest_key.clone(),
         expected_revision: 0,
         manifest_json: serde_json::json!({"generation": 2}).to_string(),
+        mutation_context: Some(native_mutation_context(
+            bucket_id,
+            "compare-and-swap-manifest",
+        )),
     });
     stale_update.metadata_mut().insert(
         "authorization",
@@ -1867,6 +2155,10 @@ async fn test_compare_and_swap_manifest_enforces_expected_revision() {
         manifest_key,
         expected_revision: first.revision,
         manifest_json: serde_json::json!({"generation": 2}).to_string(),
+        mutation_context: Some(native_mutation_context(
+            bucket_id,
+            "compare-and-swap-manifest",
+        )),
     });
     valid_update.metadata_mut().insert(
         "authorization",
@@ -1908,11 +2200,17 @@ async fn test_multipart_upload_completes_ordered_parts() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_req).await.unwrap();
+    let bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let mut initiate_req = Request::new(InitiateMultipartRequest {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
+        mutation_context: Some(native_mutation_context(bucket_id, "initiate-multipart")),
     });
     initiate_req.metadata_mut().insert(
         "authorization",
@@ -1938,6 +2236,7 @@ async fn test_multipart_upload_completes_ordered_parts() {
                         object_key: object_key.clone(),
                         upload_id: upload_id.clone(),
                         part_number,
+                        mutation_context: Some(native_mutation_context(bucket_id, "upload-part")),
                     },
                 )),
             },
@@ -1968,6 +2267,7 @@ async fn test_multipart_upload_completes_ordered_parts() {
         object_key: object_key.clone(),
         upload_id,
         parts: completed_parts,
+        mutation_context: Some(native_mutation_context(bucket_id, "complete-multipart")),
     });
     complete_req.metadata_mut().insert(
         "authorization",
@@ -2028,11 +2328,17 @@ async fn test_multipart_abort_returns_mutation_metadata() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_req).await.unwrap();
+    let bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let mut initiate_req = Request::new(InitiateMultipartRequest {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
+        mutation_context: Some(native_mutation_context(bucket_id, "initiate-multipart")),
     });
     initiate_req.metadata_mut().insert(
         "authorization",
@@ -2049,6 +2355,7 @@ async fn test_multipart_abort_returns_mutation_metadata() {
         bucket_name,
         object_key,
         upload_id: initiate_res.upload_id.clone(),
+        mutation_context: Some(native_mutation_context(bucket_id, "abort-multipart")),
     });
     abort_req.metadata_mut().insert(
         "authorization",
@@ -2087,7 +2394,12 @@ async fn test_compose_object_concatenates_sources_in_order() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_req).await.unwrap();
+    let bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let sources = vec![
         ("part-a.txt", b"hello ".to_vec()),
@@ -2098,6 +2410,7 @@ async fn test_compose_object_concatenates_sources_in_order() {
         let metadata = ObjectMetadata {
             bucket_name: bucket_name.clone(),
             object_key: key.to_string(),
+            mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
         };
         let chunks = vec![
             PutObjectRequest {
@@ -2135,6 +2448,7 @@ async fn test_compose_object_concatenates_sources_in_order() {
             .collect(),
         destination_bucket_name: bucket_name.clone(),
         destination_object_key: "composed.txt".to_string(),
+        mutation_context: Some(native_mutation_context(bucket_id, "compose-object")),
     });
     compose_req.metadata_mut().insert(
         "authorization",
@@ -2201,11 +2515,17 @@ async fn test_patch_json_object_writes_new_merged_version() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_req).await.unwrap();
+    let bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let metadata = ObjectMetadata {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
+        mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
     };
     let initial_json = br#"{"title":"old","stats":{"open":2,"closed":1},"remove_me":true}"#;
     let chunks = vec![
@@ -2236,6 +2556,7 @@ async fn test_patch_json_object_writes_new_merged_version() {
         object_key: object_key.clone(),
         base_version_id: Some(put_res.version_id.clone()),
         merge_patch_json: r#"{"title":"new","stats":{"open":3},"remove_me":null}"#.to_string(),
+        mutation_context: Some(native_mutation_context(bucket_id, "patch-json-object")),
     });
     patch_req.metadata_mut().insert(
         "authorization",
@@ -2302,13 +2623,19 @@ async fn test_list_objects_with_delimiter() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_req).await.unwrap();
+    let bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let keys = vec!["a/b.txt", "a/c.txt", "d.txt"];
     for key in keys {
         let metadata = ObjectMetadata {
             bucket_name: bucket_name.clone(),
             object_key: key.to_string(),
+            mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
         };
         let chunks = vec![
             PutObjectRequest {

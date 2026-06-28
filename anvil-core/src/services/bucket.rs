@@ -37,7 +37,9 @@ impl BucketService for AppState {
             .await?;
 
         tracing::debug!("[service] EXITING create_bucket");
-        Ok(Response::new(CreateBucketResponse {}))
+        Ok(Response::new(CreateBucketResponse {
+            bucket_id: bucket.id,
+        }))
     }
 
     async fn delete_bucket(
@@ -83,6 +85,7 @@ impl BucketService for AppState {
                 region: b.region,
                 is_public_read: b.is_public_read,
                 deleted: false,
+                bucket_id: b.id,
             })
             .collect();
 
@@ -269,6 +272,10 @@ fn bucket_metadata_event_response(
 
 fn bucket_from_metadata(value: &JsonValue) -> Result<Bucket, Status> {
     Ok(Bucket {
+        bucket_id: value
+            .get("bucket_id")
+            .and_then(JsonValue::as_i64)
+            .ok_or_else(|| Status::internal("Malformed bucket metadata event"))?,
         name: json_string_field(value, "name")?,
         creation_date: json_string_field(value, "creation_date")?,
         region: json_string_field(value, "region")?,

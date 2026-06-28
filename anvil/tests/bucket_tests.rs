@@ -2,8 +2,8 @@ use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::{
     AbortMultipartRequest, CreateBucketRequest, DeleteBucketRequest, GetBucketPolicyRequest,
-    InitiateMultipartRequest, ListBucketsRequest, ObjectMetadata, PutBucketPolicyRequest,
-    PutObjectRequest, WatchBucketMetadataRequest,
+    InitiateMultipartRequest, ListBucketsRequest, NativeMutationContext, ObjectMetadata,
+    PutBucketPolicyRequest, PutObjectRequest, WatchBucketMetadataRequest,
 };
 use anvil::tasks::TaskStatus;
 use futures_util::StreamExt;
@@ -11,6 +11,18 @@ use std::time::{Duration, Instant};
 use tonic::Request;
 
 use anvil_test_utils::*;
+
+fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
+    NativeMutationContext {
+        tenant_id: 1,
+        bucket_id,
+        principal: "test-app".to_string(),
+        request_id: format!("{tag}-request"),
+        precondition: "none".to_string(),
+        authz_zookie_optional: String::new(),
+        idempotency_key: format!("{tag}-idempotency"),
+    }
+}
 
 #[tokio::test]
 async fn test_task_claim_marks_tasks_running_before_execution() {
@@ -61,7 +73,12 @@ async fn test_delete_bucket_soft_deletes_and_enqueues_task() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_req).await.unwrap();
+    let _bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     // 1. Verify it exists
     let mut list_req = Request::new(ListBucketsRequest {});
@@ -195,7 +212,12 @@ async fn test_delete_bucket_rejects_retained_objects() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_req).await.unwrap();
+    let bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let chunks = vec![
         PutObjectRequest {
@@ -203,6 +225,7 @@ async fn test_delete_bucket_rejects_retained_objects() {
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key,
+                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
                 },
             )),
         },
@@ -258,11 +281,17 @@ async fn test_delete_bucket_rejects_active_multipart_uploads() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_req).await.unwrap();
+    let bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let mut initiate_req = Request::new(InitiateMultipartRequest {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
+        mutation_context: Some(native_mutation_context(bucket_id, "initiate-multipart")),
     });
     initiate_req.metadata_mut().insert(
         "authorization",
@@ -293,6 +322,7 @@ async fn test_delete_bucket_rejects_active_multipart_uploads() {
         bucket_name: bucket_name.clone(),
         object_key,
         upload_id,
+        mutation_context: Some(native_mutation_context(bucket_id, "abort-multipart")),
     });
     abort_req.metadata_mut().insert(
         "authorization",
@@ -381,7 +411,12 @@ async fn test_get_bucket_policy_reflects_public_read_flag() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_req).await.unwrap();
+    let _bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let mut get_req = Request::new(GetBucketPolicyRequest {
         bucket_name: bucket_name.clone(),
@@ -444,7 +479,12 @@ async fn test_watch_bucket_metadata_streams_snapshot_events() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    bucket_client.create_bucket(create_req).await.unwrap();
+    let _bucket_id = bucket_client
+        .create_bucket(create_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
 
     let mut put_req = Request::new(PutBucketPolicyRequest {
         bucket_name: bucket_name.clone(),
