@@ -7,6 +7,7 @@ use crate::formats::{
     },
 };
 use crate::storage::Storage;
+use crate::vector_hnsw::{build_hnsw_graph_for_entries, validate_hnsw_graph};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -56,7 +57,6 @@ pub struct VectorSegmentWrite<'a> {
     pub source_cursor: u64,
     pub authz_revision: u64,
     pub entries: &'a [VectorSegmentEntry],
-    pub hnsw_graph: &'a HnswGraph,
     pub deleted_bitset: &'a [u8],
 }
 
@@ -67,7 +67,14 @@ pub async fn write_vector_segment(
     let mut entries = input.entries.to_vec();
     validate_entries(input.dimension, input.metric, input.modality, &entries)?;
     entries.sort_by_key(|entry| entry.record.vector_id);
-    let body = encode_vector_body(&mut entries, input.hnsw_graph, input.deleted_bitset)?;
+    validate_deleted_bitset(input.deleted_bitset, entries.len())?;
+    let hnsw_graph = build_hnsw_graph_for_entries(
+        &entries,
+        input.metric,
+        input.hnsw_m,
+        input.hnsw_ef_construction,
+    )?;
+    let body = encode_vector_body(&mut entries, &hnsw_graph, input.deleted_bitset)?;
     let segment_hash = hash32(&body);
     let path = storage.vector_segment_path(
         input.index_id,
@@ -170,6 +177,8 @@ pub fn decode_vector_segment(bytes: &[u8]) -> Result<DecodedVectorSegment> {
     let modality = VectorModality::from_name(&header.modality)?;
     let decoded = decode_vector_body(body, header.dimension)?;
     validate_entries(header.dimension, metric, modality, &decoded.entries)?;
+    validate_hnsw_graph(&decoded.hnsw_graph, &decoded.entries, header.hnsw_m)?;
+    validate_deleted_bitset(&decoded.deleted_bitset, decoded.entries.len())?;
     Ok(DecodedVectorSegment { header, ..decoded })
 }
 
@@ -305,6 +314,16 @@ fn validate_entries(
     Ok(())
 }
 
+fn validate_deleted_bitset(deleted_bitset: &[u8], entry_count: usize) -> Result<()> {
+    let expected_len = entry_count.div_ceil(8);
+    if deleted_bitset.len() != expected_len {
+        return Err(anyhow!(
+            "vector deleted bitset length does not match entry count"
+        ));
+    }
+    Ok(())
+}
+
 fn record_hash_bounds(entries: &[VectorSegmentEntry]) -> (Hash32, Hash32) {
     let first = entries
         .first()
@@ -374,25 +393,11 @@ mod tests {
         }
     }
 
-    fn graph() -> HnswGraph {
-        HnswGraph {
-            node_count: 2,
-            layers: vec![crate::formats::vector::LayerBlock {
-                layer_index: 0,
-                node_adjacencies: vec![crate::formats::vector::NodeAdjacency {
-                    vector_id: 1,
-                    neighbors: vec![2],
-                }],
-            }],
-        }
-    }
-
     #[tokio::test]
     async fn vector_segment_round_trips_payloads_and_graph() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let entries = vec![entry(2, vec![0.0, 1.0, 0.0]), entry(1, vec![1.0, 0.0, 0.0])];
-        let graph = graph();
         let path = write_vector_segment(
             &storage,
             VectorSegmentWrite {
@@ -407,7 +412,6 @@ mod tests {
                 source_cursor: 88,
                 authz_revision: 9,
                 entries: &entries,
-                hnsw_graph: &graph,
                 deleted_bitset: &[0],
             },
         )
@@ -426,7 +430,8 @@ mod tests {
         assert_eq!(decoded.entries.len(), 2);
         assert_eq!(decoded.entries[0].record.vector_id, 1);
         assert_eq!(decoded.entries[1].record.vector_id, 2);
-        assert_eq!(decoded.hnsw_graph, graph);
+        assert_eq!(decoded.hnsw_graph.node_count, 2);
+        assert!(!decoded.hnsw_graph.layers.is_empty());
         assert_eq!(decoded.deleted_bitset, vec![0]);
     }
 
@@ -434,7 +439,6 @@ mod tests {
     async fn vector_segment_footer_protects_body() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let graph = graph();
         let path = write_vector_segment(
             &storage,
             VectorSegmentWrite {
@@ -449,7 +453,6 @@ mod tests {
                 source_cursor: 88,
                 authz_revision: 9,
                 entries: &[entry(1, vec![1.0, 0.0, 0.0])],
-                hnsw_graph: &graph,
                 deleted_bitset: &[0],
             },
         )
@@ -461,10 +464,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vector_segment_rejects_deleted_bitset_length_mismatch() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let err = write_vector_segment(
+            &storage,
+            VectorSegmentWrite {
+                index_id: "vector-alpha",
+                generation: 6,
+                dimension: 3,
+                metric: VectorMetric::Cosine,
+                embedding_model: "embedding-v1",
+                modality: VectorModality::Text,
+                hnsw_m: 32,
+                hnsw_ef_construction: 200,
+                source_cursor: 88,
+                authz_revision: 9,
+                entries: &[entry(1, vec![1.0, 0.0, 0.0])],
+                deleted_bitset: &[],
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("vector deleted bitset length does not match entry count")
+        );
+    }
+
+    #[tokio::test]
     async fn latest_vector_segment_selects_highest_generation() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let graph = graph();
         let entries = [entry(1, vec![1.0, 0.0, 0.0])];
         for generation in [1, 3, 2] {
             write_vector_segment(
@@ -481,7 +513,6 @@ mod tests {
                     source_cursor: generation,
                     authz_revision: 0,
                     entries: &entries,
-                    hnsw_graph: &graph,
                     deleted_bitset: &[0],
                 },
             )

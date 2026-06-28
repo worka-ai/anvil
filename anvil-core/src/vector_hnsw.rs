@@ -1,10 +1,12 @@
 use crate::formats::{
     FormatError, Hash32,
-    vector::{VectorMetric, VectorSearchResult, vector_score},
+    vector::{
+        HnswGraph, LayerBlock, NodeAdjacency, VectorMetric, VectorSearchResult, vector_score,
+    },
 };
 use crate::vector_segment::{DecodedVectorSegment, VectorSegmentEntry};
 use hnsw_rs::{anndists::dist::distances::Distance, hnsw::Hnsw};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const DEFAULT_MAX_LAYER: usize = 16;
 const DEFAULT_EF_SEARCH: usize = 80;
@@ -20,6 +22,100 @@ pub trait VectorIndexEngine {
         authorized_labels: Option<&BTreeSet<Hash32>>,
         limit: usize,
     ) -> Result<Vec<VectorSearchResult>, FormatError>;
+}
+
+pub fn build_hnsw_graph_for_entries(
+    entries: &[VectorSegmentEntry],
+    metric: VectorMetric,
+    hnsw_m: u16,
+    hnsw_ef_construction: u16,
+) -> Result<HnswGraph, FormatError> {
+    if entries.is_empty() {
+        return Ok(HnswGraph {
+            node_count: 0,
+            layers: Vec::new(),
+        });
+    }
+    if usize::from(hnsw_m) > MAX_HNSW_CONNECTIONS {
+        return Err(FormatError::InvalidDeclaredLength { context: "hnsw_m" });
+    }
+
+    match metric {
+        VectorMetric::Cosine => {
+            build_graph_with_distance::<AnvilCosineDistance>(entries, hnsw_m, hnsw_ef_construction)
+        }
+        VectorMetric::Dot => {
+            build_graph_with_distance::<AnvilDotDistance>(entries, hnsw_m, hnsw_ef_construction)
+        }
+        VectorMetric::L2 => {
+            build_graph_with_distance::<AnvilL2Distance>(entries, hnsw_m, hnsw_ef_construction)
+        }
+    }
+}
+
+pub fn validate_hnsw_graph(
+    graph: &HnswGraph,
+    entries: &[VectorSegmentEntry],
+    hnsw_m: u16,
+) -> Result<(), FormatError> {
+    if graph.node_count != entries.len() as u64 {
+        return Err(FormatError::InvalidDeclaredLength {
+            context: "hnsw graph node count",
+        });
+    }
+    if usize::from(hnsw_m) > MAX_HNSW_CONNECTIONS {
+        return Err(FormatError::InvalidDeclaredLength { context: "hnsw_m" });
+    }
+
+    let known_ids = entries
+        .iter()
+        .map(|entry| entry.record.vector_id)
+        .collect::<BTreeSet<_>>();
+    let mut seen_layers = BTreeSet::new();
+    for layer in &graph.layers {
+        if !seen_layers.insert(layer.layer_index) {
+            return Err(FormatError::InvalidDeclaredLength {
+                context: "hnsw duplicate layer",
+            });
+        }
+        let mut seen_nodes = BTreeSet::new();
+        for adjacency in &layer.node_adjacencies {
+            if !known_ids.contains(&adjacency.vector_id) {
+                return Err(FormatError::InvalidDeclaredLength {
+                    context: "hnsw unknown node",
+                });
+            }
+            if !seen_nodes.insert(adjacency.vector_id) {
+                return Err(FormatError::InvalidDeclaredLength {
+                    context: "hnsw duplicate node",
+                });
+            }
+            if adjacency.neighbors.len() > usize::from(hnsw_m) {
+                return Err(FormatError::InvalidDeclaredLength {
+                    context: "hnsw neighbor count",
+                });
+            }
+            let mut seen_neighbors = BTreeSet::new();
+            for neighbor in &adjacency.neighbors {
+                if *neighbor == adjacency.vector_id {
+                    return Err(FormatError::InvalidDeclaredLength {
+                        context: "hnsw self neighbor",
+                    });
+                }
+                if !known_ids.contains(neighbor) {
+                    return Err(FormatError::InvalidDeclaredLength {
+                        context: "hnsw unknown neighbor",
+                    });
+                }
+                if !seen_neighbors.insert(*neighbor) {
+                    return Err(FormatError::InvalidDeclaredLength {
+                        context: "hnsw duplicate neighbor",
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +271,93 @@ impl HnswRsVectorIndexEngine {
     }
 }
 
+fn build_graph_with_distance<D>(
+    entries: &[VectorSegmentEntry],
+    hnsw_m: u16,
+    hnsw_ef_construction: u16,
+) -> Result<HnswGraph, FormatError>
+where
+    D: Distance<f32> + Default + Send + Sync,
+{
+    let max_connections = usize::from(hnsw_m).max(1);
+    let ef_construction = usize::from(hnsw_ef_construction).max(max_connections);
+    let hnsw = Hnsw::<f32, D>::new(
+        max_connections,
+        entries.len(),
+        DEFAULT_MAX_LAYER,
+        ef_construction,
+        D::default(),
+    );
+    for (idx, entry) in entries.iter().enumerate() {
+        hnsw.insert((&entry.payload.values, idx));
+    }
+    let graph = graph_from_hnsw(&hnsw, entries)?;
+    validate_hnsw_graph(&graph, entries, hnsw_m)?;
+    Ok(graph)
+}
+
+fn graph_from_hnsw<D>(
+    hnsw: &Hnsw<'_, f32, D>,
+    entries: &[VectorSegmentEntry],
+) -> Result<HnswGraph, FormatError>
+where
+    D: Distance<f32> + Send + Sync,
+{
+    let vector_ids = entries
+        .iter()
+        .map(|entry| entry.record.vector_id)
+        .collect::<Vec<_>>();
+    let mut layers = Vec::new();
+    for layer_index in 0..=usize::from(hnsw.get_max_level_observed()) {
+        let mut nodes_by_id = BTreeMap::new();
+        for point in hnsw.get_point_indexation().get_layer_iterator(layer_index) {
+            let origin_id = point.get_origin_id();
+            let vector_id =
+                *vector_ids
+                    .get(origin_id)
+                    .ok_or(FormatError::InvalidDeclaredLength {
+                        context: "hnsw origin id",
+                    })?;
+            let neighborhoods = point.get_neighborhood_id();
+            let neighbors_for_layer =
+                neighborhoods
+                    .get(layer_index)
+                    .ok_or(FormatError::InvalidDeclaredLength {
+                        context: "hnsw layer",
+                    })?;
+            let mut neighbors = neighbors_for_layer
+                .iter()
+                .map(|neighbor| {
+                    vector_ids.get(neighbor.d_id).copied().ok_or(
+                        FormatError::InvalidDeclaredLength {
+                            context: "hnsw neighbor id",
+                        },
+                    )
+                })
+                .collect::<Result<Vec<_>, FormatError>>()?;
+            neighbors.sort_unstable();
+            neighbors.dedup();
+            nodes_by_id.insert(
+                vector_id,
+                NodeAdjacency {
+                    vector_id,
+                    neighbors,
+                },
+            );
+        }
+        if !nodes_by_id.is_empty() {
+            layers.push(LayerBlock {
+                layer_index: layer_index as u16,
+                node_adjacencies: nodes_by_id.into_values().collect(),
+            });
+        }
+    }
+    Ok(HnswGraph {
+        node_count: entries.len() as u64,
+        layers,
+    })
+}
+
 #[derive(Default, Debug, Clone, Copy)]
 struct AnvilL2Distance;
 
@@ -250,7 +433,9 @@ fn is_authorized(label: Hash32, authorized_labels: Option<&BTreeSet<Hash32>>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::formats::vector::{HnswGraph, VectorModality, VectorPayload, VectorRecord};
+    use crate::formats::vector::{
+        HnswGraph, LayerBlock, NodeAdjacency, VectorModality, VectorPayload, VectorRecord,
+    };
     use crate::vector_segment::{DecodedVectorSegment, VectorSegmentHeader};
 
     #[test]
@@ -299,6 +484,65 @@ mod tests {
             .query_segment(&segment, &[1.0, 0.0], VectorMetric::Dot, None, 1)
             .unwrap();
         assert_eq!(dot[0].vector_id, 2);
+    }
+
+    #[test]
+    fn generated_hnsw_graph_uses_segment_vector_ids() {
+        let allowed = [1; 32];
+        let entries = vec![
+            entry(100, [1.0, 0.0], allowed),
+            entry(200, [0.5, 0.5], allowed),
+            entry(300, [0.0, 1.0], allowed),
+        ];
+
+        let graph = build_hnsw_graph_for_entries(&entries, VectorMetric::Cosine, 16, 80).unwrap();
+
+        assert_eq!(graph.node_count, 3);
+        assert!(!graph.layers.is_empty());
+        let known_ids = entries
+            .iter()
+            .map(|entry| entry.record.vector_id)
+            .collect::<BTreeSet<_>>();
+        for layer in &graph.layers {
+            for node in &layer.node_adjacencies {
+                assert!(known_ids.contains(&node.vector_id));
+                for neighbor in &node.neighbors {
+                    assert!(known_ids.contains(neighbor));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hnsw_graph_validation_rejects_malformed_adjacency() {
+        let allowed = [1; 32];
+        let entries = vec![entry(1, [1.0, 0.0], allowed), entry(2, [0.0, 1.0], allowed)];
+        let unknown_neighbor = HnswGraph {
+            node_count: 2,
+            layers: vec![LayerBlock {
+                layer_index: 0,
+                node_adjacencies: vec![NodeAdjacency {
+                    vector_id: 1,
+                    neighbors: vec![3],
+                }],
+            }],
+        };
+        assert!(validate_hnsw_graph(&unknown_neighbor, &entries, 16).is_err());
+
+        let duplicate_layer = HnswGraph {
+            node_count: 2,
+            layers: vec![
+                LayerBlock {
+                    layer_index: 0,
+                    node_adjacencies: Vec::new(),
+                },
+                LayerBlock {
+                    layer_index: 0,
+                    node_adjacencies: Vec::new(),
+                },
+            ],
+        };
+        assert!(validate_hnsw_graph(&duplicate_layer, &entries, 16).is_err());
     }
 
     fn segment_with_entries(entries: Vec<VectorSegmentEntry>) -> DecodedVectorSegment {

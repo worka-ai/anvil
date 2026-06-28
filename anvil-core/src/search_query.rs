@@ -195,9 +195,7 @@ fn sort_hits(hits: &mut [FullTextSearchHit]) {
 mod tests {
     use super::*;
     use crate::formats::full_text::{FullTextDocument, build_full_text_postings};
-    use crate::formats::vector::{
-        HnswGraph, LayerBlock, NodeAdjacency, VectorModality, VectorPayload, VectorRecord,
-    };
+    use crate::formats::vector::{VectorModality, VectorPayload, VectorRecord};
     use crate::full_text_segment::{
         FullTextSegmentWrite, read_full_text_segment, write_full_text_segment,
     };
@@ -354,16 +352,6 @@ mod tests {
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let allowed = [1; 32];
         let denied = [2; 32];
-        let graph = HnswGraph {
-            node_count: 2,
-            layers: vec![LayerBlock {
-                layer_index: 0,
-                node_adjacencies: vec![NodeAdjacency {
-                    vector_id: 1,
-                    neighbors: vec![2],
-                }],
-            }],
-        };
         let entries = vec![
             vector_entry(1, allowed, vec![1.0, 0.0]),
             vector_entry(2, denied, vec![0.99, 0.0]),
@@ -383,7 +371,6 @@ mod tests {
                 source_cursor: 1,
                 authz_revision: 1,
                 entries: &entries,
-                hnsw_graph: &graph,
                 deleted_bitset: &[0],
             },
         )
@@ -406,17 +393,73 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn vector_query_round_trips_all_required_modalities() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let allowed = [9; 32];
+
+        for (idx, modality) in [
+            VectorModality::Text,
+            VectorModality::Image,
+            VectorModality::Audio,
+            VectorModality::Video,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let entries = vec![
+                vector_entry_with_modality(1, allowed, vec![1.0, 0.0], modality),
+                vector_entry_with_modality(2, allowed, vec![0.0, 1.0], modality),
+            ];
+            let path = write_vector_segment(
+                &storage,
+                VectorSegmentWrite {
+                    index_id: &format!("vector-modality-{idx}"),
+                    generation: 1,
+                    dimension: 2,
+                    metric: VectorMetric::Cosine,
+                    embedding_model: "embedding-v1",
+                    modality,
+                    hnsw_m: 32,
+                    hnsw_ef_construction: 200,
+                    source_cursor: 1,
+                    authz_revision: 1,
+                    entries: &entries,
+                    deleted_bitset: &[0],
+                },
+            )
+            .await
+            .unwrap();
+
+            let segment = read_vector_segment(path).await.unwrap();
+            let hits =
+                query_vector_segment(&segment, &[1.0, 0.0], VectorMetric::Cosine, None, 1).unwrap();
+            assert_eq!(segment.header.modality, modality.as_name());
+            assert_eq!(hits[0].vector_id, 1);
+        }
+    }
+
     fn vector_entry(
         vector_id: u64,
         authz_label_hash: Hash32,
         values: Vec<f32>,
+    ) -> VectorSegmentEntry {
+        vector_entry_with_modality(vector_id, authz_label_hash, values, VectorModality::Text)
+    }
+
+    fn vector_entry_with_modality(
+        vector_id: u64,
+        authz_label_hash: Hash32,
+        values: Vec<f32>,
+        modality: VectorModality,
     ) -> VectorSegmentEntry {
         VectorSegmentEntry {
             record: VectorRecord {
                 vector_id,
                 object_version_id: [vector_id as u8; 16],
                 chunk_id: vector_id as u32,
-                modality: VectorModality::Text as u8,
+                modality: modality as u8,
                 metric: VectorMetric::Cosine as u8,
                 dimension: 2,
                 vector_payload_offset: 0,

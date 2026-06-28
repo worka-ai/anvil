@@ -6,9 +6,7 @@ use anvil::anvil_api::{
     WatchIndexDefinitionRequest,
 };
 use anvil::formats::full_text::{FullTextDocument, build_full_text_postings};
-use anvil::formats::vector::{
-    HnswGraph, LayerBlock, NodeAdjacency, VectorMetric, VectorModality, VectorPayload, VectorRecord,
-};
+use anvil::formats::vector::{VectorMetric, VectorModality, VectorPayload, VectorRecord};
 use anvil::full_text_segment::{FullTextSegmentWrite, write_full_text_segment};
 use anvil::vector_segment::{VectorSegmentEntry, VectorSegmentWrite, write_vector_segment};
 use anvil_test_utils::*;
@@ -449,16 +447,6 @@ async fn test_query_vector_index_reads_latest_segment() {
         )
         .await
         .unwrap();
-    let graph = HnswGraph {
-        node_count: 2,
-        layers: vec![LayerBlock {
-            layer_index: 0,
-            node_adjacencies: vec![NodeAdjacency {
-                vector_id: 1,
-                neighbors: vec![2],
-            }],
-        }],
-    };
     write_vector_segment(
         &cluster.states[0].storage,
         VectorSegmentWrite {
@@ -476,7 +464,6 @@ async fn test_query_vector_index_reads_latest_segment() {
                 vector_entry(1, *first_object.version_id.as_bytes(), vec![1.0, 0.0]),
                 vector_entry(2, *second_object.version_id.as_bytes(), vec![0.0, 1.0]),
             ],
-            hnsw_graph: &graph,
             deleted_bitset: &[0],
         },
     )
@@ -647,16 +634,6 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
     )
     .await
     .unwrap();
-    let graph = HnswGraph {
-        node_count: 2,
-        layers: vec![LayerBlock {
-            layer_index: 0,
-            node_adjacencies: vec![NodeAdjacency {
-                vector_id: 1,
-                neighbors: vec![2],
-            }],
-        }],
-    };
     write_vector_segment(
         &cluster.states[0].storage,
         VectorSegmentWrite {
@@ -674,7 +651,6 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
                 vector_entry(1, *first_object.version_id.as_bytes(), vec![1.0, 0.0]),
                 vector_entry(2, *second_object.version_id.as_bytes(), vec![0.0, 1.0]),
             ],
-            hnsw_graph: &graph,
             deleted_bitset: &[0],
         },
     )
@@ -802,16 +778,6 @@ async fn test_query_inherit_object_vector_filters_results_by_object_read_scope()
         bucket.id,
         created.index_id as i64,
     );
-    let graph = HnswGraph {
-        node_count: 2,
-        layers: vec![LayerBlock {
-            layer_index: 0,
-            node_adjacencies: vec![NodeAdjacency {
-                vector_id: 1,
-                neighbors: vec![2],
-            }],
-        }],
-    };
     write_vector_segment(
         &cluster.states[0].storage,
         VectorSegmentWrite {
@@ -829,7 +795,6 @@ async fn test_query_inherit_object_vector_filters_results_by_object_read_scope()
                 vector_entry(1, *allowed_object.version_id.as_bytes(), vec![1.0, 0.0]),
                 vector_entry(2, *denied_object.version_id.as_bytes(), vec![0.0, 1.0]),
             ],
-            hnsw_graph: &graph,
             deleted_bitset: &[0],
         },
     )
