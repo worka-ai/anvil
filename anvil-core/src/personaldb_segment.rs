@@ -43,6 +43,11 @@ pub async fn write_personaldb_log_segment(
     storage: &Storage,
     input: PersonalDbLogSegmentWrite<'_>,
 ) -> Result<PathBuf> {
+    if input.source_fence_token == 0 {
+        return Err(anyhow!(
+            "personaldb log segment source fence token must be nonzero"
+        ));
+    }
     validate_log_segment_records(input.records)?;
     let start_log_index = input.records.first().expect("validated nonempty").log_index;
     let end_log_index = input.records.last().expect("validated nonempty").log_index;
@@ -323,6 +328,31 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("log index is not contiguous"));
+    }
+
+    #[tokio::test]
+    async fn personaldb_log_segment_rejects_zero_source_fence() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let record = record(1, [0; 32]);
+
+        let err = write_personaldb_log_segment(
+            &storage,
+            PersonalDbLogSegmentWrite {
+                tenant_id: 9,
+                database_id: "db-alpha",
+                schema_hash: [9; 32],
+                source_fence_token: 0,
+                records: &[record],
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("source fence token must be nonzero")
+        );
     }
 
     #[tokio::test]

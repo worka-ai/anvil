@@ -6,6 +6,9 @@ use crate::{
     auth, authz_journal,
     error_codes::AnvilErrorCode,
     formats::{Hash32, hash32, personaldb::PersonalDbLogRecord as CorePersonalDbLogRecord},
+    partition_fence::{
+        PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
+    },
     permissions::AnvilAction,
     personaldb_catchup::{
         PersonalDbCatchUpRequest as CoreCatchUpRequest,
@@ -537,6 +540,63 @@ impl AppState {
         self.config.anvil_secret_encryption_key.as_bytes()
     }
 
+    fn personaldb_node_id(&self) -> String {
+        if !self.config.public_api_addr.is_empty() {
+            return self.config.public_api_addr.clone();
+        }
+        if !self.config.api_listen_addr.is_empty() {
+            return self.config.api_listen_addr.clone();
+        }
+        if !self.config.region.is_empty() {
+            return self.config.region.clone();
+        }
+        "local-anvil-node".to_string()
+    }
+
+    async fn acquire_personaldb_group_write_fence(
+        &self,
+        tenant_id: i64,
+        database_id: &str,
+        recovered_through_sequence: u64,
+        recovered_manifest_hash: &str,
+    ) -> Result<u64, Status> {
+        validate_hex32(recovered_manifest_hash, "recovered_manifest_hash")?;
+        let partition_family = personaldb_group_partition_family().to_string();
+        let partition_id = personaldb_group_partition_id(tenant_id, database_id);
+        let owner_node_id = self.personaldb_node_id();
+        let now_nanos = chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .ok_or_else(|| Status::internal("partition owner timestamp overflow"))?;
+        let recovering = acquire_partition_recovery(
+            &self.storage,
+            PartitionRecoveryAcquire {
+                partition_family: partition_family.clone(),
+                partition_id: partition_id.clone(),
+                owner_node_id: owner_node_id.clone(),
+                recovered_through_sequence,
+                recovered_manifest_hash: recovered_manifest_hash.to_string(),
+                now_nanos,
+            },
+            self.personaldb_signing_key(),
+        )
+        .await
+        .map_err(internal_status)?;
+        let ready = publish_partition_ready(
+            &self.storage,
+            &partition_family,
+            &partition_id,
+            &owner_node_id,
+            recovering.fence_token,
+            recovered_through_sequence,
+            recovered_manifest_hash,
+            now_nanos.saturating_add(1),
+            self.personaldb_signing_key(),
+        )
+        .await
+        .map_err(internal_status)?;
+        Ok(ready.fence_token)
+    }
+
     async fn handle_personaldb_projection_writeback(
         &self,
         request: CoreSubmitChangeset,
@@ -757,6 +817,14 @@ impl AppState {
                 "PersonalDB submit epochs or schema do not match the active group",
             ));
         }
+        let source_fence_token = self
+            .acquire_personaldb_group_write_fence(
+                actor.tenant_id,
+                &validated.request.database_id,
+                previous_head.log_index,
+                &previous_head.log_hash,
+            )
+            .await?;
 
         let changes = iterate_changeset(&validated.request.changeset_bytes)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
@@ -895,7 +963,7 @@ impl AppState {
                 tenant_id: actor.tenant_id,
                 database_id: &validated.request.database_id,
                 schema_hash,
-                source_fence_token: 0,
+                source_fence_token,
                 records: std::slice::from_ref(&record),
             },
         )
@@ -1526,6 +1594,16 @@ fn hex32_status(value: &str, field: &'static str) -> Result<Hash32, Status> {
 
 fn personaldb_resource(tenant_id: i64, database_id: &str) -> String {
     format!("tenant-{tenant_id}/{database_id}")
+}
+
+fn personaldb_group_partition_family() -> &'static str {
+    "personaldb_group"
+}
+
+fn personaldb_group_partition_id(tenant_id: i64, database_id: &str) -> String {
+    hex::encode(hash32(
+        format!("personaldb_group\0{tenant_id}\0{database_id}").as_bytes(),
+    ))
 }
 
 fn personaldb_projection_resource(
