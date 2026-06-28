@@ -2,6 +2,7 @@ use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::index_service_client::IndexServiceClient;
 use anvil::anvil_api::{
     CreateIndexRequest, GetAccessTokenRequest, QueryIndexRequest, SetPublicAccessRequest,
+    WriteAuthzTupleRequest,
 };
 use anvil::storage::{DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES, ExternalChunkManifest};
 use aws_sdk_s3::Client;
@@ -54,6 +55,11 @@ fn run_large_s3_gateway_test(future: Pin<Box<dyn Future<Output = ()> + Send>>) {
 
 // Helper function to create an app, since it's used in auth tests.
 fn create_app(admin_state_path: &str, app_name: &str) -> (String, String) {
+    let (_, client_id, client_secret) = create_app_with_id(admin_state_path, app_name);
+    (client_id, client_secret)
+}
+
+fn create_app_with_id(admin_state_path: &str, app_name: &str) -> (String, String, String) {
     let admin_args = &["run", "--bin", "admin", "--"];
     let app_output = std::process::Command::new("cargo")
         .args(admin_args.iter().chain(&[
@@ -72,12 +78,22 @@ fn create_app(admin_state_path: &str, app_name: &str) -> (String, String) {
         .unwrap();
     assert!(app_output.status.success());
     let creds = String::from_utf8(app_output.stdout).unwrap();
+    let app_id = creds
+        .lines()
+        .find_map(|line| line.split_once("(ID: "))
+        .and_then(|(_, rest)| rest.strip_suffix(')'))
+        .expect("app id in admin output")
+        .to_string();
     let client_id = extract_credential(&creds, "Client ID");
     let client_secret = extract_credential(&creds, "Client Secret");
-    (client_id, client_secret)
+    (app_id, client_id, client_secret)
 }
 
 fn grant_wildcard_policy(admin_state_path: &str, app_name: &str) {
+    grant_policy(admin_state_path, app_name, "*", "*");
+}
+
+fn grant_policy(admin_state_path: &str, app_name: &str, action: &str, resource: &str) {
     let admin_args = &["run", "--bin", "admin", "--"];
     let policy_args = &[
         "policy",
@@ -85,9 +101,9 @@ fn grant_wildcard_policy(admin_state_path: &str, app_name: &str) {
         "--app-name",
         app_name,
         "--action",
-        "*",
+        action,
         "--resource",
-        "*",
+        resource,
     ];
     let status = std::process::Command::new("cargo")
         .args(
@@ -122,6 +138,26 @@ fn s3_client(http_base: &str, client_id: &str, client_secret: &str) -> Client {
         .behavior_version_latest()
         .build();
     Client::from_conf(config)
+}
+
+fn write_authz_tuple_request(
+    namespace: &str,
+    object_id: &str,
+    relation: &str,
+    subject_kind: &str,
+    subject_id: &str,
+    operation: &str,
+) -> WriteAuthzTupleRequest {
+    WriteAuthzTupleRequest {
+        namespace: namespace.to_string(),
+        object_id: object_id.to_string(),
+        relation: relation.to_string(),
+        subject_kind: subject_kind.to_string(),
+        subject_id: subject_id.to_string(),
+        caveat_hash: String::new(),
+        operation: operation.to_string(),
+        reason: "test".to_string(),
+    }
 }
 
 // Helper to get a token for specific scopes.
@@ -260,6 +296,178 @@ async fn test_s3_put_write_etag_preconditions() {
     assert!(
         matching_none_match_copy.is_err(),
         "matching source If-None-Match CopyObject should fail"
+    );
+}
+
+#[tokio::test]
+async fn test_s3_list_versions_and_get_filter_by_relationship_authorization() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let writer_app = format!("s3-relationship-writer-{}", uuid::Uuid::new_v4());
+    let (_, writer_client_id, writer_client_secret) =
+        create_app_with_id(&cluster.admin_state_path, &writer_app);
+    grant_wildcard_policy(&cluster.admin_state_path, &writer_app);
+
+    let reader_app = format!("s3-relationship-reader-{}", uuid::Uuid::new_v4());
+    let (reader_app_id, reader_client_id, reader_client_secret) =
+        create_app_with_id(&cluster.admin_state_path, &reader_app);
+
+    let bucket = format!("s3-relationship-filter-{}", uuid::Uuid::new_v4());
+    grant_policy(
+        &cluster.admin_state_path,
+        &reader_app,
+        "object:list",
+        &bucket,
+    );
+
+    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
+    let writer = s3_client(http_base, &writer_client_id, &writer_client_secret);
+    let reader = s3_client(http_base, &reader_client_id, &reader_client_secret);
+
+    let allowed_key = "docs/allowed.txt";
+    let denied_key = "docs/denied.txt";
+    let visible_nested_key = "visible/nested.txt";
+    let hidden_nested_key = "hidden/nested.txt";
+
+    writer
+        .create_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("writer should create private bucket");
+    writer
+        .put_object()
+        .bucket(&bucket)
+        .key(allowed_key)
+        .body(ByteStream::from_static(b"allowed-v1"))
+        .send()
+        .await
+        .expect("writer should put allowed v1");
+    writer
+        .put_object()
+        .bucket(&bucket)
+        .key(denied_key)
+        .body(ByteStream::from_static(b"denied"))
+        .send()
+        .await
+        .expect("writer should put denied object");
+    writer
+        .put_object()
+        .bucket(&bucket)
+        .key(allowed_key)
+        .body(ByteStream::from_static(b"allowed-v2"))
+        .send()
+        .await
+        .expect("writer should put allowed v2");
+    writer
+        .put_object()
+        .bucket(&bucket)
+        .key(visible_nested_key)
+        .body(ByteStream::from_static(b"visible"))
+        .send()
+        .await
+        .expect("writer should put visible nested object");
+    writer
+        .put_object()
+        .bucket(&bucket)
+        .key(hidden_nested_key)
+        .body(ByteStream::from_static(b"hidden"))
+        .send()
+        .await
+        .expect("writer should put hidden nested object");
+
+    let ungranted = reader
+        .list_objects_v2()
+        .bucket(&bucket)
+        .prefix("docs/")
+        .send()
+        .await
+        .expect("reader has bucket list permission");
+    assert!(
+        ungranted.contents().is_empty(),
+        "list permission alone must not reveal object keys"
+    );
+
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    for key in [allowed_key, visible_nested_key] {
+        auth_client
+            .write_authz_tuple(authorized(
+                write_authz_tuple_request(
+                    "object",
+                    &format!("{bucket}/{key}"),
+                    "reader",
+                    "app",
+                    &reader_app_id,
+                    "add",
+                ),
+                &cluster.token,
+            ))
+            .await
+            .unwrap();
+    }
+
+    let docs = reader
+        .list_objects_v2()
+        .bucket(&bucket)
+        .prefix("docs/")
+        .send()
+        .await
+        .expect("relationship-filtered docs list should succeed");
+    assert_eq!(docs.contents().len(), 1);
+    assert_eq!(docs.contents()[0].key(), Some(allowed_key));
+
+    let tree = reader
+        .list_objects_v2()
+        .bucket(&bucket)
+        .delimiter("/")
+        .send()
+        .await
+        .expect("relationship-filtered delimiter list should succeed");
+    let prefixes = tree
+        .common_prefixes()
+        .iter()
+        .filter_map(|prefix| prefix.prefix())
+        .collect::<Vec<_>>();
+    assert_eq!(prefixes, vec!["docs/", "visible/"]);
+
+    let versions = reader
+        .list_object_versions()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("relationship-filtered version list should succeed");
+    let version_keys = versions
+        .versions()
+        .iter()
+        .filter_map(|version| version.key())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        version_keys,
+        vec![allowed_key, allowed_key, visible_nested_key]
+    );
+
+    let allowed = reader
+        .get_object()
+        .bucket(&bucket)
+        .key(allowed_key)
+        .send()
+        .await
+        .expect("relationship grant should allow S3 GET");
+    let allowed_bytes = allowed.body.collect().await.unwrap().into_bytes();
+    assert_eq!(allowed_bytes.as_ref(), b"allowed-v2");
+
+    let denied = reader
+        .get_object()
+        .bucket(&bucket)
+        .key(denied_key)
+        .send()
+        .await;
+    assert!(
+        denied.is_err(),
+        "S3 GET must not allow ungranted object through bucket list permission"
     );
 }
 

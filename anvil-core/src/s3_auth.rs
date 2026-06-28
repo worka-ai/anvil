@@ -313,7 +313,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
     };
 
     let claims = Claims {
-        sub: parsed.access_key_id,
+        sub: app_details.id.to_string(),
         tenant_id: app_details.tenant_id,
         scopes,
         exp: 0, // SigV4 has its own expiry mechanism
