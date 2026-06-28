@@ -40,6 +40,9 @@ jobs:
           target/
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+    - name: Guard against external relational metadata stores
+      run: ./scripts/check-no-external-db.sh
+
     - name: Build Release Binaries (Native Linux)
       run: cargo build --release --workspace
 
