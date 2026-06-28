@@ -697,6 +697,19 @@ impl Storage {
             .join("indexes"))
     }
 
+    pub fn git_source_manifest_path(&self, tenant_id: i64, repository_id: &str) -> Result<PathBuf> {
+        ensure_safe_internal_component(repository_id, "git repository id")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("git")
+            .join("tenants")
+            .join(format!("tenant-{tenant_id}"))
+            .join("repositories")
+            .join(repository_id)
+            .join("manifest.json"))
+    }
+
     pub fn full_text_segment_path(
         &self,
         index_id: &str,

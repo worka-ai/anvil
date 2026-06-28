@@ -29,6 +29,7 @@ pub mod formats;
 pub mod full_text_segment;
 pub mod git_pack;
 pub mod git_source_index;
+pub mod git_source_manifest;
 pub mod git_source_query;
 pub mod git_source_watch;
 pub mod hf_journal;

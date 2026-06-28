@@ -2,8 +2,8 @@ use crate::anvil_api::git_source_service_server::GitSourceService;
 use crate::anvil_api::*;
 use crate::object_manager::ObjectWriteOptions;
 use crate::{
-    AppState, auth, authz_journal, git_pack, git_source_index, git_source_query, git_source_watch,
-    permissions::AnvilAction,
+    AppState, auth, authz_journal, git_pack, git_source_index, git_source_manifest,
+    git_source_query, git_source_watch, permissions::AnvilAction,
 };
 use futures_util::StreamExt;
 use serde_json::json;
@@ -88,6 +88,29 @@ impl GitSourceService for AppState {
         )
         .await
         .map_err(|err| Status::internal(err.to_string()))?;
+        let index_path_relative = self
+            .storage
+            .relative_storage_path(&index_path)
+            .map_err(|err| Status::internal(err.to_string()))?;
+        let updated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        git_source_manifest::write_git_source_repository_manifest(
+            &self.storage,
+            &git_source_manifest::GitSourceRepositoryManifest {
+                format_version: 1,
+                tenant_id: claims.tenant_id,
+                repository_id: metadata.repository_id.clone(),
+                bucket_name: metadata.bucket_name.clone(),
+                object_key: object_key.clone(),
+                pack_object_version_id: pack_object.version_id.to_string(),
+                source_hash: source_hash_hex.clone(),
+                generation,
+                record_count: parsed.records.len() as u64,
+                index_path: index_path_relative.clone(),
+                updated_at: updated_at.clone(),
+            },
+        )
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
         let authz_revision = authz_journal::latest_authz_revision(&self.storage, claims.tenant_id)
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
@@ -108,9 +131,9 @@ impl GitSourceService for AppState {
             event_type: "index_published".to_string(),
             generation,
             source_hash: source_hash_hex.clone(),
-            index_path: index_path.to_string_lossy().into_owned(),
+            index_path: index_path_relative.clone(),
             pack_object_version_id: Some(pack_object.version_id.to_string()),
-            emitted_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            emitted_at: updated_at,
         };
         git_source_watch::append_git_source_watch_record(
             &self.storage,
@@ -133,7 +156,7 @@ impl GitSourceService for AppState {
             payload_hash: pack_object.content_hash,
             generation,
             source_hash: source_hash_hex,
-            index_path: index_path.to_string_lossy().into_owned(),
+            index_path: index_path_relative,
             record_count: parsed.records.len() as u64,
             watch_cursor_low,
             watch_cursor_high,
@@ -288,6 +311,97 @@ impl AppState {
         tenant_id: i64,
         repository_id: &str,
     ) -> Result<git_source_index::DecodedGitSourceIndex, Status> {
+        match git_source_query::read_latest_git_source_index(
+            &self.storage,
+            tenant_id,
+            repository_id,
+        )
+        .await
+        {
+            Ok(Some(index)) => Ok(index),
+            Ok(None) => {
+                self.rebuild_latest_git_source_index_from_manifest(tenant_id, repository_id)
+                    .await
+            }
+            Err(_) => {
+                self.rebuild_latest_git_source_index_from_manifest(tenant_id, repository_id)
+                    .await
+            }
+        }
+    }
+
+    async fn rebuild_latest_git_source_index_from_manifest(
+        &self,
+        tenant_id: i64,
+        repository_id: &str,
+    ) -> Result<git_source_index::DecodedGitSourceIndex, Status> {
+        let manifest = git_source_manifest::read_git_source_repository_manifest(
+            &self.storage,
+            tenant_id,
+            repository_id,
+        )
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?
+        .ok_or_else(|| Status::not_found("Git source index not found"))?;
+        let version_id = uuid::Uuid::parse_str(&manifest.pack_object_version_id)
+            .map_err(|_| Status::internal("Git source manifest stores invalid pack version id"))?;
+        let internal_claims = auth::Claims {
+            sub: "internal-git-source-indexer".to_string(),
+            exp: usize::MAX,
+            scopes: vec![format!(
+                "object:read|{}/{}",
+                manifest.bucket_name, manifest.object_key
+            )],
+            tenant_id,
+        };
+        let (_object, stream) = self
+            .object_manager
+            .get_object(
+                Some(internal_claims),
+                manifest.bucket_name.clone(),
+                manifest.object_key.clone(),
+                Some(version_id),
+            )
+            .await?;
+        let pack_bytes = collect_object_stream(stream).await?;
+        if blake3::hash(&pack_bytes).to_hex().to_string() != manifest.source_hash {
+            return Err(Status::data_loss(
+                "Git source pack hash differs from repository manifest",
+            ));
+        }
+        let parsed = git_pack::build_git_source_index_from_pack(
+            repository_id,
+            &pack_bytes,
+            *version_id.as_bytes(),
+        )
+        .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let index_path = git_source_index::write_git_source_index(
+            &self.storage,
+            git_source_index::GitSourceIndexWrite {
+                tenant_id,
+                repository_id,
+                generation: manifest.generation,
+                source_hash: parsed.pack_hash,
+                hash_algorithm: parsed.hash_algorithm,
+                records: &parsed.records,
+            },
+        )
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
+        let index_path_relative = self
+            .storage
+            .relative_storage_path(&index_path)
+            .map_err(|err| Status::internal(err.to_string()))?;
+        if index_path_relative != manifest.index_path {
+            let mut updated = manifest;
+            updated.index_path = index_path_relative;
+            updated.record_count = parsed.records.len() as u64;
+            updated.updated_at =
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            git_source_manifest::write_git_source_repository_manifest(&self.storage, &updated)
+                .await
+                .map_err(|err| Status::internal(err.to_string()))?;
+        }
         git_source_query::read_latest_git_source_index(&self.storage, tenant_id, repository_id)
             .await
             .map_err(|err| Status::internal(err.to_string()))?
@@ -341,6 +455,18 @@ async fn collect_git_pack_stream(
         return Err(Status::invalid_argument("Git pack bytes must not be empty"));
     }
     Ok((metadata, bytes))
+}
+
+async fn collect_object_stream(
+    mut stream: std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = Result<Vec<u8>, Status>> + Send + 'static>,
+    >,
+) -> Result<Vec<u8>, Status> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        bytes.extend_from_slice(&chunk?);
+    }
+    Ok(bytes)
 }
 
 fn authorize_git_source_read<T>(request: &Request<T>) -> Result<auth::Claims, Status> {
