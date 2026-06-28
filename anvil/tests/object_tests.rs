@@ -52,6 +52,16 @@ fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
     }
 }
 
+fn native_mutation_context_with_precondition(
+    bucket_id: i64,
+    tag: &str,
+    precondition: &str,
+) -> NativeMutationContext {
+    let mut context = native_mutation_context(bucket_id, tag);
+    context.precondition = precondition.to_string();
+    context
+}
+
 fn put_object_chunks(
     bucket_name: &str,
     object_key: &str,
@@ -74,6 +84,29 @@ fn put_object_chunks(
             )),
         },
     ]
+}
+
+async fn put_object_for_test(
+    object_client: &mut ObjectServiceClient<tonic::transport::Channel>,
+    token: &str,
+    bucket_name: &str,
+    object_key: &str,
+    payload: &[u8],
+    mutation_context: NativeMutationContext,
+) -> Result<anvil_api::PutObjectResponse, Status> {
+    let request = authorized(
+        tokio_stream::iter(put_object_chunks(
+            bucket_name,
+            object_key,
+            payload,
+            Some(mutation_context),
+        )),
+        token,
+    );
+    object_client
+        .put_object(request)
+        .await
+        .map(|response| response.into_inner())
 }
 
 macro_rules! assert_native_mutation_response {
@@ -223,6 +256,150 @@ async fn test_native_mutations_require_valid_context() {
         .expect_err("native mutation with unavailable authz revision must fail");
     assert_eq!(err.code(), Code::FailedPrecondition);
     assert!(err.message().contains("AuthzRevisionUnavailable"));
+}
+
+#[tokio::test]
+async fn test_native_object_mutation_preconditions_are_enforced() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr).await.unwrap();
+    let bucket_name = format!("native-preconditions-{}", uuid::Uuid::new_v4());
+    let object_key = "docs/preconditioned.txt";
+
+    let bucket_id = bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
+
+    let first = put_object_for_test(
+        &mut object_client,
+        &token,
+        &bucket_name,
+        object_key,
+        b"first",
+        native_mutation_context_with_precondition(bucket_id, "first", "not_exists"),
+    )
+    .await
+    .expect("not_exists precondition should allow initial object creation");
+    assert_native_mutation_response!(first);
+
+    let duplicate = put_object_for_test(
+        &mut object_client,
+        &token,
+        &bucket_name,
+        object_key,
+        b"duplicate",
+        native_mutation_context_with_precondition(bucket_id, "duplicate", "not_exists"),
+    )
+    .await
+    .expect_err("not_exists precondition must reject an existing object");
+    assert_eq!(duplicate.code(), Code::FailedPrecondition);
+    assert!(duplicate.message().contains("precondition failed"));
+
+    let wrong_etag = put_object_for_test(
+        &mut object_client,
+        &token,
+        &bucket_name,
+        object_key,
+        b"wrong-etag",
+        native_mutation_context_with_precondition(bucket_id, "wrong-etag", "etag:not-current"),
+    )
+    .await
+    .expect_err("etag precondition must reject a mismatched object etag");
+    assert_eq!(wrong_etag.code(), Code::FailedPrecondition);
+
+    let second = put_object_for_test(
+        &mut object_client,
+        &token,
+        &bucket_name,
+        object_key,
+        b"second",
+        native_mutation_context_with_precondition(
+            bucket_id,
+            "matching-etag",
+            &format!("etag:\"{}\"", first.etag),
+        ),
+    )
+    .await
+    .expect("etag precondition should allow matching object replacement");
+    assert_native_mutation_response!(second);
+
+    let third = put_object_for_test(
+        &mut object_client,
+        &token,
+        &bucket_name,
+        object_key,
+        b"third",
+        native_mutation_context_with_precondition(
+            bucket_id,
+            "matching-version",
+            &format!("version:{}", second.version_id),
+        ),
+    )
+    .await
+    .expect("version precondition should allow matching object replacement");
+    assert_native_mutation_response!(third);
+
+    let unsupported = put_object_for_test(
+        &mut object_client,
+        &token,
+        &bucket_name,
+        object_key,
+        b"unsupported",
+        native_mutation_context_with_precondition(bucket_id, "unsupported", "after:123"),
+    )
+    .await
+    .expect_err("unsupported native precondition syntax must fail");
+    assert_eq!(unsupported.code(), Code::InvalidArgument);
+    assert!(unsupported.message().contains("Unsupported"));
+
+    let delete_response = object_client
+        .delete_object(authorized(
+            DeleteObjectRequest {
+                bucket_name: bucket_name.clone(),
+                object_key: object_key.to_string(),
+                version_id: None,
+                mutation_context: Some(native_mutation_context_with_precondition(
+                    bucket_id,
+                    "delete-existing",
+                    "exists",
+                )),
+            },
+            &token,
+        ))
+        .await
+        .expect("exists precondition should allow deleting current object")
+        .into_inner();
+    assert!(!delete_response.mutation_id.is_empty());
+    assert!(!delete_response.record_hash.is_empty());
+    assert!(delete_response.watch_cursor > third.watch_cursor);
+    assert!(delete_response.delete_marker);
+
+    let recreated = put_object_for_test(
+        &mut object_client,
+        &token,
+        &bucket_name,
+        object_key,
+        b"recreated",
+        native_mutation_context_with_precondition(bucket_id, "recreated", "not_exists"),
+    )
+    .await
+    .expect("not_exists should treat the current delete marker as absent");
+    assert_native_mutation_response!(recreated);
 }
 
 #[tokio::test]

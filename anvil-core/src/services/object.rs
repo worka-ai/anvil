@@ -1,6 +1,7 @@
 use crate::anvil_api::object_service_server::ObjectService;
 use crate::anvil_api::*;
 use crate::object_manager::ObjectWriteOptions;
+use crate::permissions::AnvilAction;
 use crate::{AppState, auth, authz_journal, bucket_journal, watch_log};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
@@ -39,6 +40,15 @@ impl ObjectService for AppState {
         };
         validate_native_mutation_context(self, &claims, &bucket_name, mutation_context.as_ref())
             .await?;
+        enforce_native_mutation_precondition(
+            self,
+            &claims,
+            &bucket_name,
+            &object_key,
+            mutation_context.as_ref(),
+            AnvilAction::ObjectWrite,
+        )
+        .await?;
 
         let data_stream = stream.map(|chunk_result| match chunk_result {
             Ok(chunk) => match chunk.data {
@@ -148,6 +158,15 @@ impl ObjectService for AppState {
             claims,
             &req.bucket_name,
             req.mutation_context.as_ref(),
+        )
+        .await?;
+        enforce_native_mutation_precondition(
+            self,
+            claims,
+            &req.bucket_name,
+            &req.object_key,
+            req.mutation_context.as_ref(),
+            AnvilAction::ObjectDelete,
         )
         .await?;
 
@@ -324,6 +343,15 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
+        enforce_native_mutation_precondition(
+            self,
+            &claims,
+            &req.destination_bucket_name,
+            &req.destination_object_key,
+            req.mutation_context.as_ref(),
+            AnvilAction::ObjectWrite,
+        )
+        .await?;
 
         let object = self
             .object_manager
@@ -367,6 +395,15 @@ impl ObjectService for AppState {
             &claims,
             &req.destination_bucket_name,
             req.mutation_context.as_ref(),
+        )
+        .await?;
+        enforce_native_mutation_precondition(
+            self,
+            &claims,
+            &req.destination_bucket_name,
+            &req.destination_object_key,
+            req.mutation_context.as_ref(),
+            AnvilAction::ObjectWrite,
         )
         .await?;
 
@@ -421,6 +458,15 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
+        enforce_native_mutation_precondition(
+            self,
+            &claims,
+            &req.bucket_name,
+            &req.object_key,
+            req.mutation_context.as_ref(),
+            AnvilAction::ObjectWrite,
+        )
+        .await?;
 
         let object = self
             .object_manager
@@ -463,6 +509,15 @@ impl ObjectService for AppState {
             &claims,
             &req.bucket_name,
             req.mutation_context.as_ref(),
+        )
+        .await?;
+        enforce_native_mutation_precondition(
+            self,
+            &claims,
+            &req.bucket_name,
+            &req.manifest_key,
+            req.mutation_context.as_ref(),
+            AnvilAction::ObjectWrite,
         )
         .await?;
         let result = self
@@ -574,6 +629,15 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
+        enforce_native_mutation_precondition(
+            self,
+            &claims,
+            &req.bucket_name,
+            &req.stream_key,
+            req.mutation_context.as_ref(),
+            AnvilAction::ObjectWrite,
+        )
+        .await?;
         let result = self
             .object_manager
             .create_append_stream(
@@ -611,6 +675,15 @@ impl ObjectService for AppState {
             &claims,
             &req.bucket_name,
             req.mutation_context.as_ref(),
+        )
+        .await?;
+        enforce_native_mutation_precondition(
+            self,
+            &claims,
+            &req.bucket_name,
+            &req.stream_key,
+            req.mutation_context.as_ref(),
+            AnvilAction::ObjectWrite,
         )
         .await?;
         let stream_id = uuid::Uuid::parse_str(&req.stream_id)
@@ -657,6 +730,15 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
+        enforce_native_mutation_precondition(
+            self,
+            &claims,
+            &req.bucket_name,
+            &req.stream_key,
+            req.mutation_context.as_ref(),
+            AnvilAction::ObjectWrite,
+        )
+        .await?;
         let version_id = req.stream_id.clone();
         let stream_id = uuid::Uuid::parse_str(&req.stream_id)
             .map_err(|_| Status::invalid_argument("Invalid stream_id"))?;
@@ -699,6 +781,15 @@ impl ObjectService for AppState {
             &claims,
             &req.bucket_name,
             req.mutation_context.as_ref(),
+        )
+        .await?;
+        enforce_native_mutation_precondition(
+            self,
+            &claims,
+            &req.bucket_name,
+            &req.object_key,
+            req.mutation_context.as_ref(),
+            AnvilAction::ObjectWrite,
         )
         .await?;
 
@@ -748,6 +839,15 @@ impl ObjectService for AppState {
             &claims,
             &metadata.bucket_name,
             metadata.mutation_context.as_ref(),
+        )
+        .await?;
+        enforce_native_mutation_precondition(
+            self,
+            &claims,
+            &metadata.bucket_name,
+            &metadata.object_key,
+            metadata.mutation_context.as_ref(),
+            AnvilAction::ObjectWrite,
         )
         .await?;
 
@@ -804,6 +904,15 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
+        enforce_native_mutation_precondition(
+            self,
+            &claims,
+            &req.bucket_name,
+            &req.object_key,
+            req.mutation_context.as_ref(),
+            AnvilAction::ObjectWrite,
+        )
+        .await?;
         let upload_id = uuid::Uuid::parse_str(&req.upload_id)
             .map_err(|_| Status::invalid_argument("Invalid upload_id"))?;
         let parts = req
@@ -856,6 +965,15 @@ impl ObjectService for AppState {
             &claims,
             &req.bucket_name,
             req.mutation_context.as_ref(),
+        )
+        .await?;
+        enforce_native_mutation_precondition(
+            self,
+            &claims,
+            &req.bucket_name,
+            &req.object_key,
+            req.mutation_context.as_ref(),
+            AnvilAction::ObjectWrite,
         )
         .await?;
         let upload_id = uuid::Uuid::parse_str(&req.upload_id)
@@ -927,6 +1045,106 @@ async fn validate_native_mutation_context(
     }
 
     Ok(())
+}
+
+enum NativeMutationPrecondition<'a> {
+    None,
+    Exists,
+    NotExists,
+    Version(uuid::Uuid),
+    Etag(&'a str),
+}
+
+async fn enforce_native_mutation_precondition(
+    state: &AppState,
+    claims: &auth::Claims,
+    bucket_name: &str,
+    object_key: &str,
+    context: Option<&NativeMutationContext>,
+    action: AnvilAction,
+) -> Result<(), Status> {
+    let context =
+        context.ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?;
+    let precondition = parse_native_mutation_precondition(&context.precondition)?;
+    if matches!(precondition, NativeMutationPrecondition::None) {
+        return Ok(());
+    }
+
+    let current = state
+        .object_manager
+        .current_object_for_mutation_precondition(
+            claims.tenant_id,
+            bucket_name,
+            object_key,
+            &claims.scopes,
+            action,
+        )
+        .await?;
+    let current = current
+        .as_ref()
+        .filter(|object| object.deleted_at.is_none());
+
+    let satisfied = match precondition {
+        NativeMutationPrecondition::None => true,
+        NativeMutationPrecondition::Exists => current.is_some(),
+        NativeMutationPrecondition::NotExists => current.is_none(),
+        NativeMutationPrecondition::Version(expected) => current
+            .map(|object| object.version_id == expected)
+            .unwrap_or(false),
+        NativeMutationPrecondition::Etag(expected) => current
+            .map(|object| etag_matches(&object.etag, expected))
+            .unwrap_or(false),
+    };
+    if !satisfied {
+        return Err(Status::failed_precondition(
+            "Native mutation precondition failed",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_native_mutation_precondition(
+    value: &str,
+) -> Result<NativeMutationPrecondition<'_>, Status> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") {
+        return Ok(NativeMutationPrecondition::None);
+    }
+    if value.eq_ignore_ascii_case("exists") {
+        return Ok(NativeMutationPrecondition::Exists);
+    }
+    if value.eq_ignore_ascii_case("not_exists")
+        || value.eq_ignore_ascii_case("not-exists")
+        || value.eq_ignore_ascii_case("absent")
+    {
+        return Ok(NativeMutationPrecondition::NotExists);
+    }
+    if let Some(version) = value.strip_prefix("version:") {
+        let version = uuid::Uuid::parse_str(version.trim()).map_err(|_| {
+            Status::invalid_argument("Invalid native mutation version precondition")
+        })?;
+        return Ok(NativeMutationPrecondition::Version(version));
+    }
+    if let Some(etag) = value.strip_prefix("etag:") {
+        let etag = etag.trim();
+        if etag.is_empty() {
+            return Err(Status::invalid_argument(
+                "Invalid native mutation etag precondition",
+            ));
+        }
+        return Ok(NativeMutationPrecondition::Etag(etag));
+    }
+    Err(Status::invalid_argument(
+        "Unsupported native mutation precondition",
+    ))
+}
+
+fn etag_matches(actual: &str, expected: &str) -> bool {
+    actual == expected || trim_etag_quotes(actual) == trim_etag_quotes(expected)
+}
+
+fn trim_etag_quotes(value: &str) -> &str {
+    value.trim().trim_matches('"')
 }
 
 fn require_native_context_field(name: &str, value: &str) -> Result<(), Status> {

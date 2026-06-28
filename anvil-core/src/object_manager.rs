@@ -1455,6 +1455,26 @@ impl ObjectManager {
         .map_err(|e| Status::internal(e.to_string()))
     }
 
+    pub async fn current_object_for_mutation_precondition(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        object_key: &str,
+        scopes: &[String],
+        action: AnvilAction,
+    ) -> Result<Option<Object>, Status> {
+        self.validate_object_request(bucket_name, object_key, scopes, action)?;
+        let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
+        metadata_journal::read_current_object(
+            &self.storage,
+            &bucket,
+            &self.encryption_key,
+            object_key,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))
+    }
+
     pub async fn copy_object(
         &self,
         claims: auth::Claims,
@@ -1762,6 +1782,16 @@ impl ObjectManager {
         object_key: &str,
         scopes: &[String],
     ) -> Result<(), Status> {
+        self.validate_object_request(bucket_name, object_key, scopes, AnvilAction::ObjectWrite)
+    }
+
+    fn validate_object_request(
+        &self,
+        bucket_name: &str,
+        object_key: &str,
+        scopes: &[String],
+        action: AnvilAction,
+    ) -> Result<(), Status> {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
@@ -1771,11 +1801,7 @@ impl ObjectManager {
         if !validation::is_valid_object_key(object_key) {
             return Err(Status::invalid_argument("Invalid object key"));
         }
-        if !auth::is_authorized(
-            AnvilAction::ObjectWrite,
-            &format!("{}/{}", bucket_name, object_key),
-            scopes,
-        ) {
+        if !auth::is_authorized(action, &format!("{}/{}", bucket_name, object_key), scopes) {
             return Err(Status::permission_denied("Permission denied"));
         }
         Ok(())
