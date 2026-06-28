@@ -15,6 +15,19 @@ use tonic::Request;
 
 use anvil::storage::{DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES, ExternalChunkManifest};
 use anvil_test_utils::*;
+use tonic::{Code, Status};
+
+fn assert_reserved_namespace_status<T>(result: Result<T, Status>) {
+    let err = match result {
+        Ok(_) => panic!("reserved namespace operation must fail"),
+        Err(err) => err,
+    };
+    assert_eq!(err.code(), Code::PermissionDenied);
+    assert!(
+        err.message().contains("UnauthorizedReservedNamespace"),
+        "expected UnauthorizedReservedNamespace, got {err:?}"
+    );
+}
 
 #[tokio::test]
 async fn test_delete_object_creates_delete_marker() {
@@ -562,6 +575,233 @@ async fn test_listing_omits_reserved_internal_object_keys() {
         .versions;
     assert_eq!(versions.len(), 1);
     assert_eq!(versions[0].key, visible_key);
+}
+
+#[tokio::test]
+async fn test_native_object_api_rejects_reserved_internal_namespaces() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+
+    let bucket_name = "test-native-reserved-namespace".to_string();
+    let visible_key = "visible/source.json".to_string();
+    let reserved_key = "_anvil/authz/native-object-api".to_string();
+    let reserved_prefix = "_anvil/authz/".to_string();
+
+    let mut create_req = Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
+    });
+    create_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client.create_bucket(create_req).await.unwrap();
+
+    let visible_chunks = vec![
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                ObjectMetadata {
+                    bucket_name: bucket_name.clone(),
+                    object_key: visible_key.clone(),
+                },
+            )),
+        },
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                br#"{"ok":true}"#.to_vec(),
+            )),
+        },
+    ];
+    let mut visible_put = Request::new(tokio_stream::iter(visible_chunks));
+    visible_put.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    object_client.put_object(visible_put).await.unwrap();
+
+    let reserved_put_chunks = vec![
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                ObjectMetadata {
+                    bucket_name: bucket_name.clone(),
+                    object_key: reserved_key.clone(),
+                },
+            )),
+        },
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                b"must not persist".to_vec(),
+            )),
+        },
+    ];
+    let mut reserved_put = Request::new(tokio_stream::iter(reserved_put_chunks));
+    reserved_put.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    assert_reserved_namespace_status(object_client.put_object(reserved_put).await);
+
+    let mut get_req = Request::new(GetObjectRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: reserved_key.clone(),
+        version_id: None,
+    });
+    get_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    assert_reserved_namespace_status(object_client.get_object(get_req).await);
+
+    let mut head_req = Request::new(HeadObjectRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: reserved_key.clone(),
+        version_id: None,
+    });
+    head_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    assert_reserved_namespace_status(object_client.head_object(head_req).await);
+
+    let mut delete_req = Request::new(DeleteObjectRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: reserved_key.clone(),
+        version_id: None,
+    });
+    delete_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    assert_reserved_namespace_status(object_client.delete_object(delete_req).await);
+
+    let mut list_req = Request::new(ListObjectsRequest {
+        bucket_name: bucket_name.clone(),
+        prefix: reserved_prefix.clone(),
+        delimiter: String::new(),
+        start_after: String::new(),
+        max_keys: 100,
+    });
+    list_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    assert_reserved_namespace_status(object_client.list_objects(list_req).await);
+
+    let mut versions_req = Request::new(ListObjectVersionsRequest {
+        bucket_name: bucket_name.clone(),
+        prefix: reserved_prefix.clone(),
+        key_marker: String::new(),
+        max_keys: 100,
+        version_id_marker: String::new(),
+    });
+    versions_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    assert_reserved_namespace_status(object_client.list_object_versions(versions_req).await);
+
+    let mut copy_from_reserved = Request::new(CopyObjectRequest {
+        source_bucket_name: bucket_name.clone(),
+        source_object_key: reserved_key.clone(),
+        source_version_id: None,
+        destination_bucket_name: bucket_name.clone(),
+        destination_object_key: "visible/copied-from-reserved.json".to_string(),
+    });
+    copy_from_reserved.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    assert_reserved_namespace_status(object_client.copy_object(copy_from_reserved).await);
+
+    let mut copy_to_reserved = Request::new(CopyObjectRequest {
+        source_bucket_name: bucket_name.clone(),
+        source_object_key: visible_key.clone(),
+        source_version_id: None,
+        destination_bucket_name: bucket_name.clone(),
+        destination_object_key: reserved_key.clone(),
+    });
+    copy_to_reserved.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    assert_reserved_namespace_status(object_client.copy_object(copy_to_reserved).await);
+
+    let mut compose_to_reserved = Request::new(ComposeObjectRequest {
+        sources: vec![ComposeObjectSource {
+            bucket_name: bucket_name.clone(),
+            object_key: visible_key.clone(),
+            version_id: None,
+        }],
+        destination_bucket_name: bucket_name.clone(),
+        destination_object_key: reserved_key.clone(),
+    });
+    compose_to_reserved.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    assert_reserved_namespace_status(object_client.compose_object(compose_to_reserved).await);
+
+    let mut patch_reserved = Request::new(PatchJsonObjectRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: reserved_key.clone(),
+        base_version_id: None,
+        merge_patch_json: r#"{"patched":true}"#.to_string(),
+    });
+    patch_reserved.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    assert_reserved_namespace_status(object_client.patch_json_object(patch_reserved).await);
+
+    let mut manifest_reserved = Request::new(CompareAndSwapManifestRequest {
+        bucket_name: bucket_name.clone(),
+        manifest_key: reserved_key.clone(),
+        expected_revision: 0,
+        manifest_json: "{}".to_string(),
+    });
+    manifest_reserved.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    assert_reserved_namespace_status(
+        object_client
+            .compare_and_swap_manifest(manifest_reserved)
+            .await,
+    );
+
+    let mut multipart_reserved = Request::new(InitiateMultipartRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: reserved_key.clone(),
+    });
+    multipart_reserved.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    assert_reserved_namespace_status(
+        object_client
+            .initiate_multipart_upload(multipart_reserved)
+            .await,
+    );
+
+    let mut watch_reserved = Request::new(WatchPrefixRequest {
+        bucket_name,
+        prefix: reserved_prefix,
+        after_cursor: 0,
+    });
+    watch_reserved.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    assert_reserved_namespace_status(object_client.watch_prefix(watch_reserved).await);
 }
 
 #[tokio::test]
