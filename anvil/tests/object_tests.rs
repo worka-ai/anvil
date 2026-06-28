@@ -916,6 +916,51 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
             .await,
     );
 
+    let mut create_append_reserved = Request::new(CreateAppendStreamRequest {
+        bucket_name: bucket_name.clone(),
+        stream_key: reserved_key.clone(),
+    });
+    create_append_reserved.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    assert_reserved_namespace_status(
+        object_client
+            .create_append_stream(create_append_reserved)
+            .await,
+    );
+
+    let mut append_record_reserved = Request::new(AppendStreamRecordRequest {
+        bucket_name: bucket_name.clone(),
+        stream_key: reserved_key.clone(),
+        stream_id: uuid::Uuid::new_v4().to_string(),
+        payload: b"reserved append payload".to_vec(),
+    });
+    append_record_reserved.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    assert_reserved_namespace_status(
+        object_client
+            .append_stream_record(append_record_reserved)
+            .await,
+    );
+
+    let mut seal_append_reserved = Request::new(SealAppendStreamSegmentRequest {
+        bucket_name: bucket_name.clone(),
+        stream_key: reserved_key.clone(),
+        stream_id: uuid::Uuid::new_v4().to_string(),
+    });
+    seal_append_reserved.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    assert_reserved_namespace_status(
+        object_client
+            .seal_append_stream_segment(seal_append_reserved)
+            .await,
+    );
+
     let mut watch_reserved = Request::new(WatchPrefixRequest {
         bucket_name,
         prefix: reserved_prefix,
