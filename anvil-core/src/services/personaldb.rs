@@ -916,7 +916,7 @@ impl AppState {
                 .ok_or_else(|| Status::internal("Invalid current timestamp"))?,
         })
         .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        authorize_personaldb_row_effects(&envelope, actor.tenant_id, &actor.scopes)?;
+        authorize_personaldb_row_effects(&self.storage, &envelope, &actor).await?;
         let envelope_hash = envelope.envelope_hash32().map_err(internal_status)?;
         let previous_log_hash = hex32_status(&previous_head.log_hash, "committed head log hash")?;
         let schema_hash = hex32_status(&manifest.schema_hash, "schema hash")?;
@@ -1362,22 +1362,43 @@ fn bind_personaldb_submit_session(
     Ok(())
 }
 
-fn authorize_personaldb_row_effects(
+async fn authorize_personaldb_row_effects(
+    storage: &crate::storage::Storage,
     envelope: &VerifiedMutationEnvelope,
-    tenant_id: i64,
-    scopes: &[String],
+    actor: &PersonalDbCommitActor,
 ) -> Result<(), Status> {
     for effect in &envelope.table_effects {
         let binding = &effect.source_resource_binding;
         let resource = format!(
             "tenant-{}/{}/{}/{}",
-            tenant_id, envelope.database_id, binding.resource_type, binding.resource_id
+            actor.tenant_id, envelope.database_id, binding.resource_type, binding.resource_id
         );
         for permission in &effect.required_permissions {
             let action = permission
                 .parse::<AnvilAction>()
                 .map_err(|_| Status::internal("Invalid PersonalDB derived permission"))?;
-            if !auth::is_authorized(action, &resource, scopes) {
+            let claims = auth::Claims {
+                sub: actor.principal.clone(),
+                exp: 0,
+                scopes: actor.scopes.clone(),
+                tenant_id: actor.tenant_id,
+            };
+            if !access_control::scope_or_relationship_allows(
+                storage,
+                &claims,
+                action,
+                &resource,
+                "personaldb_row",
+                &resource,
+                permission,
+                Some(
+                    i64::try_from(envelope.authz_revision)
+                        .map_err(|_| Status::internal("Invalid PersonalDB authz revision"))?,
+                ),
+            )
+            .await
+            .map_err(internal_status)?
+            {
                 return Err(Status::permission_denied(
                     "PersonalDB row/resource mutation is not authorized",
                 ));

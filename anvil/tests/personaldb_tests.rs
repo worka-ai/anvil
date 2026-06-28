@@ -1,11 +1,16 @@
+use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::personal_db_service_client::PersonalDbServiceClient;
 use anvil::anvil_api::{
     CreatePersonalDbGroupRequest, CreatePersonalDbProjectionRequest, GetPersonalDbGroupRequest,
     GetPersonalDbProjectionRequest, PersonalDbCatchUpRequest, PersonalDbVoterAck,
     SubmitPersonalDbChangesetRequest, WatchPersonalDbGroupRequest,
-    WatchPersonalDbProjectionRequest,
+    WatchPersonalDbProjectionRequest, WriteAuthzTupleRequest,
 };
+use anvil::anvil_personaldb_sqlite_changeset::iterate_changeset;
 use anvil::formats::hash32;
+use anvil::personaldb_envelope::{
+    PersonalDbEnvelopeDerivationInput, derive_verified_mutation_envelope,
+};
 use anvil::personaldb_projection::{
     ColumnMapping, ProjectionDefinition, ProjectionResourceBinding, RowFilter, TableMapping,
     WriteBackPolicy,
@@ -327,6 +332,120 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
     assert_eq!(event.event_type, "commit");
     assert_eq!(event.log_index, 1);
     assert_eq!(event.log_hash, committed.log_hash);
+}
+
+#[tokio::test]
+async fn personaldb_row_mutation_can_be_authorized_by_relationship_tuple() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut personaldb = PersonalDbServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut auth_client = AuthServiceClient::connect(grpc_addr).await.unwrap();
+
+    let database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+    let genesis_hash = hex::encode(hash32(format!("genesis:{database_id}").as_bytes()));
+    personaldb
+        .create_personal_db_group(authorized(
+            CreatePersonalDbGroupRequest {
+                database_id: database_id.clone(),
+                schema_hash: personaldb_test_schema_hash(),
+                genesis_hash: genesis_hash.clone(),
+                schema_sql: PERSONALDB_TEST_SCHEMA_SQL.to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let commit_only_token = cluster.states[0]
+        .jwt_manager
+        .mint_token(
+            "test-app".to_string(),
+            vec![format!("personaldb:commit|tenant-1/{database_id}")],
+            1,
+        )
+        .unwrap();
+    let changeset_bytes = sqlite_insert_changeset();
+    let denied = personaldb
+        .submit_personal_db_changeset(authorized(
+            submit_request(
+                &database_id,
+                &genesis_hash,
+                &commit_only_token,
+                changeset_bytes.clone(),
+            ),
+            &commit_only_token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), Code::PermissionDenied);
+
+    let changes = iterate_changeset(&changeset_bytes).unwrap();
+    let envelope = derive_verified_mutation_envelope(PersonalDbEnvelopeDerivationInput {
+        tenant_id: 1,
+        database_id: &database_id,
+        principal: "test-app",
+        base_log_index: 0,
+        proposed_log_index: 1,
+        changeset_payload_hash: hash32(&changeset_bytes),
+        schema_hash: &personaldb_test_schema_hash(),
+        policy_epoch: 1,
+        authz_revision: 1,
+        changes: &changes,
+        updated_at_nanos: 1,
+    })
+    .unwrap();
+    let effect = envelope
+        .table_effects
+        .first()
+        .expect("insert changeset should derive one effect");
+    let binding = &effect.source_resource_binding;
+    let resource = format!(
+        "tenant-1/{}/{}/{}",
+        database_id, binding.resource_type, binding.resource_id
+    );
+    let permission = effect
+        .required_permissions
+        .first()
+        .expect("effect should require a row mutation permission")
+        .clone();
+
+    auth_client
+        .write_authz_tuple(authorized(
+            WriteAuthzTupleRequest {
+                namespace: "personaldb_row".to_string(),
+                object_id: resource,
+                relation: permission,
+                subject_kind: "app".to_string(),
+                subject_id: "test-app".to_string(),
+                caveat_hash: String::new(),
+                operation: "add".to_string(),
+                reason: "test".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let committed = personaldb
+        .submit_personal_db_changeset(authorized(
+            submit_request(
+                &database_id,
+                &genesis_hash,
+                &commit_only_token,
+                changeset_bytes,
+            ),
+            &commit_only_token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(committed.log_index, 1);
+    assert_eq!(committed.verified_envelope_hash.len(), 64);
 }
 
 #[tokio::test]
