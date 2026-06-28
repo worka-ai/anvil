@@ -35,6 +35,7 @@ struct ManifestBody {
     updated_at: DateTime<Utc>,
 }
 
+#[cfg(test)]
 async fn compare_and_swap_manifest(
     storage: &Storage,
     tenant_id: i64,

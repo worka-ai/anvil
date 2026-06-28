@@ -106,6 +106,7 @@ struct DirectoryEntryBody {
     deleted_at: Option<String>,
 }
 
+#[cfg(test)]
 async fn append_object_mutation(
     storage: &Storage,
     bucket: &Bucket,
@@ -288,6 +289,7 @@ pub struct ManifestSegmentRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 struct WrittenSegment {
     family: FileFamily,
     path: PathBuf,
@@ -296,6 +298,7 @@ struct WrittenSegment {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg(test)]
 struct SegmentHeader {
     tenant_id: String,
     bucket_id: String,
@@ -308,6 +311,7 @@ struct SegmentHeader {
     bloom_bits_per_key: u8,
 }
 
+#[cfg(test)]
 async fn seal_object_journal_segments(
     storage: &Storage,
     bucket: &Bucket,
@@ -316,6 +320,7 @@ async fn seal_object_journal_segments(
     seal_object_journal_segments_inner(storage, bucket, manifest_signing_key, 0).await
 }
 
+#[cfg(test)]
 pub(crate) async fn seal_object_journal_segments_with_permit(
     storage: &Storage,
     bucket: &Bucket,
@@ -329,6 +334,7 @@ pub(crate) async fn seal_object_journal_segments_with_permit(
         .await
 }
 
+#[cfg(test)]
 async fn seal_object_journal_segments_inner(
     storage: &Storage,
     bucket: &Bucket,
@@ -901,6 +907,7 @@ fn version_sorts_after_marker(
     Ok(created_at < marker_created_at || (created_at == marker_created_at && order < marker_order))
 }
 
+#[cfg(test)]
 async fn write_segment_file(
     path: &Path,
     family: FileFamily,
@@ -940,6 +947,7 @@ async fn write_segment_file(
     })
 }
 
+#[cfg(test)]
 async fn write_partition_manifest(
     storage: &Storage,
     bucket: &Bucket,
@@ -1062,6 +1070,7 @@ fn sign_manifest(
     Ok(base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
 }
 
+#[cfg(test)]
 fn file_family_name(family: FileFamily) -> &'static str {
     match family {
         FileFamily::MetadataJournal => "metadata_journal",
@@ -1129,6 +1138,7 @@ fn parse_body_timestamp(value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
     Ok(chrono::DateTime::parse_from_rfc3339(value)?.with_timezone(&chrono::Utc))
 }
 
+#[cfg(test)]
 fn segment_header(
     bucket: &Bucket,
     generation: u64,
@@ -1148,6 +1158,7 @@ fn segment_header(
     }
 }
 
+#[cfg(test)]
 fn segment_record_hash_bounds(records: &[SegmentRecord]) -> (Hash32, Hash32) {
     let first = records
         .first()

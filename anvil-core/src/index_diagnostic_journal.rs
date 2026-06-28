@@ -27,6 +27,7 @@ struct IndexDiagnosticBody {
     diagnostic: IndexDiagnostic,
 }
 
+#[cfg(test)]
 async fn write_index_diagnostic(
     storage: &Storage,
     diagnostic: IndexDiagnostic,

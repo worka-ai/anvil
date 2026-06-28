@@ -53,6 +53,7 @@ struct BucketJournalBody {
     emitted_at: Option<String>,
 }
 
+#[cfg(test)]
 async fn append_bucket_mutation(
     storage: &Storage,
     bucket: &Bucket,

@@ -232,6 +232,7 @@ pub async fn read_control_state(storage: &Storage) -> Result<ControlState> {
     Ok(state)
 }
 
+#[cfg(test)]
 async fn create_region(storage: &Storage, name: &str) -> Result<bool> {
     create_region_inner(storage, name, 0).await
 }
@@ -264,6 +265,7 @@ async fn create_region_inner(storage: &Storage, name: &str, fence_token: u64) ->
     Ok(true)
 }
 
+#[cfg(test)]
 async fn create_tenant(storage: &Storage, name: &str) -> Result<Tenant> {
     create_tenant_inner(storage, name, 0).await
 }
@@ -301,6 +303,7 @@ async fn create_tenant_inner(storage: &Storage, name: &str, fence_token: u64) ->
     Ok(tenant)
 }
 
+#[cfg(test)]
 async fn create_app(
     storage: &Storage,
     tenant_id: i64,
@@ -371,6 +374,7 @@ async fn create_app_inner(
     Ok(app)
 }
 
+#[cfg(test)]
 async fn update_app_secret(storage: &Storage, app_id: i64, encrypted_secret: &[u8]) -> Result<()> {
     update_app_secret_inner(storage, app_id, encrypted_secret, 0).await
 }
@@ -408,6 +412,7 @@ async fn update_app_secret_inner(
     .await
 }
 
+#[cfg(test)]
 async fn grant_policy(storage: &Storage, app_id: i64, resource: &str, action: &str) -> Result<()> {
     grant_policy_inner(storage, app_id, resource, action, 0).await
 }
@@ -448,6 +453,7 @@ async fn grant_policy_inner(
     .await
 }
 
+#[cfg(test)]
 async fn revoke_policy(storage: &Storage, app_id: i64, resource: &str, action: &str) -> Result<()> {
     revoke_policy_inner(storage, app_id, resource, action, 0).await
 }
@@ -484,6 +490,7 @@ async fn revoke_policy_inner(
     .await
 }
 
+#[cfg(test)]
 async fn create_admin_user(
     storage: &Storage,
     username: &str,
@@ -553,6 +560,7 @@ async fn create_admin_user_inner(
     Ok(user)
 }
 
+#[cfg(test)]
 async fn update_admin_user(
     storage: &Storage,
     user_id: i64,
@@ -634,6 +642,7 @@ async fn update_admin_user_inner(
     .await
 }
 
+#[cfg(test)]
 async fn delete_admin_user(storage: &Storage, user_id: i64) -> Result<()> {
     delete_admin_user_inner(storage, user_id, 0).await
 }
@@ -658,6 +667,7 @@ async fn delete_admin_user_inner(storage: &Storage, user_id: i64, fence_token: u
     .await
 }
 
+#[cfg(test)]
 async fn create_admin_role(storage: &Storage, name: &str) -> Result<()> {
     create_admin_role_inner(storage, name, 0).await
 }
@@ -682,6 +692,7 @@ async fn create_admin_role_inner(storage: &Storage, name: &str, fence_token: u64
     append_admin_role_upsert(storage, id, name, fence_token).await
 }
 
+#[cfg(test)]
 async fn update_admin_role(storage: &Storage, id: i32, name: &str) -> Result<()> {
     update_admin_role_inner(storage, id, name, 0).await
 }
@@ -711,6 +722,7 @@ async fn update_admin_role_inner(
     Ok(())
 }
 
+#[cfg(test)]
 async fn delete_admin_role(storage: &Storage, id: i32) -> Result<()> {
     delete_admin_role_inner(storage, id, 0).await
 }

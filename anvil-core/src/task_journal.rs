@@ -53,6 +53,7 @@ struct TaskQueueState {
     tasks: BTreeMap<i64, TaskRecord>,
 }
 
+#[cfg(test)]
 async fn enqueue_task(
     storage: &Storage,
     task_type: TaskType,
@@ -99,6 +100,7 @@ async fn enqueue_task_inner(
     append_task_event(storage, TaskJournalBody::Enqueued { task }, fence_token).await
 }
 
+#[cfg(test)]
 async fn claim_pending_tasks(storage: &Storage, limit: i64) -> Result<Vec<TaskRecord>> {
     claim_pending_tasks_inner(storage, limit, 0).await
 }
@@ -159,6 +161,7 @@ pub async fn list_tasks(storage: &Storage) -> Result<Vec<TaskRecord>> {
     Ok(read_task_queue_state(storage).await?.tasks())
 }
 
+#[cfg(test)]
 async fn update_task_status(storage: &Storage, task_id: i64, status: TaskStatus) -> Result<()> {
     update_task_status_inner(storage, task_id, status, 0).await
 }
@@ -200,6 +203,7 @@ async fn update_task_status_inner(
     .await
 }
 
+#[cfg(test)]
 async fn fail_task(storage: &Storage, task_id: i64, error: &str) -> Result<()> {
     fail_task_inner(storage, task_id, error, 0).await
 }

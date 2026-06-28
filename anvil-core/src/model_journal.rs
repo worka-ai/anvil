@@ -42,6 +42,7 @@ struct ModelState {
     tensors: BTreeMap<String, Vec<TensorIndexRow>>,
 }
 
+#[cfg(test)]
 async fn create_model_artifact(
     storage: &Storage,
     artifact_id: &str,
@@ -88,6 +89,7 @@ async fn create_model_artifact_inner(
     .await
 }
 
+#[cfg(test)]
 async fn create_model_tensors(
     storage: &Storage,
     artifact_id: &str,

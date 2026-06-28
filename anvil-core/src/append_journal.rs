@@ -55,6 +55,7 @@ struct AppendState {
     records: BTreeMap<(i64, i64), AppendStreamRecord>,
 }
 
+#[cfg(test)]
 async fn create_append_stream(
     storage: &Storage,
     tenant_id: i64,
@@ -138,6 +139,7 @@ pub async fn get_active_append_stream(
         }))
 }
 
+#[cfg(test)]
 async fn append_stream_record(
     storage: &Storage,
     stream_row_id: i64,
@@ -227,6 +229,7 @@ pub async fn list_append_stream_records(
     Ok(records)
 }
 
+#[cfg(test)]
 async fn seal_append_stream(
     storage: &Storage,
     stream_row_id: i64,

@@ -52,6 +52,7 @@ pub struct AuthzTupleWrite<'a> {
     pub reason: &'a str,
 }
 
+#[cfg(test)]
 async fn write_authz_tuple(
     storage: &Storage,
     input: AuthzTupleWrite<'_>,
@@ -111,10 +112,12 @@ async fn write_authz_tuple_inner(
     Ok(record)
 }
 
+#[cfg(test)]
 async fn append_authz_tuple_record(storage: &Storage, record: &AuthzTupleRecord) -> Result<()> {
     append_authz_tuple_record_inner(storage, record, 0).await
 }
 
+#[cfg(test)]
 pub(crate) async fn append_authz_tuple_record_with_permit(
     storage: &Storage,
     record: &AuthzTupleRecord,

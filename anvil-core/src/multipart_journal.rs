@@ -59,6 +59,7 @@ struct MultipartState {
     parts: BTreeMap<(i64, i32), MultipartUploadPart>,
 }
 
+#[cfg(test)]
 async fn create_multipart_upload(
     storage: &Storage,
     tenant_id: i64,
@@ -146,6 +147,7 @@ pub async fn has_active_multipart_upload(storage: &Storage, bucket_id: i64) -> R
     Ok(false)
 }
 
+#[cfg(test)]
 async fn upsert_multipart_part(
     storage: &Storage,
     upload_row_id: i64,
@@ -350,6 +352,7 @@ pub async fn list_active_multipart_uploads(
     })
 }
 
+#[cfg(test)]
 async fn complete_multipart_upload(storage: &Storage, upload_row_id: i64) -> Result<()> {
     complete_multipart_upload_inner(storage, upload_row_id, None).await
 }
@@ -390,6 +393,7 @@ async fn complete_multipart_upload_inner(
     .await
 }
 
+#[cfg(test)]
 async fn abort_multipart_upload(
     storage: &Storage,
     tenant_id: i64,

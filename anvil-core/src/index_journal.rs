@@ -3,11 +3,15 @@ use crate::formats::{
     hash32, validate_journal_chain,
 };
 use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
-use crate::persistence::{Bucket, IndexDefinition, IndexDefinitionEvent};
+#[cfg(test)]
+use crate::persistence::Bucket;
+use crate::persistence::{IndexDefinition, IndexDefinitionEvent};
 use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value as JsonValue, json};
+use serde_json::Value as JsonValue;
+#[cfg(test)]
+use serde_json::json;
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
 
@@ -37,6 +41,7 @@ struct IndexEventBody {
     created_at: String,
 }
 
+#[cfg(test)]
 async fn append_index_definition_event(
     storage: &Storage,
     event: &IndexDefinitionEvent,
@@ -110,6 +115,7 @@ async fn append_index_definition_event_inner(
     Ok(())
 }
 
+#[cfg(test)]
 async fn write_index_definition_event(
     storage: &Storage,
     bucket: &Bucket,
@@ -119,6 +125,7 @@ async fn write_index_definition_event(
     write_index_definition_event_inner(storage, bucket, index, event_type, 0).await
 }
 
+#[cfg(test)]
 pub(crate) async fn write_index_definition_event_with_permit(
     storage: &Storage,
     bucket: &Bucket,
@@ -132,6 +139,7 @@ pub(crate) async fn write_index_definition_event_with_permit(
     write_index_definition_event_inner(storage, bucket, index, event_type, permit.fence_token).await
 }
 
+#[cfg(test)]
 async fn write_index_definition_event_inner(
     storage: &Storage,
     bucket: &Bucket,
@@ -375,6 +383,7 @@ fn index_key_hash(tenant_id: i64, bucket_id: i64, index_name: &str) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/bucket/{bucket_id}/index/{index_name}").as_bytes())
 }
 
+#[cfg(test)]
 fn index_definition_json(bucket_name: &str, index: &IndexDefinition) -> JsonValue {
     json!({
         "index_id": index.id,

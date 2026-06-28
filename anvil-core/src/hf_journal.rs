@@ -58,6 +58,7 @@ struct HfState {
     items: BTreeMap<i64, HfIngestionItem>,
 }
 
+#[cfg(test)]
 async fn create_key(
     storage: &Storage,
     name: &str,
@@ -110,6 +111,7 @@ async fn create_key_inner(
     .await
 }
 
+#[cfg(test)]
 async fn delete_key(storage: &Storage, name: &str) -> Result<u64> {
     delete_key_inner(storage, name, 0).await
 }
@@ -173,6 +175,7 @@ pub async fn list_keys(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn create_ingestion(
     storage: &Storage,
     key_id: i64,
@@ -303,6 +306,7 @@ pub async fn get_ingestion_job(storage: &Storage, id: i64) -> Result<Option<HfIn
         }))
 }
 
+#[cfg(test)]
 async fn update_ingestion_state(
     storage: &Storage,
     id: i64,
@@ -359,6 +363,7 @@ async fn update_ingestion_state_inner(
     .await
 }
 
+#[cfg(test)]
 async fn cancel_ingestion(storage: &Storage, id: i64) -> Result<u64> {
     cancel_ingestion_inner(storage, id, 0).await
 }
@@ -398,6 +403,7 @@ async fn cancel_ingestion_inner(storage: &Storage, id: i64, fence_token: u64) ->
     Ok(1)
 }
 
+#[cfg(test)]
 async fn add_item(
     storage: &Storage,
     ingestion_id: i64,
@@ -466,6 +472,7 @@ async fn add_item_inner(
     Ok(id)
 }
 
+#[cfg(test)]
 async fn update_item_state(
     storage: &Storage,
     id: i64,
@@ -522,6 +529,7 @@ async fn update_item_state_inner(
     .await
 }
 
+#[cfg(test)]
 async fn update_item_success(storage: &Storage, id: i64, size: i64, etag: &str) -> Result<()> {
     update_item_success_inner(storage, id, size, etag, 0).await
 }
