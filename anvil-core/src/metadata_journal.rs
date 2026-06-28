@@ -463,7 +463,8 @@ pub async fn recover_object_metadata_partition(
         .await
         .with_context(|| format!("read partition manifest {}", manifest_path.display()))?;
     let manifest = decode_partition_manifest(&manifest_bytes, manifest_signing_key)?;
-    let expected_partition_id = hex::encode(partition_id(bucket.tenant_id, bucket.id));
+    let expected_partition_id =
+        hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id));
     if manifest.partition_family != "object_metadata" {
         return Err(anyhow!("partition manifest family mismatch"));
     }
@@ -984,7 +985,7 @@ async fn write_partition_manifest(
     let mut manifest = PartitionManifest {
         format_version: 1,
         partition_family: "object_metadata".to_string(),
-        partition_id: hex::encode(partition_id(bucket.tenant_id, bucket.id)),
+        partition_id: hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id)),
         generation,
         fence_token,
         sealed_journals: vec![journal_ref],
@@ -1138,7 +1139,7 @@ fn segment_header(
         tenant_id: bucket.tenant_id.to_string(),
         bucket_id: bucket.id.to_string(),
         partition_family,
-        partition_id: hex::encode(partition_id(bucket.tenant_id, bucket.id)),
+        partition_id: hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id)),
         generation,
         key_order,
         compression: "none",
@@ -1226,7 +1227,7 @@ async fn ensure_journal_header(path: &Path, bucket: &Bucket, fence_token: u64) -
         tenant_id: bucket.tenant_id.to_string(),
         bucket_id: bucket.id.to_string(),
         partition_family: "object_metadata",
-        partition_id: hex::encode(partition_id(bucket.tenant_id, bucket.id)),
+        partition_id: hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id)),
         fence_token,
         first_sequence: 1,
         created_at: &created_at,
@@ -1244,7 +1245,7 @@ async fn ensure_journal_header(path: &Path, bucket: &Bucket, fence_token: u64) -
     Ok(())
 }
 
-fn partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
+pub fn object_metadata_partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
     let mut bytes = Vec::with_capacity(32);
     bytes.extend_from_slice(&tenant_id.to_le_bytes());
     bytes.extend_from_slice(&bucket_id.to_le_bytes());
@@ -1252,7 +1253,8 @@ fn partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
 }
 
 fn require_object_metadata_permit(bucket: &Bucket, permit: &PartitionWritePermit) -> Result<()> {
-    let expected_partition_id = hex::encode(partition_id(bucket.tenant_id, bucket.id));
+    let expected_partition_id =
+        hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id));
     if permit.partition_family != "object_metadata" || permit.partition_id != expected_partition_id
     {
         return Err(anyhow!(
@@ -1337,7 +1339,7 @@ mod tests {
     ) -> PartitionWritePermit {
         let request = PartitionRecoveryAcquire {
             partition_family: "object_metadata".to_string(),
-            partition_id: hex::encode(partition_id(bucket.tenant_id, bucket.id)),
+            partition_id: hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id)),
             owner_node_id: owner_node_id.to_string(),
             recovered_through_sequence: 0,
             recovered_manifest_hash: hex::encode([0; 32]),

@@ -429,7 +429,7 @@ fn event_key_hash(event: &TaskJournalBody) -> Hash32 {
     }
 }
 
-fn task_queue_partition_id() -> Hash32 {
+pub fn task_queue_partition_id() -> Hash32 {
     hash32(b"task_queue/global")
 }
 

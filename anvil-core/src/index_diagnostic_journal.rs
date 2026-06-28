@@ -225,7 +225,7 @@ fn decode_journal_file(bytes: &[u8]) -> Result<Vec<JournalFrame>> {
     Ok(frames)
 }
 
-fn index_diagnostic_partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
+pub fn index_diagnostic_partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/bucket/{bucket_id}/index_diagnostic").as_bytes())
 }
 

@@ -1036,7 +1036,7 @@ fn admin_role_key_hash(role_id: i32) -> Hash32 {
     hash32(format!("admin_role\0{role_id}").as_bytes())
 }
 
-fn control_partition_id() -> Hash32 {
+pub fn control_partition_id() -> Hash32 {
     hash32(b"control_plane/global")
 }
 

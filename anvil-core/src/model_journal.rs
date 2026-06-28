@@ -305,7 +305,7 @@ fn event_key_hash(event: &ModelEventBody) -> Hash32 {
     hash32(format!("model\0{artifact_id}").as_bytes())
 }
 
-fn model_partition_id() -> Hash32 {
+pub fn model_partition_id() -> Hash32 {
     hash32(b"model_metadata/global")
 }
 

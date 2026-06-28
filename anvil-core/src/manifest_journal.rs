@@ -205,7 +205,7 @@ async fn ensure_header(
         tenant_id: tenant_id.to_string(),
         bucket_id: bucket_id.to_string(),
         partition_family: "manifest_cas",
-        partition_id: hex::encode(partition_id(tenant_id, bucket_id)),
+        partition_id: hex::encode(manifest_cas_partition_id(tenant_id, bucket_id)),
         fence_token,
         first_sequence: 1,
         created_at: &created_at,
@@ -255,7 +255,7 @@ fn decode_journal_file(bytes: &[u8]) -> Result<Vec<JournalFrame>> {
     Ok(frames)
 }
 
-fn partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
+pub fn manifest_cas_partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/bucket/{bucket_id}/manifest_cas").as_bytes())
 }
 
@@ -264,7 +264,7 @@ fn require_manifest_cas_permit(
     bucket_id: i64,
     permit: &PartitionWritePermit,
 ) -> Result<()> {
-    let expected_partition_id = hex::encode(partition_id(tenant_id, bucket_id));
+    let expected_partition_id = hex::encode(manifest_cas_partition_id(tenant_id, bucket_id));
     if permit.partition_family != "manifest_cas" || permit.partition_id != expected_partition_id {
         anyhow::bail!("manifest CAS write permit targets a different partition");
     }
@@ -378,7 +378,7 @@ mod tests {
         owner_node_id: &str,
     ) -> crate::partition_fence::PartitionOwnerState {
         let family = "manifest_cas".to_string();
-        let id = hex::encode(partition_id(tenant_id, bucket_id));
+        let id = hex::encode(manifest_cas_partition_id(tenant_id, bucket_id));
         let recovering = acquire_partition_recovery(
             storage,
             PartitionRecoveryAcquire {

@@ -196,23 +196,22 @@ impl AuthService for AppState {
             return Err(Status::permission_denied("Permission denied"));
         }
 
-        let record = authz_journal::write_authz_tuple(
-            &self.storage,
-            authz_journal::AuthzTupleWrite {
-                tenant_id: claims.tenant_id,
-                namespace: &req.namespace,
-                object_id: &req.object_id,
-                relation: &req.relation,
-                subject_kind: &req.subject_kind,
-                subject_id: &req.subject_id,
-                caveat_hash: &req.caveat_hash,
+        let record = self
+            .persistence
+            .write_authz_tuple(
+                claims.tenant_id,
+                &req.namespace,
+                &req.object_id,
+                &req.relation,
+                &req.subject_kind,
+                &req.subject_id,
+                &req.caveat_hash,
                 operation,
-                written_by: &claims.sub,
-                reason: &req.reason,
-            },
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+                &claims.sub,
+                &req.reason,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
         let _ = self.authz_watch_tx.send(record.clone());
 
         Ok(Response::new(WriteAuthzTupleResponse {

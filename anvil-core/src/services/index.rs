@@ -395,10 +395,17 @@ impl AppState {
         index: &crate::persistence::IndexDefinition,
         event_type: &str,
     ) -> Result<crate::persistence::IndexDefinitionEvent, Status> {
-        let event =
-            index_journal::write_index_definition_event(&self.storage, bucket, index, event_type)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+        let event = self
+            .persistence
+            .create_index_definition_event(
+                bucket.tenant_id,
+                bucket.id,
+                &bucket.name,
+                index,
+                event_type,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
         let _ = self.index_watch_tx.send(event.clone());
         Ok(event)
     }

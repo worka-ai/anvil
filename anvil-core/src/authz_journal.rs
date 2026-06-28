@@ -383,7 +383,7 @@ async fn ensure_journal_header(path: &Path, tenant_id: i64, fence_token: u64) ->
     Ok(())
 }
 
-fn authz_partition_id(tenant_id: i64) -> Hash32 {
+pub fn authz_partition_id(tenant_id: i64) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/authz_tuple").as_bytes())
 }
 

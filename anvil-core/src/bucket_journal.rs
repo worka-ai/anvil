@@ -411,14 +411,18 @@ impl BucketJournalScope {
 
     fn partition_id(self) -> Hash32 {
         match self {
-            Self::Tenant(tenant_id) => bucket_partition_id(tenant_id),
-            Self::Global => hash32(b"bucket_metadata/global"),
+            Self::Tenant(tenant_id) => tenant_bucket_partition_id(tenant_id),
+            Self::Global => global_bucket_partition_id(),
         }
     }
 }
 
-fn bucket_partition_id(tenant_id: i64) -> Hash32 {
+pub fn tenant_bucket_partition_id(tenant_id: i64) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/bucket_metadata").as_bytes())
+}
+
+pub fn global_bucket_partition_id() -> Hash32 {
+    hash32(b"bucket_metadata/global")
 }
 
 fn require_bucket_scope_permit(

@@ -334,7 +334,7 @@ async fn ensure_journal_header(
         tenant_id: tenant_id.to_string(),
         bucket_id: bucket_id.to_string(),
         partition_family: "index_definition",
-        partition_id: hex::encode(index_partition_id(tenant_id, bucket_id)),
+        partition_id: hex::encode(index_definition_partition_id(tenant_id, bucket_id)),
         fence_token,
         first_sequence: 1,
         created_at: &created_at,
@@ -352,7 +352,7 @@ async fn ensure_journal_header(
     Ok(())
 }
 
-fn index_partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
+pub fn index_definition_partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/bucket/{bucket_id}/index_definition").as_bytes())
 }
 
@@ -362,7 +362,7 @@ fn require_index_definition_permit(
     permit: &PartitionWritePermit,
 ) -> Result<()> {
     if permit.partition_family != "index_definition"
-        || permit.partition_id != hex::encode(index_partition_id(tenant_id, bucket_id))
+        || permit.partition_id != hex::encode(index_definition_partition_id(tenant_id, bucket_id))
     {
         return Err(anyhow!(
             "partition write permit does not target this index definition partition"
@@ -521,7 +521,7 @@ mod tests {
     async fn ready_index_permit(storage: &Storage, owner_node_id: &str) -> PartitionWritePermit {
         let request = PartitionRecoveryAcquire {
             partition_family: "index_definition".to_string(),
-            partition_id: hex::encode(index_partition_id(42, 7)),
+            partition_id: hex::encode(index_definition_partition_id(42, 7)),
             owner_node_id: owner_node_id.to_string(),
             recovered_through_sequence: 0,
             recovered_manifest_hash: hex::encode([0; 32]),

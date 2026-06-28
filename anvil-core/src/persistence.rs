@@ -13,6 +13,10 @@ use crate::{
     config::Config,
     control_journal, hf_journal, index_diagnostic_journal, index_journal, manifest_journal,
     metadata_journal, model_journal, multipart_journal,
+    partition_fence::{
+        PartitionOwnerStatus, PartitionRecoveryAcquire, PartitionWritePermit,
+        acquire_partition_recovery, publish_partition_ready, read_partition_owner,
+    },
     storage::Storage,
     task_journal, watch_log,
 };
@@ -22,6 +26,8 @@ pub struct Persistence {
     storage: Storage,
     cache: MetadataCache,
     event_publisher: Option<Sender<MetadataEvent>>,
+    owner_node_id: String,
+    partition_owner_signing_key: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -432,6 +438,8 @@ impl Persistence {
             storage: Storage::new_at_sync(&config.storage_path)?,
             cache: MetadataCache::new(config),
             event_publisher,
+            owner_node_id: persistence_owner_node_id(config),
+            partition_owner_signing_key: config.anvil_secret_encryption_key.as_bytes().to_vec(),
         })
     }
 
@@ -443,6 +451,197 @@ impl Persistence {
 
     pub fn cache(&self) -> &MetadataCache {
         &self.cache
+    }
+
+    async fn global_write_permit(
+        &self,
+        partition_family: &str,
+        partition_id: String,
+    ) -> Result<PartitionWritePermit> {
+        if self.partition_owner_signing_key.is_empty() {
+            return Err(anyhow!("partition owner signing key must not be empty"));
+        }
+        if let Some(owner) = read_partition_owner(
+            &self.storage,
+            partition_family,
+            &partition_id,
+            &self.partition_owner_signing_key,
+        )
+        .await?
+        {
+            if owner.status == PartitionOwnerStatus::Ready
+                && owner.owner_node_id == self.owner_node_id
+            {
+                return owner.write_permit().map_err(Into::into);
+            }
+        }
+
+        let now_nanos = Utc::now()
+            .timestamp_nanos_opt()
+            .ok_or_else(|| anyhow!("partition owner timestamp overflow"))?;
+        let recovering = acquire_partition_recovery(
+            &self.storage,
+            PartitionRecoveryAcquire {
+                partition_family: partition_family.to_string(),
+                partition_id: partition_id.clone(),
+                owner_node_id: self.owner_node_id.clone(),
+                recovered_through_sequence: 0,
+                recovered_manifest_hash: hex::encode([0; 32]),
+                now_nanos,
+            },
+            &self.partition_owner_signing_key,
+        )
+        .await?;
+        let ready = publish_partition_ready(
+            &self.storage,
+            partition_family,
+            &partition_id,
+            &self.owner_node_id,
+            recovering.fence_token,
+            0,
+            &hex::encode([0; 32]),
+            now_nanos.saturating_add(1),
+            &self.partition_owner_signing_key,
+        )
+        .await?;
+        ready.write_permit().map_err(Into::into)
+    }
+
+    async fn control_write_permit(&self) -> Result<PartitionWritePermit> {
+        self.global_write_permit(
+            "control_plane",
+            hex::encode(control_journal::control_partition_id()),
+        )
+        .await
+    }
+
+    async fn task_queue_write_permit(&self) -> Result<PartitionWritePermit> {
+        self.global_write_permit(
+            "task_queue",
+            hex::encode(task_journal::task_queue_partition_id()),
+        )
+        .await
+    }
+
+    async fn model_write_permit(&self) -> Result<PartitionWritePermit> {
+        self.global_write_permit(
+            "model_metadata",
+            hex::encode(model_journal::model_partition_id()),
+        )
+        .await
+    }
+
+    async fn hf_write_permit(&self) -> Result<PartitionWritePermit> {
+        self.global_write_permit("hf_metadata", hex::encode(hf_journal::hf_partition_id()))
+            .await
+    }
+
+    async fn bucket_tenant_write_permit(&self, tenant_id: i64) -> Result<PartitionWritePermit> {
+        self.global_write_permit(
+            "bucket_metadata",
+            hex::encode(bucket_journal::tenant_bucket_partition_id(tenant_id)),
+        )
+        .await
+    }
+
+    async fn bucket_global_write_permit(&self) -> Result<PartitionWritePermit> {
+        self.global_write_permit(
+            "bucket_metadata",
+            hex::encode(bucket_journal::global_bucket_partition_id()),
+        )
+        .await
+    }
+
+    async fn object_metadata_write_permit(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+    ) -> Result<PartitionWritePermit> {
+        self.global_write_permit(
+            "object_metadata",
+            hex::encode(metadata_journal::object_metadata_partition_id(
+                tenant_id, bucket_id,
+            )),
+        )
+        .await
+    }
+
+    async fn multipart_metadata_write_permit(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+    ) -> Result<PartitionWritePermit> {
+        self.global_write_permit(
+            "multipart_metadata",
+            hex::encode(multipart_journal::multipart_metadata_partition_id(
+                tenant_id, bucket_id,
+            )),
+        )
+        .await
+    }
+
+    async fn append_metadata_write_permit(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+    ) -> Result<PartitionWritePermit> {
+        self.global_write_permit(
+            "append_metadata",
+            hex::encode(append_journal::append_metadata_partition_id(
+                tenant_id, bucket_id,
+            )),
+        )
+        .await
+    }
+
+    async fn manifest_cas_write_permit(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+    ) -> Result<PartitionWritePermit> {
+        self.global_write_permit(
+            "manifest_cas",
+            hex::encode(manifest_journal::manifest_cas_partition_id(
+                tenant_id, bucket_id,
+            )),
+        )
+        .await
+    }
+
+    async fn authz_write_permit(&self, tenant_id: i64) -> Result<PartitionWritePermit> {
+        self.global_write_permit(
+            "authz_tuple",
+            hex::encode(authz_journal::authz_partition_id(tenant_id)),
+        )
+        .await
+    }
+
+    async fn index_definition_write_permit(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+    ) -> Result<PartitionWritePermit> {
+        self.global_write_permit(
+            "index_definition",
+            hex::encode(index_journal::index_definition_partition_id(
+                tenant_id, bucket_id,
+            )),
+        )
+        .await
+    }
+
+    async fn index_diagnostic_write_permit(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+    ) -> Result<PartitionWritePermit> {
+        self.global_write_permit(
+            "index_diagnostic",
+            hex::encode(index_diagnostic_journal::index_diagnostic_partition_id(
+                tenant_id, bucket_id,
+            )),
+        )
+        .await
     }
 
     pub async fn get_admin_user_by_username(&self, username: &str) -> Result<Option<AdminUser>> {
@@ -470,12 +669,15 @@ impl Persistence {
         password_hash: &str,
         role_names: &[String],
     ) -> Result<AdminUser> {
-        control_journal::create_admin_user(
+        let permit = self.control_write_permit().await?;
+        control_journal::create_admin_user_with_permit(
             &self.storage,
             username,
             email,
             password_hash,
             role_names,
+            &permit,
+            &self.partition_owner_signing_key,
         )
         .await
     }
@@ -489,7 +691,8 @@ impl Persistence {
         is_active: bool,
         role_names: &[String],
     ) -> Result<()> {
-        control_journal::update_admin_user(
+        let permit = self.control_write_permit().await?;
+        control_journal::update_admin_user_with_permit(
             &self.storage,
             user_id,
             username,
@@ -497,12 +700,21 @@ impl Persistence {
             password_hash,
             is_active,
             role_names,
+            &permit,
+            &self.partition_owner_signing_key,
         )
         .await
     }
 
     pub async fn delete_admin_user(&self, user_id: i64) -> Result<()> {
-        control_journal::delete_admin_user(&self.storage, user_id).await
+        let permit = self.control_write_permit().await?;
+        control_journal::delete_admin_user_with_permit(
+            &self.storage,
+            user_id,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn list_admin_users(&self) -> Result<Vec<AdminUser>> {
@@ -512,7 +724,14 @@ impl Persistence {
     }
 
     pub async fn create_admin_role(&self, name: &str) -> Result<()> {
-        control_journal::create_admin_role(&self.storage, name).await
+        let permit = self.control_write_permit().await?;
+        control_journal::create_admin_role_with_permit(
+            &self.storage,
+            name,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn list_admin_roles(&self) -> Result<Vec<String>> {
@@ -528,11 +747,26 @@ impl Persistence {
     }
 
     pub async fn update_admin_role(&self, id: i32, name: &str) -> Result<()> {
-        control_journal::update_admin_role(&self.storage, id, name).await
+        let permit = self.control_write_permit().await?;
+        control_journal::update_admin_role_with_permit(
+            &self.storage,
+            id,
+            name,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn delete_admin_role(&self, id: i32) -> Result<()> {
-        control_journal::delete_admin_role(&self.storage, id).await
+        let permit = self.control_write_permit().await?;
+        control_journal::delete_admin_role_with_permit(
+            &self.storage,
+            id,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn list_policies(&self) -> Result<Vec<String>> {
@@ -548,8 +782,17 @@ impl Persistence {
         key: &str,
         manifest: &crate::anvil_api::ModelManifest,
     ) -> Result<()> {
-        model_journal::create_model_artifact(&self.storage, artifact_id, bucket_id, key, manifest)
-            .await
+        let permit = self.model_write_permit().await?;
+        model_journal::create_model_artifact_with_permit(
+            &self.storage,
+            artifact_id,
+            bucket_id,
+            key,
+            manifest,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn create_model_tensors(
@@ -557,7 +800,15 @@ impl Persistence {
         artifact_id: &str,
         tensors: &[crate::anvil_api::TensorIndexRow],
     ) -> Result<()> {
-        model_journal::create_model_tensors(&self.storage, artifact_id, tensors).await
+        let permit = self.model_write_permit().await?;
+        model_journal::create_model_tensors_with_permit(
+            &self.storage,
+            artifact_id,
+            tensors,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn list_tensors(
@@ -607,7 +858,14 @@ impl Persistence {
     }
 
     pub async fn create_region(&self, name: &str) -> Result<bool> {
-        control_journal::create_region(&self.storage, name).await
+        let permit = self.control_write_permit().await?;
+        control_journal::create_region_with_permit(
+            &self.storage,
+            name,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn list_regions(&self) -> Result<Vec<String>> {
@@ -641,7 +899,14 @@ impl Persistence {
     }
 
     pub async fn create_tenant(&self, name: &str, _api_key: &str) -> Result<Tenant> {
-        control_journal::create_tenant(&self.storage, name).await
+        let permit = self.control_write_permit().await?;
+        control_journal::create_tenant_with_permit(
+            &self.storage,
+            name,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn create_app(
@@ -651,8 +916,17 @@ impl Persistence {
         client_id: &str,
         encrypted_secret: &[u8],
     ) -> Result<App> {
-        control_journal::create_app(&self.storage, tenant_id, name, client_id, encrypted_secret)
-            .await
+        let permit = self.control_write_permit().await?;
+        control_journal::create_app_with_permit(
+            &self.storage,
+            tenant_id,
+            name,
+            client_id,
+            encrypted_secret,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn get_app_by_id(&self, id: i64) -> Result<Option<App>> {
@@ -674,15 +948,41 @@ impl Persistence {
     }
 
     pub async fn update_app_secret(&self, app_id: i64, new_encrypted_secret: &[u8]) -> Result<()> {
-        control_journal::update_app_secret(&self.storage, app_id, new_encrypted_secret).await
+        let permit = self.control_write_permit().await?;
+        control_journal::update_app_secret_with_permit(
+            &self.storage,
+            app_id,
+            new_encrypted_secret,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn grant_policy(&self, app_id: i64, resource: &str, action: &str) -> Result<()> {
-        control_journal::grant_policy(&self.storage, app_id, resource, action).await
+        let permit = self.control_write_permit().await?;
+        control_journal::grant_policy_with_permit(
+            &self.storage,
+            app_id,
+            resource,
+            action,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn revoke_policy(&self, app_id: i64, resource: &str, action: &str) -> Result<()> {
-        control_journal::revoke_policy(&self.storage, app_id, resource, action).await
+        let permit = self.control_write_permit().await?;
+        control_journal::revoke_policy_with_permit(
+            &self.storage,
+            app_id,
+            resource,
+            action,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn create_bucket(
@@ -710,10 +1010,21 @@ impl Persistence {
             created_at: Utc::now(),
             is_public_read: false,
         };
-        bucket_journal::append_bucket_mutation(
+        let tenant_permit = self
+            .bucket_tenant_write_permit(tenant_id)
+            .await
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        let global_permit = self
+            .bucket_global_write_permit()
+            .await
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        bucket_journal::append_bucket_mutation_with_permits(
             &self.storage,
             &bucket,
             BucketJournalMutation::Create,
+            &tenant_permit,
+            &global_permit,
+            &self.partition_owner_signing_key,
         )
         .await
         .map_err(|e| tonic::Status::internal(e.to_string()))?;
@@ -755,8 +1066,17 @@ impl Persistence {
             .await?
             .ok_or_else(|| anyhow!("bucket not found"))?;
         out.is_public_read = is_public;
-        bucket_journal::append_bucket_mutation(&self.storage, &out, BucketJournalMutation::Update)
-            .await?;
+        let tenant_permit = self.bucket_tenant_write_permit(out.tenant_id).await?;
+        let global_permit = self.bucket_global_write_permit().await?;
+        bucket_journal::append_bucket_mutation_with_permits(
+            &self.storage,
+            &out,
+            BucketJournalMutation::Update,
+            &tenant_permit,
+            &global_permit,
+            &self.partition_owner_signing_key,
+        )
+        .await?;
         self.cache.invalidate_bucket(tenant_id, bucket_name).await;
         Ok(out)
     }
@@ -770,8 +1090,17 @@ impl Persistence {
             .await?
             .ok_or_else(|| anyhow!("bucket not found"))?;
         out.is_public_read = is_public;
-        bucket_journal::append_bucket_mutation(&self.storage, &out, BucketJournalMutation::Update)
-            .await?;
+        let tenant_permit = self.bucket_tenant_write_permit(out.tenant_id).await?;
+        let global_permit = self.bucket_global_write_permit().await?;
+        bucket_journal::append_bucket_mutation_with_permits(
+            &self.storage,
+            &out,
+            BucketJournalMutation::Update,
+            &tenant_permit,
+            &global_permit,
+            &self.partition_owner_signing_key,
+        )
+        .await?;
         self.cache
             .invalidate_bucket(out.tenant_id, bucket_name)
             .await;
@@ -781,10 +1110,15 @@ impl Persistence {
     pub async fn soft_delete_bucket(&self, tenant_id: i64, name: &str) -> Result<Option<Bucket>> {
         let deleted = bucket_journal::read_current_bucket(&self.storage, tenant_id, name).await?;
         if let Some(bucket) = &deleted {
-            bucket_journal::append_bucket_mutation(
+            let tenant_permit = self.bucket_tenant_write_permit(bucket.tenant_id).await?;
+            let global_permit = self.bucket_global_write_permit().await?;
+            bucket_journal::append_bucket_mutation_with_permits(
                 &self.storage,
                 bucket,
                 BucketJournalMutation::Delete,
+                &tenant_permit,
+                &global_permit,
+                &self.partition_owner_signing_key,
             )
             .await?;
         }
@@ -953,11 +1287,16 @@ impl Persistence {
             inline_payload,
             checksum: None,
         };
-        metadata_journal::append_object_mutation(
+        let permit = self
+            .object_metadata_write_permit(bucket.tenant_id, bucket.id)
+            .await?;
+        metadata_journal::append_object_mutation_with_permit(
             &self.storage,
             &bucket,
             &object,
             metadata_journal::ObjectJournalMutation::Put,
+            &permit,
+            &self.partition_owner_signing_key,
         )
         .await?;
         Ok(object)
@@ -1048,11 +1387,16 @@ impl Persistence {
             deleted_at: Some(now),
             ..base
         };
-        metadata_journal::append_object_mutation(
+        let permit = self
+            .object_metadata_write_permit(bucket.tenant_id, bucket.id)
+            .await?;
+        metadata_journal::append_object_mutation_with_permit(
             &self.storage,
             &bucket,
             &object,
             metadata_journal::ObjectJournalMutation::DeleteMarker,
+            &permit,
+            &self.partition_owner_signing_key,
         )
         .await?;
         Ok(Some(object))
@@ -1078,11 +1422,16 @@ impl Persistence {
         object.id = metadata_journal::next_object_id(&self.storage, &bucket, &[]).await?;
         object.mutation_id = uuid::Uuid::new_v4();
         object.deleted_at = Some(Utc::now());
-        metadata_journal::append_object_mutation(
+        let permit = self
+            .object_metadata_write_permit(bucket.tenant_id, bucket.id)
+            .await?;
+        metadata_journal::append_object_mutation_with_permit(
             &self.storage,
             &bucket,
             &object,
             metadata_journal::ObjectJournalMutation::DeleteVersion,
+            &permit,
+            &self.partition_owner_signing_key,
         )
         .await?;
         Ok(Some(object))
@@ -1124,7 +1473,18 @@ impl Persistence {
         bucket_id: i64,
         key: &str,
     ) -> Result<MultipartUpload> {
-        multipart_journal::create_multipart_upload(&self.storage, tenant_id, bucket_id, key).await
+        let permit = self
+            .multipart_metadata_write_permit(tenant_id, bucket_id)
+            .await?;
+        multipart_journal::create_multipart_upload_with_permit(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            key,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn get_active_multipart_upload(
@@ -1152,13 +1512,22 @@ impl Persistence {
         size: i64,
         etag: &str,
     ) -> Result<MultipartUploadPart> {
-        multipart_journal::upsert_multipart_part(
+        let (tenant_id, bucket_id) =
+            multipart_journal::find_multipart_upload_partition(&self.storage, upload_row_id)
+                .await?
+                .ok_or_else(|| anyhow!("multipart upload not found"))?;
+        let permit = self
+            .multipart_metadata_write_permit(tenant_id, bucket_id)
+            .await?;
+        multipart_journal::upsert_multipart_part_with_permit(
             &self.storage,
             upload_row_id,
             part_number,
             content_hash,
             size,
             etag,
+            &permit,
+            &self.partition_owner_signing_key,
         )
         .await
     }
@@ -1205,7 +1574,22 @@ impl Persistence {
     }
 
     pub async fn complete_multipart_upload(&self, upload_row_id: i64) -> Result<()> {
-        multipart_journal::complete_multipart_upload(&self.storage, upload_row_id).await
+        let Some((tenant_id, bucket_id)) =
+            multipart_journal::find_multipart_upload_partition(&self.storage, upload_row_id)
+                .await?
+        else {
+            return Ok(());
+        };
+        let permit = self
+            .multipart_metadata_write_permit(tenant_id, bucket_id)
+            .await?;
+        multipart_journal::complete_multipart_upload_with_permit(
+            &self.storage,
+            upload_row_id,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn abort_multipart_upload(
@@ -1215,12 +1599,17 @@ impl Persistence {
         key: &str,
         upload_id: uuid::Uuid,
     ) -> Result<bool> {
-        multipart_journal::abort_multipart_upload(
+        let permit = self
+            .multipart_metadata_write_permit(tenant_id, bucket_id)
+            .await?;
+        multipart_journal::abort_multipart_upload_with_permit(
             &self.storage,
             tenant_id,
             bucket_id,
             key,
             upload_id,
+            &permit,
+            &self.partition_owner_signing_key,
         )
         .await
     }
@@ -1295,12 +1684,17 @@ impl Persistence {
         bucket_name: &str,
         stream_key: &str,
     ) -> Result<AppendStream> {
-        append_journal::create_append_stream(
+        let permit = self
+            .append_metadata_write_permit(tenant_id, bucket_id)
+            .await?;
+        append_journal::create_append_stream_with_permit(
             &self.storage,
             tenant_id,
             bucket_id,
             bucket_name,
             stream_key,
+            &permit,
+            &self.partition_owner_signing_key,
         )
         .await
     }
@@ -1328,11 +1722,20 @@ impl Persistence {
         payload_hash: &str,
         payload_size: i64,
     ) -> Result<AppendStreamRecord> {
-        append_journal::append_stream_record(
+        let (tenant_id, bucket_id) =
+            append_journal::find_append_stream_partition(&self.storage, stream_row_id)
+                .await?
+                .ok_or_else(|| anyhow!("append stream not found"))?;
+        let permit = self
+            .append_metadata_write_permit(tenant_id, bucket_id)
+            .await?;
+        append_journal::append_stream_record_with_permit(
             &self.storage,
             stream_row_id,
             payload_hash,
             payload_size,
+            &permit,
+            &self.partition_owner_signing_key,
         )
         .await
     }
@@ -1345,7 +1748,22 @@ impl Persistence {
     }
 
     pub async fn seal_append_stream(&self, stream_row_id: i64, segment_hash: &str) -> Result<bool> {
-        append_journal::seal_append_stream(&self.storage, stream_row_id, segment_hash).await
+        let Some((tenant_id, bucket_id)) =
+            append_journal::find_append_stream_partition(&self.storage, stream_row_id).await?
+        else {
+            return Ok(false);
+        };
+        let permit = self
+            .append_metadata_write_permit(tenant_id, bucket_id)
+            .await?;
+        append_journal::seal_append_stream_with_permit(
+            &self.storage,
+            stream_row_id,
+            segment_hash,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn compare_and_swap_manifest(
@@ -1358,7 +1776,8 @@ impl Persistence {
         manifest: JsonValue,
         manifest_hash: &str,
     ) -> Result<Option<ManifestCasResult>> {
-        manifest_journal::compare_and_swap_manifest(
+        let permit = self.manifest_cas_write_permit(tenant_id, bucket_id).await?;
+        manifest_journal::compare_and_swap_manifest_with_permit(
             &self.storage,
             tenant_id,
             bucket_id,
@@ -1366,6 +1785,8 @@ impl Persistence {
             expected_revision,
             manifest,
             manifest_hash,
+            &permit,
+            &self.partition_owner_signing_key,
         )
         .await
     }
@@ -1384,7 +1805,8 @@ impl Persistence {
         written_by: &str,
         reason: &str,
     ) -> Result<AuthzTupleRecord> {
-        authz_journal::write_authz_tuple(
+        let permit = self.authz_write_permit(tenant_id).await?;
+        authz_journal::write_authz_tuple_with_permit(
             &self.storage,
             authz_journal::AuthzTupleWrite {
                 tenant_id,
@@ -1398,6 +1820,8 @@ impl Persistence {
                 written_by,
                 reason,
             },
+            &permit,
+            &self.partition_owner_signing_key,
         )
         .await
     }
@@ -1626,7 +2050,16 @@ impl Persistence {
             }),
             created_at: Utc::now(),
         };
-        index_journal::append_index_definition_event(&self.storage, &event).await?;
+        let permit = self
+            .index_definition_write_permit(tenant_id, bucket_id)
+            .await?;
+        index_journal::append_index_definition_event_with_permit(
+            &self.storage,
+            &event,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await?;
         Ok(event)
     }
 
@@ -1666,7 +2099,10 @@ impl Persistence {
         message: &str,
         details: JsonValue,
     ) -> Result<IndexDiagnostic> {
-        index_diagnostic_journal::write_index_diagnostic(
+        let permit = self
+            .index_diagnostic_write_permit(tenant_id, bucket_id)
+            .await?;
+        index_diagnostic_journal::write_index_diagnostic_with_permit(
             &self.storage,
             IndexDiagnostic {
                 id: 0,
@@ -1683,6 +2119,8 @@ impl Persistence {
                 details,
                 created_at: Utc::now(),
             },
+            &permit,
+            &self.partition_owner_signing_key,
         )
         .await
     }
@@ -1724,11 +2162,27 @@ impl Persistence {
         payload: JsonValue,
         priority: i32,
     ) -> Result<()> {
-        task_journal::enqueue_task(&self.storage, task_type, payload, priority).await
+        let permit = self.task_queue_write_permit().await?;
+        task_journal::enqueue_task_with_permit(
+            &self.storage,
+            task_type,
+            payload,
+            priority,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn claim_pending_tasks(&self, limit: i64) -> Result<Vec<TaskRecord>> {
-        task_journal::claim_pending_tasks(&self.storage, limit).await
+        let permit = self.task_queue_write_permit().await?;
+        task_journal::claim_pending_tasks_with_permit(
+            &self.storage,
+            limit,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn list_tasks(&self) -> Result<Vec<TaskRecord>> {
@@ -1740,11 +2194,27 @@ impl Persistence {
         task_id: i64,
         status: crate::tasks::TaskStatus,
     ) -> Result<()> {
-        task_journal::update_task_status(&self.storage, task_id, status).await
+        let permit = self.task_queue_write_permit().await?;
+        task_journal::update_task_status_with_permit(
+            &self.storage,
+            task_id,
+            status,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn fail_task(&self, task_id: i64, error: &str) -> Result<()> {
-        task_journal::fail_task(&self.storage, task_id, error).await
+        let permit = self.task_queue_write_permit().await?;
+        task_journal::fail_task_with_permit(
+            &self.storage,
+            task_id,
+            error,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn hf_create_key(
@@ -1753,11 +2223,27 @@ impl Persistence {
         token_encrypted: &[u8],
         note: Option<&str>,
     ) -> Result<()> {
-        hf_journal::create_key(&self.storage, name, token_encrypted, note).await
+        let permit = self.hf_write_permit().await?;
+        hf_journal::create_key_with_permit(
+            &self.storage,
+            name,
+            token_encrypted,
+            note,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn hf_delete_key(&self, name: &str) -> Result<u64> {
-        hf_journal::delete_key(&self.storage, name).await
+        let permit = self.hf_write_permit().await?;
+        hf_journal::delete_key_with_permit(
+            &self.storage,
+            name,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn hf_get_key_encrypted(&self, name: &str) -> Result<Option<(i64, Vec<u8>)>> {
@@ -1788,7 +2274,8 @@ impl Persistence {
         include_globs: &[String],
         exclude_globs: &[String],
     ) -> Result<i64> {
-        hf_journal::create_ingestion(
+        let permit = self.hf_write_permit().await?;
+        hf_journal::create_ingestion_with_permit(
             &self.storage,
             key_id,
             tenant_id,
@@ -1800,6 +2287,8 @@ impl Persistence {
             target_prefix,
             include_globs,
             exclude_globs,
+            &permit,
+            &self.partition_owner_signing_key,
         )
         .await
     }
@@ -1814,11 +2303,27 @@ impl Persistence {
         state_value: crate::tasks::HFIngestionState,
         error: Option<&str>,
     ) -> Result<()> {
-        hf_journal::update_ingestion_state(&self.storage, id, state_value, error).await
+        let permit = self.hf_write_permit().await?;
+        hf_journal::update_ingestion_state_with_permit(
+            &self.storage,
+            id,
+            state_value,
+            error,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn hf_cancel_ingestion(&self, id: i64) -> Result<u64> {
-        hf_journal::cancel_ingestion(&self.storage, id).await
+        let permit = self.hf_write_permit().await?;
+        hf_journal::cancel_ingestion_with_permit(
+            &self.storage,
+            id,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn hf_add_item(
@@ -1828,7 +2333,17 @@ impl Persistence {
         size: Option<i64>,
         etag: Option<&str>,
     ) -> Result<i64> {
-        hf_journal::add_item(&self.storage, ingestion_id, path, size, etag).await
+        let permit = self.hf_write_permit().await?;
+        hf_journal::add_item_with_permit(
+            &self.storage,
+            ingestion_id,
+            path,
+            size,
+            etag,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn hf_update_item_state(
@@ -1837,11 +2352,29 @@ impl Persistence {
         state_value: crate::tasks::HFIngestionItemState,
         error: Option<&str>,
     ) -> Result<()> {
-        hf_journal::update_item_state(&self.storage, id, state_value, error).await
+        let permit = self.hf_write_permit().await?;
+        hf_journal::update_item_state_with_permit(
+            &self.storage,
+            id,
+            state_value,
+            error,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn hf_update_item_success(&self, id: i64, size: i64, etag: &str) -> Result<()> {
-        hf_journal::update_item_success(&self.storage, id, size, etag).await
+        let permit = self.hf_write_permit().await?;
+        hf_journal::update_item_success_with_permit(
+            &self.storage,
+            id,
+            size,
+            etag,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn hf_get_ingestion_items(
@@ -1875,5 +2408,228 @@ impl Persistence {
         DateTime<Utc>,
     )> {
         hf_journal::status_summary(&self.storage, id).await
+    }
+}
+
+fn persistence_owner_node_id(config: &Config) -> String {
+    if !config.public_api_addr.is_empty() {
+        return config.public_api_addr.clone();
+    }
+    if !config.api_listen_addr.is_empty() {
+        return config.api_listen_addr.clone();
+    }
+    if !config.region.is_empty() {
+        return config.region.clone();
+    }
+    "local-anvil-node".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::formats::{BinaryEnvelopeHeader, COMMON_HEADER_LEN, JournalFrame};
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn test_config(storage_path: &std::path::Path) -> Config {
+        Config {
+            jwt_secret: "test-secret".to_string(),
+            anvil_secret_encryption_key:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            public_api_addr: "test-node".to_string(),
+            api_listen_addr: "127.0.0.1:0".to_string(),
+            region: "test-region".to_string(),
+            storage_path: storage_path.to_string_lossy().to_string(),
+            ..Config::default()
+        }
+    }
+
+    fn model_manifest() -> crate::anvil_api::ModelManifest {
+        crate::anvil_api::ModelManifest {
+            schema_version: "1".to_string(),
+            artifact_id: "artifact-a".to_string(),
+            name: "artifact-a".to_string(),
+            format: "test".to_string(),
+            components: Vec::new(),
+            base_artifact_id: String::new(),
+            delta_artifact_ids: Vec::new(),
+            signatures: Vec::new(),
+            merkle_root: "abc".to_string(),
+            meta: std::collections::HashMap::new(),
+        }
+    }
+
+    async fn assert_journal_is_fenced(path: impl AsRef<std::path::Path>) {
+        let bytes = tokio::fs::read(path).await.unwrap();
+        let header = BinaryEnvelopeHeader::decode(&bytes).unwrap();
+        let header_json: serde_json::Value = serde_json::from_slice(&header.header_json).unwrap();
+        let header_fence = header_json["fence_token"].as_u64().unwrap();
+        assert!(header_fence > 0);
+
+        let mut input = &bytes[COMMON_HEADER_LEN + header.header_json.len()..];
+        let mut frames = Vec::new();
+        while !input.is_empty() {
+            let frame_len = u32::from_le_bytes(input[0..4].try_into().unwrap()) as usize;
+            let frame_end = 4 + frame_len;
+            frames.push(JournalFrame::decode(&input[..frame_end]).unwrap());
+            input = &input[frame_end..];
+        }
+        assert!(!frames.is_empty());
+        assert!(frames.iter().all(|frame| frame.fence_token == header_fence));
+    }
+
+    #[tokio::test]
+    async fn persistence_global_journal_writes_use_current_fence_tokens() {
+        let temp = tempdir().unwrap();
+        let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+
+        persistence.create_region("local").await.unwrap();
+        let bucket = persistence
+            .create_bucket(1, "bucket-a", "local")
+            .await
+            .unwrap();
+        let object = persistence
+            .create_object(
+                1,
+                bucket.id,
+                "objects/a.txt",
+                "hash-a",
+                11,
+                "etag-a",
+                Some("text/plain"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        persistence
+            .soft_delete_object(bucket.id, &object.key)
+            .await
+            .unwrap();
+        let upload = persistence
+            .create_multipart_upload(1, bucket.id, "objects/large.bin")
+            .await
+            .unwrap();
+        persistence
+            .upsert_multipart_part(upload.id, 1, "part-hash", 12, "part-etag")
+            .await
+            .unwrap();
+        persistence
+            .complete_multipart_upload(upload.id)
+            .await
+            .unwrap();
+        let stream = persistence
+            .create_append_stream(1, bucket.id, &bucket.name, "stream-a")
+            .await
+            .unwrap();
+        persistence
+            .append_stream_record(stream.id, "payload-hash", 13)
+            .await
+            .unwrap();
+        persistence
+            .seal_append_stream(stream.id, "segment-hash")
+            .await
+            .unwrap();
+        persistence
+            .compare_and_swap_manifest(
+                1,
+                bucket.id,
+                &bucket.name,
+                "manifest.json",
+                0,
+                json!({"version": 1}),
+                "manifest-hash",
+            )
+            .await
+            .unwrap();
+        let index = persistence
+            .create_index_definition(
+                1,
+                bucket.id,
+                "body",
+                "full_text",
+                json!({"prefix": "objects/"}),
+                json!({"field": "body"}),
+                "inherit",
+                json!({"mode": "sync"}),
+            )
+            .await
+            .unwrap();
+        persistence
+            .create_index_definition_event(1, bucket.id, &bucket.name, &index, "create")
+            .await
+            .unwrap();
+        persistence
+            .create_index_diagnostic(
+                1,
+                bucket.id,
+                &bucket.name,
+                Some(index.id),
+                &index.name,
+                &object.key,
+                Some(object.version_id),
+                "warning",
+                "test-warning",
+                "diagnostic",
+                json!({"source": "test"}),
+            )
+            .await
+            .unwrap();
+        persistence
+            .write_authz_tuple(
+                1,
+                "object",
+                &object.key,
+                "reader",
+                "user",
+                "user-a",
+                "",
+                "add",
+                "test",
+                "test grant",
+            )
+            .await
+            .unwrap();
+        persistence
+            .enqueue_task(
+                crate::tasks::TaskType::DeleteBucket,
+                json!({"bucket_id": 7}),
+                1,
+            )
+            .await
+            .unwrap();
+        persistence
+            .create_model_artifact("artifact-a", 1, "models/a", &model_manifest())
+            .await
+            .unwrap();
+        persistence
+            .hf_create_key("primary", b"secret", Some("note"))
+            .await
+            .unwrap();
+
+        assert_journal_is_fenced(persistence.storage.control_journal_path()).await;
+        assert_journal_is_fenced(persistence.storage.task_queue_journal_path()).await;
+        assert_journal_is_fenced(persistence.storage.model_metadata_journal_path()).await;
+        assert_journal_is_fenced(persistence.storage.hf_journal_path()).await;
+        assert_journal_is_fenced(persistence.storage.bucket_metadata_journal_path(1)).await;
+        assert_journal_is_fenced(persistence.storage.global_bucket_metadata_journal_path()).await;
+        assert_journal_is_fenced(persistence.storage.metadata_journal_path(1, bucket.id)).await;
+        assert_journal_is_fenced(persistence.storage.multipart_journal_path(1, bucket.id)).await;
+        assert_journal_is_fenced(persistence.storage.append_journal_path(1, bucket.id)).await;
+        assert_journal_is_fenced(persistence.storage.manifest_cas_journal_path(1, bucket.id)).await;
+        assert_journal_is_fenced(
+            persistence
+                .storage
+                .index_definition_journal_path(1, bucket.id),
+        )
+        .await;
+        assert_journal_is_fenced(
+            persistence
+                .storage
+                .index_diagnostic_journal_path(1, bucket.id),
+        )
+        .await;
+        assert_journal_is_fenced(persistence.storage.authz_tuple_journal_path(1)).await;
     }
 }

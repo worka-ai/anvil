@@ -278,6 +278,15 @@ async fn seal_append_stream_inner(
     Ok(true)
 }
 
+pub async fn find_append_stream_partition(
+    storage: &Storage,
+    stream_row_id: i64,
+) -> Result<Option<(i64, i64)>> {
+    Ok(find_stream(storage, stream_row_id)
+        .await?
+        .map(|(tenant_id, bucket_id, _)| (tenant_id, bucket_id)))
+}
+
 async fn find_stream(
     storage: &Storage,
     stream_row_id: i64,
@@ -395,7 +404,7 @@ async fn ensure_header(
         tenant_id: tenant_id.to_string(),
         bucket_id: bucket_id.to_string(),
         partition_family: "append_metadata",
-        partition_id: hex::encode(partition_id(tenant_id, bucket_id)),
+        partition_id: hex::encode(append_metadata_partition_id(tenant_id, bucket_id)),
         fence_token,
         first_sequence: 1,
         created_at: &created_at,
@@ -467,7 +476,7 @@ fn next_record_id(state: &AppendState) -> Result<i64> {
         .ok_or_else(|| anyhow!("append record id overflow"))
 }
 
-fn partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
+pub fn append_metadata_partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/bucket/{bucket_id}/append").as_bytes())
 }
 
@@ -476,7 +485,7 @@ fn require_append_metadata_permit(
     bucket_id: i64,
     permit: &PartitionWritePermit,
 ) -> Result<()> {
-    let expected_partition_id = hex::encode(partition_id(tenant_id, bucket_id));
+    let expected_partition_id = hex::encode(append_metadata_partition_id(tenant_id, bucket_id));
     if permit.partition_family != "append_metadata" || permit.partition_id != expected_partition_id
     {
         anyhow::bail!("append metadata write permit targets a different partition");
@@ -606,7 +615,7 @@ mod tests {
         owner_node_id: &str,
     ) -> crate::partition_fence::PartitionOwnerState {
         let family = "append_metadata".to_string();
-        let id = hex::encode(partition_id(tenant_id, bucket_id));
+        let id = hex::encode(append_metadata_partition_id(tenant_id, bucket_id));
         let recovering = acquire_partition_recovery(
             storage,
             PartitionRecoveryAcquire {

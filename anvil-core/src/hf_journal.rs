@@ -844,7 +844,7 @@ fn next_item_id(state: &HfState) -> Result<i64> {
         .ok_or_else(|| anyhow!("hf item id overflow"))
 }
 
-fn hf_partition_id() -> Hash32 {
+pub fn hf_partition_id() -> Hash32 {
     hash32(b"hf_metadata/global")
 }
 
