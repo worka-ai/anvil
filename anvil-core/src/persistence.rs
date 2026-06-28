@@ -1519,6 +1519,35 @@ impl Persistence {
         .await
     }
 
+    pub async fn compact_object_metadata(
+        &self,
+        bucket_id: i64,
+    ) -> Result<Option<metadata_journal::SealedObjectMetadataSegments>> {
+        let Some(bucket) =
+            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        else {
+            return Ok(None);
+        };
+        let journal_path = self
+            .storage
+            .metadata_journal_path(bucket.tenant_id, bucket.id);
+        if tokio::fs::metadata(&journal_path).await.is_err() {
+            return Ok(None);
+        }
+        let permit = self
+            .object_metadata_write_permit(bucket.tenant_id, bucket.id)
+            .await?;
+        metadata_journal::seal_object_journal_segments_with_permit(
+            &self.storage,
+            &bucket,
+            &self.partition_owner_signing_key,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
+        .map(Some)
+    }
+
     pub async fn create_multipart_upload(
         &self,
         tenant_id: i64,
@@ -2860,6 +2889,126 @@ mod tests {
                 .is_some()
         );
         assert_eq!(replayed.hf_list_keys().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn persistence_compacts_object_metadata_and_restarts_from_manifest() {
+        let temp = tempdir().unwrap();
+        let first_config = test_config(temp.path());
+        let persistence = Persistence::new(&first_config, None).unwrap();
+
+        persistence.create_region("local").await.unwrap();
+        let bucket = persistence
+            .create_bucket(1, "compact-bucket", "local")
+            .await
+            .unwrap();
+        let first = persistence
+            .create_object(
+                1,
+                bucket.id,
+                "docs/a.txt",
+                "hash-a",
+                11,
+                "etag-a",
+                Some("text/plain"),
+                Some(json!({"label": "a"})),
+                None,
+                Some(b"alpha".to_vec()),
+            )
+            .await
+            .unwrap();
+        persistence
+            .create_object(
+                1,
+                bucket.id,
+                "docs/nested/b.txt",
+                "hash-b",
+                12,
+                "etag-b",
+                Some("text/plain"),
+                None,
+                None,
+                Some(b"bravo".to_vec()),
+            )
+            .await
+            .unwrap();
+
+        let sealed = persistence
+            .compact_object_metadata(bucket.id)
+            .await
+            .unwrap()
+            .expect("object metadata journal should compact");
+        assert_eq!(sealed.metadata_record_count, 2);
+        assert_eq!(sealed.directory_record_count, 2);
+
+        drop(persistence);
+        let restarted_config = Config {
+            public_api_addr: "test-node-after-compaction".to_string(),
+            ..first_config
+        };
+        let restarted = Persistence::new(&restarted_config, None).unwrap();
+
+        let replayed = restarted
+            .get_object(bucket.id, "docs/a.txt")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed.version_id, first.version_id);
+        assert_eq!(replayed.inline_payload.as_deref(), Some(&b"alpha"[..]));
+        assert_eq!(replayed.user_meta.unwrap()["label"], "a");
+
+        let (objects, common_prefixes) = restarted
+            .list_objects(bucket.id, "docs/", "", 100, "/")
+            .await
+            .unwrap();
+        assert_eq!(
+            objects
+                .iter()
+                .map(|object| object.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["docs/a.txt"]
+        );
+        assert_eq!(common_prefixes, vec!["docs/nested/".to_string()]);
+        assert_eq!(
+            restarted
+                .list_object_versions(bucket.id, "docs/", "", None, 100)
+                .await
+                .unwrap()
+                .versions
+                .len(),
+            2
+        );
+
+        let replacement = restarted
+            .create_object(
+                1,
+                bucket.id,
+                "docs/a.txt",
+                "hash-c",
+                13,
+                "etag-c",
+                Some("text/plain"),
+                None,
+                None,
+                Some(b"charlie".to_vec()),
+            )
+            .await
+            .unwrap();
+        let (objects_after_append, _) = restarted
+            .list_objects(bucket.id, "docs/", "", 100, "/")
+            .await
+            .unwrap();
+        assert_eq!(objects_after_append[0].version_id, replacement.version_id);
+        assert_eq!(objects_after_append[0].content_hash, "hash-c");
+        assert_eq!(
+            restarted
+                .list_object_versions(bucket.id, "docs/a.txt", "", None, 100)
+                .await
+                .unwrap()
+                .versions
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
