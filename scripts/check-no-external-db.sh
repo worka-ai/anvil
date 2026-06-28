@@ -2,8 +2,17 @@
 set -euo pipefail
 
 # Anvil must not depend on an external relational metadata store.
-# Keep the regex self-nonmatching so this checker can scan the whole repo.
-pattern='post[g]res|post[g]resql|pg[v]ector|s[q]lx|tokio[-]post[g]res|deadpool[-]post[g]res|DATABASE[_]URL|P[O]STGRES'
+# Build the matcher from fragments so this checker can scan the whole repo
+# without matching its own source.
+db_a='post''gres'
+db_b='post''gresql'
+db_c='pg''vector'
+db_d='s''qlx'
+db_e='tokio-''post''gres'
+db_f='deadpool-''post''gres'
+db_g='DATABASE''_URL'
+db_h='POST''GRES'
+pattern="${db_a}|${db_b}|${db_c}|${db_d}|${db_e}|${db_f}|${db_g}|${db_h}"
 
 if rg -n -i -uu "$pattern" . \
   -g '!target/**' \
