@@ -513,6 +513,202 @@ async fn test_query_vector_index_reads_latest_segment() {
 }
 
 #[tokio::test]
+async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
+
+    let bucket_name = "index-query-hybrid-bucket".to_string();
+    bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let created = index_client
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket_name: bucket_name.clone(),
+                name: "body-and-vector".to_string(),
+                kind: "hybrid".to_string(),
+                selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
+                extractor_json: serde_json::json!({
+                    "text": {"source": "object_body_utf8"},
+                    "vector": {"source": "object_body_utf8"}
+                })
+                .to_string(),
+                authorization_mode: "index_only".to_string(),
+                build_policy_json: serde_json::json!({
+                    "full_text": {"positions": true},
+                    "vector": {
+                        "dimension": 2,
+                        "metric": "cosine",
+                        "modality": "text",
+                        "embedding_model": "test-embedding",
+                        "chunking": {"kind": "whole_object"}
+                    }
+                })
+                .to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .index
+        .expect("created hybrid index");
+
+    let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
+    let bucket = cluster.states[0]
+        .db
+        .get_bucket_by_name(claims.tenant_id, &bucket_name)
+        .await
+        .unwrap()
+        .expect("bucket exists");
+    let first_object = cluster.states[0]
+        .db
+        .create_object(
+            claims.tenant_id,
+            bucket.id,
+            "docs/hybrid-a.txt",
+            &hex::encode([8; 32]),
+            8,
+            "etag-hybrid-a",
+            Some("text/plain"),
+            None,
+            None,
+            Some(b"alpha beta".to_vec()),
+        )
+        .await
+        .unwrap();
+    let second_object = cluster.states[0]
+        .db
+        .create_object(
+            claims.tenant_id,
+            bucket.id,
+            "docs/hybrid-b.txt",
+            &hex::encode([9; 32]),
+            8,
+            "etag-hybrid-b",
+            Some("text/plain"),
+            None,
+            None,
+            Some(b"gamma".to_vec()),
+        )
+        .await
+        .unwrap();
+    let index_storage_id = anvil::index_journal::index_storage_id(
+        claims.tenant_id,
+        bucket.id,
+        created.index_id as i64,
+    );
+    let postings = build_full_text_postings(
+        &[
+            FullTextDocument {
+                document_id: 101,
+                field_id: 1,
+                object_version_id: *first_object.version_id.as_bytes(),
+                authz_label_hash: [1; 32],
+                text: "alpha beta",
+            },
+            FullTextDocument {
+                document_id: 202,
+                field_id: 1,
+                object_version_id: *second_object.version_id.as_bytes(),
+                authz_label_hash: [2; 32],
+                text: "gamma",
+            },
+        ],
+        &Default::default(),
+    );
+    write_full_text_segment(
+        &cluster.states[0].storage,
+        FullTextSegmentWrite {
+            index_id: &index_storage_id,
+            generation: 5,
+            tokenizer: serde_json::json!({}),
+            scorer: serde_json::json!({"kind": "bm25"}),
+            source_cursor: 30,
+            authz_revision: 31,
+            built_postings: &postings,
+            document_table: b"",
+        },
+    )
+    .await
+    .unwrap();
+    let graph = HnswGraph {
+        node_count: 2,
+        layers: vec![LayerBlock {
+            layer_index: 0,
+            node_adjacencies: vec![NodeAdjacency {
+                vector_id: 1,
+                neighbors: vec![2],
+            }],
+        }],
+    };
+    write_vector_segment(
+        &cluster.states[0].storage,
+        VectorSegmentWrite {
+            index_id: &index_storage_id,
+            generation: 6,
+            dimension: 2,
+            metric: VectorMetric::Cosine,
+            embedding_model: "test-embedding",
+            modality: VectorModality::Text,
+            hnsw_m: 32,
+            hnsw_ef_construction: 200,
+            source_cursor: 31,
+            authz_revision: 32,
+            entries: &[
+                vector_entry(1, *first_object.version_id.as_bytes(), vec![1.0, 0.0]),
+                vector_entry(2, *second_object.version_id.as_bytes(), vec![0.0, 1.0]),
+            ],
+            hnsw_graph: &graph,
+            deleted_bitset: &[0],
+        },
+    )
+    .await
+    .unwrap();
+
+    let response = index_client
+        .query_index(authorized(
+            QueryIndexRequest {
+                bucket_name,
+                index_name: "body-and-vector".to_string(),
+                query_text: "alpha".to_string(),
+                query_vector: vec![1.0, 0.0],
+                limit: 10,
+                phrase: false,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.index_kind, "hybrid");
+    assert_eq!(response.index_generation, 6);
+    assert_eq!(response.authz_revision, 32);
+    assert_eq!(response.hits[0].kind, "hybrid");
+    assert_eq!(response.hits[0].object_key, "docs/hybrid-a.txt");
+    assert_eq!(response.hits[0].document_id, 101);
+    assert_eq!(response.hits[0].vector_id, 1);
+    let recipe: serde_json::Value = serde_json::from_str(&response.scoring_recipe_json).unwrap();
+    assert_eq!(recipe["kind"], "hybrid");
+}
+
+#[tokio::test]
 async fn test_query_inherit_object_vector_filters_results_by_object_read_scope() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;

@@ -11,6 +11,7 @@ use crate::{
     search_query, validation, vector_segment,
 };
 use serde_json::Value as JsonValue;
+use std::collections::BTreeMap;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -243,7 +244,7 @@ impl IndexService for AppState {
                     .await
             }
             "vector" => self.query_vector_index(&claims, &bucket, &index, req).await,
-            "hybrid" => Err(Status::failed_precondition("IndexUnavailable")),
+            "hybrid" => self.query_hybrid_index(&claims, &bucket, &index, req).await,
             _ => Err(Status::failed_precondition("IndexDoesNotSupportQuery")),
         }
     }
@@ -417,8 +418,7 @@ impl AppState {
                 "query_vector is not valid for full_text indexes",
             ));
         }
-        let definition = FullTextIndexDefinition::from_json(&index.build_policy)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let definition = full_text_definition(index)?;
         let index_storage_id =
             index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
         let Some(segment) =
@@ -494,6 +494,178 @@ impl AppState {
             authz_revision: segment.header.authz_revision,
             scoring_recipe_json: serde_json::json!({"kind": "bm25", "k1": 1.2, "b": 0.75})
                 .to_string(),
+        }))
+    }
+
+    async fn query_hybrid_index(
+        &self,
+        claims: &auth::Claims,
+        bucket: &crate::persistence::Bucket,
+        index: &crate::persistence::IndexDefinition,
+        req: QueryIndexRequest,
+    ) -> Result<Response<QueryIndexResponse>, Status> {
+        if req.query_text.trim().is_empty() && req.query_vector.is_empty() {
+            return Err(Status::invalid_argument(
+                "query_text or query_vector is required for hybrid indexes",
+            ));
+        }
+
+        let requested_limit = query_limit(req.limit);
+        let internal_limit = internal_candidate_limit(req.limit, &index.authorization_mode);
+        let index_storage_id =
+            index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
+        let mut combined = BTreeMap::<[u8; 16], HybridAccum>::new();
+        let mut generation = 0;
+        let mut authz_revision = 0;
+        let has_text = !req.query_text.trim().is_empty();
+        let has_vector = !req.query_vector.is_empty();
+
+        if has_text {
+            let definition = full_text_definition(index)?;
+            let Some(segment) =
+                full_text_segment::read_latest_full_text_segment(&self.storage, &index_storage_id)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+            else {
+                return Err(Status::failed_precondition("IndexUnavailable"));
+            };
+            generation = generation.max(segment.header.generation);
+            authz_revision = authz_revision.max(segment.header.authz_revision);
+            let search_hits = search_query::query_full_text_segment(
+                &segment,
+                search_query::FullTextSegmentQuery {
+                    query: &req.query_text,
+                    tokenizer: &definition.tokenizer,
+                    positions_enabled: definition.positions_enabled,
+                    phrase: req.phrase,
+                    bm25: Bm25Config::default(),
+                    authorized_labels: None,
+                    limit: internal_limit,
+                },
+            )
+            .map_err(|e| Status::failed_precondition(format!("{e:?}")))?;
+            for hit in search_hits {
+                let entry = combined
+                    .entry(hit.object_version_id)
+                    .or_insert_with(|| HybridAccum::new(hit.object_version_id));
+                entry.text_score += hit.score;
+                entry.document_id = hit.document_id;
+                entry.field_id = u32::from(hit.field_id);
+            }
+        }
+
+        if has_vector {
+            let Some(segment) =
+                vector_segment::read_latest_vector_segment(&self.storage, &index_storage_id)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+            else {
+                return Err(Status::failed_precondition("IndexUnavailable"));
+            };
+            if req.query_vector.len() != usize::from(segment.header.dimension) {
+                return Err(Status::invalid_argument("query_vector dimension mismatch"));
+            }
+            generation = generation.max(segment.header.generation);
+            authz_revision = authz_revision.max(segment.header.authz_revision);
+            let metric = VectorMetric::from_name(&segment.header.metric)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let search_hits = search_query::query_vector_segment(
+                &segment,
+                &req.query_vector,
+                metric,
+                None,
+                internal_limit,
+            )
+            .map_err(|e| Status::internal(e.to_string()))?;
+            for hit in search_hits {
+                let entry = combined
+                    .entry(hit.object_version_id)
+                    .or_insert_with(|| HybridAccum::new(hit.object_version_id));
+                entry.vector_score = entry.vector_score.max(hit.score);
+                entry.vector_id = hit.vector_id;
+                entry.chunk_id = hit.chunk_id;
+                entry.source_start = hit.source_start;
+                entry.source_len = hit.source_len;
+            }
+        }
+
+        let (text_weight, vector_weight) = match (has_text, has_vector) {
+            (true, true) => (0.55, 0.35),
+            (true, false) => (1.0, 0.0),
+            (false, true) => (0.0, 1.0),
+            (false, false) => unreachable!("validated above"),
+        };
+        let mut ranked = combined.into_values().collect::<Vec<_>>();
+        for item in &mut ranked {
+            item.score = item
+                .text_score
+                .mul_add(text_weight, item.vector_score * vector_weight);
+        }
+        ranked.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.object_version_id.cmp(&right.object_version_id))
+        });
+
+        let mut hits = Vec::with_capacity(ranked.len().min(requested_limit));
+        for item in ranked {
+            let (object_version_id, object_key) = match self
+                .object_ref_for_query_hit(bucket.id, item.object_version_id)
+                .await?
+            {
+                Some(object_ref) => object_ref,
+                None if index.authorization_mode == "inherit_object" => continue,
+                None => (String::new(), String::new()),
+            };
+            if !self
+                .query_hit_visible(
+                    claims,
+                    &index.authorization_mode,
+                    &bucket.name,
+                    &object_key,
+                    authz_revision,
+                )
+                .await?
+            {
+                continue;
+            }
+            hits.push(IndexQueryHit {
+                kind: "hybrid".to_string(),
+                score: item.score,
+                object_key,
+                object_version_id,
+                document_id: item.document_id,
+                field_id: item.field_id,
+                vector_id: item.vector_id,
+                chunk_id: item.chunk_id,
+                source_start: item.source_start,
+                source_len: item.source_len,
+                metadata_json: serde_json::json!({
+                    "bucket_name": bucket.name,
+                    "text_score": item.text_score,
+                    "vector_score": item.vector_score,
+                })
+                .to_string(),
+            });
+            if hits.len() >= requested_limit {
+                break;
+            }
+        }
+
+        Ok(Response::new(QueryIndexResponse {
+            hits,
+            index_kind: index.kind.clone(),
+            index_generation: generation,
+            authz_revision,
+            scoring_recipe_json: serde_json::json!({
+                "kind": "hybrid",
+                "text_weight": text_weight,
+                "vector_weight": vector_weight,
+                "freshness_weight": if has_text && has_vector { 0.10 } else { 0.0 }
+            })
+            .to_string(),
         }))
     }
 
@@ -648,6 +820,47 @@ impl AppState {
     }
 }
 
+#[derive(Debug, Clone)]
+struct HybridAccum {
+    object_version_id: [u8; 16],
+    text_score: f32,
+    vector_score: f32,
+    score: f32,
+    document_id: u64,
+    field_id: u32,
+    vector_id: u64,
+    chunk_id: u32,
+    source_start: u64,
+    source_len: u32,
+}
+
+impl HybridAccum {
+    fn new(object_version_id: [u8; 16]) -> Self {
+        Self {
+            object_version_id,
+            text_score: 0.0,
+            vector_score: 0.0,
+            score: 0.0,
+            document_id: 0,
+            field_id: 0,
+            vector_id: 0,
+            chunk_id: 0,
+            source_start: 0,
+            source_len: 0,
+        }
+    }
+}
+
+fn full_text_definition(
+    index: &crate::persistence::IndexDefinition,
+) -> Result<FullTextIndexDefinition, Status> {
+    let policy = index
+        .build_policy
+        .get("full_text")
+        .unwrap_or(&index.build_policy);
+    FullTextIndexDefinition::from_json(policy).map_err(|e| Status::invalid_argument(e.to_string()))
+}
+
 fn parse_json_field(name: &str, value: &str) -> Result<JsonValue, Status> {
     serde_json::from_str(value)
         .map_err(|e| Status::invalid_argument(format!("Invalid {name}: {e}")))
@@ -688,6 +901,18 @@ fn validate_index_definition_shape(kind: &str, build_policy: &JsonValue) -> Resu
         }
         "vector" => {
             crate::formats::vector::VectorIndexDefinition::from_json(build_policy)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        }
+        "hybrid" => {
+            let full_text = build_policy.get("full_text").ok_or_else(|| {
+                Status::invalid_argument("Hybrid index requires full_text policy")
+            })?;
+            let vector = build_policy
+                .get("vector")
+                .ok_or_else(|| Status::invalid_argument("Hybrid index requires vector policy"))?;
+            crate::formats::full_text::FullTextIndexDefinition::from_json(full_text)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            crate::formats::vector::VectorIndexDefinition::from_json(vector)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
         }
         _ => {}
