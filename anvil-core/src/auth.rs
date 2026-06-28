@@ -4,6 +4,9 @@ use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode}
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+#[derive(Debug, Clone)]
+pub struct AuthenticatedBearerToken(pub String);
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
     pub sub: String, // Subject (e.g., app_id)

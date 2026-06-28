@@ -1,4 +1,4 @@
-use crate::AppState;
+use crate::{auth::AuthenticatedBearerToken, AppState};
 use http::Uri;
 use tonic::{Request, Status};
 
@@ -31,12 +31,15 @@ pub fn auth_interceptor<T>(mut req: Request<T>, state: &AppState) -> Result<Requ
                 .strip_prefix("Bearer ")
                 .ok_or_else(|| Status::unauthenticated("Invalid token format"))?;
 
+            let bearer_token = token.to_string();
             let claims = state
                 .jwt_manager
-                .verify_token(token)
+                .verify_token(&bearer_token)
                 .map_err(|_| Status::unauthenticated("Unauthorised, invalid token"))?;
 
             req.extensions_mut().insert(claims);
+            req.extensions_mut()
+                .insert(AuthenticatedBearerToken(bearer_token));
 
             Ok(req)
         }

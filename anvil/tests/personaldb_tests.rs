@@ -149,7 +149,7 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
         .unwrap();
     let permission_denied = client
         .submit_personal_db_changeset(authorized(
-            valid_submit_request(&database_id, &genesis_hash),
+            valid_submit_request(&database_id, &genesis_hash, &limited_token),
             &limited_token,
         ))
         .await
@@ -158,16 +158,25 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
 
     let malformed = client
         .submit_personal_db_changeset(authorized(
-            malformed_submit_request(&database_id, &genesis_hash),
+            malformed_submit_request(&database_id, &genesis_hash, &token),
             &token,
         ))
         .await
         .unwrap_err();
     assert_eq!(malformed.code(), Code::InvalidArgument);
 
+    let session_mismatch = client
+        .submit_personal_db_changeset(authorized(
+            valid_submit_request(&database_id, &genesis_hash, "not-the-bearer-token"),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(session_mismatch.code(), Code::Unauthenticated);
+
     let committed = client
         .submit_personal_db_changeset(authorized(
-            valid_submit_request(&database_id, &genesis_hash),
+            valid_submit_request(&database_id, &genesis_hash, &token),
             &token,
         ))
         .await
@@ -320,18 +329,24 @@ async fn personaldb_group_watch_streams_reserved_internal_events_through_native_
     assert_eq!(event.authz_revision, 11);
 }
 
-fn valid_submit_request(database_id: &str, genesis_hash: &str) -> SubmitPersonalDbChangesetRequest {
+fn valid_submit_request(
+    database_id: &str,
+    genesis_hash: &str,
+    session_token: &str,
+) -> SubmitPersonalDbChangesetRequest {
     let changeset_bytes = sqlite_insert_changeset();
-    submit_request(database_id, genesis_hash, changeset_bytes)
+    submit_request(database_id, genesis_hash, session_token, changeset_bytes)
 }
 
 fn malformed_submit_request(
     database_id: &str,
     genesis_hash: &str,
+    session_token: &str,
 ) -> SubmitPersonalDbChangesetRequest {
     submit_request(
         database_id,
         genesis_hash,
+        session_token,
         b"not a sqlite changeset".to_vec(),
     )
 }
@@ -339,13 +354,14 @@ fn malformed_submit_request(
 fn submit_request(
     database_id: &str,
     genesis_hash: &str,
+    session_token: &str,
     changeset_bytes: Vec<u8>,
 ) -> SubmitPersonalDbChangesetRequest {
     SubmitPersonalDbChangesetRequest {
         tenant_id: 1,
         database_id: database_id.to_string(),
         principal: "test-app".to_string(),
-        session_token: "session-token".to_string(),
+        session_token: session_token.to_string(),
         request_id: "request-1".to_string(),
         idempotency_key: "idem-1".to_string(),
         base_log_index: 0,

@@ -171,6 +171,7 @@ impl PersonalDbService for AppState {
         request: Request<SubmitPersonalDbChangesetRequest>,
     ) -> Result<Response<SubmitPersonalDbChangesetResponse>, Status> {
         let claims = request_claims(&request)?.clone();
+        let bearer_token = request_bearer_token(&request)?.to_string();
         let req = request.into_inner();
         validate_claim_tenant(claims.tenant_id, req.tenant_id)?;
         validate_database_id(&req.database_id)?;
@@ -184,6 +185,7 @@ impl PersonalDbService for AppState {
             default_max_changeset_size(),
         )
         .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        bind_personaldb_submit_session(&validated.request, &claims, &bearer_token)?;
         let signing_key = self.personaldb_signing_key();
         let manifest = read_personaldb_group_manifest(
             &self.storage,
@@ -559,6 +561,32 @@ fn request_claims<T>(request: &Request<T>) -> Result<&auth::Claims, Status> {
         .extensions()
         .get::<auth::Claims>()
         .ok_or_else(|| Status::unauthenticated("Missing claims"))
+}
+
+fn request_bearer_token<T>(request: &Request<T>) -> Result<&str, Status> {
+    request
+        .extensions()
+        .get::<auth::AuthenticatedBearerToken>()
+        .map(|token| token.0.as_str())
+        .ok_or_else(|| Status::unauthenticated("Missing authenticated session token"))
+}
+
+fn bind_personaldb_submit_session(
+    request: &CoreSubmitChangeset,
+    claims: &auth::Claims,
+    bearer_token: &str,
+) -> Result<(), Status> {
+    if request.session_token != bearer_token {
+        return Err(Status::unauthenticated(
+            "PersonalDB session token does not match authenticated bearer",
+        ));
+    }
+    if request.principal != claims.sub {
+        return Err(Status::permission_denied(
+            "PersonalDB principal does not match authenticated session",
+        ));
+    }
+    Ok(())
 }
 
 fn core_submit_request(
