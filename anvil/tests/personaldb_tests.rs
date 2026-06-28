@@ -1,9 +1,10 @@
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::personal_db_service_client::PersonalDbServiceClient;
+use anvil::anvil_api::repair_service_client::RepairServiceClient;
 use anvil::anvil_api::{
     CreatePersonalDbGroupRequest, CreatePersonalDbProjectionRequest, GetPersonalDbGroupRequest,
     GetPersonalDbProjectionRequest, PersonalDbCatchUpRequest, PersonalDbVoterAck,
-    SubmitPersonalDbChangesetRequest, WatchPersonalDbGroupRequest,
+    RepairPersonalDbLogChainRequest, SubmitPersonalDbChangesetRequest, WatchPersonalDbGroupRequest,
     WatchPersonalDbProjectionRequest, WriteAuthzTupleRequest,
 };
 use anvil::anvil_personaldb_sqlite_changeset::iterate_changeset;
@@ -332,6 +333,76 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
     assert_eq!(event.event_type, "commit");
     assert_eq!(event.log_index, 1);
     assert_eq!(event.log_hash, committed.log_hash);
+}
+
+#[tokio::test]
+async fn personaldb_repair_verifies_log_chain_and_reports_missing_payload() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut personaldb = PersonalDbServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut repair = RepairServiceClient::connect(grpc_addr).await.unwrap();
+    let database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+    let genesis_hash = create_group(&mut personaldb, &token, &database_id).await;
+    let committed = personaldb
+        .submit_personal_db_changeset(authorized(
+            valid_submit_request(&database_id, &genesis_hash, &token),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let healthy = repair
+        .repair_personal_db_log_chain(authorized(
+            RepairPersonalDbLogChainRequest {
+                database_id: database_id.clone(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(healthy.status, "up_to_date");
+    assert_eq!(healthy.committed_log_index, 1);
+    assert_eq!(healthy.verified_log_index, 1);
+    assert_eq!(healthy.committed_log_hash, committed.log_hash);
+    assert!(healthy.finding.is_none());
+
+    let payload_path = cluster.states[0]
+        .storage
+        .personaldb_changeset_payload_by_index_path(
+            1,
+            &database_id,
+            committed.log_index,
+            &committed.changeset_payload_hash,
+        )
+        .unwrap();
+    tokio::fs::remove_file(payload_path).await.unwrap();
+
+    let report = repair
+        .repair_personal_db_log_chain(authorized(
+            RepairPersonalDbLogChainRequest {
+                database_id: database_id.clone(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(report.status, "needs_review");
+    assert_eq!(report.reason, "PersonalDbChangesetPayloadMissing");
+    assert_eq!(report.committed_log_index, 1);
+    assert_eq!(report.verified_log_index, 0);
+    let finding = report.finding.expect("repair finding");
+    assert_eq!(finding.scope_kind, "personaldb");
+    assert_eq!(finding.scope_id, format!("tenant-1-database-{database_id}"));
+    assert_eq!(finding.status, "RequiresOperatorReview");
+    assert_eq!(finding.proposed_action, "VerifyOnly");
 }
 
 #[tokio::test]

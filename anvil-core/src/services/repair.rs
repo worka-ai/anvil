@@ -3,6 +3,7 @@ use crate::anvil_api::*;
 use crate::{
     AppState, auth, authz_repair, index_repair,
     permissions::AnvilAction,
+    personaldb_repair,
     repair_finding::{RepairFinding, RepairSubjectRef},
 };
 use tonic::{Request, Response, Status};
@@ -125,6 +126,40 @@ impl RepairService for AppState {
             finding: report.finding.as_ref().map(repair_finding_record),
         }))
     }
+
+    async fn repair_personal_db_log_chain(
+        &self,
+        request: Request<RepairPersonalDbLogChainRequest>,
+    ) -> Result<Response<RepairPersonalDbLogChainResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        validate_component(&req.database_id, "database_id")?;
+
+        let resource = format!("tenant-{}/{}", claims.tenant_id, req.database_id);
+        if !auth::is_authorized(AnvilAction::RepairRun, &resource, &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        let report = self
+            .persistence
+            .repair_personaldb_log_chain(claims.tenant_id, &req.database_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(RepairPersonalDbLogChainResponse {
+            status: personaldb_repair::status_name(&report.status).to_string(),
+            tenant_id: report.tenant_id,
+            database_id: report.database_id,
+            committed_log_index: report.committed_log_index,
+            verified_log_index: report.verified_log_index,
+            committed_log_hash: report.committed_log_hash,
+            reason: personaldb_repair::status_reason(&report.status),
+            finding: report.finding.as_ref().map(repair_finding_record),
+        }))
+    }
 }
 
 fn repair_finding_record(finding: &RepairFinding) -> RepairFindingRecord {
@@ -167,6 +202,7 @@ fn validate_component(value: &str, field: &'static str) -> Result<(), Status> {
         || value.contains('\\')
         || value.contains("..")
         || value.starts_with('_')
+        || value.chars().any(|ch| ch == '\0' || ch.is_control())
     {
         return Err(Status::invalid_argument(format!("{field} is invalid")));
     }

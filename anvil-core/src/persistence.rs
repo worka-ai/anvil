@@ -17,7 +17,7 @@ use crate::{
         PartitionOwnerStatus, PartitionRecoveryAcquire, PartitionWritePermit,
         acquire_partition_recovery, publish_partition_ready, read_partition_owner,
     },
-    repair_finding,
+    personaldb_repair, repair_finding,
     storage::Storage,
     task_journal, task_lease, watch_checkpoint, watch_log,
 };
@@ -29,6 +29,7 @@ pub struct Persistence {
     event_publisher: Option<Sender<MetadataEvent>>,
     owner_node_id: String,
     partition_owner_signing_key: Vec<u8>,
+    personaldb_signing_key: Vec<u8>,
     object_metadata_compaction_frame_threshold: u64,
     object_metadata_compaction_bytes_threshold: u64,
     task_lease_ttl_secs: u64,
@@ -451,6 +452,7 @@ impl Persistence {
             event_publisher,
             owner_node_id: persistence_owner_node_id(config),
             partition_owner_signing_key: hex::decode(&config.anvil_secret_encryption_key)?,
+            personaldb_signing_key: config.anvil_secret_encryption_key.as_bytes().to_vec(),
             object_metadata_compaction_frame_threshold: config
                 .object_metadata_compaction_frame_threshold,
             object_metadata_compaction_bytes_threshold: config
@@ -632,6 +634,20 @@ impl Persistence {
         self.global_write_permit(
             "authz_tuple",
             hex::encode(authz_journal::authz_partition_id(tenant_id)),
+        )
+        .await
+    }
+
+    async fn repair_write_permit(
+        &self,
+        scope_kind: &str,
+        scope_id: &str,
+    ) -> Result<PartitionWritePermit> {
+        self.global_write_permit(
+            "repair",
+            hex::encode(crate::formats::hash32(
+                format!("repair\0{scope_kind}\0{scope_id}").as_bytes(),
+            )),
         )
         .await
     }
@@ -2499,6 +2515,24 @@ impl Persistence {
             derived_index_id,
             rebuild,
             permit.fence_token,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub async fn repair_personaldb_log_chain(
+        &self,
+        tenant_id: i64,
+        database_id: &str,
+    ) -> Result<personaldb_repair::PersonalDbLogChainRepairReport> {
+        let scope_id = format!("tenant-{tenant_id}-database-{database_id}");
+        let permit = self.repair_write_permit("personaldb", &scope_id).await?;
+        personaldb_repair::repair_personaldb_log_chain(
+            &self.storage,
+            tenant_id,
+            database_id,
+            permit.fence_token,
+            &self.personaldb_signing_key,
             &self.partition_owner_signing_key,
         )
         .await

@@ -59,6 +59,7 @@ pub mod personaldb_heads;
 pub mod personaldb_projection;
 pub mod personaldb_projection_builder;
 pub mod personaldb_projection_writeback;
+pub mod personaldb_repair;
 pub mod personaldb_row_index;
 pub mod personaldb_schema;
 pub mod personaldb_segment;

@@ -83,6 +83,7 @@ service IndexService {
 service RepairService {
   rpc RepairIndex(RepairIndexRequest) returns (RepairIndexResponse);
   rpc RepairAuthzDerivedIndex(RepairAuthzDerivedIndexRequest) returns (RepairAuthzDerivedIndexResponse);
+  rpc RepairPersonalDbLogChain(RepairPersonalDbLogChainRequest) returns (RepairPersonalDbLogChainResponse);
   rpc ListRepairFindings(ListRepairFindingsRequest) returns (ListRepairFindingsResponse);
 }
 
@@ -353,6 +354,21 @@ message RepairAuthzDerivedIndexResponse {
     string source_records_hash = 5;
     string reason = 6;
     RepairFindingRecord finding = 7;
+}
+
+message RepairPersonalDbLogChainRequest {
+    string database_id = 1;
+}
+
+message RepairPersonalDbLogChainResponse {
+    string status = 1;
+    int64 tenant_id = 2;
+    string database_id = 3;
+    uint64 committed_log_index = 4;
+    uint64 verified_log_index = 5;
+    string committed_log_hash = 6;
+    string reason = 7;
+    RepairFindingRecord finding = 8;
 }
 
 message ListRepairFindingsRequest {
