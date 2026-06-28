@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
 
 // The modules we've created
+pub mod anvil_personaldb_sqlite_changeset;
 pub mod auth;
 pub mod authz_derived_lag_watch;
 pub mod authz_journal;
