@@ -416,6 +416,106 @@ async fn test_s3_reads_and_lists_survive_object_metadata_compaction() {
     );
 }
 
+#[tokio::test]
+async fn test_s3_writes_trigger_worker_metadata_compaction() {
+    let mut cluster = TestCluster::new_with_config(&["auto-compact-region"], |config| {
+        config.object_metadata_compaction_frame_threshold = 2;
+        config.object_metadata_compaction_bytes_threshold = 0;
+        config.task_lease_ttl_secs = 60;
+    })
+    .await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let app_name = format!("s3-auto-compact-{}", uuid::Uuid::new_v4());
+    let (client_id, client_secret) = create_app(&cluster.admin_state_path, &app_name);
+    grant_wildcard_policy(&cluster.admin_state_path, &app_name);
+
+    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
+    let client = s3_client(http_base, &client_id, &client_secret);
+    let bucket = format!("s3-auto-compact-{}", uuid::Uuid::new_v4());
+
+    client
+        .create_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("S3 CreateBucket should succeed");
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key("auto/a.txt")
+        .body(ByteStream::from_static(b"automatic compaction"))
+        .send()
+        .await
+        .expect("S3 PUT should schedule object metadata compaction");
+
+    let bucket_record = cluster.states[0]
+        .persistence
+        .get_bucket_by_name(1, &bucket)
+        .await
+        .unwrap()
+        .expect("bucket metadata should exist");
+    let manifest_path = cluster.states[0]
+        .storage
+        .metadata_manifest_path(1, bucket_record.id);
+
+    let completed_task = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
+            if let Some(task) = tasks.iter().find(|task| {
+                task.task_type == anvil_core::tasks::TaskType::ObjectMetadataCompaction
+                    && task.payload == serde_json::json!({ "bucket_id": bucket_record.id })
+                    && task.status == anvil_core::tasks::TaskStatus::Completed
+            }) {
+                break task.clone();
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "worker did not complete object metadata compaction task in time; tasks={tasks:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    };
+    assert!(
+        tokio::fs::metadata(&manifest_path).await.is_ok(),
+        "worker-completed compaction should publish an object metadata manifest"
+    );
+    let lease = cluster.states[0]
+        .persistence
+        .read_task_execution_lease(completed_task.id)
+        .await
+        .unwrap()
+        .expect("completed compaction task should have a task lease");
+    assert_eq!(lease.partition_family, "object_metadata");
+    assert_eq!(lease.checkpoint_cursor, lease.source_cursor);
+
+    let get = client
+        .get_object()
+        .bucket(&bucket)
+        .key("auto/a.txt")
+        .send()
+        .await
+        .expect("GET should survive worker compaction");
+    let bytes = get
+        .body
+        .collect()
+        .await
+        .expect("collect compacted body")
+        .into_bytes();
+    assert_eq!(bytes.as_ref(), b"automatic compaction");
+
+    let listing = client
+        .list_objects_v2()
+        .bucket(&bucket)
+        .prefix("auto/")
+        .send()
+        .await
+        .expect("LIST should survive worker compaction");
+    assert_eq!(listing.contents().len(), 1);
+    assert_eq!(listing.contents()[0].key(), Some("auto/a.txt"));
+}
+
 #[test]
 fn test_s3_public_and_private_access() {
     run_large_s3_gateway_test(Box::pin(run_s3_public_and_private_access()));

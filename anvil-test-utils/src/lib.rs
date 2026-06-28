@@ -79,6 +79,14 @@ impl TestCluster {
 
     #[allow(dead_code)]
     pub async fn new(regions: &[&str]) -> Self {
+        Self::new_with_config(regions, |_| {}).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn new_with_config(
+        regions: &[&str],
+        configure: impl FnOnce(&mut anvil_core::config::Config),
+    ) -> Self {
         INIT_LOGGER.call_once(|| {
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(EnvFilter::new(
@@ -89,7 +97,7 @@ impl TestCluster {
 
         let storage_path =
             std::env::temp_dir().join(format!("anvil-test-storage-{}", uuid::Uuid::new_v4()));
-        let config = Arc::new(anvil_core::config::Config {
+        let mut config = anvil_core::config::Config {
             cluster_secret: Some("test-cluster-secret".to_string()),
             jwt_secret: "test-secret".to_string(),
             anvil_secret_encryption_key:
@@ -107,7 +115,9 @@ impl TestCluster {
             personaldb_snapshot_entry_threshold: 1024,
             personaldb_snapshot_payload_bytes_threshold: 64 * 1024 * 1024,
             ..anvil_core::config::Config::default()
-        });
+        };
+        configure(&mut config);
+        let config = Arc::new(config);
 
         let unique_regions: HashSet<String> = regions.iter().map(|s| s.to_string()).collect();
         let first_region = regions.first().copied().unwrap_or("default");
