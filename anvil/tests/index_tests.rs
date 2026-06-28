@@ -2,11 +2,12 @@ use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::index_service_client::IndexServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
+use anvil::anvil_api::repair_service_client::RepairServiceClient;
 use anvil::anvil_api::{
     CreateBucketRequest, CreateIndexRequest, DisableIndexRequest, DropIndexRequest,
-    ListIndexDiagnosticsRequest, ListIndexesRequest, ObjectMetadata, PutObjectRequest,
-    QueryIndexRequest, UpdateIndexRequest, WatchIndexDefinitionRequest, WatchIndexPartitionRequest,
-    WriteAuthzTupleRequest,
+    ListIndexDiagnosticsRequest, ListIndexesRequest, ListRepairFindingsRequest, ObjectMetadata,
+    PutObjectRequest, QueryIndexRequest, RepairIndexRequest, UpdateIndexRequest,
+    WatchIndexDefinitionRequest, WatchIndexPartitionRequest, WriteAuthzTupleRequest,
 };
 use anvil::formats::full_text::{FullTextDocument, build_full_text_postings};
 use anvil::formats::vector::{VectorMetric, VectorModality, VectorPayload, VectorRecord};
@@ -646,6 +647,194 @@ async fn test_full_text_index_build_uses_source_cursor_snapshot() {
         serde_json::from_slice(&segment.document_table).unwrap();
     assert!(document_table.to_string().contains("docs/alpha.txt"));
     assert!(!document_table.to_string().contains("docs/future.txt"));
+}
+
+#[tokio::test]
+async fn test_repair_rebuilds_missing_full_text_segment_from_base_journal() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let persistence = &cluster.states[0].persistence;
+    let tenant_id = 1;
+    let bucket_name = format!("index-repair-{}", uuid::Uuid::new_v4());
+    let bucket = persistence
+        .create_bucket(tenant_id, &bucket_name, "test-region-1")
+        .await
+        .unwrap();
+    persistence
+        .create_object(
+            tenant_id,
+            bucket.id,
+            "docs/repair.txt",
+            &hex::encode([31; 32]),
+            32,
+            "etag-repair",
+            Some("text/plain"),
+            None,
+            None,
+            Some(b"repair rebuilds derived full text segment".to_vec()),
+        )
+        .await
+        .unwrap();
+    persistence
+        .compact_object_metadata(bucket.id)
+        .await
+        .unwrap()
+        .expect("object metadata compaction writes manifest segments");
+    tokio::fs::remove_file(
+        cluster.states[0]
+            .storage
+            .metadata_journal_path(tenant_id, bucket.id),
+    )
+    .await
+    .expect("remove active journal so repair must read manifest segments");
+
+    let index = persistence
+        .create_index_definition(
+            tenant_id,
+            bucket.id,
+            "body",
+            "full_text",
+            serde_json::json!({"prefix": "docs/"}),
+            serde_json::json!({"source": "object_body_utf8"}),
+            "index_only",
+            serde_json::json!({"positions": true}),
+        )
+        .await
+        .unwrap();
+    persistence
+        .create_index_definition_event(tenant_id, bucket.id, &bucket.name, &index, "create")
+        .await
+        .unwrap();
+    assert!(
+        persistence
+            .enqueue_index_build_for_index(&bucket, &index)
+            .await
+            .unwrap(),
+        "compacted source manifest must still schedule an index build"
+    );
+    let source_cursor = persistence
+        .list_tasks()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|task| {
+            task.task_type == anvil::tasks::TaskType::IndexBuild
+                && task.payload["index_id"] == serde_json::json!(index.id)
+        })
+        .and_then(|task| task.payload["source_cursor"].as_u64())
+        .expect("index build task records source cursor");
+
+    persistence
+        .build_index_task(
+            tenant_id,
+            bucket.id,
+            index.id,
+            index.version,
+            u128::from(source_cursor),
+        )
+        .await
+        .unwrap()
+        .expect("initial index build succeeds");
+    let index_storage_id = anvil::index_journal::index_storage_id(tenant_id, bucket.id, index.id);
+    let signing_key = hex::decode(&cluster.states[0].config.anvil_secret_encryption_key).unwrap();
+    let proof = anvil::derived_index_proof::read_latest_derived_index_proof(
+        &cluster.states[0].storage,
+        &index_storage_id,
+        &signing_key,
+    )
+    .await
+    .unwrap()
+    .expect("proof exists before deleting segment");
+    assert!(!proof.segment_hashes.is_empty());
+    let segment_path = anvil::full_text_segment::latest_full_text_segment_path(
+        &cluster.states[0].storage,
+        &index_storage_id,
+    )
+    .await
+    .unwrap()
+    .expect("latest segment path exists");
+    tokio::fs::remove_file(&segment_path)
+        .await
+        .expect("remove segment to force repair");
+    assert!(
+        anvil::full_text_segment::read_latest_full_text_segment(
+            &cluster.states[0].storage,
+            &index_storage_id
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "segment deletion must remove the queryable derived index"
+    );
+
+    let mut repair_client = RepairServiceClient::connect(grpc_addr).await.unwrap();
+    let report = repair_client
+        .repair_index(authorized(
+            RepairIndexRequest {
+                bucket_name: bucket_name.clone(),
+                index_name: "body".to_string(),
+                rebuild: true,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(report.status, "rebuilt_derived_index");
+    assert_eq!(report.reason, "DerivedIndexSegmentMissing");
+    assert_eq!(report.index_storage_id, index_storage_id);
+    assert_eq!(report.source_cursor_low, source_cursor);
+    assert_eq!(report.source_cursor_high, 0);
+    assert!(report.finding.is_some());
+    assert!(report.build.is_some());
+
+    let repaired = anvil::full_text_segment::read_latest_full_text_segment(
+        &cluster.states[0].storage,
+        &index_storage_id,
+    )
+    .await
+    .unwrap()
+    .expect("repair rebuilds segment");
+    let definition = anvil::formats::full_text::FullTextIndexDefinition::from_json(
+        &serde_json::json!({"positions": true}),
+    )
+    .unwrap();
+    let hits = query_full_text_segment(
+        &repaired,
+        FullTextSegmentQuery {
+            query: "repair rebuilds",
+            tokenizer: &definition.tokenizer,
+            positions_enabled: definition.positions_enabled,
+            phrase: false,
+            bm25: anvil::formats::full_text::Bm25Config::default(),
+            authorized_labels: None,
+            limit: 10,
+        },
+    )
+    .unwrap();
+    assert!(
+        !hits.is_empty(),
+        "rebuilt derived index must be queryable from base metadata and payload journals"
+    );
+
+    let findings = repair_client
+        .list_repair_findings(authorized(
+            ListRepairFindingsRequest {
+                scope_kind: "bucket".to_string(),
+                scope_id: format!("tenant-{tenant_id}-bucket-{}", bucket.id),
+                limit: 10,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .findings;
+    assert!(findings.iter().any(|finding| {
+        finding.code == "DerivedIndexSegmentMissing" && finding.status == "RebuiltDerivedIndex"
+    }));
 }
 
 #[tokio::test]

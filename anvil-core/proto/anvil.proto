@@ -80,6 +80,11 @@ service IndexService {
   rpc ListIndexDiagnostics(ListIndexDiagnosticsRequest) returns (ListIndexDiagnosticsResponse);
 }
 
+service RepairService {
+  rpc RepairIndex(RepairIndexRequest) returns (RepairIndexResponse);
+  rpc ListRepairFindings(ListRepairFindingsRequest) returns (ListRepairFindingsResponse);
+}
+
 service GitSourceService {
   rpc PutGitPack(stream PutGitPackRequest) returns (PutGitPackResponse);
   rpc GetGitObject(GetGitObjectRequest) returns (GetGitObjectResponse);
@@ -314,6 +319,72 @@ message IndexDiagnosticRecord {
 
 message ListIndexDiagnosticsResponse {
     repeated IndexDiagnosticRecord diagnostics = 1;
+}
+
+message RepairIndexRequest {
+    string bucket_name = 1;
+    string index_name = 2;
+    bool rebuild = 3;
+}
+
+message RepairIndexResponse {
+    string status = 1;
+    string bucket_name = 2;
+    string index_name = 3;
+    string index_storage_id = 4;
+    uint64 source_cursor_low = 5;
+    uint64 source_cursor_high = 6;
+    string reason = 7;
+    RepairFindingRecord finding = 8;
+    IndexBuildRecord build = 9;
+}
+
+message ListRepairFindingsRequest {
+    string scope_kind = 1;
+    string scope_id = 2;
+    uint32 limit = 3;
+}
+
+message ListRepairFindingsResponse {
+    repeated RepairFindingRecord findings = 1;
+}
+
+message RepairFindingRecord {
+    string finding_id = 1;
+    string scope_kind = 2;
+    string scope_id = 3;
+    string repair_task_id = 4;
+    uint64 lease_fence_token = 5;
+    string severity = 6;
+    string status = 7;
+    string code = 8;
+    string message = 9;
+    repeated RepairSubjectRecord subjects = 10;
+    string proposed_action = 11;
+    string evidence_json = 12;
+    int64 created_at_nanos = 13;
+    string finding_hash = 14;
+}
+
+message RepairSubjectRecord {
+    string subject_kind = 1;
+    string subject_id = 2;
+    uint64 generation = 3;
+    bool has_generation = 4;
+    uint64 cursor_low = 5;
+    uint64 cursor_high = 6;
+    bool has_cursor = 7;
+    string expected_hash = 8;
+    string actual_hash = 9;
+}
+
+message IndexBuildRecord {
+    string index_kind = 1;
+    uint64 generation = 2;
+    uint64 item_count = 3;
+    uint64 source_cursor_low = 4;
+    uint64 source_cursor_high = 5;
+    repeated string segment_hashes = 6;
 }
 
 message WatchGitSourceRequest {

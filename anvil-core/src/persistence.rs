@@ -12,11 +12,12 @@ use crate::{
     cluster::MetadataEvent,
     config::Config,
     control_journal, hf_journal, index_builder, index_diagnostic_journal, index_journal,
-    manifest_journal, metadata_journal, model_journal, multipart_journal,
+    index_repair, manifest_journal, metadata_journal, model_journal, multipart_journal,
     partition_fence::{
         PartitionOwnerStatus, PartitionRecoveryAcquire, PartitionWritePermit,
         acquire_partition_recovery, publish_partition_ready, read_partition_owner,
     },
+    repair_finding,
     storage::Storage,
     task_journal, task_lease, watch_checkpoint, watch_log,
 };
@@ -2231,7 +2232,8 @@ impl Persistence {
             &self.partition_owner_signing_key,
         )
         .await?;
-        if stats.last_sequence == 0 {
+        let source_cursor = index_repair::source_cursor_from_stats(stats);
+        if source_cursor == 0 {
             return Ok(false);
         }
         let index_storage_id =
@@ -2244,7 +2246,7 @@ impl Persistence {
         )
         .await?
         {
-            if checkpoint.cursor >= u128::from(stats.last_sequence) {
+            if checkpoint.cursor >= source_cursor {
                 return Ok(false);
             }
         }
@@ -2254,7 +2256,7 @@ impl Persistence {
                 "bucket_id": bucket.id,
                 "index_id": index.id,
                 "index_version": index.version,
-                "source_cursor": stats.last_sequence,
+                "source_cursor": source_cursor,
             }),
             40,
         )
@@ -2361,6 +2363,127 @@ impl Persistence {
             .await?;
         }
         Ok(Some(outcome))
+    }
+
+    pub async fn repair_index_from_base_journal(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        index_name: &str,
+        rebuild: bool,
+    ) -> Result<index_repair::IndexRepairReport> {
+        let bucket = self
+            .get_bucket_by_name(tenant_id, bucket_name)
+            .await?
+            .ok_or_else(|| anyhow!("bucket not found"))?;
+        let index = self
+            .get_index_definition(tenant_id, bucket.id, index_name)
+            .await?
+            .filter(|index| index.enabled)
+            .ok_or_else(|| anyhow!("index definition not found"))?;
+        if !matches!(index.kind.as_str(), "full_text" | "vector" | "hybrid") {
+            return Err(anyhow!(
+                "index kind does not have a repairable derived index"
+            ));
+        }
+
+        let stats = metadata_journal::active_object_journal_stats(
+            &self.storage,
+            &bucket,
+            &self.partition_owner_signing_key,
+        )
+        .await?;
+        let source_cursor = index_repair::source_cursor_from_stats(stats);
+        let index_storage_id =
+            index_journal::index_storage_id(bucket.tenant_id, bucket.id, index.id);
+        let source_manifest_hash = if source_cursor == 0 {
+            String::new()
+        } else {
+            metadata_journal::object_metadata_source_checkpoint_hash(
+                &self.storage,
+                &bucket,
+                &self.partition_owner_signing_key,
+                source_cursor,
+            )
+            .await?
+        };
+
+        let mut status = index_repair::assess_derived_index(
+            &self.storage,
+            &index,
+            &index_storage_id,
+            source_cursor,
+            &source_manifest_hash,
+            &self.partition_owner_signing_key,
+        )
+        .await?;
+        let mut build = None;
+        let mut finding = None;
+
+        if let index_repair::IndexRepairStatus::NeedsRepair(reason) = status.clone() {
+            let permit = self
+                .object_metadata_write_permit(bucket.tenant_id, bucket.id)
+                .await?;
+            if rebuild {
+                build = self
+                    .build_index_task(tenant_id, bucket.id, index.id, index.version, source_cursor)
+                    .await?;
+                status = index_repair::IndexRepairStatus::Rebuilt(reason.clone());
+            }
+
+            let finding_status = if rebuild {
+                repair_finding::RepairFindingStatus::RebuiltDerivedIndex
+            } else {
+                repair_finding::RepairFindingStatus::Open
+            };
+            let write = index_repair::repair_finding_write(
+                &bucket,
+                &index,
+                &index_storage_id,
+                source_cursor,
+                &source_manifest_hash,
+                &reason,
+                finding_status,
+                permit.fence_token,
+            )?;
+            finding = Some(
+                repair_finding::write_repair_finding(
+                    &self.storage,
+                    write,
+                    &self.partition_owner_signing_key,
+                )
+                .await?,
+            );
+        }
+
+        Ok(index_repair::IndexRepairReport {
+            status,
+            bucket_name: bucket.name,
+            index_name: index.name,
+            index_storage_id,
+            source_cursor,
+            finding,
+            build,
+        })
+    }
+
+    pub async fn list_repair_findings(
+        &self,
+        scope_kind: &str,
+        scope_id: &str,
+        limit: usize,
+    ) -> Result<Vec<repair_finding::RepairFinding>> {
+        let mut findings = repair_finding::list_repair_findings(
+            &self.storage,
+            scope_kind,
+            scope_id,
+            &self.partition_owner_signing_key,
+        )
+        .await?;
+        if limit > 0 && findings.len() > limit {
+            findings.truncate(limit);
+        }
+        Ok(findings)
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -39,6 +39,7 @@ pub mod index_builder;
 pub mod index_diagnostic_journal;
 pub mod index_journal;
 pub mod index_partition_watch;
+pub mod index_repair;
 pub mod manifest_journal;
 pub mod media_extraction;
 pub mod metadata_journal;

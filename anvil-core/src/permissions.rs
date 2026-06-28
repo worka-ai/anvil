@@ -19,6 +19,7 @@ pub enum AnvilAction {
     IndexAll,       // Matches index:*
     PersonalDbAll,  // Matches personaldb:*
     GitSourceAll,   // Matches git_source:*
+    RepairAll,      // Matches repair:*
 
     // Bucket actions
     BucketCreate,
@@ -76,6 +77,10 @@ pub enum AnvilAction {
     GitSourceWrite,
     GitSourceWatch,
 
+    // Repair actions
+    RepairRead,
+    RepairRun,
+
     // Internal actions
     InternalPutShard,
     InternalGetShard,
@@ -98,6 +103,7 @@ impl fmt::Display for AnvilAction {
             AnvilAction::IndexAll => "index:*",
             AnvilAction::PersonalDbAll => "personaldb:*",
             AnvilAction::GitSourceAll => "git_source:*",
+            AnvilAction::RepairAll => "repair:*",
 
             // Bucket actions
             AnvilAction::BucketCreate => "bucket:create",
@@ -155,6 +161,10 @@ impl fmt::Display for AnvilAction {
             AnvilAction::GitSourceWrite => "git_source:write",
             AnvilAction::GitSourceWatch => "git_source:watch",
 
+            // Repair actions
+            AnvilAction::RepairRead => "repair:read",
+            AnvilAction::RepairRun => "repair:run",
+
             // Internal actions
             AnvilAction::InternalPutShard => "internal:put_shard",
             AnvilAction::InternalGetShard => "internal:get_shard",
@@ -182,6 +192,7 @@ impl FromStr for AnvilAction {
             "index:*" => Ok(AnvilAction::IndexAll),
             "personaldb:*" => Ok(AnvilAction::PersonalDbAll),
             "git_source:*" => Ok(AnvilAction::GitSourceAll),
+            "repair:*" => Ok(AnvilAction::RepairAll),
 
             // Bucket actions
             "bucket:create" => Ok(AnvilAction::BucketCreate),
@@ -239,6 +250,10 @@ impl FromStr for AnvilAction {
             "git_source:write" => Ok(AnvilAction::GitSourceWrite),
             "git_source:watch" => Ok(AnvilAction::GitSourceWatch),
 
+            // Repair actions
+            "repair:read" => Ok(AnvilAction::RepairRead),
+            "repair:run" => Ok(AnvilAction::RepairRun),
+
             // Internal actions
             "internal:put_shard" => Ok(AnvilAction::InternalPutShard),
             "internal:get_shard" => Ok(AnvilAction::InternalGetShard),
@@ -267,6 +282,7 @@ mod tests {
             AnvilAction::IndexAll,
             AnvilAction::PersonalDbAll,
             AnvilAction::GitSourceAll,
+            AnvilAction::RepairAll,
             AnvilAction::BucketCreate,
             AnvilAction::BucketWatch,
             AnvilAction::ObjectWrite,
@@ -283,6 +299,8 @@ mod tests {
             AnvilAction::GitSourceRead,
             AnvilAction::GitSourceWrite,
             AnvilAction::GitSourceWatch,
+            AnvilAction::RepairRead,
+            AnvilAction::RepairRun,
             AnvilAction::InternalPutShard,
             AnvilAction::InternalDeleteShard,
         ];

@@ -193,6 +193,10 @@ fn action_covers_required(token_action: &AnvilAction, required_action: &AnvilAct
             required_action,
             AnvilAction::GitSourceRead | AnvilAction::GitSourceWrite | AnvilAction::GitSourceWatch
         ),
+        AnvilAction::RepairAll => matches!(
+            required_action,
+            AnvilAction::RepairRead | AnvilAction::RepairRun
+        ),
         _ => token_action == required_action, // Exact match for specific actions
     }
 }
@@ -328,6 +332,26 @@ mod tests {
         assert!(!is_authorized(
             AnvilAction::IndexWatch,
             "repository:repo-alpha",
+            &token_scopes
+        ));
+    }
+
+    #[test]
+    fn repair_wildcard_covers_repair_actions() {
+        let token_scopes = vec!["repair:*|tenant-1-bucket-7*".to_string()];
+        assert!(is_authorized(
+            AnvilAction::RepairRun,
+            "tenant-1-bucket-7/body",
+            &token_scopes
+        ));
+        assert!(is_authorized(
+            AnvilAction::RepairRead,
+            "tenant-1-bucket-7",
+            &token_scopes
+        ));
+        assert!(!is_authorized(
+            AnvilAction::IndexUpdate,
+            "tenant-1-bucket-7/body",
             &token_scopes
         ));
     }
