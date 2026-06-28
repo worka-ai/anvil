@@ -3,9 +3,10 @@ use crate::formats::{
     BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, Hash32, JournalFrame, JournalRecordKind,
     hash32, validate_journal_chain,
 };
+use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
 use crate::persistence::AuthzTupleRecord;
 use crate::storage::Storage;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
@@ -55,6 +56,25 @@ pub async fn write_authz_tuple(
     storage: &Storage,
     input: AuthzTupleWrite<'_>,
 ) -> Result<AuthzTupleRecord> {
+    write_authz_tuple_inner(storage, input, 0).await
+}
+
+pub async fn write_authz_tuple_with_permit(
+    storage: &Storage,
+    input: AuthzTupleWrite<'_>,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<AuthzTupleRecord> {
+    require_authz_permit(input.tenant_id, permit)?;
+    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
+    write_authz_tuple_inner(storage, input, permit.fence_token).await
+}
+
+async fn write_authz_tuple_inner(
+    storage: &Storage,
+    input: AuthzTupleWrite<'_>,
+    fence_token: u64,
+) -> Result<AuthzTupleRecord> {
     let revision = latest_authz_revision(storage, input.tenant_id)
         .await?
         .checked_add(1)
@@ -87,16 +107,35 @@ pub async fn write_authz_tuple(
         record_hash,
         written_at,
     };
-    append_authz_tuple_record(storage, &record).await?;
+    append_authz_tuple_record_inner(storage, &record, fence_token).await?;
     Ok(record)
 }
 
 pub async fn append_authz_tuple_record(storage: &Storage, record: &AuthzTupleRecord) -> Result<()> {
+    append_authz_tuple_record_inner(storage, record, 0).await
+}
+
+pub async fn append_authz_tuple_record_with_permit(
+    storage: &Storage,
+    record: &AuthzTupleRecord,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<()> {
+    require_authz_permit(record.tenant_id, permit)?;
+    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
+    append_authz_tuple_record_inner(storage, record, permit.fence_token).await
+}
+
+async fn append_authz_tuple_record_inner(
+    storage: &Storage,
+    record: &AuthzTupleRecord,
+    fence_token: u64,
+) -> Result<()> {
     let path = storage.authz_tuple_journal_path(record.tenant_id);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    ensure_journal_header(&path, record.tenant_id).await?;
+    ensure_journal_header(&path, record.tenant_id, fence_token).await?;
 
     let previous = read_authz_journal_frames_at_path(path.as_path())
         .await
@@ -128,7 +167,7 @@ pub async fn append_authz_tuple_record(storage: &Storage, record: &AuthzTupleRec
     let frame = JournalFrame::new(
         JournalRecordKind::AuthzTuple,
         sequence,
-        0,
+        fence_token,
         *mutation_id.as_bytes(),
         tuple_key_hash(record),
         previous_hash,
@@ -143,7 +182,13 @@ pub async fn append_authz_tuple_record(storage: &Storage, record: &AuthzTupleRec
     file.write_all(&frame.encode()).await?;
     file.sync_data().await?;
     let records = read_all_authz_tuple_records_from_journal(storage, record.tenant_id).await?;
-    authz_segment::write_authz_tuple_segment(storage, record.tenant_id, &records).await?;
+    authz_segment::write_authz_tuple_segment_with_fence(
+        storage,
+        record.tenant_id,
+        &records,
+        fence_token,
+    )
+    .await?;
     Ok(())
 }
 
@@ -312,7 +357,7 @@ fn decode_journal_file(bytes: &[u8]) -> Result<Vec<JournalFrame>> {
     Ok(frames)
 }
 
-async fn ensure_journal_header(path: &Path, tenant_id: i64) -> Result<()> {
+async fn ensure_journal_header(path: &Path, tenant_id: i64, fence_token: u64) -> Result<()> {
     if tokio::fs::try_exists(path).await? {
         return Ok(());
     }
@@ -321,7 +366,7 @@ async fn ensure_journal_header(path: &Path, tenant_id: i64) -> Result<()> {
         tenant_id: tenant_id.to_string(),
         partition_family: "authz_tuple",
         partition_id: hex::encode(authz_partition_id(tenant_id)),
-        fence_token: 0,
+        fence_token,
         first_sequence: 1,
         created_at: &created_at,
         codec: "none",
@@ -340,6 +385,17 @@ async fn ensure_journal_header(path: &Path, tenant_id: i64) -> Result<()> {
 
 fn authz_partition_id(tenant_id: i64) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/authz_tuple").as_bytes())
+}
+
+fn require_authz_permit(tenant_id: i64, permit: &PartitionWritePermit) -> Result<()> {
+    if permit.partition_family != "authz_tuple"
+        || permit.partition_id != hex::encode(authz_partition_id(tenant_id))
+    {
+        return Err(anyhow!(
+            "partition write permit does not target this authorization tuple partition"
+        ));
+    }
+    Ok(())
 }
 
 fn tuple_key_hash(record: &AuthzTupleRecord) -> Hash32 {
@@ -394,8 +450,13 @@ fn authz_record_hash(input: AuthzRecordHashInput<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::partition_fence::{
+        PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
+    };
     use chrono::Utc;
     use tempfile::tempdir;
+
+    const PARTITION_OWNER_KEY: &[u8] = b"authorization tuple partition owner signing key";
 
     fn record(revision: i64, operation: &str) -> AuthzTupleRecord {
         AuthzTupleRecord {
@@ -413,6 +474,39 @@ mod tests {
             record_hash: hex::encode(hash32(format!("record-{revision}").as_bytes())),
             written_at: Utc::now(),
         }
+    }
+
+    async fn ready_authz_permit(
+        storage: &Storage,
+        tenant_id: i64,
+        owner_node_id: &str,
+    ) -> PartitionWritePermit {
+        let request = PartitionRecoveryAcquire {
+            partition_family: "authz_tuple".to_string(),
+            partition_id: hex::encode(authz_partition_id(tenant_id)),
+            owner_node_id: owner_node_id.to_string(),
+            recovered_through_sequence: 0,
+            recovered_manifest_hash: hex::encode([0; 32]),
+            now_nanos: 100,
+        };
+        let recovering = acquire_partition_recovery(storage, request, PARTITION_OWNER_KEY)
+            .await
+            .unwrap();
+        publish_partition_ready(
+            storage,
+            &recovering.partition_family,
+            &recovering.partition_id,
+            owner_node_id,
+            recovering.fence_token,
+            0,
+            &hex::encode([3; 32]),
+            200,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap()
+        .write_permit()
+        .unwrap()
     }
 
     #[tokio::test]
@@ -452,5 +546,93 @@ mod tests {
             .unwrap();
         assert_eq!(watched.len(), 2);
         assert_eq!(watched[1].revision, 2);
+    }
+
+    #[tokio::test]
+    async fn authz_journal_permit_sets_frame_and_segment_fence() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let permit = ready_authz_permit(&storage, 42, "node-a").await;
+
+        append_authz_tuple_record_with_permit(
+            &storage,
+            &record(1, "add"),
+            &permit,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap();
+
+        let frames = read_authz_journal_frames_at_path(&storage.authz_tuple_journal_path(42))
+            .await
+            .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].fence_token, permit.fence_token);
+
+        let segment = authz_segment::read_latest_authz_tuple_segment(&storage, 42)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(segment.header.source_fence_token, permit.fence_token);
+    }
+
+    #[tokio::test]
+    async fn authz_journal_rejects_stale_partition_permit() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let stale = ready_authz_permit(&storage, 42, "node-a").await;
+        let fresh = ready_authz_permit(&storage, 42, "node-b").await;
+        assert_eq!(fresh.fence_token, stale.fence_token + 1);
+
+        let rejected = append_authz_tuple_record_with_permit(
+            &storage,
+            &record(1, "add"),
+            &stale,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap_err();
+        assert!(rejected.to_string().contains("PartitionNotOwned"));
+
+        append_authz_tuple_record_with_permit(
+            &storage,
+            &record(1, "add"),
+            &fresh,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn authz_write_with_permit_allocates_revision_under_fence() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let permit = ready_authz_permit(&storage, 42, "node-a").await;
+
+        let written = write_authz_tuple_with_permit(
+            &storage,
+            AuthzTupleWrite {
+                tenant_id: 42,
+                namespace: "document",
+                object_id: "beta",
+                relation: "editor",
+                subject_kind: "user",
+                subject_id: "bob",
+                caveat_hash: "",
+                operation: "add",
+                written_by: "tester",
+                reason: "test",
+            },
+            &permit,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap();
+        assert_eq!(written.revision, 1);
+        let frames = read_authz_journal_frames_at_path(&storage.authz_tuple_journal_path(42))
+            .await
+            .unwrap();
+        assert_eq!(frames[0].fence_token, permit.fence_token);
     }
 }

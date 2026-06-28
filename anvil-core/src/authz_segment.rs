@@ -18,6 +18,8 @@ pub struct AuthzSegmentHeader {
     pub partition_family: String,
     pub partition_id: String,
     pub generation: u64,
+    #[serde(default)]
+    pub source_fence_token: u64,
     pub key_order: String,
     pub created_at: String,
     pub codec: String,
@@ -33,6 +35,24 @@ pub async fn write_authz_tuple_segment(
     storage: &Storage,
     tenant_id: i64,
     records: &[AuthzTupleRecord],
+) -> Result<PathBuf> {
+    write_authz_tuple_segment_inner(storage, tenant_id, records, 0).await
+}
+
+pub async fn write_authz_tuple_segment_with_fence(
+    storage: &Storage,
+    tenant_id: i64,
+    records: &[AuthzTupleRecord],
+    source_fence_token: u64,
+) -> Result<PathBuf> {
+    write_authz_tuple_segment_inner(storage, tenant_id, records, source_fence_token).await
+}
+
+async fn write_authz_tuple_segment_inner(
+    storage: &Storage,
+    tenant_id: i64,
+    records: &[AuthzTupleRecord],
+    source_fence_token: u64,
 ) -> Result<PathBuf> {
     let generation = records
         .iter()
@@ -50,6 +70,7 @@ pub async fn write_authz_tuple_segment(
         partition_family: "authz_tuple".to_string(),
         partition_id: hex::encode(partition_id(tenant_id)),
         generation,
+        source_fence_token,
         key_order: "tuple_key_revision".to_string(),
         created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
         codec: "none".to_string(),
