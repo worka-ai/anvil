@@ -335,6 +335,110 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
 }
 
 #[tokio::test]
+async fn personaldb_concurrent_same_base_submits_publish_one_witness_commit() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut setup_client = PersonalDbServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+    let genesis_hash = create_group(&mut setup_client, &token, &database_id).await;
+
+    let mut first_client = PersonalDbServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut second_client = PersonalDbServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let first = first_client.submit_personal_db_changeset(authorized(
+        submit_request(
+            &database_id,
+            &genesis_hash,
+            &token,
+            sqlite_insert_changeset_with_item(1, "alpha", &[1_u8, 2, 3]),
+        ),
+        &token,
+    ));
+    let second = second_client.submit_personal_db_changeset(authorized(
+        submit_request(
+            &database_id,
+            &genesis_hash,
+            &token,
+            sqlite_insert_changeset_with_item(2, "beta", &[4_u8, 5, 6]),
+        ),
+        &token,
+    ));
+
+    let (first, second) = tokio::join!(first, second);
+    let mut successes = Vec::new();
+    let mut failures = Vec::new();
+    for result in [first, second] {
+        match result {
+            Ok(response) => successes.push(response.into_inner()),
+            Err(status) => failures.push(status),
+        }
+    }
+
+    assert_eq!(
+        successes.len(),
+        1,
+        "only one same-base submit can publish a witnessed commit"
+    );
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].code(), Code::FailedPrecondition);
+    assert_eq!(successes[0].log_index, 1);
+
+    let fetched = setup_client
+        .get_personal_db_group(authorized(
+            GetPersonalDbGroupRequest {
+                tenant_id: 1,
+                database_id: database_id.clone(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let committed_head = fetched.committed_head.unwrap();
+    assert_eq!(committed_head.log_index, 1);
+    assert_eq!(committed_head.log_hash, successes[0].log_hash);
+
+    let caught_up = setup_client
+        .catch_up_personal_db(authorized(
+            PersonalDbCatchUpRequest {
+                tenant_id: 1,
+                database_id: database_id.clone(),
+                principal: "test-app".to_string(),
+                replica_id: "replica-a".to_string(),
+                have_log_index: 0,
+                have_log_hash: genesis_hash,
+                max_entries: 10,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!caught_up.snapshot_required);
+    assert_eq!(
+        caught_up.entries.len(),
+        1,
+        "canonical log must not contain duplicate witness commits"
+    );
+    assert_eq!(
+        caught_up.entries[0].log_record.as_ref().unwrap().log_index,
+        1
+    );
+    assert_eq!(
+        caught_up.entries[0].log_record.as_ref().unwrap().entry_hash,
+        successes[0].log_hash
+    );
+}
+
+#[tokio::test]
 async fn personaldb_row_mutation_can_be_authorized_by_relationship_tuple() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
@@ -1616,6 +1720,10 @@ fn submit_request_at_base(
 }
 
 fn sqlite_insert_changeset() -> Vec<u8> {
+    sqlite_insert_changeset_with_item(1, "alpha", &[1_u8, 2, 3])
+}
+
+fn sqlite_insert_changeset_with_item(id: i64, name: &str, payload: &[u8]) -> Vec<u8> {
     let db = Connection::open_in_memory().unwrap();
     db.execute_batch(
         "CREATE TABLE items(
@@ -1628,8 +1736,8 @@ fn sqlite_insert_changeset() -> Vec<u8> {
     let mut session = Session::new(&db).unwrap();
     session.attach::<&str>(None).unwrap();
     db.execute(
-        "INSERT INTO items (id, name, payload) VALUES (1, 'alpha', ?1)",
-        [vec![1_u8, 2, 3]],
+        "INSERT INTO items (id, name, payload) VALUES (?1, ?2, ?3)",
+        rusqlite::params![id, name, payload],
     )
     .unwrap();
     let mut output = Vec::new();

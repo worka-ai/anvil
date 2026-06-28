@@ -4,7 +4,7 @@ use anyhow::Result;
 use cluster::ClusterState;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast};
 
 // The modules we've created
 pub mod access_control;
@@ -108,6 +108,7 @@ pub struct AppState {
     pub personaldb_watch_tx: broadcast::Sender<personaldb_watch::PersonalDbGroupWatchEvent>,
     pub personaldb_projection_watch_tx:
         broadcast::Sender<personaldb_watch::PersonalDbProjectionWatchEvent>,
+    pub personaldb_commit_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl AppState {
@@ -132,6 +133,7 @@ impl AppState {
         let (personaldb_watch_tx, _personaldb_watch_rx) = tokio::sync::broadcast::channel(1024);
         let (personaldb_projection_watch_tx, _personaldb_projection_watch_rx) =
             tokio::sync::broadcast::channel(1024);
+        let personaldb_commit_locks = Arc::new(Mutex::new(HashMap::new()));
 
         let bucket_manager =
             bucket_manager::BucketManager::new(persistence.clone(), storage.clone());
@@ -163,6 +165,7 @@ impl AppState {
             index_watch_tx,
             personaldb_watch_tx,
             personaldb_projection_watch_tx,
+            personaldb_commit_locks,
         })
     }
 }

@@ -7,7 +7,8 @@ use crate::{
     error_codes::AnvilErrorCode,
     formats::{Hash32, hash32, personaldb::PersonalDbLogRecord as CorePersonalDbLogRecord},
     partition_fence::{
-        PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
+        PartitionRecoveryAcquire, PartitionWritePermit, acquire_partition_recovery,
+        publish_partition_ready, validate_partition_write,
     },
     permissions::AnvilAction,
     personaldb_catchup::{
@@ -58,6 +59,7 @@ use crate::{
         list_personaldb_projection_watch_events,
     },
 };
+use tokio::sync::OwnedMutexGuard;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -588,13 +590,29 @@ impl AppState {
         "local-anvil-node".to_string()
     }
 
-    async fn acquire_personaldb_group_write_fence(
+    async fn personaldb_commit_guard(
+        &self,
+        tenant_id: i64,
+        database_id: &str,
+    ) -> OwnedMutexGuard<()> {
+        let key = format!("{tenant_id}:{database_id}");
+        let lock = {
+            let mut locks = self.personaldb_commit_locks.lock().await;
+            locks
+                .entry(key)
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
+
+    async fn acquire_personaldb_group_write_permit(
         &self,
         tenant_id: i64,
         database_id: &str,
         recovered_through_sequence: u64,
         recovered_manifest_hash: &str,
-    ) -> Result<u64, Status> {
+    ) -> Result<PartitionWritePermit, Status> {
         validate_hex32(recovered_manifest_hash, "recovered_manifest_hash")?;
         let partition_family = personaldb_group_partition_family().to_string();
         let partition_id = personaldb_group_partition_id(tenant_id, database_id);
@@ -629,7 +647,22 @@ impl AppState {
         )
         .await
         .map_err(internal_status)?;
-        Ok(ready.fence_token)
+        ready.write_permit().map_err(|err| {
+            Status::failed_precondition(format!("PersonalDB partition is not writable: {err}"))
+        })
+    }
+
+    async fn validate_personaldb_group_write_permit(
+        &self,
+        permit: &PartitionWritePermit,
+    ) -> Result<(), Status> {
+        validate_partition_write(&self.storage, permit, self.personaldb_signing_key())
+            .await
+            .map_err(|err| {
+                Status::failed_precondition(format!(
+                    "PersonalDB partition write fence is not current: {err}"
+                ))
+            })
     }
 
     async fn handle_personaldb_projection_writeback(
@@ -830,6 +863,9 @@ impl AppState {
         if let Some(bearer_token) = actor.bearer_token.as_deref() {
             bind_personaldb_submit_session(&validated.request, &actor, bearer_token)?;
         }
+        let _commit_guard = self
+            .personaldb_commit_guard(actor.tenant_id, &validated.request.database_id)
+            .await;
         let signing_key = self.personaldb_signing_key();
         let manifest = read_personaldb_group_manifest(
             &self.storage,
@@ -865,14 +901,31 @@ impl AppState {
                 "PersonalDB submit epochs or schema do not match the active group",
             ));
         }
-        let source_fence_token = self
-            .acquire_personaldb_group_write_fence(
+        let write_permit = self
+            .acquire_personaldb_group_write_permit(
                 actor.tenant_id,
                 &validated.request.database_id,
                 previous_head.log_index,
                 &previous_head.log_hash,
             )
             .await?;
+        let current_head_after_fence = read_personaldb_committed_head(
+            &self.storage,
+            actor.tenant_id,
+            &validated.request.database_id,
+            signing_key,
+        )
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::failed_precondition("PersonalDB committed head missing"))?;
+        if current_head_after_fence.log_index != previous_head.log_index
+            || current_head_after_fence.log_hash != previous_head.log_hash
+            || current_head_after_fence.head_hash != previous_head.head_hash
+        {
+            return Err(Status::failed_precondition(
+                "PersonalDB committed head changed during partition handoff",
+            ));
+        }
 
         let changes = iterate_changeset(&validated.request.changeset_bytes)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
@@ -1011,7 +1064,7 @@ impl AppState {
                 tenant_id: actor.tenant_id,
                 database_id: &validated.request.database_id,
                 schema_hash,
-                source_fence_token,
+                source_fence_token: write_permit.fence_token,
                 records: std::slice::from_ref(&record),
             },
         )
@@ -1035,6 +1088,25 @@ impl AppState {
             )
             .await
             .map_err(internal_status)?;
+        }
+        self.validate_personaldb_group_write_permit(&write_permit)
+            .await?;
+        let current_head_before_publish = read_personaldb_committed_head(
+            &self.storage,
+            actor.tenant_id,
+            &validated.request.database_id,
+            signing_key,
+        )
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::failed_precondition("PersonalDB committed head missing"))?;
+        if current_head_before_publish.log_index != previous_head.log_index
+            || current_head_before_publish.log_hash != previous_head.log_hash
+            || current_head_before_publish.head_hash != previous_head.head_hash
+        {
+            return Err(Status::failed_precondition(
+                "PersonalDB committed head changed before publish",
+            ));
         }
         let committed_head = PersonalDbCommittedHead {
             format_version: 1,
