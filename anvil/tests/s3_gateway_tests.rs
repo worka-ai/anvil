@@ -250,6 +250,172 @@ async fn test_s3_put_write_etag_preconditions() {
     );
 }
 
+#[tokio::test]
+async fn test_s3_reads_and_lists_survive_object_metadata_compaction() {
+    let mut cluster = TestCluster::new(&["compact-region"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let app_name = format!("s3-compact-{}", uuid::Uuid::new_v4());
+    let (client_id, client_secret) = create_app(&cluster.admin_state_path, &app_name);
+    grant_wildcard_policy(&cluster.admin_state_path, &app_name);
+
+    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
+    let client = s3_client(http_base, &client_id, &client_secret);
+    let bucket = format!("s3-compact-{}", uuid::Uuid::new_v4());
+
+    client
+        .create_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("S3 CreateBucket should succeed");
+
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key("logs/a.txt")
+        .body(ByteStream::from_static(b"a-v1"))
+        .send()
+        .await
+        .expect("put logs/a.txt v1 should succeed");
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key("logs/a.txt")
+        .body(ByteStream::from_static(b"a-v2"))
+        .send()
+        .await
+        .expect("put logs/a.txt v2 should succeed");
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key("logs/b.txt")
+        .body(ByteStream::from_static(b"b"))
+        .send()
+        .await
+        .expect("put logs/b.txt should succeed");
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key("logs/nested/c.txt")
+        .body(ByteStream::from_static(b"c"))
+        .send()
+        .await
+        .expect("put logs/nested/c.txt should succeed");
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key("logs/b.txt")
+        .send()
+        .await
+        .expect("delete logs/b.txt should create a delete marker");
+
+    let bucket_record = cluster.states[0]
+        .persistence
+        .get_bucket_by_name(1, &bucket)
+        .await
+        .unwrap()
+        .expect("bucket metadata should exist");
+    cluster.states[0]
+        .persistence
+        .compact_object_metadata(bucket_record.id)
+        .await
+        .unwrap()
+        .expect("object metadata compaction should seal a manifest");
+
+    let get_a = client
+        .get_object()
+        .bucket(&bucket)
+        .key("logs/a.txt")
+        .send()
+        .await
+        .expect("GET after compaction should succeed");
+    let bytes = get_a
+        .body
+        .collect()
+        .await
+        .expect("collect compacted object body")
+        .into_bytes();
+    assert_eq!(bytes.as_ref(), b"a-v2");
+
+    let compacted_listing = client
+        .list_objects_v2()
+        .bucket(&bucket)
+        .prefix("logs/")
+        .delimiter("/")
+        .send()
+        .await
+        .expect("delimiter LIST after compaction should succeed");
+    assert_eq!(compacted_listing.contents().len(), 1);
+    assert_eq!(compacted_listing.contents()[0].key(), Some("logs/a.txt"));
+    assert_eq!(compacted_listing.common_prefixes().len(), 1);
+    assert_eq!(
+        compacted_listing.common_prefixes()[0].prefix(),
+        Some("logs/nested/")
+    );
+
+    let compacted_versions = client
+        .list_object_versions()
+        .bucket(&bucket)
+        .prefix("logs/a.txt")
+        .send()
+        .await
+        .expect("version LIST after compaction should succeed");
+    assert_eq!(compacted_versions.versions().len(), 2);
+    assert!(
+        compacted_versions
+            .versions()
+            .iter()
+            .any(|version| version.is_latest().unwrap_or(false))
+    );
+
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key("logs/d.txt")
+        .body(ByteStream::from_static(b"d"))
+        .send()
+        .await
+        .expect("post-compaction PUT should succeed");
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key("logs/nested/c.txt")
+        .send()
+        .await
+        .expect("post-compaction DELETE should succeed");
+
+    let overlay_listing = client
+        .list_objects_v2()
+        .bucket(&bucket)
+        .prefix("logs/")
+        .delimiter("/")
+        .send()
+        .await
+        .expect("LIST should merge compacted directory segment and active journal");
+    let overlay_keys: Vec<_> = overlay_listing
+        .contents()
+        .iter()
+        .filter_map(|object| object.key())
+        .collect();
+    assert_eq!(overlay_keys, vec!["logs/a.txt", "logs/d.txt"]);
+    assert!(
+        overlay_listing.common_prefixes().is_empty(),
+        "post-compaction delete marker should remove now-empty nested prefix"
+    );
+
+    let deleted_get = client
+        .get_object()
+        .bucket(&bucket)
+        .key("logs/b.txt")
+        .send()
+        .await;
+    assert!(
+        deleted_get.is_err(),
+        "delete marker sealed during compaction must remain current"
+    );
+}
+
 #[test]
 fn test_s3_public_and_private_access() {
     run_large_s3_gateway_test(Box::pin(run_s3_public_and_private_access()));
