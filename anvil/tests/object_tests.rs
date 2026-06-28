@@ -41,14 +41,15 @@ fn assert_reserved_namespace_status<T>(result: Result<T, Status>) {
 }
 
 fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
+    let nonce = uuid::Uuid::new_v4();
     NativeMutationContext {
         tenant_id: 1,
         bucket_id,
         principal: "test-app".to_string(),
-        request_id: format!("{tag}-request"),
+        request_id: format!("{tag}-{nonce}-request"),
         precondition: "none".to_string(),
         authz_zookie_optional: String::new(),
-        idempotency_key: format!("{tag}-idempotency"),
+        idempotency_key: format!("{tag}-{nonce}-idempotency"),
     }
 }
 
@@ -107,6 +108,35 @@ async fn put_object_for_test(
         .put_object(request)
         .await
         .map(|response| response.into_inner())
+}
+
+async fn get_object_bytes_for_test(
+    object_client: &mut ObjectServiceClient<tonic::transport::Channel>,
+    token: &str,
+    bucket_name: &str,
+    object_key: &str,
+    version_id: Option<String>,
+) -> Vec<u8> {
+    let mut stream = object_client
+        .get_object(authorized(
+            GetObjectRequest {
+                bucket_name: bucket_name.to_string(),
+                object_key: object_key.to_string(),
+                version_id,
+            },
+            token,
+        ))
+        .await
+        .expect("get object")
+        .into_inner();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("object chunk");
+        if let Some(anvil_api::get_object_response::Data::Chunk(data)) = chunk.data {
+            bytes.extend_from_slice(&data);
+        }
+    }
+    bytes
 }
 
 macro_rules! assert_native_mutation_response {
@@ -400,6 +430,163 @@ async fn test_native_object_mutation_preconditions_are_enforced() {
     .await
     .expect("not_exists should treat the current delete marker as absent");
     assert_native_mutation_response!(recreated);
+}
+
+#[tokio::test]
+async fn test_native_object_mutation_idempotency_replays_without_duplicate_mutation() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr).await.unwrap();
+    let bucket_name = format!("native-idempotency-{}", uuid::Uuid::new_v4());
+    let object_key = "docs/idempotent.txt";
+
+    let bucket_id = bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
+
+    let put_context = native_mutation_context(bucket_id, "idempotent-put");
+    let put_idempotency_key = put_context.idempotency_key.clone();
+    let first = put_object_for_test(
+        &mut object_client,
+        &token,
+        &bucket_name,
+        object_key,
+        b"first-payload",
+        put_context.clone(),
+    )
+    .await
+    .expect("first idempotent put should succeed");
+    let replayed = put_object_for_test(
+        &mut object_client,
+        &token,
+        &bucket_name,
+        object_key,
+        b"second-payload-must-not-be-written",
+        put_context,
+    )
+    .await
+    .expect("second idempotent put should replay");
+    assert_eq!(replayed, first);
+
+    let downloaded = get_object_bytes_for_test(
+        &mut object_client,
+        &token,
+        &bucket_name,
+        object_key,
+        Some(first.version_id.clone()),
+    )
+    .await;
+    assert_eq!(downloaded, b"first-payload");
+
+    let versions = object_client
+        .list_object_versions(authorized(
+            ListObjectVersionsRequest {
+                bucket_name: bucket_name.clone(),
+                prefix: object_key.to_string(),
+                key_marker: String::new(),
+                max_keys: 10,
+                version_id_marker: String::new(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .versions;
+    assert_eq!(
+        versions.len(),
+        1,
+        "idempotent replay must not add a version"
+    );
+    assert_eq!(versions[0].version_id, first.version_id);
+
+    let mut reused_context = native_mutation_context(bucket_id, "reused-target");
+    reused_context.idempotency_key = put_idempotency_key;
+    let conflict = put_object_for_test(
+        &mut object_client,
+        &token,
+        &bucket_name,
+        "docs/other-target.txt",
+        b"other",
+        reused_context,
+    )
+    .await
+    .expect_err("idempotency key reuse against a different target must fail");
+    assert_eq!(conflict.code(), Code::FailedPrecondition);
+    assert!(conflict.message().contains("different mutation target"));
+
+    let delete_context = native_mutation_context(bucket_id, "idempotent-delete");
+    let delete_first = object_client
+        .delete_object(authorized(
+            DeleteObjectRequest {
+                bucket_name: bucket_name.clone(),
+                object_key: object_key.to_string(),
+                version_id: None,
+                mutation_context: Some(delete_context.clone()),
+            },
+            &token,
+        ))
+        .await
+        .expect("first idempotent delete should succeed")
+        .into_inner();
+    let delete_replayed = object_client
+        .delete_object(authorized(
+            DeleteObjectRequest {
+                bucket_name: bucket_name.clone(),
+                object_key: object_key.to_string(),
+                version_id: None,
+                mutation_context: Some(delete_context),
+            },
+            &token,
+        ))
+        .await
+        .expect("second idempotent delete should replay")
+        .into_inner();
+    assert_eq!(delete_replayed, delete_first);
+    assert!(delete_replayed.delete_marker);
+
+    let versions_after_delete = object_client
+        .list_object_versions(authorized(
+            ListObjectVersionsRequest {
+                bucket_name,
+                prefix: object_key.to_string(),
+                key_marker: String::new(),
+                max_keys: 10,
+                version_id_marker: String::new(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .versions;
+    assert_eq!(
+        versions_after_delete.len(),
+        2,
+        "idempotent delete replay must not add another delete marker"
+    );
+    assert_eq!(
+        versions_after_delete
+            .iter()
+            .filter(|version| version.is_delete_marker)
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

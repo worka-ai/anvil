@@ -13,14 +13,15 @@ use tonic::Request;
 use anvil_test_utils::*;
 
 fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
+    let nonce = uuid::Uuid::new_v4();
     NativeMutationContext {
         tenant_id: 1,
         bucket_id,
         principal: "test-app".to_string(),
-        request_id: format!("{tag}-request"),
+        request_id: format!("{tag}-{nonce}-request"),
         precondition: "none".to_string(),
         authz_zookie_optional: String::new(),
-        idempotency_key: format!("{tag}-idempotency"),
+        idempotency_key: format!("{tag}-{nonce}-idempotency"),
     }
 }
 

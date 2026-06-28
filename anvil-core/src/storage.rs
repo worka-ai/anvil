@@ -286,6 +286,23 @@ impl Storage {
             .join(format!("bucket-{bucket_id}.json"))
     }
 
+    pub fn native_idempotency_record_path(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        record_key_hash: &str,
+    ) -> Result<PathBuf> {
+        ensure_hash_hex(record_key_hash, "native idempotency record key hash")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("meta")
+            .join("idempotency")
+            .join(format!("tenant-{tenant_id}"))
+            .join(format!("bucket-{bucket_id}"))
+            .join(format!("{record_key_hash}.json")))
+    }
+
     pub fn object_watch_path(&self, tenant_id: i64, bucket_id: i64) -> PathBuf {
         self.storage_path
             .join("_anvil")

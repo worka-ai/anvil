@@ -1,9 +1,12 @@
 use crate::anvil_api::object_service_server::ObjectService;
 use crate::anvil_api::*;
+use crate::native_idempotency::{self, NativeIdempotencyTarget};
 use crate::object_manager::ObjectWriteOptions;
 use crate::permissions::AnvilAction;
 use crate::{AppState, auth, authz_journal, bucket_journal, watch_log};
 use futures_util::StreamExt;
+use serde::{Serialize, de::DeserializeOwned};
+use tokio::sync::OwnedMutexGuard;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -40,6 +43,18 @@ impl ObjectService for AppState {
         };
         validate_native_mutation_context(self, &claims, &bucket_name, mutation_context.as_ref())
             .await?;
+        let target = NativeIdempotencyTarget::new("PutObject", &bucket_name, &object_key);
+        let (attempt, replay) = begin_native_mutation::<PutObjectResponse>(
+            self,
+            mutation_context.as_ref(),
+            &target,
+            &claims.scopes,
+            AnvilAction::ObjectWrite,
+        )
+        .await?;
+        if let Some(response) = replay {
+            return Ok(Response::new(response));
+        }
         enforce_native_mutation_precondition(
             self,
             &claims,
@@ -71,7 +86,7 @@ impl ObjectService for AppState {
             .await?;
         let watch_cursor = object_watch_cursor(self, &object).await?;
 
-        Ok(Response::new(PutObjectResponse {
+        let response = PutObjectResponse {
             etag: object.etag,
             version_id: object.version_id.to_string(),
             mutation_id: object.mutation_id.to_string(),
@@ -81,7 +96,9 @@ impl ObjectService for AppState {
                 .map_err(|_| Status::internal("Invalid authz revision"))?,
             index_policy_snapshot: object.index_policy_snapshot,
             watch_cursor,
-        }))
+        };
+        complete_native_mutation(self, &attempt, &target, &response).await?;
+        Ok(Response::new(response))
     }
 
     async fn get_object(
@@ -160,6 +177,22 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
+        let target =
+            NativeIdempotencyTarget::new("DeleteObject", &req.bucket_name, &req.object_key)
+                .with_parameters(serde_json::json!({
+                    "version_id": req.version_id.as_deref().unwrap_or("")
+                }));
+        let (attempt, replay) = begin_native_mutation::<DeleteObjectResponse>(
+            self,
+            req.mutation_context.as_ref(),
+            &target,
+            &claims.scopes,
+            AnvilAction::ObjectDelete,
+        )
+        .await?;
+        if let Some(response) = replay {
+            return Ok(Response::new(response));
+        }
         enforce_native_mutation_precondition(
             self,
             claims,
@@ -193,7 +226,7 @@ impl ObjectService for AppState {
             };
         let watch_cursor = object_watch_cursor(self, &deleted).await?;
 
-        Ok(Response::new(DeleteObjectResponse {
+        let response = DeleteObjectResponse {
             version_id: deleted.version_id.to_string(),
             mutation_id: deleted.mutation_id.to_string(),
             payload_hash: deleted.content_hash,
@@ -203,7 +236,9 @@ impl ObjectService for AppState {
             index_policy_snapshot: deleted.index_policy_snapshot,
             watch_cursor,
             delete_marker: deleted.deleted_at.is_some(),
-        }))
+        };
+        complete_native_mutation(self, &attempt, &target, &response).await?;
+        Ok(Response::new(response))
     }
 
     async fn head_object(
@@ -343,6 +378,27 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
+        let target = NativeIdempotencyTarget::new(
+            "CopyObject",
+            &req.destination_bucket_name,
+            &req.destination_object_key,
+        )
+        .with_parameters(serde_json::json!({
+            "source_bucket_name": req.source_bucket_name.clone(),
+            "source_object_key": req.source_object_key.clone(),
+            "source_version_id": req.source_version_id.as_deref().unwrap_or("")
+        }));
+        let (attempt, replay) = begin_native_mutation::<CopyObjectResponse>(
+            self,
+            req.mutation_context.as_ref(),
+            &target,
+            &claims.scopes,
+            AnvilAction::ObjectWrite,
+        )
+        .await?;
+        if let Some(response) = replay {
+            return Ok(Response::new(response));
+        }
         enforce_native_mutation_precondition(
             self,
             &claims,
@@ -367,7 +423,7 @@ impl ObjectService for AppState {
         let watch_cursor = object_watch_cursor(self, &object).await?;
         let authz_revision = object_authz_revision(&object)?;
 
-        Ok(Response::new(CopyObjectResponse {
+        let response = CopyObjectResponse {
             etag: object.etag,
             version_id: object.version_id.to_string(),
             last_modified: object.created_at.to_string(),
@@ -377,7 +433,9 @@ impl ObjectService for AppState {
             authz_revision,
             watch_cursor,
             index_policy_snapshot: object.index_policy_snapshot,
-        }))
+        };
+        complete_native_mutation(self, &attempt, &target, &response).await?;
+        Ok(Response::new(response))
     }
 
     async fn compose_object(
@@ -397,6 +455,34 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
+        let target_sources = req
+            .sources
+            .iter()
+            .map(|source| {
+                serde_json::json!({
+                    "bucket_name": source.bucket_name.clone(),
+                    "object_key": source.object_key.clone(),
+                    "version_id": source.version_id.as_deref().unwrap_or("")
+                })
+            })
+            .collect::<Vec<_>>();
+        let target = NativeIdempotencyTarget::new(
+            "ComposeObject",
+            &req.destination_bucket_name,
+            &req.destination_object_key,
+        )
+        .with_parameters(serde_json::json!({ "sources": target_sources }));
+        let (attempt, replay) = begin_native_mutation::<ComposeObjectResponse>(
+            self,
+            req.mutation_context.as_ref(),
+            &target,
+            &claims.scopes,
+            AnvilAction::ObjectWrite,
+        )
+        .await?;
+        if let Some(response) = replay {
+            return Ok(Response::new(response));
+        }
         enforce_native_mutation_precondition(
             self,
             &claims,
@@ -428,7 +514,7 @@ impl ObjectService for AppState {
         let watch_cursor = object_watch_cursor(self, &object).await?;
         let authz_revision = object_authz_revision(&object)?;
 
-        Ok(Response::new(ComposeObjectResponse {
+        let response = ComposeObjectResponse {
             etag: object.etag,
             version_id: object.version_id.to_string(),
             last_modified: object.created_at.to_string(),
@@ -438,7 +524,9 @@ impl ObjectService for AppState {
             authz_revision,
             watch_cursor,
             index_policy_snapshot: object.index_policy_snapshot,
-        }))
+        };
+        complete_native_mutation(self, &attempt, &target, &response).await?;
+        Ok(Response::new(response))
     }
 
     async fn patch_json_object(
@@ -458,6 +546,26 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
+        let target = NativeIdempotencyTarget::new(
+            "PatchJsonObject",
+            &req.bucket_name,
+            &req.object_key,
+        )
+        .with_parameters(serde_json::json!({
+            "base_version_id": req.base_version_id.as_deref().unwrap_or(""),
+            "merge_patch_hash": blake3::hash(req.merge_patch_json.as_bytes()).to_hex().to_string()
+        }));
+        let (attempt, replay) = begin_native_mutation::<PatchJsonObjectResponse>(
+            self,
+            req.mutation_context.as_ref(),
+            &target,
+            &claims.scopes,
+            AnvilAction::ObjectWrite,
+        )
+        .await?;
+        if let Some(response) = replay {
+            return Ok(Response::new(response));
+        }
         enforce_native_mutation_precondition(
             self,
             &claims,
@@ -481,7 +589,7 @@ impl ObjectService for AppState {
         let watch_cursor = object_watch_cursor(self, &object).await?;
         let authz_revision = object_authz_revision(&object)?;
 
-        Ok(Response::new(PatchJsonObjectResponse {
+        let response = PatchJsonObjectResponse {
             etag: object.etag,
             version_id: object.version_id.to_string(),
             last_modified: object.created_at.to_string(),
@@ -491,7 +599,9 @@ impl ObjectService for AppState {
             authz_revision,
             watch_cursor,
             index_policy_snapshot: object.index_policy_snapshot,
-        }))
+        };
+        complete_native_mutation(self, &attempt, &target, &response).await?;
+        Ok(Response::new(response))
     }
 
     async fn compare_and_swap_manifest(
@@ -511,6 +621,26 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
+        let target = NativeIdempotencyTarget::new(
+            "CompareAndSwapManifest",
+            &req.bucket_name,
+            &req.manifest_key,
+        )
+        .with_parameters(serde_json::json!({
+            "expected_revision": req.expected_revision,
+            "manifest_hash": blake3::hash(req.manifest_json.as_bytes()).to_hex().to_string()
+        }));
+        let (attempt, replay) = begin_native_mutation::<CompareAndSwapManifestResponse>(
+            self,
+            req.mutation_context.as_ref(),
+            &target,
+            &claims.scopes,
+            AnvilAction::ObjectWrite,
+        )
+        .await?;
+        if let Some(response) = replay {
+            return Ok(Response::new(response));
+        }
         enforce_native_mutation_precondition(
             self,
             &claims,
@@ -533,7 +663,7 @@ impl ObjectService for AppState {
             .await?;
         let authz_revision = latest_authz_revision(self, claims.tenant_id).await?;
 
-        Ok(Response::new(CompareAndSwapManifestResponse {
+        let response = CompareAndSwapManifestResponse {
             revision: result.revision,
             manifest_hash: result.manifest_hash.clone(),
             version_id: result.revision.to_string(),
@@ -542,7 +672,9 @@ impl ObjectService for AppState {
             record_hash: result.receipt.record_hash,
             authz_revision,
             watch_cursor: result.receipt.watch_cursor,
-        }))
+        };
+        complete_native_mutation(self, &attempt, &target, &response).await?;
+        Ok(Response::new(response))
     }
 
     async fn watch_prefix(
@@ -629,6 +761,19 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
+        let target =
+            NativeIdempotencyTarget::new("CreateAppendStream", &req.bucket_name, &req.stream_key);
+        let (attempt, replay) = begin_native_mutation::<CreateAppendStreamResponse>(
+            self,
+            req.mutation_context.as_ref(),
+            &target,
+            &claims.scopes,
+            AnvilAction::ObjectWrite,
+        )
+        .await?;
+        if let Some(response) = replay {
+            return Ok(Response::new(response));
+        }
         enforce_native_mutation_precondition(
             self,
             &claims,
@@ -649,7 +794,7 @@ impl ObjectService for AppState {
             .await?;
         let authz_revision = latest_authz_revision(self, claims.tenant_id).await?;
 
-        Ok(Response::new(CreateAppendStreamResponse {
+        let response = CreateAppendStreamResponse {
             stream_id: result.stream_id.to_string(),
             version_id: result.stream_id.to_string(),
             mutation_id: result.receipt.mutation_id.to_string(),
@@ -657,7 +802,9 @@ impl ObjectService for AppState {
             record_hash: result.receipt.record_hash,
             authz_revision,
             watch_cursor: result.receipt.watch_cursor,
-        }))
+        };
+        complete_native_mutation(self, &attempt, &target, &response).await?;
+        Ok(Response::new(response))
     }
 
     async fn append_stream_record(
@@ -677,6 +824,23 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
+        let target =
+            NativeIdempotencyTarget::new("AppendStreamRecord", &req.bucket_name, &req.stream_key)
+                .with_parameters(serde_json::json!({
+                    "stream_id": req.stream_id.clone(),
+                    "payload_hash": blake3::hash(&req.payload).to_hex().to_string()
+                }));
+        let (attempt, replay) = begin_native_mutation::<AppendStreamRecordResponse>(
+            self,
+            req.mutation_context.as_ref(),
+            &target,
+            &claims.scopes,
+            AnvilAction::ObjectWrite,
+        )
+        .await?;
+        if let Some(response) = replay {
+            return Ok(Response::new(response));
+        }
         enforce_native_mutation_precondition(
             self,
             &claims,
@@ -701,7 +865,7 @@ impl ObjectService for AppState {
             .await?;
         let authz_revision = latest_authz_revision(self, claims.tenant_id).await?;
 
-        Ok(Response::new(AppendStreamRecordResponse {
+        let response = AppendStreamRecordResponse {
             record_sequence: record.record_sequence,
             payload_hash: record.payload_hash,
             payload_size: record.payload_size,
@@ -710,7 +874,9 @@ impl ObjectService for AppState {
             record_hash: record.receipt.record_hash,
             authz_revision,
             watch_cursor: record.receipt.watch_cursor,
-        }))
+        };
+        complete_native_mutation(self, &attempt, &target, &response).await?;
+        Ok(Response::new(response))
     }
 
     async fn seal_append_stream_segment(
@@ -730,6 +896,23 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
+        let target = NativeIdempotencyTarget::new(
+            "SealAppendStreamSegment",
+            &req.bucket_name,
+            &req.stream_key,
+        )
+        .with_parameters(serde_json::json!({ "stream_id": req.stream_id.clone() }));
+        let (attempt, replay) = begin_native_mutation::<SealAppendStreamSegmentResponse>(
+            self,
+            req.mutation_context.as_ref(),
+            &target,
+            &claims.scopes,
+            AnvilAction::ObjectWrite,
+        )
+        .await?;
+        if let Some(response) = replay {
+            return Ok(Response::new(response));
+        }
         enforce_native_mutation_precondition(
             self,
             &claims,
@@ -754,7 +937,7 @@ impl ObjectService for AppState {
             .await?;
         let authz_revision = latest_authz_revision(self, claims.tenant_id).await?;
 
-        Ok(Response::new(SealAppendStreamSegmentResponse {
+        let response = SealAppendStreamSegmentResponse {
             record_count: sealed.record_count,
             segment_hash: sealed.segment_hash.clone(),
             version_id,
@@ -763,7 +946,9 @@ impl ObjectService for AppState {
             record_hash: sealed.receipt.record_hash,
             authz_revision,
             watch_cursor: sealed.receipt.watch_cursor,
-        }))
+        };
+        complete_native_mutation(self, &attempt, &target, &response).await?;
+        Ok(Response::new(response))
     }
 
     async fn initiate_multipart_upload(
@@ -783,6 +968,22 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
+        let target = NativeIdempotencyTarget::new(
+            "InitiateMultipartUpload",
+            &req.bucket_name,
+            &req.object_key,
+        );
+        let (attempt, replay) = begin_native_mutation::<InitiateMultipartResponse>(
+            self,
+            req.mutation_context.as_ref(),
+            &target,
+            &claims.scopes,
+            AnvilAction::ObjectWrite,
+        )
+        .await?;
+        if let Some(response) = replay {
+            return Ok(Response::new(response));
+        }
         enforce_native_mutation_precondition(
             self,
             &claims,
@@ -804,7 +1005,7 @@ impl ObjectService for AppState {
             .await?;
         let authz_revision = latest_authz_revision(self, claims.tenant_id).await?;
 
-        Ok(Response::new(InitiateMultipartResponse {
+        let response = InitiateMultipartResponse {
             upload_id: result.upload_id.to_string(),
             version_id: result.upload_id.to_string(),
             mutation_id: result.receipt.mutation_id.to_string(),
@@ -812,7 +1013,9 @@ impl ObjectService for AppState {
             record_hash: result.receipt.record_hash,
             authz_revision,
             watch_cursor: result.receipt.watch_cursor,
-        }))
+        };
+        complete_native_mutation(self, &attempt, &target, &response).await?;
+        Ok(Response::new(response))
     }
 
     async fn upload_part(
@@ -841,6 +1044,23 @@ impl ObjectService for AppState {
             metadata.mutation_context.as_ref(),
         )
         .await?;
+        let target =
+            NativeIdempotencyTarget::new("UploadPart", &metadata.bucket_name, &metadata.object_key)
+                .with_parameters(serde_json::json!({
+                    "upload_id": metadata.upload_id.clone(),
+                    "part_number": metadata.part_number
+                }));
+        let (attempt, replay) = begin_native_mutation::<UploadPartResponse>(
+            self,
+            metadata.mutation_context.as_ref(),
+            &target,
+            &claims.scopes,
+            AnvilAction::ObjectWrite,
+        )
+        .await?;
+        if let Some(response) = replay {
+            return Ok(Response::new(response));
+        }
         enforce_native_mutation_precondition(
             self,
             &claims,
@@ -876,7 +1096,7 @@ impl ObjectService for AppState {
             .await?;
         let authz_revision = latest_authz_revision(self, claims.tenant_id).await?;
 
-        Ok(Response::new(UploadPartResponse {
+        let response = UploadPartResponse {
             etag: result.etag,
             version_id: part_version_id,
             mutation_id: result.receipt.mutation_id.to_string(),
@@ -884,7 +1104,9 @@ impl ObjectService for AppState {
             record_hash: result.receipt.record_hash,
             authz_revision,
             watch_cursor: result.receipt.watch_cursor,
-        }))
+        };
+        complete_native_mutation(self, &attempt, &target, &response).await?;
+        Ok(Response::new(response))
     }
 
     async fn complete_multipart_upload(
@@ -904,6 +1126,31 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
+        let target_parts = req
+            .parts
+            .iter()
+            .map(|part| serde_json::json!({"part_number": part.part_number, "etag": part.etag.clone()}))
+            .collect::<Vec<_>>();
+        let target = NativeIdempotencyTarget::new(
+            "CompleteMultipartUpload",
+            &req.bucket_name,
+            &req.object_key,
+        )
+        .with_parameters(serde_json::json!({
+            "upload_id": req.upload_id.clone(),
+            "parts": target_parts
+        }));
+        let (attempt, replay) = begin_native_mutation::<CompleteMultipartResponse>(
+            self,
+            req.mutation_context.as_ref(),
+            &target,
+            &claims.scopes,
+            AnvilAction::ObjectWrite,
+        )
+        .await?;
+        if let Some(response) = replay {
+            return Ok(Response::new(response));
+        }
         enforce_native_mutation_precondition(
             self,
             &claims,
@@ -938,7 +1185,7 @@ impl ObjectService for AppState {
         let watch_cursor = object_watch_cursor(self, &object).await?;
         let authz_revision = object_authz_revision(&object)?;
 
-        Ok(Response::new(CompleteMultipartResponse {
+        let response = CompleteMultipartResponse {
             etag: object.etag,
             version_id: object.version_id.to_string(),
             mutation_id: object.mutation_id.to_string(),
@@ -947,7 +1194,9 @@ impl ObjectService for AppState {
             authz_revision,
             watch_cursor,
             index_policy_snapshot: object.index_policy_snapshot,
-        }))
+        };
+        complete_native_mutation(self, &attempt, &target, &response).await?;
+        Ok(Response::new(response))
     }
 
     async fn abort_multipart_upload(
@@ -967,6 +1216,20 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
+        let target =
+            NativeIdempotencyTarget::new("AbortMultipartUpload", &req.bucket_name, &req.object_key)
+                .with_parameters(serde_json::json!({ "upload_id": req.upload_id.clone() }));
+        let (attempt, replay) = begin_native_mutation::<AbortMultipartResponse>(
+            self,
+            req.mutation_context.as_ref(),
+            &target,
+            &claims.scopes,
+            AnvilAction::ObjectWrite,
+        )
+        .await?;
+        if let Some(response) = replay {
+            return Ok(Response::new(response));
+        }
         enforce_native_mutation_precondition(
             self,
             &claims,
@@ -991,15 +1254,107 @@ impl ObjectService for AppState {
             .await?;
         let authz_revision = latest_authz_revision(self, claims.tenant_id).await?;
 
-        Ok(Response::new(AbortMultipartResponse {
+        let response = AbortMultipartResponse {
             version_id: result.upload_id.to_string(),
             mutation_id: result.receipt.mutation_id.to_string(),
             payload_hash: result.receipt.payload_hash,
             record_hash: result.receipt.record_hash,
             authz_revision,
             watch_cursor: result.receipt.watch_cursor,
-        }))
+        };
+        complete_native_mutation(self, &attempt, &target, &response).await?;
+        Ok(Response::new(response))
     }
+}
+
+struct NativeMutationAttempt<'a> {
+    context: &'a NativeMutationContext,
+    _guard: OwnedMutexGuard<()>,
+}
+
+async fn begin_native_mutation<'a, T>(
+    state: &AppState,
+    context: Option<&'a NativeMutationContext>,
+    target: &NativeIdempotencyTarget,
+    scopes: &[String],
+    action: AnvilAction,
+) -> Result<(NativeMutationAttempt<'a>, Option<T>), Status>
+where
+    T: DeserializeOwned,
+{
+    let context =
+        context.ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?;
+    validate_native_mutation_target_authorization(target, scopes, action)?;
+    let guard = acquire_native_mutation_lock(state, context).await?;
+    let replay = native_idempotency::load_response(&state.storage, context, target).await?;
+    Ok((
+        NativeMutationAttempt {
+            context,
+            _guard: guard,
+        },
+        replay,
+    ))
+}
+
+fn validate_native_mutation_target_authorization(
+    target: &NativeIdempotencyTarget,
+    scopes: &[String],
+    action: AnvilAction,
+) -> Result<(), Status> {
+    if !crate::validation::is_valid_bucket_name(&target.bucket_name) {
+        return Err(Status::invalid_argument("Invalid bucket name"));
+    }
+    if crate::validation::is_reserved_internal_key(&target.object_key) {
+        return Err(Status::permission_denied("UnauthorizedReservedNamespace"));
+    }
+    if !crate::validation::is_valid_object_key(&target.object_key) {
+        return Err(Status::invalid_argument("Invalid object key"));
+    }
+    if !auth::is_authorized(
+        action,
+        &format!("{}/{}", target.bucket_name, target.object_key),
+        scopes,
+    ) {
+        return Err(Status::permission_denied("Permission denied"));
+    }
+    Ok(())
+}
+
+async fn complete_native_mutation<T>(
+    state: &AppState,
+    attempt: &NativeMutationAttempt<'_>,
+    target: &NativeIdempotencyTarget,
+    response: &T,
+) -> Result<(), Status>
+where
+    T: Serialize,
+{
+    native_idempotency::store_response(&state.storage, attempt.context, target, response).await
+}
+
+async fn acquire_native_mutation_lock(
+    state: &AppState,
+    context: &NativeMutationContext,
+) -> Result<OwnedMutexGuard<()>, Status> {
+    let lock_key = native_mutation_lock_key(context);
+    let lock = {
+        let mut locks = state.native_mutation_locks.lock().await;
+        locks
+            .entry(lock_key)
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    Ok(lock.lock_owned().await)
+}
+
+fn native_mutation_lock_key(context: &NativeMutationContext) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&context.tenant_id.to_le_bytes());
+    hasher.update(&context.bucket_id.to_le_bytes());
+    hasher.update(context.principal.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(context.idempotency_key.as_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 async fn validate_native_mutation_context(
