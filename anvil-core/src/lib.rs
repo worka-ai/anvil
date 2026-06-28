@@ -20,6 +20,7 @@ pub mod cluster;
 pub mod config;
 pub mod control_journal;
 pub mod crypto;
+pub mod derived_index_catchup;
 pub mod derived_index_proof;
 pub mod diagnostic_store;
 pub mod discovery;
