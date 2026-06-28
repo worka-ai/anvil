@@ -76,6 +76,25 @@ pub(crate) async fn enqueue_task_with_permit(
     enqueue_task_inner(storage, task_type, payload, priority, permit.fence_token).await
 }
 
+pub(crate) async fn enqueue_task_if_absent_with_permit(
+    storage: &Storage,
+    task_type: TaskType,
+    payload: JsonValue,
+    priority: i32,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<bool> {
+    require_task_queue_permit(permit)?;
+    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
+    let state = read_task_queue_state(storage).await?;
+    if state.has_live_task(&task_type, &payload) {
+        return Ok(false);
+    }
+    enqueue_task_inner(storage, task_type, payload, priority, permit.fence_token)
+        .await
+        .map(|_| true)
+}
+
 async fn enqueue_task_inner(
     storage: &Storage,
     task_type: TaskType,
@@ -126,7 +145,10 @@ async fn claim_pending_tasks_inner(
     let mut tasks = state
         .tasks
         .values()
-        .filter(|task| task.status == TaskStatus::Pending && task.scheduled_at <= now)
+        .filter(|task| {
+            matches!(task.status, TaskStatus::Pending | TaskStatus::Failed)
+                && task.scheduled_at <= now
+        })
         .cloned()
         .collect::<Vec<_>>();
     tasks.sort_by(|a, b| {
@@ -422,6 +444,14 @@ impl TaskQueueState {
     fn tasks(&self) -> Vec<TaskRecord> {
         self.tasks.values().cloned().collect()
     }
+
+    fn has_live_task(&self, task_type: &TaskType, payload: &JsonValue) -> bool {
+        self.tasks.values().any(|task| {
+            &task.task_type == task_type
+                && &task.payload == payload
+                && matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
+        })
+    }
 }
 
 fn event_key_hash(event: &TaskJournalBody) -> Hash32 {
@@ -543,6 +573,121 @@ mod tests {
                 .iter()
                 .all(|frame| frame.fence_token == permit.fence_token)
         );
+    }
+
+    #[tokio::test]
+    pub(crate) async fn task_journal_deduplicates_live_tasks_but_allows_new_after_completion() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let owner = ready_owner(&storage, "node-a").await;
+        let permit = owner.write_permit().unwrap();
+        let payload = json!({"bucket_id": 7});
+
+        assert!(
+            enqueue_task_if_absent_with_permit(
+                &storage,
+                TaskType::ObjectMetadataCompaction,
+                payload.clone(),
+                50,
+                &permit,
+                KEY,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !enqueue_task_if_absent_with_permit(
+                &storage,
+                TaskType::ObjectMetadataCompaction,
+                payload.clone(),
+                50,
+                &permit,
+                KEY,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(list_tasks(&storage).await.unwrap().len(), 1);
+
+        let claimed = claim_pending_tasks_with_permit(&storage, 1, &permit, KEY)
+            .await
+            .unwrap();
+        update_task_status_with_permit(
+            &storage,
+            claimed[0].id,
+            TaskStatus::Completed,
+            &permit,
+            KEY,
+        )
+        .await
+        .unwrap();
+        assert!(
+            enqueue_task_if_absent_with_permit(
+                &storage,
+                TaskType::ObjectMetadataCompaction,
+                payload,
+                50,
+                &permit,
+                KEY,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(list_tasks(&storage).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    pub(crate) async fn task_journal_reclaims_failed_tasks_after_retry_delay() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let owner = ready_owner(&storage, "node-a").await;
+        let permit = owner.write_permit().unwrap();
+
+        enqueue_task_with_permit(
+            &storage,
+            TaskType::DeleteBucket,
+            json!({"bucket_id": 7}),
+            100,
+            &permit,
+            KEY,
+        )
+        .await
+        .unwrap();
+        let first_claim = claim_pending_tasks_with_permit(&storage, 1, &permit, KEY)
+            .await
+            .unwrap();
+        fail_task_with_permit(&storage, first_claim[0].id, "try again", &permit, KEY)
+            .await
+            .unwrap();
+        let not_ready = claim_pending_tasks_with_permit(&storage, 1, &permit, KEY)
+            .await
+            .unwrap();
+        assert!(not_ready.is_empty());
+
+        let mut state = read_task_queue_state(&storage).await.unwrap();
+        let task = state.tasks.get_mut(&first_claim[0].id).unwrap();
+        task.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        append_task_event(
+            &storage,
+            TaskJournalBody::Failed {
+                task_id: task.id,
+                error: task.last_error.clone().unwrap(),
+                attempts: task.attempts,
+                scheduled_at: task.scheduled_at,
+                updated_at: Utc::now(),
+            },
+            permit.fence_token,
+        )
+        .await
+        .unwrap();
+
+        let retried = claim_pending_tasks_with_permit(&storage, 1, &permit, KEY)
+            .await
+            .unwrap();
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].id, first_claim[0].id);
+        assert_eq!(retried[0].status, TaskStatus::Running);
+        assert_eq!(retried[0].attempts, 1);
     }
 
     #[tokio::test]

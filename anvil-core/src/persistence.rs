@@ -28,6 +28,8 @@ pub struct Persistence {
     event_publisher: Option<Sender<MetadataEvent>>,
     owner_node_id: String,
     partition_owner_signing_key: Vec<u8>,
+    object_metadata_compaction_frame_threshold: u64,
+    object_metadata_compaction_bytes_threshold: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -440,6 +442,10 @@ impl Persistence {
             event_publisher,
             owner_node_id: persistence_owner_node_id(config),
             partition_owner_signing_key: hex::decode(&config.anvil_secret_encryption_key)?,
+            object_metadata_compaction_frame_threshold: config
+                .object_metadata_compaction_frame_threshold,
+            object_metadata_compaction_bytes_threshold: config
+                .object_metadata_compaction_bytes_threshold,
         })
     }
 
@@ -1312,6 +1318,8 @@ impl Persistence {
             &self.partition_owner_signing_key,
         )
         .await?;
+        self.enqueue_object_metadata_compaction_if_due(&bucket)
+            .await?;
         Ok(object)
     }
 
@@ -1441,6 +1449,8 @@ impl Persistence {
             &self.partition_owner_signing_key,
         )
         .await?;
+        self.enqueue_object_metadata_compaction_if_due(&bucket)
+            .await?;
         Ok(Some(object))
     }
 
@@ -1486,6 +1496,8 @@ impl Persistence {
             &self.partition_owner_signing_key,
         )
         .await?;
+        self.enqueue_object_metadata_compaction_if_due(&bucket)
+            .await?;
         Ok(Some(object))
     }
 
@@ -1546,6 +1558,30 @@ impl Persistence {
         )
         .await
         .map(Some)
+    }
+
+    async fn enqueue_object_metadata_compaction_if_due(&self, bucket: &Bucket) -> Result<()> {
+        let stats = metadata_journal::active_object_journal_stats(
+            &self.storage,
+            bucket,
+            &self.partition_owner_signing_key,
+        )
+        .await?;
+        let frame_due = self.object_metadata_compaction_frame_threshold > 0
+            && stats.uncompacted_frame_count >= self.object_metadata_compaction_frame_threshold;
+        let bytes_due = self.object_metadata_compaction_bytes_threshold > 0
+            && stats.uncompacted_encoded_bytes >= self.object_metadata_compaction_bytes_threshold;
+        if !frame_due && !bytes_due {
+            return Ok(());
+        }
+
+        self.enqueue_task_if_absent(
+            crate::tasks::TaskType::ObjectMetadataCompaction,
+            serde_json::json!({ "bucket_id": bucket.id }),
+            50,
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn create_multipart_upload(
@@ -2245,6 +2281,24 @@ impl Persistence {
     ) -> Result<()> {
         let permit = self.task_queue_write_permit().await?;
         task_journal::enqueue_task_with_permit(
+            &self.storage,
+            task_type,
+            payload,
+            priority,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub async fn enqueue_task_if_absent(
+        &self,
+        task_type: crate::tasks::TaskType,
+        payload: JsonValue,
+        priority: i32,
+    ) -> Result<bool> {
+        let permit = self.task_queue_write_permit().await?;
+        task_journal::enqueue_task_if_absent_with_permit(
             &self.storage,
             task_type,
             payload,
@@ -3008,6 +3062,98 @@ mod tests {
                 .versions
                 .len(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn persistence_schedules_deduplicated_object_metadata_compaction_tasks() {
+        let temp = tempdir().unwrap();
+        let config = Config {
+            object_metadata_compaction_frame_threshold: 2,
+            object_metadata_compaction_bytes_threshold: 0,
+            ..test_config(temp.path())
+        };
+        let persistence = Persistence::new(&config, None).unwrap();
+
+        persistence.create_region("local").await.unwrap();
+        let bucket = persistence
+            .create_bucket(1, "scheduled-compact-bucket", "local")
+            .await
+            .unwrap();
+        persistence
+            .create_object(
+                1,
+                bucket.id,
+                "objects/a.txt",
+                "hash-a",
+                11,
+                "etag-a",
+                Some("text/plain"),
+                None,
+                None,
+                Some(b"alpha".to_vec()),
+            )
+            .await
+            .unwrap();
+
+        let tasks = persistence.list_tasks().await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0].task_type,
+            crate::tasks::TaskType::ObjectMetadataCompaction
+        );
+        assert_eq!(tasks[0].payload, json!({ "bucket_id": bucket.id }));
+
+        persistence
+            .create_object(
+                1,
+                bucket.id,
+                "objects/b.txt",
+                "hash-b",
+                12,
+                "etag-b",
+                Some("text/plain"),
+                None,
+                None,
+                Some(b"bravo".to_vec()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            persistence.list_tasks().await.unwrap().len(),
+            1,
+            "live compaction task should be deduplicated per bucket"
+        );
+
+        let claimed = persistence.claim_pending_tasks(1).await.unwrap();
+        persistence
+            .compact_object_metadata(bucket.id)
+            .await
+            .unwrap();
+        persistence
+            .update_task_status(claimed[0].id, crate::tasks::TaskStatus::Completed)
+            .await
+            .unwrap();
+
+        persistence
+            .create_object(
+                1,
+                bucket.id,
+                "objects/c.txt",
+                "hash-c",
+                13,
+                "etag-c",
+                Some("text/plain"),
+                None,
+                None,
+                Some(b"charlie".to_vec()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            persistence.list_tasks().await.unwrap().len(),
+            2,
+            "new post-compaction journal frames should schedule a new task"
         );
     }
 

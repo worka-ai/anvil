@@ -63,6 +63,14 @@ pub struct Config {
     /// PersonalDB changeset payload bytes committed after the latest snapshot before building another snapshot.
     #[arg(long, env, default_value_t = 64 * 1024 * 1024)]
     pub personaldb_snapshot_payload_bytes_threshold: u64,
+
+    /// Uncompacted object metadata journal frames allowed before scheduling compaction.
+    #[arg(long, env, default_value_t = 4096)]
+    pub object_metadata_compaction_frame_threshold: u64,
+
+    /// Uncompacted object metadata journal bytes allowed before scheduling compaction.
+    #[arg(long, env, default_value_t = 64 * 1024 * 1024)]
+    pub object_metadata_compaction_bytes_threshold: u64,
 }
 impl Config {
     #[allow(unused)]

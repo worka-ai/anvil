@@ -24,6 +24,7 @@ async fn test_cluster_gossip() {
         storage_path: "anvil-data".to_string(),
         personaldb_snapshot_entry_threshold: 1024,
         personaldb_snapshot_payload_bytes_threshold: 64 * 1024 * 1024,
+        ..anvil::config::Config::default()
     });
     // 1. Create two swarms
     let mut swarm1 = create_swarm(config.clone()).await.unwrap();
@@ -123,6 +124,7 @@ async fn test_cluster_gossip_invalid_secret() {
         storage_path: "anvil-data".to_string(),
         personaldb_snapshot_entry_threshold: 1024,
         personaldb_snapshot_payload_bytes_threshold: 64 * 1024 * 1024,
+        ..anvil::config::Config::default()
     });
     let config2 = Arc::new(anvil::config::Config {
         jwt_secret: "test-secret".to_string(),
@@ -141,6 +143,7 @@ async fn test_cluster_gossip_invalid_secret() {
         storage_path: "anvil-data".to_string(),
         personaldb_snapshot_entry_threshold: 1024,
         personaldb_snapshot_payload_bytes_threshold: 64 * 1024 * 1024,
+        ..anvil::config::Config::default()
     });
 
     let mut swarm1 = create_swarm(config1).await.unwrap();

@@ -106,6 +106,7 @@ impl TestCluster {
             storage_path: storage_path.to_string_lossy().into_owned(),
             personaldb_snapshot_entry_threshold: 1024,
             personaldb_snapshot_payload_bytes_threshold: 64 * 1024 * 1024,
+            ..anvil_core::config::Config::default()
         });
 
         let unique_regions: HashSet<String> = regions.iter().map(|s| s.to_string()).collect();

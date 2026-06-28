@@ -284,6 +284,14 @@ pub struct NativeObjectListing {
     pub common_prefixes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ActiveObjectJournalStats {
+    pub uncompacted_frame_count: u64,
+    pub uncompacted_encoded_bytes: u64,
+    pub last_sequence: u64,
+    pub compacted_through_sequence: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PartitionManifest {
     pub format_version: u16,
@@ -1373,6 +1381,53 @@ pub fn decode_journal_file(input: &[u8]) -> Result<(usize, Vec<JournalFrame>)> {
         .ok_or_else(|| anyhow!("metadata journal header length overflow"))?;
     let frames = decode_frames(&input[header_len..])?;
     Ok((header_len, frames))
+}
+
+pub async fn active_object_journal_stats(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+) -> Result<ActiveObjectJournalStats> {
+    let mut compacted_through_sequence = 0;
+    let manifest_path = storage.metadata_manifest_path(bucket.tenant_id, bucket.id);
+    if tokio::fs::metadata(&manifest_path).await.is_ok() {
+        let manifest_bytes = tokio::fs::read(&manifest_path)
+            .await
+            .with_context(|| format!("read partition manifest {}", manifest_path.display()))?;
+        compacted_through_sequence =
+            decode_partition_manifest(&manifest_bytes, manifest_signing_key)?
+                .compacted_through_sequence;
+    }
+
+    let journal_path = storage.metadata_journal_path(bucket.tenant_id, bucket.id);
+    if tokio::fs::metadata(&journal_path).await.is_err() {
+        return Ok(ActiveObjectJournalStats {
+            compacted_through_sequence,
+            ..ActiveObjectJournalStats::default()
+        });
+    }
+    let journal_bytes = tokio::fs::read(&journal_path)
+        .await
+        .with_context(|| format!("read metadata journal {}", journal_path.display()))?;
+    let (_, frames) = decode_journal_file(&journal_bytes)?;
+    let mut stats = ActiveObjectJournalStats {
+        last_sequence: frames
+            .last()
+            .map(|frame| frame.partition_sequence)
+            .unwrap_or(0),
+        compacted_through_sequence,
+        ..ActiveObjectJournalStats::default()
+    };
+    for frame in frames {
+        if frame.partition_sequence <= compacted_through_sequence {
+            continue;
+        }
+        stats.uncompacted_frame_count = stats.uncompacted_frame_count.saturating_add(1);
+        stats.uncompacted_encoded_bytes = stats
+            .uncompacted_encoded_bytes
+            .saturating_add(frame.encode().len() as u64);
+    }
+    Ok(stats)
 }
 
 fn decode_frames(mut input: &[u8]) -> Result<Vec<JournalFrame>> {
