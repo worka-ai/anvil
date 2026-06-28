@@ -2574,14 +2574,16 @@ fn parse_http_range(
 }
 
 fn invalid_range_response(object_size: u64) -> Response {
-    Response::builder()
-        .status(axum::http::StatusCode::RANGE_NOT_SATISFIABLE)
-        .header("Content-Range", format!("bytes */{}", object_size))
-        .header("Content-Type", "application/xml")
-        .body(Body::from(format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\n  <Code>InvalidRange</Code>\n  <Message>Invalid Range header</Message>\n</Error>\n"
-        )))
-        .unwrap()
+    let mut response = s3_error(
+        "InvalidRange",
+        "Invalid Range header",
+        axum::http::StatusCode::RANGE_NOT_SATISFIABLE,
+    );
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_RANGE,
+        format!("bytes */{}", object_size).parse().unwrap(),
+    );
+    response
 }
 
 fn slice_stream_by_range(
@@ -2812,6 +2814,37 @@ mod tests {
                 .resolve(10)
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_range_error_includes_request_id_and_content_range() {
+        let response = invalid_range_response(10);
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::RANGE_NOT_SATISFIABLE
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok()),
+            Some("bytes */10")
+        );
+        let request_id = response
+            .headers()
+            .get("x-amz-request-id")
+            .expect("S3 invalid range errors must include request id")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(request_id.len(), 32);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let xml = std::str::from_utf8(&body).unwrap();
+        assert!(xml.contains("<Code>InvalidRange</Code>"));
+        assert!(xml.contains(&format!("<RequestId>{request_id}</RequestId>")));
     }
 
     #[test]
