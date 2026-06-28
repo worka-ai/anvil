@@ -4,7 +4,9 @@ use crate::formats::{
 };
 use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
 use crate::persistence::{
-    MultipartPartsPage, MultipartUpload, MultipartUploadPart, MultipartUploadsPage,
+    MetadataMutationReceipt, MultipartAbortMutation, MultipartCompletionMutation,
+    MultipartPartsPage, MultipartUpload, MultipartUploadMutation, MultipartUploadPart,
+    MultipartUploadPartMutation, MultipartUploadsPage,
 };
 use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
@@ -65,7 +67,7 @@ async fn create_multipart_upload(
     tenant_id: i64,
     bucket_id: i64,
     key: &str,
-) -> Result<MultipartUpload> {
+) -> Result<MultipartUploadMutation> {
     create_multipart_upload_inner(storage, tenant_id, bucket_id, key, 0).await
 }
 
@@ -76,7 +78,7 @@ pub(crate) async fn create_multipart_upload_with_permit(
     key: &str,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
-) -> Result<MultipartUpload> {
+) -> Result<MultipartUploadMutation> {
     require_multipart_metadata_permit(tenant_id, bucket_id, permit)?;
     validate_partition_write(storage, permit, partition_owner_signing_key).await?;
     create_multipart_upload_inner(storage, tenant_id, bucket_id, key, permit.fence_token).await
@@ -88,7 +90,7 @@ async fn create_multipart_upload_inner(
     bucket_id: i64,
     key: &str,
     fence_token: u64,
-) -> Result<MultipartUpload> {
+) -> Result<MultipartUploadMutation> {
     let state = read_state(storage, tenant_id, bucket_id).await?;
     let id = next_upload_id(&state)?;
     let upload = MultipartUpload {
@@ -101,7 +103,7 @@ async fn create_multipart_upload_inner(
         completed_at: None,
         aborted_at: None,
     };
-    append_body(
+    let receipt = append_body(
         storage,
         tenant_id,
         bucket_id,
@@ -111,7 +113,7 @@ async fn create_multipart_upload_inner(
         fence_token,
     )
     .await?;
-    Ok(upload)
+    Ok(MultipartUploadMutation { upload, receipt })
 }
 
 pub async fn get_active_multipart_upload(
@@ -155,7 +157,7 @@ async fn upsert_multipart_part(
     content_hash: &str,
     size: i64,
     etag: &str,
-) -> Result<MultipartUploadPart> {
+) -> Result<MultipartUploadPartMutation> {
     upsert_multipart_part_inner(
         storage,
         upload_row_id,
@@ -177,7 +179,7 @@ pub(crate) async fn upsert_multipart_part_with_permit(
     etag: &str,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
-) -> Result<MultipartUploadPart> {
+) -> Result<MultipartUploadPartMutation> {
     validate_partition_write(storage, permit, partition_owner_signing_key).await?;
     upsert_multipart_part_inner(
         storage,
@@ -199,7 +201,7 @@ async fn upsert_multipart_part_inner(
     size: i64,
     etag: &str,
     permit: Option<&PartitionWritePermit>,
-) -> Result<MultipartUploadPart> {
+) -> Result<MultipartUploadPartMutation> {
     let (tenant_id, bucket_id, _) = find_upload(storage, upload_row_id)
         .await?
         .ok_or_else(|| anyhow!("multipart upload not found"))?;
@@ -221,7 +223,7 @@ async fn upsert_multipart_part_inner(
         etag: etag.to_string(),
         created_at: Utc::now(),
     };
-    append_body(
+    let receipt = append_body(
         storage,
         tenant_id,
         bucket_id,
@@ -231,7 +233,7 @@ async fn upsert_multipart_part_inner(
         fence_token,
     )
     .await?;
-    Ok(part)
+    Ok(MultipartUploadPartMutation { part, receipt })
 }
 
 pub async fn list_multipart_parts(
@@ -353,7 +355,10 @@ pub async fn list_active_multipart_uploads(
 }
 
 #[cfg(test)]
-async fn complete_multipart_upload(storage: &Storage, upload_row_id: i64) -> Result<()> {
+async fn complete_multipart_upload(
+    storage: &Storage,
+    upload_row_id: i64,
+) -> Result<MultipartCompletionMutation> {
     complete_multipart_upload_inner(storage, upload_row_id, None).await
 }
 
@@ -362,7 +367,7 @@ pub(crate) async fn complete_multipart_upload_with_permit(
     upload_row_id: i64,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
-) -> Result<()> {
+) -> Result<MultipartCompletionMutation> {
     validate_partition_write(storage, permit, partition_owner_signing_key).await?;
     complete_multipart_upload_inner(storage, upload_row_id, Some(permit)).await
 }
@@ -371,17 +376,20 @@ async fn complete_multipart_upload_inner(
     storage: &Storage,
     upload_row_id: i64,
     permit: Option<&PartitionWritePermit>,
-) -> Result<()> {
+) -> Result<MultipartCompletionMutation> {
     let Some((tenant_id, bucket_id, mut upload)) = find_upload(storage, upload_row_id).await?
     else {
-        return Ok(());
+        return Ok(MultipartCompletionMutation {
+            completed: false,
+            receipt: None,
+        });
     };
     if let Some(permit) = permit {
         require_multipart_metadata_permit(tenant_id, bucket_id, permit)?;
     }
     let fence_token = permit.map(|permit| permit.fence_token).unwrap_or(0);
     upload.completed_at = Some(Utc::now());
-    append_body(
+    let receipt = append_body(
         storage,
         tenant_id,
         bucket_id,
@@ -390,7 +398,11 @@ async fn complete_multipart_upload_inner(
         None,
         fence_token,
     )
-    .await
+    .await?;
+    Ok(MultipartCompletionMutation {
+        completed: true,
+        receipt: Some(receipt),
+    })
 }
 
 pub(crate) async fn abort_multipart_upload_with_permit(
@@ -401,7 +413,7 @@ pub(crate) async fn abort_multipart_upload_with_permit(
     upload_id: uuid::Uuid,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
-) -> Result<bool> {
+) -> Result<MultipartAbortMutation> {
     require_multipart_metadata_permit(tenant_id, bucket_id, permit)?;
     validate_partition_write(storage, permit, partition_owner_signing_key).await?;
     abort_multipart_upload_inner(
@@ -422,14 +434,17 @@ async fn abort_multipart_upload_inner(
     key: &str,
     upload_id: uuid::Uuid,
     fence_token: u64,
-) -> Result<bool> {
+) -> Result<MultipartAbortMutation> {
     let Some(mut upload) =
         get_active_multipart_upload(storage, tenant_id, bucket_id, key, upload_id).await?
     else {
-        return Ok(false);
+        return Ok(MultipartAbortMutation {
+            aborted: false,
+            receipt: None,
+        });
     };
     upload.aborted_at = Some(Utc::now());
-    append_body(
+    let receipt = append_body(
         storage,
         tenant_id,
         bucket_id,
@@ -439,7 +454,10 @@ async fn abort_multipart_upload_inner(
         fence_token,
     )
     .await?;
-    Ok(true)
+    Ok(MultipartAbortMutation {
+        aborted: true,
+        receipt: Some(receipt),
+    })
 }
 
 pub async fn find_multipart_upload_partition(
@@ -501,7 +519,7 @@ async fn append_body(
     upload: Option<MultipartUpload>,
     part: Option<MultipartUploadPart>,
     fence_token: u64,
-) -> Result<()> {
+) -> Result<MetadataMutationReceipt> {
     let path = storage.multipart_journal_path(tenant_id, bucket_id);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -529,6 +547,13 @@ async fn append_body(
         )
         .as_bytes(),
     );
+    let body = serde_json::to_vec(&MultipartBody {
+        event: event.as_str().to_string(),
+        upload,
+        part,
+        emitted_at: Utc::now().to_rfc3339(),
+    })?;
+    let payload_hash = hex::encode(hash32(&body));
     let frame = JournalFrame::new(
         JournalRecordKind::MultipartMetadata,
         sequence,
@@ -536,20 +561,21 @@ async fn append_body(
         *mutation_id.as_bytes(),
         key_hash,
         previous_hash,
-        serde_json::to_vec(&MultipartBody {
-            event: event.as_str().to_string(),
-            upload,
-            part,
-            emitted_at: Utc::now().to_rfc3339(),
-        })?,
+        body,
     );
+    let receipt = MetadataMutationReceipt {
+        mutation_id,
+        payload_hash,
+        record_hash: hex::encode(frame.record_hash),
+        watch_cursor: frame.partition_sequence,
+    };
     let mut file = tokio::fs::OpenOptions::new()
         .append(true)
         .open(&path)
         .await?;
     file.write_all(&frame.encode()).await?;
     file.sync_data().await?;
-    Ok(())
+    Ok(receipt)
 }
 
 async fn ensure_header(
@@ -675,7 +701,8 @@ mod tests {
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let upload = create_multipart_upload(&storage, 1, 2, "obj")
             .await
-            .unwrap();
+            .unwrap()
+            .upload;
         upsert_multipart_part(&storage, upload.id, 1, "hash-a", 10, "etag-a")
             .await
             .unwrap();
@@ -692,9 +719,12 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        complete_multipart_upload(&storage, upload.id)
-            .await
-            .unwrap();
+        assert!(
+            complete_multipart_upload(&storage, upload.id)
+                .await
+                .unwrap()
+                .completed
+        );
         assert!(
             get_active_multipart_upload(&storage, 1, 2, "obj", upload.upload_id)
                 .await
@@ -714,11 +744,18 @@ mod tests {
             .await
             .unwrap();
         upsert_multipart_part_with_permit(
-            &storage, upload.id, 1, "hash-a", 10, "etag-a", &permit, KEY,
+            &storage,
+            upload.upload.id,
+            1,
+            "hash-a",
+            10,
+            "etag-a",
+            &permit,
+            KEY,
         )
         .await
         .unwrap();
-        complete_multipart_upload_with_permit(&storage, upload.id, &permit, KEY)
+        complete_multipart_upload_with_permit(&storage, upload.upload.id, &permit, KEY)
             .await
             .unwrap();
 
@@ -754,7 +791,7 @@ mod tests {
 
         let err = upsert_multipart_part_with_permit(
             &storage,
-            upload.id,
+            upload.upload.id,
             1,
             "hash-a",
             10,

@@ -183,6 +183,12 @@ pub struct MultipartUpload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultipartUploadMutation {
+    pub upload: MultipartUpload,
+    pub receipt: MetadataMutationReceipt,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MultipartUploadsPage {
     pub uploads: Vec<MultipartUpload>,
     pub is_truncated: bool,
@@ -199,6 +205,24 @@ pub struct MultipartUploadPart {
     pub size: i64,
     pub etag: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultipartUploadPartMutation {
+    pub part: MultipartUploadPart,
+    pub receipt: MetadataMutationReceipt,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultipartCompletionMutation {
+    pub completed: bool,
+    pub receipt: Option<MetadataMutationReceipt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultipartAbortMutation {
+    pub aborted: bool,
+    pub receipt: Option<MetadataMutationReceipt>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,6 +248,14 @@ pub struct ObjectWatchEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataMutationReceipt {
+    pub mutation_id: uuid::Uuid,
+    pub payload_hash: String,
+    pub record_hash: String,
+    pub watch_cursor: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendStream {
     pub id: i64,
     pub tenant_id: i64,
@@ -237,6 +269,12 @@ pub struct AppendStream {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppendStreamMutation {
+    pub stream: AppendStream,
+    pub receipt: MetadataMutationReceipt,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendStreamRecord {
     pub id: i64,
     pub stream_id: i64,
@@ -247,9 +285,22 @@ pub struct AppendStreamRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppendStreamRecordMutation {
+    pub record: AppendStreamRecord,
+    pub receipt: MetadataMutationReceipt,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SealAppendStreamMutation {
+    pub sealed: bool,
+    pub receipt: Option<MetadataMutationReceipt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestCasResult {
     pub revision: i64,
     pub manifest_hash: String,
+    pub receipt: MetadataMutationReceipt,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1623,7 +1674,7 @@ impl Persistence {
         tenant_id: i64,
         bucket_id: i64,
         key: &str,
-    ) -> Result<MultipartUpload> {
+    ) -> Result<MultipartUploadMutation> {
         let permit = self
             .multipart_metadata_write_permit(tenant_id, bucket_id)
             .await?;
@@ -1662,7 +1713,7 @@ impl Persistence {
         content_hash: &str,
         size: i64,
         etag: &str,
-    ) -> Result<MultipartUploadPart> {
+    ) -> Result<MultipartUploadPartMutation> {
         let (tenant_id, bucket_id) =
             multipart_journal::find_multipart_upload_partition(&self.storage, upload_row_id)
                 .await?
@@ -1724,12 +1775,18 @@ impl Persistence {
         .await
     }
 
-    pub async fn complete_multipart_upload(&self, upload_row_id: i64) -> Result<()> {
+    pub async fn complete_multipart_upload(
+        &self,
+        upload_row_id: i64,
+    ) -> Result<MultipartCompletionMutation> {
         let Some((tenant_id, bucket_id)) =
             multipart_journal::find_multipart_upload_partition(&self.storage, upload_row_id)
                 .await?
         else {
-            return Ok(());
+            return Ok(MultipartCompletionMutation {
+                completed: false,
+                receipt: None,
+            });
         };
         let permit = self
             .multipart_metadata_write_permit(tenant_id, bucket_id)
@@ -1749,7 +1806,7 @@ impl Persistence {
         bucket_id: i64,
         key: &str,
         upload_id: uuid::Uuid,
-    ) -> Result<bool> {
+    ) -> Result<MultipartAbortMutation> {
         let permit = self
             .multipart_metadata_write_permit(tenant_id, bucket_id)
             .await?;
@@ -1834,7 +1891,7 @@ impl Persistence {
         bucket_id: i64,
         bucket_name: &str,
         stream_key: &str,
-    ) -> Result<AppendStream> {
+    ) -> Result<AppendStreamMutation> {
         let permit = self
             .append_metadata_write_permit(tenant_id, bucket_id)
             .await?;
@@ -1872,7 +1929,7 @@ impl Persistence {
         stream_row_id: i64,
         payload_hash: &str,
         payload_size: i64,
-    ) -> Result<AppendStreamRecord> {
+    ) -> Result<AppendStreamRecordMutation> {
         let (tenant_id, bucket_id) =
             append_journal::find_append_stream_partition(&self.storage, stream_row_id)
                 .await?
@@ -1898,11 +1955,18 @@ impl Persistence {
         append_journal::list_append_stream_records(&self.storage, stream_row_id).await
     }
 
-    pub async fn seal_append_stream(&self, stream_row_id: i64, segment_hash: &str) -> Result<bool> {
+    pub async fn seal_append_stream(
+        &self,
+        stream_row_id: i64,
+        segment_hash: &str,
+    ) -> Result<SealAppendStreamMutation> {
         let Some((tenant_id, bucket_id)) =
             append_journal::find_append_stream_partition(&self.storage, stream_row_id).await?
         else {
-            return Ok(false);
+            return Ok(SealAppendStreamMutation {
+                sealed: false,
+                receipt: None,
+            });
         };
         let permit = self
             .append_metadata_write_permit(tenant_id, bucket_id)
@@ -3185,7 +3249,8 @@ mod tests {
         let upload = persistence
             .create_multipart_upload(tenant.id, bucket.id, "uploads/large.bin")
             .await
-            .unwrap();
+            .unwrap()
+            .upload;
         persistence
             .upsert_multipart_part(upload.id, 1, "part-hash-a", 4, "part-etag-a")
             .await
@@ -3194,7 +3259,8 @@ mod tests {
         let append_stream = persistence
             .create_append_stream(tenant.id, bucket.id, &bucket.name, "events")
             .await
-            .unwrap();
+            .unwrap()
+            .stream;
         persistence
             .append_stream_record(append_stream.id, "event-payload-hash", 42)
             .await
@@ -3784,7 +3850,8 @@ mod tests {
         let upload = persistence
             .create_multipart_upload(1, bucket.id, "objects/large.bin")
             .await
-            .unwrap();
+            .unwrap()
+            .upload;
         persistence
             .upsert_multipart_part(upload.id, 1, "part-hash", 12, "part-etag")
             .await
@@ -3796,7 +3863,8 @@ mod tests {
         let stream = persistence
             .create_append_stream(1, bucket.id, &bucket.name, "stream-a")
             .await
-            .unwrap();
+            .unwrap()
+            .stream;
         persistence
             .append_stream_record(stream.id, "payload-hash", 13)
             .await

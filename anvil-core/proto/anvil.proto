@@ -608,6 +608,12 @@ message InitiateMultipartRequest {
 
 message InitiateMultipartResponse {
     string upload_id = 1;
+    string version_id = 2;
+    string mutation_id = 3;
+    string payload_hash = 4;
+    string record_hash = 5;
+    uint64 authz_revision = 6;
+    uint64 watch_cursor = 7;
 }
 
 message UploadPartRequest {
@@ -626,6 +632,12 @@ message UploadPartMetadata {
 
 message UploadPartResponse {
     string etag = 1;
+    string version_id = 2;
+    string mutation_id = 3;
+    string payload_hash = 4;
+    string record_hash = 5;
+    uint64 authz_revision = 6;
+    uint64 watch_cursor = 7;
 }
 
 message CompleteMultipartPart {
@@ -713,6 +725,12 @@ message CompareAndSwapManifestRequest {
 message CompareAndSwapManifestResponse {
     uint64 revision = 1;
     string manifest_hash = 2;
+    string version_id = 3;
+    string mutation_id = 4;
+    string payload_hash = 5;
+    string record_hash = 6;
+    uint64 authz_revision = 7;
+    uint64 watch_cursor = 8;
 }
 
 message WatchPrefixRequest {
@@ -740,6 +758,12 @@ message CreateAppendStreamRequest {
 
 message CreateAppendStreamResponse {
     string stream_id = 1;
+    string version_id = 2;
+    string mutation_id = 3;
+    string payload_hash = 4;
+    string record_hash = 5;
+    uint64 authz_revision = 6;
+    uint64 watch_cursor = 7;
 }
 
 message AppendStreamRecordRequest {
@@ -753,6 +777,11 @@ message AppendStreamRecordResponse {
     uint64 record_sequence = 1;
     string payload_hash = 2;
     int64 payload_size = 3;
+    string version_id = 4;
+    string mutation_id = 5;
+    string record_hash = 6;
+    uint64 authz_revision = 7;
+    uint64 watch_cursor = 8;
 }
 
 message SealAppendStreamSegmentRequest {
@@ -764,6 +793,12 @@ message SealAppendStreamSegmentRequest {
 message SealAppendStreamSegmentResponse {
     uint64 record_count = 1;
     string segment_hash = 2;
+    string version_id = 3;
+    string mutation_id = 4;
+    string payload_hash = 5;
+    string record_hash = 6;
+    uint64 authz_revision = 7;
+    uint64 watch_cursor = 8;
 }
 
 message CompleteMultipartResponse {
@@ -783,7 +818,14 @@ message AbortMultipartRequest {
     string upload_id = 3;
 }
 
-message AbortMultipartResponse {}
+message AbortMultipartResponse {
+    string version_id = 1;
+    string mutation_id = 2;
+    string payload_hash = 3;
+    string record_hash = 4;
+    uint64 authz_revision = 5;
+    uint64 watch_cursor = 6;
+}
 
 // Internal Service for node-to-node communication
 service InternalAnvilService {

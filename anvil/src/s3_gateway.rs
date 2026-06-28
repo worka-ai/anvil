@@ -1869,12 +1869,12 @@ async fn initiate_multipart_upload(
         .initiate_multipart_upload(claims.tenant_id, &bucket, &key, &claims.scopes)
         .await
     {
-        Ok(upload_id) => {
+        Ok(result) => {
             let xml = format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Bucket>{}</Bucket>\n  <Key>{}</Key>\n  <UploadId>{}</UploadId>\n</InitiateMultipartUploadResult>\n",
                 xml_escape(&bucket),
                 xml_escape(&key),
-                upload_id
+                result.upload_id
             );
             Response::builder()
                 .status(200)
@@ -1908,9 +1908,9 @@ async fn upload_part(
         )
         .await
     {
-        Ok(etag) => Response::builder()
+        Ok(result) => Response::builder()
             .status(200)
-            .header("ETag", format!("\"{}\"", etag))
+            .header("ETag", format!("\"{}\"", result.etag))
             .body(Body::empty())
             .unwrap(),
         Err(status) => s3_status_to_response_for_auth(status, true, "NoSuchUpload"),
@@ -2241,7 +2241,7 @@ async fn abort_multipart_upload(
         .abort_multipart_upload(claims.tenant_id, &bucket, &key, upload_id, &claims.scopes)
         .await
     {
-        Ok(()) => Response::builder()
+        Ok(_) => Response::builder()
             .status(axum::http::StatusCode::NO_CONTENT)
             .body(Body::empty())
             .unwrap(),

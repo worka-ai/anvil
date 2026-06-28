@@ -3,7 +3,7 @@ use crate::formats::{
     hash32, validate_journal_chain,
 };
 use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
-use crate::persistence::ManifestCasResult;
+use crate::persistence::{ManifestCasResult, MetadataMutationReceipt};
 use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -103,7 +103,7 @@ async fn compare_and_swap_manifest_inner(
     let revision = current
         .checked_add(1)
         .ok_or_else(|| anyhow!("manifest revision overflow"))?;
-    append_manifest(
+    let receipt = append_manifest(
         storage,
         ManifestBody {
             tenant_id,
@@ -120,6 +120,7 @@ async fn compare_and_swap_manifest_inner(
     Ok(Some(ManifestCasResult {
         revision,
         manifest_hash: manifest_hash.to_string(),
+        receipt,
     }))
 }
 
@@ -138,7 +139,11 @@ async fn current_revision(
         .unwrap_or(0))
 }
 
-async fn append_manifest(storage: &Storage, body: ManifestBody, fence_token: u64) -> Result<()> {
+async fn append_manifest(
+    storage: &Storage,
+    body: ManifestBody,
+    fence_token: u64,
+) -> Result<MetadataMutationReceipt> {
     let path = storage.manifest_cas_journal_path(body.tenant_id, body.bucket_id);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -154,6 +159,8 @@ async fn append_manifest(storage: &Storage, body: ManifestBody, fence_token: u64
         .map(|frame| frame.record_hash)
         .unwrap_or([0; 32]);
     let mutation_id = uuid::Uuid::new_v4();
+    let body_bytes = serde_json::to_vec(&body)?;
+    let payload_hash = hex::encode(hash32(&body_bytes));
     let frame = JournalFrame::new(
         JournalRecordKind::ManifestCas,
         sequence,
@@ -167,15 +174,21 @@ async fn append_manifest(storage: &Storage, body: ManifestBody, fence_token: u64
             .as_bytes(),
         ),
         previous_hash,
-        serde_json::to_vec(&body)?,
+        body_bytes,
     );
+    let receipt = MetadataMutationReceipt {
+        mutation_id,
+        payload_hash,
+        record_hash: hex::encode(frame.record_hash),
+        watch_cursor: frame.partition_sequence,
+    };
     let mut file = tokio::fs::OpenOptions::new()
         .append(true)
         .open(&path)
         .await?;
     file.write_all(&frame.encode()).await?;
     file.sync_data().await?;
-    Ok(())
+    Ok(receipt)
 }
 
 async fn read_manifest_bodies(

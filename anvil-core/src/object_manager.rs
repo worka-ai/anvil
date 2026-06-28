@@ -8,7 +8,8 @@ use crate::{
     metadata_journal,
     permissions::AnvilAction,
     persistence::{
-        Bucket, Object, ObjectVersion, ObjectVersionsPage, ObjectWatchEvent, Persistence,
+        Bucket, MetadataMutationReceipt, Object, ObjectVersion, ObjectVersionsPage,
+        ObjectWatchEvent, Persistence,
     },
     placement::PlacementManager,
     sharding::ShardManager,
@@ -58,6 +59,25 @@ pub struct CompleteMultipartPart {
     pub etag: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct InitiateMultipartUploadResult {
+    pub upload_id: uuid::Uuid,
+    pub receipt: MetadataMutationReceipt,
+}
+
+#[derive(Debug, Clone)]
+pub struct UploadPartResult {
+    pub etag: String,
+    pub payload_hash: String,
+    pub receipt: MetadataMutationReceipt,
+}
+
+#[derive(Debug, Clone)]
+pub struct AbortMultipartUploadResult {
+    pub upload_id: uuid::Uuid,
+    pub receipt: MetadataMutationReceipt,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ObjectWriteOptions {
     pub content_type: Option<String>,
@@ -99,18 +119,27 @@ pub struct AppendStreamRecordResult {
     pub record_sequence: u64,
     pub payload_hash: String,
     pub payload_size: i64,
+    pub receipt: MetadataMutationReceipt,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateAppendStreamResult {
+    pub stream_id: uuid::Uuid,
+    pub receipt: MetadataMutationReceipt,
 }
 
 #[derive(Debug, Clone)]
 pub struct SealAppendStreamResult {
     pub record_count: u64,
     pub segment_hash: String,
+    pub receipt: MetadataMutationReceipt,
 }
 
 #[derive(Debug, Clone)]
 pub struct ManifestCasResult {
     pub revision: u64,
     pub manifest_hash: String,
+    pub receipt: MetadataMutationReceipt,
 }
 
 impl ObjectManager {
@@ -334,16 +363,19 @@ impl ObjectManager {
         bucket_name: &str,
         object_key: &str,
         scopes: &[String],
-    ) -> Result<uuid::Uuid, Status> {
+    ) -> Result<InitiateMultipartUploadResult, Status> {
         self.validate_write_request(bucket_name, object_key, scopes)?;
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
 
-        let upload = self
+        let mutation = self
             .persistence
             .create_multipart_upload(tenant_id, bucket.id, object_key)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(upload.upload_id)
+        Ok(InitiateMultipartUploadResult {
+            upload_id: mutation.upload.upload_id,
+            receipt: mutation.receipt,
+        })
     }
 
     pub async fn upload_part(
@@ -355,7 +387,7 @@ impl ObjectManager {
         part_number: i32,
         scopes: &[String],
         data_stream: impl Stream<Item = Result<Vec<u8>, Status>> + Unpin,
-    ) -> Result<String, Status> {
+    ) -> Result<UploadPartResult, Status> {
         self.validate_write_request(bucket_name, object_key, scopes)?;
         validate_multipart_part_number(part_number)?;
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
@@ -376,7 +408,7 @@ impl ObjectManager {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let part = self
+        let mutation = self
             .persistence
             .upsert_multipart_part(
                 upload.id,
@@ -387,7 +419,11 @@ impl ObjectManager {
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(part.etag)
+        Ok(UploadPartResult {
+            etag: mutation.part.etag,
+            payload_hash: content_hash,
+            receipt: mutation.receipt,
+        })
     }
 
     pub async fn complete_multipart_upload(
@@ -468,10 +504,14 @@ impl ObjectManager {
             )
             .await?;
 
-        self.persistence
+        let completion = self
+            .persistence
             .complete_multipart_upload(upload.id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        if !completion.completed {
+            return Err(Status::not_found("Multipart upload not found"));
+        }
 
         Ok(object)
     }
@@ -483,16 +523,16 @@ impl ObjectManager {
         object_key: &str,
         upload_id: uuid::Uuid,
         scopes: &[String],
-    ) -> Result<(), Status> {
+    ) -> Result<AbortMultipartUploadResult, Status> {
         self.validate_write_request(bucket_name, object_key, scopes)?;
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
-        let aborted = self
+        let mutation = self
             .persistence
             .abort_multipart_upload(tenant_id, bucket.id, object_key, upload_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        if aborted {
-            Ok(())
+        if let Some(receipt) = mutation.receipt {
+            Ok(AbortMultipartUploadResult { upload_id, receipt })
         } else {
             Err(Status::not_found("Multipart upload not found"))
         }
@@ -605,15 +645,18 @@ impl ObjectManager {
         bucket_name: &str,
         stream_key: &str,
         scopes: &[String],
-    ) -> Result<uuid::Uuid, Status> {
+    ) -> Result<CreateAppendStreamResult, Status> {
         self.validate_write_request(bucket_name, stream_key, scopes)?;
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
-        let stream = self
+        let mutation = self
             .persistence
             .create_append_stream(tenant_id, bucket.id, &bucket.name, stream_key)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(stream.stream_id)
+        Ok(CreateAppendStreamResult {
+            stream_id: mutation.stream.stream_id,
+            receipt: mutation.receipt,
+        })
     }
 
     pub async fn append_stream_record(
@@ -639,17 +682,18 @@ impl ObjectManager {
             .store_whole_object(&payload_hash, &payload)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        let record = self
+        let mutation = self
             .persistence
             .append_stream_record(stream.id, &payload_hash, payload.len() as i64)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(AppendStreamRecordResult {
-            record_sequence: u64::try_from(record.record_sequence)
+            record_sequence: u64::try_from(mutation.record.record_sequence)
                 .map_err(|_| Status::internal("Invalid record sequence"))?,
             payload_hash,
             payload_size: payload.len() as i64,
+            receipt: mutation.receipt,
         })
     }
 
@@ -692,15 +736,16 @@ impl ObjectManager {
             .seal_append_stream(stream.id, &segment_hash)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        if !sealed {
+        let Some(receipt) = sealed.receipt else {
             return Err(Status::failed_precondition(
                 "Append stream is already sealed",
             ));
-        }
+        };
 
         Ok(SealAppendStreamResult {
             record_count: records.len() as u64,
             segment_hash,
+            receipt,
         })
     }
 
@@ -742,6 +787,7 @@ impl ObjectManager {
             revision: u64::try_from(result.revision)
                 .map_err(|_| Status::internal("Invalid manifest revision"))?,
             manifest_hash: result.manifest_hash,
+            receipt: result.receipt,
         })
     }
 

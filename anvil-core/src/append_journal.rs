@@ -3,7 +3,10 @@ use crate::formats::{
     hash32, validate_journal_chain,
 };
 use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
-use crate::persistence::{AppendStream, AppendStreamRecord};
+use crate::persistence::{
+    AppendStream, AppendStreamMutation, AppendStreamRecord, AppendStreamRecordMutation,
+    MetadataMutationReceipt, SealAppendStreamMutation,
+};
 use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
@@ -62,7 +65,7 @@ async fn create_append_stream(
     bucket_id: i64,
     bucket_name: &str,
     stream_key: &str,
-) -> Result<AppendStream> {
+) -> Result<AppendStreamMutation> {
     create_append_stream_inner(storage, tenant_id, bucket_id, bucket_name, stream_key, 0).await
 }
 
@@ -74,7 +77,7 @@ pub(crate) async fn create_append_stream_with_permit(
     stream_key: &str,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
-) -> Result<AppendStream> {
+) -> Result<AppendStreamMutation> {
     require_append_metadata_permit(tenant_id, bucket_id, permit)?;
     validate_partition_write(storage, permit, partition_owner_signing_key).await?;
     create_append_stream_inner(
@@ -95,7 +98,7 @@ async fn create_append_stream_inner(
     bucket_name: &str,
     stream_key: &str,
     fence_token: u64,
-) -> Result<AppendStream> {
+) -> Result<AppendStreamMutation> {
     let state = read_state(storage, tenant_id, bucket_id).await?;
     let stream = AppendStream {
         id: next_stream_id(&state)?,
@@ -108,7 +111,7 @@ async fn create_append_stream_inner(
         sealed_at: None,
         segment_hash: None,
     };
-    append_body(
+    let receipt = append_body(
         storage,
         tenant_id,
         bucket_id,
@@ -118,7 +121,7 @@ async fn create_append_stream_inner(
         fence_token,
     )
     .await?;
-    Ok(stream)
+    Ok(AppendStreamMutation { stream, receipt })
 }
 
 pub async fn get_active_append_stream(
@@ -145,7 +148,7 @@ async fn append_stream_record(
     stream_row_id: i64,
     payload_hash: &str,
     payload_size: i64,
-) -> Result<AppendStreamRecord> {
+) -> Result<AppendStreamRecordMutation> {
     append_stream_record_inner(storage, stream_row_id, payload_hash, payload_size, None).await
 }
 
@@ -156,7 +159,7 @@ pub(crate) async fn append_stream_record_with_permit(
     payload_size: i64,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
-) -> Result<AppendStreamRecord> {
+) -> Result<AppendStreamRecordMutation> {
     validate_partition_write(storage, permit, partition_owner_signing_key).await?;
     append_stream_record_inner(
         storage,
@@ -174,7 +177,7 @@ async fn append_stream_record_inner(
     payload_hash: &str,
     payload_size: i64,
     permit: Option<&PartitionWritePermit>,
-) -> Result<AppendStreamRecord> {
+) -> Result<AppendStreamRecordMutation> {
     let (tenant_id, bucket_id, _) = find_stream(storage, stream_row_id)
         .await?
         .ok_or_else(|| anyhow!("append stream not found"))?;
@@ -199,7 +202,7 @@ async fn append_stream_record_inner(
         payload_size,
         created_at: Utc::now(),
     };
-    append_body(
+    let receipt = append_body(
         storage,
         tenant_id,
         bucket_id,
@@ -209,7 +212,7 @@ async fn append_stream_record_inner(
         fence_token,
     )
     .await?;
-    Ok(record)
+    Ok(AppendStreamRecordMutation { record, receipt })
 }
 
 pub async fn list_append_stream_records(
@@ -234,7 +237,7 @@ async fn seal_append_stream(
     storage: &Storage,
     stream_row_id: i64,
     segment_hash: &str,
-) -> Result<bool> {
+) -> Result<SealAppendStreamMutation> {
     seal_append_stream_inner(storage, stream_row_id, segment_hash, None).await
 }
 
@@ -244,7 +247,7 @@ pub(crate) async fn seal_append_stream_with_permit(
     segment_hash: &str,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
-) -> Result<bool> {
+) -> Result<SealAppendStreamMutation> {
     validate_partition_write(storage, permit, partition_owner_signing_key).await?;
     seal_append_stream_inner(storage, stream_row_id, segment_hash, Some(permit)).await
 }
@@ -254,21 +257,27 @@ async fn seal_append_stream_inner(
     stream_row_id: i64,
     segment_hash: &str,
     permit: Option<&PartitionWritePermit>,
-) -> Result<bool> {
+) -> Result<SealAppendStreamMutation> {
     let Some((tenant_id, bucket_id, mut stream)) = find_stream(storage, stream_row_id).await?
     else {
-        return Ok(false);
+        return Ok(SealAppendStreamMutation {
+            sealed: false,
+            receipt: None,
+        });
     };
     if let Some(permit) = permit {
         require_append_metadata_permit(tenant_id, bucket_id, permit)?;
     }
     let fence_token = permit.map(|permit| permit.fence_token).unwrap_or(0);
     if stream.sealed_at.is_some() {
-        return Ok(false);
+        return Ok(SealAppendStreamMutation {
+            sealed: false,
+            receipt: None,
+        });
     }
     stream.sealed_at = Some(Utc::now());
     stream.segment_hash = Some(segment_hash.to_string());
-    append_body(
+    let receipt = append_body(
         storage,
         tenant_id,
         bucket_id,
@@ -278,7 +287,10 @@ async fn seal_append_stream_inner(
         fence_token,
     )
     .await?;
-    Ok(true)
+    Ok(SealAppendStreamMutation {
+        sealed: true,
+        receipt: Some(receipt),
+    })
 }
 
 pub async fn find_append_stream_partition(
@@ -342,7 +354,7 @@ async fn append_body(
     stream: Option<AppendStream>,
     record: Option<AppendStreamRecord>,
     fence_token: u64,
-) -> Result<()> {
+) -> Result<MetadataMutationReceipt> {
     let path = storage.append_journal_path(tenant_id, bucket_id);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -370,6 +382,13 @@ async fn append_body(
         )
         .as_bytes(),
     );
+    let body = serde_json::to_vec(&AppendBody {
+        event: event.as_str().to_string(),
+        stream,
+        record,
+        emitted_at: Utc::now().to_rfc3339(),
+    })?;
+    let payload_hash = hex::encode(hash32(&body));
     let frame = JournalFrame::new(
         JournalRecordKind::AppendMetadata,
         sequence,
@@ -377,20 +396,21 @@ async fn append_body(
         *mutation_id.as_bytes(),
         key_hash,
         previous_hash,
-        serde_json::to_vec(&AppendBody {
-            event: event.as_str().to_string(),
-            stream,
-            record,
-            emitted_at: Utc::now().to_rfc3339(),
-        })?,
+        body,
     );
+    let receipt = MetadataMutationReceipt {
+        mutation_id,
+        payload_hash,
+        record_hash: hex::encode(frame.record_hash),
+        watch_cursor: frame.partition_sequence,
+    };
     let mut file = tokio::fs::OpenOptions::new()
         .append(true)
         .open(&path)
         .await?;
     file.write_all(&frame.encode()).await?;
     file.sync_data().await?;
-    Ok(())
+    Ok(receipt)
 }
 
 async fn ensure_header(
@@ -512,7 +532,8 @@ mod tests {
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let stream = create_append_stream(&storage, 1, 2, "bucket", "stream")
             .await
-            .unwrap();
+            .unwrap()
+            .stream;
         append_stream_record(&storage, stream.id, "hash-a", 10)
             .await
             .unwrap();
@@ -536,6 +557,7 @@ mod tests {
             seal_append_stream(&storage, stream.id, "seg")
                 .await
                 .unwrap()
+                .sealed
         );
         assert!(
             get_active_append_stream(&storage, 1, 2, "stream", stream.stream_id)
@@ -556,10 +578,10 @@ mod tests {
             create_append_stream_with_permit(&storage, 1, 2, "bucket", "stream", &permit, KEY)
                 .await
                 .unwrap();
-        append_stream_record_with_permit(&storage, stream.id, "hash-a", 10, &permit, KEY)
+        append_stream_record_with_permit(&storage, stream.stream.id, "hash-a", 10, &permit, KEY)
             .await
             .unwrap();
-        seal_append_stream_with_permit(&storage, stream.id, "segment-a", &permit, KEY)
+        seal_append_stream_with_permit(&storage, stream.stream.id, "segment-a", &permit, KEY)
             .await
             .unwrap();
 
@@ -601,10 +623,16 @@ mod tests {
         let newer = ready_owner(&storage, 1, 2, "node-b").await;
         assert!(newer.fence_token > stale_permit.fence_token);
 
-        let err =
-            append_stream_record_with_permit(&storage, stream.id, "hash-a", 10, &stale_permit, KEY)
-                .await
-                .unwrap_err();
+        let err = append_stream_record_with_permit(
+            &storage,
+            stream.stream.id,
+            "hash-a",
+            10,
+            &stale_permit,
+            KEY,
+        )
+        .await
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("write permit owner is not current")

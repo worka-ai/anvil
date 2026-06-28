@@ -3,13 +3,13 @@ use anvil::anvil_api::index_service_client::IndexServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::repair_service_client::RepairServiceClient;
 use anvil::anvil_api::{
-    self, AppendStreamRecordRequest, CompareAndSwapManifestRequest, CompleteMultipartPart,
-    CompleteMultipartRequest, ComposeObjectRequest, ComposeObjectSource, CopyObjectRequest,
-    CreateAppendStreamRequest, CreateBucketRequest, CreateIndexRequest, DeleteObjectRequest,
-    GetObjectRequest, HeadObjectRequest, InitiateMultipartRequest, ListObjectVersionsRequest,
-    ListObjectsRequest, ObjectMetadata, PatchJsonObjectRequest, PutObjectRequest,
-    RepairDirectoryIndexRequest, SealAppendStreamSegmentRequest, UploadPartMetadata,
-    UploadPartRequest, WatchPrefixRequest,
+    self, AbortMultipartRequest, AppendStreamRecordRequest, CompareAndSwapManifestRequest,
+    CompleteMultipartPart, CompleteMultipartRequest, ComposeObjectRequest, ComposeObjectSource,
+    CopyObjectRequest, CreateAppendStreamRequest, CreateBucketRequest, CreateIndexRequest,
+    DeleteObjectRequest, GetObjectRequest, HeadObjectRequest, InitiateMultipartRequest,
+    ListObjectVersionsRequest, ListObjectsRequest, ObjectMetadata, PatchJsonObjectRequest,
+    PutObjectRequest, RepairDirectoryIndexRequest, SealAppendStreamSegmentRequest,
+    UploadPartMetadata, UploadPartRequest, WatchPrefixRequest,
 };
 use futures_util::StreamExt;
 use std::time::Duration;
@@ -1712,12 +1712,14 @@ async fn test_append_stream_records_are_ordered_and_sealable() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    let stream_id = object_client
+    let create_stream = object_client
         .create_append_stream(create_stream_req)
         .await
         .unwrap()
-        .into_inner()
-        .stream_id;
+        .into_inner();
+    assert_native_mutation_response!(create_stream);
+    assert_eq!(create_stream.version_id, create_stream.stream_id);
+    let stream_id = create_stream.stream_id;
 
     let mut first_req = Request::new(AppendStreamRecordRequest {
         bucket_name: bucket_name.clone(),
@@ -1734,6 +1736,8 @@ async fn test_append_stream_records_are_ordered_and_sealable() {
         .await
         .unwrap()
         .into_inner();
+    assert_native_mutation_response!(first);
+    assert_eq!(first.version_id, "1");
     assert_eq!(first.record_sequence, 1);
     assert_eq!(first.payload_size, 5);
     assert!(!first.payload_hash.is_empty());
@@ -1753,7 +1757,9 @@ async fn test_append_stream_records_are_ordered_and_sealable() {
         .await
         .unwrap()
         .into_inner();
+    assert_native_mutation_response!(second);
     assert_eq!(second.record_sequence, 2);
+    assert!(second.watch_cursor > first.watch_cursor);
 
     let mut seal_req = Request::new(SealAppendStreamSegmentRequest {
         bucket_name: bucket_name.clone(),
@@ -1769,8 +1775,11 @@ async fn test_append_stream_records_are_ordered_and_sealable() {
         .await
         .unwrap()
         .into_inner();
+    assert_native_mutation_response!(sealed);
+    assert_eq!(sealed.version_id, stream_id);
     assert_eq!(sealed.record_count, 2);
     assert!(!sealed.segment_hash.is_empty());
+    assert!(sealed.watch_cursor > second.watch_cursor);
 
     let mut append_after_seal = Request::new(AppendStreamRecordRequest {
         bucket_name,
@@ -1831,7 +1840,9 @@ async fn test_compare_and_swap_manifest_enforces_expected_revision() {
         .await
         .unwrap()
         .into_inner();
+    assert_native_mutation_response!(first);
     assert_eq!(first.revision, 1);
+    assert_eq!(first.version_id, "1");
     assert!(!first.manifest_hash.is_empty());
 
     let mut stale_update = Request::new(CompareAndSwapManifestRequest {
@@ -1866,8 +1877,11 @@ async fn test_compare_and_swap_manifest_enforces_expected_revision() {
         .await
         .unwrap()
         .into_inner();
+    assert_native_mutation_response!(second);
     assert_eq!(second.revision, 2);
+    assert_eq!(second.version_id, "2");
     assert_ne!(second.manifest_hash, first.manifest_hash);
+    assert!(second.watch_cursor > first.watch_cursor);
 }
 
 #[tokio::test]
@@ -1904,12 +1918,14 @@ async fn test_multipart_upload_completes_ordered_parts() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    let upload_id = object_client
+    let initiate_res = object_client
         .initiate_multipart_upload(initiate_req)
         .await
         .unwrap()
-        .into_inner()
-        .upload_id;
+        .into_inner();
+    assert_native_mutation_response!(initiate_res);
+    assert_eq!(initiate_res.version_id, initiate_res.upload_id);
+    let upload_id = initiate_res.upload_id;
 
     let part_payloads = [(1, b"multi".to_vec()), (2, b"part".to_vec())];
     let mut completed_parts = Vec::new();
@@ -1939,6 +1955,8 @@ async fn test_multipart_upload_completes_ordered_parts() {
             .await
             .unwrap()
             .into_inner();
+        assert_native_mutation_response!(upload_part);
+        assert_eq!(upload_part.version_id, part_number.to_string());
         completed_parts.push(CompleteMultipartPart {
             part_number,
             etag: upload_part.etag,
@@ -1984,6 +2002,66 @@ async fn test_multipart_upload_completes_ordered_parts() {
     }
 
     assert_eq!(downloaded, b"multipart");
+}
+
+#[tokio::test]
+async fn test_multipart_abort_returns_mutation_metadata() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+
+    let bucket_name = "test-multipart-abort-bucket".to_string();
+    let object_key = "aborted.txt".to_string();
+    let mut create_req = Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
+    });
+    create_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    bucket_client.create_bucket(create_req).await.unwrap();
+
+    let mut initiate_req = Request::new(InitiateMultipartRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: object_key.clone(),
+    });
+    initiate_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let initiate_res = object_client
+        .initiate_multipart_upload(initiate_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_native_mutation_response!(initiate_res);
+
+    let mut abort_req = Request::new(AbortMultipartRequest {
+        bucket_name,
+        object_key,
+        upload_id: initiate_res.upload_id.clone(),
+    });
+    abort_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let abort_res = object_client
+        .abort_multipart_upload(abort_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_native_mutation_response!(abort_res);
+    assert_eq!(abort_res.version_id, initiate_res.upload_id);
+    assert!(abort_res.watch_cursor > initiate_res.watch_cursor);
 }
 
 #[tokio::test]

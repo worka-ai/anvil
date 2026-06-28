@@ -1,7 +1,7 @@
 use crate::anvil_api::object_service_server::ObjectService;
 use crate::anvil_api::*;
 use crate::object_manager::ObjectWriteOptions;
-use crate::{AppState, auth, watch_log};
+use crate::{AppState, auth, authz_journal, watch_log};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -439,10 +439,17 @@ impl ObjectService for AppState {
                 &claims.scopes,
             )
             .await?;
+        let authz_revision = latest_authz_revision(self, claims.tenant_id).await?;
 
         Ok(Response::new(CompareAndSwapManifestResponse {
             revision: result.revision,
-            manifest_hash: result.manifest_hash,
+            manifest_hash: result.manifest_hash.clone(),
+            version_id: result.revision.to_string(),
+            mutation_id: result.receipt.mutation_id.to_string(),
+            payload_hash: result.manifest_hash,
+            record_hash: result.receipt.record_hash,
+            authz_revision,
+            watch_cursor: result.receipt.watch_cursor,
         }))
     }
 
@@ -523,7 +530,7 @@ impl ObjectService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
-        let stream_id = self
+        let result = self
             .object_manager
             .create_append_stream(
                 claims.tenant_id,
@@ -532,9 +539,16 @@ impl ObjectService for AppState {
                 &claims.scopes,
             )
             .await?;
+        let authz_revision = latest_authz_revision(self, claims.tenant_id).await?;
 
         Ok(Response::new(CreateAppendStreamResponse {
-            stream_id: stream_id.to_string(),
+            stream_id: result.stream_id.to_string(),
+            version_id: result.stream_id.to_string(),
+            mutation_id: result.receipt.mutation_id.to_string(),
+            payload_hash: result.receipt.payload_hash,
+            record_hash: result.receipt.record_hash,
+            authz_revision,
+            watch_cursor: result.receipt.watch_cursor,
         }))
     }
 
@@ -561,11 +575,17 @@ impl ObjectService for AppState {
                 &claims.scopes,
             )
             .await?;
+        let authz_revision = latest_authz_revision(self, claims.tenant_id).await?;
 
         Ok(Response::new(AppendStreamRecordResponse {
             record_sequence: record.record_sequence,
             payload_hash: record.payload_hash,
             payload_size: record.payload_size,
+            version_id: record.record_sequence.to_string(),
+            mutation_id: record.receipt.mutation_id.to_string(),
+            record_hash: record.receipt.record_hash,
+            authz_revision,
+            watch_cursor: record.receipt.watch_cursor,
         }))
     }
 
@@ -579,6 +599,7 @@ impl ObjectService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
+        let version_id = req.stream_id.clone();
         let stream_id = uuid::Uuid::parse_str(&req.stream_id)
             .map_err(|_| Status::invalid_argument("Invalid stream_id"))?;
         let sealed = self
@@ -591,10 +612,17 @@ impl ObjectService for AppState {
                 &claims.scopes,
             )
             .await?;
+        let authz_revision = latest_authz_revision(self, claims.tenant_id).await?;
 
         Ok(Response::new(SealAppendStreamSegmentResponse {
             record_count: sealed.record_count,
-            segment_hash: sealed.segment_hash,
+            segment_hash: sealed.segment_hash.clone(),
+            version_id,
+            mutation_id: sealed.receipt.mutation_id.to_string(),
+            payload_hash: sealed.segment_hash,
+            record_hash: sealed.receipt.record_hash,
+            authz_revision,
+            watch_cursor: sealed.receipt.watch_cursor,
         }))
     }
 
@@ -609,7 +637,7 @@ impl ObjectService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
 
-        let upload_id = self
+        let result = self
             .object_manager
             .initiate_multipart_upload(
                 claims.tenant_id,
@@ -618,9 +646,16 @@ impl ObjectService for AppState {
                 &claims.scopes,
             )
             .await?;
+        let authz_revision = latest_authz_revision(self, claims.tenant_id).await?;
 
         Ok(Response::new(InitiateMultipartResponse {
-            upload_id: upload_id.to_string(),
+            upload_id: result.upload_id.to_string(),
+            version_id: result.upload_id.to_string(),
+            mutation_id: result.receipt.mutation_id.to_string(),
+            payload_hash: result.receipt.payload_hash,
+            record_hash: result.receipt.record_hash,
+            authz_revision,
+            watch_cursor: result.receipt.watch_cursor,
         }))
     }
 
@@ -644,6 +679,7 @@ impl ObjectService for AppState {
             None => return Err(Status::invalid_argument("Empty stream")),
         };
 
+        let part_version_id = metadata.part_number.to_string();
         let upload_id = uuid::Uuid::parse_str(&metadata.upload_id)
             .map_err(|_| Status::invalid_argument("Invalid upload_id"))?;
         let data_stream = stream.map(|chunk_result| match chunk_result {
@@ -654,7 +690,7 @@ impl ObjectService for AppState {
             Err(e) => Err(e),
         });
 
-        let etag = self
+        let result = self
             .object_manager
             .upload_part(
                 claims.tenant_id,
@@ -666,8 +702,17 @@ impl ObjectService for AppState {
                 data_stream,
             )
             .await?;
+        let authz_revision = latest_authz_revision(self, claims.tenant_id).await?;
 
-        Ok(Response::new(UploadPartResponse { etag }))
+        Ok(Response::new(UploadPartResponse {
+            etag: result.etag,
+            version_id: part_version_id,
+            mutation_id: result.receipt.mutation_id.to_string(),
+            payload_hash: result.payload_hash,
+            record_hash: result.receipt.record_hash,
+            authz_revision,
+            watch_cursor: result.receipt.watch_cursor,
+        }))
     }
 
     async fn complete_multipart_upload(
@@ -730,7 +775,8 @@ impl ObjectService for AppState {
         let upload_id = uuid::Uuid::parse_str(&req.upload_id)
             .map_err(|_| Status::invalid_argument("Invalid upload_id"))?;
 
-        self.object_manager
+        let result = self
+            .object_manager
             .abort_multipart_upload(
                 claims.tenant_id,
                 &req.bucket_name,
@@ -739,9 +785,24 @@ impl ObjectService for AppState {
                 &claims.scopes,
             )
             .await?;
+        let authz_revision = latest_authz_revision(self, claims.tenant_id).await?;
 
-        Ok(Response::new(AbortMultipartResponse {}))
+        Ok(Response::new(AbortMultipartResponse {
+            version_id: result.upload_id.to_string(),
+            mutation_id: result.receipt.mutation_id.to_string(),
+            payload_hash: result.receipt.payload_hash,
+            record_hash: result.receipt.record_hash,
+            authz_revision,
+            watch_cursor: result.receipt.watch_cursor,
+        }))
     }
+}
+
+async fn latest_authz_revision(state: &AppState, tenant_id: i64) -> Result<u64, Status> {
+    let revision = authz_journal::latest_authz_revision(&state.storage, tenant_id)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+    u64::try_from(revision).map_err(|_| Status::internal("Invalid authz revision"))
 }
 
 fn parse_optional_version_id(value: Option<&str>) -> Result<Option<uuid::Uuid>, Status> {
