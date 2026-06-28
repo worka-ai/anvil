@@ -2,9 +2,10 @@ use crate::formats::{
     BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, Hash32, JournalFrame, JournalRecordKind,
     hash32, validate_journal_chain,
 };
+use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
 use crate::persistence::{Bucket, BucketMetadataEvent};
 use crate::storage::Storage;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use std::path::Path;
@@ -62,6 +63,7 @@ pub async fn append_bucket_mutation(
         bucket,
         mutation,
         BucketJournalScope::Tenant(bucket.tenant_id),
+        0,
     )
     .await?;
     append_bucket_mutation_to_path(
@@ -69,6 +71,39 @@ pub async fn append_bucket_mutation(
         bucket,
         mutation,
         BucketJournalScope::Global,
+        0,
+    )
+    .await
+}
+
+pub async fn append_bucket_mutation_with_permits(
+    storage: &Storage,
+    bucket: &Bucket,
+    mutation: BucketJournalMutation,
+    tenant_permit: &PartitionWritePermit,
+    global_permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<()> {
+    let tenant_scope = BucketJournalScope::Tenant(bucket.tenant_id);
+    let global_scope = BucketJournalScope::Global;
+    require_bucket_scope_permit(tenant_scope, tenant_permit)?;
+    require_bucket_scope_permit(global_scope, global_permit)?;
+    validate_partition_write(storage, tenant_permit, partition_owner_signing_key).await?;
+    validate_partition_write(storage, global_permit, partition_owner_signing_key).await?;
+    append_bucket_mutation_to_path(
+        storage.bucket_metadata_journal_path(bucket.tenant_id),
+        bucket,
+        mutation,
+        tenant_scope,
+        tenant_permit.fence_token,
+    )
+    .await?;
+    append_bucket_mutation_to_path(
+        storage.global_bucket_metadata_journal_path(),
+        bucket,
+        mutation,
+        global_scope,
+        global_permit.fence_token,
     )
     .await
 }
@@ -131,11 +166,12 @@ async fn append_bucket_mutation_to_path(
     bucket: &Bucket,
     mutation: BucketJournalMutation,
     scope: BucketJournalScope,
+    fence_token: u64,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    ensure_journal_header(&path, scope).await?;
+    ensure_journal_header(&path, scope, fence_token).await?;
 
     let previous = read_bucket_journal_frames_at_path(path.as_path())
         .await
@@ -163,7 +199,7 @@ async fn append_bucket_mutation_to_path(
     let frame = JournalFrame::new(
         JournalRecordKind::BucketMetadata,
         sequence,
-        0,
+        fence_token,
         *mutation_id.as_bytes(),
         bucket_key_hash(bucket.tenant_id, &bucket.name),
         previous_hash,
@@ -329,7 +365,11 @@ fn decode_journal_file(bytes: &[u8]) -> Result<Vec<JournalFrame>> {
     Ok(frames)
 }
 
-async fn ensure_journal_header(path: &Path, scope: BucketJournalScope) -> Result<()> {
+async fn ensure_journal_header(
+    path: &Path,
+    scope: BucketJournalScope,
+    fence_token: u64,
+) -> Result<()> {
     if tokio::fs::try_exists(path).await? {
         return Ok(());
     }
@@ -338,7 +378,7 @@ async fn ensure_journal_header(path: &Path, scope: BucketJournalScope) -> Result
         tenant_id: scope.tenant_label(),
         partition_family: "bucket_metadata",
         partition_id: hex::encode(scope.partition_id()),
-        fence_token: 0,
+        fence_token,
         first_sequence: 1,
         created_at: &created_at,
         codec: "none",
@@ -379,6 +419,20 @@ impl BucketJournalScope {
 
 fn bucket_partition_id(tenant_id: i64) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/bucket_metadata").as_bytes())
+}
+
+fn require_bucket_scope_permit(
+    scope: BucketJournalScope,
+    permit: &PartitionWritePermit,
+) -> Result<()> {
+    if permit.partition_family != "bucket_metadata"
+        || permit.partition_id != hex::encode(scope.partition_id())
+    {
+        return Err(anyhow!(
+            "partition write permit does not target this bucket metadata partition"
+        ));
+    }
+    Ok(())
 }
 
 fn bucket_key_hash(tenant_id: i64, bucket_name: &str) -> Hash32 {
@@ -428,8 +482,13 @@ fn bucket_metadata_json(body: &BucketJournalBody, deleted: bool) -> JsonValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::partition_fence::{
+        PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
+    };
     use chrono::Utc;
     use tempfile::tempdir;
+
+    const PARTITION_OWNER_KEY: &[u8] = b"bucket metadata partition owner signing key";
 
     fn bucket(id: i64, name: &str, is_public_read: bool) -> Bucket {
         Bucket {
@@ -440,6 +499,39 @@ mod tests {
             created_at: Utc::now(),
             is_public_read,
         }
+    }
+
+    async fn ready_bucket_permit(
+        storage: &Storage,
+        scope: BucketJournalScope,
+        owner_node_id: &str,
+    ) -> PartitionWritePermit {
+        let request = PartitionRecoveryAcquire {
+            partition_family: "bucket_metadata".to_string(),
+            partition_id: hex::encode(scope.partition_id()),
+            owner_node_id: owner_node_id.to_string(),
+            recovered_through_sequence: 0,
+            recovered_manifest_hash: hex::encode([0; 32]),
+            now_nanos: 100,
+        };
+        let recovering = acquire_partition_recovery(storage, request, PARTITION_OWNER_KEY)
+            .await
+            .unwrap();
+        publish_partition_ready(
+            storage,
+            &recovering.partition_family,
+            &recovering.partition_id,
+            owner_node_id,
+            recovering.fence_token,
+            0,
+            &hex::encode([2; 32]),
+            200,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap()
+        .write_permit()
+        .unwrap()
     }
 
     #[tokio::test]
@@ -522,5 +614,82 @@ mod tests {
             .unwrap();
         assert_eq!(latest.id, 2);
         assert_eq!(latest.bucket_name, "watched-bucket");
+    }
+
+    #[tokio::test]
+    async fn bucket_journal_permits_set_tenant_and_global_frame_fences() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let bucket = bucket(1, "fenced-bucket", false);
+        let tenant_permit = ready_bucket_permit(
+            &storage,
+            BucketJournalScope::Tenant(bucket.tenant_id),
+            "node-a",
+        )
+        .await;
+        let global_permit =
+            ready_bucket_permit(&storage, BucketJournalScope::Global, "node-a").await;
+
+        append_bucket_mutation_with_permits(
+            &storage,
+            &bucket,
+            BucketJournalMutation::Create,
+            &tenant_permit,
+            &global_permit,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap();
+
+        let tenant_frames = read_bucket_journal_frames_at_path(
+            &storage.bucket_metadata_journal_path(bucket.tenant_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tenant_frames.len(), 1);
+        assert_eq!(tenant_frames[0].fence_token, tenant_permit.fence_token);
+
+        let global_frames =
+            read_bucket_journal_frames_at_path(&storage.global_bucket_metadata_journal_path())
+                .await
+                .unwrap();
+        assert_eq!(global_frames.len(), 1);
+        assert_eq!(global_frames[0].fence_token, global_permit.fence_token);
+    }
+
+    #[tokio::test]
+    async fn bucket_journal_rejects_stale_scope_permit() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let bucket = bucket(1, "stale-bucket", false);
+        let tenant_scope = BucketJournalScope::Tenant(bucket.tenant_id);
+        let stale_tenant = ready_bucket_permit(&storage, tenant_scope, "node-a").await;
+        let fresh_tenant = ready_bucket_permit(&storage, tenant_scope, "node-b").await;
+        let global_permit =
+            ready_bucket_permit(&storage, BucketJournalScope::Global, "node-b").await;
+        assert_eq!(fresh_tenant.fence_token, stale_tenant.fence_token + 1);
+
+        let rejected = append_bucket_mutation_with_permits(
+            &storage,
+            &bucket,
+            BucketJournalMutation::Create,
+            &stale_tenant,
+            &global_permit,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap_err();
+        assert!(rejected.to_string().contains("PartitionNotOwned"));
+
+        append_bucket_mutation_with_permits(
+            &storage,
+            &bucket,
+            BucketJournalMutation::Create,
+            &fresh_tenant,
+            &global_permit,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap();
     }
 }
