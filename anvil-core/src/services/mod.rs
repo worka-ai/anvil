@@ -82,5 +82,6 @@ pub fn create_grpc_router(state: AppState, auth_interceptor: AuthInterceptorFn) 
 pub fn create_axum_router(grpc_router: Routes) -> axum::Router {
     grpc_router
         .into_axum_router()
+        .route_layer(axum::middleware::from_fn(middleware::request_id_mw))
         .route_layer(axum::middleware::from_fn(middleware::save_uri_mw))
 }

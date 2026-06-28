@@ -1,6 +1,12 @@
 use crate::{AppState, auth::AuthenticatedBearerToken};
+use axum::{http::HeaderValue, response::Response};
 use http::Uri;
 use tonic::{Request, Status};
+
+pub const ANVIL_REQUEST_ID_HEADER: &str = "x-anvil-request-id";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnvilRequestId(pub String);
 
 pub fn auth_interceptor<T>(mut req: Request<T>, state: &AppState) -> Result<Request<T>, Status> {
     let has_auth = req.metadata().get("authorization").is_some();
@@ -66,4 +72,21 @@ pub async fn save_uri_mw(
 
     req.extensions_mut().insert(full_uri);
     next.run(req).await
+}
+
+pub async fn request_id_mw(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let request_id = uuid::Uuid::new_v4().simple().to_string();
+    req.extensions_mut()
+        .insert(AnvilRequestId(request_id.clone()));
+
+    let mut response = next.run(req).await;
+    if let Ok(header_value) = HeaderValue::from_str(&request_id) {
+        response
+            .headers_mut()
+            .insert(ANVIL_REQUEST_ID_HEADER, header_value);
+    }
+    response
 }

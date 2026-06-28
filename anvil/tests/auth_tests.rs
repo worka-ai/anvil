@@ -3,7 +3,7 @@ use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::{
     CheckPermissionRequest, CreateBucketRequest, GetAccessTokenRequest, GetObjectRequest,
-    GrantAccessRequest, ObjectMetadata, PutObjectRequest, RevokeAccessRequest,
+    GrantAccessRequest, ListBucketsRequest, ObjectMetadata, PutObjectRequest, RevokeAccessRequest,
     SetPublicAccessRequest, WatchAuthzTupleLogRequest, WriteAuthzTupleRequest,
 };
 use futures_util::StreamExt;
@@ -11,6 +11,30 @@ use std::time::Duration;
 use tonic::Request;
 
 use anvil_test_utils::*;
+
+#[tokio::test]
+async fn grpc_error_responses_include_server_request_id() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let mut bucket_client = BucketServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let err = bucket_client
+        .list_buckets(Request::new(ListBucketsRequest {}))
+        .await
+        .expect_err("unauthenticated request must fail");
+
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    let request_id = err
+        .metadata()
+        .get("x-anvil-request-id")
+        .expect("gRPC error metadata must include x-anvil-request-id")
+        .to_str()
+        .expect("request id must be ASCII metadata");
+    assert_eq!(request_id.len(), 32);
+    assert!(request_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+}
 
 // Helper function to create an app, since it's used in auth tests.
 fn create_app(admin_state_path: &str, app_name: &str) -> (String, String) {
