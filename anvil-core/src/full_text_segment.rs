@@ -53,7 +53,8 @@ pub async fn write_full_text_segment(
     input: FullTextSegmentWrite<'_>,
 ) -> Result<PathBuf> {
     let encoded_terms = encode_terms(&input.built_postings.terms);
-    let postings_bytes = input.built_postings.postings_bytes.clone();
+    let postings_bytes = zstd::stream::encode_all(&input.built_postings.postings_bytes[..], 3)
+        .context("compress full text postings block")?;
     let body = encode_full_text_body(&encoded_terms, &postings_bytes, input.document_table)?;
     let segment_hash = hash32(&body);
     let path = storage.full_text_segment_path(
@@ -76,7 +77,7 @@ pub async fn write_full_text_segment(
         term_count: input.built_postings.terms.len() as u64,
         postings_bytes_len: postings_bytes.len() as u64,
         posting_count: input.built_postings.postings.len() as u64,
-        codec: "none".to_string(),
+        codec: "zstd".to_string(),
         created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
     };
     let header_json = serde_json::to_vec(&header)?;
@@ -215,7 +216,12 @@ fn decode_full_text_body(
         return Err(anyhow!("full text postings exceed body length"));
     }
     let terms = decode_terms(&body[dictionary_start..dictionary_end], header.term_count)?;
-    let postings_bytes = body[dictionary_end..postings_end].to_vec();
+    let encoded_postings_bytes = &body[dictionary_end..postings_end];
+    let postings_bytes = match header.codec.as_str() {
+        "zstd" => zstd::stream::decode_all(encoded_postings_bytes)
+            .context("decompress full text postings block")?,
+        other => return Err(anyhow!("unsupported full text postings codec {other}")),
+    };
     let postings = decode_postings(&postings_bytes)?;
     if postings.len() as u64 != header.posting_count {
         return Err(anyhow!("full text posting count does not match header"));
@@ -352,6 +358,16 @@ mod tests {
         assert_eq!(decoded.header.index_id, "index-alpha");
         assert_eq!(decoded.header.source_cursor, 44);
         assert_eq!(decoded.header.authz_revision, 7);
+        assert_eq!(decoded.header.codec, "zstd");
+        let expected_compressed = zstd::stream::encode_all(&built.postings_bytes[..], 3).unwrap();
+        assert_ne!(
+            expected_compressed, built.postings_bytes,
+            "test fixture should prove on-disk postings are compressed bytes"
+        );
+        assert_eq!(
+            decoded.header.postings_bytes_len,
+            expected_compressed.len() as u64
+        );
         assert_eq!(decoded.terms, built.terms);
         assert_eq!(decoded.postings, built.postings);
         assert_eq!(decoded.postings_bytes, built.postings_bytes);
