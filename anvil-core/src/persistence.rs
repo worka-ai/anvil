@@ -2222,7 +2222,7 @@ impl Persistence {
         bucket: &Bucket,
         index: &IndexDefinition,
     ) -> Result<bool> {
-        if !index.enabled || index.kind != "full_text" {
+        if !index.enabled || !matches!(index.kind.as_str(), "full_text" | "vector" | "hybrid") {
             return Ok(false);
         }
         let stats = metadata_journal::active_object_journal_stats(
@@ -2265,7 +2265,7 @@ impl Persistence {
         Ok(scheduled)
     }
 
-    pub async fn build_full_text_index_task(
+    pub async fn build_index_task(
         &self,
         tenant_id: i64,
         bucket_id: i64,
@@ -2295,18 +2295,56 @@ impl Persistence {
         if !index.enabled || index.version != index_version {
             return Ok(None);
         }
-        if index.kind != "full_text" {
-            return Ok(None);
+        let outcome = match index.kind.as_str() {
+            "full_text" => {
+                index_builder::build_full_text_index(
+                    &self.storage,
+                    &bucket,
+                    &index,
+                    &self.partition_owner_signing_key,
+                    source_cursor,
+                )
+                .await?
+            }
+            "vector" => {
+                index_builder::build_vector_index(
+                    &self.storage,
+                    &bucket,
+                    &index,
+                    &self.partition_owner_signing_key,
+                    source_cursor,
+                )
+                .await?
+            }
+            "hybrid" => {
+                index_builder::build_hybrid_index(
+                    &self.storage,
+                    &bucket,
+                    &index,
+                    &self.partition_owner_signing_key,
+                    source_cursor,
+                )
+                .await?
+            }
+            _ => return Ok(None),
+        };
+        for diagnostic in &outcome.diagnostics {
+            self.create_index_diagnostic(
+                tenant_id,
+                bucket_id,
+                &bucket.name,
+                Some(index.id),
+                &index.name,
+                &diagnostic.object_key,
+                diagnostic.version_id,
+                &diagnostic.severity,
+                &diagnostic.code,
+                &diagnostic.message,
+                diagnostic.details.clone(),
+            )
+            .await?;
         }
-        index_builder::build_full_text_index(
-            &self.storage,
-            &bucket,
-            &index,
-            &self.partition_owner_signing_key,
-            source_cursor,
-        )
-        .await
-        .map(Some)
+        Ok(Some(outcome))
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -334,6 +334,362 @@ async fn test_full_text_index_builds_from_object_write_task() {
 }
 
 #[tokio::test]
+async fn test_vector_index_builds_from_object_write_task() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut index_client = IndexServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr).await.unwrap();
+
+    let bucket_name = format!("vector-index-build-task-{}", uuid::Uuid::new_v4());
+    bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    index_client
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket_name: bucket_name.clone(),
+                name: "embedding".to_string(),
+                kind: "vector".to_string(),
+                selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
+                extractor_json: serde_json::json!({"source": "object_body_json_vector"})
+                    .to_string(),
+                authorization_mode: "index_only".to_string(),
+                build_policy_json: serde_json::json!({
+                    "dimension": 2,
+                    "metric": "cosine",
+                    "modality": "text",
+                    "embedding_model": "test-explicit-vector",
+                    "chunking": {"kind": "whole_object"}
+                })
+                .to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let chunks = vec![
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                ObjectMetadata {
+                    bucket_name: bucket_name.clone(),
+                    object_key: "docs/vector.json".to_string(),
+                },
+            )),
+        },
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                br#"{"vector":[1.0,0.0],"source_start":4,"source_len":12}"#.to_vec(),
+            )),
+        },
+    ];
+    let mut put_req = Request::new(tokio_stream::iter(chunks));
+    put_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {token}").parse().expect("valid token"),
+    );
+    object_client.put_object(put_req).await.unwrap();
+
+    let mut final_response = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline {
+        let response = index_client
+            .query_index(authorized(
+                QueryIndexRequest {
+                    bucket_name: bucket_name.clone(),
+                    index_name: "embedding".to_string(),
+                    query_text: String::new(),
+                    query_vector: vec![1.0, 0.0],
+                    limit: 10,
+                    phrase: false,
+                },
+                &token,
+            ))
+            .await;
+        if let Ok(response) = response {
+            let response = response.into_inner();
+            if response
+                .hits
+                .iter()
+                .any(|hit| hit.object_key == "docs/vector.json")
+            {
+                final_response = Some(response);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let response = final_response.expect("vector index build task should make object searchable");
+    assert_eq!(response.index_kind, "vector");
+    assert!(response.index_generation >= 1);
+    assert_eq!(response.hits[0].object_key, "docs/vector.json");
+    assert_eq!(response.hits[0].vector_id, 1);
+    let tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
+    assert!(tasks.iter().any(|task| {
+        task.task_type == anvil::tasks::TaskType::IndexBuild
+            && task.status == anvil::tasks::TaskStatus::Completed
+    }));
+    assert!(!tasks.iter().any(|task| {
+        task.task_type == anvil::tasks::TaskType::IndexBuild
+            && task.status == anvil::tasks::TaskStatus::Failed
+    }));
+}
+
+#[tokio::test]
+async fn test_vector_index_build_records_dimension_mismatch_diagnostic() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut index_client = IndexServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr).await.unwrap();
+
+    let bucket_name = format!("vector-diagnostic-task-{}", uuid::Uuid::new_v4());
+    bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    index_client
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket_name: bucket_name.clone(),
+                name: "embedding".to_string(),
+                kind: "vector".to_string(),
+                selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
+                extractor_json: serde_json::json!({"source": "object_body_json_vector"})
+                    .to_string(),
+                authorization_mode: "index_only".to_string(),
+                build_policy_json: serde_json::json!({
+                    "dimension": 3,
+                    "metric": "cosine",
+                    "modality": "text",
+                    "embedding_model": "test-explicit-vector",
+                    "chunking": {"kind": "whole_object"}
+                })
+                .to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let chunks = vec![
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                ObjectMetadata {
+                    bucket_name: bucket_name.clone(),
+                    object_key: "docs/bad-vector.json".to_string(),
+                },
+            )),
+        },
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                br#"{"vector":[1.0,0.0]}"#.to_vec(),
+            )),
+        },
+    ];
+    let mut put_req = Request::new(tokio_stream::iter(chunks));
+    put_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {token}").parse().expect("valid token"),
+    );
+    object_client.put_object(put_req).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut found = false;
+    while tokio::time::Instant::now() < deadline {
+        let diagnostics = index_client
+            .list_index_diagnostics(authorized(
+                ListIndexDiagnosticsRequest {
+                    bucket_name: bucket_name.clone(),
+                    index_name: "embedding".to_string(),
+                    severity: "error".to_string(),
+                    after_cursor: 0,
+                    limit: 10,
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .diagnostics;
+        if diagnostics.iter().any(|diagnostic| {
+            diagnostic.object_key == "docs/bad-vector.json"
+                && diagnostic.code == "VectorDimensionMismatch"
+        }) {
+            found = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    assert!(found, "dimension mismatch should write an index diagnostic");
+    let tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
+    assert!(tasks.iter().any(|task| {
+        task.task_type == anvil::tasks::TaskType::IndexBuild
+            && task.status == anvil::tasks::TaskStatus::Completed
+    }));
+    assert!(!tasks.iter().any(|task| {
+        task.task_type == anvil::tasks::TaskType::IndexBuild
+            && task.status == anvil::tasks::TaskStatus::Failed
+    }));
+}
+
+#[tokio::test]
+async fn test_hybrid_index_builds_text_and_vector_segments_from_object_write_task() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut index_client = IndexServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr).await.unwrap();
+
+    let bucket_name = format!("hybrid-index-build-task-{}", uuid::Uuid::new_v4());
+    bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    index_client
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket_name: bucket_name.clone(),
+                name: "body-and-vector".to_string(),
+                kind: "hybrid".to_string(),
+                selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
+                extractor_json: serde_json::json!({
+                    "text": {"source": "object_body_utf8"},
+                    "vector": {
+                        "source": "object_body_json_vector",
+                        "json_pointer": "/embedding"
+                    }
+                })
+                .to_string(),
+                authorization_mode: "index_only".to_string(),
+                build_policy_json: serde_json::json!({
+                    "full_text": {"positions": true},
+                    "vector": {
+                        "dimension": 2,
+                        "metric": "cosine",
+                        "modality": "text",
+                        "embedding_model": "test-explicit-vector",
+                        "chunking": {"kind": "whole_object"}
+                    }
+                })
+                .to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let body = br#"{"body":"lease dashboard summary","embedding":[0.0,1.0]}"#.to_vec();
+    let chunks = vec![
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                ObjectMetadata {
+                    bucket_name: bucket_name.clone(),
+                    object_key: "docs/hybrid.json".to_string(),
+                },
+            )),
+        },
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(body)),
+        },
+    ];
+    let mut put_req = Request::new(tokio_stream::iter(chunks));
+    put_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {token}").parse().expect("valid token"),
+    );
+    object_client.put_object(put_req).await.unwrap();
+
+    let mut final_response = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline {
+        let response = index_client
+            .query_index(authorized(
+                QueryIndexRequest {
+                    bucket_name: bucket_name.clone(),
+                    index_name: "body-and-vector".to_string(),
+                    query_text: "lease dashboard".to_string(),
+                    query_vector: vec![0.0, 1.0],
+                    limit: 10,
+                    phrase: false,
+                },
+                &token,
+            ))
+            .await;
+        if let Ok(response) = response {
+            let response = response.into_inner();
+            if response
+                .hits
+                .iter()
+                .any(|hit| hit.object_key == "docs/hybrid.json")
+            {
+                final_response = Some(response);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let response = final_response.expect("hybrid index build task should make object searchable");
+    assert_eq!(response.index_kind, "hybrid");
+    assert!(response.index_generation >= 1);
+    assert_eq!(response.hits[0].object_key, "docs/hybrid.json");
+    assert!(response.hits[0].score > 0.0);
+    let tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
+    assert!(tasks.iter().any(|task| {
+        task.task_type == anvil::tasks::TaskType::IndexBuild
+            && task.status == anvil::tasks::TaskStatus::Completed
+    }));
+    assert!(!tasks.iter().any(|task| {
+        task.task_type == anvil::tasks::TaskType::IndexBuild
+            && task.status == anvil::tasks::TaskStatus::Failed
+    }));
+}
+
+#[tokio::test]
 async fn test_query_full_text_index_reads_latest_segment() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;

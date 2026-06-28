@@ -134,7 +134,7 @@ async fn execute_task_with_lease(
 async fn handle_index_build(persistence: &Persistence, task: &Task) -> anyhow::Result<()> {
     let payload: IndexBuildPayload = serde_json::from_value(task.payload.clone())?;
     match persistence
-        .build_full_text_index_task(
+        .build_index_task(
             payload.tenant_id,
             payload.bucket_id,
             payload.index_id,
@@ -147,10 +147,12 @@ async fn handle_index_build(persistence: &Persistence, task: &Task) -> anyhow::R
             info!(
                 index_id = payload.index_id,
                 index_storage_id = %outcome.index_storage_id,
+                index_kind = %outcome.index_kind,
                 generation = outcome.generation,
-                document_count = outcome.document_count,
+                item_count = outcome.item_count,
                 source_cursor = outcome.source_cursor,
-                segment_hash = %outcome.segment_hash,
+                segment_hashes = ?outcome.segment_hashes,
+                diagnostic_count = outcome.diagnostics.len(),
                 "Index build task completed"
             );
         }

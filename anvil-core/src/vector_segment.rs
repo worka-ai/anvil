@@ -111,17 +111,30 @@ pub async fn write_vector_segment(
         last_hash,
     );
 
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("vector segment path has no file name"))?;
+    let tmp_path = path.with_file_name(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
-        .create(true)
+        .create_new(true)
         .truncate(true)
-        .open(&path)
+        .open(&tmp_path)
         .await
-        .with_context(|| format!("create vector segment {}", path.display()))?;
+        .with_context(|| format!("create vector segment temp {}", tmp_path.display()))?;
     file.write_all(&encoded_header).await?;
     file.write_all(&body).await?;
     file.write_all(&footer.encode()).await?;
     file.sync_data().await?;
+    drop(file);
+    if tokio::fs::try_exists(&path).await? {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Ok(path);
+    }
+    tokio::fs::rename(&tmp_path, &path)
+        .await
+        .with_context(|| format!("publish vector segment {}", path.display()))?;
     Ok(path)
 }
 

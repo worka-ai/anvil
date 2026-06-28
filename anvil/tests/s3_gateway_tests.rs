@@ -622,6 +622,109 @@ async fn test_s3_put_triggers_full_text_index_build() {
     }));
 }
 
+#[tokio::test]
+async fn test_s3_put_triggers_vector_index_build() {
+    let mut cluster = TestCluster::new(&["s3-vector-index-region"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let app_name = format!("s3-vector-index-{}", uuid::Uuid::new_v4());
+    let (client_id, client_secret) = create_app(&cluster.admin_state_path, &app_name);
+    grant_wildcard_policy(&cluster.admin_state_path, &app_name);
+
+    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
+    let client = s3_client(http_base, &client_id, &client_secret);
+    let bucket = format!("s3-vector-index-{}", uuid::Uuid::new_v4());
+    client
+        .create_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("S3 CreateBucket should succeed");
+
+    let mut index_client = IndexServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    index_client
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket_name: bucket.clone(),
+                name: "embedding".to_string(),
+                kind: "vector".to_string(),
+                selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
+                extractor_json: serde_json::json!({"source": "object_body_json_vector"})
+                    .to_string(),
+                authorization_mode: "index_only".to_string(),
+                build_policy_json: serde_json::json!({
+                    "dimension": 2,
+                    "metric": "cosine",
+                    "modality": "text",
+                    "embedding_model": "test-explicit-vector",
+                    "chunking": {"kind": "whole_object"}
+                })
+                .to_string(),
+            },
+            &cluster.token,
+        ))
+        .await
+        .unwrap();
+
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key("docs/s3-vector.json")
+        .body(ByteStream::from_static(
+            br#"{"vector":[0.0,1.0],"source_start":2,"source_len":16}"#,
+        ))
+        .send()
+        .await
+        .expect("S3 PUT should succeed");
+
+    let mut indexed = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline {
+        let query = index_client
+            .query_index(authorized(
+                QueryIndexRequest {
+                    bucket_name: bucket.clone(),
+                    index_name: "embedding".to_string(),
+                    query_text: String::new(),
+                    query_vector: vec![0.0, 1.0],
+                    limit: 10,
+                    phrase: false,
+                },
+                &cluster.token,
+            ))
+            .await;
+        if let Ok(query) = query {
+            let response = query.into_inner();
+            if response
+                .hits
+                .iter()
+                .any(|hit| hit.object_key == "docs/s3-vector.json")
+            {
+                indexed = Some(response);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let response =
+        indexed.expect("S3 object vector should be searchable after index task completes");
+    assert_eq!(response.index_kind, "vector");
+    assert!(response.index_generation >= 1);
+    assert_eq!(response.hits[0].object_key, "docs/s3-vector.json");
+    let tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
+    assert!(tasks.iter().any(|task| {
+        task.task_type == anvil::tasks::TaskType::IndexBuild
+            && task.status == anvil::tasks::TaskStatus::Completed
+    }));
+    assert!(!tasks.iter().any(|task| {
+        task.task_type == anvil::tasks::TaskType::IndexBuild
+            && task.status == anvil::tasks::TaskStatus::Failed
+    }));
+}
+
 #[test]
 fn test_s3_public_and_private_access() {
     run_large_s3_gateway_test(Box::pin(run_s3_public_and_private_access()));
