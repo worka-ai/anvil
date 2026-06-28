@@ -11,6 +11,10 @@ use crate::metadata_journal;
 use crate::persistence::{Bucket, IndexDefinition, Object};
 use crate::storage::{ExternalChunkManifest, Storage};
 use crate::vector_segment::{self, VectorSegmentEntry, VectorSegmentWrite};
+use crate::{
+    derived_index_proof::{self, DerivedIndexProofWrite},
+    watch_checkpoint::{self, WatchCheckpointUpdate},
+};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde::Serialize;
@@ -93,6 +97,7 @@ pub async fn build_full_text_index(
     index: &IndexDefinition,
     partition_owner_signing_key: &[u8],
     source_cursor: u128,
+    builder_node_id: &str,
 ) -> Result<IndexBuildOutcome> {
     if index.kind != "full_text" {
         return Err(anyhow!("index build only supports full_text indexes"));
@@ -230,15 +235,27 @@ pub async fn build_full_text_index(
     })?;
     let segment_hash = blake3::hash(&segment_bytes).to_hex().to_string();
     let partition_id = hex::encode(hash32(index_storage_id.as_bytes()));
-    let proof_hash = blake3::hash(
-        format!(
-            "full_text:{}:{}:{}:{}",
-            index_storage_id, generation, source_cursor, segment_hash
-        )
-        .as_bytes(),
+    let source_manifest_hash = metadata_journal::object_metadata_source_checkpoint_hash(
+        storage,
+        bucket,
+        partition_owner_signing_key,
+        source_cursor,
     )
-    .to_hex()
-    .to_string();
+    .await?;
+    let proof = publish_index_build_proof_and_checkpoint(
+        storage,
+        bucket,
+        &index_storage_id,
+        &index.kind,
+        &partition_id,
+        source_cursor,
+        &source_manifest_hash,
+        generation,
+        &[segment_hash.clone()],
+        builder_node_id,
+        partition_owner_signing_key,
+    )
+    .await?;
     let watch_cursor = next_index_watch_cursor(
         storage,
         index.tenant_id,
@@ -262,10 +279,11 @@ pub async fn build_full_text_index(
             event_type: "segment_built".to_string(),
             generation,
             source_cursor,
-            source_manifest_hash: hex::encode(hash32(
-                format!("bucket:{}:cursor:{}", bucket.id, source_cursor).as_bytes(),
-            )),
-            proof_hash,
+            source_manifest_hash,
+            proof_hash: proof
+                .proof_hash
+                .clone()
+                .ok_or_else(|| anyhow!("derived index proof was not sealed"))?,
             segment_hashes: vec![segment_hash.clone()],
             emitted_at: chrono::Utc::now().to_rfc3339(),
         },
@@ -289,6 +307,7 @@ pub async fn build_vector_index(
     index: &IndexDefinition,
     partition_owner_signing_key: &[u8],
     source_cursor: u128,
+    builder_node_id: &str,
 ) -> Result<IndexBuildOutcome> {
     if index.kind != "vector" {
         return Err(anyhow!("index build only supports vector indexes"));
@@ -301,6 +320,7 @@ pub async fn build_vector_index(
         &index.extractor,
         partition_owner_signing_key,
         source_cursor,
+        builder_node_id,
         "vector",
     )
     .await
@@ -312,6 +332,7 @@ pub async fn build_hybrid_index(
     index: &IndexDefinition,
     partition_owner_signing_key: &[u8],
     source_cursor: u128,
+    builder_node_id: &str,
 ) -> Result<IndexBuildOutcome> {
     if index.kind != "hybrid" {
         return Err(anyhow!("index build only supports hybrid indexes"));
@@ -342,6 +363,7 @@ pub async fn build_hybrid_index(
         &text_index,
         partition_owner_signing_key,
         source_cursor,
+        builder_node_id,
     )
     .await?;
     let vector_outcome = build_vector_index_with_policy(
@@ -352,6 +374,7 @@ pub async fn build_hybrid_index(
         vector_extractor,
         partition_owner_signing_key,
         source_cursor,
+        builder_node_id,
         "hybrid",
     )
     .await?;
@@ -381,6 +404,7 @@ async fn build_vector_index_with_policy(
     extractor: &JsonValue,
     partition_owner_signing_key: &[u8],
     source_cursor: u128,
+    builder_node_id: &str,
     outcome_kind: &str,
 ) -> Result<IndexBuildOutcome> {
     if !index.enabled {
@@ -504,15 +528,27 @@ async fn build_vector_index_with_policy(
         .with_context(|| format!("read generated vector segment {}", segment_path.display()))?;
     let segment_hash = blake3::hash(&segment_bytes).to_hex().to_string();
     let partition_id = hex::encode(hash32(index_storage_id.as_bytes()));
-    let proof_hash = blake3::hash(
-        format!(
-            "vector:{}:{}:{}:{}",
-            index_storage_id, generation, source_cursor, segment_hash
-        )
-        .as_bytes(),
+    let source_manifest_hash = metadata_journal::object_metadata_source_checkpoint_hash(
+        storage,
+        bucket,
+        partition_owner_signing_key,
+        source_cursor,
     )
-    .to_hex()
-    .to_string();
+    .await?;
+    let proof = publish_index_build_proof_and_checkpoint(
+        storage,
+        bucket,
+        &index_storage_id,
+        outcome_kind,
+        &partition_id,
+        source_cursor,
+        &source_manifest_hash,
+        generation,
+        &[segment_hash.clone()],
+        builder_node_id,
+        partition_owner_signing_key,
+    )
+    .await?;
     let watch_cursor = next_index_watch_cursor(
         storage,
         index.tenant_id,
@@ -536,10 +572,11 @@ async fn build_vector_index_with_policy(
             event_type: "segment_built".to_string(),
             generation,
             source_cursor,
-            source_manifest_hash: hex::encode(hash32(
-                format!("bucket:{}:cursor:{}", bucket.id, source_cursor).as_bytes(),
-            )),
-            proof_hash,
+            source_manifest_hash,
+            proof_hash: proof
+                .proof_hash
+                .clone()
+                .ok_or_else(|| anyhow!("derived index proof was not sealed"))?,
             segment_hashes: vec![segment_hash.clone()],
             emitted_at: chrono::Utc::now().to_rfc3339(),
         },
@@ -555,6 +592,63 @@ async fn build_vector_index_with_policy(
         segment_hashes: vec![segment_hash],
         diagnostics,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_index_build_proof_and_checkpoint(
+    storage: &Storage,
+    bucket: &Bucket,
+    index_storage_id: &str,
+    index_kind: &str,
+    index_partition_id: &str,
+    source_cursor: u128,
+    source_manifest_hash: &str,
+    generation: u64,
+    segment_hashes: &[String],
+    builder_node_id: &str,
+    signing_key: &[u8],
+) -> Result<derived_index_proof::DerivedIndexProof> {
+    let built_at_nanos = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .ok_or_else(|| anyhow!("timestamp cannot be represented in nanoseconds"))?;
+    let proof = derived_index_proof::write_derived_index_proof(
+        storage,
+        DerivedIndexProofWrite {
+            index_id: index_storage_id.to_string(),
+            index_kind: index_kind.to_string(),
+            partition_family: "index".to_string(),
+            partition_id: index_partition_id.to_string(),
+            source_watch_stream_id: "object_metadata".to_string(),
+            source_cursor,
+            source_manifest_hash: source_manifest_hash.to_string(),
+            generation,
+            segment_hashes: segment_hashes.to_vec(),
+            built_by_node: builder_node_id.to_string(),
+            built_at_nanos,
+        },
+        signing_key,
+    )
+    .await?;
+    watch_checkpoint::checkpoint_watch_consumer(
+        storage,
+        WatchCheckpointUpdate {
+            watch_stream_id: "object_metadata".to_string(),
+            partition_family: "object_metadata".to_string(),
+            partition_id: hex::encode(metadata_journal::object_metadata_partition_id(
+                bucket.tenant_id,
+                bucket.id,
+            )),
+            consumer_id: index_storage_id.to_string(),
+            cursor: source_cursor,
+            source_manifest_hash: source_manifest_hash.to_string(),
+            generation,
+            updated_by_node: builder_node_id.to_string(),
+            updated_at_nanos: built_at_nanos,
+        },
+        signing_key,
+    )
+    .await?;
+    Ok(proof)
 }
 
 async fn next_index_watch_cursor(

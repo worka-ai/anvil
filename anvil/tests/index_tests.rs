@@ -563,6 +563,29 @@ async fn test_full_text_index_build_uses_source_cursor_snapshot() {
     .unwrap()
     .expect("full text segment exists");
     assert_eq!(segment.header.source_cursor, source_cursor);
+    let signing_key = hex::decode(&cluster.states[0].config.anvil_secret_encryption_key).unwrap();
+    let proof = anvil::derived_index_proof::read_latest_derived_index_proof(
+        &cluster.states[0].storage,
+        &index_storage_id,
+        &signing_key,
+    )
+    .await
+    .unwrap()
+    .expect("derived index proof exists");
+    assert_eq!(proof.source_cursor, u128::from(source_cursor));
+    assert_eq!(proof.generation, segment.header.generation);
+    assert_eq!(proof.segment_hashes.len(), 1);
+    let checkpoint = anvil::watch_checkpoint::read_watch_checkpoint(
+        &cluster.states[0].storage,
+        "object_metadata",
+        &index_storage_id,
+        &signing_key,
+    )
+    .await
+    .unwrap()
+    .expect("index watch checkpoint exists");
+    assert_eq!(checkpoint.cursor, u128::from(source_cursor));
+    assert_eq!(checkpoint.source_manifest_hash, proof.source_manifest_hash);
 
     let definition = anvil::formats::full_text::FullTextIndexDefinition::from_json(
         &serde_json::json!({"positions": true}),

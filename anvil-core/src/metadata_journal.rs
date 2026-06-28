@@ -1486,6 +1486,58 @@ pub async fn active_object_journal_stats(
     Ok(stats)
 }
 
+pub async fn object_metadata_source_checkpoint_hash(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+    max_sequence: u128,
+) -> Result<String> {
+    let max_sequence = u64::try_from(max_sequence)
+        .map_err(|_| anyhow!("object metadata source cursor exceeds u64 sequence range"))?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"anvil.object_metadata.source_checkpoint.v1");
+    hasher.update(&bucket.tenant_id.to_le_bytes());
+    hasher.update(&bucket.id.to_le_bytes());
+    hasher.update(&max_sequence.to_le_bytes());
+
+    let mut compacted_through_sequence = 0u64;
+    let manifest_path = storage.metadata_manifest_path(bucket.tenant_id, bucket.id);
+    if tokio::fs::metadata(&manifest_path).await.is_ok() {
+        let manifest_bytes = tokio::fs::read(&manifest_path)
+            .await
+            .with_context(|| format!("read partition manifest {}", manifest_path.display()))?;
+        let manifest = decode_partition_manifest(&manifest_bytes, manifest_signing_key)?;
+        compacted_through_sequence = manifest.compacted_through_sequence;
+        if compacted_through_sequence > max_sequence {
+            return Err(anyhow!(
+                "object metadata source cursor is older than manifest checkpoint"
+            ));
+        }
+        hasher.update(manifest.manifest_hash.as_deref().unwrap_or("").as_bytes());
+    } else {
+        hasher.update(&[0; 32]);
+    }
+
+    let journal_path = storage.metadata_journal_path(bucket.tenant_id, bucket.id);
+    if tokio::fs::metadata(&journal_path).await.is_ok() {
+        let journal_bytes = tokio::fs::read(&journal_path)
+            .await
+            .with_context(|| format!("read metadata journal {}", journal_path.display()))?;
+        let (_, frames) = decode_journal_file(&journal_bytes)?;
+        for frame in frames {
+            if frame.partition_sequence <= compacted_through_sequence
+                || frame.partition_sequence > max_sequence
+            {
+                continue;
+            }
+            hasher.update(&frame.partition_sequence.to_le_bytes());
+            hasher.update(&frame.record_hash);
+        }
+    }
+
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 fn decode_frames(mut input: &[u8]) -> Result<Vec<JournalFrame>> {
     let mut frames = Vec::new();
     while !input.is_empty() {

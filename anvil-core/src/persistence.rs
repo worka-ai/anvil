@@ -2303,6 +2303,7 @@ impl Persistence {
                     &index,
                     &self.partition_owner_signing_key,
                     source_cursor,
+                    &self.owner_node_id,
                 )
                 .await?
             }
@@ -2313,6 +2314,7 @@ impl Persistence {
                     &index,
                     &self.partition_owner_signing_key,
                     source_cursor,
+                    &self.owner_node_id,
                 )
                 .await?
             }
@@ -2323,6 +2325,7 @@ impl Persistence {
                     &index,
                     &self.partition_owner_signing_key,
                     source_cursor,
+                    &self.owner_node_id,
                 )
                 .await?
             }
