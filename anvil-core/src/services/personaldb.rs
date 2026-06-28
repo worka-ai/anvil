@@ -465,12 +465,7 @@ impl PersonalDbService for AppState {
                 database_id: &validated.request.database_id,
                 schema_sql: &schema_sql,
                 created_by_node: &claims.sub,
-                policy: PersonalDbSnapshotPolicy {
-                    entry_threshold: self.config.personaldb_snapshot_entry_threshold,
-                    payload_bytes_threshold: self
-                        .config
-                        .personaldb_snapshot_payload_bytes_threshold,
-                },
+                policy: configured_personaldb_snapshot_policy(&self.config),
             },
             signing_key,
         )
@@ -894,6 +889,24 @@ fn personaldb_resource(tenant_id: i64, database_id: &str) -> String {
     format!("tenant-{tenant_id}/{database_id}")
 }
 
+fn configured_personaldb_snapshot_policy(
+    config: &crate::config::Config,
+) -> PersonalDbSnapshotPolicy {
+    let default = PersonalDbSnapshotPolicy::default();
+    PersonalDbSnapshotPolicy {
+        entry_threshold: if config.personaldb_snapshot_entry_threshold == 0 {
+            default.entry_threshold
+        } else {
+            config.personaldb_snapshot_entry_threshold
+        },
+        payload_bytes_threshold: if config.personaldb_snapshot_payload_bytes_threshold == 0 {
+            default.payload_bytes_threshold
+        } else {
+            config.personaldb_snapshot_payload_bytes_threshold
+        },
+    }
+}
+
 fn nonzero_limit(limit: u32) -> usize {
     if limit == 0 { 100 } else { limit as usize }
 }
@@ -956,5 +969,12 @@ mod tests {
     #[test]
     fn genesis_hash_uses_blake3_hash_format() {
         assert!(validate_hex32(&hex::encode(hash32(b"genesis")), "genesis_hash").is_ok());
+    }
+
+    #[test]
+    fn snapshot_policy_uses_spec_defaults_for_zero_config_values() {
+        let config = crate::config::Config::default();
+        let policy = configured_personaldb_snapshot_policy(&config);
+        assert_eq!(policy, PersonalDbSnapshotPolicy::default());
     }
 }
