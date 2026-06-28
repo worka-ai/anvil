@@ -15,7 +15,10 @@ use crate::{
         write_personaldb_changeset_payload, write_personaldb_commit_certificate,
     },
     personaldb_control::{PersonalDbCommitCertificate, PersonalDbGroupManifest},
-    personaldb_envelope::{PersonalDbEnvelopeDerivationInput, derive_verified_mutation_envelope},
+    personaldb_envelope::{
+        PersonalDbEnvelopeDerivationInput, VerifiedMutationEnvelope,
+        derive_verified_mutation_envelope,
+    },
     personaldb_heads::{
         PersonalDbCommittedHead, PersonalDbSnapshotsHead, read_personaldb_committed_head,
         read_personaldb_group_manifest, write_personaldb_committed_head,
@@ -253,6 +256,7 @@ impl PersonalDbService for AppState {
                 .ok_or_else(|| Status::internal("Invalid current timestamp"))?,
         })
         .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        authorize_personaldb_row_effects(&envelope, &claims)?;
         let envelope_hash = envelope.envelope_hash32().map_err(internal_status)?;
         let previous_log_hash = hex32_status(&committed_head.log_hash, "committed head log hash")?;
         let schema_hash = hex32_status(&manifest.schema_hash, "schema hash")?;
@@ -585,6 +589,30 @@ fn bind_personaldb_submit_session(
         return Err(Status::permission_denied(
             "PersonalDB principal does not match authenticated session",
         ));
+    }
+    Ok(())
+}
+
+fn authorize_personaldb_row_effects(
+    envelope: &VerifiedMutationEnvelope,
+    claims: &auth::Claims,
+) -> Result<(), Status> {
+    for effect in &envelope.table_effects {
+        let binding = &effect.source_resource_binding;
+        let resource = format!(
+            "tenant-{}/{}/{}/{}",
+            claims.tenant_id, envelope.database_id, binding.resource_type, binding.resource_id
+        );
+        for permission in &effect.required_permissions {
+            let action = permission
+                .parse::<AnvilAction>()
+                .map_err(|_| Status::internal("Invalid PersonalDB derived permission"))?;
+            if !auth::is_authorized(action, &resource, &claims.scopes) {
+                return Err(Status::permission_denied(
+                    "PersonalDB row/resource mutation is not authorized",
+                ));
+            }
+        }
     }
     Ok(())
 }

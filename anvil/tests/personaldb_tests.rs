@@ -175,6 +175,23 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
         .unwrap_err();
     assert_eq!(session_mismatch.code(), Code::Unauthenticated);
 
+    let commit_only_token = cluster.states[0]
+        .jwt_manager
+        .mint_token(
+            "test-app".to_string(),
+            vec![format!("personaldb:commit|tenant-1/{database_id}")],
+            1,
+        )
+        .unwrap();
+    let row_permission_denied = client
+        .submit_personal_db_changeset(authorized(
+            valid_submit_request(&database_id, &genesis_hash, &commit_only_token),
+            &commit_only_token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(row_permission_denied.code(), Code::PermissionDenied);
+
     let committed = client
         .submit_personal_db_changeset(authorized(
             valid_submit_request(&database_id, &genesis_hash, &token),

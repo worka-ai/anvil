@@ -185,6 +185,9 @@ fn action_covers_required(token_action: &AnvilAction, required_action: &AnvilAct
                 | AnvilAction::PersonalDbRead
                 | AnvilAction::PersonalDbCommit
                 | AnvilAction::PersonalDbWatch
+                | AnvilAction::PersonalDbInsert
+                | AnvilAction::PersonalDbUpdate
+                | AnvilAction::PersonalDbDelete
         ),
         _ => token_action == required_action, // Exact match for specific actions
     }
@@ -262,6 +265,11 @@ mod tests {
         assert!(is_authorized(
             AnvilAction::PersonalDbRead,
             "tenant-1/db-alpha",
+            &personaldb_scopes
+        ));
+        assert!(is_authorized(
+            AnvilAction::PersonalDbInsert,
+            "tenant-1/db-alpha/items/items:row-hash",
             &personaldb_scopes
         ));
         assert!(!is_authorized(

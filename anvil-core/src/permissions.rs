@@ -66,6 +66,9 @@ pub enum AnvilAction {
     PersonalDbRead,
     PersonalDbCommit,
     PersonalDbWatch,
+    PersonalDbInsert,
+    PersonalDbUpdate,
+    PersonalDbDelete,
 
     // Internal actions
     InternalPutShard,
@@ -136,6 +139,9 @@ impl fmt::Display for AnvilAction {
             AnvilAction::PersonalDbRead => "personaldb:read",
             AnvilAction::PersonalDbCommit => "personaldb:commit",
             AnvilAction::PersonalDbWatch => "personaldb:watch",
+            AnvilAction::PersonalDbInsert => "personaldb:insert",
+            AnvilAction::PersonalDbUpdate => "personaldb:update",
+            AnvilAction::PersonalDbDelete => "personaldb:delete",
 
             // Internal actions
             AnvilAction::InternalPutShard => "internal:put_shard",
@@ -211,6 +217,9 @@ impl FromStr for AnvilAction {
             "personaldb:read" => Ok(AnvilAction::PersonalDbRead),
             "personaldb:commit" => Ok(AnvilAction::PersonalDbCommit),
             "personaldb:watch" => Ok(AnvilAction::PersonalDbWatch),
+            "personaldb:insert" => Ok(AnvilAction::PersonalDbInsert),
+            "personaldb:update" => Ok(AnvilAction::PersonalDbUpdate),
+            "personaldb:delete" => Ok(AnvilAction::PersonalDbDelete),
 
             // Internal actions
             "internal:put_shard" => Ok(AnvilAction::InternalPutShard),
