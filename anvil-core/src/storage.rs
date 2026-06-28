@@ -466,13 +466,18 @@ impl Storage {
     pub fn personaldb_group_dir(&self, tenant_id: i64, database_id: &str) -> Result<PathBuf> {
         ensure_safe_internal_component(database_id, "personaldb database id")?;
         Ok(self
+            .personaldb_tenant_groups_dir(tenant_id)?
+            .join(database_id))
+    }
+
+    pub fn personaldb_tenant_groups_dir(&self, tenant_id: i64) -> Result<PathBuf> {
+        Ok(self
             .storage_path
             .join("_anvil")
             .join("personaldb")
             .join("tenants")
             .join(format!("tenant-{tenant_id}"))
-            .join("groups")
-            .join(database_id))
+            .join("groups"))
     }
 
     pub fn personaldb_group_manifest_path(

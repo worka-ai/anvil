@@ -148,6 +148,61 @@ pub async fn read_projection_definition(
     Ok(Some(definition))
 }
 
+pub async fn list_projection_definitions_for_source(
+    storage: &Storage,
+    tenant_id: i64,
+    source_database_id: &str,
+) -> Result<Vec<ProjectionDefinition>> {
+    let groups_dir = storage.personaldb_tenant_groups_dir(tenant_id)?;
+    let mut definitions = Vec::new();
+    let mut groups = match tokio::fs::read_dir(&groups_dir).await {
+        Ok(groups) => groups,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(definitions),
+        Err(err) => return Err(err).with_context(|| format!("read {}", groups_dir.display())),
+    };
+    while let Some(group) = groups.next_entry().await? {
+        let file_type = group.file_type().await?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let database_id = group.file_name().to_string_lossy().into_owned();
+        let projections_dir = group.path().join("projections");
+        let mut projections = match tokio::fs::read_dir(&projections_dir).await {
+            Ok(projections) => projections,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("read {}", projections_dir.display()));
+            }
+        };
+        while let Some(projection) = projections.next_entry().await? {
+            let file_type = projection.file_type().await?;
+            if !file_type.is_dir() {
+                continue;
+            }
+            let projection_id = projection.file_name().to_string_lossy().into_owned();
+            let Some(definition) =
+                read_projection_definition(storage, tenant_id, &database_id, &projection_id)
+                    .await?
+            else {
+                continue;
+            };
+            if definition
+                .source_database_ids
+                .iter()
+                .any(|source| source == source_database_id)
+            {
+                definitions.push(definition);
+            }
+        }
+    }
+    definitions.sort_by(|left, right| {
+        left.database_id
+            .cmp(&right.database_id)
+            .then_with(|| left.projection_id.cmp(&right.projection_id))
+    });
+    Ok(definitions)
+}
+
 fn canonicalize_projection_definition(definition: &mut ProjectionDefinition) {
     definition.source_database_ids.sort();
     definition.table_mappings.sort();
@@ -448,6 +503,34 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(read, definition);
+    }
+
+    #[tokio::test]
+    async fn projection_definitions_can_be_listed_by_source_group() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let first = sample_definition().seal().unwrap();
+        write_projection_definition(&storage, 7, "projection-db", &first)
+            .await
+            .unwrap();
+        let mut second = sample_definition();
+        second.database_id = "projection-db-b".to_string();
+        second.projection_id = "projection-b".to_string();
+        second.source_database_ids = vec!["db-gamma".to_string()];
+        second.table_mappings[0].source_database_id = "db-gamma".to_string();
+        let second = second.seal().unwrap();
+        write_projection_definition(&storage, 7, "projection-db-b", &second)
+            .await
+            .unwrap();
+
+        let definitions = list_projection_definitions_for_source(&storage, 7, "db-alpha")
+            .await
+            .unwrap();
+        assert_eq!(definitions, vec![first]);
+        let missing = list_projection_definitions_for_source(&storage, 7, "db-missing")
+            .await
+            .unwrap();
+        assert!(missing.is_empty());
     }
 
     #[tokio::test]
