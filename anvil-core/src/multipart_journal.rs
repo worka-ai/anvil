@@ -393,17 +393,6 @@ async fn complete_multipart_upload_inner(
     .await
 }
 
-#[cfg(test)]
-async fn abort_multipart_upload(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-    key: &str,
-    upload_id: uuid::Uuid,
-) -> Result<bool> {
-    abort_multipart_upload_inner(storage, tenant_id, bucket_id, key, upload_id, 0).await
-}
-
 pub(crate) async fn abort_multipart_upload_with_permit(
     storage: &Storage,
     tenant_id: i64,

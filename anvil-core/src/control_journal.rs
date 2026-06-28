@@ -692,11 +692,6 @@ async fn create_admin_role_inner(storage: &Storage, name: &str, fence_token: u64
     append_admin_role_upsert(storage, id, name, fence_token).await
 }
 
-#[cfg(test)]
-async fn update_admin_role(storage: &Storage, id: i32, name: &str) -> Result<()> {
-    update_admin_role_inner(storage, id, name, 0).await
-}
-
 pub(crate) async fn update_admin_role_with_permit(
     storage: &Storage,
     id: i32,
@@ -720,11 +715,6 @@ async fn update_admin_role_inner(
         append_admin_role_upsert(storage, id, name, fence_token).await?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-async fn delete_admin_role(storage: &Storage, id: i32) -> Result<()> {
-    delete_admin_role_inner(storage, id, 0).await
 }
 
 pub(crate) async fn delete_admin_role_with_permit(

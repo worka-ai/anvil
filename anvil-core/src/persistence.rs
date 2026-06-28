@@ -2479,6 +2479,338 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persistence_replays_anvil_owned_state_after_fresh_instance() {
+        let temp = tempdir().unwrap();
+        let first_config = test_config(temp.path());
+        let persistence = Persistence::new(&first_config, None).unwrap();
+
+        persistence.create_region("local").await.unwrap();
+        let tenant = persistence
+            .create_tenant("tenant-a", "unused")
+            .await
+            .unwrap();
+        let app = persistence
+            .create_app(tenant.id, "app-a", "client-a", b"encrypted-secret")
+            .await
+            .unwrap();
+        persistence
+            .grant_policy(app.id, "bucket:docs", "read")
+            .await
+            .unwrap();
+
+        let bucket = persistence
+            .create_bucket(tenant.id, "docs", "local")
+            .await
+            .unwrap();
+        let object = persistence
+            .create_object(
+                tenant.id,
+                bucket.id,
+                "project/a.txt",
+                "payload-hash-a",
+                11,
+                "etag-a",
+                Some("text/plain"),
+                Some(json!({"label": "alpha"})),
+                None,
+                Some(b"hello world".to_vec()),
+            )
+            .await
+            .unwrap();
+        persistence
+            .create_object(
+                tenant.id,
+                bucket.id,
+                "project/nested/b.txt",
+                "payload-hash-b",
+                12,
+                "etag-b",
+                Some("text/plain"),
+                None,
+                None,
+                Some(b"hello again".to_vec()),
+            )
+            .await
+            .unwrap();
+
+        let upload = persistence
+            .create_multipart_upload(tenant.id, bucket.id, "uploads/large.bin")
+            .await
+            .unwrap();
+        persistence
+            .upsert_multipart_part(upload.id, 1, "part-hash-a", 4, "part-etag-a")
+            .await
+            .unwrap();
+
+        let append_stream = persistence
+            .create_append_stream(tenant.id, bucket.id, &bucket.name, "events")
+            .await
+            .unwrap();
+        persistence
+            .append_stream_record(append_stream.id, "event-payload-hash", 42)
+            .await
+            .unwrap();
+
+        let manifest = persistence
+            .compare_and_swap_manifest(
+                tenant.id,
+                bucket.id,
+                &bucket.name,
+                "manifests/current.json",
+                0,
+                json!({"generation": 1}),
+                "manifest-hash-a",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let index = persistence
+            .create_index_definition(
+                tenant.id,
+                bucket.id,
+                "body",
+                "full_text",
+                json!({"prefix": "project/"}),
+                json!({"field": "body"}),
+                "inherit",
+                json!({"mode": "watch"}),
+            )
+            .await
+            .unwrap();
+        persistence
+            .create_index_definition_event(tenant.id, bucket.id, &bucket.name, &index, "create")
+            .await
+            .unwrap();
+        persistence
+            .create_index_diagnostic(
+                tenant.id,
+                bucket.id,
+                &bucket.name,
+                Some(index.id),
+                &index.name,
+                &object.key,
+                Some(object.version_id),
+                "warning",
+                "diagnostic-alpha",
+                "synthetic diagnostic for replay coverage",
+                json!({"source": "test"}),
+            )
+            .await
+            .unwrap();
+
+        let authz = persistence
+            .write_authz_tuple(
+                tenant.id,
+                "document",
+                &object.key,
+                "reader",
+                "user",
+                "user-a",
+                "",
+                "add",
+                "test",
+                "grant reader",
+            )
+            .await
+            .unwrap();
+        persistence
+            .enqueue_task(
+                crate::tasks::TaskType::DeleteBucket,
+                json!({"bucket_id": bucket.id}),
+                5,
+            )
+            .await
+            .unwrap();
+        persistence
+            .create_model_artifact("artifact-a", tenant.id, "models/a", &model_manifest())
+            .await
+            .unwrap();
+        persistence
+            .hf_create_key("primary", b"secret", Some("note"))
+            .await
+            .unwrap();
+
+        drop(persistence);
+
+        let restarted_config = Config {
+            public_api_addr: "test-node-after-restart".to_string(),
+            ..first_config
+        };
+        let replayed = Persistence::new(&restarted_config, None).unwrap();
+
+        assert!(
+            replayed
+                .list_regions()
+                .await
+                .unwrap()
+                .contains(&"local".to_string())
+        );
+        assert_eq!(
+            replayed
+                .get_tenant_by_name("tenant-a")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            tenant.id
+        );
+        assert_eq!(
+            replayed
+                .get_app_by_client_id("client-a")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            app.id
+        );
+        assert_eq!(
+            replayed.get_policies_for_app(app.id).await.unwrap(),
+            vec!["read|bucket:docs".to_string()]
+        );
+        assert_eq!(
+            replayed
+                .get_bucket_by_name(tenant.id, "docs")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            bucket.id
+        );
+
+        let replayed_object = replayed
+            .get_object(bucket.id, "project/a.txt")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed_object.version_id, object.version_id);
+        assert_eq!(
+            replayed_object.inline_payload.as_deref(),
+            Some(&b"hello world"[..])
+        );
+        assert_eq!(replayed_object.user_meta.unwrap()["label"], "alpha");
+
+        let (objects, common_prefixes) = replayed
+            .list_objects(bucket.id, "project/", "", 100, "/")
+            .await
+            .unwrap();
+        assert_eq!(
+            objects
+                .iter()
+                .map(|object| object.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["project/a.txt"]
+        );
+        assert_eq!(common_prefixes, vec!["project/nested/".to_string()]);
+        assert_eq!(
+            replayed
+                .list_object_versions(bucket.id, "project/", "", None, 100)
+                .await
+                .unwrap()
+                .versions
+                .len(),
+            2
+        );
+
+        assert_eq!(
+            replayed
+                .get_active_multipart_upload(
+                    tenant.id,
+                    bucket.id,
+                    "uploads/large.bin",
+                    upload.upload_id
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            upload.id
+        );
+        assert_eq!(
+            replayed
+                .list_multipart_parts(upload.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            replayed
+                .list_append_stream_records(append_stream.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let second_manifest = replayed
+            .compare_and_swap_manifest(
+                tenant.id,
+                bucket.id,
+                &bucket.name,
+                "manifests/current.json",
+                manifest.revision,
+                json!({"generation": 2}),
+                "manifest-hash-b",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_manifest.revision, manifest.revision + 1);
+
+        assert_eq!(
+            replayed
+                .list_index_definitions(tenant.id, bucket.id, false)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            replayed
+                .list_index_definition_events(tenant.id, bucket.id, 0, 100)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            replayed
+                .list_index_diagnostics(tenant.id, bucket.id, &index.name, "", 0, 100)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            replayed
+                .check_authz_tuple(
+                    tenant.id,
+                    "document",
+                    &object.key,
+                    "reader",
+                    "user",
+                    "user-a",
+                    "",
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            authz.revision
+        );
+        assert_eq!(replayed.list_tasks().await.unwrap().len(), 1);
+        assert!(
+            replayed
+                .get_model_artifact("artifact-a")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(replayed.hf_list_keys().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn persistence_global_journal_writes_use_current_fence_tokens() {
         let temp = tempdir().unwrap();
         let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();

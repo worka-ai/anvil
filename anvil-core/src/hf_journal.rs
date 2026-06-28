@@ -363,11 +363,6 @@ async fn update_ingestion_state_inner(
     .await
 }
 
-#[cfg(test)]
-async fn cancel_ingestion(storage: &Storage, id: i64) -> Result<u64> {
-    cancel_ingestion_inner(storage, id, 0).await
-}
-
 pub(crate) async fn cancel_ingestion_with_permit(
     storage: &Storage,
     id: i64,
@@ -470,16 +465,6 @@ async fn add_item_inner(
     )
     .await?;
     Ok(id)
-}
-
-#[cfg(test)]
-async fn update_item_state(
-    storage: &Storage,
-    id: i64,
-    state_value: crate::tasks::HFIngestionItemState,
-    error: Option<&str>,
-) -> Result<()> {
-    update_item_state_inner(storage, id, state_value, error, 0).await
 }
 
 pub(crate) async fn update_item_state_with_permit(
