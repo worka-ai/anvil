@@ -241,7 +241,15 @@ fn validate_committed_head_unsigned(head: &PersonalDbCommittedHead) -> Result<()
     validate_hex32(&head.schema_hash, "schema_hash")?;
     require_nonempty(&head.tenant_id, "tenant_id")?;
     require_nonempty(&head.database_id, "database_id")?;
-    require_nonempty(&head.segment_path, "segment_path")?;
+    if head.log_index == 0 {
+        if !head.segment_path.is_empty() {
+            return Err(anyhow!(
+                "personaldb genesis committed head segment path must be empty"
+            ));
+        }
+    } else {
+        require_nonempty(&head.segment_path, "segment_path")?;
+    }
     require_nonempty(&head.updated_at, "updated_at")?;
     require_nonempty(&head.updated_by_node, "updated_by_node")?;
     Ok(())

@@ -91,6 +91,7 @@ pub struct AppState {
     pub bucket_watch_tx: broadcast::Sender<persistence::BucketMetadataEvent>,
     pub authz_watch_tx: broadcast::Sender<persistence::AuthzTupleRecord>,
     pub index_watch_tx: broadcast::Sender<persistence::IndexDefinitionEvent>,
+    pub personaldb_watch_tx: broadcast::Sender<personaldb_watch::PersonalDbGroupWatchEvent>,
 }
 
 impl AppState {
@@ -112,6 +113,7 @@ impl AppState {
         let (bucket_watch_tx, _bucket_watch_rx) = tokio::sync::broadcast::channel(1024);
         let (authz_watch_tx, _authz_watch_rx) = tokio::sync::broadcast::channel(1024);
         let (index_watch_tx, _index_watch_rx) = tokio::sync::broadcast::channel(1024);
+        let (personaldb_watch_tx, _personaldb_watch_rx) = tokio::sync::broadcast::channel(1024);
 
         let bucket_manager = bucket_manager::BucketManager::new(db.clone(), storage.clone());
         let object_manager = object_manager::ObjectManager::new(
@@ -140,6 +142,7 @@ impl AppState {
             bucket_watch_tx,
             authz_watch_tx,
             index_watch_tx,
+            personaldb_watch_tx,
         })
     }
 }

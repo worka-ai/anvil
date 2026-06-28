@@ -4,6 +4,7 @@ pub mod huggingface;
 pub mod index;
 pub mod internal;
 pub mod object;
+pub mod personaldb;
 
 use crate::anvil_api::{
     auth_service_server::AuthServiceServer, bucket_service_server::BucketServiceServer,
@@ -12,6 +13,7 @@ use crate::anvil_api::{
     index_service_server::IndexServiceServer,
     internal_anvil_service_server::InternalAnvilServiceServer,
     object_service_server::ObjectServiceServer,
+    personal_db_service_server::PersonalDbServiceServer,
 };
 use crate::{AppState, middleware};
 use tonic::service::Routes;
@@ -56,6 +58,10 @@ pub fn create_grpc_router(state: AppState, auth_interceptor: AuthInterceptorFn) 
         auth_closure.clone(),
     ))
     .add_service(IndexServiceServer::with_interceptor(
+        state.clone(),
+        auth_closure.clone(),
+    ))
+    .add_service(PersonalDbServiceServer::with_interceptor(
         state.clone(),
         auth_closure.clone(),
     ))

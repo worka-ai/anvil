@@ -527,6 +527,14 @@ service AuthService {
   rpc WatchAuthzTupleLog(WatchAuthzTupleLogRequest) returns (stream WatchAuthzTupleLogResponse);
 }
 
+service PersonalDbService {
+  rpc CreatePersonalDbGroup(CreatePersonalDbGroupRequest) returns (PersonalDbGroupResponse);
+  rpc GetPersonalDbGroup(GetPersonalDbGroupRequest) returns (PersonalDbGroupResponse);
+  rpc SubmitPersonalDbChangeset(SubmitPersonalDbChangesetRequest) returns (SubmitPersonalDbChangesetResponse);
+  rpc CatchUpPersonalDb(PersonalDbCatchUpRequest) returns (PersonalDbCatchUpResponse);
+  rpc WatchPersonalDbGroup(WatchPersonalDbGroupRequest) returns (stream WatchPersonalDbGroupResponse);
+}
+
 // Hugging Face Keys (public API, policy enforced)
 service HuggingFaceKeyService {
   rpc CreateKey(CreateHfKeyRequest) returns (CreateHfKeyResponse);
@@ -677,6 +685,192 @@ message WatchAuthzTupleLogResponse {
     string reason = 10;
     string record_hash = 11;
     string written_at = 12;
+}
+
+message CreatePersonalDbGroupRequest {
+    string database_id = 1;
+    string schema_hash = 2;
+    string genesis_hash = 3;
+}
+
+message GetPersonalDbGroupRequest {
+    int64 tenant_id = 1;
+    string database_id = 2;
+}
+
+message PersonalDbGroupResponse {
+    PersonalDbGroupManifestRecord manifest = 1;
+    PersonalDbCommittedHeadRecord committed_head = 2;
+}
+
+message PersonalDbGroupManifestRecord {
+    uint32 format_version = 1;
+    string tenant_id = 2;
+    string database_id = 3;
+    string schema_hash = 4;
+    string genesis_hash = 5;
+    string created_at = 6;
+    string created_by = 7;
+    string consistency_policy = 8;
+    uint32 object_layout_version = 9;
+    uint64 active_membership_epoch = 10;
+    uint64 active_policy_epoch = 11;
+    uint64 current_row_index_generation = 12;
+    uint64 current_projection_generation = 13;
+    string manifest_hash = 14;
+    string manifest_signature = 15;
+}
+
+message PersonalDbCommittedHeadRecord {
+    uint32 format_version = 1;
+    string tenant_id = 2;
+    string database_id = 3;
+    uint64 log_index = 4;
+    string log_hash = 5;
+    string segment_path = 6;
+    uint64 row_index_generation = 7;
+    uint64 policy_epoch = 8;
+    uint64 membership_epoch = 9;
+    string schema_hash = 10;
+    string updated_at = 11;
+    string updated_by_node = 12;
+    string head_hash = 13;
+    string head_signature = 14;
+}
+
+message PersonalDbSnapshotsHeadRecord {
+    uint32 format_version = 1;
+    string tenant_id = 2;
+    string database_id = 3;
+    uint64 latest_snapshot_log_index = 4;
+    string latest_snapshot_log_hash = 5;
+    string latest_snapshot_manifest_path = 6;
+    uint32 retained_snapshot_count = 7;
+    string updated_at = 8;
+    string updated_by_node = 9;
+    string head_hash = 10;
+    string head_signature = 11;
+}
+
+message PersonalDbVoterAck {
+    string replica_id = 1;
+    uint64 log_index = 2;
+    string log_hash = 3;
+    string signature = 4;
+}
+
+message SubmitPersonalDbChangesetRequest {
+    int64 tenant_id = 1;
+    string database_id = 2;
+    string principal = 3;
+    string session_token = 4;
+    string request_id = 5;
+    string idempotency_key = 6;
+    uint64 base_log_index = 7;
+    string base_log_hash = 8;
+    uint64 client_log_epoch = 9;
+    uint64 membership_epoch = 10;
+    uint64 policy_epoch = 11;
+    string leader_replica_id = 12;
+    repeated PersonalDbVoterAck voter_acks = 13;
+    string changeset_payload_hash = 14;
+    bytes changeset_bytes = 15;
+    string client_debug_metadata_json = 16;
+}
+
+message SubmitPersonalDbChangesetResponse {
+    uint64 log_index = 1;
+    string log_hash = 2;
+    string changeset_payload_hash = 3;
+    string verified_envelope_hash = 4;
+    string certificate_hash = 5;
+    PersonalDbCommitCertificateRecord certificate = 6;
+    PersonalDbCommittedHeadRecord committed_head = 7;
+    uint64 watch_cursor_low = 8;
+    uint64 watch_cursor_high = 9;
+}
+
+message PersonalDbCommitCertificateRecord {
+    uint32 format_version = 1;
+    string tenant_id = 2;
+    string database_id = 3;
+    uint64 log_index = 4;
+    string previous_log_hash = 5;
+    string entry_hash = 6;
+    string changeset_payload_hash = 7;
+    string verified_envelope_hash = 8;
+    uint64 client_log_epoch = 9;
+    uint64 membership_epoch = 10;
+    uint64 policy_epoch = 11;
+    string leader_replica_id = 12;
+    string voter_acks_hash = 13;
+    uint64 authz_revision = 14;
+    string witness_node_id = 15;
+    string witnessed_at = 16;
+    string certificate_hash = 17;
+    string witness_signature = 18;
+}
+
+message PersonalDbCatchUpRequest {
+    int64 tenant_id = 1;
+    string database_id = 2;
+    string principal = 3;
+    string replica_id = 4;
+    uint64 have_log_index = 5;
+    string have_log_hash = 6;
+    uint32 max_entries = 7;
+}
+
+message PersonalDbCatchUpResponse {
+    bool snapshot_required = 1;
+    string snapshot_reason = 2;
+    PersonalDbCommittedHeadRecord committed_head = 3;
+    PersonalDbSnapshotsHeadRecord snapshots_head = 4;
+    repeated PersonalDbCatchUpEntry entries = 5;
+    bool has_more = 6;
+}
+
+message PersonalDbCatchUpEntry {
+    PersonalDbLogRecord log_record = 1;
+    bytes changeset_bytes = 2;
+    PersonalDbCommitCertificateRecord certificate = 3;
+    bytes certificate_json = 4;
+}
+
+message PersonalDbLogRecord {
+    uint64 log_index = 1;
+    uint64 client_log_epoch = 2;
+    uint64 membership_epoch = 3;
+    uint64 policy_epoch = 4;
+    string previous_log_hash = 5;
+    string changeset_payload_hash = 6;
+    string verified_envelope_hash = 7;
+    string certificate_hash = 8;
+    string payload_ref = 9;
+    string certificate_ref = 10;
+    bytes inline_certificate_json = 11;
+    string entry_hash = 12;
+}
+
+message WatchPersonalDbGroupRequest {
+    int64 tenant_id = 1;
+    string database_id = 2;
+    uint64 after_cursor_low = 3;
+    uint64 after_cursor_high = 4;
+}
+
+message WatchPersonalDbGroupResponse {
+    uint64 cursor_low = 1;
+    uint64 cursor_high = 2;
+    string database_id = 3;
+    string event_type = 4;
+    uint64 log_index = 5;
+    string log_hash = 6;
+    string changeset_payload_hash = 7;
+    string certificate_hash = 8;
+    string committed_head_hash = 9;
+    uint64 authz_revision = 10;
+    string emitted_at = 11;
 }
 
 

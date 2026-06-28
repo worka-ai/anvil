@@ -176,6 +176,13 @@ fn action_covers_required(token_action: &AnvilAction, required_action: &AnvilAct
                 | AnvilAction::IndexDelete
                 | AnvilAction::IndexWatch
         ),
+        AnvilAction::PersonalDbAll => matches!(
+            required_action,
+            AnvilAction::PersonalDbCreate
+                | AnvilAction::PersonalDbRead
+                | AnvilAction::PersonalDbCommit
+                | AnvilAction::PersonalDbWatch
+        ),
         _ => token_action == required_action, // Exact match for specific actions
     }
 }
@@ -241,6 +248,23 @@ mod tests {
             AnvilAction::BucketCreate,
             "any-bucket",
             &token_scopes
+        ));
+        assert!(is_authorized(
+            AnvilAction::PersonalDbCommit,
+            "tenant-1/db-alpha",
+            &token_scopes
+        ));
+
+        let personaldb_scopes = vec!["personaldb:*|tenant-1/*".to_string()];
+        assert!(is_authorized(
+            AnvilAction::PersonalDbRead,
+            "tenant-1/db-alpha",
+            &personaldb_scopes
+        ));
+        assert!(!is_authorized(
+            AnvilAction::PersonalDbRead,
+            "tenant-2/db-alpha",
+            &personaldb_scopes
         ));
 
         //below the we get unauthorised if wildcard doesn't grant access

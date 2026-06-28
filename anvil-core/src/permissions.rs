@@ -17,6 +17,7 @@ pub enum AnvilAction {
     PolicyAll,      // Matches policy:*
     AuthzAll,       // Matches authz:*
     IndexAll,       // Matches index:*
+    PersonalDbAll,  // Matches personaldb:*
 
     // Bucket actions
     BucketCreate,
@@ -60,6 +61,12 @@ pub enum AnvilAction {
     IndexDelete,
     IndexWatch,
 
+    // PersonalDB actions
+    PersonalDbCreate,
+    PersonalDbRead,
+    PersonalDbCommit,
+    PersonalDbWatch,
+
     // Internal actions
     InternalPutShard,
     InternalGetShard,
@@ -80,6 +87,7 @@ impl fmt::Display for AnvilAction {
             AnvilAction::PolicyAll => "policy:*",
             AnvilAction::AuthzAll => "authz:*",
             AnvilAction::IndexAll => "index:*",
+            AnvilAction::PersonalDbAll => "personaldb:*",
 
             // Bucket actions
             AnvilAction::BucketCreate => "bucket:create",
@@ -123,6 +131,12 @@ impl fmt::Display for AnvilAction {
             AnvilAction::IndexDelete => "index:delete",
             AnvilAction::IndexWatch => "index:watch",
 
+            // PersonalDB actions
+            AnvilAction::PersonalDbCreate => "personaldb:create",
+            AnvilAction::PersonalDbRead => "personaldb:read",
+            AnvilAction::PersonalDbCommit => "personaldb:commit",
+            AnvilAction::PersonalDbWatch => "personaldb:watch",
+
             // Internal actions
             AnvilAction::InternalPutShard => "internal:put_shard",
             AnvilAction::InternalGetShard => "internal:get_shard",
@@ -148,6 +162,7 @@ impl FromStr for AnvilAction {
             "policy:*" => Ok(AnvilAction::PolicyAll),
             "authz:*" => Ok(AnvilAction::AuthzAll),
             "index:*" => Ok(AnvilAction::IndexAll),
+            "personaldb:*" => Ok(AnvilAction::PersonalDbAll),
 
             // Bucket actions
             "bucket:create" => Ok(AnvilAction::BucketCreate),
@@ -191,6 +206,12 @@ impl FromStr for AnvilAction {
             "index:delete" => Ok(AnvilAction::IndexDelete),
             "index:watch" => Ok(AnvilAction::IndexWatch),
 
+            // PersonalDB actions
+            "personaldb:create" => Ok(AnvilAction::PersonalDbCreate),
+            "personaldb:read" => Ok(AnvilAction::PersonalDbRead),
+            "personaldb:commit" => Ok(AnvilAction::PersonalDbCommit),
+            "personaldb:watch" => Ok(AnvilAction::PersonalDbWatch),
+
             // Internal actions
             "internal:put_shard" => Ok(AnvilAction::InternalPutShard),
             "internal:get_shard" => Ok(AnvilAction::InternalGetShard),
@@ -217,6 +238,7 @@ mod tests {
             AnvilAction::PolicyAll,
             AnvilAction::AuthzAll,
             AnvilAction::IndexAll,
+            AnvilAction::PersonalDbAll,
             AnvilAction::BucketCreate,
             AnvilAction::BucketWatch,
             AnvilAction::ObjectWrite,
@@ -226,6 +248,10 @@ mod tests {
             AnvilAction::AuthzCheck,
             AnvilAction::IndexCreate,
             AnvilAction::IndexWatch,
+            AnvilAction::PersonalDbCreate,
+            AnvilAction::PersonalDbRead,
+            AnvilAction::PersonalDbCommit,
+            AnvilAction::PersonalDbWatch,
             AnvilAction::InternalPutShard,
             AnvilAction::InternalDeleteShard,
         ];
