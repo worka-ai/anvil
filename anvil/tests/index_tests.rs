@@ -11,6 +11,7 @@ use anvil::anvil_api::{
 use anvil::formats::full_text::{FullTextDocument, build_full_text_postings};
 use anvil::formats::vector::{VectorMetric, VectorModality, VectorPayload, VectorRecord};
 use anvil::full_text_segment::{FullTextSegmentWrite, write_full_text_segment};
+use anvil::search_query::{FullTextSegmentQuery, query_full_text_segment};
 use anvil::vector_segment::{VectorSegmentEntry, VectorSegmentWrite, write_vector_segment};
 use anvil_test_utils::*;
 use futures_util::StreamExt;
@@ -468,6 +469,138 @@ async fn test_full_text_index_build_extracts_json_pointer_from_object_write_task
     assert_eq!(response.index_kind, "full_text");
     assert_eq!(response.hits[0].object_key, "docs/report.json");
     assert!(response.hits[0].score > 0.0);
+}
+
+#[tokio::test]
+async fn test_full_text_index_build_uses_source_cursor_snapshot() {
+    let cluster = TestCluster::new(&["test-region-1"]).await;
+    let persistence = &cluster.states[0].persistence;
+    let tenant_id = 1;
+    let bucket_name = format!("cursor-snapshot-{}", uuid::Uuid::new_v4());
+    let bucket = persistence
+        .create_bucket(tenant_id, &bucket_name, "test-region-1")
+        .await
+        .unwrap();
+    let index = persistence
+        .create_index_definition(
+            tenant_id,
+            bucket.id,
+            "body",
+            "full_text",
+            serde_json::json!({"prefix": "docs/"}),
+            serde_json::json!({"source": "object_body_utf8"}),
+            "index_only",
+            serde_json::json!({"positions": true}),
+        )
+        .await
+        .unwrap();
+    persistence
+        .create_index_definition_event(tenant_id, bucket.id, &bucket.name, &index, "create")
+        .await
+        .unwrap();
+
+    persistence
+        .create_object(
+            tenant_id,
+            bucket.id,
+            "docs/alpha.txt",
+            &hex::encode([1; 32]),
+            20,
+            "etag-alpha",
+            Some("text/plain"),
+            None,
+            None,
+            Some(b"alpha cursor visible".to_vec()),
+        )
+        .await
+        .unwrap();
+    let source_cursor = persistence
+        .list_tasks()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|task| {
+            task.task_type == anvil::tasks::TaskType::IndexBuild
+                && task.payload["index_id"] == serde_json::json!(index.id)
+        })
+        .and_then(|task| task.payload["source_cursor"].as_u64())
+        .expect("first index build task records source cursor");
+
+    persistence
+        .create_object(
+            tenant_id,
+            bucket.id,
+            "docs/future.txt",
+            &hex::encode([2; 32]),
+            27,
+            "etag-future",
+            Some("text/plain"),
+            None,
+            None,
+            Some(b"future object must wait".to_vec()),
+        )
+        .await
+        .unwrap();
+
+    persistence
+        .build_index_task(
+            tenant_id,
+            bucket.id,
+            index.id,
+            index.version,
+            u128::from(source_cursor),
+        )
+        .await
+        .unwrap()
+        .expect("index build succeeds");
+
+    let index_storage_id = anvil::index_journal::index_storage_id(tenant_id, bucket.id, index.id);
+    let segment = anvil::full_text_segment::read_latest_full_text_segment(
+        &cluster.states[0].storage,
+        &index_storage_id,
+    )
+    .await
+    .unwrap()
+    .expect("full text segment exists");
+    assert_eq!(segment.header.source_cursor, source_cursor);
+
+    let definition = anvil::formats::full_text::FullTextIndexDefinition::from_json(
+        &serde_json::json!({"positions": true}),
+    )
+    .unwrap();
+    let alpha_hits = query_full_text_segment(
+        &segment,
+        FullTextSegmentQuery {
+            query: "alpha",
+            tokenizer: &definition.tokenizer,
+            positions_enabled: definition.positions_enabled,
+            phrase: false,
+            bm25: anvil::formats::full_text::Bm25Config::default(),
+            authorized_labels: None,
+            limit: 10,
+        },
+    )
+    .unwrap();
+    let future_hits = query_full_text_segment(
+        &segment,
+        FullTextSegmentQuery {
+            query: "future",
+            tokenizer: &definition.tokenizer,
+            positions_enabled: definition.positions_enabled,
+            phrase: false,
+            bm25: anvil::formats::full_text::Bm25Config::default(),
+            authorized_labels: None,
+            limit: 10,
+        },
+    )
+    .unwrap();
+    assert!(!alpha_hits.is_empty());
+    assert!(future_hits.is_empty());
+
+    let document_table: serde_json::Value =
+        serde_json::from_slice(&segment.document_table).unwrap();
+    assert!(document_table.to_string().contains("docs/alpha.txt"));
+    assert!(!document_table.to_string().contains("docs/future.txt"));
 }
 
 #[tokio::test]

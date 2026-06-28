@@ -852,6 +852,31 @@ pub async fn read_current_objects(
     manifest_signing_key: &[u8],
 ) -> Result<Vec<Object>> {
     let body_records = read_object_version_bodies(storage, bucket, manifest_signing_key).await?;
+    current_objects_from_version_bodies(body_records)
+}
+
+pub async fn read_current_objects_through_sequence(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+    max_sequence: u128,
+) -> Result<Vec<Object>> {
+    if max_sequence == 0 {
+        return Ok(Vec::new());
+    }
+    let body_records = read_object_version_bodies_through_sequence(
+        storage,
+        bucket,
+        manifest_signing_key,
+        max_sequence,
+    )
+    .await?;
+    current_objects_from_version_bodies(body_records)
+}
+
+fn current_objects_from_version_bodies(
+    body_records: Vec<(usize, ObjectVersionBody)>,
+) -> Result<Vec<Object>> {
     let mut versions_by_key = object_versions_by_key(body_records);
 
     let mut current = Vec::new();
@@ -976,6 +1001,27 @@ async fn read_object_version_bodies(
     bucket: &Bucket,
     manifest_signing_key: &[u8],
 ) -> Result<Vec<(usize, ObjectVersionBody)>> {
+    read_object_version_bodies_inner(storage, bucket, manifest_signing_key, None).await
+}
+
+async fn read_object_version_bodies_through_sequence(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+    max_sequence: u128,
+) -> Result<Vec<(usize, ObjectVersionBody)>> {
+    let max_sequence = u64::try_from(max_sequence)
+        .map_err(|_| anyhow!("object metadata source cursor exceeds u64 sequence range"))?;
+    read_object_version_bodies_inner(storage, bucket, manifest_signing_key, Some(max_sequence))
+        .await
+}
+
+async fn read_object_version_bodies_inner(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+    max_sequence: Option<u64>,
+) -> Result<Vec<(usize, ObjectVersionBody)>> {
     let mut body_records = Vec::<(usize, ObjectVersionBody)>::new();
     let mut order = 0usize;
     let mut compacted_through_sequence = 0u64;
@@ -991,6 +1037,13 @@ async fn read_object_version_bodies(
                 )
             })?;
         compacted_through_sequence = recovered.manifest.compacted_through_sequence;
+        if let Some(max_sequence) = max_sequence {
+            if compacted_through_sequence > max_sequence {
+                return Err(anyhow!(
+                    "object metadata source cursor is older than manifest checkpoint"
+                ));
+            }
+        }
         for record in recovered.metadata_records {
             let body: ObjectVersionBody = serde_json::from_slice(&record.value)?;
             body_records.push((order, body));
@@ -1006,6 +1059,9 @@ async fn read_object_version_bodies(
         let (_, frames) = decode_journal_file(&journal_bytes)?;
         for frame in frames {
             if frame.partition_sequence <= compacted_through_sequence {
+                continue;
+            }
+            if max_sequence.is_some_and(|max_sequence| frame.partition_sequence > max_sequence) {
                 continue;
             }
             if matches!(

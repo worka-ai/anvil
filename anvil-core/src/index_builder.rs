@@ -114,9 +114,13 @@ pub async fn build_full_text_index(
         .max(u64::try_from(source_cursor).unwrap_or(u64::MAX))
         .max(1);
 
-    let objects =
-        metadata_journal::read_current_objects(storage, bucket, partition_owner_signing_key)
-            .await?;
+    let objects = metadata_journal::read_current_objects_through_sequence(
+        storage,
+        bucket,
+        partition_owner_signing_key,
+        source_cursor,
+    )
+    .await?;
     let mut owned_documents = Vec::new();
     let mut diagnostics = Vec::new();
     for object in objects {
@@ -395,9 +399,13 @@ async fn build_vector_index_with_policy(
         .max(u64::try_from(source_cursor).unwrap_or(u64::MAX))
         .max(1);
 
-    let objects =
-        metadata_journal::read_current_objects(storage, bucket, partition_owner_signing_key)
-            .await?;
+    let objects = metadata_journal::read_current_objects_through_sequence(
+        storage,
+        bucket,
+        partition_owner_signing_key,
+        source_cursor,
+    )
+    .await?;
     let mut vector_documents = Vec::new();
     let mut diagnostics = Vec::new();
     for object in objects {
