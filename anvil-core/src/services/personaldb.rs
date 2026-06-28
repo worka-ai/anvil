@@ -25,7 +25,14 @@ use crate::{
         write_personaldb_group_manifest,
     },
     personaldb_row_index::{PersonalDbRowIndexWrite, write_personaldb_row_index},
+    personaldb_schema::{
+        read_personaldb_schema_sql, validate_changeset_tables_registered, validate_schema_sql,
+        write_personaldb_schema_sql,
+    },
     personaldb_segment::{PersonalDbLogSegmentWrite, write_personaldb_log_segment},
+    personaldb_snapshot_builder::{
+        PersonalDbSnapshotBuildRequest, PersonalDbSnapshotPolicy, maybe_build_personaldb_snapshot,
+    },
     personaldb_submit::{
         SubmitPersonalDbChangeset as CoreSubmitChangeset, default_max_changeset_size,
         validate_submit_personaldb_changeset,
@@ -55,6 +62,8 @@ impl PersonalDbService for AppState {
         validate_database_id(&req.database_id)?;
         validate_hex32(&req.schema_hash, "schema_hash")?;
         validate_hex32(&req.genesis_hash, "genesis_hash")?;
+        validate_schema_sql(&req.schema_sql, &req.schema_hash)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
 
         let resource = personaldb_resource(claims.tenant_id, &req.database_id);
         if !auth::is_authorized(AnvilAction::PersonalDbCreate, &resource, &claims.scopes) {
@@ -93,6 +102,15 @@ impl PersonalDbService for AppState {
             manifest_signature: None,
         }
         .seal(signing_key)
+        .map_err(internal_status)?;
+        write_personaldb_schema_sql(
+            &self.storage,
+            claims.tenant_id,
+            &req.database_id,
+            &req.schema_sql,
+            &req.schema_hash,
+        )
+        .await
         .map_err(internal_status)?;
         write_personaldb_group_manifest(&self.storage, claims.tenant_id, &manifest, signing_key)
             .await
@@ -226,6 +244,17 @@ impl PersonalDbService for AppState {
         }
 
         let changes = iterate_changeset(&validated.request.changeset_bytes)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let schema_sql = read_personaldb_schema_sql(
+            &self.storage,
+            claims.tenant_id,
+            &validated.request.database_id,
+            &manifest.schema_hash,
+        )
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::failed_precondition("PersonalDB schema SQL missing"))?;
+        validate_changeset_tables_registered(&changes, &schema_sql)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         let authz_revision = authz_journal::latest_authz_revision(&self.storage, claims.tenant_id)
             .await
@@ -429,6 +458,25 @@ impl PersonalDbService for AppState {
             emitted_at: now_rfc3339(),
         };
         let mutation_id = *uuid::Uuid::new_v4().as_bytes();
+        maybe_build_personaldb_snapshot(
+            &self.storage,
+            PersonalDbSnapshotBuildRequest {
+                tenant_id: claims.tenant_id,
+                database_id: &validated.request.database_id,
+                schema_sql: &schema_sql,
+                created_by_node: &claims.sub,
+                policy: PersonalDbSnapshotPolicy {
+                    entry_threshold: self.config.personaldb_snapshot_entry_threshold,
+                    payload_bytes_threshold: self
+                        .config
+                        .personaldb_snapshot_payload_bytes_threshold,
+                },
+            },
+            signing_key,
+        )
+        .await
+        .map_err(internal_status)?;
+
         append_personaldb_group_watch_record(
             &self.storage,
             claims.tenant_id,

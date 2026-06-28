@@ -49,6 +49,7 @@ pub mod personaldb_envelope;
 pub mod personaldb_heads;
 pub mod personaldb_projection;
 pub mod personaldb_row_index;
+pub mod personaldb_schema;
 pub mod personaldb_segment;
 pub mod personaldb_snapshot_builder;
 pub mod personaldb_snapshot_store;

@@ -55,6 +55,14 @@ pub struct Config {
     /// Directory used for Anvil-owned object bytes, metadata journals, indexes, and manifests.
     #[arg(long, env, default_value = "anvil-data")]
     pub storage_path: String,
+
+    /// PersonalDB entries committed after the latest snapshot before building another snapshot.
+    #[arg(long, env, default_value_t = 1024)]
+    pub personaldb_snapshot_entry_threshold: u64,
+
+    /// PersonalDB changeset payload bytes committed after the latest snapshot before building another snapshot.
+    #[arg(long, env, default_value_t = 64 * 1024 * 1024)]
+    pub personaldb_snapshot_payload_bytes_threshold: u64,
 }
 impl Config {
     #[allow(unused)]

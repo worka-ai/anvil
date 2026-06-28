@@ -485,6 +485,12 @@ impl Storage {
             .join("manifest.json"))
     }
 
+    pub fn personaldb_schema_sql_path(&self, tenant_id: i64, database_id: &str) -> Result<PathBuf> {
+        Ok(self
+            .personaldb_group_dir(tenant_id, database_id)?
+            .join("schema.sql"))
+    }
+
     pub fn personaldb_committed_head_path(
         &self,
         tenant_id: i64,

@@ -12,6 +12,16 @@ use rusqlite::{Connection, session::Session};
 use std::time::Duration;
 use tonic::{Code, Request};
 
+const PERSONALDB_TEST_SCHEMA_SQL: &str = "CREATE TABLE items(
+    id INTEGER PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL,
+    payload BLOB
+);";
+
+fn personaldb_test_schema_hash() -> String {
+    hex::encode(hash32(PERSONALDB_TEST_SCHEMA_SQL.as_bytes()))
+}
+
 fn authorized<T>(message: T, token: &str) -> Request<T> {
     let mut request = Request::new(message);
     request.metadata_mut().insert(
@@ -30,7 +40,7 @@ async fn personaldb_group_create_get_and_catch_up_are_native_api_backed() {
     let token = cluster.token.clone();
     let mut client = PersonalDbServiceClient::connect(grpc_addr).await.unwrap();
     let database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
-    let schema_hash = hex::encode([3; 32]);
+    let schema_hash = personaldb_test_schema_hash();
     let genesis_hash = hex::encode(hash32(format!("genesis:{database_id}").as_bytes()));
 
     let created = client
@@ -39,6 +49,7 @@ async fn personaldb_group_create_get_and_catch_up_are_native_api_backed() {
                 database_id: database_id.clone(),
                 schema_hash: schema_hash.clone(),
                 genesis_hash: genesis_hash.clone(),
+                schema_sql: PERSONALDB_TEST_SCHEMA_SQL.to_string(),
             },
             &token,
         ))
@@ -132,8 +143,9 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
         .create_personal_db_group(authorized(
             CreatePersonalDbGroupRequest {
                 database_id: database_id.clone(),
-                schema_hash: hex::encode([4; 32]),
+                schema_hash: personaldb_test_schema_hash(),
                 genesis_hash: genesis_hash.clone(),
+                schema_sql: PERSONALDB_TEST_SCHEMA_SQL.to_string(),
             },
             &token,
         ))
@@ -297,6 +309,69 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
     assert_eq!(event.event_type, "commit");
     assert_eq!(event.log_index, 1);
     assert_eq!(event.log_hash, committed.log_hash);
+}
+
+#[tokio::test]
+async fn personaldb_submit_builds_snapshot_when_threshold_is_reached() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    std::sync::Arc::make_mut(&mut cluster.states[0].config).personaldb_snapshot_entry_threshold = 1;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut client = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+    let genesis_hash = hex::encode(hash32(format!("genesis:{database_id}").as_bytes()));
+    client
+        .create_personal_db_group(authorized(
+            CreatePersonalDbGroupRequest {
+                database_id: database_id.clone(),
+                schema_hash: personaldb_test_schema_hash(),
+                genesis_hash: genesis_hash.clone(),
+                schema_sql: PERSONALDB_TEST_SCHEMA_SQL.to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let committed = client
+        .submit_personal_db_changeset(authorized(
+            valid_submit_request(&database_id, &genesis_hash, &token),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let divergent = client
+        .catch_up_personal_db(authorized(
+            PersonalDbCatchUpRequest {
+                tenant_id: 1,
+                database_id: database_id.clone(),
+                principal: "test-app".to_string(),
+                replica_id: "replica-a".to_string(),
+                have_log_index: 0,
+                have_log_hash: hex::encode([9; 32]),
+                max_entries: 10,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(divergent.snapshot_required);
+    assert_eq!(divergent.snapshot_reason, "divergent_replica");
+    let snapshots_head = divergent.snapshots_head.expect("snapshots head");
+    assert_eq!(snapshots_head.latest_snapshot_log_index, 1);
+    assert_eq!(snapshots_head.latest_snapshot_log_hash, committed.log_hash);
+    let manifest_path = cluster.states[0]
+        .storage
+        .resolve_relative_storage_path(&snapshots_head.latest_snapshot_manifest_path)
+        .unwrap();
+    assert!(manifest_path.exists());
 }
 
 #[tokio::test]

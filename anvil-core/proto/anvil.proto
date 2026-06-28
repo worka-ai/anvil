@@ -691,6 +691,7 @@ message CreatePersonalDbGroupRequest {
     string database_id = 1;
     string schema_hash = 2;
     string genesis_hash = 3;
+    string schema_sql = 4;
 }
 
 message GetPersonalDbGroupRequest {
