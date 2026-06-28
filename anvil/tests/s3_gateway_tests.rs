@@ -936,6 +936,44 @@ async fn run_s3_public_and_private_access() {
     assert_eq!(second_v1_page.contents().len(), 1);
     assert_eq!(second_v1_page.contents()[0].key(), Some("page/b.txt"));
 
+    client
+        .put_object()
+        .bucket(&private_bucket)
+        .key("tree/root.txt")
+        .body(ByteStream::from_static(b"root"))
+        .send()
+        .await
+        .expect("put tree/root.txt should succeed");
+    client
+        .put_object()
+        .bucket(&private_bucket)
+        .key("tree/a/file.txt")
+        .body(ByteStream::from_static(b"a"))
+        .send()
+        .await
+        .expect("put tree/a/file.txt should succeed");
+    client
+        .put_object()
+        .bucket(&private_bucket)
+        .key("tree/b/file.txt")
+        .body(ByteStream::from_static(b"b"))
+        .send()
+        .await
+        .expect("put tree/b/file.txt should succeed");
+    let tree_listing = client
+        .list_objects_v2()
+        .bucket(&private_bucket)
+        .prefix("tree/")
+        .delimiter("/")
+        .send()
+        .await
+        .expect("delimiter list should succeed");
+    assert_eq!(tree_listing.contents().len(), 1);
+    assert_eq!(tree_listing.contents()[0].key(), Some("tree/root.txt"));
+    assert_eq!(tree_listing.common_prefixes().len(), 2);
+    assert_eq!(tree_listing.common_prefixes()[0].prefix(), Some("tree/a/"));
+    assert_eq!(tree_listing.common_prefixes()[1].prefix(), Some("tree/b/"));
+
     let multipart_key = "multipart-private.txt";
     let multipart = client
         .create_multipart_upload()
