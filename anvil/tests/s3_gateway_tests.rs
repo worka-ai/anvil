@@ -2097,6 +2097,21 @@ async fn run_s3_public_and_private_access() {
         .unwrap();
     assert_eq!(reserved_head.status(), 403);
 
+    let reserved_range_get = reqwest::Client::new()
+        .get(&reserved_url)
+        .header(reqwest::header::RANGE, "bytes=0-1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reserved_range_get.status(), 403);
+    assert!(
+        reserved_range_get
+            .text()
+            .await
+            .unwrap()
+            .contains("UnauthorizedReservedNamespace")
+    );
+
     let put_err = client
         .put_object()
         .bucket(&public_bucket)
