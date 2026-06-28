@@ -652,6 +652,12 @@ message CopyObjectResponse {
     string etag = 1;
     string version_id = 2;
     string last_modified = 3;
+    string mutation_id = 4;
+    string payload_hash = 5;
+    string record_hash = 6;
+    uint64 authz_revision = 7;
+    uint64 watch_cursor = 8;
+    string index_policy_snapshot = 9;
 }
 
 message ComposeObjectSource {
@@ -670,6 +676,12 @@ message ComposeObjectResponse {
     string etag = 1;
     string version_id = 2;
     string last_modified = 3;
+    string mutation_id = 4;
+    string payload_hash = 5;
+    string record_hash = 6;
+    uint64 authz_revision = 7;
+    uint64 watch_cursor = 8;
+    string index_policy_snapshot = 9;
 }
 
 message PatchJsonObjectRequest {
@@ -683,6 +695,12 @@ message PatchJsonObjectResponse {
     string etag = 1;
     string version_id = 2;
     string last_modified = 3;
+    string mutation_id = 4;
+    string payload_hash = 5;
+    string record_hash = 6;
+    uint64 authz_revision = 7;
+    uint64 watch_cursor = 8;
+    string index_policy_snapshot = 9;
 }
 
 message CompareAndSwapManifestRequest {
@@ -751,6 +769,12 @@ message SealAppendStreamSegmentResponse {
 message CompleteMultipartResponse {
     string etag = 1;
     string version_id = 2;
+    string mutation_id = 3;
+    string payload_hash = 4;
+    string record_hash = 5;
+    uint64 authz_revision = 6;
+    uint64 watch_cursor = 7;
+    string index_policy_snapshot = 8;
 }
 
 message AbortMultipartRequest {

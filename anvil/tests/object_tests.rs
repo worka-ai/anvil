@@ -40,6 +40,15 @@ fn assert_reserved_namespace_status<T>(result: Result<T, Status>) {
     );
 }
 
+macro_rules! assert_native_mutation_response {
+    ($response:expr) => {{
+        assert!(!$response.mutation_id.is_empty());
+        assert!(!$response.payload_hash.is_empty());
+        assert!(!$response.record_hash.is_empty());
+        assert!($response.watch_cursor > 0);
+    }};
+}
+
 #[tokio::test]
 async fn test_repair_rebuilds_missing_directory_segment_from_metadata_journal() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
@@ -1431,6 +1440,9 @@ async fn test_copy_object_creates_independent_destination_version() {
 
     assert_eq!(copy_res.etag, put_res.etag);
     assert_ne!(copy_res.version_id, put_res.version_id);
+    assert_native_mutation_response!(copy_res);
+    assert_eq!(copy_res.payload_hash, put_res.payload_hash);
+    assert!(copy_res.watch_cursor > put_res.watch_cursor);
 
     let mut get_req = Request::new(GetObjectRequest {
         bucket_name: bucket_name.clone(),
@@ -1948,6 +1960,7 @@ async fn test_multipart_upload_completes_ordered_parts() {
         .await
         .unwrap()
         .into_inner();
+    assert_native_mutation_response!(complete_res);
 
     let mut get_req = Request::new(GetObjectRequest {
         bucket_name: bucket_name.clone(),
@@ -2054,6 +2067,7 @@ async fn test_compose_object_concatenates_sources_in_order() {
         .await
         .unwrap()
         .into_inner();
+    assert_native_mutation_response!(compose_res);
 
     let mut get_req = Request::new(GetObjectRequest {
         bucket_name: bucket_name.clone(),
@@ -2156,6 +2170,8 @@ async fn test_patch_json_object_writes_new_merged_version() {
         .into_inner();
 
     assert_ne!(patch_res.version_id, put_res.version_id);
+    assert_native_mutation_response!(patch_res);
+    assert!(patch_res.watch_cursor > put_res.watch_cursor);
 
     let mut get_req = Request::new(GetObjectRequest {
         bucket_name: bucket_name.clone(),

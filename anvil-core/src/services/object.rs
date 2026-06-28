@@ -320,11 +320,19 @@ impl ObjectService for AppState {
                 &req.destination_object_key,
             )
             .await?;
+        let watch_cursor = object_watch_cursor(self, &object).await?;
+        let authz_revision = object_authz_revision(&object)?;
 
         Ok(Response::new(CopyObjectResponse {
             etag: object.etag,
             version_id: object.version_id.to_string(),
             last_modified: object.created_at.to_string(),
+            mutation_id: object.mutation_id.to_string(),
+            payload_hash: object.content_hash,
+            record_hash: object.record_hash,
+            authz_revision,
+            watch_cursor,
+            index_policy_snapshot: object.index_policy_snapshot,
         }))
     }
 
@@ -357,11 +365,19 @@ impl ObjectService for AppState {
                 &req.destination_object_key,
             )
             .await?;
+        let watch_cursor = object_watch_cursor(self, &object).await?;
+        let authz_revision = object_authz_revision(&object)?;
 
         Ok(Response::new(ComposeObjectResponse {
             etag: object.etag,
             version_id: object.version_id.to_string(),
             last_modified: object.created_at.to_string(),
+            mutation_id: object.mutation_id.to_string(),
+            payload_hash: object.content_hash,
+            record_hash: object.record_hash,
+            authz_revision,
+            watch_cursor,
+            index_policy_snapshot: object.index_policy_snapshot,
         }))
     }
 
@@ -386,11 +402,19 @@ impl ObjectService for AppState {
                 &req.merge_patch_json,
             )
             .await?;
+        let watch_cursor = object_watch_cursor(self, &object).await?;
+        let authz_revision = object_authz_revision(&object)?;
 
         Ok(Response::new(PatchJsonObjectResponse {
             etag: object.etag,
             version_id: object.version_id.to_string(),
             last_modified: object.created_at.to_string(),
+            mutation_id: object.mutation_id.to_string(),
+            payload_hash: object.content_hash,
+            record_hash: object.record_hash,
+            authz_revision,
+            watch_cursor,
+            index_policy_snapshot: object.index_policy_snapshot,
         }))
     }
 
@@ -678,10 +702,18 @@ impl ObjectService for AppState {
                 &claims.scopes,
             )
             .await?;
+        let watch_cursor = object_watch_cursor(self, &object).await?;
+        let authz_revision = object_authz_revision(&object)?;
 
         Ok(Response::new(CompleteMultipartResponse {
             etag: object.etag,
             version_id: object.version_id.to_string(),
+            mutation_id: object.mutation_id.to_string(),
+            payload_hash: object.content_hash,
+            record_hash: object.record_hash,
+            authz_revision,
+            watch_cursor,
+            index_policy_snapshot: object.index_policy_snapshot,
         }))
     }
 
@@ -734,6 +766,10 @@ async fn object_watch_cursor(
     .map_err(|e| Status::internal(e.to_string()))?
     .ok_or_else(|| Status::internal("Object mutation watch event not found"))?;
     u64::try_from(cursor).map_err(|_| Status::internal("Invalid object watch cursor"))
+}
+
+fn object_authz_revision(object: &crate::persistence::Object) -> Result<u64, Status> {
+    u64::try_from(object.authz_revision).map_err(|_| Status::internal("Invalid authz revision"))
 }
 
 fn watch_event_response(
