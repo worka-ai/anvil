@@ -635,7 +635,34 @@ async fn test_cli_hf_ingest_start_with_options() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_cli_configure_interactive() {
-    todo!()
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(10)).await;
+    let config_dir = tempdir().unwrap();
+
+    let app_name = format!("cli-configure-{}", uuid::Uuid::new_v4());
+    let (client_id, client_secret) = create_app(&cluster, &app_name).await;
+
+    let output = run_cli(
+        &[
+            "configure",
+            "--name",
+            "configured",
+            "--host",
+            &cluster.grpc_addrs[0],
+            "--client-id",
+            &client_id,
+            "--client-secret",
+            &client_secret,
+            "--default",
+        ],
+        config_dir.path(),
+    )
+    .await;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Profile 'configured' saved."));
+
+    let output = run_cli(&["bucket", "ls"], config_dir.path()).await;
+    assert!(output.status.success());
 }
