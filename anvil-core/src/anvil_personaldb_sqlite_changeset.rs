@@ -76,12 +76,13 @@ pub fn iterate_changeset(changeset_bytes: &[u8]) -> Result<Vec<DecodedSqliteChan
                     optional_value(item.new_value(column), "new", column)?
                 }
             };
-            if new_value.is_some()
-                && matches!(
-                    operation,
-                    SqliteChangesetOperation::Insert | SqliteChangesetOperation::Update
-                )
-            {
+            let column_changed = match operation {
+                SqliteChangesetOperation::Insert | SqliteChangesetOperation::Update => {
+                    new_value.is_some()
+                }
+                SqliteChangesetOperation::Delete => old_value.is_some(),
+            };
+            if column_changed {
                 changed_column_indexes.push(column);
             }
             old_values.push(old_value);
@@ -241,6 +242,7 @@ mod tests {
             Some(SqliteChangesetValue::Text(b"alpha".to_vec()))
         );
         assert!(change.new_values.iter().all(Option::is_none));
+        assert_eq!(change.changed_column_indexes, vec![0, 1, 2]);
     }
 
     #[test]

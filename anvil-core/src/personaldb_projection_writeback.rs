@@ -545,6 +545,58 @@ mod tests {
         assert!(err.to_string().contains("protected"));
     }
 
+    #[test]
+    fn writeback_builder_maps_insert_to_source_changeset() {
+        let definition = allow_name_definition_with_id_insert_delete();
+        let built = build_projection_writeback_changeset(ProjectionWriteBackInput {
+            source_schema_sql: SOURCE_SCHEMA,
+            target_schema_sql: TARGET_SCHEMA,
+            definition: &definition,
+            projection_changeset_bytes: &projection_insert_changeset(),
+        })
+        .unwrap();
+        assert_eq!(built.source_database_id, "source-db");
+        assert_eq!(built.operation_count, 1);
+
+        let source = Connection::open_in_memory().unwrap();
+        source.execute_batch(SOURCE_SCHEMA).unwrap();
+        apply_changeset_to_snapshot_builder(&source, &built.changeset_bytes).unwrap();
+        let name: String = source
+            .query_row("SELECT name FROM items WHERE id = 2", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(name, "beta");
+    }
+
+    #[test]
+    fn writeback_builder_maps_delete_to_source_changeset() {
+        let definition = allow_name_definition_with_id_insert_delete();
+        let built = build_projection_writeback_changeset(ProjectionWriteBackInput {
+            source_schema_sql: SOURCE_SCHEMA,
+            target_schema_sql: TARGET_SCHEMA,
+            definition: &definition,
+            projection_changeset_bytes: &projection_delete_changeset(),
+        })
+        .unwrap();
+        assert_eq!(built.source_database_id, "source-db");
+        assert_eq!(built.operation_count, 1);
+
+        let source = Connection::open_in_memory().unwrap();
+        source.execute_batch(SOURCE_SCHEMA).unwrap();
+        source
+            .execute(
+                "INSERT INTO items (id, name, payload) VALUES (1, 'alpha', NULL)",
+                [],
+            )
+            .unwrap();
+        apply_changeset_to_snapshot_builder(&source, &built.changeset_bytes).unwrap();
+        let count: i64 = source
+            .query_row("SELECT COUNT(*) FROM items WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
     fn allow_name_definition() -> ProjectionDefinition {
         ProjectionDefinition {
             format_version: 1,
@@ -595,6 +647,28 @@ mod tests {
         .unwrap()
     }
 
+    fn allow_name_definition_with_id_insert_delete() -> ProjectionDefinition {
+        let mut definition = allow_name_definition();
+        definition.writeback_policy = WriteBackPolicy::AllowMappedColumns {
+            protected_columns: Vec::new(),
+            allowed_columns: vec!["id".to_string(), "name".to_string()],
+        };
+        definition.seal().unwrap()
+    }
+
+    fn projection_insert_changeset() -> Vec<u8> {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(TARGET_SCHEMA).unwrap();
+        let mut session = Session::new(&db).unwrap();
+        session.attach::<&str>(None).unwrap();
+        db.execute(
+            "INSERT INTO items_projection (id, name) VALUES (2, 'beta')",
+            [],
+        )
+        .unwrap();
+        session_changeset(session)
+    }
+
     fn projection_update_changeset() -> Vec<u8> {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(TARGET_SCHEMA).unwrap();
@@ -606,6 +680,21 @@ mod tests {
         let mut session = Session::new(&db).unwrap();
         session.attach::<&str>(None).unwrap();
         db.execute("UPDATE items_projection SET name = 'beta' WHERE id = 1", [])
+            .unwrap();
+        session_changeset(session)
+    }
+
+    fn projection_delete_changeset() -> Vec<u8> {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(TARGET_SCHEMA).unwrap();
+        db.execute(
+            "INSERT INTO items_projection (id, name) VALUES (1, 'alpha')",
+            [],
+        )
+        .unwrap();
+        let mut session = Session::new(&db).unwrap();
+        session.attach::<&str>(None).unwrap();
+        db.execute("DELETE FROM items_projection WHERE id = 1", [])
             .unwrap();
         session_changeset(session)
     }
