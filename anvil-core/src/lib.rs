@@ -41,6 +41,7 @@ pub mod middleware;
 pub mod model_journal;
 pub mod multipart_journal;
 pub mod object_manager;
+pub mod partition_fence;
 pub mod permissions;
 pub mod persistence;
 pub mod personaldb_catchup;

@@ -4,6 +4,7 @@ use crate::formats::{
     segment::{SegmentBody, SegmentRecord},
     validate_journal_chain,
 };
+use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
 use crate::persistence::{Bucket, Object, ObjectVersion, ObjectVersionsPage};
 use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
@@ -111,12 +112,35 @@ pub async fn append_object_mutation(
     object: &Object,
     mutation: ObjectJournalMutation,
 ) -> Result<PathBuf> {
+    append_object_mutation_inner(storage, bucket, object, mutation, 0).await
+}
+
+pub async fn append_object_mutation_with_permit(
+    storage: &Storage,
+    bucket: &Bucket,
+    object: &Object,
+    mutation: ObjectJournalMutation,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<PathBuf> {
+    require_object_metadata_permit(bucket, permit)?;
+    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
+    append_object_mutation_inner(storage, bucket, object, mutation, permit.fence_token).await
+}
+
+async fn append_object_mutation_inner(
+    storage: &Storage,
+    bucket: &Bucket,
+    object: &Object,
+    mutation: ObjectJournalMutation,
+    fence_token: u64,
+) -> Result<PathBuf> {
     let path = storage.metadata_journal_path(bucket.tenant_id, bucket.id);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    ensure_journal_header(&path, bucket).await?;
+    ensure_journal_header(&path, bucket, fence_token).await?;
     let existing = tokio::fs::read(&path).await?;
     let (header_len, frames) = decode_journal_file(&existing)?;
     let previous_hash = frames
@@ -157,7 +181,7 @@ pub async fn append_object_mutation(
     let object_frame = JournalFrame::new(
         mutation.object_record_kind(),
         next_sequence,
-        0,
+        fence_token,
         *object.mutation_id.as_bytes(),
         object_version_key_hash(bucket, object),
         previous_hash,
@@ -181,7 +205,7 @@ pub async fn append_object_mutation(
     let directory_frame = JournalFrame::new(
         JournalRecordKind::DirectoryEntry,
         next_sequence + 1,
-        0,
+        fence_token,
         *object.mutation_id.as_bytes(),
         directory_key_hash(bucket, object),
         object_frame.record_hash,
@@ -289,6 +313,28 @@ pub async fn seal_object_journal_segments(
     bucket: &Bucket,
     manifest_signing_key: &[u8],
 ) -> Result<SealedObjectMetadataSegments> {
+    seal_object_journal_segments_inner(storage, bucket, manifest_signing_key, 0).await
+}
+
+pub async fn seal_object_journal_segments_with_permit(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<SealedObjectMetadataSegments> {
+    require_object_metadata_permit(bucket, permit)?;
+    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
+    seal_object_journal_segments_inner(storage, bucket, manifest_signing_key, permit.fence_token)
+        .await
+}
+
+async fn seal_object_journal_segments_inner(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+    fence_token: u64,
+) -> Result<SealedObjectMetadataSegments> {
     let journal_path = storage.metadata_journal_path(bucket.tenant_id, bucket.id);
     let journal_bytes = tokio::fs::read(&journal_path)
         .await
@@ -354,6 +400,7 @@ pub async fn seal_object_journal_segments(
         &[metadata_segment, directory_segment],
         manifest_signing_key,
         &manifest_path,
+        fence_token,
     )
     .await?;
 
@@ -900,6 +947,7 @@ async fn write_partition_manifest(
     segments: &[WrittenSegment],
     manifest_signing_key: &[u8],
     manifest_path: &Path,
+    fence_token: u64,
 ) -> Result<PartitionManifest> {
     if manifest_signing_key.is_empty() {
         return Err(anyhow!("partition manifest signing key must not be empty"));
@@ -938,7 +986,7 @@ async fn write_partition_manifest(
         partition_family: "object_metadata".to_string(),
         partition_id: hex::encode(partition_id(bucket.tenant_id, bucket.id)),
         generation,
-        fence_token: 0,
+        fence_token,
         sealed_journals: vec![journal_ref],
         active_journal: None,
         segments: segment_refs,
@@ -1169,7 +1217,7 @@ fn decode_frames(mut input: &[u8]) -> Result<Vec<JournalFrame>> {
     Ok(frames)
 }
 
-async fn ensure_journal_header(path: &Path, bucket: &Bucket) -> Result<()> {
+async fn ensure_journal_header(path: &Path, bucket: &Bucket, fence_token: u64) -> Result<()> {
     if tokio::fs::try_exists(path).await? {
         return Ok(());
     }
@@ -1179,7 +1227,7 @@ async fn ensure_journal_header(path: &Path, bucket: &Bucket) -> Result<()> {
         bucket_id: bucket.id.to_string(),
         partition_family: "object_metadata",
         partition_id: hex::encode(partition_id(bucket.tenant_id, bucket.id)),
-        fence_token: 0,
+        fence_token,
         first_sequence: 1,
         created_at: &created_at,
         codec: "none",
@@ -1201,6 +1249,17 @@ fn partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
     bytes.extend_from_slice(&tenant_id.to_le_bytes());
     bytes.extend_from_slice(&bucket_id.to_le_bytes());
     hash32(&bytes)
+}
+
+fn require_object_metadata_permit(bucket: &Bucket, permit: &PartitionWritePermit) -> Result<()> {
+    let expected_partition_id = hex::encode(partition_id(bucket.tenant_id, bucket.id));
+    if permit.partition_family != "object_metadata" || permit.partition_id != expected_partition_id
+    {
+        return Err(anyhow!(
+            "partition write permit does not target this object metadata partition"
+        ));
+    }
+    Ok(())
 }
 
 fn object_version_key_hash(bucket: &Bucket, object: &Object) -> Hash32 {
@@ -1226,8 +1285,13 @@ fn directory_key_hash(bucket: &Bucket, object: &Object) -> Hash32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::partition_fence::{
+        PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
+    };
     use chrono::Utc;
     use tempfile::tempdir;
+
+    const PARTITION_OWNER_KEY: &[u8] = b"object metadata partition owner signing key";
 
     fn sample_bucket() -> Bucket {
         Bucket {
@@ -1264,6 +1328,39 @@ mod tests {
             inline_payload: None,
             checksum: None,
         }
+    }
+
+    async fn ready_object_metadata_permit(
+        storage: &Storage,
+        bucket: &Bucket,
+        owner_node_id: &str,
+    ) -> PartitionWritePermit {
+        let request = PartitionRecoveryAcquire {
+            partition_family: "object_metadata".to_string(),
+            partition_id: hex::encode(partition_id(bucket.tenant_id, bucket.id)),
+            owner_node_id: owner_node_id.to_string(),
+            recovered_through_sequence: 0,
+            recovered_manifest_hash: hex::encode([0; 32]),
+            now_nanos: 100,
+        };
+        let recovering = acquire_partition_recovery(storage, request, PARTITION_OWNER_KEY)
+            .await
+            .unwrap();
+        publish_partition_ready(
+            storage,
+            &recovering.partition_family,
+            &recovering.partition_id,
+            owner_node_id,
+            recovering.fence_token,
+            0,
+            &hex::encode([1; 32]),
+            200,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap()
+        .write_permit()
+        .unwrap()
     }
 
     #[tokio::test]
@@ -1306,6 +1403,83 @@ mod tests {
             .unwrap();
         assert_eq!(current.len(), 1);
         assert_eq!(current[0].key, first.key);
+    }
+
+    #[tokio::test]
+    async fn object_metadata_write_permit_sets_frame_and_manifest_fence() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let bucket = sample_bucket();
+        let permit = ready_object_metadata_permit(&storage, &bucket, "node-a").await;
+        let object = sample_object(1, "docs/fenced.txt", false);
+
+        let path = append_object_mutation_with_permit(
+            &storage,
+            &bucket,
+            &object,
+            ObjectJournalMutation::Put,
+            &permit,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap();
+        let (_, frames) = decode_journal_file(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.fence_token == permit.fence_token)
+        );
+
+        let manifest_key = b"manifest signing key";
+        let sealed = seal_object_journal_segments_with_permit(
+            &storage,
+            &bucket,
+            manifest_key,
+            &permit,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap();
+        let manifest = decode_partition_manifest(
+            &tokio::fs::read(sealed.manifest_path).await.unwrap(),
+            manifest_key,
+        )
+        .unwrap();
+        assert_eq!(manifest.fence_token, permit.fence_token);
+    }
+
+    #[tokio::test]
+    async fn object_metadata_write_rejects_stale_partition_permit() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let bucket = sample_bucket();
+        let stale_permit = ready_object_metadata_permit(&storage, &bucket, "node-a").await;
+        let fresh_permit = ready_object_metadata_permit(&storage, &bucket, "node-b").await;
+        assert_eq!(fresh_permit.fence_token, stale_permit.fence_token + 1);
+
+        let rejected = append_object_mutation_with_permit(
+            &storage,
+            &bucket,
+            &sample_object(1, "docs/stale.txt", false),
+            ObjectJournalMutation::Put,
+            &stale_permit,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap_err();
+        assert!(rejected.to_string().contains("PartitionNotOwned"));
+
+        append_object_mutation_with_permit(
+            &storage,
+            &bucket,
+            &sample_object(2, "docs/fresh.txt", false),
+            ObjectJournalMutation::Put,
+            &fresh_permit,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

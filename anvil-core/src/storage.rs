@@ -195,6 +195,22 @@ impl Storage {
             .join("tasks.anjournal")
     }
 
+    pub fn partition_owner_path(
+        &self,
+        partition_family: &str,
+        partition_id: &str,
+    ) -> Result<PathBuf> {
+        ensure_safe_internal_component(partition_family, "partition family")?;
+        ensure_hash_hex(partition_id, "partition id")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("control")
+            .join("partition-owners")
+            .join(partition_family)
+            .join(format!("{partition_id}.json")))
+    }
+
     pub fn model_metadata_journal_path(&self) -> PathBuf {
         self.storage_path
             .join("_anvil")
