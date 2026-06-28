@@ -1,4 +1,9 @@
-use crate::formats::{Hash32, hash32, personaldb::RowIndexRecord};
+use crate::{
+    anvil_personaldb_sqlite_changeset::{
+        DecodedSqliteChangesetChange, SqliteChangesetOperation, SqliteChangesetValue,
+    },
+    formats::{Hash32, hash32, personaldb::RowIndexRecord},
+};
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -118,6 +123,93 @@ impl VerifiedMutationEnvelope {
             .map(RowMetadata::to_row_index_record)
             .collect()
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct PersonalDbEnvelopeDerivationInput<'a> {
+    pub tenant_id: i64,
+    pub database_id: &'a str,
+    pub principal: &'a str,
+    pub base_log_index: u64,
+    pub proposed_log_index: u64,
+    pub changeset_payload_hash: Hash32,
+    pub schema_hash: &'a str,
+    pub policy_epoch: u64,
+    pub authz_revision: u64,
+    pub changes: &'a [DecodedSqliteChangesetChange],
+    pub updated_at_nanos: i64,
+}
+
+pub fn derive_verified_mutation_envelope(
+    input: PersonalDbEnvelopeDerivationInput<'_>,
+) -> Result<VerifiedMutationEnvelope> {
+    if input.changes.is_empty() {
+        return Err(anyhow!(
+            "verified mutation envelope requires at least one SQLite changeset effect"
+        ));
+    }
+    let mut table_effects = Vec::with_capacity(input.changes.len());
+    let mut row_metadata_delta = RowMetadataDelta::default();
+    for change in input.changes {
+        let table_name_hash = hex::encode(hash32(change.table_name.as_bytes()));
+        let primary_key_hash = primary_key_hash(change)?;
+        let operation = table_operation(change.operation);
+        let before_columns_hash = columns_hash(&change.old_values);
+        let after_columns_hash = columns_hash(&change.new_values);
+        let resource_binding =
+            derived_resource_binding(input.principal, &change.table_name, &primary_key_hash);
+        table_effects.push(TableEffect {
+            table_name: change.table_name.clone(),
+            primary_key_hash: primary_key_hash.clone(),
+            operation,
+            before_columns_hash: before_columns_hash_for_operation(operation, before_columns_hash),
+            after_columns_hash: after_columns_hash_for_operation(operation, after_columns_hash),
+            changed_columns: changed_column_names(change),
+            source_resource_binding: resource_binding.clone(),
+            required_permissions: vec![required_permission(operation).to_string()],
+        });
+        match operation {
+            TableOperation::Insert | TableOperation::Update => {
+                row_metadata_delta.upserts.push(RowMetadata {
+                    source_database_id: input.database_id.to_string(),
+                    source_table: change.table_name.clone(),
+                    table_name_hash: table_name_hash.clone(),
+                    primary_key_hash: primary_key_hash.clone(),
+                    resource_type: resource_binding.resource_type,
+                    resource_id: resource_binding.resource_id,
+                    parent_resource_id: resource_binding.parent_resource_id,
+                    creator_principal: resource_binding.creator_principal,
+                    owner_principal: resource_binding.owner_principal,
+                    row_version: input.proposed_log_index,
+                    policy_epoch: input.policy_epoch,
+                    auth_attribute_hash: row_auth_attribute_hash(change, input.policy_epoch),
+                    updated_at_nanos: input.updated_at_nanos,
+                });
+            }
+            TableOperation::Delete => {
+                row_metadata_delta.deletes.push(RowMetadataKey {
+                    database_id: input.database_id.to_string(),
+                    table_name_hash,
+                    primary_key_hash,
+                });
+            }
+        }
+    }
+    VerifiedMutationEnvelope {
+        format_version: 1,
+        tenant_id: input.tenant_id.to_string(),
+        database_id: input.database_id.to_string(),
+        base_log_index: input.base_log_index,
+        proposed_log_index: input.proposed_log_index,
+        changeset_payload_hash: hex::encode(input.changeset_payload_hash),
+        schema_hash: input.schema_hash.to_string(),
+        policy_epoch: input.policy_epoch,
+        authz_revision: input.authz_revision,
+        table_effects,
+        row_metadata_delta,
+        envelope_hash: None,
+    }
+    .seal()
 }
 
 impl RowMetadata {
@@ -354,6 +446,146 @@ fn require_nonempty(value: &str, field: &'static str) -> Result<()> {
     Ok(())
 }
 
+fn table_operation(operation: SqliteChangesetOperation) -> TableOperation {
+    match operation {
+        SqliteChangesetOperation::Insert => TableOperation::Insert,
+        SqliteChangesetOperation::Update => TableOperation::Update,
+        SqliteChangesetOperation::Delete => TableOperation::Delete,
+    }
+}
+
+fn primary_key_hash(change: &DecodedSqliteChangesetChange) -> Result<String> {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(change.table_name.as_bytes());
+    encoded.push(0);
+    let mut saw_primary_key = false;
+    for (column, is_primary_key) in change.primary_key_columns.iter().copied().enumerate() {
+        if !is_primary_key {
+            continue;
+        }
+        saw_primary_key = true;
+        encoded.extend_from_slice(&(column as u32).to_le_bytes());
+        let value = change.new_values[column]
+            .as_ref()
+            .or(change.old_values[column].as_ref())
+            .ok_or_else(|| anyhow!("primary key column is absent from SQLite changeset"))?;
+        encode_sqlite_value(&mut encoded, value);
+    }
+    if !saw_primary_key {
+        return Err(anyhow!("SQLite changeset has no primary key columns"));
+    }
+    Ok(hex::encode(hash32(&encoded)))
+}
+
+fn columns_hash(values: &[Option<SqliteChangesetValue>]) -> Option<String> {
+    if values.iter().all(Option::is_none) {
+        return None;
+    }
+    let mut encoded = Vec::new();
+    for (column, value) in values.iter().enumerate() {
+        encoded.extend_from_slice(&(column as u32).to_le_bytes());
+        match value {
+            Some(value) => {
+                encoded.push(1);
+                encode_sqlite_value(&mut encoded, value);
+            }
+            None => encoded.push(0),
+        }
+    }
+    Some(hex::encode(hash32(&encoded)))
+}
+
+fn encode_sqlite_value(out: &mut Vec<u8>, value: &SqliteChangesetValue) {
+    match value {
+        SqliteChangesetValue::Null => out.push(0),
+        SqliteChangesetValue::Integer(value) => {
+            out.push(1);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        SqliteChangesetValue::Real(value) => {
+            out.push(2);
+            out.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        SqliteChangesetValue::Text(value) => {
+            out.push(3);
+            out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            out.extend_from_slice(value);
+        }
+        SqliteChangesetValue::Blob(value) => {
+            out.push(4);
+            out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            out.extend_from_slice(value);
+        }
+    }
+}
+
+fn before_columns_hash_for_operation(
+    operation: TableOperation,
+    hash: Option<String>,
+) -> Option<String> {
+    match operation {
+        TableOperation::Insert => None,
+        TableOperation::Update | TableOperation::Delete => hash,
+    }
+}
+
+fn after_columns_hash_for_operation(
+    operation: TableOperation,
+    hash: Option<String>,
+) -> Option<String> {
+    match operation {
+        TableOperation::Insert | TableOperation::Update => hash,
+        TableOperation::Delete => None,
+    }
+}
+
+fn changed_column_names(change: &DecodedSqliteChangesetChange) -> Vec<String> {
+    change
+        .changed_column_indexes
+        .iter()
+        .map(|column| format!("column:{column}"))
+        .collect()
+}
+
+fn derived_resource_binding(
+    principal: &str,
+    table_name: &str,
+    primary_key_hash: &str,
+) -> ResourceBinding {
+    ResourceBinding {
+        resource_type: table_name.to_string(),
+        resource_id: format!("{table_name}:{primary_key_hash}"),
+        parent_resource_id: None,
+        creator_principal: principal.to_string(),
+        owner_principal: Some(principal.to_string()),
+    }
+}
+
+fn required_permission(operation: TableOperation) -> &'static str {
+    match operation {
+        TableOperation::Insert => "personaldb:insert",
+        TableOperation::Update => "personaldb:update",
+        TableOperation::Delete => "personaldb:delete",
+    }
+}
+
+fn row_auth_attribute_hash(change: &DecodedSqliteChangesetChange, policy_epoch: u64) -> String {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(change.table_name.as_bytes());
+    encoded.push(0);
+    encoded.extend_from_slice(&policy_epoch.to_le_bytes());
+    encoded.push(0);
+    for value in change
+        .new_values
+        .iter()
+        .chain(change.old_values.iter())
+        .flatten()
+    {
+        encode_sqlite_value(&mut encoded, value);
+    }
+    hex::encode(hash32(&encoded))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,6 +666,73 @@ mod tests {
         assert_eq!(rows[0].resource_id, b"invoice-1".to_vec());
     }
 
+    #[test]
+    fn derives_envelope_from_sqlite_changeset_effects_without_client_metadata() {
+        let changes = vec![
+            decoded_change(SqliteChangesetOperation::Insert),
+            decoded_change(SqliteChangesetOperation::Delete),
+        ];
+        let envelope = derive_verified_mutation_envelope(PersonalDbEnvelopeDerivationInput {
+            tenant_id: 7,
+            database_id: "db-alpha",
+            principal: "principal-a",
+            base_log_index: 41,
+            proposed_log_index: 42,
+            changeset_payload_hash: [2; 32],
+            schema_hash: &hex32(3),
+            policy_epoch: 5,
+            authz_revision: 9,
+            changes: &changes,
+            updated_at_nanos: 1_717_000_000,
+        })
+        .unwrap();
+
+        envelope.verify().unwrap();
+        assert_eq!(envelope.table_effects.len(), 2);
+        assert_eq!(
+            envelope
+                .table_effects
+                .iter()
+                .map(|effect| effect.operation)
+                .collect::<Vec<_>>(),
+            vec![TableOperation::Insert, TableOperation::Delete]
+        );
+        assert_eq!(envelope.row_metadata_delta.upserts.len(), 1);
+        assert_eq!(envelope.row_metadata_delta.deletes.len(), 1);
+        assert_eq!(
+            envelope.table_effects[0].required_permissions,
+            vec!["personaldb:insert".to_string()]
+        );
+        assert!(
+            envelope.table_effects[0]
+                .changed_columns
+                .contains(&"column:1".to_string())
+        );
+        assert!(envelope.table_effects[0].primary_key_hash.len() == 64);
+    }
+
+    #[test]
+    fn envelope_derivation_rejects_missing_primary_key_values() {
+        let mut change = decoded_change(SqliteChangesetOperation::Update);
+        change.old_values[0] = None;
+        change.new_values[0] = None;
+        let err = derive_verified_mutation_envelope(PersonalDbEnvelopeDerivationInput {
+            tenant_id: 7,
+            database_id: "db-alpha",
+            principal: "principal-a",
+            base_log_index: 41,
+            proposed_log_index: 42,
+            changeset_payload_hash: [2; 32],
+            schema_hash: &hex32(3),
+            policy_epoch: 5,
+            authz_revision: 9,
+            changes: &[change],
+            updated_at_nanos: 1_717_000_000,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("primary key column"));
+    }
+
     fn sample_envelope() -> VerifiedMutationEnvelope {
         VerifiedMutationEnvelope {
             format_version: 1,
@@ -510,5 +809,47 @@ mod tests {
 
     fn hex32(seed: u8) -> String {
         hex::encode([seed; 32])
+    }
+
+    fn decoded_change(operation: SqliteChangesetOperation) -> DecodedSqliteChangesetChange {
+        let old_values = match operation {
+            SqliteChangesetOperation::Insert => vec![None, None, None],
+            SqliteChangesetOperation::Update => vec![
+                Some(SqliteChangesetValue::Integer(1)),
+                Some(SqliteChangesetValue::Text(b"alpha".to_vec())),
+                None,
+            ],
+            SqliteChangesetOperation::Delete => vec![
+                Some(SqliteChangesetValue::Integer(2)),
+                Some(SqliteChangesetValue::Text(b"alpha".to_vec())),
+                None,
+            ],
+        };
+        let new_values = match operation {
+            SqliteChangesetOperation::Insert => vec![
+                Some(SqliteChangesetValue::Integer(1)),
+                Some(SqliteChangesetValue::Text(b"alpha".to_vec())),
+                Some(SqliteChangesetValue::Blob(vec![1, 2, 3])),
+            ],
+            SqliteChangesetOperation::Update => vec![
+                Some(SqliteChangesetValue::Integer(1)),
+                Some(SqliteChangesetValue::Text(b"beta".to_vec())),
+                None,
+            ],
+            SqliteChangesetOperation::Delete => vec![None, None, None],
+        };
+        DecodedSqliteChangesetChange {
+            table_name: "items".to_string(),
+            operation,
+            indirect: false,
+            primary_key_columns: vec![true, false, false],
+            old_values,
+            new_values,
+            changed_column_indexes: match operation {
+                SqliteChangesetOperation::Insert => vec![0, 1, 2],
+                SqliteChangesetOperation::Update => vec![1],
+                SqliteChangesetOperation::Delete => vec![0, 1],
+            },
+        }
     }
 }
