@@ -617,6 +617,104 @@ async fn personaldb_source_commit_builds_projection_group_and_watch_event() {
 }
 
 #[tokio::test]
+async fn personaldb_projection_group_submit_rejects_direct_writeback_when_policy_denies() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut client = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let source_database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+    let projection_database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+    let source_genesis = create_group(&mut client, &token, &source_database_id).await;
+    create_group_with_schema(
+        &mut client,
+        &token,
+        &projection_database_id,
+        PERSONALDB_PROJECTION_TEST_SCHEMA_SQL,
+        &personaldb_projection_test_schema_hash(),
+    )
+    .await;
+
+    let definition = projection_definition(&projection_database_id, &source_database_id);
+    client
+        .create_personal_db_projection(authorized(
+            CreatePersonalDbProjectionRequest {
+                tenant_id: 1,
+                database_id: projection_database_id.clone(),
+                projection_definition_json: serde_json::to_string(&definition).unwrap(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    client
+        .submit_personal_db_changeset(authorized(
+            valid_submit_request(&source_database_id, &source_genesis, &token),
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let projection_head_before = client
+        .get_personal_db_group(authorized(
+            GetPersonalDbGroupRequest {
+                tenant_id: 1,
+                database_id: projection_database_id.clone(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .committed_head
+        .expect("projection committed head");
+    assert_eq!(projection_head_before.log_index, 1);
+
+    let err = client
+        .submit_personal_db_changeset(authorized(
+            submit_request_at_base(
+                &projection_database_id,
+                projection_head_before.log_index,
+                &projection_head_before.log_hash,
+                &token,
+                sqlite_projection_update_changeset(),
+            ),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert!(
+        err.message()
+            .contains("PersonalDbProjectionWriteBackRejected")
+    );
+
+    let projection_head_after = client
+        .get_personal_db_group(authorized(
+            GetPersonalDbGroupRequest {
+                tenant_id: 1,
+                database_id: projection_database_id,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .committed_head
+        .expect("projection committed head");
+    assert_eq!(
+        projection_head_after.log_index,
+        projection_head_before.log_index
+    );
+    assert_eq!(
+        projection_head_after.log_hash,
+        projection_head_before.log_hash
+    );
+}
+
+#[tokio::test]
 async fn personaldb_api_rejects_cross_tenant_request_scope() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
@@ -804,22 +902,32 @@ fn submit_request(
     session_token: &str,
     changeset_bytes: Vec<u8>,
 ) -> SubmitPersonalDbChangesetRequest {
+    submit_request_at_base(database_id, 0, genesis_hash, session_token, changeset_bytes)
+}
+
+fn submit_request_at_base(
+    database_id: &str,
+    base_log_index: u64,
+    base_log_hash: &str,
+    session_token: &str,
+    changeset_bytes: Vec<u8>,
+) -> SubmitPersonalDbChangesetRequest {
     SubmitPersonalDbChangesetRequest {
         tenant_id: 1,
         database_id: database_id.to_string(),
         principal: "test-app".to_string(),
         session_token: session_token.to_string(),
-        request_id: "request-1".to_string(),
-        idempotency_key: "idem-1".to_string(),
-        base_log_index: 0,
-        base_log_hash: genesis_hash.to_string(),
-        client_log_epoch: 1,
+        request_id: format!("request-{base_log_index}"),
+        idempotency_key: format!("idem-{base_log_index}"),
+        base_log_index,
+        base_log_hash: base_log_hash.to_string(),
+        client_log_epoch: base_log_index.saturating_add(1),
         membership_epoch: 1,
         policy_epoch: 1,
         leader_replica_id: "leader-a".to_string(),
         voter_acks: vec![PersonalDbVoterAck {
             replica_id: "replica-a".to_string(),
-            log_index: 1,
+            log_index: base_log_index.saturating_add(1),
             log_hash: hex::encode([8; 32]),
             signature: "signature-a".to_string(),
         }],
@@ -846,6 +954,25 @@ fn sqlite_insert_changeset() -> Vec<u8> {
         [vec![1_u8, 2, 3]],
     )
     .unwrap();
+    let mut output = Vec::new();
+    session.changeset_strm(&mut output).unwrap();
+    assert!(!output.is_empty());
+    output
+}
+
+fn sqlite_projection_update_changeset() -> Vec<u8> {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(PERSONALDB_PROJECTION_TEST_SCHEMA_SQL)
+        .unwrap();
+    db.execute(
+        "INSERT INTO items_projection (id, name) VALUES (1, 'alpha')",
+        [],
+    )
+    .unwrap();
+    let mut session = Session::new(&db).unwrap();
+    session.attach::<&str>(None).unwrap();
+    db.execute("UPDATE items_projection SET name = 'beta' WHERE id = 1", [])
+        .unwrap();
     let mut output = Vec::new();
     session.changeset_strm(&mut output).unwrap();
     assert!(!output.is_empty());

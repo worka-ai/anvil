@@ -4,6 +4,7 @@ use crate::{
     AppState,
     anvil_personaldb_sqlite_changeset::iterate_changeset,
     auth, authz_journal,
+    error_codes::AnvilErrorCode,
     formats::{Hash32, hash32, personaldb::PersonalDbLogRecord as CorePersonalDbLogRecord},
     permissions::AnvilAction,
     personaldb_catchup::{
@@ -25,7 +26,8 @@ use crate::{
         write_personaldb_group_manifest,
     },
     personaldb_projection::{
-        ProjectionDefinition, list_projection_definitions_for_source, read_projection_definition,
+        ProjectionDefinition, WriteBackPolicy, list_projection_definitions_for_database,
+        list_projection_definitions_for_source, read_projection_definition,
         write_projection_definition,
     },
     personaldb_projection_builder::{ProjectionBuildInput, build_projection_changeset},
@@ -330,19 +332,29 @@ impl PersonalDbService for AppState {
         validate_claim_tenant(claims.tenant_id, req.tenant_id)?;
         validate_database_id(&req.database_id)?;
         let core_request = core_submit_request(req)?;
+        let actor = PersonalDbCommitActor {
+            tenant_id: claims.tenant_id,
+            principal: claims.sub.clone(),
+            scopes: claims.scopes.clone(),
+            bearer_token: Some(bearer_token),
+            require_public_commit_authorization: true,
+        };
+        let projection_definitions = list_projection_definitions_for_database(
+            &self.storage,
+            claims.tenant_id,
+            &core_request.database_id,
+        )
+        .await
+        .map_err(internal_status)?;
+        if !projection_definitions.is_empty() {
+            return self
+                .reject_personaldb_projection_writeback(core_request, actor, projection_definitions)
+                .await;
+        }
         let source_database_id = core_request.database_id.clone();
         let source_changeset_bytes = core_request.changeset_bytes.clone();
         let committed = self
-            .commit_personaldb_changeset(
-                core_request,
-                PersonalDbCommitActor {
-                    tenant_id: claims.tenant_id,
-                    principal: claims.sub.clone(),
-                    scopes: claims.scopes.clone(),
-                    bearer_token: Some(bearer_token),
-                    require_public_commit_authorization: true,
-                },
-            )
+            .commit_personaldb_changeset(core_request, actor)
             .await?;
         self.build_personaldb_projections_for_source_commit(
             claims.tenant_id,
@@ -531,6 +543,43 @@ impl PersonalDbService for AppState {
 impl AppState {
     fn personaldb_signing_key(&self) -> &[u8] {
         self.config.anvil_secret_encryption_key.as_bytes()
+    }
+
+    async fn reject_personaldb_projection_writeback(
+        &self,
+        request: CoreSubmitChangeset,
+        actor: PersonalDbCommitActor,
+        definitions: Vec<ProjectionDefinition>,
+    ) -> Result<Response<SubmitPersonalDbChangesetResponse>, Status> {
+        validate_claim_tenant(actor.tenant_id, request.tenant_id)?;
+        validate_database_id(&request.database_id)?;
+        if let Some(bearer_token) = actor.bearer_token.as_deref() {
+            bind_personaldb_submit_session(&request, &actor, bearer_token)?;
+        }
+        let resource = personaldb_resource(actor.tenant_id, &request.database_id);
+        if !auth::is_authorized(AnvilAction::PersonalDbCommit, &resource, &actor.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+        let validated = validate_submit_personaldb_changeset(request, default_max_changeset_size())
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        iterate_changeset(&validated.request.changeset_bytes)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        if definitions.len() != 1 {
+            return Err(projection_writeback_rejected(
+                "projection write-back has ambiguous projection bindings",
+            ));
+        }
+        let definition = definitions.into_iter().next().ok_or_else(|| {
+            projection_writeback_rejected("projection write-back binding missing")
+        })?;
+        match definition.writeback_policy {
+            WriteBackPolicy::Deny => Err(projection_writeback_rejected(
+                "projection write-back is denied by projection policy",
+            )),
+            WriteBackPolicy::AllowMappedColumns { .. } => Err(projection_writeback_rejected(
+                "projection write-back translation is not available for this projection",
+            )),
+        }
     }
 
     async fn commit_personaldb_changeset(
@@ -1402,6 +1451,13 @@ fn now_rfc3339() -> String {
 
 fn internal_status(err: impl std::fmt::Display) -> Status {
     Status::internal(err.to_string())
+}
+
+fn projection_writeback_rejected(reason: &'static str) -> Status {
+    Status::failed_precondition(format!(
+        "{}: {reason}",
+        AnvilErrorCode::PersonalDbProjectionWriteBackRejected
+    ))
 }
 
 fn projection_response(

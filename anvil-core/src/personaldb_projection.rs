@@ -203,6 +203,39 @@ pub async fn list_projection_definitions_for_source(
     Ok(definitions)
 }
 
+pub async fn list_projection_definitions_for_database(
+    storage: &Storage,
+    tenant_id: i64,
+    database_id: &str,
+) -> Result<Vec<ProjectionDefinition>> {
+    let projections_dir = storage
+        .personaldb_group_dir(tenant_id, database_id)?
+        .join("projections");
+    let mut definitions = Vec::new();
+    let mut projections = match tokio::fs::read_dir(&projections_dir).await {
+        Ok(projections) => projections,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(definitions),
+        Err(err) => {
+            return Err(err).with_context(|| format!("read {}", projections_dir.display()));
+        }
+    };
+    while let Some(projection) = projections.next_entry().await? {
+        let file_type = projection.file_type().await?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let projection_id = projection.file_name().to_string_lossy().into_owned();
+        let Some(definition) =
+            read_projection_definition(storage, tenant_id, database_id, &projection_id).await?
+        else {
+            continue;
+        };
+        definitions.push(definition);
+    }
+    definitions.sort_by(|left, right| left.projection_id.cmp(&right.projection_id));
+    Ok(definitions)
+}
+
 fn canonicalize_projection_definition(definition: &mut ProjectionDefinition) {
     definition.source_database_ids.sort();
     definition.table_mappings.sort();
