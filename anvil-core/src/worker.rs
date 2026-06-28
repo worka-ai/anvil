@@ -33,6 +33,11 @@ struct DeleteBucketPayload {
     bucket_id: i64,
 }
 
+#[derive(Deserialize)]
+struct ObjectMetadataCompactionPayload {
+    bucket_id: i64,
+}
+
 pub async fn run(
     persistence: Persistence,
     cluster_state: ClusterState,
@@ -66,6 +71,9 @@ pub async fn run(
                 let result = match task.task_type {
                     TaskType::DeleteObject => handle_delete_object(&p, &cs, &jm, &task).await,
                     TaskType::DeleteBucket => handle_delete_bucket(&p, &task).await,
+                    TaskType::ObjectMetadataCompaction => {
+                        handle_object_metadata_compaction(&p, &task).await
+                    }
                     TaskType::HFIngestion => {
                         handle_hf_ingestion(&p, &om, &task, &encryption_key).await
                     }
@@ -93,6 +101,32 @@ pub async fn run(
             });
         }
     }
+}
+
+async fn handle_object_metadata_compaction(
+    persistence: &Persistence,
+    task: &Task,
+) -> anyhow::Result<()> {
+    let payload: ObjectMetadataCompactionPayload = serde_json::from_value(task.payload.clone())?;
+    let Some(sealed) = persistence
+        .compact_object_metadata(payload.bucket_id)
+        .await?
+    else {
+        info!(
+            bucket_id = payload.bucket_id,
+            "Object metadata compaction skipped; bucket or journal did not exist"
+        );
+        return Ok(());
+    };
+    info!(
+        bucket_id = payload.bucket_id,
+        generation = sealed.generation,
+        metadata_records = sealed.metadata_record_count,
+        directory_records = sealed.directory_record_count,
+        manifest_hash = %sealed.manifest_hash,
+        "Object metadata compaction sealed partition"
+    );
+    Ok(())
 }
 
 async fn handle_hf_ingestion(
@@ -523,4 +557,83 @@ async fn handle_delete_bucket(persistence: &Persistence, task: &Task) -> Result<
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::Config, storage::Storage};
+    use chrono::Utc;
+    use tempfile::tempdir;
+
+    fn test_config(storage_path: &std::path::Path) -> Config {
+        Config {
+            jwt_secret: "test-secret".to_string(),
+            anvil_secret_encryption_key:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            public_api_addr: "worker-test-node".to_string(),
+            api_listen_addr: "127.0.0.1:0".to_string(),
+            region: "test-region".to_string(),
+            storage_path: storage_path.to_string_lossy().to_string(),
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn object_metadata_compaction_task_seals_manifest() {
+        let temp = tempdir().unwrap();
+        let config = test_config(temp.path());
+        let persistence = Persistence::new(&config, None).unwrap();
+
+        persistence.create_region("local").await.unwrap();
+        let bucket = persistence
+            .create_bucket(1, "task-compact-bucket", "local")
+            .await
+            .unwrap();
+        let object = persistence
+            .create_object(
+                1,
+                bucket.id,
+                "docs/a.txt",
+                "hash-a",
+                11,
+                "etag-a",
+                Some("text/plain"),
+                None,
+                None,
+                Some(b"alpha".to_vec()),
+            )
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+        let task = Task {
+            id: 1,
+            task_type: TaskType::ObjectMetadataCompaction,
+            payload: json!({ "bucket_id": bucket.id }),
+            priority: 0,
+            status: TaskStatus::Running,
+            attempts: 1,
+            last_error: None,
+            scheduled_at: now,
+            created_at: now,
+            updated_at: now,
+        };
+        handle_object_metadata_compaction(&persistence, &task)
+            .await
+            .unwrap();
+
+        let storage = Storage::new_at_sync(&config.storage_path).unwrap();
+        assert!(
+            tokio::fs::metadata(storage.metadata_manifest_path(1, bucket.id))
+                .await
+                .is_ok()
+        );
+        let replayed = persistence
+            .get_object(bucket.id, "docs/a.txt")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed.version_id, object.version_id);
+    }
 }
