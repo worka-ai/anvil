@@ -34,7 +34,10 @@ use crate::{
         list_projection_definitions_for_source, read_projection_definition,
         write_projection_definition,
     },
-    personaldb_projection_builder::{ProjectionBuildInput, build_projection_changeset},
+    personaldb_projection_builder::{
+        ProjectionAuthorizationCheck, ProjectionAuthorizationDecisions, ProjectionBuildInput,
+        build_projection_changeset_with_authorization, collect_projection_authorization_checks,
+    },
     personaldb_projection_writeback::{
         ProjectionWriteBackInput, build_projection_writeback_changeset,
     },
@@ -1297,14 +1300,26 @@ impl AppState {
         .await
         .map_err(internal_status)?
         .ok_or_else(|| Status::failed_precondition("PersonalDB projection schema SQL missing"))?;
-        let Some(projection_changeset) = build_projection_changeset(ProjectionBuildInput {
+        let build_input = ProjectionBuildInput {
             source_database_id,
             source_schema_sql,
             target_schema_sql: &target_schema_sql,
             definition,
             source_changeset_bytes,
-        })
-        .map_err(internal_status)?
+        };
+        let authorization_checks =
+            collect_projection_authorization_checks(build_input).map_err(internal_status)?;
+        let authorization = self
+            .evaluate_projection_authorization_checks(
+                tenant_id,
+                &definition.target_actor_or_scope,
+                authorization_checks,
+                authz_revision,
+            )
+            .await?;
+        let Some(projection_changeset) =
+            build_projection_changeset_with_authorization(build_input, &authorization)
+                .map_err(internal_status)?
         else {
             return Ok(());
         };
@@ -1398,6 +1413,37 @@ impl AppState {
                 payload,
             });
         Ok(())
+    }
+
+    async fn evaluate_projection_authorization_checks(
+        &self,
+        tenant_id: i64,
+        target_actor: &str,
+        checks: std::collections::BTreeSet<ProjectionAuthorizationCheck>,
+        authz_revision: u64,
+    ) -> Result<ProjectionAuthorizationDecisions, Status> {
+        let revision = i64::try_from(authz_revision)
+            .map_err(|_| Status::internal("Invalid projection authorization revision"))?;
+        let mut allowed = Vec::new();
+        for check in checks {
+            let is_allowed = authz_journal::resolve_permission_at_revision(
+                &self.storage,
+                tenant_id,
+                &check.namespace,
+                &check.object_id,
+                &check.relation,
+                access_control::APP_SUBJECT_KIND,
+                target_actor,
+                "",
+                revision,
+            )
+            .await
+            .map_err(internal_status)?;
+            if is_allowed {
+                allowed.push(check);
+            }
+        }
+        Ok(ProjectionAuthorizationDecisions::new(allowed))
     }
 }
 

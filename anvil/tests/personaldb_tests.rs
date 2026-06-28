@@ -840,6 +840,95 @@ async fn personaldb_source_commit_builds_projection_group_and_watch_event() {
 }
 
 #[tokio::test]
+async fn personaldb_projection_resource_relation_filter_uses_authz_index() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut client = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let source_database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+    let projection_database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+    let source_genesis = create_group(&mut client, &token, &source_database_id).await;
+    let projection_genesis = create_group_with_schema(
+        &mut client,
+        &token,
+        &projection_database_id,
+        PERSONALDB_PROJECTION_TEST_SCHEMA_SQL,
+        &personaldb_projection_test_schema_hash(),
+    )
+    .await;
+
+    let definition =
+        projection_definition_with_resource_filter(&projection_database_id, &source_database_id);
+    client
+        .create_personal_db_projection(authorized(
+            CreatePersonalDbProjectionRequest {
+                tenant_id: 1,
+                database_id: projection_database_id.clone(),
+                projection_definition_json: serde_json::to_string(&definition).unwrap(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    auth_client
+        .write_authz_tuple(authorized(
+            WriteAuthzTupleRequest {
+                namespace: "personaldb_row".to_string(),
+                object_id: format!("tenant-1/{source_database_id}/items/1"),
+                relation: "viewer".to_string(),
+                subject_kind: "app".to_string(),
+                subject_id: "scope-primary".to_string(),
+                caveat_hash: String::new(),
+                operation: "add".to_string(),
+                reason: "allow projection target".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let source_commit = client
+        .submit_personal_db_changeset(authorized(
+            valid_submit_request(&source_database_id, &source_genesis, &token),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(source_commit.log_index, 1);
+
+    let projected = client
+        .catch_up_personal_db(authorized(
+            PersonalDbCatchUpRequest {
+                tenant_id: 1,
+                database_id: projection_database_id.clone(),
+                principal: "test-app".to_string(),
+                replica_id: "replica-projection-authz".to_string(),
+                have_log_index: 0,
+                have_log_hash: projection_genesis,
+                max_entries: 10,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!projected.snapshot_required);
+    assert_eq!(projected.entries.len(), 1);
+    assert_eq!(
+        projected.entries[0].log_record.as_ref().unwrap().log_index,
+        1
+    );
+}
+
+#[tokio::test]
 async fn personaldb_projection_group_submit_rejects_direct_writeback_when_policy_denies() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
@@ -1630,6 +1719,19 @@ fn projection_definition_allowing_name_writeback(
         protected_columns: vec!["id".to_string()],
         allowed_columns: vec!["name".to_string()],
     };
+    definition
+}
+
+fn projection_definition_with_resource_filter(
+    projection_database_id: &str,
+    source_database_id: &str,
+) -> ProjectionDefinition {
+    let mut definition = projection_definition(projection_database_id, source_database_id);
+    definition.row_filters = vec![RowFilter::ResourceRelationAllows {
+        table: "items".to_string(),
+        resource_id_field: "id".to_string(),
+        relation: "viewer".to_string(),
+    }];
     definition
 }
 

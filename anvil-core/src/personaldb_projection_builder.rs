@@ -7,7 +7,7 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, params_from_iter, session::Session, types::Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProjectionBuildInput<'a> {
@@ -22,6 +22,33 @@ pub struct ProjectionBuildInput<'a> {
 pub struct ProjectionBuildResult {
     pub changeset_bytes: Vec<u8>,
     pub projected_operation_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProjectionAuthorizationCheck {
+    pub namespace: String,
+    pub object_id: String,
+    pub relation: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectionAuthorizationDecisions {
+    allowed: BTreeSet<ProjectionAuthorizationCheck>,
+}
+
+impl ProjectionAuthorizationDecisions {
+    pub fn new<I>(allowed: I) -> Self
+    where
+        I: IntoIterator<Item = ProjectionAuthorizationCheck>,
+    {
+        Self {
+            allowed: allowed.into_iter().collect(),
+        }
+    }
+
+    pub fn allows(&self, check: &ProjectionAuthorizationCheck) -> bool {
+        self.allowed.contains(check)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -40,10 +67,82 @@ struct ProjectedOperation {
 pub fn build_projection_changeset(
     input: ProjectionBuildInput<'_>,
 ) -> Result<Option<ProjectionBuildResult>> {
+    build_projection_changeset_inner(input, None)
+}
+
+pub fn build_projection_changeset_with_authorization(
+    input: ProjectionBuildInput<'_>,
+    authorization: &ProjectionAuthorizationDecisions,
+) -> Result<Option<ProjectionBuildResult>> {
+    build_projection_changeset_inner(input, Some(authorization))
+}
+
+pub fn collect_projection_authorization_checks(
+    input: ProjectionBuildInput<'_>,
+) -> Result<BTreeSet<ProjectionAuthorizationCheck>> {
+    let source_changes = iterate_changeset(input.source_changeset_bytes)?;
+    let source_schema = load_schema(input.source_schema_sql)?;
+    let mut checks = BTreeSet::new();
+    for change in &source_changes {
+        let Some(source_table_schema) = source_schema.get(&change.table_name) else {
+            continue;
+        };
+        let has_mapping = input.definition.table_mappings.iter().any(|mapping| {
+            mapping.source_database_id == input.source_database_id
+                && mapping.source_table == change.table_name
+        });
+        if !has_mapping {
+            continue;
+        }
+        match change.operation {
+            SqliteChangesetOperation::Insert => {
+                collect_row_authorization_checks(
+                    input,
+                    source_table_schema,
+                    change,
+                    true,
+                    &mut checks,
+                )?;
+            }
+            SqliteChangesetOperation::Delete => {
+                collect_row_authorization_checks(
+                    input,
+                    source_table_schema,
+                    change,
+                    false,
+                    &mut checks,
+                )?;
+            }
+            SqliteChangesetOperation::Update => {
+                collect_row_authorization_checks(
+                    input,
+                    source_table_schema,
+                    change,
+                    false,
+                    &mut checks,
+                )?;
+                collect_row_authorization_checks(
+                    input,
+                    source_table_schema,
+                    change,
+                    true,
+                    &mut checks,
+                )?;
+            }
+        }
+    }
+    Ok(checks)
+}
+
+fn build_projection_changeset_inner(
+    input: ProjectionBuildInput<'_>,
+    authorization: Option<&ProjectionAuthorizationDecisions>,
+) -> Result<Option<ProjectionBuildResult>> {
     let source_changes = iterate_changeset(input.source_changeset_bytes)?;
     let source_schema = load_schema(input.source_schema_sql)?;
     let target_schema = load_schema(input.target_schema_sql)?;
-    let operations = plan_projected_operations(input, &source_changes, &source_schema)?;
+    let operations =
+        plan_projected_operations(input, &source_changes, &source_schema, authorization)?;
     if operations.is_empty() {
         return Ok(None);
     }
@@ -59,6 +158,7 @@ fn plan_projected_operations(
     input: ProjectionBuildInput<'_>,
     source_changes: &[DecodedSqliteChangesetChange],
     source_schema: &BTreeMap<String, TableSchema>,
+    authorization: Option<&ProjectionAuthorizationDecisions>,
 ) -> Result<Vec<ProjectedOperation>> {
     let mut operations = Vec::new();
     for change in source_changes {
@@ -72,13 +172,13 @@ fn plan_projected_operations(
             let old_included = match change.operation {
                 SqliteChangesetOperation::Insert => false,
                 SqliteChangesetOperation::Update | SqliteChangesetOperation::Delete => {
-                    row_matches_filters(input.definition, source_table_schema, change, false)?
+                    row_matches_filters(input, source_table_schema, change, false, authorization)?
                 }
             };
             let new_included = match change.operation {
                 SqliteChangesetOperation::Delete => false,
                 SqliteChangesetOperation::Insert | SqliteChangesetOperation::Update => {
-                    row_matches_filters(input.definition, source_table_schema, change, true)?
+                    row_matches_filters(input, source_table_schema, change, true, authorization)?
                 }
             };
 
@@ -166,12 +266,14 @@ fn encode_projected_changeset(
 }
 
 fn row_matches_filters(
-    definition: &ProjectionDefinition,
+    input: ProjectionBuildInput<'_>,
     source_schema: &TableSchema,
     change: &DecodedSqliteChangesetChange,
     use_new_values: bool,
+    authorization: Option<&ProjectionAuthorizationDecisions>,
 ) -> Result<bool> {
-    for filter in definition
+    for filter in input
+        .definition
         .row_filters
         .iter()
         .filter(|filter| filter_table(filter) == change.table_name)
@@ -192,13 +294,155 @@ fn row_matches_filters(
             RowFilter::FieldInAuthorizedResourceSet { .. }
             | RowFilter::ResourceRelationAllows { .. }
             | RowFilter::ParentRelationAllows { .. } => {
-                return Err(anyhow!(
-                    "authorization-backed projection filters require authorization index evaluation"
-                ));
+                let Some(check) = authorization_check_for_filter(
+                    input,
+                    source_schema,
+                    change,
+                    use_new_values,
+                    filter,
+                )?
+                else {
+                    return Ok(false);
+                };
+                let decisions = authorization.ok_or_else(|| {
+                    anyhow!(
+                        "authorization-backed projection filters require authorization decisions"
+                    )
+                })?;
+                if !decisions.allows(&check) {
+                    return Ok(false);
+                }
             }
         }
     }
     Ok(true)
+}
+
+fn collect_row_authorization_checks(
+    input: ProjectionBuildInput<'_>,
+    source_schema: &TableSchema,
+    change: &DecodedSqliteChangesetChange,
+    use_new_values: bool,
+    checks: &mut BTreeSet<ProjectionAuthorizationCheck>,
+) -> Result<()> {
+    for filter in input
+        .definition
+        .row_filters
+        .iter()
+        .filter(|filter| filter_table(filter) == change.table_name)
+    {
+        if let Some(check) =
+            authorization_check_for_filter(input, source_schema, change, use_new_values, filter)?
+        {
+            checks.insert(check);
+        }
+    }
+    Ok(())
+}
+
+fn authorization_check_for_filter(
+    input: ProjectionBuildInput<'_>,
+    source_schema: &TableSchema,
+    change: &DecodedSqliteChangesetChange,
+    use_new_values: bool,
+    filter: &RowFilter,
+) -> Result<Option<ProjectionAuthorizationCheck>> {
+    match filter {
+        RowFilter::FieldInAuthorizedResourceSet {
+            field,
+            resource_set,
+            ..
+        } => {
+            let Some(value) = value_for_field(source_schema, change, use_new_values, field)? else {
+                return Ok(None);
+            };
+            Ok(Some(ProjectionAuthorizationCheck {
+                namespace: resource_set.clone(),
+                object_id: sqlite_value_literal(&value),
+                relation: "member".to_string(),
+            }))
+        }
+        RowFilter::ResourceRelationAllows {
+            resource_id_field,
+            relation,
+            ..
+        } => {
+            let Some(value) =
+                value_for_field(source_schema, change, use_new_values, resource_id_field)?
+            else {
+                return Ok(None);
+            };
+            let binding = resource_binding_for_table(input.definition, &change.table_name)?;
+            Ok(Some(ProjectionAuthorizationCheck {
+                namespace: "personaldb_row".to_string(),
+                object_id: personaldb_row_object_id(
+                    input.definition,
+                    input.source_database_id,
+                    &binding.resource_type,
+                    &sqlite_value_literal(&value),
+                ),
+                relation: relation.clone(),
+            }))
+        }
+        RowFilter::ParentRelationAllows {
+            parent_resource_id_field,
+            relation,
+            ..
+        } => {
+            let Some(value) = value_for_field(
+                source_schema,
+                change,
+                use_new_values,
+                parent_resource_id_field,
+            )?
+            else {
+                return Ok(None);
+            };
+            let binding = resource_binding_for_table(input.definition, &change.table_name)?;
+            Ok(Some(ProjectionAuthorizationCheck {
+                namespace: "personaldb_row".to_string(),
+                object_id: personaldb_row_object_id(
+                    input.definition,
+                    input.source_database_id,
+                    &binding.resource_type,
+                    &sqlite_value_literal(&value),
+                ),
+                relation: relation.clone(),
+            }))
+        }
+        RowFilter::FieldEqualsLiteral { .. } | RowFilter::NotDeleted { .. } => Ok(None),
+    }
+}
+
+fn resource_binding_for_table<'a>(
+    definition: &'a ProjectionDefinition,
+    table: &str,
+) -> Result<&'a crate::personaldb_projection::ProjectionResourceBinding> {
+    let mut matches = definition
+        .resource_bindings
+        .iter()
+        .filter(|binding| binding.source_table == table);
+    let binding = matches
+        .next()
+        .ok_or_else(|| anyhow!("projection authorization filter requires a resource binding"))?;
+    if matches.next().is_some() {
+        return Err(anyhow!(
+            "projection authorization filter has ambiguous resource bindings"
+        ));
+    }
+    Ok(binding)
+}
+
+fn personaldb_row_object_id(
+    definition: &ProjectionDefinition,
+    source_database_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+) -> String {
+    format!(
+        "tenant-{}/{}/{}/{}",
+        definition.tenant_id, source_database_id, resource_type, resource_id
+    )
 }
 
 fn project_row(
@@ -454,6 +698,7 @@ mod tests {
         CREATE TABLE items(
             id INTEGER PRIMARY KEY NOT NULL,
             name TEXT NOT NULL,
+            account_id TEXT,
             deleted_at TEXT
         );
     ";
@@ -565,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_builder_rejects_authorization_backed_filters_until_authz_index_is_available() {
+    fn projection_builder_requires_authorization_decisions_for_authz_filters() {
         let source_changeset = source_insert_changeset();
         let definition = definition(vec![RowFilter::ResourceRelationAllows {
             table: "items".to_string(),
@@ -580,7 +825,112 @@ mod tests {
             source_changeset_bytes: &source_changeset,
         })
         .unwrap_err();
-        assert!(err.to_string().contains("authorization index evaluation"));
+        assert!(err.to_string().contains("authorization decisions"));
+    }
+
+    #[test]
+    fn projection_builder_applies_resource_relation_authorization_filter() {
+        let source_changeset = source_insert_changeset();
+        let definition = definition(vec![RowFilter::ResourceRelationAllows {
+            table: "items".to_string(),
+            resource_id_field: "id".to_string(),
+            relation: "viewer".to_string(),
+        }]);
+        let input = ProjectionBuildInput {
+            source_database_id: "source-db",
+            source_schema_sql: SOURCE_SCHEMA,
+            target_schema_sql: TARGET_SCHEMA,
+            definition: &definition,
+            source_changeset_bytes: &source_changeset,
+        };
+        let checks = collect_projection_authorization_checks(input).unwrap();
+        assert!(checks.contains(&ProjectionAuthorizationCheck {
+            namespace: "personaldb_row".to_string(),
+            object_id: "tenant-1/source-db/items/1".to_string(),
+            relation: "viewer".to_string(),
+        }));
+
+        let denied = build_projection_changeset_with_authorization(
+            input,
+            &ProjectionAuthorizationDecisions::default(),
+        )
+        .unwrap();
+        assert!(denied.is_none());
+
+        let allowed = build_projection_changeset_with_authorization(
+            input,
+            &ProjectionAuthorizationDecisions::new(checks),
+        )
+        .unwrap();
+        assert!(allowed.is_some());
+    }
+
+    #[test]
+    fn projection_builder_applies_field_resource_set_authorization_filter() {
+        let source_changeset = source_insert_changeset();
+        let definition = definition(vec![RowFilter::FieldInAuthorizedResourceSet {
+            table: "items".to_string(),
+            field: "account_id".to_string(),
+            resource_set: "account".to_string(),
+        }]);
+        let input = ProjectionBuildInput {
+            source_database_id: "source-db",
+            source_schema_sql: SOURCE_SCHEMA,
+            target_schema_sql: TARGET_SCHEMA,
+            definition: &definition,
+            source_changeset_bytes: &source_changeset,
+        };
+        let checks = collect_projection_authorization_checks(input).unwrap();
+        assert_eq!(
+            checks,
+            BTreeSet::from([ProjectionAuthorizationCheck {
+                namespace: "account".to_string(),
+                object_id: "account-a".to_string(),
+                relation: "member".to_string(),
+            }])
+        );
+        assert!(
+            build_projection_changeset_with_authorization(
+                input,
+                &ProjectionAuthorizationDecisions::new(checks),
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn projection_builder_applies_parent_relation_authorization_filter() {
+        let source_changeset = source_insert_changeset();
+        let definition = definition(vec![RowFilter::ParentRelationAllows {
+            table: "items".to_string(),
+            parent_resource_id_field: "account_id".to_string(),
+            relation: "viewer".to_string(),
+        }]);
+        let input = ProjectionBuildInput {
+            source_database_id: "source-db",
+            source_schema_sql: SOURCE_SCHEMA,
+            target_schema_sql: TARGET_SCHEMA,
+            definition: &definition,
+            source_changeset_bytes: &source_changeset,
+        };
+        let checks = collect_projection_authorization_checks(input).unwrap();
+        assert_eq!(
+            checks,
+            BTreeSet::from([ProjectionAuthorizationCheck {
+                namespace: "personaldb_row".to_string(),
+                object_id: "tenant-1/source-db/items/account-a".to_string(),
+                relation: "viewer".to_string(),
+            }])
+        );
+        assert!(
+            build_projection_changeset_with_authorization(
+                input,
+                &ProjectionAuthorizationDecisions::new(checks),
+            )
+            .unwrap()
+            .is_some()
+        );
     }
 
     fn source_insert_changeset() -> Vec<u8> {
@@ -589,7 +939,7 @@ mod tests {
         let mut session = Session::new(&db).unwrap();
         session.attach::<&str>(None).unwrap();
         db.execute(
-            "INSERT INTO items (id, name, deleted_at) VALUES (1, 'alpha', NULL)",
+            "INSERT INTO items (id, name, account_id, deleted_at) VALUES (1, 'alpha', 'account-a', NULL)",
             [],
         )
         .unwrap();
@@ -600,7 +950,7 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(SOURCE_SCHEMA).unwrap();
         db.execute(
-            "INSERT INTO items (id, name, deleted_at) VALUES (1, 'alpha', NULL)",
+            "INSERT INTO items (id, name, account_id, deleted_at) VALUES (1, 'alpha', 'account-a', NULL)",
             [],
         )
         .unwrap();
@@ -614,7 +964,7 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(SOURCE_SCHEMA).unwrap();
         db.execute(
-            "INSERT INTO items (id, name, deleted_at) VALUES (1, 'alpha', NULL)",
+            "INSERT INTO items (id, name, account_id, deleted_at) VALUES (1, 'alpha', 'account-a', NULL)",
             [],
         )
         .unwrap();
@@ -672,7 +1022,7 @@ mod tests {
                 primary_key_column: "id".to_string(),
                 resource_type: "items".to_string(),
                 resource_id_column: "id".to_string(),
-                parent_resource_id_column: None,
+                parent_resource_id_column: Some("account_id".to_string()),
             }],
             writeback_policy: WriteBackPolicy::Deny,
             definition_hash: None,
