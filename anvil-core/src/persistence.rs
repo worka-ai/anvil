@@ -18,7 +18,7 @@ use crate::{
         acquire_partition_recovery, publish_partition_ready, read_partition_owner,
     },
     storage::Storage,
-    task_journal, task_lease, watch_log,
+    task_journal, task_lease, watch_checkpoint, watch_log,
 };
 
 #[derive(Debug, Clone)]
@@ -2234,8 +2234,21 @@ impl Persistence {
         if stats.last_sequence == 0 {
             return Ok(false);
         }
-        self.enqueue_task_if_absent(
-            crate::tasks::TaskType::IndexBuild,
+        let index_storage_id =
+            index_journal::index_storage_id(bucket.tenant_id, bucket.id, index.id);
+        if let Some(checkpoint) = watch_checkpoint::read_watch_checkpoint(
+            &self.storage,
+            "object_metadata",
+            &index_storage_id,
+            &self.partition_owner_signing_key,
+        )
+        .await?
+        {
+            if checkpoint.cursor >= u128::from(stats.last_sequence) {
+                return Ok(false);
+            }
+        }
+        self.enqueue_index_build_task(
             serde_json::json!({
                 "tenant_id": bucket.tenant_id,
                 "bucket_id": bucket.id,
@@ -2450,6 +2463,18 @@ impl Persistence {
         task_journal::enqueue_task_if_absent_with_permit(
             &self.storage,
             task_type,
+            payload,
+            priority,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    async fn enqueue_index_build_task(&self, payload: JsonValue, priority: i32) -> Result<bool> {
+        let permit = self.task_queue_write_permit().await?;
+        task_journal::enqueue_index_build_task_with_permit(
+            &self.storage,
             payload,
             priority,
             &permit,

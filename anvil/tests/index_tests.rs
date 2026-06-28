@@ -541,6 +541,28 @@ async fn test_full_text_index_build_uses_source_cursor_snapshot() {
         )
         .await
         .unwrap();
+    let coalesced_tasks = persistence
+        .list_tasks()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|task| {
+            task.task_type == anvil::tasks::TaskType::IndexBuild
+                && task.payload["index_id"] == serde_json::json!(index.id)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        coalesced_tasks.len(),
+        1,
+        "index build tasks for the same index should coalesce before execution"
+    );
+    assert!(
+        coalesced_tasks[0].payload["source_cursor"]
+            .as_u64()
+            .unwrap()
+            > source_cursor,
+        "coalesced index build should advance to the latest source cursor"
+    );
 
     persistence
         .build_index_task(
@@ -624,6 +646,146 @@ async fn test_full_text_index_build_uses_source_cursor_snapshot() {
         serde_json::from_slice(&segment.document_table).unwrap();
     assert!(document_table.to_string().contains("docs/alpha.txt"));
     assert!(!document_table.to_string().contains("docs/future.txt"));
+}
+
+#[tokio::test]
+async fn test_index_build_followup_waits_for_running_build_and_catches_up_after_restart() {
+    let cluster = TestCluster::new(&["test-region-1"]).await;
+    let persistence = &cluster.states[0].persistence;
+    let tenant_id = 1;
+    let bucket_name = format!("index-handoff-{}", uuid::Uuid::new_v4());
+    let bucket = persistence
+        .create_bucket(tenant_id, &bucket_name, "test-region-1")
+        .await
+        .unwrap();
+    let index = persistence
+        .create_index_definition(
+            tenant_id,
+            bucket.id,
+            "body",
+            "full_text",
+            serde_json::json!({"prefix": "docs/"}),
+            serde_json::json!({"source": "object_body_utf8"}),
+            "index_only",
+            serde_json::json!({"positions": true}),
+        )
+        .await
+        .unwrap();
+    persistence
+        .create_index_definition_event(tenant_id, bucket.id, &bucket.name, &index, "create")
+        .await
+        .unwrap();
+
+    persistence
+        .create_object(
+            tenant_id,
+            bucket.id,
+            "docs/alpha.txt",
+            &hex::encode([11; 32]),
+            20,
+            "etag-alpha",
+            Some("text/plain"),
+            None,
+            None,
+            Some(b"alpha handoff first".to_vec()),
+        )
+        .await
+        .unwrap();
+    let running = persistence.claim_pending_tasks(10).await.unwrap();
+    assert_eq!(running.len(), 1);
+    assert_eq!(running[0].task_type, anvil::tasks::TaskType::IndexBuild);
+    let first_cursor = running[0].payload["source_cursor"].as_u64().unwrap();
+
+    persistence
+        .create_object(
+            tenant_id,
+            bucket.id,
+            "docs/bravo.txt",
+            &hex::encode([12; 32]),
+            21,
+            "etag-bravo",
+            Some("text/plain"),
+            None,
+            None,
+            Some(b"bravo handoff followup".to_vec()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        persistence
+            .claim_pending_tasks(10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "follow-up for a running index build must wait for the active build"
+    );
+
+    let restarted = anvil::persistence::Persistence::new(&cluster.states[0].config, None).unwrap();
+    restarted
+        .build_index_task(
+            tenant_id,
+            bucket.id,
+            index.id,
+            index.version,
+            u128::from(first_cursor),
+        )
+        .await
+        .unwrap()
+        .expect("first build succeeds after restart");
+    restarted
+        .update_task_status(running[0].id, anvil::tasks::TaskStatus::Completed)
+        .await
+        .unwrap();
+
+    let followup = restarted.claim_pending_tasks(10).await.unwrap();
+    assert_eq!(followup.len(), 1);
+    let followup_cursor = followup[0].payload["source_cursor"].as_u64().unwrap();
+    assert!(followup_cursor > first_cursor);
+    restarted
+        .build_index_task(
+            tenant_id,
+            bucket.id,
+            index.id,
+            index.version,
+            u128::from(followup_cursor),
+        )
+        .await
+        .unwrap()
+        .expect("follow-up build succeeds");
+    restarted
+        .update_task_status(followup[0].id, anvil::tasks::TaskStatus::Completed)
+        .await
+        .unwrap();
+
+    let index_storage_id = anvil::index_journal::index_storage_id(tenant_id, bucket.id, index.id);
+    let segment = anvil::full_text_segment::read_latest_full_text_segment(
+        &cluster.states[0].storage,
+        &index_storage_id,
+    )
+    .await
+    .unwrap()
+    .expect("full text segment exists");
+    assert_eq!(segment.header.source_cursor, followup_cursor);
+    let definition = anvil::formats::full_text::FullTextIndexDefinition::from_json(
+        &serde_json::json!({"positions": true}),
+    )
+    .unwrap();
+    for term in ["alpha", "bravo"] {
+        let hits = query_full_text_segment(
+            &segment,
+            FullTextSegmentQuery {
+                query: term,
+                tokenizer: &definition.tokenizer,
+                positions_enabled: definition.positions_enabled,
+                phrase: false,
+                bm25: anvil::formats::full_text::Bm25Config::default(),
+                authorized_labels: None,
+                limit: 10,
+            },
+        )
+        .unwrap();
+        assert!(!hits.is_empty(), "{term} should be present after catch-up");
+    }
 }
 
 #[tokio::test]
