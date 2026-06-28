@@ -1445,8 +1445,7 @@ mod list_bucket_pagination_tests {
 }
 
 async fn readiness_check(State(state): State<AppState>) -> Response {
-    // DB readiness: attempt a lightweight operation. If Persistence exposes no ping, rely on pool creation success earlier.
-    // Cluster readiness: at least 1 peer known (self included)
+    // Cluster readiness: at least 1 peer known (self included).
     let peers = state.cluster.read().await.len();
     if peers >= 1 {
         (axum::http::StatusCode::OK, "READY").into_response()

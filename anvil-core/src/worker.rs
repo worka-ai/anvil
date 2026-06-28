@@ -494,7 +494,7 @@ async fn handle_delete_object(
         let _ = futures::future::join_all(futures).await;
     }
 
-    // Finally, hard delete the object from the database.
+    // Finally, hard delete the object metadata.
     persistence.hard_delete_object(payload.object_id).await?;
 
     info!(

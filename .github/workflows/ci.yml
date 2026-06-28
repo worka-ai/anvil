@@ -14,24 +14,6 @@ jobs:
   build-and-test:
     runs-on: worka-l1
 
-    services:
-      postgres:
-        image: postgres:17-alpine
-        env:
-          POSTGRES_USER: anvil
-          POSTGRES_PASSWORD: anvil
-          POSTGRES_DB: anvil
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-    env:
-      MAINTENANCE_DATABASE_URL: postgres://anvil:anvil@localhost:5432/anvil
-
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -80,14 +62,6 @@ jobs:
         tags: anvil:test
 #        # platforms: linux/amd64,linux/arm64
         platforms: linux/amd64
-
-    - name: Wait for PostgreSQL to be ready
-      run: |
-        until pg_isready -h localhost -p 5432 -U postgres; do
-          echo "Waiting for PostgreSQL..."
-          sleep 2
-        done
-        echo "PostgreSQL is ready."
 
     - name: Run All Tests
       env:

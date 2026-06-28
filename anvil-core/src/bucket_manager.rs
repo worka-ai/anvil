@@ -37,7 +37,7 @@ impl BucketManager {
             return Err(Status::permission_denied("Permission denied"));
         }
 
-        tracing::debug!("[manager] Calling DB to create bucket: {}", bucket_name);
+        tracing::debug!("[manager] Creating bucket metadata: {}", bucket_name);
         let bucket = self
             .db
             .create_bucket(tenant_id, bucket_name, region)

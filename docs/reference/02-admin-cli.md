@@ -9,7 +9,7 @@ tags: [reference, cli, admin]
 
 This page provides a complete reference for all commands available in the `admin` CLI. This tool is used by system administrators to manage the foundational resources of the Anvil deployment.
 
-**Note:** These commands typically require direct access to the Anvil node (e.g., via `docker compose exec`) and connect directly to the global database.
+**Note:** These commands typically require direct access to the Anvil node (e.g., via `docker compose exec`) and write directly to Anvil's native metadata journals.
 
 ## `tenant`
 
