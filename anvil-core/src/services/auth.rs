@@ -1,6 +1,9 @@
 use crate::anvil_api::auth_service_server::AuthService;
 use crate::anvil_api::*;
-use crate::{AppState, auth, authz_journal, crypto, permissions::AnvilAction};
+use crate::{
+    AppState, auth, authz_derived_lag_watch, authz_journal, authz_namespace_watch, crypto,
+    permissions::AnvilAction,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -9,6 +12,12 @@ use tonic::{Request, Response, Status};
 impl AuthService for AppState {
     type WatchAuthzTupleLogStream = std::pin::Pin<
         Box<dyn futures_core::Stream<Item = Result<WatchAuthzTupleLogResponse, Status>> + Send>,
+    >;
+    type WatchAuthzNamespaceStream = std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = Result<WatchAuthzNamespaceResponse, Status>> + Send>,
+    >;
+    type WatchAuthzDerivedLagStream = std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = Result<WatchAuthzDerivedLagResponse, Status>> + Send>,
     >;
 
     async fn get_access_token(
@@ -379,6 +388,166 @@ impl AuthService for AppState {
             Box::pin(ReceiverStream::new(rx)) as Self::WatchAuthzTupleLogStream
         ))
     }
+
+    async fn watch_authz_namespace(
+        &self,
+        request: Request<WatchAuthzNamespaceRequest>,
+    ) -> Result<Response<Self::WatchAuthzNamespaceStream>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        validate_watch_component("namespace", &req.namespace)?;
+        if !auth::is_authorized(AnvilAction::AuthzWatch, &req.namespace, &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        let after_cursor = join_u128(req.after_cursor_low, req.after_cursor_high);
+        let snapshot = authz_namespace_watch::list_authz_namespace_watch_events(
+            &self.storage,
+            claims.tenant_id,
+            &req.namespace,
+            after_cursor,
+            1000,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+        let storage = self.storage.clone();
+        let namespace = req.namespace;
+        let tenant_id = claims.tenant_id;
+        let (tx, rx) = mpsc::channel(32);
+        tokio::spawn(async move {
+            let mut last_cursor = after_cursor;
+            for event in snapshot {
+                last_cursor = last_cursor.max(event.cursor);
+                if tx
+                    .send(Ok(authz_namespace_watch_response(event)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let events = match authz_namespace_watch::list_authz_namespace_watch_events(
+                    &storage,
+                    tenant_id,
+                    &namespace,
+                    last_cursor,
+                    1000,
+                )
+                .await
+                {
+                    Ok(events) => events,
+                    Err(err) => {
+                        let _ = tx.send(Err(Status::internal(err.to_string()))).await;
+                        return;
+                    }
+                };
+                for event in events {
+                    last_cursor = last_cursor.max(event.cursor);
+                    if tx
+                        .send(Ok(authz_namespace_watch_response(event)))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(
+            Box::pin(ReceiverStream::new(rx)) as Self::WatchAuthzNamespaceStream
+        ))
+    }
+
+    async fn watch_authz_derived_lag(
+        &self,
+        request: Request<WatchAuthzDerivedLagRequest>,
+    ) -> Result<Response<Self::WatchAuthzDerivedLagStream>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        validate_watch_component("derived_index_id", &req.derived_index_id)?;
+        if !auth::is_authorized(
+            AnvilAction::AuthzWatch,
+            &req.derived_index_id,
+            &claims.scopes,
+        ) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        let after_cursor = join_u128(req.after_cursor_low, req.after_cursor_high);
+        let snapshot = authz_derived_lag_watch::list_authz_derived_lag_watch_events(
+            &self.storage,
+            claims.tenant_id,
+            &req.derived_index_id,
+            after_cursor,
+            1000,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+        let storage = self.storage.clone();
+        let derived_index_id = req.derived_index_id;
+        let tenant_id = claims.tenant_id;
+        let (tx, rx) = mpsc::channel(32);
+        tokio::spawn(async move {
+            let mut last_cursor = after_cursor;
+            for event in snapshot {
+                last_cursor = last_cursor.max(event.cursor);
+                if tx
+                    .send(Ok(authz_derived_lag_watch_response(event)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let events = match authz_derived_lag_watch::list_authz_derived_lag_watch_events(
+                    &storage,
+                    tenant_id,
+                    &derived_index_id,
+                    last_cursor,
+                    1000,
+                )
+                .await
+                {
+                    Ok(events) => events,
+                    Err(err) => {
+                        let _ = tx.send(Err(Status::internal(err.to_string()))).await;
+                        return;
+                    }
+                };
+                for event in events {
+                    last_cursor = last_cursor.max(event.cursor);
+                    if tx
+                        .send(Ok(authz_derived_lag_watch_response(event)))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(
+            Box::pin(ReceiverStream::new(rx)) as Self::WatchAuthzDerivedLagStream
+        ))
+    }
 }
 
 fn authz_resource(namespace: &str, object_id: &str, relation: &str) -> String {
@@ -394,6 +563,16 @@ fn validate_tuple_field(name: &str, value: &str) -> Result<(), Status> {
     if value.chars().any(char::is_control) {
         return Err(Status::invalid_argument(format!(
             "{name} must not contain control characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_watch_component(name: &str, value: &str) -> Result<(), Status> {
+    validate_tuple_field(name, value)?;
+    if value == "." || value == ".." || value.contains('/') {
+        return Err(Status::invalid_argument(format!(
+            "{name} must be a safe path component"
         )));
     }
     Ok(())
@@ -470,6 +649,53 @@ fn authz_tuple_log_response(
     }
 }
 
+fn authz_namespace_watch_response(
+    event: authz_namespace_watch::AuthzNamespaceWatchEvent,
+) -> WatchAuthzNamespaceResponse {
+    let (cursor_low, cursor_high) = split_u128(event.cursor);
+    WatchAuthzNamespaceResponse {
+        cursor_low,
+        cursor_high,
+        namespace: event.payload.namespace,
+        event_type: event.payload.event_type,
+        authz_revision: event.authz_revision,
+        schema_hash: event.payload.schema_hash,
+        invalidates_derived_usersets: event.payload.invalidates_derived_usersets,
+        emitted_at: event.payload.emitted_at,
+    }
+}
+
+fn authz_derived_lag_watch_response(
+    event: authz_derived_lag_watch::AuthzDerivedLagWatchEvent,
+) -> WatchAuthzDerivedLagResponse {
+    let (cursor_low, cursor_high) = split_u128(event.cursor);
+    let (source_cursor_low, source_cursor_high) = split_u128(event.payload.source_cursor);
+    let revision_lag = event.payload.revision_lag();
+    WatchAuthzDerivedLagResponse {
+        cursor_low,
+        cursor_high,
+        derived_index_id: event.payload.derived_index_id,
+        derived_index_kind: event.payload.derived_index_kind,
+        processed_revision: event.payload.processed_revision,
+        latest_revision: event.payload.latest_revision,
+        revision_lag,
+        source_cursor_low,
+        source_cursor_high,
+        source_manifest_hash: event.payload.source_manifest_hash,
+        generation: event.payload.generation,
+        authz_revision: event.authz_revision,
+        emitted_at: event.payload.emitted_at,
+    }
+}
+
+fn split_u128(value: u128) -> (u64, u64) {
+    (value as u64, (value >> 64) as u64)
+}
+
+fn join_u128(low: u64, high: u64) -> u128 {
+    u128::from(low) | (u128::from(high) << 64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,5 +734,12 @@ mod tests {
                 .code(),
             tonic::Code::InvalidArgument
         );
+    }
+
+    #[test]
+    fn authz_watch_cursor_split_round_trips() {
+        let cursor = (u128::from(99_u64) << 64) | u128::from(42_u64);
+        let (low, high) = split_u128(cursor);
+        assert_eq!(join_u128(low, high), cursor);
     }
 }

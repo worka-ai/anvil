@@ -553,6 +553,8 @@ service AuthService {
   rpc WriteAuthzTuple(WriteAuthzTupleRequest) returns (WriteAuthzTupleResponse);
   rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
   rpc WatchAuthzTupleLog(WatchAuthzTupleLogRequest) returns (stream WatchAuthzTupleLogResponse);
+  rpc WatchAuthzNamespace(WatchAuthzNamespaceRequest) returns (stream WatchAuthzNamespaceResponse);
+  rpc WatchAuthzDerivedLag(WatchAuthzDerivedLagRequest) returns (stream WatchAuthzDerivedLagResponse);
 }
 
 service PersonalDbService {
@@ -716,6 +718,45 @@ message WatchAuthzTupleLogResponse {
     string reason = 10;
     string record_hash = 11;
     string written_at = 12;
+}
+
+message WatchAuthzNamespaceRequest {
+    string namespace = 1;
+    uint64 after_cursor_low = 2;
+    uint64 after_cursor_high = 3;
+}
+
+message WatchAuthzNamespaceResponse {
+    uint64 cursor_low = 1;
+    uint64 cursor_high = 2;
+    string namespace = 3;
+    string event_type = 4;
+    uint64 authz_revision = 5;
+    string schema_hash = 6;
+    bool invalidates_derived_usersets = 7;
+    string emitted_at = 8;
+}
+
+message WatchAuthzDerivedLagRequest {
+    string derived_index_id = 1;
+    uint64 after_cursor_low = 2;
+    uint64 after_cursor_high = 3;
+}
+
+message WatchAuthzDerivedLagResponse {
+    uint64 cursor_low = 1;
+    uint64 cursor_high = 2;
+    string derived_index_id = 3;
+    string derived_index_kind = 4;
+    uint64 processed_revision = 5;
+    uint64 latest_revision = 6;
+    uint64 revision_lag = 7;
+    uint64 source_cursor_low = 8;
+    uint64 source_cursor_high = 9;
+    string source_manifest_hash = 10;
+    uint64 generation = 11;
+    uint64 authz_revision = 12;
+    string emitted_at = 13;
 }
 
 message CreatePersonalDbGroupRequest {

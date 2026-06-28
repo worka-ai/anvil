@@ -4,7 +4,14 @@ use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::{
     CheckPermissionRequest, CreateBucketRequest, GetAccessTokenRequest, GetObjectRequest,
     GrantAccessRequest, ListBucketsRequest, ObjectMetadata, PutObjectRequest, RevokeAccessRequest,
-    SetPublicAccessRequest, WatchAuthzTupleLogRequest, WriteAuthzTupleRequest,
+    SetPublicAccessRequest, WatchAuthzDerivedLagRequest, WatchAuthzNamespaceRequest,
+    WatchAuthzTupleLogRequest, WriteAuthzTupleRequest,
+};
+use anvil::authz_derived_lag_watch::{
+    AuthzDerivedLagWatchPayload, append_authz_derived_lag_watch_record,
+};
+use anvil::authz_namespace_watch::{
+    AuthzNamespaceWatchPayload, append_authz_namespace_watch_record,
 };
 use futures_util::StreamExt;
 use std::time::Duration;
@@ -435,6 +442,163 @@ async fn test_authz_tuple_write_check_and_watch() {
         .await
         .unwrap_err();
     assert_eq!(unavailable.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn test_authz_namespace_watch_streams_snapshot_and_new_events() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    append_authz_namespace_watch_record(
+        &cluster.states[0].storage,
+        1,
+        1,
+        [1; 16],
+        namespace_watch_payload(10),
+    )
+    .await
+    .unwrap();
+
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut watch_req = Request::new(WatchAuthzNamespaceRequest {
+        namespace: "document".to_string(),
+        after_cursor_low: 0,
+        after_cursor_high: 0,
+    });
+    watch_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", cluster.token).parse().unwrap(),
+    );
+    let mut stream = auth_client
+        .watch_authz_namespace(watch_req)
+        .await
+        .unwrap()
+        .into_inner();
+
+    let snapshot = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.cursor_low, 1);
+    assert_eq!(snapshot.cursor_high, 0);
+    assert_eq!(snapshot.namespace, "document");
+    assert_eq!(snapshot.event_type, "schema_changed");
+    assert_eq!(snapshot.authz_revision, 10);
+    assert!(snapshot.invalidates_derived_usersets);
+
+    append_authz_namespace_watch_record(
+        &cluster.states[0].storage,
+        1,
+        2,
+        [2; 16],
+        namespace_watch_payload(11),
+    )
+    .await
+    .unwrap();
+    let live = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(live.cursor_low, 2);
+    assert_eq!(live.authz_revision, 11);
+}
+
+#[tokio::test]
+async fn test_authz_derived_lag_watch_streams_snapshot_and_new_events() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    append_authz_derived_lag_watch_record(
+        &cluster.states[0].storage,
+        1,
+        1,
+        [1; 16],
+        derived_lag_watch_payload(90, 100, 1),
+    )
+    .await
+    .unwrap();
+
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut watch_req = Request::new(WatchAuthzDerivedLagRequest {
+        derived_index_id: "derived-userset-primary".to_string(),
+        after_cursor_low: 0,
+        after_cursor_high: 0,
+    });
+    watch_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", cluster.token).parse().unwrap(),
+    );
+    let mut stream = auth_client
+        .watch_authz_derived_lag(watch_req)
+        .await
+        .unwrap()
+        .into_inner();
+
+    let snapshot = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.cursor_low, 1);
+    assert_eq!(snapshot.derived_index_id, "derived-userset-primary");
+    assert_eq!(snapshot.derived_index_kind, "userset");
+    assert_eq!(snapshot.processed_revision, 90);
+    assert_eq!(snapshot.latest_revision, 100);
+    assert_eq!(snapshot.revision_lag, 10);
+    assert_eq!(snapshot.generation, 1);
+    assert_eq!(snapshot.authz_revision, 100);
+
+    append_authz_derived_lag_watch_record(
+        &cluster.states[0].storage,
+        1,
+        2,
+        [2; 16],
+        derived_lag_watch_payload(100, 100, 2),
+    )
+    .await
+    .unwrap();
+    let live = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(live.cursor_low, 2);
+    assert_eq!(live.revision_lag, 0);
+    assert_eq!(live.generation, 2);
+}
+
+fn namespace_watch_payload(authz_revision: u64) -> AuthzNamespaceWatchPayload {
+    AuthzNamespaceWatchPayload {
+        namespace: "document".to_string(),
+        event_type: "schema_changed".to_string(),
+        authz_revision,
+        schema_hash: hex::encode([4; 32]),
+        invalidates_derived_usersets: true,
+        emitted_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+    }
+}
+
+fn derived_lag_watch_payload(
+    processed_revision: u64,
+    latest_revision: u64,
+    generation: u64,
+) -> AuthzDerivedLagWatchPayload {
+    AuthzDerivedLagWatchPayload {
+        derived_index_id: "derived-userset-primary".to_string(),
+        derived_index_kind: "userset".to_string(),
+        processed_revision,
+        latest_revision,
+        source_cursor: u128::from(latest_revision),
+        source_manifest_hash: hex::encode([9; 32]),
+        generation,
+        emitted_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+    }
 }
 
 #[tokio::test]
