@@ -26,6 +26,7 @@ Anvil stores object bytes, metadata journals, indexes, manifests, and local cont
 | `STORAGE_PATH` | No | Directory containing Anvil-owned object bytes and metadata state. Defaults to `anvil-data`. |
 | `OBJECT_METADATA_COMPACTION_FRAME_THRESHOLD` | No | Number of uncompacted object metadata journal frames allowed before Anvil schedules an object metadata compaction task. Defaults to `4096`; set to `0` to disable frame-count scheduling. |
 | `OBJECT_METADATA_COMPACTION_BYTES_THRESHOLD` | No | Encoded size of uncompacted object metadata journal frames allowed before Anvil schedules an object metadata compaction task. Defaults to `67108864`; set to `0` to disable byte-count scheduling. |
+| `TASK_LEASE_TTL_SECS` | No | Seconds that an in-process background task lease remains valid without renewal. Defaults to `300`. |
 
 ## Admin CLI Variables
 

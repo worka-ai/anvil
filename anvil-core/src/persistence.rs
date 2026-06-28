@@ -18,7 +18,7 @@ use crate::{
         acquire_partition_recovery, publish_partition_ready, read_partition_owner,
     },
     storage::Storage,
-    task_journal, watch_log,
+    task_journal, task_lease, watch_log,
 };
 
 #[derive(Debug, Clone)]
@@ -30,6 +30,7 @@ pub struct Persistence {
     partition_owner_signing_key: Vec<u8>,
     object_metadata_compaction_frame_threshold: u64,
     object_metadata_compaction_bytes_threshold: u64,
+    task_lease_ttl_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,6 +350,13 @@ pub struct TaskRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskLeaseTarget {
+    partition_family: String,
+    partition_id: String,
+    source_cursor: u128,
+}
+
 #[derive(Debug, Clone)]
 pub struct HfIngestionJob {
     pub key_id: i64,
@@ -446,6 +454,11 @@ impl Persistence {
                 .object_metadata_compaction_frame_threshold,
             object_metadata_compaction_bytes_threshold: config
                 .object_metadata_compaction_bytes_threshold,
+            task_lease_ttl_secs: if config.task_lease_ttl_secs == 0 {
+                300
+            } else {
+                config.task_lease_ttl_secs
+            },
         })
     }
 
@@ -2309,6 +2322,100 @@ impl Persistence {
         .await
     }
 
+    pub async fn acquire_task_execution_lease(
+        &self,
+        task: &TaskRecord,
+    ) -> Result<task_lease::TaskLease> {
+        let target = self.task_lease_target(task).await?;
+        let now_nanos = current_time_nanos()?;
+        let ttl_nanos = self.task_lease_ttl_nanos()?;
+        task_lease::acquire_task_lease(
+            &self.storage,
+            task_lease::TaskLeaseAcquire {
+                task_id: task_lease_id(task.id)?,
+                task_kind: task.task_type.as_str().to_string(),
+                partition_family: target.partition_family,
+                partition_id: target.partition_id,
+                owner_node_id: self.owner_node_id.clone(),
+                source_cursor: target.source_cursor,
+                now_nanos,
+                ttl_nanos,
+            },
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub async fn checkpoint_task_execution_lease(
+        &self,
+        lease: &task_lease::TaskLease,
+        checkpoint_cursor: u128,
+    ) -> Result<task_lease::TaskLease> {
+        task_lease::checkpoint_task_lease(
+            &self.storage,
+            &lease.task_id,
+            &self.owner_node_id,
+            lease.fence_token,
+            checkpoint_cursor,
+            current_time_nanos()?,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub async fn read_task_execution_lease(
+        &self,
+        task_id: i64,
+    ) -> Result<Option<task_lease::TaskLease>> {
+        task_lease::read_task_lease(
+            &self.storage,
+            &task_lease_id(task_id)?,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    async fn task_lease_target(&self, task: &TaskRecord) -> Result<TaskLeaseTarget> {
+        match task.task_type {
+            crate::tasks::TaskType::ObjectMetadataCompaction => {
+                let bucket_id = task_payload_i64(task, "bucket_id")?;
+                let bucket = bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("object metadata compaction bucket not found"))?;
+                let stats = metadata_journal::active_object_journal_stats(
+                    &self.storage,
+                    &bucket,
+                    &self.partition_owner_signing_key,
+                )
+                .await?;
+                Ok(TaskLeaseTarget {
+                    partition_family: "object_metadata".to_string(),
+                    partition_id: hex::encode(metadata_journal::object_metadata_partition_id(
+                        bucket.tenant_id,
+                        bucket.id,
+                    )),
+                    source_cursor: u128::from(stats.last_sequence),
+                })
+            }
+            _ => Ok(TaskLeaseTarget {
+                partition_family: "task_queue".to_string(),
+                partition_id: hex::encode(task_journal::task_queue_partition_id()),
+                source_cursor: task.id.max(0) as u128,
+            }),
+        }
+    }
+
+    fn task_lease_ttl_nanos(&self) -> Result<i64> {
+        if self.task_lease_ttl_secs == 0 {
+            return Err(anyhow!("task lease ttl must be nonzero"));
+        }
+        let ttl = self
+            .task_lease_ttl_secs
+            .checked_mul(1_000_000_000)
+            .ok_or_else(|| anyhow!("task lease ttl overflow"))?;
+        i64::try_from(ttl).map_err(|_| anyhow!("task lease ttl cannot fit i64 nanoseconds"))
+    }
+
     pub async fn claim_pending_tasks(&self, limit: i64) -> Result<Vec<TaskRecord>> {
         let permit = self.task_queue_write_permit().await?;
         task_journal::claim_pending_tasks_with_permit(
@@ -2557,6 +2664,26 @@ fn persistence_owner_node_id(config: &Config) -> String {
         return config.region.clone();
     }
     "local-anvil-node".to_string()
+}
+
+fn current_time_nanos() -> Result<i64> {
+    Utc::now()
+        .timestamp_nanos_opt()
+        .ok_or_else(|| anyhow!("timestamp cannot be represented in nanoseconds"))
+}
+
+fn task_lease_id(task_id: i64) -> Result<String> {
+    if task_id <= 0 {
+        return Err(anyhow!("task id must be positive"));
+    }
+    Ok(format!("task-{task_id}"))
+}
+
+fn task_payload_i64(task: &TaskRecord, field: &'static str) -> Result<i64> {
+    task.payload
+        .get(field)
+        .and_then(JsonValue::as_i64)
+        .ok_or_else(|| anyhow!("task {} payload must include integer {field}", task.id))
 }
 
 #[cfg(test)]
@@ -3155,6 +3282,87 @@ mod tests {
             2,
             "new post-compaction journal frames should schedule a new task"
         );
+    }
+
+    #[tokio::test]
+    async fn persistence_task_execution_lease_targets_object_metadata_partition() {
+        let temp = tempdir().unwrap();
+        let config = test_config(temp.path());
+        let persistence = Persistence::new(&config, None).unwrap();
+
+        persistence.create_region("local").await.unwrap();
+        let bucket = persistence
+            .create_bucket(1, "lease-target-bucket", "local")
+            .await
+            .unwrap();
+        persistence
+            .create_object(
+                1,
+                bucket.id,
+                "objects/a.txt",
+                "hash-a",
+                11,
+                "etag-a",
+                Some("text/plain"),
+                None,
+                None,
+                Some(b"alpha".to_vec()),
+            )
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+        let task = TaskRecord {
+            id: 77,
+            task_type: crate::tasks::TaskType::ObjectMetadataCompaction,
+            payload: json!({ "bucket_id": bucket.id }),
+            priority: 0,
+            status: crate::tasks::TaskStatus::Running,
+            attempts: 1,
+            last_error: None,
+            scheduled_at: now,
+            created_at: now,
+            updated_at: now,
+        };
+        let lease = persistence
+            .acquire_task_execution_lease(&task)
+            .await
+            .unwrap();
+        assert_eq!(lease.task_id, "task-77");
+        assert_eq!(lease.task_kind, "OBJECT_METADATA_COMPACTION");
+        assert_eq!(lease.partition_family, "object_metadata");
+        assert_eq!(
+            lease.partition_id,
+            hex::encode(metadata_journal::object_metadata_partition_id(1, bucket.id))
+        );
+        assert!(
+            lease.source_cursor >= 2,
+            "object PUT should create object-version and directory frames"
+        );
+
+        let read_back = persistence
+            .read_task_execution_lease(task.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_back, lease);
+
+        let competing_config = Config {
+            public_api_addr: "other-worker-node".to_string(),
+            ..config
+        };
+        let competing = Persistence::new(&competing_config, None).unwrap();
+        let err = competing
+            .acquire_task_execution_lease(&task)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("owned by another active node"));
+
+        let checkpointed = persistence
+            .checkpoint_task_execution_lease(&lease, lease.source_cursor)
+            .await
+            .unwrap();
+        assert_eq!(checkpointed.checkpoint_cursor, lease.source_cursor);
     }
 
     #[tokio::test]

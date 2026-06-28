@@ -71,6 +71,10 @@ pub struct Config {
     /// Uncompacted object metadata journal bytes allowed before scheduling compaction.
     #[arg(long, env, default_value_t = 64 * 1024 * 1024)]
     pub object_metadata_compaction_bytes_threshold: u64,
+
+    /// Seconds that an in-process background task lease remains valid without renewal.
+    #[arg(long, env, default_value_t = 300)]
+    pub task_lease_ttl_secs: u64,
 }
 impl Config {
     #[allow(unused)]

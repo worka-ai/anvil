@@ -68,20 +68,8 @@ pub async fn run(
             let om = object_manager.clone();
             let encryption_key = encryption_key.clone();
             tokio::spawn(async move {
-                let result = match task.task_type {
-                    TaskType::DeleteObject => handle_delete_object(&p, &cs, &jm, &task).await,
-                    TaskType::DeleteBucket => handle_delete_bucket(&p, &task).await,
-                    TaskType::ObjectMetadataCompaction => {
-                        handle_object_metadata_compaction(&p, &task).await
-                    }
-                    TaskType::HFIngestion => {
-                        handle_hf_ingestion(&p, &om, &task, &encryption_key).await
-                    }
-                    _ => {
-                        warn!("Unhandled task type: {:?}", task.task_type);
-                        Ok(())
-                    }
-                };
+                let result =
+                    execute_task_with_lease(&p, &cs, &jm, &om, &task, &encryption_key).await;
 
                 if let Err(e) = result {
                     error!("Task {} failed: {:?}", task.id, e);
@@ -101,6 +89,36 @@ pub async fn run(
             });
         }
     }
+}
+
+async fn execute_task_with_lease(
+    persistence: &Persistence,
+    cluster_state: &ClusterState,
+    jwt_manager: &Arc<JwtManager>,
+    object_manager: &ObjectManager,
+    task: &Task,
+    encryption_key: &Arc<Vec<u8>>,
+) -> anyhow::Result<()> {
+    let lease = persistence.acquire_task_execution_lease(task).await?;
+    match task.task_type {
+        TaskType::DeleteObject => {
+            handle_delete_object(persistence, cluster_state, jwt_manager, task).await?
+        }
+        TaskType::DeleteBucket => handle_delete_bucket(persistence, task).await?,
+        TaskType::ObjectMetadataCompaction => {
+            handle_object_metadata_compaction(persistence, task).await?
+        }
+        TaskType::HFIngestion => {
+            handle_hf_ingestion(persistence, object_manager, task, encryption_key).await?
+        }
+        _ => {
+            warn!("Unhandled task type: {:?}", task.task_type);
+        }
+    }
+    persistence
+        .checkpoint_task_execution_lease(&lease, lease.source_cursor)
+        .await?;
+    Ok(())
 }
 
 async fn handle_object_metadata_compaction(
@@ -562,9 +580,13 @@ async fn handle_delete_bucket(persistence: &Persistence, task: &Task) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::Config, storage::Storage};
+    use crate::{
+        config::Config, placement::PlacementManager, sharding::ShardManager, storage::Storage,
+    };
     use chrono::Utc;
+    use std::collections::HashMap;
     use tempfile::tempdir;
+    use tokio::sync::{RwLock, broadcast};
 
     fn test_config(storage_path: &std::path::Path) -> Config {
         Config {
@@ -619,11 +641,33 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        handle_object_metadata_compaction(&persistence, &task)
-            .await
-            .unwrap();
-
         let storage = Storage::new_at_sync(&config.storage_path).unwrap();
+        let cluster_state: ClusterState = Arc::new(RwLock::new(HashMap::new()));
+        let jwt_manager = Arc::new(JwtManager::new(config.jwt_secret.clone()));
+        let (watch_tx, _watch_rx) = broadcast::channel(16);
+        let object_manager = ObjectManager::new(
+            persistence.clone(),
+            PlacementManager::default(),
+            cluster_state.clone(),
+            ShardManager::new(),
+            storage.clone(),
+            config.region.clone(),
+            jwt_manager.clone(),
+            config.anvil_secret_encryption_key.clone(),
+            watch_tx,
+        );
+        let encryption_key = Arc::new(hex::decode(&config.anvil_secret_encryption_key).unwrap());
+        execute_task_with_lease(
+            &persistence,
+            &cluster_state,
+            &jwt_manager,
+            &object_manager,
+            &task,
+            &encryption_key,
+        )
+        .await
+        .unwrap();
+
         assert!(
             tokio::fs::metadata(storage.metadata_manifest_path(1, bucket.id))
                 .await
@@ -635,5 +679,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(replayed.version_id, object.version_id);
+        let lease = persistence
+            .read_task_execution_lease(task.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.partition_family, "object_metadata");
+        assert_eq!(lease.checkpoint_cursor, lease.source_cursor);
     }
 }
