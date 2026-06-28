@@ -100,6 +100,8 @@ axum-extra = { version = "0.10.2", features = ["typed-header"] }
 regex = "1.11.3"
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled", "session"] }
 unicode-normalization = "0.1.24"
+caseless = "0.2.2"
+unicode-segmentation = "1.13.3"
 zstd = "0.13"
 aws-sigv4 = { version = "1", features = ["sign-http", "http1", "sign-eventstream"] }
 aws-credential-types = "1"   # for Credentials

@@ -304,6 +304,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "bytes",
+ "caseless",
  "chrono",
  "clap",
  "constant_time_eq 0.4.2",
@@ -364,6 +365,7 @@ dependencies = [
  "tracing-subscriber",
  "trust-dns-resolver",
  "unicode-normalization",
+ "unicode-segmentation",
  "uuid",
  "zstd",
 ]
@@ -1263,6 +1265,15 @@ checksum = "7dafe3a8757b027e2be6e4e5601ed563c55989fcf1546e933c66c8eb3a058d35"
 dependencies = [
  "bytes",
  "either",
+]
+
+[[package]]
+name = "caseless"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b6fd507454086c8edfd769ca6ada439193cdb209c7681712ef6275cccbfe5d8"
+dependencies = [
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -5999,6 +6010,12 @@ checksum = "5033c97c4262335cded6d6fc3e5c18ab755e1a3dc96376350f3d8e9f009ad956"
 dependencies = [
  "tinyvec",
 ]
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "unicode-width"

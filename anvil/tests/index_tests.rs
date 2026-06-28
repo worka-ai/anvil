@@ -1511,11 +1511,25 @@ async fn test_vector_index_build_records_dimension_mismatch_diagnostic() {
     }
 
     assert!(found, "dimension mismatch should write an index diagnostic");
-    let tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
-    assert!(tasks.iter().any(|task| {
-        task.task_type == anvil::tasks::TaskType::IndexBuild
-            && task.status == anvil::tasks::TaskStatus::Completed
-    }));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let tasks = loop {
+        let tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
+        if tasks.iter().any(|task| {
+            task.task_type == anvil::tasks::TaskType::IndexBuild
+                && task.status == anvil::tasks::TaskStatus::Completed
+        }) || tokio::time::Instant::now() >= deadline
+        {
+            break tasks;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        tasks.iter().any(|task| {
+            task.task_type == anvil::tasks::TaskType::IndexBuild
+                && task.status == anvil::tasks::TaskStatus::Completed
+        }),
+        "diagnostic should be followed by completed index build task"
+    );
     assert!(!tasks.iter().any(|task| {
         task.task_type == anvil::tasks::TaskType::IndexBuild
             && task.status == anvil::tasks::TaskStatus::Failed

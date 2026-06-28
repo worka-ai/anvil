@@ -364,49 +364,28 @@ struct NormalizedCharSpan {
 }
 
 pub fn tokenize_text(input: &str, config: &TokenizerConfig) -> Vec<Token> {
+    use unicode_segmentation::UnicodeSegmentation;
+
     let (normalized, spans) = normalize_for_full_text(input, config);
     let mut tokens = Vec::new();
-    let mut current_start = None;
-    let mut current_chars = 0usize;
     let mut position = 0u32;
 
-    for (offset, ch) in normalized.char_indices() {
-        if is_index_token_char(ch) {
-            if current_start.is_none() {
-                current_start = Some(offset);
-                current_chars = 0;
-            }
-            current_chars += 1;
+    for (start, segment) in normalized.split_word_bound_indices() {
+        if !is_index_word_segment(segment) {
             continue;
         }
-
-        if let Some(start) = current_start.take() {
-            push_token(
-                &normalized,
-                &spans,
-                start,
-                offset,
-                current_chars,
-                &mut position,
-                &mut tokens,
-                config,
-            );
-        }
-    }
-
-    if let Some(start) = current_start {
+        let end = start + segment.len();
         push_token(
             &normalized,
             &spans,
             start,
-            normalized.len(),
-            current_chars,
+            end,
+            segment.chars().count(),
             &mut position,
             &mut tokens,
             config,
         );
     }
-
     tokens
 }
 
@@ -415,42 +394,41 @@ fn normalize_for_full_text(
     config: &TokenizerConfig,
 ) -> (String, Vec<NormalizedCharSpan>) {
     use unicode_normalization::UnicodeNormalization;
+    use unicode_segmentation::UnicodeSegmentation;
 
     let mut normalized = String::with_capacity(input.len());
     let mut spans = Vec::new();
 
-    for (original_start, ch) in input.char_indices() {
-        let original_end = original_start + ch.len_utf8();
+    for (original_start, grapheme) in input.grapheme_indices(true) {
+        let original_end = original_start + grapheme.len();
         let source = if config.normalize_nfkc {
-            ch.to_string().nfkc().collect::<String>()
+            grapheme.nfkc().collect::<String>()
         } else {
-            ch.to_string()
+            grapheme.to_string()
         };
-        for normalized_ch in source.chars() {
-            let folded = if config.lowercase {
-                normalized_ch.to_lowercase().collect::<String>()
-            } else {
-                normalized_ch.to_string()
-            };
-            for folded_ch in folded.chars() {
-                let normalized_start = normalized.len();
-                normalized.push(folded_ch);
-                let normalized_end = normalized.len();
-                spans.push(NormalizedCharSpan {
-                    normalized_start,
-                    normalized_end,
-                    original_start,
-                    original_end,
-                });
-            }
+        let folded = if config.lowercase {
+            caseless::default_case_fold_str(&source)
+        } else {
+            source
+        };
+        for folded_ch in folded.chars() {
+            let normalized_start = normalized.len();
+            normalized.push(folded_ch);
+            let normalized_end = normalized.len();
+            spans.push(NormalizedCharSpan {
+                normalized_start,
+                normalized_end,
+                original_start,
+                original_end,
+            });
         }
     }
 
     (normalized, spans)
 }
 
-fn is_index_token_char(ch: char) -> bool {
-    ch.is_alphanumeric() || ch == '_'
+fn is_index_word_segment(segment: &str) -> bool {
+    segment.chars().any(char::is_alphanumeric)
 }
 
 fn push_token(
@@ -836,18 +814,70 @@ mod tests {
                 .iter()
                 .map(|token| token.term.as_str())
                 .collect::<Vec<_>>(),
-            vec!["acme", "café", "世界"]
+            vec!["acme", "café", "世", "界"]
         );
         assert_eq!(tokens[0].position, 0);
         assert_eq!(tokens[1].position, 1);
         assert_eq!(tokens[2].position, 2);
+        assert_eq!(tokens[3].position, 3);
         assert_eq!(
             &"Ａcme Café, 世界!"[tokens[0].original_byte_start..tokens[0].original_byte_end],
             "Ａcme"
         );
         assert_eq!(
             &"Ａcme Café, 世界!"[tokens[2].original_byte_start..tokens[2].original_byte_end],
-            "世界"
+            "世"
+        );
+    }
+
+    #[test]
+    fn tokenizer_uses_unicode_case_folding() {
+        let tokens = tokenize_text("Straße Teſt spiﬃest", &TokenizerConfig::default());
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|token| token.term.as_str())
+                .collect::<Vec<_>>(),
+            vec!["strasse", "test", "spiffiest"]
+        );
+    }
+
+    #[test]
+    fn tokenizer_normalizes_grapheme_clusters_before_tokenizing() {
+        let input = "Cafe\u{301} resume\u{301}";
+        let tokens = tokenize_text(input, &TokenizerConfig::default());
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|token| token.term.as_str())
+                .collect::<Vec<_>>(),
+            vec!["café", "resumé"]
+        );
+        assert_eq!(
+            &input[tokens[0].original_byte_start..tokens[0].original_byte_end],
+            "Cafe\u{301}"
+        );
+    }
+
+    #[test]
+    fn tokenizer_uses_unicode_word_boundaries() {
+        let tokens = tokenize_text(
+            "can't_stop 123.45 email@example.com",
+            &TokenizerConfig::default(),
+        );
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|token| token.term.as_str())
+                .collect::<Vec<_>>(),
+            vec!["can't_stop", "123.45", "email", "example.com"]
+        );
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|token| token.position)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
         );
     }
 
