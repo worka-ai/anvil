@@ -1,4 +1,5 @@
 use crate::{
+    access_control,
     anvil_api::{
         CommitShardRequest, GetShardRequest, PutShardRequest, internal_anvil_service_client,
     },
@@ -819,17 +820,6 @@ impl ObjectManager {
             .get_authorized_bucket(claims.as_ref(), &bucket_name)
             .await?;
 
-        if !bucket.is_public_read {
-            let claims = claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
-            if !auth::is_authorized(
-                AnvilAction::ObjectRead,
-                &format!("{}/{}", bucket_name, object_key),
-                &claims.scopes,
-            ) {
-                return Err(Status::permission_denied("Permission denied"));
-            }
-        }
-
         let object = match version_id {
             Some(version_id) => {
                 let object = metadata_journal::read_object_version(
@@ -857,6 +847,15 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Object not found"))?,
         };
+        if !bucket.is_public_read {
+            let claims = claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
+            if !self
+                .object_read_allowed(&claims, &bucket_name, &object_key, None)
+                .await?
+            {
+                return Err(Status::permission_denied("Permission denied"));
+            }
+        }
 
         let (tx, rx) = mpsc::channel(4);
         let app_state = self.clone();
@@ -1211,22 +1210,11 @@ impl ObjectManager {
             return Err(Status::invalid_argument("Invalid object key"));
         }
 
-        // Allow public buckets to bypass auth; otherwise require appropriate scope
         let bucket = self
             .get_authorized_bucket(claims.as_ref(), bucket_name)
             .await?;
-        if !bucket.is_public_read {
-            let claims = claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
-            if !auth::is_authorized(
-                AnvilAction::ObjectRead,
-                &format!("{}/{}", bucket_name, object_key),
-                &claims.scopes,
-            ) {
-                return Err(Status::permission_denied("Permission denied"));
-            }
-        }
 
-        match version_id {
+        let object = match version_id {
             Some(version_id) => {
                 let object = metadata_journal::read_object_version(
                     &self.storage,
@@ -1241,7 +1229,7 @@ impl ObjectManager {
                 if object.deleted_at.is_some() {
                     return Err(Status::not_found("Object version is a delete marker"));
                 }
-                Ok(object)
+                object
             }
             None => metadata_journal::read_current_object(
                 &self.storage,
@@ -1251,8 +1239,18 @@ impl ObjectManager {
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Object not found")),
+            .ok_or_else(|| Status::not_found("Object not found"))?,
+        };
+        if !bucket.is_public_read {
+            let claims = claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
+            if !self
+                .object_read_allowed(&claims, bucket_name, object_key, None)
+                .await?
+            {
+                return Err(Status::permission_denied("Permission denied"));
+            }
         }
+        Ok(object)
     }
 
     pub async fn list_objects(
@@ -1527,6 +1525,28 @@ impl ObjectManager {
         }
 
         Ok(bucket)
+    }
+
+    async fn object_read_allowed(
+        &self,
+        claims: &auth::Claims,
+        bucket_name: &str,
+        object_key: &str,
+        authz_revision: Option<i64>,
+    ) -> Result<bool, Status> {
+        let object_resource = format!("{bucket_name}/{object_key}");
+        access_control::scope_or_relationship_allows(
+            &self.storage,
+            claims,
+            AnvilAction::ObjectRead,
+            &object_resource,
+            "object",
+            &object_resource,
+            "reader",
+            authz_revision,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))
     }
 
     async fn publish_object_watch_event(

@@ -1,7 +1,7 @@
 use crate::anvil_api::index_service_server::IndexService;
 use crate::anvil_api::*;
 use crate::{
-    AppState, auth, authz_journal, bucket_journal,
+    AppState, access_control, auth, bucket_journal,
     formats::{
         full_text::{Bm25Config, FullTextIndexDefinition},
         vector::VectorMetric,
@@ -932,20 +932,16 @@ impl AppState {
                 }
                 let revision = i64::try_from(authz_revision)
                     .map_err(|_| Status::internal("Invalid authz revision"))?;
-                let record = authz_journal::check_authz_tuple_at_revision(
+                access_control::relationship_allows(
                     &self.storage,
-                    claims.tenant_id,
+                    claims,
                     "object",
                     &object_resource,
                     "reader",
-                    "app",
-                    &claims.sub,
-                    "",
-                    revision,
+                    Some(revision),
                 )
                 .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-                Ok(record.is_some_and(|record| record.operation == "add"))
+                .map_err(|e| Status::internal(e.to_string()))
             }
             "index_only" | "public" => Ok(true),
             _ => Ok(false),

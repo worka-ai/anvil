@@ -1,7 +1,7 @@
 use crate::anvil_api::personal_db_service_server::PersonalDbService;
 use crate::anvil_api::*;
 use crate::{
-    AppState,
+    AppState, access_control,
     anvil_personaldb_sqlite_changeset::iterate_changeset,
     auth, authz_journal,
     error_codes::AnvilErrorCode,
@@ -201,8 +201,15 @@ impl PersonalDbService for AppState {
         let req = request.into_inner();
         validate_claim_tenant(claims.tenant_id, req.tenant_id)?;
         validate_database_id(&req.database_id)?;
-        let resource = personaldb_resource(claims.tenant_id, &req.database_id);
-        if !auth::is_authorized(AnvilAction::PersonalDbRead, &resource, &claims.scopes) {
+        if !personaldb_access_allowed(
+            &self.storage,
+            &claims,
+            &req.database_id,
+            AnvilAction::PersonalDbRead,
+            "reader",
+        )
+        .await?
+        {
             return Err(Status::permission_denied("Permission denied"));
         }
         let signing_key = self.personaldb_signing_key();
@@ -311,9 +318,16 @@ impl PersonalDbService for AppState {
         validate_claim_tenant(claims.tenant_id, req.tenant_id)?;
         validate_database_id(&req.database_id)?;
         validate_projection_id(&req.projection_id)?;
-        let resource =
-            personaldb_projection_resource(claims.tenant_id, &req.database_id, &req.projection_id);
-        if !auth::is_authorized(AnvilAction::PersonalDbRead, &resource, &claims.scopes) {
+        if !personaldb_projection_access_allowed(
+            &self.storage,
+            &claims,
+            &req.database_id,
+            &req.projection_id,
+            AnvilAction::PersonalDbRead,
+            "reader",
+        )
+        .await?
+        {
             return Err(Status::permission_denied("Permission denied"));
         }
         let definition = read_projection_definition(
@@ -382,8 +396,15 @@ impl PersonalDbService for AppState {
         let req = request.into_inner();
         validate_claim_tenant(claims.tenant_id, req.tenant_id)?;
         validate_database_id(&req.database_id)?;
-        let resource = personaldb_resource(claims.tenant_id, &req.database_id);
-        if !auth::is_authorized(AnvilAction::PersonalDbRead, &resource, &claims.scopes) {
+        if !personaldb_access_allowed(
+            &self.storage,
+            &claims,
+            &req.database_id,
+            AnvilAction::PersonalDbRead,
+            "reader",
+        )
+        .await?
+        {
             return Err(Status::permission_denied("Permission denied"));
         }
         let response = personaldb_catch_up(
@@ -412,8 +433,15 @@ impl PersonalDbService for AppState {
         let req = request.into_inner();
         validate_claim_tenant(claims.tenant_id, req.tenant_id)?;
         validate_database_id(&req.database_id)?;
-        let resource = personaldb_resource(claims.tenant_id, &req.database_id);
-        if !auth::is_authorized(AnvilAction::PersonalDbWatch, &resource, &claims.scopes) {
+        if !personaldb_access_allowed(
+            &self.storage,
+            &claims,
+            &req.database_id,
+            AnvilAction::PersonalDbWatch,
+            "watcher",
+        )
+        .await?
+        {
             return Err(Status::permission_denied("Permission denied"));
         }
         let after_cursor = join_u128(req.after_cursor_low, req.after_cursor_high);
@@ -476,9 +504,16 @@ impl PersonalDbService for AppState {
         validate_claim_tenant(claims.tenant_id, req.tenant_id)?;
         validate_database_id(&req.database_id)?;
         validate_projection_id(&req.projection_id)?;
-        let resource =
-            personaldb_projection_resource(claims.tenant_id, &req.database_id, &req.projection_id);
-        if !auth::is_authorized(AnvilAction::PersonalDbWatch, &resource, &claims.scopes) {
+        if !personaldb_projection_access_allowed(
+            &self.storage,
+            &claims,
+            &req.database_id,
+            &req.projection_id,
+            AnvilAction::PersonalDbWatch,
+            "watcher",
+        )
+        .await?
+        {
             return Err(Status::permission_denied("Permission denied"));
         }
         let after_cursor = join_u128(req.after_cursor_low, req.after_cursor_high);
@@ -608,8 +643,15 @@ impl AppState {
         if let Some(bearer_token) = actor.bearer_token.as_deref() {
             bind_personaldb_submit_session(&request, &actor, bearer_token)?;
         }
-        let resource = personaldb_resource(actor.tenant_id, &request.database_id);
-        if !auth::is_authorized(AnvilAction::PersonalDbCommit, &resource, &actor.scopes) {
+        if !personaldb_actor_access_allowed(
+            &self.storage,
+            &actor,
+            &request.database_id,
+            AnvilAction::PersonalDbCommit,
+            "committer",
+        )
+        .await?
+        {
             return Err(Status::permission_denied("Permission denied"));
         }
         let validated = validate_submit_personaldb_changeset(request, default_max_changeset_size())
@@ -770,9 +812,15 @@ impl AppState {
     ) -> Result<CommittedPersonalDbChangeset, Status> {
         validate_claim_tenant(actor.tenant_id, request.tenant_id)?;
         validate_database_id(&request.database_id)?;
-        let resource = personaldb_resource(actor.tenant_id, &request.database_id);
         if actor.require_public_commit_authorization
-            && !auth::is_authorized(AnvilAction::PersonalDbCommit, &resource, &actor.scopes)
+            && !personaldb_actor_access_allowed(
+                &self.storage,
+                &actor,
+                &request.database_id,
+                AnvilAction::PersonalDbCommit,
+                "committer",
+            )
+            .await?
         {
             return Err(Status::permission_denied("Permission denied"));
         }
@@ -1596,6 +1644,44 @@ fn personaldb_resource(tenant_id: i64, database_id: &str) -> String {
     format!("tenant-{tenant_id}/{database_id}")
 }
 
+async fn personaldb_access_allowed(
+    storage: &crate::storage::Storage,
+    claims: &auth::Claims,
+    database_id: &str,
+    action: AnvilAction,
+    relation: &str,
+) -> Result<bool, Status> {
+    let resource = personaldb_resource(claims.tenant_id, database_id);
+    access_control::scope_or_relationship_allows(
+        storage,
+        claims,
+        action,
+        &resource,
+        "personaldb",
+        &resource,
+        relation,
+        None,
+    )
+    .await
+    .map_err(internal_status)
+}
+
+async fn personaldb_actor_access_allowed(
+    storage: &crate::storage::Storage,
+    actor: &PersonalDbCommitActor,
+    database_id: &str,
+    action: AnvilAction,
+    relation: &str,
+) -> Result<bool, Status> {
+    let claims = auth::Claims {
+        sub: actor.principal.clone(),
+        exp: 0,
+        scopes: actor.scopes.clone(),
+        tenant_id: actor.tenant_id,
+    };
+    personaldb_access_allowed(storage, &claims, database_id, action, relation).await
+}
+
 fn personaldb_group_partition_family() -> &'static str {
     "personaldb_group"
 }
@@ -1612,6 +1698,29 @@ fn personaldb_projection_resource(
     projection_id: &str,
 ) -> String {
     format!("tenant-{tenant_id}/{database_id}/projections/{projection_id}")
+}
+
+async fn personaldb_projection_access_allowed(
+    storage: &crate::storage::Storage,
+    claims: &auth::Claims,
+    database_id: &str,
+    projection_id: &str,
+    action: AnvilAction,
+    relation: &str,
+) -> Result<bool, Status> {
+    let resource = personaldb_projection_resource(claims.tenant_id, database_id, projection_id);
+    access_control::scope_or_relationship_allows(
+        storage,
+        claims,
+        action,
+        &resource,
+        "personaldb_projection",
+        &resource,
+        relation,
+        None,
+    )
+    .await
+    .map_err(internal_status)
 }
 
 fn configured_personaldb_snapshot_policy(

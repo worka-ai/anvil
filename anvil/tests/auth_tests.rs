@@ -46,6 +46,11 @@ async fn grpc_error_responses_include_server_request_id() {
 
 // Helper function to create an app, since it's used in auth tests.
 fn create_app(admin_state_path: &str, app_name: &str) -> (String, String) {
+    let (_, client_id, client_secret) = create_app_with_id(admin_state_path, app_name);
+    (client_id, client_secret)
+}
+
+fn create_app_with_id(admin_state_path: &str, app_name: &str) -> (String, String, String) {
     let admin_args = &["run", "--bin", "admin", "--"];
     let app_output = std::process::Command::new("cargo")
         .args(admin_args.iter().chain(&[
@@ -64,9 +69,41 @@ fn create_app(admin_state_path: &str, app_name: &str) -> (String, String) {
         .unwrap();
     assert!(app_output.status.success());
     let creds = String::from_utf8(app_output.stdout).unwrap();
+    let app_id = creds
+        .lines()
+        .find_map(|line| line.split_once("(ID: "))
+        .and_then(|(_, rest)| rest.strip_suffix(')'))
+        .expect("app id in admin output")
+        .to_string();
     let client_id = extract_credential(&creds, "Client ID");
     let client_secret = extract_credential(&creds, "Client Secret");
-    (client_id, client_secret)
+    (app_id, client_id, client_secret)
+}
+
+fn grant_policy(admin_state_path: &str, app_name: &str, action: &str, resource: &str) {
+    let admin_args = &["run", "--bin", "admin", "--"];
+    let output = std::process::Command::new("cargo")
+        .args(admin_args.iter().chain(&[
+            "--anvil-secret-encryption-key",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--storage-path",
+            admin_state_path,
+            "policy",
+            "grant",
+            "--app-name",
+            app_name,
+            "--action",
+            action,
+            "--resource",
+            resource,
+        ]))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "policy grant failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 // Helper to get a token for specific scopes.
@@ -625,6 +662,111 @@ async fn test_authz_permission_resolves_nested_usersets() {
         assert_eq!(event.latest_revision, expected_revision);
         assert_eq!(event.revision_lag, 0);
     }
+}
+
+#[tokio::test]
+async fn test_object_read_uses_relationship_authorization_before_streaming_bytes() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let bucket_name = "relationship-read-bucket".to_string();
+    let object_key = "private/report.txt".to_string();
+    let payload = b"relationship authorized object".to_vec();
+
+    let mut bucket_client = BucketServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut object_client = ObjectServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    let mut create_bucket = Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
+    });
+    add_bearer(&mut create_bucket, &token);
+    bucket_client.create_bucket(create_bucket).await.unwrap();
+
+    let put_chunks = vec![
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                ObjectMetadata {
+                    bucket_name: bucket_name.clone(),
+                    object_key: object_key.clone(),
+                },
+            )),
+        },
+        PutObjectRequest {
+            data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                payload.clone(),
+            )),
+        },
+    ];
+    let mut put_request = Request::new(tokio_stream::iter(put_chunks));
+    add_bearer(&mut put_request, &token);
+    object_client.put_object(put_request).await.unwrap();
+
+    let (reader_app_id, reader_client_id, reader_client_secret) =
+        create_app_with_id(&cluster.admin_state_path, "relationship-reader-app");
+    grant_policy(
+        &cluster.admin_state_path,
+        "relationship-reader-app",
+        "bucket:read",
+        "unrelated-bucket",
+    );
+    let reader_token = get_token_for_scopes(
+        &cluster.grpc_addrs[0],
+        &reader_client_id,
+        &reader_client_secret,
+        vec!["bucket:read|unrelated-bucket".to_string()],
+    )
+    .await;
+
+    let mut denied_get = Request::new(GetObjectRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: object_key.clone(),
+        version_id: None,
+    });
+    add_bearer(&mut denied_get, &reader_token);
+    let denied = object_client.get_object(denied_get).await.unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+
+    let mut grant_reader = Request::new(write_authz_tuple_request(
+        "object",
+        &format!("{bucket_name}/{object_key}"),
+        "reader",
+        "app",
+        &reader_app_id,
+        "add",
+    ));
+    add_bearer(&mut grant_reader, &token);
+    auth_client.write_authz_tuple(grant_reader).await.unwrap();
+
+    let mut allowed_get = Request::new(GetObjectRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: object_key.clone(),
+        version_id: None,
+    });
+    add_bearer(&mut allowed_get, &reader_token);
+    let mut stream = object_client
+        .get_object(allowed_get)
+        .await
+        .unwrap()
+        .into_inner();
+    let first = stream.next().await.unwrap().unwrap();
+    assert!(matches!(
+        first.data,
+        Some(anvil::anvil_api::get_object_response::Data::Metadata(_))
+    ));
+    let second = stream.next().await.unwrap().unwrap();
+    let Some(anvil::anvil_api::get_object_response::Data::Chunk(bytes)) = second.data else {
+        panic!("second get_object response must be payload bytes");
+    };
+    assert_eq!(bytes, payload);
 }
 
 #[tokio::test]

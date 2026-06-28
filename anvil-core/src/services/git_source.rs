@@ -2,7 +2,7 @@ use crate::anvil_api::git_source_service_server::GitSourceService;
 use crate::anvil_api::*;
 use crate::object_manager::ObjectWriteOptions;
 use crate::{
-    AppState, auth, authz_journal, git_pack, git_source_index, git_source_manifest,
+    AppState, access_control, auth, authz_journal, git_pack, git_source_index, git_source_manifest,
     git_source_query, git_source_watch, permissions::AnvilAction,
 };
 use futures_util::StreamExt;
@@ -170,7 +170,7 @@ impl GitSourceService for AppState {
         let claims = authorize_git_source_read(&request)?;
         let req = request.into_inner();
         validate_component("repository_id", &req.repository_id)?;
-        ensure_git_source_read(&claims, &req.repository_id)?;
+        ensure_git_source_read(&self.storage, &claims, &req.repository_id).await?;
         let object_id = parse_git_hex_id("object_id", &req.object_id)?;
         let index = self
             .latest_git_source_index(claims.tenant_id, &req.repository_id)
@@ -191,7 +191,7 @@ impl GitSourceService for AppState {
         let claims = authorize_git_source_read(&request)?;
         let req = request.into_inner();
         validate_component("repository_id", &req.repository_id)?;
-        ensure_git_source_read(&claims, &req.repository_id)?;
+        ensure_git_source_read(&self.storage, &claims, &req.repository_id).await?;
         let commit_id = parse_git_hex_id("commit_id", &req.commit_id)?;
         let index = self
             .latest_git_source_index(claims.tenant_id, &req.repository_id)
@@ -212,7 +212,7 @@ impl GitSourceService for AppState {
         let claims = authorize_git_source_read(&request)?;
         let req = request.into_inner();
         validate_component("repository_id", &req.repository_id)?;
-        ensure_git_source_read(&claims, &req.repository_id)?;
+        ensure_git_source_read(&self.storage, &claims, &req.repository_id).await?;
         let commit_id = parse_git_hex_id("commit_id", &req.commit_id)?;
         let index = self
             .latest_git_source_index(claims.tenant_id, &req.repository_id)
@@ -478,9 +478,25 @@ fn authorize_git_source_read<T>(request: &Request<T>) -> Result<auth::Claims, St
     Ok(claims)
 }
 
-fn ensure_git_source_read(claims: &auth::Claims, repository_id: &str) -> Result<(), Status> {
+async fn ensure_git_source_read(
+    storage: &crate::storage::Storage,
+    claims: &auth::Claims,
+    repository_id: &str,
+) -> Result<(), Status> {
     let resource = git_source_resource(repository_id);
-    if auth::is_authorized(AnvilAction::GitSourceRead, &resource, &claims.scopes) {
+    if access_control::scope_or_relationship_allows(
+        storage,
+        claims,
+        AnvilAction::GitSourceRead,
+        &resource,
+        "git_repository",
+        repository_id,
+        "reader",
+        None,
+    )
+    .await
+    .map_err(|e| Status::internal(e.to_string()))?
+    {
         Ok(())
     } else {
         Err(Status::permission_denied("Permission denied"))
