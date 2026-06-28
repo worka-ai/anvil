@@ -976,6 +976,101 @@ async fn personaldb_projection_writeback_rejects_protected_column_mutation() {
 }
 
 #[tokio::test]
+async fn personaldb_projection_writeback_rejects_ambiguous_source_binding() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut client = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let first_source_database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+    let second_source_database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+    let projection_database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+    let first_source_genesis = create_group(&mut client, &token, &first_source_database_id).await;
+    let second_source_genesis = create_group(&mut client, &token, &second_source_database_id).await;
+    create_group_with_schema(
+        &mut client,
+        &token,
+        &projection_database_id,
+        PERSONALDB_PROJECTION_TEST_SCHEMA_SQL,
+        &personaldb_projection_test_schema_hash(),
+    )
+    .await;
+
+    let definition = projection_definition_with_ambiguous_writeback(
+        &projection_database_id,
+        &first_source_database_id,
+        &second_source_database_id,
+    );
+    client
+        .create_personal_db_projection(authorized(
+            CreatePersonalDbProjectionRequest {
+                tenant_id: 1,
+                database_id: projection_database_id.clone(),
+                projection_definition_json: serde_json::to_string(&definition).unwrap(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let projection_head_before = client
+        .get_personal_db_group(authorized(
+            GetPersonalDbGroupRequest {
+                tenant_id: 1,
+                database_id: projection_database_id.clone(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .committed_head
+        .expect("projection committed head");
+
+    let err = client
+        .submit_personal_db_changeset(authorized(
+            submit_request_at_base(
+                &projection_database_id,
+                projection_head_before.log_index,
+                &projection_head_before.log_hash,
+                &token,
+                sqlite_projection_update_changeset(),
+            ),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert!(
+        err.message()
+            .contains("PersonalDbProjectionWriteBackRejected")
+    );
+
+    for (database_id, genesis_hash) in [
+        (&first_source_database_id, &first_source_genesis),
+        (&second_source_database_id, &second_source_genesis),
+    ] {
+        let source_head = client
+            .get_personal_db_group(authorized(
+                GetPersonalDbGroupRequest {
+                    tenant_id: 1,
+                    database_id: database_id.to_string(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .committed_head
+            .expect("source committed head");
+        assert_eq!(source_head.log_index, 0);
+        assert_eq!(&source_head.log_hash, genesis_hash);
+    }
+}
+
+#[tokio::test]
 async fn personaldb_api_rejects_cross_tenant_request_scope() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
@@ -1153,6 +1248,26 @@ fn projection_definition_allowing_name_writeback(
         protected_columns: vec!["id".to_string()],
         allowed_columns: vec!["name".to_string()],
     };
+    definition
+}
+
+fn projection_definition_with_ambiguous_writeback(
+    projection_database_id: &str,
+    first_source_database_id: &str,
+    second_source_database_id: &str,
+) -> ProjectionDefinition {
+    let mut definition = projection_definition_allowing_name_writeback(
+        projection_database_id,
+        first_source_database_id,
+    );
+    definition
+        .source_database_ids
+        .push(second_source_database_id.to_string());
+    definition.table_mappings.push(TableMapping {
+        source_database_id: second_source_database_id.to_string(),
+        source_table: "items".to_string(),
+        target_table: "items_projection".to_string(),
+    });
     definition
 }
 
