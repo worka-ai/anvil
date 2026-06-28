@@ -2,6 +2,7 @@ use crate::formats::{
     BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, Hash32, JournalFrame, JournalRecordKind,
     hash32, validate_journal_chain,
 };
+use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
 use crate::persistence::{AdminRole, AdminUser, App, AppDetails, Tenant};
 use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
@@ -13,7 +14,7 @@ use tokio::io::AsyncWriteExt;
 #[derive(Debug, Serialize)]
 struct ControlJournalHeader<'a> {
     partition_family: &'static str,
-    partition_id: &'static str,
+    partition_id: String,
     fence_token: u64,
     first_sequence: u64,
     created_at: &'a str,
@@ -232,6 +233,20 @@ pub async fn read_control_state(storage: &Storage) -> Result<ControlState> {
 }
 
 pub async fn create_region(storage: &Storage, name: &str) -> Result<bool> {
+    create_region_inner(storage, name, 0).await
+}
+
+pub async fn create_region_with_permit(
+    storage: &Storage,
+    name: &str,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<bool> {
+    let fence_token = validate_control_write(storage, permit, partition_owner_signing_key).await?;
+    create_region_inner(storage, name, fence_token).await
+}
+
+async fn create_region_inner(storage: &Storage, name: &str, fence_token: u64) -> Result<bool> {
     require_nonempty(name, "region")?;
     let state = read_control_state(storage).await?;
     if state.regions.contains(name) {
@@ -243,12 +258,27 @@ pub async fn create_region(storage: &Storage, name: &str) -> Result<bool> {
             name: name.to_string(),
         },
         region_key_hash(name),
+        fence_token,
     )
     .await?;
     Ok(true)
 }
 
 pub async fn create_tenant(storage: &Storage, name: &str) -> Result<Tenant> {
+    create_tenant_inner(storage, name, 0).await
+}
+
+pub async fn create_tenant_with_permit(
+    storage: &Storage,
+    name: &str,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<Tenant> {
+    let fence_token = validate_control_write(storage, permit, partition_owner_signing_key).await?;
+    create_tenant_inner(storage, name, fence_token).await
+}
+
+async fn create_tenant_inner(storage: &Storage, name: &str, fence_token: u64) -> Result<Tenant> {
     require_nonempty(name, "tenant")?;
     let state = read_control_state(storage).await?;
     if let Some(existing) = state.tenant_by_name(name) {
@@ -265,6 +295,7 @@ pub async fn create_tenant(storage: &Storage, name: &str) -> Result<Tenant> {
             name: tenant.name.clone(),
         },
         tenant_key_hash(&tenant.name),
+        fence_token,
     )
     .await?;
     Ok(tenant)
@@ -276,6 +307,38 @@ pub async fn create_app(
     name: &str,
     client_id: &str,
     encrypted_secret: &[u8],
+) -> Result<App> {
+    create_app_inner(storage, tenant_id, name, client_id, encrypted_secret, 0).await
+}
+
+pub async fn create_app_with_permit(
+    storage: &Storage,
+    tenant_id: i64,
+    name: &str,
+    client_id: &str,
+    encrypted_secret: &[u8],
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<App> {
+    let fence_token = validate_control_write(storage, permit, partition_owner_signing_key).await?;
+    create_app_inner(
+        storage,
+        tenant_id,
+        name,
+        client_id,
+        encrypted_secret,
+        fence_token,
+    )
+    .await
+}
+
+async fn create_app_inner(
+    storage: &Storage,
+    tenant_id: i64,
+    name: &str,
+    client_id: &str,
+    encrypted_secret: &[u8],
+    fence_token: u64,
 ) -> Result<App> {
     require_nonempty(name, "app")?;
     require_nonempty(client_id, "client_id")?;
@@ -302,6 +365,7 @@ pub async fn create_app(
             client_secret_encrypted: encrypted_secret.to_vec(),
         },
         app_key_hash(tenant_id, name),
+        fence_token,
     )
     .await?;
     Ok(app)
@@ -311,6 +375,26 @@ pub async fn update_app_secret(
     storage: &Storage,
     app_id: i64,
     encrypted_secret: &[u8],
+) -> Result<()> {
+    update_app_secret_inner(storage, app_id, encrypted_secret, 0).await
+}
+
+pub async fn update_app_secret_with_permit(
+    storage: &Storage,
+    app_id: i64,
+    encrypted_secret: &[u8],
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<()> {
+    let fence_token = validate_control_write(storage, permit, partition_owner_signing_key).await?;
+    update_app_secret_inner(storage, app_id, encrypted_secret, fence_token).await
+}
+
+async fn update_app_secret_inner(
+    storage: &Storage,
+    app_id: i64,
+    encrypted_secret: &[u8],
+    fence_token: u64,
 ) -> Result<()> {
     let state = read_control_state(storage).await?;
     if !state.apps.contains_key(&app_id) {
@@ -323,6 +407,7 @@ pub async fn update_app_secret(
             client_secret_encrypted: encrypted_secret.to_vec(),
         },
         app_id_key_hash(app_id),
+        fence_token,
     )
     .await
 }
@@ -332,6 +417,28 @@ pub async fn grant_policy(
     app_id: i64,
     resource: &str,
     action: &str,
+) -> Result<()> {
+    grant_policy_inner(storage, app_id, resource, action, 0).await
+}
+
+pub async fn grant_policy_with_permit(
+    storage: &Storage,
+    app_id: i64,
+    resource: &str,
+    action: &str,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<()> {
+    let fence_token = validate_control_write(storage, permit, partition_owner_signing_key).await?;
+    grant_policy_inner(storage, app_id, resource, action, fence_token).await
+}
+
+async fn grant_policy_inner(
+    storage: &Storage,
+    app_id: i64,
+    resource: &str,
+    action: &str,
+    fence_token: u64,
 ) -> Result<()> {
     let state = read_control_state(storage).await?;
     if !state.apps.contains_key(&app_id) {
@@ -345,6 +452,7 @@ pub async fn grant_policy(
             action: action.to_string(),
         },
         policy_key_hash(app_id, resource, action),
+        fence_token,
     )
     .await
 }
@@ -355,6 +463,28 @@ pub async fn revoke_policy(
     resource: &str,
     action: &str,
 ) -> Result<()> {
+    revoke_policy_inner(storage, app_id, resource, action, 0).await
+}
+
+pub async fn revoke_policy_with_permit(
+    storage: &Storage,
+    app_id: i64,
+    resource: &str,
+    action: &str,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<()> {
+    let fence_token = validate_control_write(storage, permit, partition_owner_signing_key).await?;
+    revoke_policy_inner(storage, app_id, resource, action, fence_token).await
+}
+
+async fn revoke_policy_inner(
+    storage: &Storage,
+    app_id: i64,
+    resource: &str,
+    action: &str,
+    fence_token: u64,
+) -> Result<()> {
     append_control_event(
         storage,
         ControlEventBody::AppPolicyRevoke {
@@ -363,6 +493,7 @@ pub async fn revoke_policy(
             action: action.to_string(),
         },
         policy_key_hash(app_id, resource, action),
+        fence_token,
     )
     .await
 }
@@ -374,12 +505,44 @@ pub async fn create_admin_user(
     password_hash: &str,
     role_names: &[String],
 ) -> Result<AdminUser> {
+    create_admin_user_inner(storage, username, email, password_hash, role_names, 0).await
+}
+
+pub async fn create_admin_user_with_permit(
+    storage: &Storage,
+    username: &str,
+    email: &str,
+    password_hash: &str,
+    role_names: &[String],
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<AdminUser> {
+    let fence_token = validate_control_write(storage, permit, partition_owner_signing_key).await?;
+    create_admin_user_inner(
+        storage,
+        username,
+        email,
+        password_hash,
+        role_names,
+        fence_token,
+    )
+    .await
+}
+
+async fn create_admin_user_inner(
+    storage: &Storage,
+    username: &str,
+    email: &str,
+    password_hash: &str,
+    role_names: &[String],
+    fence_token: u64,
+) -> Result<AdminUser> {
     require_nonempty(username, "username")?;
     let mut state = read_control_state(storage).await?;
     if state.admin_user_by_username(username).is_some() {
         return Err(anyhow!("admin user already exists"));
     }
-    let role_ids = ensure_admin_roles(storage, &mut state, role_names).await?;
+    let role_ids = ensure_admin_roles(storage, &mut state, role_names, fence_token).await?;
     let user = AdminUser {
         id: state.allocate_id(),
         username: username.to_string(),
@@ -398,6 +561,7 @@ pub async fn create_admin_user(
             role_ids,
         },
         admin_user_key_hash(user.id),
+        fence_token,
     )
     .await?;
     Ok(user)
@@ -412,12 +576,62 @@ pub async fn update_admin_user(
     is_active: bool,
     role_names: &[String],
 ) -> Result<()> {
+    update_admin_user_inner(
+        storage,
+        user_id,
+        username,
+        email,
+        password_hash,
+        is_active,
+        role_names,
+        0,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn update_admin_user_with_permit(
+    storage: &Storage,
+    user_id: i64,
+    username: &str,
+    email: &str,
+    password_hash: Option<&str>,
+    is_active: bool,
+    role_names: &[String],
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<()> {
+    let fence_token = validate_control_write(storage, permit, partition_owner_signing_key).await?;
+    update_admin_user_inner(
+        storage,
+        user_id,
+        username,
+        email,
+        password_hash,
+        is_active,
+        role_names,
+        fence_token,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn update_admin_user_inner(
+    storage: &Storage,
+    user_id: i64,
+    username: &str,
+    email: &str,
+    password_hash: Option<&str>,
+    is_active: bool,
+    role_names: &[String],
+    fence_token: u64,
+) -> Result<()> {
     require_nonempty(username, "username")?;
     let mut state = read_control_state(storage).await?;
     let existing = state
         .admin_user_by_id(user_id)
         .ok_or_else(|| anyhow!("admin user not found"))?;
-    let role_ids = ensure_admin_roles(storage, &mut state, role_names).await?;
+    let role_ids = ensure_admin_roles(storage, &mut state, role_names, fence_token).await?;
     append_control_event(
         storage,
         ControlEventBody::AdminUserUpsert {
@@ -429,43 +643,108 @@ pub async fn update_admin_user(
             role_ids,
         },
         admin_user_key_hash(user_id),
+        fence_token,
     )
     .await
 }
 
 pub async fn delete_admin_user(storage: &Storage, user_id: i64) -> Result<()> {
+    delete_admin_user_inner(storage, user_id, 0).await
+}
+
+pub async fn delete_admin_user_with_permit(
+    storage: &Storage,
+    user_id: i64,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<()> {
+    let fence_token = validate_control_write(storage, permit, partition_owner_signing_key).await?;
+    delete_admin_user_inner(storage, user_id, fence_token).await
+}
+
+async fn delete_admin_user_inner(storage: &Storage, user_id: i64, fence_token: u64) -> Result<()> {
     append_control_event(
         storage,
         ControlEventBody::AdminUserDelete { id: user_id },
         admin_user_key_hash(user_id),
+        fence_token,
     )
     .await
 }
 
 pub async fn create_admin_role(storage: &Storage, name: &str) -> Result<()> {
+    create_admin_role_inner(storage, name, 0).await
+}
+
+pub async fn create_admin_role_with_permit(
+    storage: &Storage,
+    name: &str,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<()> {
+    let fence_token = validate_control_write(storage, permit, partition_owner_signing_key).await?;
+    create_admin_role_inner(storage, name, fence_token).await
+}
+
+async fn create_admin_role_inner(storage: &Storage, name: &str, fence_token: u64) -> Result<()> {
     require_nonempty(name, "admin role")?;
     let state = read_control_state(storage).await?;
     if state.admin_roles.values().any(|role| role.name == name) {
         return Ok(());
     }
     let id = state.next_admin_role_id()?;
-    append_admin_role_upsert(storage, id, name).await
+    append_admin_role_upsert(storage, id, name, fence_token).await
 }
 
 pub async fn update_admin_role(storage: &Storage, id: i32, name: &str) -> Result<()> {
+    update_admin_role_inner(storage, id, name, 0).await
+}
+
+pub async fn update_admin_role_with_permit(
+    storage: &Storage,
+    id: i32,
+    name: &str,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<()> {
+    let fence_token = validate_control_write(storage, permit, partition_owner_signing_key).await?;
+    update_admin_role_inner(storage, id, name, fence_token).await
+}
+
+async fn update_admin_role_inner(
+    storage: &Storage,
+    id: i32,
+    name: &str,
+    fence_token: u64,
+) -> Result<()> {
     require_nonempty(name, "admin role")?;
     let state = read_control_state(storage).await?;
     if state.admin_roles.contains_key(&id) {
-        append_admin_role_upsert(storage, id, name).await?;
+        append_admin_role_upsert(storage, id, name, fence_token).await?;
     }
     Ok(())
 }
 
 pub async fn delete_admin_role(storage: &Storage, id: i32) -> Result<()> {
+    delete_admin_role_inner(storage, id, 0).await
+}
+
+pub async fn delete_admin_role_with_permit(
+    storage: &Storage,
+    id: i32,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<()> {
+    let fence_token = validate_control_write(storage, permit, partition_owner_signing_key).await?;
+    delete_admin_role_inner(storage, id, fence_token).await
+}
+
+async fn delete_admin_role_inner(storage: &Storage, id: i32, fence_token: u64) -> Result<()> {
     append_control_event(
         storage,
         ControlEventBody::AdminRoleDelete { id },
         admin_role_key_hash(id),
+        fence_token,
     )
     .await
 }
@@ -474,6 +753,7 @@ async fn ensure_admin_roles(
     storage: &Storage,
     state: &mut ControlState,
     role_names: &[String],
+    fence_token: u64,
 ) -> Result<Vec<i32>> {
     let mut role_ids = Vec::new();
     for role_name in role_names {
@@ -487,7 +767,7 @@ async fn ensure_admin_roles(
             continue;
         }
         let id = state.next_admin_role_id()?;
-        append_admin_role_upsert(storage, id, role_name).await?;
+        append_admin_role_upsert(storage, id, role_name, fence_token).await?;
         apply_event(
             state,
             ControlEventBody::AdminRoleUpsert {
@@ -502,7 +782,12 @@ async fn ensure_admin_roles(
     Ok(role_ids)
 }
 
-async fn append_admin_role_upsert(storage: &Storage, id: i32, name: &str) -> Result<()> {
+async fn append_admin_role_upsert(
+    storage: &Storage,
+    id: i32,
+    name: &str,
+    fence_token: u64,
+) -> Result<()> {
     append_control_event(
         storage,
         ControlEventBody::AdminRoleUpsert {
@@ -510,6 +795,7 @@ async fn append_admin_role_upsert(storage: &Storage, id: i32, name: &str) -> Res
             name: name.to_string(),
         },
         admin_role_key_hash(id),
+        fence_token,
     )
     .await
 }
@@ -518,12 +804,13 @@ async fn append_control_event(
     storage: &Storage,
     event: ControlEventBody,
     key_hash: Hash32,
+    fence_token: u64,
 ) -> Result<()> {
     let path = storage.control_journal_path();
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    ensure_journal_header(&path).await?;
+    ensure_journal_header(&path, fence_token).await?;
     let previous = read_control_journal_frames_at_path(path.as_path())
         .await
         .unwrap_or_default();
@@ -539,7 +826,7 @@ async fn append_control_event(
     let frame = JournalFrame::new(
         JournalRecordKind::ControlPlane,
         sequence,
-        0,
+        fence_token,
         *mutation_id.as_bytes(),
         key_hash,
         previous_hash,
@@ -555,15 +842,15 @@ async fn append_control_event(
     Ok(())
 }
 
-async fn ensure_journal_header(path: &Path) -> Result<()> {
+async fn ensure_journal_header(path: &Path, fence_token: u64) -> Result<()> {
     if tokio::fs::try_exists(path).await? {
         return Ok(());
     }
     let created_at = chrono::Utc::now().to_rfc3339();
     let header_json = serde_json::to_vec(&ControlJournalHeader {
         partition_family: "control_plane",
-        partition_id: "global",
-        fence_token: 0,
+        partition_id: hex::encode(control_partition_id()),
+        fence_token,
         first_sequence: 1,
         created_at: &created_at,
         codec: "none",
@@ -749,6 +1036,29 @@ fn admin_role_key_hash(role_id: i32) -> Hash32 {
     hash32(format!("admin_role\0{role_id}").as_bytes())
 }
 
+fn control_partition_id() -> Hash32 {
+    hash32(b"control_plane/global")
+}
+
+async fn validate_control_write(
+    storage: &Storage,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<u64> {
+    require_control_permit(permit)?;
+    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
+    Ok(permit.fence_token)
+}
+
+fn require_control_permit(permit: &PartitionWritePermit) -> Result<()> {
+    if permit.partition_family != "control_plane"
+        || permit.partition_id != hex::encode(control_partition_id())
+    {
+        anyhow::bail!("control-plane write permit targets a different partition");
+    }
+    Ok(())
+}
+
 fn require_nonempty(value: &str, field: &'static str) -> Result<()> {
     if value.is_empty() {
         return Err(anyhow!("{field} must not be empty"));
@@ -759,7 +1069,12 @@ fn require_nonempty(value: &str, field: &'static str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::partition_fence::{
+        PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
+    };
     use tempfile::tempdir;
+
+    const KEY: &[u8] = b"control-plane partition owner key";
 
     #[tokio::test]
     async fn control_journal_replays_regions_tenants_apps_and_policies() {
@@ -873,5 +1188,139 @@ mod tests {
                 .admin_user_by_id(user.id)
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn control_journal_with_permit_writes_fenced_frames_and_header() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let owner = ready_owner(&storage, "node-a").await;
+        let permit = owner.write_permit().unwrap();
+
+        assert!(
+            create_region_with_permit(&storage, "local", &permit, KEY)
+                .await
+                .unwrap()
+        );
+        let tenant = create_tenant_with_permit(&storage, "default", &permit, KEY)
+            .await
+            .unwrap();
+        let app = create_app_with_permit(
+            &storage,
+            tenant.id,
+            "demo",
+            "client-a",
+            b"secret-a",
+            &permit,
+            KEY,
+        )
+        .await
+        .unwrap();
+        grant_policy_with_permit(&storage, app.id, "*", "*", &permit, KEY)
+            .await
+            .unwrap();
+        update_app_secret_with_permit(&storage, app.id, b"secret-b", &permit, KEY)
+            .await
+            .unwrap();
+        revoke_policy_with_permit(&storage, app.id, "*", "*", &permit, KEY)
+            .await
+            .unwrap();
+        let user = create_admin_user_with_permit(
+            &storage,
+            "alice",
+            "alice@example.test",
+            "hash-a",
+            &["viewer".to_string(), "operator".to_string()],
+            &permit,
+            KEY,
+        )
+        .await
+        .unwrap();
+        update_admin_user_with_permit(
+            &storage,
+            user.id,
+            "alice",
+            "alice@new.example.test",
+            Some("hash-b"),
+            false,
+            &["operator".to_string()],
+            &permit,
+            KEY,
+        )
+        .await
+        .unwrap();
+        delete_admin_user_with_permit(&storage, user.id, &permit, KEY)
+            .await
+            .unwrap();
+
+        let journal = tokio::fs::read(storage.control_journal_path())
+            .await
+            .unwrap();
+        let header = BinaryEnvelopeHeader::decode(&journal).unwrap();
+        let header_json: serde_json::Value = serde_json::from_slice(&header.header_json).unwrap();
+        assert_eq!(header_json["partition_family"], "control_plane");
+        assert_eq!(header_json["partition_id"], permit.partition_id);
+        assert_eq!(header_json["fence_token"], permit.fence_token);
+
+        let frames = decode_journal_file(&journal).unwrap();
+        assert_eq!(frames.len(), 11);
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.fence_token == permit.fence_token)
+        );
+    }
+
+    #[tokio::test]
+    async fn control_journal_with_permit_rejects_stale_fence() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let owner = ready_owner(&storage, "node-a").await;
+        let stale_permit = owner.write_permit().unwrap();
+        let newer = ready_owner(&storage, "node-b").await;
+        assert!(newer.fence_token > stale_permit.fence_token);
+
+        let err = create_region_with_permit(&storage, "local", &stale_permit, KEY)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("write permit owner is not current")
+        );
+    }
+
+    async fn ready_owner(
+        storage: &Storage,
+        owner_node_id: &str,
+    ) -> crate::partition_fence::PartitionOwnerState {
+        let family = "control_plane".to_string();
+        let id = hex::encode(control_partition_id());
+        let recovering = acquire_partition_recovery(
+            storage,
+            PartitionRecoveryAcquire {
+                partition_family: family.clone(),
+                partition_id: id.clone(),
+                owner_node_id: owner_node_id.to_string(),
+                recovered_through_sequence: 0,
+                recovered_manifest_hash: hex::encode([0; 32]),
+                now_nanos: 100,
+            },
+            KEY,
+        )
+        .await
+        .unwrap();
+        publish_partition_ready(
+            storage,
+            &family,
+            &id,
+            owner_node_id,
+            recovering.fence_token,
+            0,
+            &hex::encode([1; 32]),
+            200,
+            KEY,
+        )
+        .await
+        .unwrap()
     }
 }
