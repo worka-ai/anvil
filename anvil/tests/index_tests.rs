@@ -589,6 +589,136 @@ async fn test_vector_index_builds_from_object_write_task() {
 }
 
 #[tokio::test]
+async fn test_vector_index_builds_required_media_modalities_from_object_write_tasks() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut index_client = IndexServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+
+    let bucket_name = format!("media-vector-index-{}", uuid::Uuid::new_v4());
+    bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
+    let bucket = cluster.states[0]
+        .persistence
+        .get_bucket_by_name(claims.tenant_id, &bucket_name)
+        .await
+        .unwrap()
+        .expect("bucket exists");
+
+    let media_cases = [
+        (
+            "text",
+            "text/plain",
+            "media/text/notes.txt",
+            b"plain text vector source".as_slice(),
+        ),
+        (
+            "image",
+            "image/png",
+            "media/image/photo.bin",
+            b"image bytes for deterministic embedding".as_slice(),
+        ),
+        (
+            "audio",
+            "audio/mpeg",
+            "media/audio/clip.bin",
+            b"audio bytes for deterministic embedding".as_slice(),
+        ),
+        (
+            "video",
+            "video/mp4",
+            "media/video/movie.bin",
+            b"video bytes for deterministic embedding".as_slice(),
+        ),
+    ];
+    for (modality, content_type, object_key, body) in media_cases {
+        cluster.states[0]
+            .persistence
+            .create_object(
+                claims.tenant_id,
+                bucket.id,
+                object_key,
+                &hex::encode(anvil::formats::hash32(body)),
+                i64::try_from(body.len()).unwrap(),
+                &format!("etag-{modality}"),
+                Some(content_type),
+                None,
+                None,
+                Some(body.to_vec()),
+            )
+            .await
+            .unwrap();
+    }
+
+    for (modality, content_type, object_key, _body) in media_cases {
+        let index_name = format!("{modality}-embedding");
+        index_client
+            .create_index(authorized(
+                CreateIndexRequest {
+                    bucket_name: bucket_name.clone(),
+                    name: index_name.clone(),
+                    kind: "vector".to_string(),
+                    selector_json: serde_json::json!({
+                        "prefix": format!("media/{modality}/"),
+                        "content_type": content_type
+                    })
+                    .to_string(),
+                    extractor_json: serde_json::json!({"source": "object_body_utf8"}).to_string(),
+                    authorization_mode: "index_only".to_string(),
+                    build_policy_json: serde_json::json!({
+                        "dimension": 4,
+                        "metric": "cosine",
+                        "modality": modality,
+                        "embedding_model": format!("test-{modality}-embedding"),
+                        "chunking": {"kind": "whole_object"}
+                    })
+                    .to_string(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap();
+
+        let response = wait_for_vector_hit(
+            &mut index_client,
+            &bucket_name,
+            &index_name,
+            object_key,
+            vec![1.0, 0.0, 0.0, 0.0],
+            &token,
+        )
+        .await;
+        assert_eq!(response.index_kind, "vector");
+        assert_eq!(response.hits[0].object_key, object_key);
+        let metadata: serde_json::Value =
+            serde_json::from_str(&response.hits[0].metadata_json).unwrap();
+        assert_eq!(metadata["modality"], modality);
+    }
+
+    let tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
+    assert!(!tasks.iter().any(|task| {
+        task.task_type == anvil::tasks::TaskType::IndexBuild
+            && task.status == anvil::tasks::TaskStatus::Failed
+    }));
+}
+
+#[tokio::test]
 async fn test_vector_index_build_records_dimension_mismatch_diagnostic() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
@@ -1930,6 +2060,40 @@ async fn test_list_index_diagnostics_filters_by_index_and_severity() {
         .diagnostics;
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].severity, "error");
+}
+
+async fn wait_for_vector_hit(
+    index_client: &mut IndexServiceClient<tonic::transport::Channel>,
+    bucket_name: &str,
+    index_name: &str,
+    object_key: &str,
+    query_vector: Vec<f32>,
+    token: &str,
+) -> anvil::anvil_api::QueryIndexResponse {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline {
+        let response = index_client
+            .query_index(authorized(
+                QueryIndexRequest {
+                    bucket_name: bucket_name.to_string(),
+                    index_name: index_name.to_string(),
+                    query_text: String::new(),
+                    query_vector: query_vector.clone(),
+                    limit: 10,
+                    phrase: false,
+                },
+                token,
+            ))
+            .await;
+        if let Ok(response) = response {
+            let response = response.into_inner();
+            if response.hits.iter().any(|hit| hit.object_key == object_key) {
+                return response;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    panic!("vector index `{index_name}` did not return `{object_key}` before timeout");
 }
 
 fn vector_entry(
