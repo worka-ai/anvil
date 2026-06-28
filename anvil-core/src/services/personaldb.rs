@@ -4,7 +4,7 @@ use crate::{
     AppState,
     anvil_personaldb_sqlite_changeset::iterate_changeset,
     auth, authz_journal,
-    formats::{Hash32, personaldb::PersonalDbLogRecord as CorePersonalDbLogRecord},
+    formats::{Hash32, hash32, personaldb::PersonalDbLogRecord as CorePersonalDbLogRecord},
     permissions::AnvilAction,
     personaldb_catchup::{
         PersonalDbCatchUpRequest as CoreCatchUpRequest,
@@ -25,8 +25,10 @@ use crate::{
         write_personaldb_group_manifest,
     },
     personaldb_projection::{
-        ProjectionDefinition, read_projection_definition, write_projection_definition,
+        ProjectionDefinition, list_projection_definitions_for_source, read_projection_definition,
+        write_projection_definition,
     },
+    personaldb_projection_builder::{ProjectionBuildInput, build_projection_changeset},
     personaldb_row_index::{PersonalDbRowIndexWrite, write_personaldb_row_index},
     personaldb_schema::{
         read_personaldb_schema_sql, validate_changeset_tables_registered, validate_schema_sql,
@@ -42,13 +44,37 @@ use crate::{
     },
     personaldb_watch::{
         PersonalDbGroupWatchEvent, PersonalDbGroupWatchPayload, PersonalDbProjectionWatchEvent,
-        append_personaldb_group_watch_record, latest_personaldb_group_watch_cursor,
-        list_personaldb_group_watch_events, list_personaldb_projection_watch_events,
+        PersonalDbProjectionWatchPayload, append_personaldb_group_watch_record,
+        append_personaldb_projection_watch_record, latest_personaldb_group_watch_cursor,
+        latest_personaldb_projection_watch_cursor, list_personaldb_group_watch_events,
+        list_personaldb_projection_watch_events,
     },
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+
+#[derive(Debug, Clone)]
+struct PersonalDbCommitActor {
+    tenant_id: i64,
+    principal: String,
+    scopes: Vec<String>,
+    bearer_token: Option<String>,
+    require_public_commit_authorization: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CommittedPersonalDbChangeset {
+    log_index: u64,
+    log_hash: String,
+    changeset_payload_hash: String,
+    verified_envelope_hash: String,
+    certificate_hash: String,
+    certificate: PersonalDbCommitCertificate,
+    committed_head: PersonalDbCommittedHead,
+    watch_cursor: u128,
+    authz_revision: u64,
+}
 
 #[tonic::async_trait]
 impl PersonalDbService for AppState {
@@ -303,308 +329,39 @@ impl PersonalDbService for AppState {
         let req = request.into_inner();
         validate_claim_tenant(claims.tenant_id, req.tenant_id)?;
         validate_database_id(&req.database_id)?;
-        let resource = personaldb_resource(claims.tenant_id, &req.database_id);
-        if !auth::is_authorized(AnvilAction::PersonalDbCommit, &resource, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
-
-        let validated = validate_submit_personaldb_changeset(
-            core_submit_request(req)?,
-            default_max_changeset_size(),
-        )
-        .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        bind_personaldb_submit_session(&validated.request, &claims, &bearer_token)?;
-        let signing_key = self.personaldb_signing_key();
-        let manifest = read_personaldb_group_manifest(
-            &self.storage,
-            claims.tenant_id,
-            &validated.request.database_id,
-            signing_key,
-        )
-        .await
-        .map_err(internal_status)?
-        .ok_or_else(|| Status::not_found("PersonalDB group not found"))?;
-        let committed_head = read_personaldb_committed_head(
-            &self.storage,
-            claims.tenant_id,
-            &validated.request.database_id,
-            signing_key,
-        )
-        .await
-        .map_err(internal_status)?
-        .ok_or_else(|| Status::failed_precondition("PersonalDB committed head missing"))?;
-
-        if committed_head.log_index != validated.request.base_log_index
-            || committed_head.log_hash != validated.request.base_log_hash
-        {
-            return Err(Status::failed_precondition(
-                "PersonalDB base log position does not match committed head",
-            ));
-        }
-        if manifest.active_membership_epoch != validated.request.membership_epoch
-            || manifest.active_policy_epoch != validated.request.policy_epoch
-            || committed_head.schema_hash != manifest.schema_hash
-        {
-            return Err(Status::failed_precondition(
-                "PersonalDB submit epochs or schema do not match the active group",
-            ));
-        }
-
-        let changes = iterate_changeset(&validated.request.changeset_bytes)
-            .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        let schema_sql = read_personaldb_schema_sql(
-            &self.storage,
-            claims.tenant_id,
-            &validated.request.database_id,
-            &manifest.schema_hash,
-        )
-        .await
-        .map_err(internal_status)?
-        .ok_or_else(|| Status::failed_precondition("PersonalDB schema SQL missing"))?;
-        validate_changeset_tables_registered(&changes, &schema_sql)
-            .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        let authz_revision = authz_journal::latest_authz_revision(&self.storage, claims.tenant_id)
-            .await
-            .map_err(internal_status)
-            .and_then(|revision| {
-                u64::try_from(revision)
-                    .map_err(|_| Status::internal("Invalid authorization revision"))
-            })?;
-        let proposed_log_index = validated
-            .request
-            .base_log_index
-            .checked_add(1)
-            .ok_or_else(|| Status::failed_precondition("PersonalDB log index overflow"))?;
-        let updated_at = chrono::Utc::now();
-        let envelope = derive_verified_mutation_envelope(PersonalDbEnvelopeDerivationInput {
-            tenant_id: claims.tenant_id,
-            database_id: &validated.request.database_id,
-            principal: &validated.request.principal,
-            base_log_index: validated.request.base_log_index,
-            proposed_log_index,
-            changeset_payload_hash: validated.changeset_payload_hash,
-            schema_hash: &manifest.schema_hash,
-            policy_epoch: manifest.active_policy_epoch,
-            authz_revision,
-            changes: &changes,
-            updated_at_nanos: updated_at
-                .timestamp_nanos_opt()
-                .ok_or_else(|| Status::internal("Invalid current timestamp"))?,
-        })
-        .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        authorize_personaldb_row_effects(&envelope, &claims)?;
-        let envelope_hash = envelope.envelope_hash32().map_err(internal_status)?;
-        let previous_log_hash = hex32_status(&committed_head.log_hash, "committed head log hash")?;
-        let schema_hash = hex32_status(&manifest.schema_hash, "schema hash")?;
-        let payload_paths = write_personaldb_changeset_payload(
-            &self.storage,
-            claims.tenant_id,
-            &validated.request.database_id,
-            proposed_log_index,
-            validated.changeset_payload_hash,
-            &validated.request.changeset_bytes,
-        )
-        .await
-        .map_err(internal_status)?;
-        let payload_ref = self
-            .storage
-            .relative_storage_path(&payload_paths.by_index_path)
-            .map_err(internal_status)?
-            .into_bytes();
-
-        let provisional_record = CorePersonalDbLogRecord::new(
-            proposed_log_index,
-            validated.request.client_log_epoch,
-            validated.request.membership_epoch,
-            validated.request.policy_epoch,
-            previous_log_hash,
-            validated.changeset_payload_hash,
-            envelope_hash,
-            [0; 32],
-            payload_ref.clone(),
-            Vec::new(),
-            Vec::new(),
-        );
-        let witnessed_at = now_rfc3339();
-        let certificate = PersonalDbCommitCertificate {
-            format_version: 1,
-            tenant_id: claims.tenant_id.to_string(),
-            database_id: validated.request.database_id.clone(),
-            log_index: proposed_log_index,
-            previous_log_hash: hex::encode(previous_log_hash),
-            entry_hash: hex::encode(provisional_record.entry_hash),
-            changeset_payload_hash: hex::encode(validated.changeset_payload_hash),
-            verified_envelope_hash: hex::encode(envelope_hash),
-            client_log_epoch: validated.request.client_log_epoch,
-            membership_epoch: validated.request.membership_epoch,
-            policy_epoch: validated.request.policy_epoch,
-            leader_replica_id: validated.request.leader_replica_id.clone(),
-            voter_acks_hash: hex::encode(validated.voter_acks_hash),
-            authz_revision,
-            witness_node_id: claims.sub.clone(),
-            witnessed_at,
-            certificate_hash: None,
-            witness_signature: None,
-        }
-        .seal(signing_key)
-        .map_err(internal_status)?;
-        let certificate_path = write_personaldb_commit_certificate(
-            &self.storage,
-            claims.tenant_id,
-            &validated.request.database_id,
-            &certificate,
-            signing_key,
-        )
-        .await
-        .map_err(internal_status)?;
-        let certificate_hash = hex32_status(
-            certificate
-                .certificate_hash
-                .as_deref()
-                .ok_or_else(|| Status::internal("PersonalDB certificate hash missing"))?,
-            "certificate hash",
-        )?;
-        let certificate_ref = self
-            .storage
-            .relative_storage_path(&certificate_path)
-            .map_err(internal_status)?
-            .into_bytes();
-        let record = CorePersonalDbLogRecord::new(
-            proposed_log_index,
-            validated.request.client_log_epoch,
-            validated.request.membership_epoch,
-            validated.request.policy_epoch,
-            previous_log_hash,
-            validated.changeset_payload_hash,
-            envelope_hash,
-            certificate_hash,
-            payload_ref,
-            certificate_ref,
-            Vec::new(),
-        );
-        let segment_path = write_personaldb_log_segment(
-            &self.storage,
-            PersonalDbLogSegmentWrite {
-                tenant_id: claims.tenant_id,
-                database_id: &validated.request.database_id,
-                schema_hash,
-                source_fence_token: 0,
-                records: std::slice::from_ref(&record),
-            },
-        )
-        .await
-        .map_err(internal_status)?;
-        let mut row_index_generation = committed_head.row_index_generation;
-        let row_index_records = envelope.row_index_upserts().map_err(internal_status)?;
-        if !row_index_records.is_empty() {
-            row_index_generation = row_index_generation
-                .checked_add(1)
-                .ok_or_else(|| Status::failed_precondition("PersonalDB row index overflow"))?;
-            write_personaldb_row_index(
-                &self.storage,
-                PersonalDbRowIndexWrite {
+        let core_request = core_submit_request(req)?;
+        let source_database_id = core_request.database_id.clone();
+        let source_changeset_bytes = core_request.changeset_bytes.clone();
+        let committed = self
+            .commit_personaldb_changeset(
+                core_request,
+                PersonalDbCommitActor {
                     tenant_id: claims.tenant_id,
-                    database_id: &validated.request.database_id,
-                    generation: row_index_generation,
-                    source_hash: record.entry_hash,
-                    records: &row_index_records,
+                    principal: claims.sub.clone(),
+                    scopes: claims.scopes.clone(),
+                    bearer_token: Some(bearer_token),
+                    require_public_commit_authorization: true,
                 },
             )
-            .await
-            .map_err(internal_status)?;
-        }
-        let committed_head = PersonalDbCommittedHead {
-            format_version: 1,
-            tenant_id: claims.tenant_id.to_string(),
-            database_id: validated.request.database_id.clone(),
-            log_index: proposed_log_index,
-            log_hash: hex::encode(record.entry_hash),
-            segment_path: self
-                .storage
-                .relative_storage_path(&segment_path)
-                .map_err(internal_status)?,
-            row_index_generation,
-            policy_epoch: manifest.active_policy_epoch,
-            membership_epoch: manifest.active_membership_epoch,
-            schema_hash: manifest.schema_hash.clone(),
-            updated_at: now_rfc3339(),
-            updated_by_node: claims.sub.clone(),
-            head_hash: None,
-            head_signature: None,
-        }
-        .seal(signing_key)
-        .map_err(internal_status)?;
-        write_personaldb_committed_head(
-            &self.storage,
+            .await?;
+        self.build_personaldb_projections_for_source_commit(
             claims.tenant_id,
-            &validated.request.database_id,
-            &committed_head,
-            signing_key,
+            &source_database_id,
+            &source_changeset_bytes,
+            committed.log_index,
+            &committed.log_hash,
+            committed.authz_revision,
         )
-        .await
-        .map_err(internal_status)?;
-
-        let watch_cursor = latest_personaldb_group_watch_cursor(
-            &self.storage,
-            claims.tenant_id,
-            &validated.request.database_id,
-        )
-        .await
-        .map_err(internal_status)?
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| Status::internal("PersonalDB watch cursor overflow"))?;
-        let watch_payload = PersonalDbGroupWatchPayload {
-            database_id: validated.request.database_id.clone(),
-            event_type: "commit".to_string(),
-            log_index: proposed_log_index,
-            log_hash: hex::encode(record.entry_hash),
-            changeset_payload_hash: hex::encode(validated.changeset_payload_hash),
-            certificate_hash: hex::encode(certificate_hash),
-            committed_head_hash: committed_head.head_hash.clone().unwrap_or_default(),
-            emitted_at: now_rfc3339(),
-        };
-        let mutation_id = *uuid::Uuid::new_v4().as_bytes();
-        maybe_build_personaldb_snapshot(
-            &self.storage,
-            PersonalDbSnapshotBuildRequest {
-                tenant_id: claims.tenant_id,
-                database_id: &validated.request.database_id,
-                schema_sql: &schema_sql,
-                created_by_node: &claims.sub,
-                policy: configured_personaldb_snapshot_policy(&self.config),
-            },
-            signing_key,
-        )
-        .await
-        .map_err(internal_status)?;
-
-        append_personaldb_group_watch_record(
-            &self.storage,
-            claims.tenant_id,
-            &validated.request.database_id,
-            watch_cursor,
-            mutation_id,
-            authz_revision,
-            watch_payload.clone(),
-        )
-        .await
-        .map_err(internal_status)?;
-        let _ = self.personaldb_watch_tx.send(PersonalDbGroupWatchEvent {
-            cursor: watch_cursor,
-            mutation_id,
-            authz_revision,
-            payload: watch_payload,
-        });
-        let (watch_cursor_low, watch_cursor_high) = split_u128(watch_cursor);
+        .await?;
+        let (watch_cursor_low, watch_cursor_high) = split_u128(committed.watch_cursor);
         Ok(Response::new(SubmitPersonalDbChangesetResponse {
-            log_index: proposed_log_index,
-            log_hash: hex::encode(record.entry_hash),
-            changeset_payload_hash: hex::encode(validated.changeset_payload_hash),
-            verified_envelope_hash: hex::encode(envelope_hash),
-            certificate_hash: hex::encode(certificate_hash),
-            certificate: Some(certificate_record(certificate)),
-            committed_head: Some(committed_head_record(committed_head)),
+            log_index: committed.log_index,
+            log_hash: committed.log_hash,
+            changeset_payload_hash: committed.changeset_payload_hash,
+            verified_envelope_hash: committed.verified_envelope_hash,
+            certificate_hash: committed.certificate_hash,
+            certificate: Some(certificate_record(committed.certificate)),
+            committed_head: Some(committed_head_record(committed.committed_head)),
             watch_cursor_low,
             watch_cursor_high,
         }))
@@ -775,6 +532,515 @@ impl AppState {
     fn personaldb_signing_key(&self) -> &[u8] {
         self.config.anvil_secret_encryption_key.as_bytes()
     }
+
+    async fn commit_personaldb_changeset(
+        &self,
+        request: CoreSubmitChangeset,
+        actor: PersonalDbCommitActor,
+    ) -> Result<CommittedPersonalDbChangeset, Status> {
+        validate_claim_tenant(actor.tenant_id, request.tenant_id)?;
+        validate_database_id(&request.database_id)?;
+        let resource = personaldb_resource(actor.tenant_id, &request.database_id);
+        if actor.require_public_commit_authorization
+            && !auth::is_authorized(AnvilAction::PersonalDbCommit, &resource, &actor.scopes)
+        {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        let validated = validate_submit_personaldb_changeset(request, default_max_changeset_size())
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        if let Some(bearer_token) = actor.bearer_token.as_deref() {
+            bind_personaldb_submit_session(&validated.request, &actor, bearer_token)?;
+        }
+        let signing_key = self.personaldb_signing_key();
+        let manifest = read_personaldb_group_manifest(
+            &self.storage,
+            actor.tenant_id,
+            &validated.request.database_id,
+            signing_key,
+        )
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::not_found("PersonalDB group not found"))?;
+        let previous_head = read_personaldb_committed_head(
+            &self.storage,
+            actor.tenant_id,
+            &validated.request.database_id,
+            signing_key,
+        )
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::failed_precondition("PersonalDB committed head missing"))?;
+
+        if previous_head.log_index != validated.request.base_log_index
+            || previous_head.log_hash != validated.request.base_log_hash
+        {
+            return Err(Status::failed_precondition(
+                "PersonalDB base log position does not match committed head",
+            ));
+        }
+        if manifest.active_membership_epoch != validated.request.membership_epoch
+            || manifest.active_policy_epoch != validated.request.policy_epoch
+            || previous_head.schema_hash != manifest.schema_hash
+        {
+            return Err(Status::failed_precondition(
+                "PersonalDB submit epochs or schema do not match the active group",
+            ));
+        }
+
+        let changes = iterate_changeset(&validated.request.changeset_bytes)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let schema_sql = read_personaldb_schema_sql(
+            &self.storage,
+            actor.tenant_id,
+            &validated.request.database_id,
+            &manifest.schema_hash,
+        )
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::failed_precondition("PersonalDB schema SQL missing"))?;
+        validate_changeset_tables_registered(&changes, &schema_sql)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let authz_revision = authz_journal::latest_authz_revision(&self.storage, actor.tenant_id)
+            .await
+            .map_err(internal_status)
+            .and_then(|revision| {
+                u64::try_from(revision)
+                    .map_err(|_| Status::internal("Invalid authorization revision"))
+            })?;
+        let proposed_log_index = validated
+            .request
+            .base_log_index
+            .checked_add(1)
+            .ok_or_else(|| Status::failed_precondition("PersonalDB log index overflow"))?;
+        let updated_at = chrono::Utc::now();
+        let envelope = derive_verified_mutation_envelope(PersonalDbEnvelopeDerivationInput {
+            tenant_id: actor.tenant_id,
+            database_id: &validated.request.database_id,
+            principal: &validated.request.principal,
+            base_log_index: validated.request.base_log_index,
+            proposed_log_index,
+            changeset_payload_hash: validated.changeset_payload_hash,
+            schema_hash: &manifest.schema_hash,
+            policy_epoch: manifest.active_policy_epoch,
+            authz_revision,
+            changes: &changes,
+            updated_at_nanos: updated_at
+                .timestamp_nanos_opt()
+                .ok_or_else(|| Status::internal("Invalid current timestamp"))?,
+        })
+        .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        authorize_personaldb_row_effects(&envelope, actor.tenant_id, &actor.scopes)?;
+        let envelope_hash = envelope.envelope_hash32().map_err(internal_status)?;
+        let previous_log_hash = hex32_status(&previous_head.log_hash, "committed head log hash")?;
+        let schema_hash = hex32_status(&manifest.schema_hash, "schema hash")?;
+        let payload_paths = write_personaldb_changeset_payload(
+            &self.storage,
+            actor.tenant_id,
+            &validated.request.database_id,
+            proposed_log_index,
+            validated.changeset_payload_hash,
+            &validated.request.changeset_bytes,
+        )
+        .await
+        .map_err(internal_status)?;
+        let payload_ref = self
+            .storage
+            .relative_storage_path(&payload_paths.by_index_path)
+            .map_err(internal_status)?
+            .into_bytes();
+
+        let provisional_record = CorePersonalDbLogRecord::new(
+            proposed_log_index,
+            validated.request.client_log_epoch,
+            validated.request.membership_epoch,
+            validated.request.policy_epoch,
+            previous_log_hash,
+            validated.changeset_payload_hash,
+            envelope_hash,
+            [0; 32],
+            payload_ref.clone(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let certificate = PersonalDbCommitCertificate {
+            format_version: 1,
+            tenant_id: actor.tenant_id.to_string(),
+            database_id: validated.request.database_id.clone(),
+            log_index: proposed_log_index,
+            previous_log_hash: hex::encode(previous_log_hash),
+            entry_hash: hex::encode(provisional_record.entry_hash),
+            changeset_payload_hash: hex::encode(validated.changeset_payload_hash),
+            verified_envelope_hash: hex::encode(envelope_hash),
+            client_log_epoch: validated.request.client_log_epoch,
+            membership_epoch: validated.request.membership_epoch,
+            policy_epoch: validated.request.policy_epoch,
+            leader_replica_id: validated.request.leader_replica_id.clone(),
+            voter_acks_hash: hex::encode(validated.voter_acks_hash),
+            authz_revision,
+            witness_node_id: actor.principal.clone(),
+            witnessed_at: now_rfc3339(),
+            certificate_hash: None,
+            witness_signature: None,
+        }
+        .seal(signing_key)
+        .map_err(internal_status)?;
+        let certificate_path = write_personaldb_commit_certificate(
+            &self.storage,
+            actor.tenant_id,
+            &validated.request.database_id,
+            &certificate,
+            signing_key,
+        )
+        .await
+        .map_err(internal_status)?;
+        let certificate_hash = hex32_status(
+            certificate
+                .certificate_hash
+                .as_deref()
+                .ok_or_else(|| Status::internal("PersonalDB certificate hash missing"))?,
+            "certificate hash",
+        )?;
+        let certificate_ref = self
+            .storage
+            .relative_storage_path(&certificate_path)
+            .map_err(internal_status)?
+            .into_bytes();
+        let record = CorePersonalDbLogRecord::new(
+            proposed_log_index,
+            validated.request.client_log_epoch,
+            validated.request.membership_epoch,
+            validated.request.policy_epoch,
+            previous_log_hash,
+            validated.changeset_payload_hash,
+            envelope_hash,
+            certificate_hash,
+            payload_ref,
+            certificate_ref,
+            Vec::new(),
+        );
+        let segment_path = write_personaldb_log_segment(
+            &self.storage,
+            PersonalDbLogSegmentWrite {
+                tenant_id: actor.tenant_id,
+                database_id: &validated.request.database_id,
+                schema_hash,
+                source_fence_token: 0,
+                records: std::slice::from_ref(&record),
+            },
+        )
+        .await
+        .map_err(internal_status)?;
+        let mut row_index_generation = previous_head.row_index_generation;
+        let row_index_records = envelope.row_index_upserts().map_err(internal_status)?;
+        if !row_index_records.is_empty() {
+            row_index_generation = row_index_generation
+                .checked_add(1)
+                .ok_or_else(|| Status::failed_precondition("PersonalDB row index overflow"))?;
+            write_personaldb_row_index(
+                &self.storage,
+                PersonalDbRowIndexWrite {
+                    tenant_id: actor.tenant_id,
+                    database_id: &validated.request.database_id,
+                    generation: row_index_generation,
+                    source_hash: record.entry_hash,
+                    records: &row_index_records,
+                },
+            )
+            .await
+            .map_err(internal_status)?;
+        }
+        let committed_head = PersonalDbCommittedHead {
+            format_version: 1,
+            tenant_id: actor.tenant_id.to_string(),
+            database_id: validated.request.database_id.clone(),
+            log_index: proposed_log_index,
+            log_hash: hex::encode(record.entry_hash),
+            segment_path: self
+                .storage
+                .relative_storage_path(&segment_path)
+                .map_err(internal_status)?,
+            row_index_generation,
+            policy_epoch: manifest.active_policy_epoch,
+            membership_epoch: manifest.active_membership_epoch,
+            schema_hash: manifest.schema_hash.clone(),
+            updated_at: now_rfc3339(),
+            updated_by_node: actor.principal.clone(),
+            head_hash: None,
+            head_signature: None,
+        }
+        .seal(signing_key)
+        .map_err(internal_status)?;
+        write_personaldb_committed_head(
+            &self.storage,
+            actor.tenant_id,
+            &validated.request.database_id,
+            &committed_head,
+            signing_key,
+        )
+        .await
+        .map_err(internal_status)?;
+
+        let watch_cursor = latest_personaldb_group_watch_cursor(
+            &self.storage,
+            actor.tenant_id,
+            &validated.request.database_id,
+        )
+        .await
+        .map_err(internal_status)?
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| Status::internal("PersonalDB watch cursor overflow"))?;
+        let watch_payload = PersonalDbGroupWatchPayload {
+            database_id: validated.request.database_id.clone(),
+            event_type: "commit".to_string(),
+            log_index: proposed_log_index,
+            log_hash: hex::encode(record.entry_hash),
+            changeset_payload_hash: hex::encode(validated.changeset_payload_hash),
+            certificate_hash: hex::encode(certificate_hash),
+            committed_head_hash: committed_head.head_hash.clone().unwrap_or_default(),
+            emitted_at: now_rfc3339(),
+        };
+        let mutation_id = *uuid::Uuid::new_v4().as_bytes();
+        maybe_build_personaldb_snapshot(
+            &self.storage,
+            PersonalDbSnapshotBuildRequest {
+                tenant_id: actor.tenant_id,
+                database_id: &validated.request.database_id,
+                schema_sql: &schema_sql,
+                created_by_node: &actor.principal,
+                policy: configured_personaldb_snapshot_policy(&self.config),
+            },
+            signing_key,
+        )
+        .await
+        .map_err(internal_status)?;
+
+        append_personaldb_group_watch_record(
+            &self.storage,
+            actor.tenant_id,
+            &validated.request.database_id,
+            watch_cursor,
+            mutation_id,
+            authz_revision,
+            watch_payload.clone(),
+        )
+        .await
+        .map_err(internal_status)?;
+        let _ = self.personaldb_watch_tx.send(PersonalDbGroupWatchEvent {
+            cursor: watch_cursor,
+            mutation_id,
+            authz_revision,
+            payload: watch_payload,
+        });
+
+        Ok(CommittedPersonalDbChangeset {
+            log_index: proposed_log_index,
+            log_hash: hex::encode(record.entry_hash),
+            changeset_payload_hash: hex::encode(validated.changeset_payload_hash),
+            verified_envelope_hash: hex::encode(envelope_hash),
+            certificate_hash: hex::encode(certificate_hash),
+            certificate,
+            committed_head,
+            watch_cursor,
+            authz_revision,
+        })
+    }
+
+    async fn build_personaldb_projections_for_source_commit(
+        &self,
+        tenant_id: i64,
+        source_database_id: &str,
+        source_changeset_bytes: &[u8],
+        source_log_index: u64,
+        source_log_hash: &str,
+        authz_revision: u64,
+    ) -> Result<(), Status> {
+        let signing_key = self.personaldb_signing_key();
+        let source_manifest = read_personaldb_group_manifest(
+            &self.storage,
+            tenant_id,
+            source_database_id,
+            signing_key,
+        )
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::not_found("PersonalDB source group not found"))?;
+        let source_schema_sql = read_personaldb_schema_sql(
+            &self.storage,
+            tenant_id,
+            source_database_id,
+            &source_manifest.schema_hash,
+        )
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::failed_precondition("PersonalDB source schema SQL missing"))?;
+        let definitions =
+            list_projection_definitions_for_source(&self.storage, tenant_id, source_database_id)
+                .await
+                .map_err(internal_status)?;
+        for definition in definitions {
+            self.build_one_personaldb_projection(
+                tenant_id,
+                source_database_id,
+                &source_schema_sql,
+                source_changeset_bytes,
+                source_log_index,
+                source_log_hash,
+                authz_revision,
+                &definition,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn build_one_personaldb_projection(
+        &self,
+        tenant_id: i64,
+        source_database_id: &str,
+        source_schema_sql: &str,
+        source_changeset_bytes: &[u8],
+        source_log_index: u64,
+        source_log_hash: &str,
+        authz_revision: u64,
+        definition: &ProjectionDefinition,
+    ) -> Result<(), Status> {
+        if definition.target_database_id != definition.database_id {
+            return Err(Status::failed_precondition(
+                "PersonalDB projection target database scope mismatch",
+            ));
+        }
+        let signing_key = self.personaldb_signing_key();
+        let target_manifest = read_personaldb_group_manifest(
+            &self.storage,
+            tenant_id,
+            &definition.database_id,
+            signing_key,
+        )
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::not_found("PersonalDB projection group not found"))?;
+        let target_head = read_personaldb_committed_head(
+            &self.storage,
+            tenant_id,
+            &definition.database_id,
+            signing_key,
+        )
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::failed_precondition("PersonalDB projection head missing"))?;
+        let target_schema_sql = read_personaldb_schema_sql(
+            &self.storage,
+            tenant_id,
+            &definition.database_id,
+            &target_manifest.schema_hash,
+        )
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::failed_precondition("PersonalDB projection schema SQL missing"))?;
+        let Some(projection_changeset) = build_projection_changeset(ProjectionBuildInput {
+            source_database_id,
+            source_schema_sql,
+            target_schema_sql: &target_schema_sql,
+            definition,
+            source_changeset_bytes,
+        })
+        .map_err(internal_status)?
+        else {
+            return Ok(());
+        };
+        if projection_changeset.changeset_bytes.is_empty() {
+            return Ok(());
+        }
+        let internal_actor = "anvil-projection-builder".to_string();
+        let payload_hash = hash32(&projection_changeset.changeset_bytes);
+        let projection_commit = self
+            .commit_personaldb_changeset(
+                CoreSubmitChangeset {
+                    tenant_id,
+                    database_id: definition.database_id.clone(),
+                    principal: internal_actor.clone(),
+                    session_token: "internal-projection-builder".to_string(),
+                    request_id: format!(
+                        "projection:{}:{}:{}",
+                        source_database_id, source_log_index, definition.projection_id
+                    ),
+                    idempotency_key: format!(
+                        "projection:{}:{}:{}",
+                        source_database_id, source_log_hash, definition.projection_id
+                    ),
+                    base_log_index: target_head.log_index,
+                    base_log_hash: target_head.log_hash,
+                    client_log_epoch: target_head.log_index.saturating_add(1),
+                    membership_epoch: target_manifest.active_membership_epoch,
+                    policy_epoch: target_manifest.active_policy_epoch,
+                    leader_replica_id: internal_actor.clone(),
+                    voter_acks: vec![crate::personaldb_submit::PersonalDbVoterAck {
+                        replica_id: internal_actor.clone(),
+                        log_index: target_head.log_index.saturating_add(1),
+                        log_hash: hex::encode(payload_hash),
+                        signature: "internal-projection-builder".to_string(),
+                    }],
+                    changeset_payload_hash: hex::encode(payload_hash),
+                    changeset_bytes: projection_changeset.changeset_bytes,
+                    client_debug_metadata: None,
+                },
+                PersonalDbCommitActor {
+                    tenant_id,
+                    principal: internal_actor,
+                    scopes: vec!["*|*".to_string()],
+                    bearer_token: None,
+                    require_public_commit_authorization: false,
+                },
+            )
+            .await?;
+        let cursor = latest_personaldb_projection_watch_cursor(
+            &self.storage,
+            tenant_id,
+            &definition.database_id,
+            &definition.projection_id,
+        )
+        .await
+        .map_err(internal_status)?
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| Status::internal("PersonalDB projection watch cursor overflow"))?;
+        let payload = PersonalDbProjectionWatchPayload {
+            database_id: definition.database_id.clone(),
+            projection_id: definition.projection_id.clone(),
+            event_type: "projection_committed".to_string(),
+            source_database_id: source_database_id.to_string(),
+            source_log_index,
+            source_log_hash: source_log_hash.to_string(),
+            projection_log_index: projection_commit.log_index,
+            projection_log_hash: projection_commit.log_hash.clone(),
+            definition_hash: definition.definition_hash.clone().unwrap_or_default(),
+            emitted_at: now_rfc3339(),
+        };
+        let mutation_id = *uuid::Uuid::new_v4().as_bytes();
+        append_personaldb_projection_watch_record(
+            &self.storage,
+            tenant_id,
+            &definition.database_id,
+            &definition.projection_id,
+            cursor,
+            mutation_id,
+            authz_revision,
+            payload.clone(),
+        )
+        .await
+        .map_err(internal_status)?;
+        let _ = self
+            .personaldb_projection_watch_tx
+            .send(PersonalDbProjectionWatchEvent {
+                cursor,
+                mutation_id,
+                authz_revision,
+                payload,
+            });
+        Ok(())
+    }
 }
 
 fn request_claims<T>(request: &Request<T>) -> Result<&auth::Claims, Status> {
@@ -794,7 +1060,7 @@ fn request_bearer_token<T>(request: &Request<T>) -> Result<&str, Status> {
 
 fn bind_personaldb_submit_session(
     request: &CoreSubmitChangeset,
-    claims: &auth::Claims,
+    actor: &PersonalDbCommitActor,
     bearer_token: &str,
 ) -> Result<(), Status> {
     if request.session_token != bearer_token {
@@ -802,7 +1068,7 @@ fn bind_personaldb_submit_session(
             "PersonalDB session token does not match authenticated bearer",
         ));
     }
-    if request.principal != claims.sub {
+    if request.principal != actor.principal {
         return Err(Status::permission_denied(
             "PersonalDB principal does not match authenticated session",
         ));
@@ -812,19 +1078,20 @@ fn bind_personaldb_submit_session(
 
 fn authorize_personaldb_row_effects(
     envelope: &VerifiedMutationEnvelope,
-    claims: &auth::Claims,
+    tenant_id: i64,
+    scopes: &[String],
 ) -> Result<(), Status> {
     for effect in &envelope.table_effects {
         let binding = &effect.source_resource_binding;
         let resource = format!(
             "tenant-{}/{}/{}/{}",
-            claims.tenant_id, envelope.database_id, binding.resource_type, binding.resource_id
+            tenant_id, envelope.database_id, binding.resource_type, binding.resource_id
         );
         for permission in &effect.required_permissions {
             let action = permission
                 .parse::<AnvilAction>()
                 .map_err(|_| Status::internal("Invalid PersonalDB derived permission"))?;
-            if !auth::is_authorized(action, &resource, &claims.scopes) {
+            if !auth::is_authorized(action, &resource, scopes) {
                 return Err(Status::permission_denied(
                     "PersonalDB row/resource mutation is not authorized",
                 ));
@@ -1061,7 +1328,10 @@ fn validate_projection_definition_scope(
     database_id: &str,
     definition: &ProjectionDefinition,
 ) -> Result<(), Status> {
-    if definition.tenant_id != tenant_id.to_string() || definition.database_id != database_id {
+    if definition.tenant_id != tenant_id.to_string()
+        || definition.database_id != database_id
+        || definition.target_database_id != database_id
+    {
         return Err(Status::invalid_argument(
             "PersonalDB projection definition scope mismatch",
         ));

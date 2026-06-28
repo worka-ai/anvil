@@ -27,8 +27,17 @@ const PERSONALDB_TEST_SCHEMA_SQL: &str = "CREATE TABLE items(
     payload BLOB
 );";
 
+const PERSONALDB_PROJECTION_TEST_SCHEMA_SQL: &str = "CREATE TABLE items_projection(
+    id INTEGER PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL
+);";
+
 fn personaldb_test_schema_hash() -> String {
     hex::encode(hash32(PERSONALDB_TEST_SCHEMA_SQL.as_bytes()))
+}
+
+fn personaldb_projection_test_schema_hash() -> String {
+    hex::encode(hash32(PERSONALDB_PROJECTION_TEST_SCHEMA_SQL.as_bytes()))
 }
 
 fn authorized<T>(message: T, token: &str) -> Request<T> {
@@ -395,7 +404,14 @@ async fn personaldb_projection_definition_create_get_and_watch_are_native_api_ba
     let source_database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
     let projection_database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
     create_group(&mut client, &token, &source_database_id).await;
-    create_group(&mut client, &token, &projection_database_id).await;
+    create_group_with_schema(
+        &mut client,
+        &token,
+        &projection_database_id,
+        PERSONALDB_PROJECTION_TEST_SCHEMA_SQL,
+        &personaldb_projection_test_schema_hash(),
+    )
+    .await;
 
     let definition = projection_definition(&projection_database_id, &source_database_id);
     let created = client
@@ -481,6 +497,123 @@ async fn personaldb_projection_definition_create_get_and_watch_are_native_api_ba
     assert_eq!(event.projection_id, "projection-items");
     assert_eq!(event.source_database_id, source_database_id);
     assert_eq!(event.authz_revision, 12);
+}
+
+#[tokio::test]
+async fn personaldb_source_commit_builds_projection_group_and_watch_event() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut client = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let source_database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+    let projection_database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+    let source_genesis = create_group(&mut client, &token, &source_database_id).await;
+    let projection_genesis = create_group_with_schema(
+        &mut client,
+        &token,
+        &projection_database_id,
+        PERSONALDB_PROJECTION_TEST_SCHEMA_SQL,
+        &personaldb_projection_test_schema_hash(),
+    )
+    .await;
+
+    let definition = projection_definition(&projection_database_id, &source_database_id);
+    let created = client
+        .create_personal_db_projection(authorized(
+            CreatePersonalDbProjectionRequest {
+                tenant_id: 1,
+                database_id: projection_database_id.clone(),
+                projection_definition_json: serde_json::to_string(&definition).unwrap(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let created_definition: ProjectionDefinition =
+        serde_json::from_str(&created.projection_definition_json).unwrap();
+
+    let source_commit = client
+        .submit_personal_db_changeset(authorized(
+            valid_submit_request(&source_database_id, &source_genesis, &token),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(source_commit.log_index, 1);
+
+    let projected = client
+        .catch_up_personal_db(authorized(
+            PersonalDbCatchUpRequest {
+                tenant_id: 1,
+                database_id: projection_database_id.clone(),
+                principal: "test-app".to_string(),
+                replica_id: "replica-projection".to_string(),
+                have_log_index: 0,
+                have_log_hash: projection_genesis,
+                max_entries: 10,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!projected.snapshot_required);
+    assert_eq!(projected.entries.len(), 1);
+    assert_eq!(
+        projected.entries[0].log_record.as_ref().unwrap().log_index,
+        1
+    );
+    let projection_db = Connection::open_in_memory().unwrap();
+    projection_db
+        .execute_batch(PERSONALDB_PROJECTION_TEST_SCHEMA_SQL)
+        .unwrap();
+    projection_db
+        .apply_strm(
+            &mut std::io::Cursor::new(&projected.entries[0].changeset_bytes),
+            None::<fn(&str) -> bool>,
+            |_conflict, _item| rusqlite::session::ConflictAction::SQLITE_CHANGESET_ABORT,
+        )
+        .unwrap();
+    let name: String = projection_db
+        .query_row(
+            "SELECT name FROM items_projection WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(name, "alpha");
+
+    let watch = client
+        .watch_personal_db_projection(authorized(
+            WatchPersonalDbProjectionRequest {
+                tenant_id: 1,
+                database_id: projection_database_id.clone(),
+                projection_id: "projection-items".to_string(),
+                after_cursor_low: 0,
+                after_cursor_high: 0,
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    let mut stream = watch.into_inner();
+    let event = stream.next().await.unwrap().unwrap();
+    assert_eq!(event.database_id, projection_database_id);
+    assert_eq!(event.projection_id, "projection-items");
+    assert_eq!(event.event_type, "projection_committed");
+    assert_eq!(event.source_database_id, source_database_id);
+    assert_eq!(event.source_log_index, 1);
+    assert_eq!(event.source_log_hash, source_commit.log_hash);
+    assert_eq!(event.projection_log_index, 1);
+    assert_eq!(
+        event.definition_hash,
+        created_definition.definition_hash.unwrap()
+    );
 }
 
 #[tokio::test]
@@ -570,20 +703,38 @@ async fn create_group(
     client: &mut PersonalDbServiceClient<tonic::transport::Channel>,
     token: &str,
     database_id: &str,
-) {
+) -> String {
+    create_group_with_schema(
+        client,
+        token,
+        database_id,
+        PERSONALDB_TEST_SCHEMA_SQL,
+        &personaldb_test_schema_hash(),
+    )
+    .await
+}
+
+async fn create_group_with_schema(
+    client: &mut PersonalDbServiceClient<tonic::transport::Channel>,
+    token: &str,
+    database_id: &str,
+    schema_sql: &str,
+    schema_hash: &str,
+) -> String {
     let genesis_hash = hex::encode(hash32(format!("genesis:{database_id}").as_bytes()));
     client
         .create_personal_db_group(authorized(
             CreatePersonalDbGroupRequest {
                 database_id: database_id.to_string(),
-                schema_hash: personaldb_test_schema_hash(),
-                genesis_hash,
-                schema_sql: PERSONALDB_TEST_SCHEMA_SQL.to_string(),
+                schema_hash: schema_hash.to_string(),
+                genesis_hash: genesis_hash.clone(),
+                schema_sql: schema_sql.to_string(),
             },
             token,
         ))
         .await
         .unwrap();
+    genesis_hash
 }
 
 fn projection_definition(
@@ -617,9 +768,10 @@ fn projection_definition(
                 target_column: "name".to_string(),
             },
         ],
-        row_filters: vec![RowFilter::NotDeleted {
+        row_filters: vec![RowFilter::FieldEqualsLiteral {
             table: "items".to_string(),
-            deleted_field: "deleted_at".to_string(),
+            field: "id".to_string(),
+            literal: "1".to_string(),
         }],
         resource_bindings: vec![ProjectionResourceBinding {
             source_table: "items".to_string(),
