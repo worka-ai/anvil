@@ -542,7 +542,7 @@ async fn test_full_text_index_build_uses_source_cursor_snapshot() {
         )
         .await
         .unwrap();
-    let coalesced_tasks = persistence
+    let index_tasks = persistence
         .list_tasks()
         .await
         .unwrap()
@@ -552,17 +552,25 @@ async fn test_full_text_index_build_uses_source_cursor_snapshot() {
                 && task.payload["index_id"] == serde_json::json!(index.id)
         })
         .collect::<Vec<_>>();
+    let pending_tasks = index_tasks
+        .iter()
+        .filter(|task| task.status == anvil::tasks::TaskStatus::Pending)
+        .collect::<Vec<_>>();
     assert_eq!(
-        coalesced_tasks.len(),
+        pending_tasks.len(),
         1,
-        "index build tasks for the same index should coalesce before execution"
+        "index build tasks for the same index should expose one pending build before execution"
     );
     assert!(
-        coalesced_tasks[0].payload["source_cursor"]
-            .as_u64()
-            .unwrap()
-            > source_cursor,
-        "coalesced index build should advance to the latest source cursor"
+        pending_tasks[0].payload["source_cursor"].as_u64().unwrap() > source_cursor,
+        "pending index build should advance to the latest source cursor"
+    );
+    assert!(
+        index_tasks
+            .iter()
+            .any(|task| task.status == anvil::tasks::TaskStatus::Completed
+                && task.payload["source_cursor"] == serde_json::json!(source_cursor)),
+        "superseded index build should remain in the journal as a completed task"
     );
 
     persistence
