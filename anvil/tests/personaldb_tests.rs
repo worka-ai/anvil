@@ -1,11 +1,20 @@
 use anvil::anvil_api::personal_db_service_client::PersonalDbServiceClient;
 use anvil::anvil_api::{
-    CreatePersonalDbGroupRequest, GetPersonalDbGroupRequest, PersonalDbCatchUpRequest,
-    PersonalDbVoterAck, SubmitPersonalDbChangesetRequest, WatchPersonalDbGroupRequest,
+    CreatePersonalDbGroupRequest, CreatePersonalDbProjectionRequest, GetPersonalDbGroupRequest,
+    GetPersonalDbProjectionRequest, PersonalDbCatchUpRequest, PersonalDbVoterAck,
+    SubmitPersonalDbChangesetRequest, WatchPersonalDbGroupRequest,
+    WatchPersonalDbProjectionRequest,
 };
 use anvil::formats::hash32;
+use anvil::personaldb_projection::{
+    ColumnMapping, ProjectionDefinition, ProjectionResourceBinding, RowFilter, TableMapping,
+    WriteBackPolicy,
+};
 use anvil::personaldb_row_index::read_personaldb_row_index;
-use anvil::personaldb_watch::{PersonalDbGroupWatchPayload, append_personaldb_group_watch_record};
+use anvil::personaldb_watch::{
+    PersonalDbGroupWatchPayload, PersonalDbProjectionWatchPayload,
+    append_personaldb_group_watch_record, append_personaldb_projection_watch_record,
+};
 use anvil_test_utils::*;
 use futures_util::StreamExt;
 use rusqlite::{Connection, session::Session};
@@ -375,6 +384,106 @@ async fn personaldb_submit_builds_snapshot_when_threshold_is_reached() {
 }
 
 #[tokio::test]
+async fn personaldb_projection_definition_create_get_and_watch_are_native_api_backed() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut client = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let source_database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+    let projection_database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+    create_group(&mut client, &token, &source_database_id).await;
+    create_group(&mut client, &token, &projection_database_id).await;
+
+    let definition = projection_definition(&projection_database_id, &source_database_id);
+    let created = client
+        .create_personal_db_projection(authorized(
+            CreatePersonalDbProjectionRequest {
+                tenant_id: 1,
+                database_id: projection_database_id.clone(),
+                projection_definition_json: serde_json::to_string(&definition).unwrap(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let created_definition: ProjectionDefinition =
+        serde_json::from_str(&created.projection_definition_json).unwrap();
+    created_definition.verify().unwrap();
+    assert_eq!(created_definition.database_id, projection_database_id);
+    assert_eq!(
+        created_definition.source_database_ids,
+        vec![source_database_id.clone()]
+    );
+    assert!(created_definition.definition_hash.as_ref().unwrap().len() == 64);
+
+    let fetched = client
+        .get_personal_db_projection(authorized(
+            GetPersonalDbProjectionRequest {
+                tenant_id: 1,
+                database_id: projection_database_id.clone(),
+                projection_id: "projection-items".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let fetched_definition: ProjectionDefinition =
+        serde_json::from_str(&fetched.projection_definition_json).unwrap();
+    assert_eq!(fetched_definition, created_definition);
+
+    let payload = PersonalDbProjectionWatchPayload {
+        database_id: projection_database_id.clone(),
+        projection_id: "projection-items".to_string(),
+        event_type: "projection_committed".to_string(),
+        source_database_id: source_database_id.clone(),
+        source_log_index: 1,
+        source_log_hash: hex::encode([1; 32]),
+        projection_log_index: 1,
+        projection_log_hash: hex::encode([2; 32]),
+        definition_hash: created_definition.definition_hash.unwrap(),
+        emitted_at: "2026-06-28T00:00:00Z".to_string(),
+    };
+    append_personaldb_projection_watch_record(
+        &cluster.states[0].storage,
+        1,
+        &projection_database_id,
+        "projection-items",
+        77,
+        *uuid::Uuid::new_v4().as_bytes(),
+        12,
+        payload,
+    )
+    .await
+    .unwrap();
+    let watch = client
+        .watch_personal_db_projection(authorized(
+            WatchPersonalDbProjectionRequest {
+                tenant_id: 1,
+                database_id: projection_database_id.clone(),
+                projection_id: "projection-items".to_string(),
+                after_cursor_low: 0,
+                after_cursor_high: 0,
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    let mut stream = watch.into_inner();
+    let event = stream.next().await.unwrap().unwrap();
+    assert_eq!(event.cursor_low, 77);
+    assert_eq!(event.cursor_high, 0);
+    assert_eq!(event.database_id, projection_database_id);
+    assert_eq!(event.projection_id, "projection-items");
+    assert_eq!(event.source_database_id, source_database_id);
+    assert_eq!(event.authz_revision, 12);
+}
+
+#[tokio::test]
 async fn personaldb_api_rejects_cross_tenant_request_scope() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
@@ -455,6 +564,73 @@ fn valid_submit_request(
 ) -> SubmitPersonalDbChangesetRequest {
     let changeset_bytes = sqlite_insert_changeset();
     submit_request(database_id, genesis_hash, session_token, changeset_bytes)
+}
+
+async fn create_group(
+    client: &mut PersonalDbServiceClient<tonic::transport::Channel>,
+    token: &str,
+    database_id: &str,
+) {
+    let genesis_hash = hex::encode(hash32(format!("genesis:{database_id}").as_bytes()));
+    client
+        .create_personal_db_group(authorized(
+            CreatePersonalDbGroupRequest {
+                database_id: database_id.to_string(),
+                schema_hash: personaldb_test_schema_hash(),
+                genesis_hash,
+                schema_sql: PERSONALDB_TEST_SCHEMA_SQL.to_string(),
+            },
+            token,
+        ))
+        .await
+        .unwrap();
+}
+
+fn projection_definition(
+    projection_database_id: &str,
+    source_database_id: &str,
+) -> ProjectionDefinition {
+    ProjectionDefinition {
+        format_version: 1,
+        tenant_id: "1".to_string(),
+        database_id: projection_database_id.to_string(),
+        projection_id: "projection-items".to_string(),
+        source_database_ids: vec![source_database_id.to_string()],
+        target_database_id: projection_database_id.to_string(),
+        target_actor_or_scope: "scope-primary".to_string(),
+        table_mappings: vec![TableMapping {
+            source_database_id: source_database_id.to_string(),
+            source_table: "items".to_string(),
+            target_table: "items_projection".to_string(),
+        }],
+        column_mappings: vec![
+            ColumnMapping {
+                source_table: "items".to_string(),
+                source_column: "id".to_string(),
+                target_table: "items_projection".to_string(),
+                target_column: "id".to_string(),
+            },
+            ColumnMapping {
+                source_table: "items".to_string(),
+                source_column: "name".to_string(),
+                target_table: "items_projection".to_string(),
+                target_column: "name".to_string(),
+            },
+        ],
+        row_filters: vec![RowFilter::NotDeleted {
+            table: "items".to_string(),
+            deleted_field: "deleted_at".to_string(),
+        }],
+        resource_bindings: vec![ProjectionResourceBinding {
+            source_table: "items".to_string(),
+            primary_key_column: "id".to_string(),
+            resource_type: "items".to_string(),
+            resource_id_column: "id".to_string(),
+            parent_resource_id_column: None,
+        }],
+        writeback_policy: WriteBackPolicy::Deny,
+        definition_hash: None,
+    }
 }
 
 fn malformed_submit_request(

@@ -24,6 +24,9 @@ use crate::{
         read_personaldb_group_manifest, write_personaldb_committed_head,
         write_personaldb_group_manifest,
     },
+    personaldb_projection::{
+        ProjectionDefinition, read_projection_definition, write_projection_definition,
+    },
     personaldb_row_index::{PersonalDbRowIndexWrite, write_personaldb_row_index},
     personaldb_schema::{
         read_personaldb_schema_sql, validate_changeset_tables_registered, validate_schema_sql,
@@ -38,9 +41,9 @@ use crate::{
         validate_submit_personaldb_changeset,
     },
     personaldb_watch::{
-        PersonalDbGroupWatchEvent, PersonalDbGroupWatchPayload,
+        PersonalDbGroupWatchEvent, PersonalDbGroupWatchPayload, PersonalDbProjectionWatchEvent,
         append_personaldb_group_watch_record, latest_personaldb_group_watch_cursor,
-        list_personaldb_group_watch_events,
+        list_personaldb_group_watch_events, list_personaldb_projection_watch_events,
     },
 };
 use tokio::sync::mpsc;
@@ -51,6 +54,12 @@ use tonic::{Request, Response, Status};
 impl PersonalDbService for AppState {
     type WatchPersonalDbGroupStream = std::pin::Pin<
         Box<dyn futures_core::Stream<Item = Result<WatchPersonalDbGroupResponse, Status>> + Send>,
+    >;
+    type WatchPersonalDbProjectionStream = std::pin::Pin<
+        Box<
+            dyn futures_core::Stream<Item = Result<WatchPersonalDbProjectionResponse, Status>>
+                + Send,
+        >,
     >;
 
     async fn create_personal_db_group(
@@ -185,6 +194,104 @@ impl PersonalDbService for AppState {
             manifest: Some(group_manifest_record(manifest)),
             committed_head: committed_head.map(committed_head_record),
         }))
+    }
+
+    async fn create_personal_db_projection(
+        &self,
+        request: Request<CreatePersonalDbProjectionRequest>,
+    ) -> Result<Response<PersonalDbProjectionResponse>, Status> {
+        let claims = request_claims(&request)?.clone();
+        let req = request.into_inner();
+        validate_claim_tenant(claims.tenant_id, req.tenant_id)?;
+        validate_database_id(&req.database_id)?;
+        let mut definition: ProjectionDefinition =
+            serde_json::from_str(&req.projection_definition_json)
+                .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        validate_projection_definition_scope(claims.tenant_id, &req.database_id, &definition)?;
+        validate_projection_id(&definition.projection_id)?;
+        let resource = personaldb_projection_resource(
+            claims.tenant_id,
+            &req.database_id,
+            &definition.projection_id,
+        );
+        if !auth::is_authorized(AnvilAction::PersonalDbCreate, &resource, &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+        let signing_key = self.personaldb_signing_key();
+        read_personaldb_group_manifest(
+            &self.storage,
+            claims.tenant_id,
+            &req.database_id,
+            signing_key,
+        )
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::not_found("PersonalDB projection group not found"))?;
+        for source_database_id in &definition.source_database_ids {
+            validate_database_id(source_database_id)?;
+            read_personaldb_group_manifest(
+                &self.storage,
+                claims.tenant_id,
+                source_database_id,
+                signing_key,
+            )
+            .await
+            .map_err(internal_status)?
+            .ok_or_else(|| Status::not_found("PersonalDB projection source group not found"))?;
+        }
+        if read_projection_definition(
+            &self.storage,
+            claims.tenant_id,
+            &req.database_id,
+            &definition.projection_id,
+        )
+        .await
+        .map_err(internal_status)?
+        .is_some()
+        {
+            return Err(Status::already_exists(
+                "PersonalDB projection already exists",
+            ));
+        }
+        definition.definition_hash = None;
+        let definition = definition
+            .seal()
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        write_projection_definition(
+            &self.storage,
+            claims.tenant_id,
+            &req.database_id,
+            &definition,
+        )
+        .await
+        .map_err(internal_status)?;
+        Ok(Response::new(projection_response(definition)?))
+    }
+
+    async fn get_personal_db_projection(
+        &self,
+        request: Request<GetPersonalDbProjectionRequest>,
+    ) -> Result<Response<PersonalDbProjectionResponse>, Status> {
+        let claims = request_claims(&request)?.clone();
+        let req = request.into_inner();
+        validate_claim_tenant(claims.tenant_id, req.tenant_id)?;
+        validate_database_id(&req.database_id)?;
+        validate_projection_id(&req.projection_id)?;
+        let resource =
+            personaldb_projection_resource(claims.tenant_id, &req.database_id, &req.projection_id);
+        if !auth::is_authorized(AnvilAction::PersonalDbRead, &resource, &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+        let definition = read_projection_definition(
+            &self.storage,
+            claims.tenant_id,
+            &req.database_id,
+            &req.projection_id,
+        )
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::not_found("PersonalDB projection not found"))?;
+        Ok(Response::new(projection_response(definition)?))
     }
 
     async fn submit_personal_db_changeset(
@@ -595,6 +702,73 @@ impl PersonalDbService for AppState {
             Box::pin(ReceiverStream::new(rx)) as Self::WatchPersonalDbGroupStream
         ))
     }
+
+    async fn watch_personal_db_projection(
+        &self,
+        request: Request<WatchPersonalDbProjectionRequest>,
+    ) -> Result<Response<Self::WatchPersonalDbProjectionStream>, Status> {
+        let claims = request_claims(&request)?.clone();
+        let req = request.into_inner();
+        validate_claim_tenant(claims.tenant_id, req.tenant_id)?;
+        validate_database_id(&req.database_id)?;
+        validate_projection_id(&req.projection_id)?;
+        let resource =
+            personaldb_projection_resource(claims.tenant_id, &req.database_id, &req.projection_id);
+        if !auth::is_authorized(AnvilAction::PersonalDbWatch, &resource, &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+        let after_cursor = join_u128(req.after_cursor_low, req.after_cursor_high);
+        let snapshot = list_personaldb_projection_watch_events(
+            &self.storage,
+            claims.tenant_id,
+            &req.database_id,
+            &req.projection_id,
+            after_cursor,
+            1000,
+        )
+        .await
+        .map_err(internal_status)?;
+        let mut live = self.personaldb_projection_watch_tx.subscribe();
+        let (tx, rx) = mpsc::channel(32);
+        tokio::spawn(async move {
+            let mut last_cursor = after_cursor;
+            for event in snapshot {
+                last_cursor = last_cursor.max(event.cursor);
+                if tx.send(Ok(projection_watch_response(event))).await.is_err() {
+                    return;
+                }
+            }
+            loop {
+                match live.recv().await {
+                    Ok(event) => {
+                        if event.cursor <= last_cursor
+                            || event.payload.database_id != req.database_id
+                            || event.payload.projection_id != req.projection_id
+                        {
+                            continue;
+                        }
+                        last_cursor = event.cursor;
+                        if tx.send(Ok(projection_watch_response(event))).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let _ = tx
+                            .send(Err(Status::data_loss(
+                                "PersonalDB projection watch fell behind retained live event window",
+                            )))
+                            .await;
+                        return;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+
+        Ok(Response::new(
+            Box::pin(ReceiverStream::new(rx)) as Self::WatchPersonalDbProjectionStream
+        ))
+    }
 }
 
 impl AppState {
@@ -870,6 +1044,31 @@ fn validate_database_id(database_id: &str) -> Result<(), Status> {
     Ok(())
 }
 
+fn validate_projection_id(projection_id: &str) -> Result<(), Status> {
+    if projection_id.is_empty() {
+        return Err(Status::invalid_argument("projection_id must not be empty"));
+    }
+    if projection_id.contains('/') || projection_id.contains("..") {
+        return Err(Status::invalid_argument(
+            "projection_id contains unsafe characters",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_projection_definition_scope(
+    tenant_id: i64,
+    database_id: &str,
+    definition: &ProjectionDefinition,
+) -> Result<(), Status> {
+    if definition.tenant_id != tenant_id.to_string() || definition.database_id != database_id {
+        return Err(Status::invalid_argument(
+            "PersonalDB projection definition scope mismatch",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_hex32(value: &str, field: &'static str) -> Result<(), Status> {
     if value.len() != 64 || !value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(Status::invalid_argument(format!("{field} must be hex32")));
@@ -887,6 +1086,14 @@ fn hex32_status(value: &str, field: &'static str) -> Result<Hash32, Status> {
 
 fn personaldb_resource(tenant_id: i64, database_id: &str) -> String {
     format!("tenant-{tenant_id}/{database_id}")
+}
+
+fn personaldb_projection_resource(
+    tenant_id: i64,
+    database_id: &str,
+    projection_id: &str,
+) -> String {
+    format!("tenant-{tenant_id}/{database_id}/projections/{projection_id}")
 }
 
 fn configured_personaldb_snapshot_policy(
@@ -925,6 +1132,35 @@ fn now_rfc3339() -> String {
 
 fn internal_status(err: impl std::fmt::Display) -> Status {
     Status::internal(err.to_string())
+}
+
+fn projection_response(
+    definition: ProjectionDefinition,
+) -> Result<PersonalDbProjectionResponse, Status> {
+    Ok(PersonalDbProjectionResponse {
+        projection_definition_json: serde_json::to_string(&definition).map_err(internal_status)?,
+    })
+}
+
+fn projection_watch_response(
+    event: PersonalDbProjectionWatchEvent,
+) -> WatchPersonalDbProjectionResponse {
+    let (low, high) = split_u128(event.cursor);
+    WatchPersonalDbProjectionResponse {
+        cursor_low: low,
+        cursor_high: high,
+        database_id: event.payload.database_id,
+        projection_id: event.payload.projection_id,
+        event_type: event.payload.event_type,
+        source_database_id: event.payload.source_database_id,
+        source_log_index: event.payload.source_log_index,
+        source_log_hash: event.payload.source_log_hash,
+        projection_log_index: event.payload.projection_log_index,
+        projection_log_hash: event.payload.projection_log_hash,
+        definition_hash: event.payload.definition_hash,
+        authz_revision: event.authz_revision,
+        emitted_at: event.payload.emitted_at,
+    }
 }
 
 #[cfg(test)]

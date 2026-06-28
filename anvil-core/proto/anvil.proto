@@ -530,9 +530,12 @@ service AuthService {
 service PersonalDbService {
   rpc CreatePersonalDbGroup(CreatePersonalDbGroupRequest) returns (PersonalDbGroupResponse);
   rpc GetPersonalDbGroup(GetPersonalDbGroupRequest) returns (PersonalDbGroupResponse);
+  rpc CreatePersonalDbProjection(CreatePersonalDbProjectionRequest) returns (PersonalDbProjectionResponse);
+  rpc GetPersonalDbProjection(GetPersonalDbProjectionRequest) returns (PersonalDbProjectionResponse);
   rpc SubmitPersonalDbChangeset(SubmitPersonalDbChangesetRequest) returns (SubmitPersonalDbChangesetResponse);
   rpc CatchUpPersonalDb(PersonalDbCatchUpRequest) returns (PersonalDbCatchUpResponse);
   rpc WatchPersonalDbGroup(WatchPersonalDbGroupRequest) returns (stream WatchPersonalDbGroupResponse);
+  rpc WatchPersonalDbProjection(WatchPersonalDbProjectionRequest) returns (stream WatchPersonalDbProjectionResponse);
 }
 
 // Hugging Face Keys (public API, policy enforced)
@@ -704,6 +707,22 @@ message PersonalDbGroupResponse {
     PersonalDbCommittedHeadRecord committed_head = 2;
 }
 
+message CreatePersonalDbProjectionRequest {
+    int64 tenant_id = 1;
+    string database_id = 2;
+    string projection_definition_json = 3;
+}
+
+message GetPersonalDbProjectionRequest {
+    int64 tenant_id = 1;
+    string database_id = 2;
+    string projection_id = 3;
+}
+
+message PersonalDbProjectionResponse {
+    string projection_definition_json = 1;
+}
+
 message PersonalDbGroupManifestRecord {
     uint32 format_version = 1;
     string tenant_id = 2;
@@ -872,6 +891,30 @@ message WatchPersonalDbGroupResponse {
     string committed_head_hash = 9;
     uint64 authz_revision = 10;
     string emitted_at = 11;
+}
+
+message WatchPersonalDbProjectionRequest {
+    int64 tenant_id = 1;
+    string database_id = 2;
+    string projection_id = 3;
+    uint64 after_cursor_low = 4;
+    uint64 after_cursor_high = 5;
+}
+
+message WatchPersonalDbProjectionResponse {
+    uint64 cursor_low = 1;
+    uint64 cursor_high = 2;
+    string database_id = 3;
+    string projection_id = 4;
+    string event_type = 5;
+    string source_database_id = 6;
+    uint64 source_log_index = 7;
+    string source_log_hash = 8;
+    uint64 projection_log_index = 9;
+    string projection_log_hash = 10;
+    string definition_hash = 11;
+    uint64 authz_revision = 12;
+    string emitted_at = 13;
 }
 
 
