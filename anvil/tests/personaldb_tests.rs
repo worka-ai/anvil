@@ -5,6 +5,7 @@ use anvil::anvil_api::{
 };
 use anvil::formats::hash32;
 use anvil::personaldb_watch::{PersonalDbGroupWatchPayload, append_personaldb_group_watch_record};
+use anvil::personaldb_row_index::read_personaldb_row_index;
 use anvil_test_utils::*;
 use futures_util::StreamExt;
 use rusqlite::{Connection, session::Session};
@@ -190,6 +191,25 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
     assert_eq!(committed.watch_cursor_high, 0);
     assert_eq!(committed.certificate.as_ref().unwrap().log_index, 1);
     assert_eq!(committed.committed_head.as_ref().unwrap().log_index, 1);
+    assert_eq!(committed.committed_head.as_ref().unwrap().row_index_generation, 1);
+
+    let row_index_path = cluster.states[0]
+        .storage
+        .personaldb_row_index_path(1, &database_id, 1, &committed.log_hash)
+        .unwrap();
+    let row_index = read_personaldb_row_index(row_index_path).await.unwrap();
+    assert_eq!(row_index.header.generation, 1);
+    assert_eq!(row_index.records.len(), 1);
+    assert_eq!(row_index.records[0].database_id, database_id.as_bytes());
+
+    let stale_base = client
+        .submit_personal_db_changeset(authorized(
+            valid_submit_request(&database_id, &genesis_hash, &token),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(stale_base.code(), Code::FailedPrecondition);
 
     let fetched = client
         .get_personal_db_group(authorized(
