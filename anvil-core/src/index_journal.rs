@@ -2,9 +2,10 @@ use crate::formats::{
     BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, Hash32, JournalFrame, JournalRecordKind,
     hash32, validate_journal_chain,
 };
+use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
 use crate::persistence::{Bucket, IndexDefinition, IndexDefinitionEvent};
 use crate::storage::Storage;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use std::path::Path;
@@ -40,11 +41,30 @@ pub async fn append_index_definition_event(
     storage: &Storage,
     event: &IndexDefinitionEvent,
 ) -> Result<()> {
+    append_index_definition_event_inner(storage, event, 0).await
+}
+
+pub async fn append_index_definition_event_with_permit(
+    storage: &Storage,
+    event: &IndexDefinitionEvent,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<()> {
+    require_index_definition_permit(event.tenant_id, event.bucket_id, permit)?;
+    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
+    append_index_definition_event_inner(storage, event, permit.fence_token).await
+}
+
+async fn append_index_definition_event_inner(
+    storage: &Storage,
+    event: &IndexDefinitionEvent,
+    fence_token: u64,
+) -> Result<()> {
     let path = storage.index_definition_journal_path(event.tenant_id, event.bucket_id);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    ensure_journal_header(&path, event.tenant_id, event.bucket_id).await?;
+    ensure_journal_header(&path, event.tenant_id, event.bucket_id, fence_token).await?;
 
     let previous = read_index_journal_frames_at_path(path.as_path())
         .await
@@ -73,7 +93,7 @@ pub async fn append_index_definition_event(
     let frame = JournalFrame::new(
         JournalRecordKind::IndexDefinition,
         sequence,
-        0,
+        fence_token,
         *mutation_id.as_bytes(),
         index_key_hash(event.tenant_id, event.bucket_id, &event.index_name),
         previous_hash,
@@ -96,6 +116,29 @@ pub async fn write_index_definition_event(
     index: &IndexDefinition,
     event_type: &str,
 ) -> Result<IndexDefinitionEvent> {
+    write_index_definition_event_inner(storage, bucket, index, event_type, 0).await
+}
+
+pub async fn write_index_definition_event_with_permit(
+    storage: &Storage,
+    bucket: &Bucket,
+    index: &IndexDefinition,
+    event_type: &str,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<IndexDefinitionEvent> {
+    require_index_definition_permit(bucket.tenant_id, bucket.id, permit)?;
+    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
+    write_index_definition_event_inner(storage, bucket, index, event_type, permit.fence_token).await
+}
+
+async fn write_index_definition_event_inner(
+    storage: &Storage,
+    bucket: &Bucket,
+    index: &IndexDefinition,
+    event_type: &str,
+    fence_token: u64,
+) -> Result<IndexDefinitionEvent> {
     let cursor = read_all_index_definition_events(storage, bucket.tenant_id, bucket.id)
         .await?
         .into_iter()
@@ -116,7 +159,7 @@ pub async fn write_index_definition_event(
         definition: index_definition_json(&bucket.name, index),
         created_at: chrono::Utc::now(),
     };
-    append_index_definition_event(storage, &event).await?;
+    append_index_definition_event_inner(storage, &event, fence_token).await?;
     Ok(event)
 }
 
@@ -277,7 +320,12 @@ fn decode_journal_file(bytes: &[u8]) -> Result<Vec<JournalFrame>> {
     Ok(frames)
 }
 
-async fn ensure_journal_header(path: &Path, tenant_id: i64, bucket_id: i64) -> Result<()> {
+async fn ensure_journal_header(
+    path: &Path,
+    tenant_id: i64,
+    bucket_id: i64,
+    fence_token: u64,
+) -> Result<()> {
     if tokio::fs::try_exists(path).await? {
         return Ok(());
     }
@@ -287,7 +335,7 @@ async fn ensure_journal_header(path: &Path, tenant_id: i64, bucket_id: i64) -> R
         bucket_id: bucket_id.to_string(),
         partition_family: "index_definition",
         partition_id: hex::encode(index_partition_id(tenant_id, bucket_id)),
-        fence_token: 0,
+        fence_token,
         first_sequence: 1,
         created_at: &created_at,
         codec: "none",
@@ -306,6 +354,21 @@ async fn ensure_journal_header(path: &Path, tenant_id: i64, bucket_id: i64) -> R
 
 fn index_partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/bucket/{bucket_id}/index_definition").as_bytes())
+}
+
+fn require_index_definition_permit(
+    tenant_id: i64,
+    bucket_id: i64,
+    permit: &PartitionWritePermit,
+) -> Result<()> {
+    if permit.partition_family != "index_definition"
+        || permit.partition_id != hex::encode(index_partition_id(tenant_id, bucket_id))
+    {
+        return Err(anyhow!(
+            "partition write permit does not target this index definition partition"
+        ));
+    }
+    Ok(())
 }
 
 fn index_key_hash(tenant_id: i64, bucket_id: i64, index_name: &str) -> Hash32 {
@@ -389,9 +452,14 @@ fn parse_definition_time(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::partition_fence::{
+        PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
+    };
     use chrono::Utc;
     use serde_json::json;
     use tempfile::tempdir;
+
+    const PARTITION_OWNER_KEY: &[u8] = b"index definition partition owner signing key";
 
     fn event(cursor: i64, name: &str, event_type: &str, enabled: bool) -> IndexDefinitionEvent {
         IndexDefinitionEvent {
@@ -448,6 +516,35 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    async fn ready_index_permit(storage: &Storage, owner_node_id: &str) -> PartitionWritePermit {
+        let request = PartitionRecoveryAcquire {
+            partition_family: "index_definition".to_string(),
+            partition_id: hex::encode(index_partition_id(42, 7)),
+            owner_node_id: owner_node_id.to_string(),
+            recovered_through_sequence: 0,
+            recovered_manifest_hash: hex::encode([0; 32]),
+            now_nanos: 100,
+        };
+        let recovering = acquire_partition_recovery(storage, request, PARTITION_OWNER_KEY)
+            .await
+            .unwrap();
+        publish_partition_ready(
+            storage,
+            &recovering.partition_family,
+            &recovering.partition_id,
+            owner_node_id,
+            recovering.fence_token,
+            0,
+            &hex::encode([4; 32]),
+            200,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap()
+        .write_permit()
+        .unwrap()
     }
 
     #[tokio::test]
@@ -510,5 +607,80 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].event_type, "disable");
         assert_eq!(events[1].definition["enabled"].as_bool(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn index_journal_permit_sets_frame_fence() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let permit = ready_index_permit(&storage, "node-a").await;
+
+        append_index_definition_event_with_permit(
+            &storage,
+            &event(1, "body", "create", true),
+            &permit,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap();
+
+        let frames =
+            read_index_journal_frames_at_path(&storage.index_definition_journal_path(42, 7))
+                .await
+                .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].fence_token, permit.fence_token);
+    }
+
+    #[tokio::test]
+    async fn index_journal_rejects_stale_partition_permit() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let stale = ready_index_permit(&storage, "node-a").await;
+        let fresh = ready_index_permit(&storage, "node-b").await;
+        assert_eq!(fresh.fence_token, stale.fence_token + 1);
+
+        let rejected = append_index_definition_event_with_permit(
+            &storage,
+            &event(1, "body", "create", true),
+            &stale,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap_err();
+        assert!(rejected.to_string().contains("PartitionNotOwned"));
+
+        append_index_definition_event_with_permit(
+            &storage,
+            &event(1, "body", "create", true),
+            &fresh,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn index_write_with_permit_allocates_cursor_under_fence() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let permit = ready_index_permit(&storage, "node-a").await;
+        let written = write_index_definition_event_with_permit(
+            &storage,
+            &bucket(),
+            &index(1, true),
+            "create",
+            &permit,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(written.id, 1);
+        let frames =
+            read_index_journal_frames_at_path(&storage.index_definition_journal_path(42, 7))
+                .await
+                .unwrap();
+        assert_eq!(frames[0].fence_token, permit.fence_token);
     }
 }

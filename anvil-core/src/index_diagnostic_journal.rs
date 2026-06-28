@@ -2,6 +2,7 @@ use crate::formats::{
     BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, Hash32, JournalFrame, JournalRecordKind,
     hash32, validate_journal_chain,
 };
+use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
 use crate::persistence::IndexDiagnostic;
 use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
@@ -28,7 +29,26 @@ struct IndexDiagnosticBody {
 
 pub async fn write_index_diagnostic(
     storage: &Storage,
+    diagnostic: IndexDiagnostic,
+) -> Result<IndexDiagnostic> {
+    write_index_diagnostic_inner(storage, diagnostic, 0).await
+}
+
+pub async fn write_index_diagnostic_with_permit(
+    storage: &Storage,
+    diagnostic: IndexDiagnostic,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<IndexDiagnostic> {
+    require_index_diagnostic_permit(diagnostic.tenant_id, diagnostic.bucket_id, permit)?;
+    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
+    write_index_diagnostic_inner(storage, diagnostic, permit.fence_token).await
+}
+
+async fn write_index_diagnostic_inner(
+    storage: &Storage,
     mut diagnostic: IndexDiagnostic,
+    fence_token: u64,
 ) -> Result<IndexDiagnostic> {
     let cursor = read_index_diagnostics(
         storage,
@@ -47,7 +67,7 @@ pub async fn write_index_diagnostic(
     .checked_add(1)
     .ok_or_else(|| anyhow!("index diagnostic cursor overflow"))?;
     diagnostic.id = cursor;
-    append_diagnostic(storage, &diagnostic).await?;
+    append_diagnostic(storage, &diagnostic, fence_token).await?;
     Ok(diagnostic)
 }
 
@@ -89,12 +109,22 @@ pub async fn read_index_diagnostics(
     Ok(diagnostics)
 }
 
-async fn append_diagnostic(storage: &Storage, diagnostic: &IndexDiagnostic) -> Result<()> {
+async fn append_diagnostic(
+    storage: &Storage,
+    diagnostic: &IndexDiagnostic,
+    fence_token: u64,
+) -> Result<()> {
     let path = storage.index_diagnostic_journal_path(diagnostic.tenant_id, diagnostic.bucket_id);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    ensure_journal_header(&path, diagnostic.tenant_id, diagnostic.bucket_id).await?;
+    ensure_journal_header(
+        &path,
+        diagnostic.tenant_id,
+        diagnostic.bucket_id,
+        fence_token,
+    )
+    .await?;
     let previous = read_index_diagnostic_frames_at_path(path.as_path())
         .await
         .unwrap_or_default();
@@ -110,7 +140,7 @@ async fn append_diagnostic(storage: &Storage, diagnostic: &IndexDiagnostic) -> R
     let frame = JournalFrame::new(
         JournalRecordKind::IndexDiagnostic,
         sequence,
-        0,
+        fence_token,
         *mutation_id.as_bytes(),
         diagnostic_key_hash(diagnostic),
         previous_hash,
@@ -128,7 +158,12 @@ async fn append_diagnostic(storage: &Storage, diagnostic: &IndexDiagnostic) -> R
     Ok(())
 }
 
-async fn ensure_journal_header(path: &Path, tenant_id: i64, bucket_id: i64) -> Result<()> {
+async fn ensure_journal_header(
+    path: &Path,
+    tenant_id: i64,
+    bucket_id: i64,
+    fence_token: u64,
+) -> Result<()> {
     if tokio::fs::try_exists(path).await? {
         return Ok(());
     }
@@ -138,7 +173,7 @@ async fn ensure_journal_header(path: &Path, tenant_id: i64, bucket_id: i64) -> R
         bucket_id: bucket_id.to_string(),
         partition_family: "index_diagnostic",
         partition_id: hex::encode(index_diagnostic_partition_id(tenant_id, bucket_id)),
-        fence_token: 0,
+        fence_token,
         first_sequence: 1,
         created_at: &created_at,
         codec: "none",
@@ -194,6 +229,21 @@ fn index_diagnostic_partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/bucket/{bucket_id}/index_diagnostic").as_bytes())
 }
 
+fn require_index_diagnostic_permit(
+    tenant_id: i64,
+    bucket_id: i64,
+    permit: &PartitionWritePermit,
+) -> Result<()> {
+    if permit.partition_family != "index_diagnostic"
+        || permit.partition_id != hex::encode(index_diagnostic_partition_id(tenant_id, bucket_id))
+    {
+        return Err(anyhow!(
+            "partition write permit does not target this index diagnostic partition"
+        ));
+    }
+    Ok(())
+}
+
 fn diagnostic_key_hash(diagnostic: &IndexDiagnostic) -> Hash32 {
     hash32(
         format!(
@@ -207,9 +257,14 @@ fn diagnostic_key_hash(diagnostic: &IndexDiagnostic) -> Hash32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::partition_fence::{
+        PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
+    };
     use chrono::Utc;
     use serde_json::json;
     use tempfile::tempdir;
+
+    const PARTITION_OWNER_KEY: &[u8] = b"index diagnostic partition owner signing key";
 
     fn diagnostic(index_name: &str, severity: &str) -> IndexDiagnostic {
         IndexDiagnostic {
@@ -227,6 +282,38 @@ mod tests {
             details: json!({"line": 1}),
             created_at: Utc::now(),
         }
+    }
+
+    async fn ready_diagnostic_permit(
+        storage: &Storage,
+        owner_node_id: &str,
+    ) -> PartitionWritePermit {
+        let request = PartitionRecoveryAcquire {
+            partition_family: "index_diagnostic".to_string(),
+            partition_id: hex::encode(index_diagnostic_partition_id(42, 7)),
+            owner_node_id: owner_node_id.to_string(),
+            recovered_through_sequence: 0,
+            recovered_manifest_hash: hex::encode([0; 32]),
+            now_nanos: 100,
+        };
+        let recovering = acquire_partition_recovery(storage, request, PARTITION_OWNER_KEY)
+            .await
+            .unwrap();
+        publish_partition_ready(
+            storage,
+            &recovering.partition_family,
+            &recovering.partition_id,
+            owner_node_id,
+            recovering.fence_token,
+            0,
+            &hex::encode([5; 32]),
+            200,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap()
+        .write_permit()
+        .unwrap()
     }
 
     #[tokio::test]
@@ -253,5 +340,56 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn index_diagnostic_permit_sets_frame_fence() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let permit = ready_diagnostic_permit(&storage, "node-a").await;
+
+        let written = write_index_diagnostic_with_permit(
+            &storage,
+            diagnostic("a", "warning"),
+            &permit,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap();
+        assert_eq!(written.id, 1);
+        let frames =
+            read_index_diagnostic_frames_at_path(&storage.index_diagnostic_journal_path(42, 7))
+                .await
+                .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].fence_token, permit.fence_token);
+    }
+
+    #[tokio::test]
+    async fn index_diagnostic_rejects_stale_partition_permit() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let stale = ready_diagnostic_permit(&storage, "node-a").await;
+        let fresh = ready_diagnostic_permit(&storage, "node-b").await;
+        assert_eq!(fresh.fence_token, stale.fence_token + 1);
+
+        let rejected = write_index_diagnostic_with_permit(
+            &storage,
+            diagnostic("a", "warning"),
+            &stale,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap_err();
+        assert!(rejected.to_string().contains("PartitionNotOwned"));
+
+        write_index_diagnostic_with_permit(
+            &storage,
+            diagnostic("a", "warning"),
+            &fresh,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap();
     }
 }
