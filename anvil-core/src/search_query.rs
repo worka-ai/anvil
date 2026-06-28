@@ -4,11 +4,10 @@ use crate::formats::{
         Bm25Config, Bm25FieldStats, FullTextQueryError, Posting, TokenizerConfig, bm25_score,
         decode_postings, evaluate_phrase_query, tokenize_text,
     },
-    vector::{
-        VectorMetric, VectorSearchCandidate, VectorSearchResult, select_authorized_vector_results,
-    },
+    vector::{VectorMetric, VectorSearchResult},
 };
 use crate::full_text_segment::DecodedFullTextSegment;
+use crate::vector_hnsw::{HnswRsVectorIndexEngine, VectorIndexEngine};
 use crate::vector_segment::DecodedVectorSegment;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -132,16 +131,13 @@ pub fn query_vector_segment(
     authorized_labels: Option<&BTreeSet<Hash32>>,
     limit: usize,
 ) -> Result<Vec<VectorSearchResult>, crate::formats::FormatError> {
-    let candidates = segment
-        .entries
-        .iter()
-        .map(|entry| VectorSearchCandidate {
-            record: entry.record.clone(),
-            values: entry.payload.values.clone(),
-            authorized: is_authorized(entry.record.authz_label_hash, authorized_labels),
-        })
-        .collect::<Vec<_>>();
-    select_authorized_vector_results(query, &candidates, metric, limit)
+    HnswRsVectorIndexEngine::default().query_segment(
+        segment,
+        query,
+        metric,
+        authorized_labels,
+        limit,
+    )
 }
 
 fn postings_for_term(segment: &DecodedFullTextSegment, term_utf8: &[u8]) -> Vec<Posting> {
