@@ -43,6 +43,9 @@ jobs:
     - name: Guard against external relational metadata stores
       run: ./scripts/check-no-external-db.sh
 
+    - name: Guard against public unfenced journal writes
+      run: ./scripts/check-no-public-unfenced-journal-writes.sh
+
     - name: Build Release Binaries (Native Linux)
       run: cargo build --release --workspace
 
