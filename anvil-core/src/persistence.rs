@@ -439,7 +439,7 @@ impl Persistence {
             cache: MetadataCache::new(config),
             event_publisher,
             owner_node_id: persistence_owner_node_id(config),
-            partition_owner_signing_key: config.anvil_secret_encryption_key.as_bytes().to_vec(),
+            partition_owner_signing_key: hex::decode(&config.anvil_secret_encryption_key)?,
         })
     }
 
@@ -1130,10 +1130,18 @@ impl Persistence {
         let has_objects = if let Some(bucket) =
             bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
         {
-            !metadata_journal::read_object_versions(&self.storage, &bucket, &[], "", "", None, 1)
-                .await?
-                .versions
-                .is_empty()
+            !metadata_journal::read_object_versions(
+                &self.storage,
+                &bucket,
+                &self.partition_owner_signing_key,
+                "",
+                "",
+                None,
+                1,
+            )
+            .await?
+            .versions
+            .is_empty()
         } else {
             false
         };
@@ -1265,7 +1273,12 @@ impl Persistence {
             delete_marker: false,
         });
         let object = Object {
-            id: metadata_journal::next_object_id(&self.storage, &bucket, &[]).await?,
+            id: metadata_journal::next_object_id(
+                &self.storage,
+                &bucket,
+                &self.partition_owner_signing_key,
+            )
+            .await?,
             tenant_id,
             bucket_id,
             key: key.to_string(),
@@ -1308,7 +1321,13 @@ impl Persistence {
         else {
             return Ok(None);
         };
-        metadata_journal::read_current_object(&self.storage, &bucket, &[], key).await
+        metadata_journal::read_current_object(
+            &self.storage,
+            &bucket,
+            &self.partition_owner_signing_key,
+            key,
+        )
+        .await
     }
 
     pub async fn get_object_version(
@@ -1322,7 +1341,14 @@ impl Persistence {
         else {
             return Ok(None);
         };
-        metadata_journal::read_object_version(&self.storage, &bucket, &[], key, version_id).await
+        metadata_journal::read_object_version(
+            &self.storage,
+            &bucket,
+            &self.partition_owner_signing_key,
+            key,
+            version_id,
+        )
+        .await
     }
 
     pub async fn get_object_version_by_id(
@@ -1335,7 +1361,13 @@ impl Persistence {
         else {
             return Ok(None);
         };
-        metadata_journal::read_object_version_by_id(&self.storage, &bucket, &[], version_id).await
+        metadata_journal::read_object_version_by_id(
+            &self.storage,
+            &bucket,
+            &self.partition_owner_signing_key,
+            version_id,
+        )
+        .await
     }
 
     pub async fn list_objects(
@@ -1354,7 +1386,7 @@ impl Persistence {
         let listing = metadata_journal::list_current_objects(
             &self.storage,
             &bucket,
-            &[],
+            &self.partition_owner_signing_key,
             prefix,
             start_after,
             limit,
@@ -1370,14 +1402,24 @@ impl Persistence {
         else {
             return Ok(None);
         };
-        let Some(base) =
-            metadata_journal::read_current_object(&self.storage, &bucket, &[], key).await?
+        let Some(base) = metadata_journal::read_current_object(
+            &self.storage,
+            &bucket,
+            &self.partition_owner_signing_key,
+            key,
+        )
+        .await?
         else {
             return Ok(None);
         };
         let now = Utc::now();
         let object = Object {
-            id: metadata_journal::next_object_id(&self.storage, &bucket, &[]).await?,
+            id: metadata_journal::next_object_id(
+                &self.storage,
+                &bucket,
+                &self.partition_owner_signing_key,
+            )
+            .await?,
             mutation_id: uuid::Uuid::new_v4(),
             version_id: uuid::Uuid::new_v4(),
             content_hash: String::new(),
@@ -1413,13 +1455,23 @@ impl Persistence {
         else {
             return Ok(None);
         };
-        let Some(mut object) =
-            metadata_journal::read_object_version(&self.storage, &bucket, &[], key, version_id)
-                .await?
+        let Some(mut object) = metadata_journal::read_object_version(
+            &self.storage,
+            &bucket,
+            &self.partition_owner_signing_key,
+            key,
+            version_id,
+        )
+        .await?
         else {
             return Ok(None);
         };
-        object.id = metadata_journal::next_object_id(&self.storage, &bucket, &[]).await?;
+        object.id = metadata_journal::next_object_id(
+            &self.storage,
+            &bucket,
+            &self.partition_owner_signing_key,
+        )
+        .await?;
         object.mutation_id = uuid::Uuid::new_v4();
         object.deleted_at = Some(Utc::now());
         let permit = self
@@ -1458,7 +1510,7 @@ impl Persistence {
         metadata_journal::read_object_versions(
             &self.storage,
             &bucket,
-            &[],
+            &self.partition_owner_signing_key,
             prefix,
             key_marker,
             version_id_marker,
