@@ -1212,6 +1212,42 @@ async fn run_s3_public_and_private_access() {
         .expect_err("reserved namespace LIST must fail");
     assert_reserved_namespace_error(list_err);
 
+    let bucket = cluster.states[0]
+        .db
+        .get_bucket_by_name(1, &public_bucket)
+        .await
+        .unwrap()
+        .expect("public bucket metadata should exist");
+    cluster.states[0]
+        .db
+        .create_object(
+            bucket.tenant_id,
+            bucket.id,
+            reserved_key,
+            &hex::encode([9; 32]),
+            0,
+            "reserved-etag",
+            None,
+            None,
+            None,
+            Some(Vec::new()),
+        )
+        .await
+        .unwrap();
+    let root_listing = client
+        .list_objects_v2()
+        .bucket(&public_bucket)
+        .send()
+        .await
+        .expect("root listing should succeed");
+    assert!(
+        root_listing
+            .contents()
+            .iter()
+            .all(|object| object.key() != Some(reserved_key)),
+        "S3 LIST must not reveal reserved namespace keys"
+    );
+
     let delete_err = client
         .delete_object()
         .bucket(&public_bucket)
@@ -1220,6 +1256,15 @@ async fn run_s3_public_and_private_access() {
         .await
         .expect_err("reserved namespace DELETE must fail");
     assert_reserved_namespace_error(delete_err);
+
+    let personaldb_delete_err = client
+        .delete_object()
+        .bucket(&public_bucket)
+        .key("_anvil/personaldb/group")
+        .send()
+        .await
+        .expect_err("reserved PersonalDB namespace DELETE must fail");
+    assert_reserved_namespace_error(personaldb_delete_err);
 
     let copy_from_reserved_err = client
         .copy_object()
