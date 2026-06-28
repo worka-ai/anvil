@@ -83,6 +83,22 @@ pub struct MediaExtractionPlan {
     pub diagnostics: Vec<MediaDiagnostic>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DerivedMediaOutput {
+    pub kind: DerivedOutputKind,
+    pub modality: Option<EmbeddingModality>,
+    pub caller_visible: bool,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaExtractionResult {
+    pub plan: MediaExtractionPlan,
+    pub outputs: Vec<DerivedMediaOutput>,
+    pub diagnostics: Vec<MediaDiagnostic>,
+}
+
 impl MediaExtractionPlan {
     pub fn is_supported(&self) -> bool {
         self.media_kind != MediaKind::Unsupported
@@ -194,6 +210,41 @@ pub fn plan_media_extraction(request: MediaExtractionRequest) -> Result<MediaExt
     })
 }
 
+pub fn execute_media_extraction(
+    request: MediaExtractionRequest,
+    payload: &[u8],
+) -> Result<MediaExtractionResult> {
+    let plan = plan_media_extraction(request)?;
+    let mut diagnostics = plan.diagnostics.clone();
+    let mut outputs = Vec::new();
+    match plan.media_kind {
+        MediaKind::PlainText | MediaKind::Markdown => {
+            let text = decode_utf8_payload(payload, &mut diagnostics)?;
+            push_text_outputs(&plan, &text, &mut outputs)?;
+        }
+        MediaKind::Json => {
+            let text = extract_json_text(payload, &mut diagnostics)?;
+            push_text_outputs(&plan, &text, &mut outputs)?;
+        }
+        MediaKind::Pdf | MediaKind::Image | MediaKind::Audio | MediaKind::Video => {
+            diagnostics.push(MediaDiagnostic {
+                severity: DiagnosticSeverity::Warning,
+                code: "ExtractorBackendUnavailable".to_string(),
+                message: format!(
+                    "media kind {:?} requires a configured extraction backend",
+                    plan.media_kind
+                ),
+            });
+        }
+        MediaKind::Unsupported => {}
+    }
+    Ok(MediaExtractionResult {
+        plan,
+        outputs,
+        diagnostics,
+    })
+}
+
 pub fn classify_media_kind(content_type: &str) -> MediaKind {
     let normalized = normalize_content_type(content_type);
     match normalized.as_str() {
@@ -205,6 +256,103 @@ pub fn classify_media_kind(content_type: &str) -> MediaKind {
         value if value.starts_with("audio/") => MediaKind::Audio,
         value if value.starts_with("video/") => MediaKind::Video,
         _ => MediaKind::Unsupported,
+    }
+}
+
+fn push_text_outputs(
+    plan: &MediaExtractionPlan,
+    text: &str,
+    outputs: &mut Vec<DerivedMediaOutput>,
+) -> Result<()> {
+    for output_plan in &plan.outputs {
+        match output_plan.kind {
+            DerivedOutputKind::TextTranscript => outputs.push(DerivedMediaOutput {
+                kind: output_plan.kind,
+                modality: output_plan.modality,
+                caller_visible: output_plan.caller_visible,
+                content_type: "text/plain; charset=utf-8".to_string(),
+                bytes: text.as_bytes().to_vec(),
+            }),
+            DerivedOutputKind::FullTextRecord => outputs.push(DerivedMediaOutput {
+                kind: output_plan.kind,
+                modality: output_plan.modality,
+                caller_visible: output_plan.caller_visible,
+                content_type: "application/json".to_string(),
+                bytes: serde_json::to_vec(&serde_json::json!({
+                    "tenant_id": plan.object.tenant_id,
+                    "bucket_id": plan.object.bucket_id,
+                    "object_key": plan.object.object_key,
+                    "version_id": plan.object.version_id,
+                    "content_hash": plan.object.content_hash,
+                    "text": text,
+                }))?,
+            }),
+            DerivedOutputKind::EmbeddingRequest => outputs.push(DerivedMediaOutput {
+                kind: output_plan.kind,
+                modality: output_plan.modality,
+                caller_visible: output_plan.caller_visible,
+                content_type: "application/json".to_string(),
+                bytes: serde_json::to_vec(&serde_json::json!({
+                    "modality": output_plan.modality,
+                    "input": text,
+                    "source_content_hash": plan.object.content_hash,
+                }))?,
+            }),
+            DerivedOutputKind::Thumbnail | DerivedOutputKind::FrameDescriptor => {}
+        }
+    }
+    Ok(())
+}
+
+fn decode_utf8_payload(payload: &[u8], diagnostics: &mut Vec<MediaDiagnostic>) -> Result<String> {
+    match std::str::from_utf8(payload) {
+        Ok(text) => Ok(text.to_string()),
+        Err(error) => {
+            diagnostics.push(MediaDiagnostic {
+                severity: DiagnosticSeverity::Error,
+                code: "InvalidUtf8Payload".to_string(),
+                message: error.to_string(),
+            });
+            Err(anyhow!("media text payload is not valid UTF-8"))
+        }
+    }
+}
+
+fn extract_json_text(payload: &[u8], diagnostics: &mut Vec<MediaDiagnostic>) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_slice(payload).map_err(|error| {
+        diagnostics.push(MediaDiagnostic {
+            severity: DiagnosticSeverity::Error,
+            code: "InvalidJsonPayload".to_string(),
+            message: error.to_string(),
+        });
+        anyhow!("media JSON payload is not valid JSON")
+    })?;
+    let mut strings = Vec::new();
+    collect_json_strings(&value, &mut strings);
+    if strings.is_empty() {
+        diagnostics.push(MediaDiagnostic {
+            severity: DiagnosticSeverity::Warning,
+            code: "JsonContainsNoText".to_string(),
+            message: "JSON payload contains no string values for text extraction".to_string(),
+        });
+    }
+    Ok(strings.join("\n"))
+}
+
+fn collect_json_strings<'a>(value: &'a serde_json::Value, output: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::String(text) => output.push(text),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_json_strings(item, output);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for value in map.values() {
+                collect_json_strings(value, output);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
 }
 
@@ -345,6 +493,55 @@ mod tests {
         assert!(plan.outputs.is_empty());
         assert_eq!(plan.diagnostics.len(), 1);
         assert_eq!(plan.diagnostics[0].code, "UnsupportedMediaType");
+    }
+
+    #[test]
+    fn executes_text_payload_into_transcript_full_text_and_embedding_records() {
+        let result = execute_media_extraction(
+            request("text/plain", DerivedAssetPolicy::InternalOnly),
+            b"alpha beta",
+        )
+        .unwrap();
+        assert_eq!(result.outputs.len(), 3);
+        assert_eq!(result.outputs[0].kind, DerivedOutputKind::TextTranscript);
+        assert_eq!(result.outputs[0].bytes, b"alpha beta");
+        let full_text: serde_json::Value =
+            serde_json::from_slice(&result.outputs[1].bytes).unwrap();
+        assert_eq!(full_text["text"], "alpha beta");
+        let embedding: serde_json::Value =
+            serde_json::from_slice(&result.outputs[2].bytes).unwrap();
+        assert_eq!(embedding["input"], "alpha beta");
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn executes_json_payload_by_collecting_string_values() {
+        let result = execute_media_extraction(
+            request("application/json", DerivedAssetPolicy::InternalOnly),
+            br#"{"title":"Alpha","items":[{"body":"Beta"},{"count":2}]}"#,
+        )
+        .unwrap();
+        assert_eq!(result.outputs.len(), 3);
+        let transcript = std::str::from_utf8(&result.outputs[0].bytes).unwrap();
+        assert!(transcript.contains("Alpha"));
+        assert!(transcript.contains("Beta"));
+    }
+
+    #[test]
+    fn execution_reports_invalid_utf8_and_backend_gaps() {
+        let invalid = execute_media_extraction(
+            request("text/plain", DerivedAssetPolicy::InternalOnly),
+            &[0xff, 0xfe],
+        );
+        assert!(invalid.is_err());
+
+        let image = execute_media_extraction(
+            request("image/png", DerivedAssetPolicy::InternalOnly),
+            b"not-an-image-decoder-test",
+        )
+        .unwrap();
+        assert!(image.outputs.is_empty());
+        assert_eq!(image.diagnostics[0].code, "ExtractorBackendUnavailable");
     }
 
     #[test]
