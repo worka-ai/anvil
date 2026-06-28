@@ -76,6 +76,7 @@ service IndexService {
   rpc ListIndexes(ListIndexesRequest) returns (ListIndexesResponse);
   rpc QueryIndex(QueryIndexRequest) returns (QueryIndexResponse);
   rpc WatchIndexDefinition(WatchIndexDefinitionRequest) returns (stream WatchIndexDefinitionResponse);
+  rpc WatchIndexPartition(WatchIndexPartitionRequest) returns (stream WatchIndexPartitionResponse);
   rpc ListIndexDiagnostics(ListIndexDiagnosticsRequest) returns (ListIndexDiagnosticsResponse);
 }
 
@@ -179,6 +180,33 @@ message WatchIndexDefinitionResponse {
     string event_type = 2;
     IndexDefinitionRecord index = 3;
     string emitted_at = 4;
+}
+
+message WatchIndexPartitionRequest {
+    string bucket_name = 1;
+    string index_name = 2;
+    string partition_id = 3;
+    uint64 after_cursor_low = 4;
+    uint64 after_cursor_high = 5;
+}
+
+message WatchIndexPartitionResponse {
+    uint64 cursor_low = 1;
+    uint64 cursor_high = 2;
+    string bucket_name = 3;
+    string index_name = 4;
+    string index_storage_id = 5;
+    string partition_id = 6;
+    string event_type = 7;
+    string index_kind = 8;
+    uint64 generation = 9;
+    uint64 source_cursor_low = 10;
+    uint64 source_cursor_high = 11;
+    string source_manifest_hash = 12;
+    string proof_hash = 13;
+    repeated string segment_hashes = 14;
+    uint64 authz_revision = 15;
+    string emitted_at = 16;
 }
 
 message ListIndexDiagnosticsRequest {

@@ -5,7 +5,8 @@ use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::{
     CreateBucketRequest, CreateIndexRequest, DisableIndexRequest, DropIndexRequest,
     ListIndexDiagnosticsRequest, ListIndexesRequest, ObjectMetadata, PutObjectRequest,
-    QueryIndexRequest, UpdateIndexRequest, WatchIndexDefinitionRequest, WriteAuthzTupleRequest,
+    QueryIndexRequest, UpdateIndexRequest, WatchIndexDefinitionRequest, WatchIndexPartitionRequest,
+    WriteAuthzTupleRequest,
 };
 use anvil::formats::full_text::{FullTextDocument, build_full_text_postings};
 use anvil::formats::vector::{VectorMetric, VectorModality, VectorPayload, VectorRecord};
@@ -322,6 +323,37 @@ async fn test_full_text_index_builds_from_object_write_task() {
     assert_eq!(response.index_kind, "full_text");
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "docs/alpha.txt");
+
+    let mut watch = index_client
+        .watch_index_partition(authorized(
+            WatchIndexPartitionRequest {
+                bucket_name: bucket_name.clone(),
+                index_name: "body".to_string(),
+                partition_id: String::new(),
+                after_cursor_low: 0,
+                after_cursor_high: 0,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let watch_event = tokio::time::timeout(Duration::from_secs(5), watch.next())
+        .await
+        .expect("index partition watch should yield a built segment event")
+        .expect("index partition watch stream should stay open")
+        .expect("index partition watch event should be successful");
+    assert_eq!(watch_event.bucket_name, bucket_name);
+    assert_eq!(watch_event.index_name, "body");
+    assert_eq!(watch_event.event_type, "segment_built");
+    assert_eq!(watch_event.index_kind, "full_text");
+    assert_eq!(watch_event.generation, response.index_generation);
+    assert!(!watch_event.index_storage_id.is_empty());
+    assert!(!watch_event.partition_id.is_empty());
+    assert!(!watch_event.source_manifest_hash.is_empty());
+    assert!(!watch_event.proof_hash.is_empty());
+    assert!(!watch_event.segment_hashes.is_empty());
+
     let tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
     assert!(tasks.iter().any(|task| {
         task.task_type == anvil::tasks::TaskType::IndexBuild

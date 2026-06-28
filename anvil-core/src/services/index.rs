@@ -6,12 +6,13 @@ use crate::{
         full_text::{Bm25Config, FullTextIndexDefinition},
         vector::VectorMetric,
     },
-    full_text_segment, index_journal,
+    full_text_segment, index_journal, index_partition_watch,
     permissions::AnvilAction,
     search_query, validation, vector_segment,
 };
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -20,6 +21,9 @@ use tonic::{Request, Response, Status};
 impl IndexService for AppState {
     type WatchIndexDefinitionStream = std::pin::Pin<
         Box<dyn futures_core::Stream<Item = Result<WatchIndexDefinitionResponse, Status>> + Send>,
+    >;
+    type WatchIndexPartitionStream = std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = Result<WatchIndexPartitionResponse, Status>> + Send>,
     >;
 
     async fn create_index(
@@ -333,6 +337,120 @@ impl IndexService for AppState {
 
         Ok(Response::new(
             Box::pin(ReceiverStream::new(rx)) as Self::WatchIndexDefinitionStream
+        ))
+    }
+
+    async fn watch_index_partition(
+        &self,
+        request: Request<WatchIndexPartitionRequest>,
+    ) -> Result<Response<Self::WatchIndexPartitionStream>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        validate_index_name(&req.index_name)?;
+        if !auth::is_authorized(AnvilAction::IndexWatch, &req.bucket_name, &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+        let bucket = self
+            .get_index_bucket(claims.tenant_id, &req.bucket_name)
+            .await?;
+        let index = self
+            .persistence
+            .get_index_definition(claims.tenant_id, bucket.id, &req.index_name)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .filter(|index| index.enabled)
+            .ok_or_else(|| Status::not_found("Index definition not found"))?;
+        let index_storage_id =
+            index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
+        let partition_id = if req.partition_id.trim().is_empty() {
+            hex::encode(crate::formats::hash32(index_storage_id.as_bytes()))
+        } else {
+            validate_hex32(&req.partition_id, "partition_id")?;
+            req.partition_id
+        };
+        let after_cursor = join_u128(req.after_cursor_low, req.after_cursor_high);
+        let snapshot = index_partition_watch::list_index_partition_watch_events(
+            &self.storage,
+            claims.tenant_id,
+            bucket.id,
+            &index_storage_id,
+            &partition_id,
+            after_cursor,
+            1000,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+        let storage = self.storage.clone();
+        let bucket_name = bucket.name.clone();
+        let index_name = index.name.clone();
+        let tenant_id = claims.tenant_id;
+        let bucket_id = bucket.id;
+        let (tx, rx) = mpsc::channel(32);
+        tokio::spawn(async move {
+            let mut last_cursor = after_cursor;
+            for event in snapshot {
+                last_cursor = last_cursor.max(event.cursor);
+                if tx
+                    .send(Ok(index_partition_event_response(
+                        &bucket_name,
+                        &index_name,
+                        &index_storage_id,
+                        &partition_id,
+                        event,
+                    )))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                let events = match index_partition_watch::list_index_partition_watch_events(
+                    &storage,
+                    tenant_id,
+                    bucket_id,
+                    &index_storage_id,
+                    &partition_id,
+                    last_cursor,
+                    1000,
+                )
+                .await
+                {
+                    Ok(events) => events,
+                    Err(error) => {
+                        let _ = tx.send(Err(Status::internal(error.to_string()))).await;
+                        return;
+                    }
+                };
+                for event in events {
+                    last_cursor = last_cursor.max(event.cursor);
+                    if tx
+                        .send(Ok(index_partition_event_response(
+                            &bucket_name,
+                            &index_name,
+                            &index_storage_id,
+                            &partition_id,
+                            event,
+                        )))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(
+            Box::pin(ReceiverStream::new(rx)) as Self::WatchIndexPartitionStream
         ))
     }
 
@@ -962,6 +1080,22 @@ fn index_resource(bucket_name: &str, index_name: &str) -> String {
     format!("{}/{}", bucket_name, index_name)
 }
 
+fn validate_hex32(value: &str, field: &'static str) -> Result<(), Status> {
+    if value.len() == 64 && value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(format!("{field} must be hex32")))
+    }
+}
+
+fn split_u128(value: u128) -> (u64, u64) {
+    (value as u64, (value >> 64) as u64)
+}
+
+fn join_u128(low: u64, high: u64) -> u128 {
+    u128::from(low) | (u128::from(high) << 64)
+}
+
 fn index_record(
     bucket_name: &str,
     index: crate::persistence::IndexDefinition,
@@ -980,6 +1114,35 @@ fn index_record(
         created_at: index.created_at.to_string(),
         updated_at: index.updated_at.to_string(),
     })
+}
+
+fn index_partition_event_response(
+    bucket_name: &str,
+    index_name: &str,
+    index_storage_id: &str,
+    partition_id: &str,
+    event: index_partition_watch::IndexPartitionWatchEvent,
+) -> WatchIndexPartitionResponse {
+    let (cursor_low, cursor_high) = split_u128(event.cursor);
+    let (source_cursor_low, source_cursor_high) = split_u128(event.payload.source_cursor);
+    WatchIndexPartitionResponse {
+        cursor_low,
+        cursor_high,
+        bucket_name: bucket_name.to_string(),
+        index_name: index_name.to_string(),
+        index_storage_id: index_storage_id.to_string(),
+        partition_id: partition_id.to_string(),
+        event_type: event.payload.event_type,
+        index_kind: event.payload.index_kind,
+        generation: event.payload.generation,
+        source_cursor_low,
+        source_cursor_high,
+        source_manifest_hash: event.payload.source_manifest_hash,
+        proof_hash: event.payload.proof_hash,
+        segment_hashes: event.payload.segment_hashes,
+        authz_revision: event.authz_revision,
+        emitted_at: event.payload.emitted_at,
+    }
 }
 
 fn index_definition_event_response(
