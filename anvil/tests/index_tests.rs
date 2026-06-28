@@ -513,7 +513,172 @@ async fn test_query_vector_index_reads_latest_segment() {
 }
 
 #[tokio::test]
-async fn test_query_inherit_object_index_fails_closed_until_authz_filter_is_available() {
+async fn test_query_inherit_object_vector_filters_results_by_object_read_scope() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
+
+    let bucket_name = "index-query-inherit-vector-bucket".to_string();
+    bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let created = index_client
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket_name: bucket_name.clone(),
+                name: "embedding".to_string(),
+                kind: "vector".to_string(),
+                selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
+                extractor_json: serde_json::json!({"source": "object_body_utf8"}).to_string(),
+                authorization_mode: "inherit_object".to_string(),
+                build_policy_json: serde_json::json!({
+                    "dimension": 2,
+                    "metric": "cosine",
+                    "modality": "text",
+                    "embedding_model": "test-embedding",
+                    "chunking": {"kind": "whole_object"}
+                })
+                .to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .index
+        .expect("created index");
+
+    let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
+    let bucket = cluster.states[0]
+        .db
+        .get_bucket_by_name(claims.tenant_id, &bucket_name)
+        .await
+        .unwrap()
+        .expect("bucket exists");
+    let allowed_object = cluster.states[0]
+        .db
+        .create_object(
+            claims.tenant_id,
+            bucket.id,
+            "docs/vector-allowed.txt",
+            &hex::encode([6; 32]),
+            8,
+            "etag-vector-allowed",
+            Some("text/plain"),
+            None,
+            None,
+            Some(b"allowed".to_vec()),
+        )
+        .await
+        .unwrap();
+    let denied_object = cluster.states[0]
+        .db
+        .create_object(
+            claims.tenant_id,
+            bucket.id,
+            "docs/vector-denied.txt",
+            &hex::encode([7; 32]),
+            7,
+            "etag-vector-denied",
+            Some("text/plain"),
+            None,
+            None,
+            Some(b"denied".to_vec()),
+        )
+        .await
+        .unwrap();
+    let index_storage_id = anvil::index_journal::index_storage_id(
+        claims.tenant_id,
+        bucket.id,
+        created.index_id as i64,
+    );
+    let graph = HnswGraph {
+        node_count: 2,
+        layers: vec![LayerBlock {
+            layer_index: 0,
+            node_adjacencies: vec![NodeAdjacency {
+                vector_id: 1,
+                neighbors: vec![2],
+            }],
+        }],
+    };
+    write_vector_segment(
+        &cluster.states[0].storage,
+        VectorSegmentWrite {
+            index_id: &index_storage_id,
+            generation: 4,
+            dimension: 2,
+            metric: VectorMetric::Cosine,
+            embedding_model: "test-embedding",
+            modality: VectorModality::Text,
+            hnsw_m: 32,
+            hnsw_ef_construction: 200,
+            source_cursor: 40,
+            authz_revision: 41,
+            entries: &[
+                vector_entry(1, *allowed_object.version_id.as_bytes(), vec![1.0, 0.0]),
+                vector_entry(2, *denied_object.version_id.as_bytes(), vec![0.0, 1.0]),
+            ],
+            hnsw_graph: &graph,
+            deleted_bitset: &[0],
+        },
+    )
+    .await
+    .unwrap();
+
+    let limited_token = cluster.states[0]
+        .jwt_manager
+        .mint_token(
+            "limited-vector-reader".to_string(),
+            vec![
+                format!("index:read|{bucket_name}"),
+                format!("object:read|{bucket_name}/docs/vector-allowed.txt"),
+            ],
+            claims.tenant_id,
+        )
+        .unwrap();
+    let response = index_client
+        .query_index(authorized(
+            QueryIndexRequest {
+                bucket_name,
+                index_name: "embedding".to_string(),
+                query_text: String::new(),
+                query_vector: vec![1.0, 0.0],
+                limit: 2,
+                phrase: false,
+            },
+            &limited_token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(
+        response
+            .hits
+            .iter()
+            .map(|hit| (hit.vector_id, hit.object_key.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(1, "docs/vector-allowed.txt")]
+    );
+}
+
+#[tokio::test]
+async fn test_query_inherit_object_full_text_filters_results_by_object_read_scope() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
@@ -536,7 +701,7 @@ async fn test_query_inherit_object_index_fails_closed_until_authz_filter_is_avai
         .await
         .unwrap();
 
-    index_client
+    let created = index_client
         .create_index(authorized(
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
@@ -550,9 +715,109 @@ async fn test_query_inherit_object_index_fails_closed_until_authz_filter_is_avai
             &token,
         ))
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner()
+        .index
+        .expect("created index");
 
-    let err = index_client
+    let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
+    let bucket = cluster.states[0]
+        .db
+        .get_bucket_by_name(claims.tenant_id, &bucket_name)
+        .await
+        .unwrap()
+        .expect("bucket exists");
+    let allowed_object = cluster.states[0]
+        .db
+        .create_object(
+            claims.tenant_id,
+            bucket.id,
+            "docs/allowed.txt",
+            &hex::encode([4; 32]),
+            15,
+            "etag-allowed",
+            Some("text/plain"),
+            None,
+            None,
+            Some(b"alpha allowed".to_vec()),
+        )
+        .await
+        .unwrap();
+    let denied_object = cluster.states[0]
+        .db
+        .create_object(
+            claims.tenant_id,
+            bucket.id,
+            "docs/denied.txt",
+            &hex::encode([5; 32]),
+            14,
+            "etag-denied",
+            Some("text/plain"),
+            None,
+            None,
+            Some(b"alpha denied".to_vec()),
+        )
+        .await
+        .unwrap();
+    let index_storage_id = anvil::index_journal::index_storage_id(
+        claims.tenant_id,
+        bucket.id,
+        created.index_id as i64,
+    );
+    let postings = build_full_text_postings(
+        &[
+            FullTextDocument {
+                document_id: 1,
+                field_id: 1,
+                object_version_id: *allowed_object.version_id.as_bytes(),
+                authz_label_hash: [1; 32],
+                text: "alpha allowed",
+            },
+            FullTextDocument {
+                document_id: 2,
+                field_id: 1,
+                object_version_id: *denied_object.version_id.as_bytes(),
+                authz_label_hash: [2; 32],
+                text: "alpha denied",
+            },
+            FullTextDocument {
+                document_id: 3,
+                field_id: 1,
+                object_version_id: [9; 16],
+                authz_label_hash: [3; 32],
+                text: "alpha missing metadata",
+            },
+        ],
+        &Default::default(),
+    );
+    write_full_text_segment(
+        &cluster.states[0].storage,
+        FullTextSegmentWrite {
+            index_id: &index_storage_id,
+            generation: 2,
+            tokenizer: serde_json::json!({}),
+            scorer: serde_json::json!({"kind": "bm25"}),
+            source_cursor: 3,
+            authz_revision: 4,
+            built_postings: &postings,
+            document_table: b"",
+        },
+    )
+    .await
+    .unwrap();
+
+    let limited_token = cluster.states[0]
+        .jwt_manager
+        .mint_token(
+            "limited-index-reader".to_string(),
+            vec![
+                format!("index:read|{bucket_name}"),
+                format!("object:read|{bucket_name}/docs/allowed.txt"),
+            ],
+            claims.tenant_id,
+        )
+        .unwrap();
+    let response = index_client
         .query_index(authorized(
             QueryIndexRequest {
                 bucket_name,
@@ -562,13 +827,15 @@ async fn test_query_inherit_object_index_fails_closed_until_authz_filter_is_avai
                 limit: 10,
                 phrase: false,
             },
-            &token,
+            &limited_token,
         ))
         .await
-        .unwrap_err();
+        .unwrap()
+        .into_inner();
 
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-    assert!(err.message().contains("AuthzRevisionUnavailable"));
+    assert_eq!(response.hits.len(), 1);
+    assert_eq!(response.hits[0].object_key, "docs/allowed.txt");
+    assert_eq!(response.hits[0].document_id, 1);
 }
 
 #[tokio::test]

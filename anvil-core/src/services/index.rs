@@ -237,13 +237,12 @@ impl IndexService for AppState {
             .filter(|index| index.enabled)
             .ok_or_else(|| Status::not_found("Index definition not found"))?;
 
-        if index.authorization_mode == "inherit_object" {
-            return Err(Status::failed_precondition("AuthzRevisionUnavailable"));
-        }
-
         match index.kind.as_str() {
-            "full_text" => self.query_full_text_index(&bucket, &index, req).await,
-            "vector" => self.query_vector_index(&bucket, &index, req).await,
+            "full_text" => {
+                self.query_full_text_index(&claims, &bucket, &index, req)
+                    .await
+            }
+            "vector" => self.query_vector_index(&claims, &bucket, &index, req).await,
             "hybrid" => Err(Status::failed_precondition("IndexUnavailable")),
             _ => Err(Status::failed_precondition("IndexDoesNotSupportQuery")),
         }
@@ -405,6 +404,7 @@ impl AppState {
 
     async fn query_full_text_index(
         &self,
+        claims: &auth::Claims,
         bucket: &crate::persistence::Bucket,
         index: &crate::persistence::IndexDefinition,
         req: QueryIndexRequest,
@@ -437,15 +437,24 @@ impl AppState {
                 phrase: req.phrase,
                 bm25: Bm25Config::default(),
                 authorized_labels: None,
-                limit: query_limit(req.limit),
+                limit: internal_candidate_limit(req.limit, &index.authorization_mode),
             },
         )
         .map_err(|e| Status::failed_precondition(format!("{e:?}")))?;
-        let mut hits = Vec::with_capacity(search_hits.len());
+        let requested_limit = query_limit(req.limit);
+        let mut hits = Vec::with_capacity(search_hits.len().min(requested_limit));
         for hit in search_hits {
-            let (object_version_id, object_key) = self
+            let (object_version_id, object_key) = match self
                 .object_ref_for_query_hit(bucket.id, hit.object_version_id)
-                .await?;
+                .await?
+            {
+                Some(object_ref) => object_ref,
+                None if index.authorization_mode == "inherit_object" => continue,
+                None => (String::new(), String::new()),
+            };
+            if !query_hit_visible(claims, &index.authorization_mode, &bucket.name, &object_key) {
+                continue;
+            }
             hits.push(IndexQueryHit {
                 kind: "full_text".to_string(),
                 score: hit.score,
@@ -464,6 +473,9 @@ impl AppState {
                 })
                 .to_string(),
             });
+            if hits.len() >= requested_limit {
+                break;
+            }
         }
 
         Ok(Response::new(QueryIndexResponse {
@@ -478,6 +490,7 @@ impl AppState {
 
     async fn query_vector_index(
         &self,
+        claims: &auth::Claims,
         bucket: &crate::persistence::Bucket,
         index: &crate::persistence::IndexDefinition,
         req: QueryIndexRequest,
@@ -509,14 +522,23 @@ impl AppState {
             &req.query_vector,
             metric,
             None,
-            query_limit(req.limit),
+            internal_candidate_limit(req.limit, &index.authorization_mode),
         )
         .map_err(|e| Status::internal(e.to_string()))?;
-        let mut hits = Vec::with_capacity(search_hits.len());
+        let requested_limit = query_limit(req.limit);
+        let mut hits = Vec::with_capacity(search_hits.len().min(requested_limit));
         for hit in search_hits {
-            let (object_version_id, object_key) = self
+            let (object_version_id, object_key) = match self
                 .object_ref_for_query_hit(bucket.id, hit.object_version_id)
-                .await?;
+                .await?
+            {
+                Some(object_ref) => object_ref,
+                None if index.authorization_mode == "inherit_object" => continue,
+                None => (String::new(), String::new()),
+            };
+            if !query_hit_visible(claims, &index.authorization_mode, &bucket.name, &object_key) {
+                continue;
+            }
             hits.push(IndexQueryHit {
                 kind: "vector".to_string(),
                 score: hit.score,
@@ -535,6 +557,9 @@ impl AppState {
                 })
                 .to_string(),
             });
+            if hits.len() >= requested_limit {
+                break;
+            }
         }
 
         Ok(Response::new(QueryIndexResponse {
@@ -555,17 +580,14 @@ impl AppState {
         &self,
         bucket_id: i64,
         version_bytes: [u8; 16],
-    ) -> Result<(String, String), Status> {
+    ) -> Result<Option<(String, String)>, Status> {
         let version_id = uuid::Uuid::from_bytes(version_bytes);
         let object = self
             .db
             .get_object_version_by_id(bucket_id, version_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        Ok((
-            version_id.to_string(),
-            object.map(|object| object.key).unwrap_or_default(),
-        ))
+        Ok(object.map(|object| (version_id.to_string(), object.key)))
     }
 }
 
@@ -627,6 +649,35 @@ fn query_limit(value: u32) -> usize {
     match value {
         0 => 10,
         other => other.min(1000) as usize,
+    }
+}
+
+fn internal_candidate_limit(value: u32, authorization_mode: &str) -> usize {
+    let limit = query_limit(value);
+    if authorization_mode == "inherit_object" {
+        limit.saturating_mul(20)
+    } else {
+        limit
+    }
+}
+
+fn query_hit_visible(
+    claims: &auth::Claims,
+    authorization_mode: &str,
+    bucket_name: &str,
+    object_key: &str,
+) -> bool {
+    match authorization_mode {
+        "inherit_object" => {
+            !object_key.is_empty()
+                && auth::is_authorized(
+                    AnvilAction::ObjectRead,
+                    &format!("{bucket_name}/{object_key}"),
+                    &claims.scopes,
+                )
+        }
+        "index_only" | "public" => true,
+        _ => false,
     }
 }
 
