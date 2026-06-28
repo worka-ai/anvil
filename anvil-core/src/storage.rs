@@ -93,6 +93,13 @@ impl Storage {
             .join("definitions.anjournal")
     }
 
+    pub fn hf_journal_path(&self) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("hf")
+            .join("huggingface.anjournal")
+    }
+
     pub fn append_journal_path(&self, tenant_id: i64, bucket_id: i64) -> PathBuf {
         self.storage_path
             .join("_anvil")

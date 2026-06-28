@@ -2,8 +2,8 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
-use tokio::sync::{RwLock, mpsc::Sender};
+use std::collections::HashSet;
+use tokio::sync::mpsc::Sender;
 
 use crate::{
     append_journal, authz_journal,
@@ -11,78 +11,61 @@ use crate::{
     cache::MetadataCache,
     cluster::MetadataEvent,
     config::Config,
-    control_journal, index_diagnostic_journal, index_journal, manifest_journal, metadata_journal,
-    model_journal, multipart_journal,
+    control_journal, hf_journal, index_diagnostic_journal, index_journal, manifest_journal,
+    metadata_journal, model_journal, multipart_journal,
     storage::Storage,
     task_journal, watch_log,
 };
 
 #[derive(Debug, Clone)]
 pub struct Persistence {
-    state_path: PathBuf,
     storage: Storage,
-    state: Arc<RwLock<NativeState>>,
     cache: MetadataCache,
     event_publisher: Option<Sender<MetadataEvent>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct NativeState {
-    next_id: i64,
-    hf_keys: Vec<HfKey>,
-    hf_ingestions: Vec<HfIngestion>,
-    hf_items: Vec<HfIngestionItem>,
-}
-
-impl NativeState {
-    fn allocate_id(&mut self) -> i64 {
-        self.next_id += 1;
-        self.next_id
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct HfKey {
+    pub(crate) id: i64,
+    pub(crate) name: String,
+    pub(crate) token_encrypted: Vec<u8>,
+    pub(crate) note: Option<String>,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct HfKey {
-    id: i64,
-    name: String,
-    token_encrypted: Vec<u8>,
-    note: Option<String>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
+pub(crate) struct HfIngestion {
+    pub(crate) id: i64,
+    pub(crate) key_id: i64,
+    pub(crate) tenant_id: i64,
+    pub(crate) requester_app_id: i64,
+    pub(crate) repo: String,
+    pub(crate) revision: String,
+    pub(crate) target_bucket: String,
+    pub(crate) target_region: String,
+    pub(crate) target_prefix: String,
+    pub(crate) include_globs: Vec<String>,
+    pub(crate) exclude_globs: Vec<String>,
+    pub(crate) state: crate::tasks::HFIngestionState,
+    pub(crate) error: Option<String>,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) started_at: Option<DateTime<Utc>>,
+    pub(crate) finished_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct HfIngestion {
-    id: i64,
-    key_id: i64,
-    tenant_id: i64,
-    requester_app_id: i64,
-    repo: String,
-    revision: String,
-    target_bucket: String,
-    target_region: String,
-    target_prefix: String,
-    include_globs: Vec<String>,
-    exclude_globs: Vec<String>,
-    state: crate::tasks::HFIngestionState,
-    error: Option<String>,
-    created_at: DateTime<Utc>,
-    started_at: Option<DateTime<Utc>>,
-    finished_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct HfIngestionItem {
-    id: i64,
-    ingestion_id: i64,
-    path: String,
-    size: Option<i64>,
-    etag: Option<String>,
-    state: crate::tasks::HFIngestionItemState,
-    error: Option<String>,
-    created_at: DateTime<Utc>,
-    started_at: Option<DateTime<Utc>>,
-    finished_at: Option<DateTime<Utc>>,
+pub(crate) struct HfIngestionItem {
+    pub(crate) id: i64,
+    pub(crate) ingestion_id: i64,
+    pub(crate) path: String,
+    pub(crate) size: Option<i64>,
+    pub(crate) etag: Option<String>,
+    pub(crate) state: crate::tasks::HFIngestionItemState,
+    pub(crate) error: Option<String>,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) started_at: Option<DateTime<Utc>>,
+    pub(crate) finished_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,59 +428,11 @@ fn canonical_json_bytes(value: &JsonValue) -> Vec<u8> {
 
 impl Persistence {
     pub fn new(config: &Config, event_publisher: Option<Sender<MetadataEvent>>) -> Result<Self> {
-        let storage = Storage::new_at_sync(&config.storage_path)?;
-        let state_path = PathBuf::from(&config.storage_path)
-            .join("_anvil")
-            .join("meta")
-            .join("native-state.json");
-        if let Some(parent) = state_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let state = if state_path.exists() {
-            let bytes = std::fs::read(&state_path)?;
-            if bytes.is_empty() {
-                NativeState::default()
-            } else {
-                serde_json::from_slice(&bytes)?
-            }
-        } else {
-            NativeState::default()
-        };
         Ok(Self {
-            state_path,
-            storage,
-            state: Arc::new(RwLock::new(state)),
+            storage: Storage::new_at_sync(&config.storage_path)?,
             cache: MetadataCache::new(config),
             event_publisher,
         })
-    }
-
-    async fn persist_state(&self, state: NativeState) -> Result<()> {
-        if let Some(parent) = self.state_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let tmp = self.state_path.with_extension("json.tmp");
-        let bytes = serde_json::to_vec_pretty(&state)?;
-        tokio::fs::write(&tmp, bytes).await?;
-        tokio::fs::rename(&tmp, &self.state_path).await?;
-        Ok(())
-    }
-
-    async fn persist_after_write(&self, state: &NativeState) -> Result<()> {
-        self.persist_state(state.clone()).await
-    }
-
-    async fn refresh_from_disk(&self) -> Result<()> {
-        let bytes = match tokio::fs::read(&self.state_path).await {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => return Err(err.into()),
-        };
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        *self.state.write().await = serde_json::from_slice(&bytes)?;
-        Ok(())
     }
 
     async fn publish_event(&self, event: MetadataEvent) {
@@ -1805,69 +1740,25 @@ impl Persistence {
         token_encrypted: &[u8],
         note: Option<&str>,
     ) -> Result<()> {
-        let mut state = self.state.write().await;
-        if state.hf_keys.iter().any(|k| k.name == name) {
-            return Err(anyhow!("hugging face key already exists"));
-        }
-        let now = Utc::now();
-        let key = HfKey {
-            id: state.allocate_id(),
-            name: name.to_string(),
-            token_encrypted: token_encrypted.to_vec(),
-            note: note.map(ToOwned::to_owned),
-            created_at: now,
-            updated_at: now,
-        };
-        state.hf_keys.push(key);
-        self.persist_after_write(&state).await
+        hf_journal::create_key(&self.storage, name, token_encrypted, note).await
     }
 
     pub async fn hf_delete_key(&self, name: &str) -> Result<u64> {
-        let mut state = self.state.write().await;
-        let before = state.hf_keys.len();
-        state.hf_keys.retain(|k| k.name != name);
-        let deleted = before - state.hf_keys.len();
-        if deleted > 0 {
-            self.persist_after_write(&state).await?;
-        }
-        Ok(deleted as u64)
+        hf_journal::delete_key(&self.storage, name).await
     }
 
     pub async fn hf_get_key_encrypted(&self, name: &str) -> Result<Option<(i64, Vec<u8>)>> {
-        Ok(self
-            .state
-            .read()
-            .await
-            .hf_keys
-            .iter()
-            .find(|k| k.name == name)
-            .map(|k| (k.id, k.token_encrypted.clone())))
+        hf_journal::get_key_encrypted(&self.storage, name).await
     }
 
     pub async fn hf_get_key_encrypted_by_id(&self, id: i64) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .state
-            .read()
-            .await
-            .hf_keys
-            .iter()
-            .find(|key| key.id == id)
-            .map(|key| key.token_encrypted.clone()))
+        hf_journal::get_key_encrypted_by_id(&self.storage, id).await
     }
 
     pub async fn hf_list_keys(
         &self,
     ) -> Result<Vec<(String, Option<String>, DateTime<Utc>, DateTime<Utc>)>> {
-        let mut keys = self
-            .state
-            .read()
-            .await
-            .hf_keys
-            .iter()
-            .map(|k| (k.name.clone(), k.note.clone(), k.created_at, k.updated_at))
-            .collect::<Vec<_>>();
-        keys.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(keys)
+        hf_journal::list_keys(&self.storage).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1884,50 +1775,24 @@ impl Persistence {
         include_globs: &[String],
         exclude_globs: &[String],
     ) -> Result<i64> {
-        let mut state = self.state.write().await;
-        let id = state.allocate_id();
-        state.hf_ingestions.push(HfIngestion {
-            id,
+        hf_journal::create_ingestion(
+            &self.storage,
             key_id,
             tenant_id,
             requester_app_id,
-            repo: repo.to_string(),
-            revision: revision.unwrap_or("main").to_string(),
-            target_bucket: target_bucket.to_string(),
-            target_region: target_region.to_string(),
-            target_prefix: target_prefix.unwrap_or_default().to_string(),
-            include_globs: include_globs.to_vec(),
-            exclude_globs: exclude_globs.to_vec(),
-            state: crate::tasks::HFIngestionState::Queued,
-            error: None,
-            created_at: Utc::now(),
-            started_at: None,
-            finished_at: None,
-        });
-        self.persist_after_write(&state).await?;
-        Ok(id)
+            repo,
+            revision,
+            target_bucket,
+            target_region,
+            target_prefix,
+            include_globs,
+            exclude_globs,
+        )
+        .await
     }
 
     pub async fn hf_get_ingestion_job(&self, id: i64) -> Result<Option<HfIngestionJob>> {
-        Ok(self
-            .state
-            .read()
-            .await
-            .hf_ingestions
-            .iter()
-            .find(|h| h.id == id)
-            .map(|h| HfIngestionJob {
-                key_id: h.key_id,
-                tenant_id: h.tenant_id,
-                requester_app_id: h.requester_app_id,
-                repo: h.repo.clone(),
-                revision: h.revision.clone(),
-                target_bucket: h.target_bucket.clone(),
-                target_region: h.target_region.clone(),
-                target_prefix: h.target_prefix.clone(),
-                include_globs: h.include_globs.clone(),
-                exclude_globs: h.exclude_globs.clone(),
-            }))
+        hf_journal::get_ingestion_job(&self.storage, id).await
     }
 
     pub async fn hf_update_ingestion_state(
@@ -1936,44 +1801,11 @@ impl Persistence {
         state_value: crate::tasks::HFIngestionState,
         error: Option<&str>,
     ) -> Result<()> {
-        let mut state = self.state.write().await;
-        if let Some(job) = state.hf_ingestions.iter_mut().find(|h| h.id == id) {
-            job.state = state_value;
-            job.error = error.map(ToOwned::to_owned);
-            if state_value == crate::tasks::HFIngestionState::Running && job.started_at.is_none() {
-                job.started_at = Some(Utc::now());
-            }
-            if matches!(
-                state_value,
-                crate::tasks::HFIngestionState::Completed
-                    | crate::tasks::HFIngestionState::Failed
-                    | crate::tasks::HFIngestionState::Canceled
-            ) {
-                job.finished_at = Some(Utc::now());
-            }
-        }
-        self.persist_after_write(&state).await
+        hf_journal::update_ingestion_state(&self.storage, id, state_value, error).await
     }
 
     pub async fn hf_cancel_ingestion(&self, id: i64) -> Result<u64> {
-        let mut state = self.state.write().await;
-        let mut updated = 0;
-        if let Some(job) = state.hf_ingestions.iter_mut().find(|h| {
-            h.id == id
-                && matches!(
-                    h.state,
-                    crate::tasks::HFIngestionState::Queued
-                        | crate::tasks::HFIngestionState::Running
-                )
-        }) {
-            job.state = crate::tasks::HFIngestionState::Canceled;
-            job.finished_at = Some(Utc::now());
-            updated = 1;
-        }
-        if updated > 0 {
-            self.persist_after_write(&state).await?;
-        }
-        Ok(updated)
+        hf_journal::cancel_ingestion(&self.storage, id).await
     }
 
     pub async fn hf_add_item(
@@ -1983,33 +1815,7 @@ impl Persistence {
         size: Option<i64>,
         etag: Option<&str>,
     ) -> Result<i64> {
-        let mut state = self.state.write().await;
-        if let Some(item) = state
-            .hf_items
-            .iter_mut()
-            .find(|i| i.ingestion_id == ingestion_id && i.path == path)
-        {
-            item.size = size;
-            item.etag = etag.map(ToOwned::to_owned);
-            let id = item.id;
-            self.persist_after_write(&state).await?;
-            return Ok(id);
-        }
-        let id = state.allocate_id();
-        state.hf_items.push(HfIngestionItem {
-            id,
-            ingestion_id,
-            path: path.to_string(),
-            size,
-            etag: etag.map(ToOwned::to_owned),
-            state: crate::tasks::HFIngestionItemState::Queued,
-            error: None,
-            created_at: Utc::now(),
-            started_at: None,
-            finished_at: None,
-        });
-        self.persist_after_write(&state).await?;
-        Ok(id)
+        hf_journal::add_item(&self.storage, ingestion_id, path, size, etag).await
     }
 
     pub async fn hf_update_item_state(
@@ -2018,54 +1824,18 @@ impl Persistence {
         state_value: crate::tasks::HFIngestionItemState,
         error: Option<&str>,
     ) -> Result<()> {
-        let mut state = self.state.write().await;
-        if let Some(item) = state.hf_items.iter_mut().find(|i| i.id == id) {
-            item.state = state_value;
-            item.error = error.map(ToOwned::to_owned);
-            if state_value == crate::tasks::HFIngestionItemState::Downloading
-                && item.started_at.is_none()
-            {
-                item.started_at = Some(Utc::now());
-            }
-            if matches!(
-                state_value,
-                crate::tasks::HFIngestionItemState::Stored
-                    | crate::tasks::HFIngestionItemState::Failed
-                    | crate::tasks::HFIngestionItemState::Skipped
-            ) {
-                item.finished_at = Some(Utc::now());
-            }
-        }
-        self.persist_after_write(&state).await
+        hf_journal::update_item_state(&self.storage, id, state_value, error).await
     }
 
     pub async fn hf_update_item_success(&self, id: i64, size: i64, etag: &str) -> Result<()> {
-        let mut state = self.state.write().await;
-        if let Some(item) = state.hf_items.iter_mut().find(|i| i.id == id) {
-            item.state = crate::tasks::HFIngestionItemState::Stored;
-            item.size = Some(size);
-            item.etag = Some(etag.to_string());
-            item.finished_at = Some(Utc::now());
-        }
-        self.persist_after_write(&state).await
+        hf_journal::update_item_success(&self.storage, id, size, etag).await
     }
 
     pub async fn hf_get_ingestion_items(
         &self,
         ingestion_id: i64,
     ) -> Result<Vec<(String, Option<i64>, Option<String>, Option<DateTime<Utc>>)>> {
-        Ok(self
-            .state
-            .read()
-            .await
-            .hf_items
-            .iter()
-            .filter(|i| {
-                i.ingestion_id == ingestion_id
-                    && i.state == crate::tasks::HFIngestionItemState::Stored
-            })
-            .map(|i| (i.path.clone(), i.size, i.etag.clone(), i.finished_at))
-            .collect())
+        hf_journal::get_ingestion_items(&self.storage, ingestion_id).await
     }
 
     pub async fn hf_get_all_items_for_prefix(
@@ -2074,24 +1844,7 @@ impl Persistence {
         bucket: &str,
         prefix: &str,
     ) -> Result<Vec<(String, Option<i64>, Option<String>, Option<DateTime<Utc>>)>> {
-        let state = self.state.read().await;
-        let ingestion_ids = state
-            .hf_ingestions
-            .iter()
-            .filter(|h| {
-                h.tenant_id == tenant_id && h.target_bucket == bucket && h.target_prefix == prefix
-            })
-            .map(|h| h.id)
-            .collect::<HashSet<_>>();
-        Ok(state
-            .hf_items
-            .iter()
-            .filter(|i| {
-                ingestion_ids.contains(&i.ingestion_id)
-                    && i.state == crate::tasks::HFIngestionItemState::Stored
-            })
-            .map(|i| (i.path.clone(), i.size, i.etag.clone(), i.finished_at))
-            .collect())
+        hf_journal::get_all_items_for_prefix(&self.storage, tenant_id, bucket, prefix).await
     }
 
     pub async fn hf_status_summary(
@@ -2108,59 +1861,6 @@ impl Persistence {
         Option<DateTime<Utc>>,
         DateTime<Utc>,
     )> {
-        let state = self.state.read().await;
-        let job = state
-            .hf_ingestions
-            .iter()
-            .find(|h| h.id == id)
-            .ok_or_else(|| anyhow!("ingestion not found"))?;
-        let queued = state
-            .hf_items
-            .iter()
-            .filter(|i| {
-                i.ingestion_id == id && i.state == crate::tasks::HFIngestionItemState::Queued
-            })
-            .count() as i64;
-        let downloading = state
-            .hf_items
-            .iter()
-            .filter(|i| {
-                i.ingestion_id == id && i.state == crate::tasks::HFIngestionItemState::Downloading
-            })
-            .count() as i64;
-        let stored = state
-            .hf_items
-            .iter()
-            .filter(|i| {
-                i.ingestion_id == id && i.state == crate::tasks::HFIngestionItemState::Stored
-            })
-            .count() as i64;
-        let failed = state
-            .hf_items
-            .iter()
-            .filter(|i| {
-                i.ingestion_id == id && i.state == crate::tasks::HFIngestionItemState::Failed
-            })
-            .count() as i64;
-        let state_text = if job.state == crate::tasks::HFIngestionState::Running
-            && queued == 0
-            && downloading == 0
-            && (stored > 0 || failed > 0)
-        {
-            "completed".to_string()
-        } else {
-            job.state.as_str().to_string()
-        };
-        Ok((
-            state_text,
-            queued,
-            downloading,
-            stored,
-            failed,
-            job.error.clone(),
-            job.started_at,
-            job.finished_at,
-            job.created_at,
-        ))
+        hf_journal::status_summary(&self.storage, id).await
     }
 }

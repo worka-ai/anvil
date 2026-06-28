@@ -324,6 +324,7 @@ pub enum JournalRecordKind {
     MultipartMetadata = 14,
     AppendMetadata = 15,
     ManifestCas = 16,
+    HfMetadata = 17,
 }
 
 impl JournalRecordKind {
@@ -345,6 +346,7 @@ impl JournalRecordKind {
             14 => Ok(Self::MultipartMetadata),
             15 => Ok(Self::AppendMetadata),
             16 => Ok(Self::ManifestCas),
+            17 => Ok(Self::HfMetadata),
             other => Err(FormatError::UnsupportedFamily(other)),
         }
     }
