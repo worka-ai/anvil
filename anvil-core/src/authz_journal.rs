@@ -63,6 +63,7 @@ pub(crate) async fn write_authz_tuple_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<AuthzTupleRecord> {
     require_authz_permit(input.tenant_id, permit)?;
+    validate_optional_caveat_hash(input.caveat_hash)?;
     validate_partition_write(storage, permit, partition_owner_signing_key).await?;
     write_authz_tuple_inner(storage, input, permit.fence_token).await
 }
@@ -72,6 +73,7 @@ async fn write_authz_tuple_inner(
     input: AuthzTupleWrite<'_>,
     fence_token: u64,
 ) -> Result<AuthzTupleRecord> {
+    validate_optional_caveat_hash(input.caveat_hash)?;
     let revision = latest_authz_revision(storage, input.tenant_id)
         .await?
         .checked_add(1)
@@ -223,6 +225,17 @@ pub async fn check_authz_tuple(
         i64::MAX,
     )
     .await
+}
+
+pub fn validate_optional_caveat_hash(value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    if value.len() == 64 && value.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        Ok(())
+    } else {
+        Err(anyhow!("caveat_hash must be empty or hex32"))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -745,6 +758,14 @@ mod tests {
             .unwrap();
         assert_eq!(watched.len(), 2);
         assert_eq!(watched[1].revision, 2);
+    }
+
+    #[test]
+    fn caveat_hash_validation_accepts_empty_or_hex32_only() {
+        validate_optional_caveat_hash("").unwrap();
+        validate_optional_caveat_hash(&hex::encode([7; 32])).unwrap();
+        validate_optional_caveat_hash("not-hex32").unwrap_err();
+        validate_optional_caveat_hash(&hex::encode([7; 31])).unwrap_err();
     }
 
     #[tokio::test]

@@ -196,6 +196,7 @@ impl AuthService for AppState {
         validate_tuple_field("relation", &req.relation)?;
         validate_tuple_field("subject_kind", &req.subject_kind)?;
         validate_tuple_field("subject_id", &req.subject_id)?;
+        validate_caveat_hash(&req.caveat_hash)?;
         let operation = match req.operation.as_str() {
             "add" | "remove" => req.operation.as_str(),
             _ => return Err(Status::invalid_argument("operation must be add or remove")),
@@ -271,6 +272,7 @@ impl AuthService for AppState {
         validate_tuple_field("relation", &req.relation)?;
         validate_tuple_field("subject_kind", &req.subject_kind)?;
         validate_tuple_field("subject_id", &req.subject_id)?;
+        validate_caveat_hash(&req.caveat_hash)?;
         let resource = authz_resource(&req.namespace, &req.object_id, &req.relation);
         if !auth::is_authorized(AnvilAction::AuthzCheck, &resource, &claims.scopes) {
             return Err(Status::permission_denied("Permission denied"));
@@ -573,6 +575,11 @@ fn validate_tuple_field(name: &str, value: &str) -> Result<(), Status> {
         )));
     }
     Ok(())
+}
+
+fn validate_caveat_hash(value: &str) -> Result<(), Status> {
+    authz_journal::validate_optional_caveat_hash(value)
+        .map_err(|err| Status::invalid_argument(err.to_string()))
 }
 
 fn validate_watch_component(name: &str, value: &str) -> Result<(), Status> {

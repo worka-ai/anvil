@@ -580,6 +580,60 @@ async fn test_authz_tuple_write_check_and_watch() {
 }
 
 #[tokio::test]
+async fn test_authz_tuple_rejects_invalid_caveat_hash_before_writing() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    let mut invalid_write = Request::new(WriteAuthzTupleRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: "not-a-hex32-caveat".to_string(),
+        operation: "add".to_string(),
+        reason: "invalid caveat".to_string(),
+    });
+    add_bearer(&mut invalid_write, &token);
+    let status = auth_client
+        .write_authz_tuple(invalid_write)
+        .await
+        .expect_err("invalid caveat hash must be rejected");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert_eq!(
+        cluster.states[0]
+            .persistence
+            .latest_authz_revision(1)
+            .await
+            .unwrap(),
+        0,
+        "invalid caveat input must not append an authz revision"
+    );
+
+    let mut invalid_check = Request::new(CheckPermissionRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: "not-a-hex32-caveat".to_string(),
+        consistency: "latest".to_string(),
+        zookie: String::new(),
+    });
+    add_bearer(&mut invalid_check, &token);
+    let status = auth_client
+        .check_permission(invalid_check)
+        .await
+        .expect_err("invalid caveat hash must be rejected");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
 async fn test_authz_permission_resolves_nested_usersets() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
