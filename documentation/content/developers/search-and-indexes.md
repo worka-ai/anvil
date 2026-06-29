@@ -5,7 +5,7 @@ description: Define and query metadata, full text, vector, and hybrid indexes in
 
 # Search And Indexes
 
-**What this page gives you:** a developer workflow for building search features with Anvil. You will learn how to map user intent to index definitions, query shapes, consistency choices, and authorization-safe results.
+**What this page gives you:** a developer workflow for building search features with Anvil. You will learn how to map user intent to index definitions, query shapes, consistency choices, and authorisation-safe results.
 
 Search is a product feature. Users do not care which index family answered the query; they care that results are relevant, fast, current enough, and permitted. Your code should express the user's question clearly enough for Anvil to use the right index and security model.
 
@@ -16,7 +16,7 @@ Write the product query in plain language:
 - "Show invoices for this customer from last month."
 - "Find contracts that mention limitation of liability."
 - "Show images similar to this one."
-- "Find artifacts produced by build 1842."
+- "Find artefacts produced by build 1842."
 - "Search documents I am allowed to see."
 
 Then choose index families.
@@ -51,7 +51,7 @@ filters:
 snippet: true
 ```
 
-Treat snippets as object exposure. They must be returned only for authorized results.
+Treat snippets as object exposure. They must be returned only for authorised results.
 
 ## Vector query
 
@@ -97,7 +97,7 @@ Examples:
 - after uploading a document, the UI may wait for the metadata index to include it;
 - full text extraction may show "indexing" until text is available;
 - semantic search may show a partial state until embeddings finish;
-- a permission change may require authorization-derived indexes to catch up before showing results.
+- a permission change may require authorisation-derived indexes to catch up before showing results.
 
 If Anvil reports `IndexNotReady`, that is not an error to bypass. It is a consistency signal.
 
@@ -109,7 +109,7 @@ A good result item should include enough information to render and debug:
 - object version;
 - title or display metadata;
 - matched fields;
-- snippet where requested and authorized;
+- snippet where requested and authorised;
 - score components when useful;
 - index generation or cursor;
 - request id for diagnostics.
@@ -118,4 +118,4 @@ Keep the result tied to source version. If the user opens it, the application ca
 
 ## What you can build after this page
 
-You should be able to define search features around metadata, full text, vector, and hybrid indexes while preserving authorization and consistency. Next, use PersonalDB when the application needs local-first database sync rather than object-only workflows.
+You should be able to define search features around metadata, full text, vector, and hybrid indexes while preserving authorisation and consistency. Next, use PersonalDB when the application needs local-first database sync rather than object-only workflows.

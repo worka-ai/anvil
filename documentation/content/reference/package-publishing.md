@@ -1,11 +1,11 @@
 ---
 title: Package Publishing
-description: Published Anvil artifacts and how each package is meant to be used.
+description: Published Anvil artefacts and how each package is meant to be used.
 ---
 
 # Package Publishing
 
-**What this page gives you:** a reference for the artifacts an Anvil release publishes and the audience for each artifact.
+**What this page gives you:** a reference for the artefacts an Anvil release publishes and the audience for each artefact.
 
 Anvil ships multiple packages because developers and operators enter the system through different tools. Operators need a server image. Rust users may install crates and CLI tools. TypeScript and Python users need client packages. Everyone needs documentation matching the release.
 
@@ -30,13 +30,13 @@ The TypeScript package is for Node.js services, web backends, automation, and de
 
 ## Python client
 
-The Python package is for data workflows, importers, automation, model artifact tooling, and service integration. It should include generated gRPC modules, protocol files, package metadata, and connection examples.
+The Python package is for data workflows, importers, automation, model artefact tooling, and service integration. It should include generated gRPC modules, protocol files, package metadata, and connection examples.
 
 ## Documentation site
 
-The documentation site is part of the release. It teaches concepts, guides developers, guides operators, and provides reference material tied to the released behavior.
+The documentation site is part of the release. It teaches concepts, guides developers, guides operators, and provides reference material tied to the released behaviour.
 
-## Artifact relationship
+## Artefact relationship
 
 ```text
 operator deploys Docker image
@@ -49,4 +49,4 @@ operator deploys Docker image
 
 ## What you can do after this page
 
-You should be able to identify which Anvil artifact a user needs and verify that a release includes every expected server, client, and documentation output.
+You should be able to identify which Anvil artefact a user needs and verify that a release includes every expected server, client, and documentation output.

@@ -7,7 +7,7 @@ description: Learn watch streams, cursors, derived indexes, lag, replay, repair,
 
 **What this page gives you:** a model for change streams and derived data. You will learn how Anvil keeps indexes, projections, source views, and operational timelines current without asking every consumer to rescan buckets.
 
-Derived data is data computed from source data. A full text index is derived from object content. A metadata index is derived from object metadata. A vector index is derived from embeddings. A PersonalDB projection is derived from committed changesets. An authorization userset index is derived from relationship tuples.
+Derived data is data computed from source data. A full text index is derived from object content. A metadata index is derived from object metadata. A vector index is derived from embeddings. A PersonalDB projection is derived from committed changesets. An authorisation userset index is derived from relationship tuples.
 
 Derived data is useful because it is fast to query. It is dangerous if it silently drifts from the source. A search index that missed a delete is unsafe. A projection that skipped a commit is wrong. A permissions index that ignored a tuple update can expose private data.
 
@@ -19,17 +19,17 @@ The source of truth is the durable mutation stream. Mutations include:
 
 - object writes and deletes;
 - metadata updates;
-- authorization tuple changes;
+- authorisation tuple changes;
 - index definition changes;
 - PersonalDB commits;
-- source artifact records;
+- source artefact records;
 - control-plane updates.
 
 Each committed mutation has an ordered position. That position is the thing watchers use to know where they are.
 
 ## Watch stream
 
-A watch stream is an ordered feed of changes. A watcher subscribes to a scope such as a bucket, prefix, index family, authorization namespace, or PersonalDB group. The watcher receives events and stores a cursor.
+A watch stream is an ordered feed of changes. A watcher subscribes to a scope such as a bucket, prefix, index family, authorisation namespace, or PersonalDB group. The watcher receives events and stores a cursor.
 
 A cursor is a bookmark:
 
@@ -64,9 +64,9 @@ Examples:
 - a full text index has not extracted a large PDF yet;
 - a vector index is waiting for embeddings;
 - a PersonalDB projection has not processed the latest commit;
-- an authorization userset index has not consumed a tuple update.
+- an authorisation userset index has not consumed a tuple update.
 
-Applications can choose behavior based on lag and required consistency. Some screens can show slightly stale suggestions. A permission-sensitive workflow should wait for the required authorization revision.
+Applications can choose behaviour based on lag and required consistency. Some screens can show slightly stale suggestions. A permission-sensitive workflow should wait for the required authorisation revision.
 
 ## Generations and manifests
 

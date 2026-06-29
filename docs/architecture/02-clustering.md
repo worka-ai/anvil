@@ -35,7 +35,7 @@ pub struct ClusterMessage {
 
 #### Security
 
-To prevent unauthorized nodes from joining the cluster and to ensure message integrity, every `ClusterMessage` is signed using an HMAC-SHA256 signature. The `ANVIL_CLUSTER_SECRET` environment variable provides the shared secret used for signing and verification. When a node receives a gossip message, it first verifies the signature. If the signature is invalid or the message timestamp is too old, the message is discarded.
+To prevent unauthorised nodes from joining the cluster and to ensure message integrity, every `ClusterMessage` is signed using an HMAC-SHA256 signature. The `ANVIL_CLUSTER_SECRET` environment variable provides the shared secret used for signing and verification. When a node receives a gossip message, it first verifies the signature. If the signature is invalid or the message timestamp is too old, the message is discarded.
 
 ### The Cluster State
 

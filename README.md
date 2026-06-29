@@ -1,8 +1,8 @@
 # Anvil
 
-Anvil is a production object storage platform for teams that need storage to do more than accept bytes. It stores objects, but it also keeps metadata indexes, full text search, vector search, relationship authorization, watch streams, source artifacts, and PersonalDB witnessing under one coherent system.
+Anvil is a production object storage platform for teams that need storage to do more than accept bytes. It stores objects, but it also keeps metadata indexes, full text search, vector search, relationship authorisation, watch streams, source artefacts, and PersonalDB witnessing under one coherent system.
 
-Most product teams start with a simple requirement: upload something and read it later. The next requirements arrive quickly: list recent project files, filter by metadata, search inside documents, find similar media, protect every result with fine-grained authorization, update live views when data changes, and sync local-first SQLite data without losing consistency. When those capabilities are assembled from unrelated systems, application code becomes the place where storage correctness is glued together.
+Most product teams start with a simple requirement: upload something and read it later. The next requirements arrive quickly: list recent project files, filter by metadata, search inside documents, find similar media, protect every result with fine-grained authorisation, update live views when data changes, and sync local-first SQLite data without losing consistency. When those capabilities are assembled from unrelated systems, application code becomes the place where storage correctness is glued together.
 
 Anvil moves those concerns into the storage layer.
 
@@ -18,24 +18,24 @@ An object store is a system that stores bytes under names. That foundation is us
 - Which indexes have caught up to this write?
 - Which local database changes were witnessed, certified, projected, and made visible?
 
-Anvil treats these as storage questions rather than application glue. Object identity, metadata, versions, authorization, watches, indexes, and recovery evidence are part of one product model.
+Anvil treats these as storage questions rather than application glue. Object identity, metadata, versions, authorisation, watches, indexes, and recovery evidence are part of one product model.
 
 ## Core Capabilities
 
 - **Object storage:** buckets, keys, object versions, checksums, range reads, multipart flows, and S3-compatible access for existing tooling.
 - **Metadata and path indexes:** predictable key layouts and queryable metadata for fast listings, filters, facets, and operational navigation.
-- **Full text search:** tokenization, ranking, snippets, and authorization-safe search results over object text and extracted content.
-- **Vector search:** semantic retrieval over text, images, audio, and video using vector segments and Rust-native nearest-neighbor indexing.
-- **Relationship authorization:** Zanzibar-style tuples, permissions, caveats, and fail-closed reserved namespaces protecting every exposure path.
+- **Full text search:** tokenization, ranking, snippets, and authorisation-safe search results over object text and extracted content.
+- **Vector search:** semantic retrieval over text, images, audio, and video using vector segments and Rust-native nearest-neighbour indexing.
+- **Relationship authorisation:** relationship tuples, computed permissions, caveats, and fail-closed reserved namespaces protecting every exposure path.
 - **Watch streams:** durable change streams with cursors so indexes, projections, applications, and operators can catch up without rescanning everything.
-- **PersonalDB witnessing:** SQLite changeset verification, commit certificates, snapshots, row metadata, authorized projections, and catch-up support for local-first applications.
-- **Source and model artifacts:** storage patterns for source packs, build outputs, logs, screenshots, model manifests, media derivatives, and reproducibility records.
+- **PersonalDB witnessing:** SQLite changeset verification, commit certificates, snapshots, row metadata, authorised projections, and catch-up support for local-first applications.
+- **Source and model artefacts:** storage patterns for source packs, build outputs, logs, screenshots, model manifests, media derivatives, and reproducibility records.
 
 ## Documentation
 
 The public documentation lives in `documentation/` and is built with Fission.
 
-Start with the learning path if you are new to object storage, indexing, search, authorization, watches, or PersonalDB:
+Start with the learning path if you are new to object storage, indexing, search, authorisation, watches, or PersonalDB:
 
 ```sh
 fission site serve --project-dir documentation
@@ -59,14 +59,14 @@ The documentation is structured as a progressive guide:
 
 ## Development Checks
 
-Run the workspace checks before publishing or changing core behavior:
+Run the workspace checks before publishing or changing core behaviour:
 
 ```sh
 cargo fmt --all -- --check
 cargo test --workspace
 ```
 
-S3 compatibility is a release priority. Changes to request signing, streaming uploads, object operations, metadata, authorization, or bucket behavior should include focused S3 gateway tests and then the full workspace test suite.
+S3 compatibility is a release priority. Changes to request signing, streaming uploads, object operations, metadata, authorisation, or bucket behaviour should include focused S3 gateway tests and then the full workspace test suite.
 
 ## Release Surfaces
 

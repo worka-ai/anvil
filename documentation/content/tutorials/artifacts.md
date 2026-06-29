@@ -1,18 +1,18 @@
 ---
-title: Source, Model, And Ingestion Artifacts
-description: Store source packs, query source trees, manage ingestion keys and jobs, and serve model tensor artifacts.
+title: Source, Model, And Ingestion Artefacts
+description: Store source packs, query source trees, manage ingestion keys and jobs, and serve model tensor artefacts.
 ---
 
-# Source, Model, And Ingestion Artifacts
+# Source, Model, And Ingestion Artefacts
 
 **What this page gives you:** a tutorial for every operation in this area, with Rust, Java, Node.js, and Python tabs for each operation.
 
-Anvil can store more than end-user uploads. Source packs, build outputs, model manifests, tensor shards, and imported model repositories all benefit from the same object identity, metadata, authorization, watches, and search model. This tutorial covers Git source artifacts, model manifests, tensor reads, ingestion keys, and ingestion jobs.
+Anvil can store more than end-user uploads. Source packs, build outputs, model manifests, tensor shards, and imported model repositories all benefit from the same object identity, metadata, authorisation, watches, and search model. This tutorial covers Git source artefacts, model manifests, tensor reads, ingestion keys, and ingestion jobs.
 
 ## Workflow
 
 1. Connect a client with an endpoint and token.
-2. Send a request that names the bucket, object, index, group, resource, or artifact explicitly.
+2. Send a request that names the bucket, object, index, group, resource, or artefact explicitly.
 3. Preserve the returned version, cursor, generation, certificate, or diagnostic id when the response includes one.
 4. Use that returned value for preconditions, watch resume, catch-up, or repair verification.
 
@@ -21,9 +21,6 @@ Anvil can store more than end-user uploads. Source packs, build outputs, model m
 **Operation:** `GitSourceService.PutGitPack`
 
 Stores a source pack and indexes commit, tree, and blob records.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
 
 ```anvil-tabs
 {
@@ -39,10 +36,7 @@ The important rule is to pass the caller identity and request context through th
 
 **Operation:** `GitSourceService.GetGitObject`
 
-Finds where a Git object is stored inside source artifact packs.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
+Finds where a Git object is stored inside source artefact packs.
 
 ```anvil-tabs
 {
@@ -60,9 +54,6 @@ The important rule is to pass the caller identity and request context through th
 
 Resolves a repository commit and path to the stored blob location.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "GetGitBlobByPath",
@@ -79,9 +70,6 @@ The important rule is to pass the caller identity and request context through th
 
 Lists source tree entries below a commit prefix.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "ListGitTree",
@@ -92,14 +80,11 @@ The important rule is to pass the caller identity and request context through th
 }
 ```
 
-## Watch Git source artifacts
+## Watch Git source artefacts
 
 **Operation:** `GitSourceService.WatchGitSource`
 
-Streams source artifact index events.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
+Streams source artefact index events.
 
 ```anvil-tabs
 {
@@ -115,10 +100,7 @@ The important rule is to pass the caller identity and request context through th
 
 **Operation:** `ModelService.PutModelManifest`
 
-Writes a structured model manifest that points at tensor artifacts.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
+Writes a structured model manifest that points at tensor artefacts.
 
 ```anvil-tabs
 {
@@ -136,9 +118,6 @@ The important rule is to pass the caller identity and request context through th
 
 Lists tensors described by a model manifest.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "ListTensors",
@@ -154,9 +133,6 @@ The important rule is to pass the caller identity and request context through th
 **Operation:** `ModelService.GetTensor`
 
 Streams one tensor payload.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
 
 ```anvil-tabs
 {
@@ -174,9 +150,6 @@ The important rule is to pass the caller identity and request context through th
 
 Streams multiple tensor payloads.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "GetTensors",
@@ -192,9 +165,6 @@ The important rule is to pass the caller identity and request context through th
 **Operation:** `HuggingFaceKeyService.CreateKey`
 
 Stores an external ingestion credential by name without returning the secret.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
 
 ```anvil-tabs
 {
@@ -212,9 +182,6 @@ The important rule is to pass the caller identity and request context through th
 
 Lists stored ingestion credentials without exposing secret values.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "ListKeys",
@@ -230,9 +197,6 @@ The important rule is to pass the caller identity and request context through th
 **Operation:** `HuggingFaceKeyService.DeleteKey`
 
 Deletes an external ingestion credential.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
 
 ```anvil-tabs
 {
@@ -250,9 +214,6 @@ The important rule is to pass the caller identity and request context through th
 
 Starts an import job into a target bucket and prefix.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "StartIngestion",
@@ -268,9 +229,6 @@ The important rule is to pass the caller identity and request context through th
 **Operation:** `HfIngestionService.GetIngestionStatus`
 
 Reads import progress, completion, or failure state.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
 
 ```anvil-tabs
 {
@@ -288,9 +246,6 @@ The important rule is to pass the caller identity and request context through th
 
 Requests cancellation of an active import job.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "CancelIngestion",
@@ -303,4 +258,4 @@ The important rule is to pass the caller identity and request context through th
 
 ## What you can do after this page
 
-You should now be able to perform every operation in this area and understand why the request shape matters. Continue to another tutorial area or use the reference pages when you need exact configuration and error behavior.
+You should now be able to perform every operation in this area and understand why the request shape matters. Continue to another tutorial area or use the reference pages when you need exact configuration and error behaviour.

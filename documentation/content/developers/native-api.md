@@ -5,9 +5,9 @@ description: Build applications against Anvil's native API with a production men
 
 # Native API
 
-**What this page gives you:** a developer's model for using Anvil's full capability surface. You will learn when to use the native API, how requests flow, and how to structure application code so storage, search, authorization, watches, and PersonalDB remain coherent.
+**What this page gives you:** a developer's model for using Anvil's full capability surface. You will learn when to use the native API, how requests flow, and how to structure application code so storage, search, authorisation, watches, and PersonalDB remain coherent.
 
-The native API is Anvil's complete interface. S3 compatibility is useful for existing object tools, but S3 cannot express Anvil-specific operations such as index creation, authorization schemas, watch subscriptions, vector search, PersonalDB groups, source manifests, and structured repair diagnostics.
+The native API is Anvil's complete interface. S3 compatibility is useful for existing object tools, but S3 cannot express Anvil-specific operations such as index creation, authorisation schemas, watch subscriptions, vector search, PersonalDB groups, source manifests, and structured repair diagnostics.
 
 Use S3-compatible clients when the job is moving object bytes. Use the native API when the application needs Anvil's integrated model.
 
@@ -21,14 +21,14 @@ client configuration
   -> token exchange or token refresh
   -> request with identity, tenant, scope, and idempotency
   -> authentication
-  -> authorization
+  -> authorisation
   -> validation and preconditions
   -> durable mutation or read
   -> derived events and indexes
   -> response with version, cursor, request id, or diagnostic reason
 ```
 
-That lifecycle matters because a storage request is rarely "just a file operation". A write may affect object state, metadata indexes, full text inputs, vector inputs, watches, source manifests, PersonalDB projections, and authorization-visible query results.
+That lifecycle matters because a storage request is rarely "just a file operation". A write may affect object state, metadata indexes, full text inputs, vector inputs, watches, source manifests, PersonalDB projections, and authorisation-visible query results.
 
 ## Client layering
 
@@ -42,7 +42,7 @@ configuration
   -> UI or business workflow
 ```
 
-Do not scatter endpoint strings, credentials, bucket names, retry behavior, and metadata conventions across product code. A repository layer can own Anvil-specific concerns and present application-level operations such as `upload_contract`, `search_documents`, or `submit_local_changeset`.
+Do not scatter endpoint strings, credentials, bucket names, retry behaviour, and metadata conventions across product code. A repository layer can own Anvil-specific concerns and present application-level operations such as `upload_contract`, `search_documents`, or `submit_local_changeset`.
 
 ## Idempotency and retries
 
@@ -53,7 +53,7 @@ Use idempotency for:
 - object puts where duplicate writes would be harmful;
 - metadata updates from background jobs;
 - PersonalDB commit submissions;
-- source artifact ingestion;
+- source artefact ingestion;
 - administrative operations triggered by automation.
 
 ## Preconditions
@@ -73,7 +73,7 @@ A production object write should normally include:
 - metadata;
 - idempotency key;
 - optional precondition;
-- caller identity and authorization context;
+- caller identity and authorisation context;
 - expected checksum when the client can provide it.
 
 Choose keys and metadata from the application model, not from whichever upload widget happened to send the file.
@@ -86,7 +86,7 @@ Define indexes for the queries the product actually needs. A document applicatio
 - documents by status and customer;
 - full text over extracted text and title;
 - vectors for semantic search;
-- source artifacts by build id;
+- source artefacts by build id;
 - PersonalDB projections by assignee or due date.
 
 Query indexes through the native API with caller identity. Do not fetch broad result sets with administrative credentials and filter locally.
@@ -107,13 +107,13 @@ Common watchers include:
 
 A watcher must be idempotent. It may process the same event after a crash or retry. Write derived outputs so repeating work is safe.
 
-## Authorization-aware application design
+## Authorisation-aware application design
 
 Good pattern:
 
 ```text
 call Anvil with the end-user identity and required action
-  -> receive only authorized objects, rows, snippets, and counts
+  -> receive only authorised objects, rows, snippets, and counts
   -> render the result
 ```
 
@@ -125,7 +125,7 @@ call broad query as admin
   -> hope counts, snippets, timings, and facets did not leak data
 ```
 
-The weak pattern is unsafe. Authorization must protect direct reads, listings, metadata filters, full text snippets, vector neighbors, watches, and PersonalDB projections.
+The weak pattern is unsafe. Authorisation must protect direct reads, listings, metadata filters, full text snippets, vector neighbours, watches, and PersonalDB projections.
 
 ## Error handling
 
@@ -134,7 +134,7 @@ Handle errors by category:
 | Category | Meaning | Developer response |
 | --- | --- | --- |
 | Authentication | No valid identity. | Refresh credentials or ask the user to sign in. |
-| Authorization | Identity exists but lacks permission. | Hide action, request access, or show access denied. |
+| Authorisation | Identity exists but lacks permission. | Hide action, request access, or show access denied. |
 | Precondition | Version, ETag, or expected state changed. | Reload, merge, or retry deliberately. |
 | Idempotency | Same key was reused inconsistently. | Fix caller logic; do not generate a random retry key. |
 | Index readiness | Required derived state is not current. | Show loading, wait, or choose weaker consistency only if safe. |
@@ -143,4 +143,4 @@ Handle errors by category:
 
 ## What you can build after this page
 
-You should be able to design an Anvil client layer that uses credentials, idempotency, preconditions, objects, metadata, indexes, watches, authorization, and PersonalDB deliberately. Next, use the S3 compatibility guide for existing object tools or the object metadata guide for product modeling.
+You should be able to design an Anvil client layer that uses credentials, idempotency, preconditions, objects, metadata, indexes, watches, authorisation, and PersonalDB deliberately. Next, use the S3 compatibility guide for existing object tools or the object metadata guide for product modelling.

@@ -5,9 +5,9 @@ description: Build, test, package, publish, and verify Anvil server images, Rust
 
 # Release Checklist
 
-**What this page gives you:** a repeatable release process. You will know which artifacts must be built, which tests prove them, and what to verify after publishing.
+**What this page gives you:** a repeatable release process. You will know which artefacts must be built, which tests prove them, and what to verify after publishing.
 
-A release is not a tag. A release is a set of installable artifacts that operators and developers can use: server image, Rust crates, CLI, TypeScript client, Python client, protocol files, and documentation.
+A release is not a tag. A release is a set of installable artefacts that operators and developers can use: server image, Rust crates, CLI, TypeScript client, Python client, protocol files, and documentation.
 
 ## Source verification
 
@@ -44,7 +44,7 @@ Build the production image with a fixed version tag. Then run a smoke test that 
 - reserved namespace access is rejected;
 - native object API works;
 - metadata index query works;
-- authorization tuple check works;
+- authorisation tuple check works;
 - metrics and logs are emitted.
 
 ## Rust crates

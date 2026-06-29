@@ -7,7 +7,7 @@ description: Deploy Anvil nodes, configure durable storage, identity, clustering
 
 **What this page gives you:** an operator's introduction to running Anvil in production. You will learn what a node is, what state must be durable, which network addresses matter, and what to verify before users depend on the deployment.
 
-Anvil runs as one server process per node. Every node runs the same binary. A node can serve native API traffic, serve S3-compatible traffic, participate in cluster coordination, own partitions, evaluate authorization, maintain indexes, run leased background responsibilities, and witness PersonalDB commits. There are no separate worker-only binaries; background responsibilities are selected inside Anvil processes.
+Anvil runs as one server process per node. Every node runs the same binary. A node can serve native API traffic, serve S3-compatible traffic, participate in cluster coordination, own partitions, evaluate authorisation, maintain indexes, run leased background responsibilities, and witness PersonalDB commits. There are no separate worker-only binaries; background responsibilities are selected inside Anvil processes.
 
 ## Deployment model
 
@@ -53,7 +53,7 @@ prepare durable volumes
   -> create buckets and policies
   -> run S3 and native API smoke tests
   -> create indexes and verify watch-driven maintenance
-  -> verify authorization, search, and PersonalDB paths
+  -> verify authorisation, search, and PersonalDB paths
 ```
 
 Do not treat process start as deployment success. A node that starts but cannot authorize requests, persist objects, build indexes, or resume watches is not ready.
@@ -66,7 +66,7 @@ Plan for several resource families:
 - metadata and path indexes;
 - full text postings, token data, and snippets;
 - vector segments and HNSW graph memory;
-- authorization tuples and derived userset indexes;
+- authorisation tuples and derived userset indexes;
 - PersonalDB commits, snapshots, and projections;
 - watch logs and cursor retention;
 - background rebuild and repair headroom.
@@ -87,7 +87,7 @@ Before opening the deployment to users, prove:
 8. native object API writes and reads work;
 9. metadata index query returns expected results;
 10. full text and vector index definitions can be created;
-11. authorization tuple writes affect access decisions;
+11. authorisation tuple writes affect access decisions;
 12. watches deliver object events and resume from cursors;
 13. PersonalDB group open and commit returns a certificate;
 14. backup snapshot can be created or scheduled;

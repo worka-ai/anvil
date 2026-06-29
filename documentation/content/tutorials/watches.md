@@ -25,12 +25,12 @@ A watch is not a notification that can be forgotten. It is a durable stream posi
 | `WatchPrefix` | Objects, Versions, Streams, And Multipart Uploads | [Open operation](/tutorials/objects/#watch-a-prefix) |
 | `WatchIndexDefinition` | Indexes And Search | [Open operation](/tutorials/search/#watch-index-definitions) |
 | `WatchIndexPartition` | Indexes And Search | [Open operation](/tutorials/search/#watch-index-partitions) |
-| `WatchAuthzTupleLog` | Authentication And Relationship Authorization | [Open operation](/tutorials/authorization/#watch-authz-tuple-log) |
-| `WatchAuthzNamespace` | Authentication And Relationship Authorization | [Open operation](/tutorials/authorization/#watch-authz-namespace) |
-| `WatchAuthzDerivedLag` | Authentication And Relationship Authorization | [Open operation](/tutorials/authorization/#watch-authz-derived-lag) |
+| `WatchAuthzTupleLog` | Authentication And Relationship Authorisation | [Open operation](/tutorials/authorisation/#watch-authz-tuple-log) |
+| `WatchAuthzNamespace` | Authentication And Relationship Authorisation | [Open operation](/tutorials/authorisation/#watch-authz-namespace) |
+| `WatchAuthzDerivedLag` | Authentication And Relationship Authorisation | [Open operation](/tutorials/authorisation/#watch-authz-derived-lag) |
 | `WatchPersonalDbGroup` | PersonalDB Witnessing | [Open operation](/tutorials/personaldb/#watch-personaldb-group) |
 | `WatchPersonalDbProjection` | PersonalDB Witnessing | [Open operation](/tutorials/personaldb/#watch-personaldb-projection) |
-| `WatchGitSource` | Source, Model, And Ingestion Artifacts | [Open operation](/tutorials/artifacts/#watch-git-source-artifacts) |
+| `WatchGitSource` | Source, Model, And Ingestion Artefacts | [Open operation](/tutorials/artifacts/#watch-git-source-artefacts) |
 
 ## Language pattern
 

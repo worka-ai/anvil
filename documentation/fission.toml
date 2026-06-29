@@ -4,6 +4,9 @@ targets = ["site"]
 name = "Anvil Documentation"
 app_id = "org.anvil.storage.docs"
 
+[package]
+icon = "assets/app-icon.png"
+
 [site]
 entry = "crate::site_app"
 base_path = "/"
@@ -12,14 +15,16 @@ default_locale = "en-GB"
 generate_sitemap = false
 generate_robots = false
 title = "Anvil"
-description = "Anvil is a production object store with native indexing, vector search, full text search, relationship authorization, watch streams, and PersonalDB witness support."
+description = "Anvil is a production object store with native indexing, vector search, full text search, relationship authorisation, watch streams, and PersonalDB witness support."
 logo = "/app-icon.png"
 favicon = "/app-icon.png"
-asset_dirs = ["assets"]
+asset_dirs = ["assets", "site/highlight"]
 css_files = ["site/overrides.css"]
 
 [site.code_highlighting]
 enabled = true
+stylesheet_href = "/anvil-highlight.css"
+script_src = "/anvil-highlight.js"
 
 [site.search]
 enabled = true

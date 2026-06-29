@@ -1,13 +1,13 @@
 ---
 title: Identity And Access
-description: Operate Anvil authentication, scopes, relationship authorization schemas, tuples, caveats, and reserved namespace protections.
+description: Operate Anvil authentication, scopes, relationship authorisation schemas, tuples, caveats, and reserved namespace protections.
 ---
 
 # Identity And Access
 
-**What this page gives you:** an operator's model for credentials, token scopes, relationship authorization, caveats, and safe access audits.
+**What this page gives you:** an operator's model for credentials, token scopes, relationship authorisation, caveats, and safe access audits.
 
-Anvil access control protects every data exposure path: object reads, listings, metadata filters, full text search, vector results, watch streams, PersonalDB state, source artifacts, and administrative APIs. Operators must manage both coarse API credentials and fine-grained relationship policy.
+Anvil access control protects every data exposure path: object reads, listings, metadata filters, full text search, vector results, watch streams, PersonalDB state, source artefacts, and administrative APIs. Operators must manage both coarse API credentials and fine-grained relationship policy.
 
 ## Identity layers
 
@@ -34,6 +34,20 @@ For each credential, document:
 - rotation process;
 - emergency revocation process;
 - expected request volume.
+
+## Authorisation namespaces
+
+An authorisation namespace has two operational meanings that must not be confused.
+
+A tuple namespace label is data inside a tuple, such as `document` in `document:doc-42#viewer@user:amy`. It identifies the protected-object family used for a permission check. It does not create a storage bucket, does not create an object, and does not give the caller authority to define policy.
+
+A namespace schema definition is privileged policy. It defines which relations may exist for a tuple namespace label, which subject kinds may appear on those relations, which usersets may be referenced, which caveats are valid, and which computed relations are valid permission checks.
+
+Treat namespace definitions like production policy code. A namespace change can alter reads, writes, search visibility, watch delivery, and projection output for every object of that type. Do not expose namespace definition writes as ordinary tenant self-service unless that tenant has been explicitly delegated policy-administration authority.
+
+The admin CLI and bootstrap path are for privileged setup: creating tenants, creating applications and secrets, granting coarse token scopes, registering namespace and caveat definitions, and seeding the first owner/admin relationships. Ordinary tenant users should not redefine namespaces, mint scopes, or bypass tuple typing through object writes.
+
+After bootstrap, scoped tenant applications may write allowed relationship tuples, check permissions, and watch authorisation changes only within their grants. They cannot create tenant boundaries, grant themselves broader authority, redefine namespace schemas or caveats, write invalid tuple shapes, or read `_anvil/` internal paths.
 
 ## Relationship schemas
 
@@ -80,4 +94,4 @@ Regularly verify:
 
 ## What you can do after this page
 
-You should be able to operate credentials, scopes, relationship schemas, tuples, caveats, and reserved namespace protections without treating authorization as an application afterthought.
+You should be able to operate credentials, scopes, relationship schemas, tuples, caveats, and reserved namespace protections without treating authorisation as an application afterthought.

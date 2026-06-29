@@ -1,6 +1,6 @@
 ---
 title: Security Errors
-description: Interpret Anvil authentication, authorization, namespace, caveat, precondition, and index-readiness errors.
+description: Interpret Anvil authentication, authorisation, namespace, caveat, precondition, and index-readiness errors.
 ---
 
 # Security Errors
@@ -30,7 +30,7 @@ A forbidden response does not always mean a loud error. If an item should be inv
 
 ## Index readiness
 
-`IndexNotReady` is not an authorization failure. It means the requested derived state has not reached the required cursor or generation. A UI can show a loader; a workflow gate can wait; a background job can retry.
+`IndexNotReady` is not an authorisation failure. It means the requested derived state has not reached the required cursor or generation. A UI can show a loader; a workflow gate can wait; a background job can retry.
 
 ## What you can do after this page
 

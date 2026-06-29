@@ -20,10 +20,10 @@ A complete backup strategy covers:
 - metadata index definitions and generations;
 - full text index segments and tokenizer metadata;
 - vector index segments and HNSW graph material;
-- authorization schemas, tuples, caveats, and derived indexes;
+- authorisation schemas, tuples, caveats, and derived indexes;
 - watch logs, cursors, and checkpoints;
 - PersonalDB commits, snapshots, projections, and certificates;
-- source and model artifact manifests;
+- source and model artefact manifests;
 - control-plane secrets where recoverable by policy;
 - diagnostic and repair findings.
 
@@ -46,7 +46,7 @@ stop affected writers or isolate target
   -> restore durable state
   -> start Anvil in recovery mode or controlled environment
   -> validate object manifests and hashes
-  -> validate authorization state
+  -> validate authorisation state
   -> validate watch cursors
   -> validate index generations
   -> rebuild invalid derived structures
@@ -55,7 +55,7 @@ stop affected writers or isolate target
   -> resume normal traffic
 ```
 
-Do not skip validation. A deployment that starts after restore may still have stale indexes or invalid authorization-derived state.
+Do not skip validation. A deployment that starts after restore may still have stale indexes or invalid authorisation-derived state.
 
 ## Recovery testing
 
@@ -66,7 +66,7 @@ A release-quality recovery drill should prove:
 3. prefix listings match expected counts;
 4. metadata filters return expected results;
 5. full text and vector indexes either validate or rebuild;
-6. relationship authorization decisions match expected fixtures;
+6. relationship authorisation decisions match expected fixtures;
 7. reserved namespaces remain inaccessible through public APIs;
 8. watches resume without event loss;
 9. PersonalDB groups open and accepted heads match certificates;

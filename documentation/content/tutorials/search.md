@@ -7,12 +7,12 @@ description: Create, update, query, disable, drop, watch, and diagnose Anvil ind
 
 **What this page gives you:** a tutorial for every operation in this area, with Rust, Java, Node.js, and Python tabs for each operation.
 
-Indexes turn stored objects into fast product queries. Directory and metadata indexes answer structural questions. Full text indexes answer language questions. Vector indexes answer semantic similarity questions. Hybrid indexes combine signals. This tutorial shows the complete index lifecycle and the query path that keeps authorization attached to results.
+Indexes turn stored objects into fast product queries. Directory and metadata indexes answer structural questions. Full text indexes answer language questions. Vector indexes answer semantic similarity questions. Hybrid indexes combine signals. This tutorial shows the complete index lifecycle and the query path that keeps authorisation attached to results.
 
 ## Workflow
 
 1. Connect a client with an endpoint and token.
-2. Send a request that names the bucket, object, index, group, resource, or artifact explicitly.
+2. Send a request that names the bucket, object, index, group, resource, or artefact explicitly.
 3. Preserve the returned version, cursor, generation, certificate, or diagnostic id when the response includes one.
 4. Use that returned value for preconditions, watch resume, catch-up, or repair verification.
 
@@ -21,9 +21,6 @@ Indexes turn stored objects into fast product queries. Directory and metadata in
 **Operation:** `IndexService.CreateIndex`
 
 Creates a derived query structure for path, metadata, full text, vector, hybrid, source, or PersonalDB data.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
 
 ```anvil-tabs
 {
@@ -39,10 +36,7 @@ The important rule is to pass the caller identity and request context through th
 
 **Operation:** `IndexService.UpdateIndex`
 
-Changes selector, extractor, authorization, or build policy while preserving the named index identity.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
+Changes selector, extractor, authorisation, or build policy while preserving the named index identity.
 
 ```anvil-tabs
 {
@@ -60,9 +54,6 @@ The important rule is to pass the caller identity and request context through th
 
 Lists index definitions for a bucket.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "ListIndexes",
@@ -77,10 +68,7 @@ The important rule is to pass the caller identity and request context through th
 
 **Operation:** `IndexService.QueryIndex`
 
-Runs a path, metadata, full text, vector, or hybrid query and filters results through authorization.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
+Runs a path, metadata, full text, vector, or hybrid query and filters results through authorisation.
 
 ```anvil-tabs
 {
@@ -98,9 +86,6 @@ The important rule is to pass the caller identity and request context through th
 
 Streams index definition changes so clients and workers can react.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "WatchIndexDefinition",
@@ -116,9 +101,6 @@ The important rule is to pass the caller identity and request context through th
 **Operation:** `IndexService.WatchIndexPartition`
 
 Streams partition progress and generation changes for derived index work.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
 
 ```anvil-tabs
 {
@@ -136,9 +118,6 @@ The important rule is to pass the caller identity and request context through th
 
 Returns index build and query findings that explain lag, failures, or repair state.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "ListIndexDiagnostics",
@@ -154,9 +133,6 @@ The important rule is to pass the caller identity and request context through th
 **Operation:** `IndexService.DisableIndex`
 
 Stops an index from serving new queries without deleting its definition immediately.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
 
 ```anvil-tabs
 {
@@ -174,9 +150,6 @@ The important rule is to pass the caller identity and request context through th
 
 Removes the index definition and derived state when the query path is no longer used.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "DropIndex",
@@ -189,4 +162,4 @@ The important rule is to pass the caller identity and request context through th
 
 ## What you can do after this page
 
-You should now be able to perform every operation in this area and understand why the request shape matters. Continue to another tutorial area or use the reference pages when you need exact configuration and error behavior.
+You should now be able to perform every operation in this area and understand why the request shape matters. Continue to another tutorial area or use the reference pages when you need exact configuration and error behaviour.

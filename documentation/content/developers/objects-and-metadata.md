@@ -7,7 +7,7 @@ description: Model application data as object bodies, keys, versions, metadata, 
 
 **What this page gives you:** a method for turning application concepts into Anvil objects. You will learn how to decide what becomes a key, what becomes metadata, what becomes an object body, and what becomes an index.
 
-Object modeling starts from product behavior. Do not begin with the file picker or database table. Begin with the screens, jobs, permissions, and searches your application must support.
+Object modelling starts from product behaviour. Do not begin with the file picker or database table. Begin with the screens, jobs, permissions, and searches your application must support.
 
 ## Start with product questions
 
@@ -17,7 +17,7 @@ List the questions your product must answer:
 - Which filters can the user apply?
 - Which objects are watched for live updates?
 - Which fields are shown in cards or tables?
-- Which objects share an authorization boundary?
+- Which objects share an authorisation boundary?
 - Which background jobs process this data?
 - Which objects are retained, archived, or deleted together?
 
@@ -25,7 +25,7 @@ The answers decide key shape, metadata fields, and index definitions.
 
 ## Choose the object body
 
-The body is the durable payload. It can be a file, a JSON envelope, a compressed archive, a snapshot, or a derived artifact.
+The body is the durable payload. It can be a file, a JSON envelope, a compressed archive, a snapshot, or a derived artefact.
 
 Good object body examples:
 
@@ -48,11 +48,11 @@ The key should express natural scope:
 tenants/acme/projects/p-123/documents/doc-42/original.pdf
 ```
 
-This key tells Anvil and operators where the object belongs. A document list can query the project prefix. A watch can subscribe to the prefix. Authorization can refer to the project. Backup and diagnostics can navigate the same structure.
+This key tells Anvil and operators where the object belongs. A document list can query the project prefix. A watch can subscribe to the prefix. Authorisation can refer to the project. Backup and diagnostics can navigate the same structure.
 
 ## Choose metadata
 
-Metadata should contain fields needed for listing, filtering, sorting, ranking, display, retention, and authorization context. It should not duplicate large object body content.
+Metadata should contain fields needed for listing, filtering, sorting, ranking, display, retention, and authorisation context. It should not duplicate large object body content.
 
 Example:
 
@@ -97,7 +97,7 @@ Create indexes around stable access patterns:
 | `documents_by_customer` | Account views. |
 | `documents_full_text` | User text search. |
 | `documents_embeddings` | Semantic search. |
-| `documents_source_artifacts` | Build or ingestion tracing. |
+| `documents_source_artefacts` | Build or ingestion tracing. |
 
 Avoid one enormous "everything" index. Smaller, purpose-built indexes are easier to reason about, rebuild, authorize, and monitor.
 

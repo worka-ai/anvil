@@ -47,6 +47,13 @@
     return root;
   }
 
+  function highlightTabs(root) {
+    if (!window.hljs || !window.hljs.highlightElement) return;
+    root.querySelectorAll("pre code").forEach((block) => {
+      window.hljs.highlightElement(block);
+    });
+  }
+
   function upgrade() {
     const blocks = Array.from(document.querySelectorAll("code.language-anvil-tabs"));
     blocks.forEach((block, index) => {
@@ -58,7 +65,9 @@
       }
       const pre = block.closest("pre") || block.parentElement;
       if (!pre || !pre.parentNode) return;
-      pre.replaceWith(buildTabs(payload, index));
+      const tabs = buildTabs(payload, index);
+      pre.replaceWith(tabs);
+      highlightTabs(tabs);
     });
   }
 

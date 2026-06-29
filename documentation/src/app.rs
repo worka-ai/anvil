@@ -1,4 +1,4 @@
-use fission::core::op::{AlignItems, BoxShadow, Fill, FlexWrap, JustifyContent};
+use fission::core::op::{AlignItems, BoxShadow, Fill, FlexWrap, ImageFit, JustifyContent};
 use fission::prelude::*;
 use fission::site::FissionSite;
 
@@ -13,7 +13,7 @@ pub fn site_app() -> FissionSite {
         .route_widget::<DocumentationState, _>(
             "/",
             "Anvil",
-            Some("A production object store with indexing, search, authorization, watch streams, and PersonalDB witnessing built in.".to_string()),
+            Some("A production object store with indexing, search, authorisation, watch streams, and PersonalDB witnessing built in.".to_string()),
             HomePage,
         )
         .footer_widget::<DocumentationState, _>(SiteFooter)
@@ -83,6 +83,7 @@ impl From<HomePage> for Widget {
         Container::new(Column {
             gap: Some(76.0),
             children: vec![
+                HomeHeader.into(),
                 HeroSection.into(),
                 PrincipleSection.into(),
                 CapabilitySection.into(),
@@ -103,6 +104,90 @@ impl From<HomePage> for Widget {
         })
         .padding([36.0, 36.0, 42.0, 54.0])
         .into()
+    }
+}
+
+#[derive(Clone)]
+struct HomeHeader;
+
+impl From<HomeHeader> for Widget {
+    fn from(_: HomeHeader) -> Self {
+        Container::new(Row {
+            gap: Some(22.0),
+            wrap: FlexWrap::Wrap,
+            align_items: AlignItems::Center,
+            justify_content: JustifyContent::SpaceBetween,
+            children: vec![
+                Row {
+                    gap: Some(12.0),
+                    align_items: AlignItems::Center,
+                    children: vec![
+                        Image::asset("/app-icon.png")
+                            .size(48.0, 48.0)
+                            .fit(ImageFit::Contain)
+                            .semantic_label("Anvil logo")
+                            .into(),
+                        Text::new("Anvil")
+                            .size(24.0)
+                            .weight(900)
+                            .color(rgb(248, 251, 255))
+                            .semantics_identifier("site-route:/")
+                            .into(),
+                    ],
+                    ..Default::default()
+                }
+                .into(),
+                Row {
+                    gap: Some(16.0),
+                    wrap: FlexWrap::Wrap,
+                    align_items: AlignItems::Center,
+                    justify_content: JustifyContent::End,
+                    children: vec![
+                        HeaderLink::new("Learn", "/learn/overview/").into(),
+                        HeaderLink::new("Tutorials", "/tutorials/overview/").into(),
+                        HeaderLink::new("Developers", "/developers/native-api/").into(),
+                        HeaderLink::new("Operators", "/operators/deployment/").into(),
+                        HeaderLink::new("Reference", "/reference/configuration/").into(),
+                    ],
+                    ..Default::default()
+                }
+                .into(),
+            ],
+            ..Default::default()
+        })
+        .padding([22.0, 22.0, 16.0, 16.0])
+        .bg_fill(Fill::Solid(rgba(21, 29, 56, 185)))
+        .border(rgb(39, 51, 90), 1.0)
+        .border_radius(28.0)
+        .shadow(BoxShadow {
+            color: rgba(0, 0, 0, 72),
+            blur_radius: 24.0,
+            offset: (0.0, 14.0),
+        })
+        .into()
+    }
+}
+
+#[derive(Clone)]
+struct HeaderLink {
+    label: &'static str,
+    href: &'static str,
+}
+
+impl HeaderLink {
+    fn new(label: &'static str, href: &'static str) -> Self {
+        Self { label, href }
+    }
+}
+
+impl From<HeaderLink> for Widget {
+    fn from(link: HeaderLink) -> Self {
+        Text::new(link.label)
+            .size(14.0)
+            .weight(900)
+            .color(rgb(194, 205, 226))
+            .semantics_identifier(format!("site-route:{}", link.href))
+            .into()
     }
 }
 
@@ -132,7 +217,7 @@ impl From<HeroSection> for Widget {
                             .max_width(850.0)
                             .flex_shrink(1.0)
                             .into(),
-                        Text::new("Anvil stores bytes, then keeps the derived systems that make those bytes useful attached to the same source of truth: path and metadata indexes, full text search, vector search, relationship authorization, durable watches, source artifacts, model artifacts, and PersonalDB witnessing.")
+                        Text::new("Anvil stores bytes, then keeps the derived systems that make those bytes useful attached to the same source of truth: path and metadata indexes, full text search, vector search, relationship authorisation, durable watches, source artefacts, model artefacts, and PersonalDB witnessing.")
                             .size(20.0)
                             .line_height(31.0)
                             .color(rgb(194, 205, 226))
@@ -181,7 +266,7 @@ impl From<SystemMap> for Widget {
                     .into(),
                 PipelineLine::new("01", "Commit object", "bytes + metadata + version").into(),
                 PipelineLine::new("02", "Maintain views", "path, text, vector, authz, PersonalDB").into(),
-                PipelineLine::new("03", "Serve safely", "authorized reads, searches, watches, sync").into(),
+                PipelineLine::new("03", "Serve safely", "authorised reads, searches, watches, sync").into(),
                 Container::new(Text::new("No sidecar search service guessing what changed. No app-only permission filter trying to hide leaked snippets. No projection job without a cursor.")
                     .size(14.0)
                     .line_height(22.0)
@@ -235,9 +320,9 @@ impl From<PrincipleSection> for Widget {
                 Container::new(Column {
                     gap: Some(18.0),
                     children: vec![
-                        ArgumentLine::new("Search must know permissions", "Counts, snippets, vectors, facets, and suggestions can leak data if authorization is only applied after the query.").into(),
+                        ArgumentLine::new("Search must know permissions", "Counts, snippets, vectors, facets, and suggestions can leak data if authorisation is only applied after the query.").into(),
                         ArgumentLine::new("Indexes must prove what they consumed", "Derived state is useful only when it exposes cursors, generations, manifests, lag, and repair findings.").into(),
-                        ArgumentLine::new("Local-first sync needs a witness", "SQLite changesets need validation, commit certificates, snapshots, and projections that follow the same authorization model.").into(),
+                        ArgumentLine::new("Local-first sync needs a witness", "SQLite changesets need validation, commit certificates, snapshots, and projections that follow the same authorisation model.").into(),
                     ],
                     ..Default::default()
                 })
@@ -264,7 +349,7 @@ impl From<CapabilitySection> for Widget {
                 SectionIntro::new(
                     "Capabilities",
                     "The feature set is broad because the source facts are shared.",
-                    "Objects, indexes, authorization, watch streams, PersonalDB, source artifacts, and model artifacts all refer to the same buckets, keys, versions, checksums, metadata, and durable mutation cursors.",
+                    "Objects, indexes, authorisation, watch streams, PersonalDB, source artefacts, and model artefacts all refer to the same buckets, keys, versions, checksums, metadata, and durable mutation cursors.",
                 )
                 .into(),
                 Column {
@@ -272,7 +357,7 @@ impl From<CapabilitySection> for Widget {
                     children: vec![
                         CapabilityLine::new("Store", "Buckets, keys, versions, checksums, range reads, multipart uploads, append streams, JSON patching, manifest compare-and-swap.", "/tutorials/objects/").into(),
                         CapabilityLine::new("Find", "Directory indexes, metadata filters, full text search, vector search, hybrid ranking, source indexes, model tensor lookup.", "/tutorials/search/").into(),
-                        CapabilityLine::new("Protect", "Token scopes, public access policy, Zanzibar-style tuples, caveats, permission checks, authz watches, fail-closed internal namespaces.", "/tutorials/authorization/").into(),
+                        CapabilityLine::new("Protect", "Token scopes, public access policy, relationship tuples, caveats, permission checks, authz watches, fail-closed internal namespaces.", "/tutorials/authorisation/").into(),
                         CapabilityLine::new("React", "Bucket metadata watches, prefix watches, index definition watches, partition watches, authz watches, source watches, PersonalDB watches.", "/tutorials/watches/").into(),
                         CapabilityLine::new("Sync", "PersonalDB groups, changesets, catch-up, snapshots, projections, row metadata, projection writeback, witness certificates.", "/tutorials/personaldb/").into(),
                         CapabilityLine::new("Operate", "Index repair, directory repair, authz derived repair, PersonalDB log-chain repair, diagnostics, release smoke tests, package publishing.", "/tutorials/operations/").into(),
@@ -308,9 +393,9 @@ impl From<FlowSection> for Widget {
                 Container::new(Column {
                     gap: Some(14.0),
                     children: vec![
-                        StepText::new("1", "Learn", "Understand object storage, keys, indexes, vectors, authorization, watches, and PersonalDB.").into(),
+                        StepText::new("1", "Learn", "Understand object storage, keys, indexes, vectors, authorisation, watches, and PersonalDB.").into(),
                         StepText::new("2", "Build", "Run tutorials that create buckets, write objects, query indexes, stream watches, and submit PersonalDB changes.").into(),
-                        StepText::new("3", "Operate", "Deploy nodes, issue credentials, monitor lag, repair derived data, and publish release artifacts.").into(),
+                        StepText::new("3", "Operate", "Deploy nodes, issue credentials, monitor lag, repair derived data, and publish release artefacts.").into(),
                     ],
                     ..Default::default()
                 })
@@ -382,7 +467,7 @@ impl From<FinalCta> for Widget {
                             .color(rgb(248, 251, 255))
                             .max_width(720.0)
                             .into(),
-                        Text::new("It gives teams one place to reason about stored bytes, searchable meaning, authorization, live change streams, and local-first database witness state.")
+                        Text::new("It gives teams one place to reason about stored bytes, searchable meaning, authorisation, live change streams, and local-first database witness state.")
                             .size(17.0)
                             .line_height(27.0)
                             .color(rgba(218, 227, 246, 255))

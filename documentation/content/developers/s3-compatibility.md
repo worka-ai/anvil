@@ -9,7 +9,7 @@ description: Use S3-compatible clients with Anvil while understanding the bounda
 
 S3 compatibility means tools that speak the S3 object API can use Anvil for common object operations. That matters because many systems already know how to upload, download, list, range-read, and multipart-upload objects through an S3-style interface.
 
-Compatibility does not mean Anvil is only an S3 service. S3 does not contain concepts for native index definitions, relationship authorization schemas, watch streams, vector search, PersonalDB witnessing, or structured repair. Those features use Anvil's native API.
+Compatibility does not mean Anvil is only an S3 service. S3 does not contain concepts for native index definitions, relationship authorisation schemas, watch streams, vector search, PersonalDB witnessing, or structured repair. Those features use Anvil's native API.
 
 ## What maps cleanly
 
@@ -21,11 +21,11 @@ Compatibility does not mean Anvil is only an S3 service. S3 does not contain con
 | User metadata | Object metadata | Queryable when indexed through native definitions. |
 | ETag/checksum | Version/hash surface | Useful for integrity and preconditions. |
 | LIST prefix | Directory/prefix query | Backed by Anvil path indexes. |
-| GET range | Range read | Authorization and version rules still apply. |
-| Multipart upload | Multipart object assembly | Useful for large artifacts. |
+| GET range | Range read | Authorisation and version rules still apply. |
+| Multipart upload | Multipart object assembly | Useful for large artefacts. |
 | Conditional headers | Preconditions | Prevent stale or conflicting operations. |
 
-Use S3-compatible clients for importers, backup tools, artifact uploaders, data pipelines, and existing libraries that only need object movement.
+Use S3-compatible clients for importers, backup tools, artefact uploaders, data pipelines, and existing libraries that only need object movement.
 
 ## What requires native APIs
 
@@ -34,22 +34,22 @@ Use native APIs for:
 - creating and updating index definitions;
 - querying metadata indexes beyond basic prefix lists;
 - full text, vector, and hybrid search;
-- managing relationship authorization schemas and tuples;
+- managing relationship authorisation schemas and tuples;
 - subscribing to watches;
 - opening PersonalDB groups and submitting commits;
 - reading PersonalDB projections;
-- creating source and model artifact manifests;
+- creating source and model artefact manifests;
 - inspecting diagnostics and repair findings.
 
 A common pattern is to import bytes through S3, then define indexes and query them through the native API.
 
 ## Authentication and request signing
 
-S3-compatible requests are signed. Anvil verifies the signature, maps the credential to an Anvil identity, and then evaluates authorization for the requested bucket, key, method, and metadata exposure.
+S3-compatible requests are signed. Anvil verifies the signature, maps the credential to an Anvil identity, and then evaluates authorisation for the requested bucket, key, method, and metadata exposure.
 
-Keep S3 credentials narrow. A tool that uploads build artifacts should not have permission to delete unrelated objects, read private prefixes, or manage authorization state.
+Keep S3 credentials narrow. A tool that uploads build artefacts should not have permission to delete unrelated objects, read private prefixes, or manage authorisation state.
 
-## Streaming and multipart behavior
+## Streaming and multipart behaviour
 
 Large clients often stream request bodies or use multipart uploads. Anvil verifies signed streaming payloads and validates multipart assembly. This matters because large uploads should be safe even when bodies arrive in chunks and clients retry interrupted operations.
 
@@ -61,8 +61,8 @@ A production smoke test should cover:
 - object metadata round trip;
 - range GET;
 - conditional requests;
-- list prefix behavior;
-- delete and head behavior where permitted.
+- list prefix behaviour;
+- delete and head behaviour where permitted.
 
 ## Reserved namespaces
 
@@ -78,11 +78,11 @@ operator creates bucket and scoped credentials
   -> client verifies counts and checksums
   -> application/native job writes index definitions
   -> Anvil indexes metadata, text, or vectors
-  -> application queries authorized results through native API
+  -> application queries authorised results through native API
 ```
 
-The S3 tool moves bytes. Anvil's native model turns those bytes into searchable, authorized, watchable product data.
+The S3 tool moves bytes. Anvil's native model turns those bytes into searchable, authorised, watchable product data.
 
 ## What you can build after this page
 
-You should be able to connect existing S3-compatible tools to Anvil safely and know when to switch to native APIs for indexing, search, watches, authorization, PersonalDB, and diagnostics.
+You should be able to connect existing S3-compatible tools to Anvil safely and know when to switch to native APIs for indexing, search, watches, authorisation, PersonalDB, and diagnostics.

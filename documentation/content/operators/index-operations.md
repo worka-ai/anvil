@@ -5,7 +5,7 @@ description: Monitor and repair Anvil path, metadata, full text, vector, authz, 
 
 # Index Operations
 
-**What this page gives you:** an operator's guide to index health. You will learn what index lag means, why generations matter, when rebuilds are required, and how to reason about full text, vector, authorization, and PersonalDB derived state.
+**What this page gives you:** an operator's guide to index health. You will learn what index lag means, why generations matter, when rebuilds are required, and how to reason about full text, vector, authorisation, and PersonalDB derived state.
 
 Indexes are maintained views over source facts. They make queries fast, but they must stay tied to durable source data. A healthy deployment needs visibility into each derived subsystem, not just object byte storage.
 
@@ -17,8 +17,8 @@ Anvil maintains several kinds of derived structures:
 - metadata indexes;
 - full text indexes;
 - vector indexes;
-- source artifact indexes;
-- authorization derived userset indexes;
+- source artefact indexes;
+- authorisation derived userset indexes;
 - PersonalDB projections;
 - media extraction outputs.
 
@@ -37,7 +37,7 @@ Persistent lag can indicate:
 - repeated validation failure;
 - an overloaded node selected for too much background work.
 
-Alert thresholds should match product expectations. A collaboration product may need near-immediate metadata and authorization updates. A media archive may tolerate longer vector indexing lag.
+Alert thresholds should match product expectations. A collaboration product may need near-immediate metadata and authorisation updates. A media archive may tolerate longer vector indexing lag.
 
 ## Generations
 
@@ -47,9 +47,9 @@ Queries should use valid generations. Rebuilding a new generation should not des
 
 ## Full text operations
 
-Full text indexes depend on tokenization, language handling, extraction, and snippet policy. Changing tokenization or snippet behavior is an index definition change. Rebuild affected generations so ranking and snippets are consistent.
+Full text indexes depend on tokenization, language handling, extraction, and snippet policy. Changing tokenization or snippet behaviour is an index definition change. Rebuild affected generations so ranking and snippets are consistent.
 
-Snippets are sensitive. Verify snippet storage and result exposure follow authorization policy.
+Snippets are sensitive. Verify snippet storage and result exposure follow authorisation policy.
 
 ## Vector operations
 
@@ -59,7 +59,7 @@ Vector indexes require careful compatibility:
 - dimension must match exactly;
 - distance metric must match intended semantics;
 - HNSW memory usage must be planned;
-- candidate fetching must account for authorization filtering;
+- candidate fetching must account for authorisation filtering;
 - segment compaction must preserve source cursor proof.
 
 If any of model, dimension, or metric changes, create a new index generation. Do not mix incompatible vectors.

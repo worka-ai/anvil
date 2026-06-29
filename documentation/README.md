@@ -2,7 +2,7 @@
 
 This folder contains the Fission static documentation site for Anvil.
 
-The site is intentionally structured as a learning path, not a command dump. The home page explains why Anvil exists. The Learn section teaches object storage, key design, indexing, search, authorization, watches, and PersonalDB from first principles. The Developer section then applies those concepts to application code. The Operator section explains deployment, identity, indexing operations, backup, and release work. The Reference section is for exact settings, command families, package outputs, and errors after the concepts are clear.
+The site is intentionally structured as a learning path, not a command dump. The home page explains why Anvil exists. The Learn section teaches object storage, key design, indexing, search, authorisation, watches, and PersonalDB from first principles. The Developer section then applies those concepts to application code. The Operator section explains deployment, identity, indexing operations, backup, and release work. The Reference section is for exact settings, command families, package outputs, and errors after the concepts are clear.
 
 ## Build
 

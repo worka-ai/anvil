@@ -12,7 +12,7 @@ A bucket is the administrative boundary around related objects. Create buckets a
 ## Workflow
 
 1. Connect a client with an endpoint and token.
-2. Send a request that names the bucket, object, index, group, resource, or artifact explicitly.
+2. Send a request that names the bucket, object, index, group, resource, or artefact explicitly.
 3. Preserve the returned version, cursor, generation, certificate, or diagnostic id when the response includes one.
 4. Use that returned value for preconditions, watch resume, catch-up, or repair verification.
 
@@ -21,9 +21,6 @@ A bucket is the administrative boundary around related objects. Create buckets a
 **Operation:** `BucketService.CreateBucket`
 
 Creates the policy and placement boundary that will hold related objects.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
 
 ```anvil-tabs
 {
@@ -41,9 +38,6 @@ The important rule is to pass the caller identity and request context through th
 
 Returns bucket boundaries visible to the caller.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "ListBuckets",
@@ -59,9 +53,6 @@ The important rule is to pass the caller identity and request context through th
 **Operation:** `BucketService.GetBucketPolicy`
 
 Reads the policy document currently attached to a bucket.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
 
 ```anvil-tabs
 {
@@ -79,9 +70,6 @@ The important rule is to pass the caller identity and request context through th
 
 Replaces or creates a bucket policy using an explicit policy document.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "PutBucketPolicy",
@@ -97,9 +85,6 @@ The important rule is to pass the caller identity and request context through th
 **Operation:** `BucketService.WatchBucketMetadata`
 
 Streams bucket metadata changes after a cursor.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
 
 ```anvil-tabs
 {
@@ -117,9 +102,6 @@ The important rule is to pass the caller identity and request context through th
 
 Deletes a bucket boundary after callers have decided how object lifecycle should end.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "DeleteBucket",
@@ -132,4 +114,4 @@ The important rule is to pass the caller identity and request context through th
 
 ## What you can do after this page
 
-You should now be able to perform every operation in this area and understand why the request shape matters. Continue to another tutorial area or use the reference pages when you need exact configuration and error behavior.
+You should now be able to perform every operation in this area and understand why the request shape matters. Continue to another tutorial area or use the reference pages when you need exact configuration and error behaviour.

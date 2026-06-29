@@ -25,8 +25,8 @@ href = "/tutorials/search/"
 level = 1
 
 [[items]]
-title = "Authorization"
-href = "/tutorials/authorization/"
+title = "Authorisation"
+href = "/tutorials/authorisation/"
 level = 1
 
 [[items]]
@@ -40,7 +40,7 @@ href = "/tutorials/personaldb/"
 level = 1
 
 [[items]]
-title = "Artifacts And Ingestion"
+title = "Artefacts And Ingestion"
 href = "/tutorials/artifacts/"
 level = 1
 

@@ -1,6 +1,6 @@
 ---
 title: Repair And Operator Operations
-description: Repair indexes, directory indexes, authorization-derived indexes, PersonalDB log chains, and inspect findings.
+description: Repair indexes, directory indexes, authorisation-derived indexes, PersonalDB log chains, and inspect findings.
 ---
 
 # Repair And Operator Operations
@@ -12,7 +12,7 @@ Operators need safe ways to prove derived state is correct and to repair it when
 ## Workflow
 
 1. Connect a client with an endpoint and token.
-2. Send a request that names the bucket, object, index, group, resource, or artifact explicitly.
+2. Send a request that names the bucket, object, index, group, resource, or artefact explicitly.
 3. Preserve the returned version, cursor, generation, certificate, or diagnostic id when the response includes one.
 4. Use that returned value for preconditions, watch resume, catch-up, or repair verification.
 
@@ -21,9 +21,6 @@ Operators need safe ways to prove derived state is correct and to repair it when
 **Operation:** `RepairService.RepairIndex`
 
 Rebuilds or validates index derived state from source object facts.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
 
 ```anvil-tabs
 {
@@ -41,9 +38,6 @@ The important rule is to pass the caller identity and request context through th
 
 Rebuilds or validates path listing structures.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "RepairDirectoryIndex",
@@ -54,14 +48,11 @@ The important rule is to pass the caller identity and request context through th
 }
 ```
 
-## Repair authorization-derived indexes
+## Repair authorisation-derived indexes
 
 **Operation:** `RepairService.RepairAuthzDerivedIndex`
 
-Rebuilds authorization-derived views from source tuple and namespace facts.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
+Rebuilds authorisation-derived views from source tuple and namespace facts.
 
 ```anvil-tabs
 {
@@ -79,9 +70,6 @@ The important rule is to pass the caller identity and request context through th
 
 Validates PersonalDB commit chains and reports required recovery work.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "RepairPersonalDbLogChain",
@@ -97,9 +85,6 @@ The important rule is to pass the caller identity and request context through th
 **Operation:** `RepairService.ListRepairFindings`
 
 Reads repair diagnostics produced by repair jobs.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
 
 ```anvil-tabs
 {
@@ -118,9 +103,6 @@ The important rule is to pass the caller identity and request context through th
 Node-to-node storage write used by Anvil internals, not public application code.
 
 > This is an internal node-to-node operation. Application clients do not call it directly; it is documented here so operators understand the complete Anvil surface.
-
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
 
 
 ```anvil-tabs
@@ -142,9 +124,6 @@ Node-to-node storage read used by Anvil internals, not public application code.
 > This is an internal node-to-node operation. Application clients do not call it directly; it is documented here so operators understand the complete Anvil surface.
 
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "GetShard",
@@ -162,9 +141,6 @@ The important rule is to pass the caller identity and request context through th
 Node-to-node shard commit used by Anvil internals, not public application code.
 
 > This is an internal node-to-node operation. Application clients do not call it directly; it is documented here so operators understand the complete Anvil surface.
-
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
 
 
 ```anvil-tabs
@@ -186,9 +162,6 @@ Node-to-node shard deletion used by Anvil internals, not public application code
 > This is an internal node-to-node operation. Application clients do not call it directly; it is documented here so operators understand the complete Anvil surface.
 
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "DeleteShard",
@@ -201,4 +174,4 @@ The important rule is to pass the caller identity and request context through th
 
 ## What you can do after this page
 
-You should now be able to perform every operation in this area and understand why the request shape matters. Continue to another tutorial area or use the reference pages when you need exact configuration and error behavior.
+You should now be able to perform every operation in this area and understand why the request shape matters. Continue to another tutorial area or use the reference pages when you need exact configuration and error behaviour.

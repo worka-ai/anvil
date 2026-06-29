@@ -5,9 +5,9 @@ description: Build local-first applications that use Anvil as the PersonalDB wit
 
 # PersonalDB Applications
 
-**What this page gives you:** a developer-oriented model for local-first applications using PersonalDB through Anvil. You will learn how to structure client sync, commits, snapshots, projections, and authorization.
+**What this page gives you:** a developer-oriented model for local-first applications using PersonalDB through Anvil. You will learn how to structure client sync, commits, snapshots, projections, and authorisation.
 
-A local-first application reads and writes a local SQLite database. The UI stays fast because ordinary views query local state. The application still needs shared truth: accepted changes, current heads, snapshots for new devices, projections for server-side queries, and authorization rules.
+A local-first application reads and writes a local SQLite database. The UI stays fast because ordinary views query local state. The application still needs shared truth: accepted changes, current heads, snapshots for new devices, projections for server-side queries, and authorisation rules.
 
 Anvil acts as the PersonalDB witness. It validates and records commits, signs accepted heads, stores snapshots, maintains projections, and authorizes every operation.
 
@@ -23,7 +23,7 @@ A typical application has:
 - a conflict handling strategy;
 - a snapshot downloader;
 - projection readers for server-visible views;
-- authorization rules for group open, commit, snapshot, and projection reads.
+- authorisation rules for group open, commit, snapshot, and projection reads.
 
 Do not create a separate server database for the same shared state. That creates two sources of truth. Use PersonalDB commits and projections.
 
@@ -65,16 +65,16 @@ Common rejections:
 | --- | --- | --- |
 | Stale base head | Other commits were accepted first. | Fetch commits, merge/apply, submit a new changeset. |
 | Schema mismatch | Client schema is not compatible. | Run migration or block until upgraded. |
-| Authorization denied | Caller may not open or commit. | Stop sync and surface access issue. |
+| Authorisation denied | Caller may not open or commit. | Stop sync and surface access issue. |
 | Invalid changeset | Changeset cannot be applied safely. | Fix client bug or conflict handling. |
 | Idempotency mismatch | Same key reused for different content. | Fix retry logic. |
 
 ## Projections
 
-Use projections when the server needs queryable derived views. For example, a task application may keep each device local but expose a server projection of open tasks by assignee. Projection builders consume accepted commits and write authorized queryable views.
+Use projections when the server needs queryable derived views. For example, a task application may keep each device local but expose a server projection of open tasks by assignee. Projection builders consume accepted commits and write authorised queryable views.
 
 Projection reads should include caller identity. A projection row is still data exposure.
 
 ## What you can build after this page
 
-You should be able to build a local-first sync loop where Anvil witnesses SQLite changesets, returns commit certificates, stores snapshots, and serves authorized projections.
+You should be able to build a local-first sync loop where Anvil witnesses SQLite changesets, returns commit certificates, stores snapshots, and serves authorised projections.

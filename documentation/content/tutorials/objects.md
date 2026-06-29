@@ -12,7 +12,7 @@ Objects are the durable source facts in Anvil. A write stores bytes, metadata, c
 ## Workflow
 
 1. Connect a client with an endpoint and token.
-2. Send a request that names the bucket, object, index, group, resource, or artifact explicitly.
+2. Send a request that names the bucket, object, index, group, resource, or artefact explicitly.
 3. Preserve the returned version, cursor, generation, certificate, or diagnostic id when the response includes one.
 4. Use that returned value for preconditions, watch resume, catch-up, or repair verification.
 
@@ -21,9 +21,6 @@ Objects are the durable source facts in Anvil. A write stores bytes, metadata, c
 **Operation:** `ObjectService.PutObject`
 
 Writes object bytes and metadata as a new durable object version.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
 
 ```anvil-tabs
 {
@@ -41,9 +38,6 @@ The important rule is to pass the caller identity and request context through th
 
 Reads object metadata and body bytes for a selected version.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "GetObject",
@@ -60,9 +54,6 @@ The important rule is to pass the caller identity and request context through th
 
 Reads object metadata without streaming the body.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "HeadObject",
@@ -77,10 +68,7 @@ The important rule is to pass the caller identity and request context through th
 
 **Operation:** `ObjectService.ListObjects`
 
-Lists objects by prefix and authorization scope.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
+Lists objects by prefix and authorisation scope.
 
 ```anvil-tabs
 {
@@ -98,9 +86,6 @@ The important rule is to pass the caller identity and request context through th
 
 Lists previous object states for audit, recovery, or explicit version reads.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "ListObjectVersions",
@@ -116,9 +101,6 @@ The important rule is to pass the caller identity and request context through th
 **Operation:** `ObjectService.CopyObject`
 
 Copies one object version to another key without the client re-uploading bytes.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
 
 ```anvil-tabs
 {
@@ -136,9 +118,6 @@ The important rule is to pass the caller identity and request context through th
 
 Creates one object from ordered source object ranges or parts.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "ComposeObject",
@@ -154,9 +133,6 @@ The important rule is to pass the caller identity and request context through th
 **Operation:** `ObjectService.PatchJsonObject`
 
 Applies a structured JSON patch with preconditions.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
 
 ```anvil-tabs
 {
@@ -174,9 +150,6 @@ The important rule is to pass the caller identity and request context through th
 
 Updates a manifest only when its current version matches the expected value.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "CompareAndSwapManifest",
@@ -192,9 +165,6 @@ The important rule is to pass the caller identity and request context through th
 **Operation:** `ObjectService.WatchPrefix`
 
 Streams object mutations below a bucket/key prefix.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
 
 ```anvil-tabs
 {
@@ -212,9 +182,6 @@ The important rule is to pass the caller identity and request context through th
 
 Creates an ordered append stream for records that should become sealed segments.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "CreateAppendStream",
@@ -230,9 +197,6 @@ The important rule is to pass the caller identity and request context through th
 **Operation:** `ObjectService.AppendStreamRecord`
 
 Appends one record to an active stream.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
 
 ```anvil-tabs
 {
@@ -250,9 +214,6 @@ The important rule is to pass the caller identity and request context through th
 
 Closes the active segment and makes it durable for readers and derived systems.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "SealAppendStreamSegment",
@@ -268,9 +229,6 @@ The important rule is to pass the caller identity and request context through th
 **Operation:** `ObjectService.InitiateMultipartUpload`
 
 Starts a large-object upload split into numbered parts.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
 
 ```anvil-tabs
 {
@@ -288,9 +246,6 @@ The important rule is to pass the caller identity and request context through th
 
 Uploads one numbered part of a multipart object.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "UploadPart",
@@ -306,9 +261,6 @@ The important rule is to pass the caller identity and request context through th
 **Operation:** `ObjectService.CompleteMultipartUpload`
 
 Assembles uploaded parts into the final object version.
-
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
 
 ```anvil-tabs
 {
@@ -326,9 +278,6 @@ The important rule is to pass the caller identity and request context through th
 
 Cancels an incomplete multipart upload and releases temporary state.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "AbortMultipartUpload",
@@ -345,9 +294,6 @@ The important rule is to pass the caller identity and request context through th
 
 Writes a delete marker or removes the current object state according to policy.
 
-The important rule is to pass the caller identity and request context through the client instead of bypassing Anvil with out-of-band credentials. That keeps object state, indexes, search results, watch streams, and authorization decisions aligned.
-
-
 ```anvil-tabs
 {
   "operation": "DeleteObject",
@@ -360,4 +306,4 @@ The important rule is to pass the caller identity and request context through th
 
 ## What you can do after this page
 
-You should now be able to perform every operation in this area and understand why the request shape matters. Continue to another tutorial area or use the reference pages when you need exact configuration and error behavior.
+You should now be able to perform every operation in this area and understand why the request shape matters. Continue to another tutorial area or use the reference pages when you need exact configuration and error behaviour.

@@ -1,11 +1,11 @@
 ---
 title: Indexes And Search
-description: Learn directory indexes, metadata indexes, full text search, vector search, hybrid ranking, and authorization-safe search.
+description: Learn directory indexes, metadata indexes, full text search, vector search, hybrid ranking, and authorisation-safe search.
 ---
 
 # Indexes And Search
 
-**What this page gives you:** an introduction to indexing and search for readers who have never built a search system. You will learn why indexes exist, how full text and vector search differ, why hybrid search exists, and why authorization must be part of every query.
+**What this page gives you:** an introduction to indexing and search for readers who have never built a search system. You will learn why indexes exist, how full text and vector search differ, why hybrid search exists, and why authorisation must be part of every query.
 
 An index is a maintained shortcut. Without an index, a system answers a question by scanning everything. With an index, it keeps a structure that lets it jump to likely answers.
 
@@ -54,7 +54,7 @@ overdue, invoice, includes, updated, payment, terms
 
 A query for `payment terms` should rank this document higher than one that mentions only `payment` once. Full text search can also support snippets, highlighting, language-aware tokenization, and phrase queries.
 
-The important security point: snippets are data. A snippet from a private document is private data. Anvil treats full text results as authorized object exposure, not a harmless search side channel.
+The important security point: snippets are data. A snippet from a private document is private data. Anvil treats full text results as authorised object exposure, not a harmless search side channel.
 
 ## Vector search
 
@@ -70,14 +70,14 @@ stop billing me
 
 Vector search is useful when exact words are not enough. Users can search by meaning, compare images, find similar audio, or retrieve related video segments.
 
-A brute-force vector search compares the query vector to every stored vector. That becomes expensive at scale. Anvil uses graph-based approximate nearest-neighbor indexing with Rust-native HNSW support. Approximate search means the system finds high-quality candidates quickly rather than proving the mathematical nearest neighbor by scanning everything.
+A brute-force vector search compares the query vector to every stored vector. That becomes expensive at scale. Anvil uses graph-based approximate nearest-neighbour indexing with Rust-native HNSW support. Approximate search means the system finds high-quality candidates quickly rather than proving the mathematical nearest neighbour by scanning everything.
 
 Vector indexes have strict contracts:
 
 - the embedding model identity must match;
 - the vector dimension must match;
 - the distance metric must match the application meaning;
-- authorization filtering must happen before results are exposed;
+- authorisation filtering must happen before results are exposed;
 - index generations must prove which source objects they cover.
 
 ## Hybrid search
@@ -92,22 +92,22 @@ prefix: tenants/acme/
 ranking: text score + vector similarity + freshness
 ```
 
-A hybrid query should not be a pile of separate result lists merged in application code. The merge must preserve authorization, deduplication, source versions, and consistency. Anvil's search model exists so those constraints live in the storage platform.
+A hybrid query should not be a pile of separate result lists merged in application code. The merge must preserve authorisation, deduplication, source versions, and consistency. Anvil's search model exists so those constraints live in the storage platform.
 
-## Authorization-safe search
+## Authorisation-safe search
 
 Search can leak data even when object reads are protected. A caller might learn that a private document exists from:
 
 - result counts;
 - facet counts;
 - snippets;
-- vector neighbors;
+- vector neighbours;
 - timing differences;
 - autocomplete suggestions;
 - watch notifications;
 - metadata-only listings.
 
-Anvil evaluates authorization as part of query execution. Search results, counts, snippets, and derived rows must be filtered before exposure. Applications should not run a broad admin query and then filter in memory.
+Anvil evaluates authorisation as part of query execution. Search results, counts, snippets, and derived rows must be filtered before exposure. Applications should not run a broad admin query and then filter in memory.
 
 ## Index freshness and readiness
 
@@ -122,4 +122,4 @@ Anvil exposes readiness and lag so applications can choose correct user experien
 
 ## What you can do after this page
 
-You should be able to explain directory indexes, metadata indexes, full text search, vector search, hybrid ranking, authorization-safe result filtering, and index readiness. Next, learn the authorization model that protects all of those surfaces.
+You should be able to explain directory indexes, metadata indexes, full text search, vector search, hybrid ranking, authorisation-safe result filtering, and index readiness. Next, learn the authorisation model that protects all of those surfaces.
