@@ -664,6 +664,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_journal_reader_fails_closed_on_tampered_frame() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+
+        enqueue_task(
+            &storage,
+            TaskType::DeleteBucket,
+            json!({"bucket_id": 7}),
+            100,
+        )
+        .await
+        .unwrap();
+
+        let path = storage.task_queue_journal_path();
+        let mut bytes = tokio::fs::read(&path).await.unwrap();
+        let header = BinaryEnvelopeHeader::decode(&bytes).unwrap();
+        let body_start = COMMON_HEADER_LEN
+            .checked_add(header.header_json.len())
+            .and_then(|offset| offset.checked_add(4))
+            .and_then(|offset| offset.checked_add(140))
+            .expect("frame body offset");
+        bytes[body_start] ^= 0x55;
+        tokio::fs::write(&path, bytes).await.unwrap();
+
+        let err = list_tasks(&storage)
+            .await
+            .expect_err("tampered task queue journal must not replay partial state");
+        assert!(
+            err.to_string().contains("hash mismatch"),
+            "unexpected tamper error: {err}"
+        );
+    }
+
+    #[tokio::test]
     pub(crate) async fn task_journal_with_permit_writes_fenced_frames_and_header() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
