@@ -29,10 +29,6 @@ placement = "body-end"
 file = "site/tutorial-tabs.html"
 route_prefixes = ["/tutorials"]
 
-[[site.elements]]
-placement = "body-end"
-file = "site/home-light-theme.html"
-routes = ["/"]
 
 [[site.nav]]
 title = "Home"

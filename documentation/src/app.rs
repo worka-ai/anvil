@@ -37,31 +37,39 @@ fn anvil_light_theme() -> Theme {
     tokens.colors.border = rgb(210, 219, 233);
     tokens.colors.border_strong = rgb(149, 164, 184);
     tokens.colors.focus_ring = rgb(30, 92, 220);
+    tokens.colors.success = rgb(37, 99, 235);
+    tokens.colors.warning = rgb(190, 109, 35);
+    tokens.colors.info = rgb(14, 116, 225);
+    tokens.colors.error = rgb(225, 29, 72);
     Theme::from_tokens(tokens, DesignMode::Light)
 }
 
 fn anvil_dark_theme() -> Theme {
     let mut tokens = Theme::dark().tokens;
-    tokens.colors.primary = rgb(96, 165, 250);
-    tokens.colors.on_primary = rgb(8, 18, 38);
-    tokens.colors.primary_hover = rgb(147, 197, 253);
-    tokens.colors.primary_subtle = rgb(21, 38, 68);
-    tokens.colors.secondary = rgb(251, 191, 36);
-    tokens.colors.on_secondary = rgb(27, 19, 4);
-    tokens.colors.background = rgb(7, 12, 24);
-    tokens.colors.on_background = rgb(226, 232, 240);
-    tokens.colors.surface = rgb(13, 20, 34);
-    tokens.colors.surface_raised = rgb(17, 27, 46);
-    tokens.colors.surface_sunken = rgb(5, 10, 21);
-    tokens.colors.on_surface = rgb(226, 232, 240);
-    tokens.colors.heading = rgb(248, 250, 252);
-    tokens.colors.text_primary = rgb(226, 232, 240);
-    tokens.colors.text_secondary = rgb(186, 197, 214);
-    tokens.colors.text_muted = rgb(139, 152, 174);
-    tokens.colors.text_link = rgb(147, 197, 253);
-    tokens.colors.border = rgb(45, 58, 82);
-    tokens.colors.border_strong = rgb(74, 94, 130);
-    tokens.colors.focus_ring = rgb(251, 191, 36);
+    tokens.colors.primary = rgb(122, 167, 255);
+    tokens.colors.on_primary = rgb(6, 10, 24);
+    tokens.colors.primary_hover = rgb(166, 195, 255);
+    tokens.colors.primary_subtle = rgb(18, 31, 65);
+    tokens.colors.secondary = rgb(255, 184, 107);
+    tokens.colors.on_secondary = rgb(35, 20, 4);
+    tokens.colors.background = rgb(7, 8, 21);
+    tokens.colors.on_background = rgb(234, 240, 252);
+    tokens.colors.surface = rgb(15, 20, 43);
+    tokens.colors.surface_raised = rgb(21, 29, 56);
+    tokens.colors.surface_sunken = rgb(5, 8, 19);
+    tokens.colors.on_surface = rgb(234, 240, 252);
+    tokens.colors.heading = rgb(248, 251, 255);
+    tokens.colors.text_primary = rgb(234, 240, 252);
+    tokens.colors.text_secondary = rgb(194, 205, 226);
+    tokens.colors.text_muted = rgb(145, 160, 190);
+    tokens.colors.text_link = rgb(166, 195, 255);
+    tokens.colors.border = rgb(39, 51, 90);
+    tokens.colors.border_strong = rgb(78, 96, 145);
+    tokens.colors.focus_ring = rgb(255, 184, 107);
+    tokens.colors.success = rgb(122, 167, 255);
+    tokens.colors.warning = rgb(255, 184, 107);
+    tokens.colors.info = rgb(147, 197, 253);
+    tokens.colors.error = rgb(255, 107, 138);
     Theme::from_tokens(tokens, DesignMode::Dark)
 }
 
@@ -88,9 +96,9 @@ impl From<HomePage> for Widget {
             start: (0.0, 0.0),
             end: (1.0, 1.0),
             stops: vec![
-                (0.0, rgb(246, 241, 232)),
-                (0.55, rgb(238, 243, 252).with_alpha(205)),
-                (1.0, rgb(255, 252, 246)),
+                (0.0, rgb(7, 8, 21)),
+                (0.55, rgb(18, 31, 65).with_alpha(205)),
+                (1.0, rgb(15, 20, 43)),
             ],
         })
         .padding([36.0, 36.0, 42.0, 54.0])
@@ -120,14 +128,14 @@ impl From<HeroSection> for Widget {
                             .family(tokens.typography.font_family_serif.clone())
                             .weight(900)
                             .line_height(68.0)
-                            .color(rgb(15, 23, 42))
+                            .color(rgb(248, 251, 255))
                             .max_width(850.0)
                             .flex_shrink(1.0)
                             .into(),
                         Text::new("Anvil stores bytes, then keeps the derived systems that make those bytes useful attached to the same source of truth: path and metadata indexes, full text search, vector search, relationship authorization, durable watches, source artifacts, model artifacts, and PersonalDB witnessing.")
                             .size(20.0)
                             .line_height(31.0)
-                            .color(rgb(71, 85, 105))
+                            .color(rgb(194, 205, 226))
                             .max_width(790.0)
                             .flex_shrink(1.0)
                             .into(),
@@ -169,7 +177,7 @@ impl From<SystemMap> for Widget {
                 Text::new("A write becomes a platform event")
                     .size(16.0)
                     .weight(900)
-                    .color(rgb(15, 23, 42))
+                    .color(rgb(248, 251, 255))
                     .into(),
                 PipelineLine::new("01", "Commit object", "bytes + metadata + version").into(),
                 PipelineLine::new("02", "Maintain views", "path, text, vector, authz, PersonalDB").into(),
@@ -177,9 +185,9 @@ impl From<SystemMap> for Widget {
                 Container::new(Text::new("No sidecar search service guessing what changed. No app-only permission filter trying to hide leaked snippets. No projection job without a cursor.")
                     .size(14.0)
                     .line_height(22.0)
-                    .color(rgb(71, 85, 105)))
+                    .color(rgb(194, 205, 226)))
                     .padding([18.0, 18.0, 16.0, 16.0])
-                    .bg_fill(Fill::Solid(rgb(238, 243, 252).with_alpha(210)))
+                    .bg_fill(Fill::Solid(rgb(18, 31, 65).with_alpha(210)))
                     .border_radius(20.0)
                     .into(),
             ],
@@ -190,15 +198,15 @@ impl From<SystemMap> for Widget {
             start: (0.0, 0.0),
             end: (1.0, 1.0),
             stops: vec![
-                (0.0, rgb(255, 255, 255).with_alpha(246)),
-                (1.0, rgb(231, 239, 255).with_alpha(210)),
+                (0.0, rgb(21, 29, 56).with_alpha(246)),
+                (1.0, rgb(28, 41, 82).with_alpha(210)),
             ],
         })
-        .border(rgb(210, 219, 233), 1.0)
+        .border(rgb(39, 51, 90), 1.0)
         .border_radius(30.0)
         .padding([24.0, 24.0, 24.0, 24.0])
         .shadow(BoxShadow {
-            color: rgb(15, 23, 42).with_alpha(24),
+            color: rgba(0, 0, 0, 90),
             blur_radius: 28.0,
             offset: (0.0, 18.0),
         })
@@ -240,7 +248,7 @@ impl From<PrincipleSection> for Widget {
             ..Default::default()
         })
         .padding([0.0, 0.0, 8.0, 8.0])
-        .border(rgb(226, 232, 240), 0.0)
+        .border(rgb(39, 51, 90), 0.0)
         .into()
     }
 }
@@ -313,8 +321,8 @@ impl From<FlowSection> for Widget {
             ..Default::default()
         })
         .padding([32.0, 32.0, 32.0, 32.0])
-        .bg_fill(Fill::Solid(rgb(255, 255, 255).with_alpha(232)))
-        .border(rgb(210, 219, 233), 1.0)
+        .bg_fill(Fill::Solid(rgb(21, 29, 56).with_alpha(232)))
+        .border(rgb(39, 51, 90), 1.0)
         .border_radius(30.0)
         .into()
     }
@@ -371,13 +379,13 @@ impl From<FinalCta> for Widget {
                             .size(34.0)
                             .weight(900)
                             .line_height(42.0)
-                            .color(Color::WHITE)
+                            .color(rgb(248, 251, 255))
                             .max_width(720.0)
                             .into(),
                         Text::new("It gives teams one place to reason about stored bytes, searchable meaning, authorization, live change streams, and local-first database witness state.")
                             .size(17.0)
                             .line_height(27.0)
-                            .color(rgba(219, 228, 241, 255))
+                            .color(rgba(218, 227, 246, 255))
                             .max_width(760.0)
                             .into(),
                     ],
@@ -400,12 +408,12 @@ impl From<FinalCta> for Widget {
         .bg_fill(Fill::LinearGradient {
             start: (0.0, 0.0),
             end: (1.0, 1.0),
-            stops: vec![(0.0, rgb(10, 20, 38)), (1.0, rgb(22, 44, 82))],
+            stops: vec![(0.0, rgb(6, 10, 24)), (1.0, rgb(30, 45, 88))],
         })
         .border_radius(30.0)
         .padding([34.0, 34.0, 34.0, 34.0])
         .shadow(BoxShadow {
-            color: rgba(2, 6, 23, 70),
+            color: rgba(0, 0, 0, 90),
             blur_radius: 20.0,
             offset: (0.0, 14.0),
         })
@@ -441,21 +449,21 @@ impl From<SectionIntro> for Widget {
                     .size(13.0)
                     .weight(900)
                     .letter_spacing(1.3)
-                    .color(rgb(190, 109, 35))
+                    .color(rgb(255, 184, 107))
                     .into(),
                 Text::new(section.title)
                     .size(40.0)
                     .family(tokens.typography.font_family_serif.clone())
                     .weight(900)
                     .line_height(47.0)
-                    .color(rgb(15, 23, 42))
+                    .color(rgb(248, 251, 255))
                     .max_width(720.0)
                     .flex_shrink(1.0)
                     .into(),
                 Text::new(section.body)
                     .size(18.0)
                     .line_height(29.0)
-                    .color(rgb(71, 85, 105))
+                    .color(rgb(194, 205, 226))
                     .max_width(770.0)
                     .flex_shrink(1.0)
                     .into(),
@@ -497,9 +505,9 @@ impl From<PipelineLine> for Widget {
                     Text::new(line.number)
                         .size(12.0)
                         .weight(900)
-                        .color(Color::WHITE),
+                        .color(rgb(6, 10, 24)),
                 )
-                .bg(rgb(30, 92, 220))
+                .bg(rgb(122, 167, 255))
                 .border_radius(999.0)
                 .padding([10.0, 10.0, 8.0, 8.0])
                 .into(),
@@ -509,11 +517,11 @@ impl From<PipelineLine> for Widget {
                         Text::new(line.title)
                             .size(16.0)
                             .weight(900)
-                            .color(rgb(15, 23, 42))
+                            .color(rgb(248, 251, 255))
                             .into(),
                         Text::new(line.body)
                             .size(13.0)
-                            .color(rgb(100, 116, 139))
+                            .color(rgb(145, 160, 190))
                             .into(),
                     ],
                     ..Default::default()
@@ -548,19 +556,19 @@ impl From<ArgumentLine> for Widget {
                 Text::new(item.title)
                     .size(22.0)
                     .weight(900)
-                    .color(rgb(15, 23, 42))
+                    .color(rgb(248, 251, 255))
                     .into(),
                 Text::new(item.body)
                     .size(16.0)
                     .line_height(25.0)
-                    .color(rgb(71, 85, 105))
+                    .color(rgb(194, 205, 226))
                     .max_width(600.0)
                     .into(),
             ],
             ..Default::default()
         })
         .padding([0.0, 0.0, 18.0, 18.0])
-        .border(rgb(226, 232, 240), 0.0)
+        .border(rgb(39, 51, 90), 0.0)
         .into()
     }
 }
@@ -592,13 +600,13 @@ impl From<CapabilityLine> for Widget {
                     .family(tokens.typography.font_family_serif.clone())
                     .weight(900)
                     .line_height(33.0)
-                    .color(rgb(15, 23, 42))
+                    .color(rgb(248, 251, 255))
                     .min_width(150.0)
                     .into(),
                 Text::new(item.body)
                     .size(16.0)
                     .line_height(25.0)
-                    .color(rgb(71, 85, 105))
+                    .color(rgb(194, 205, 226))
                     .max_width(760.0)
                     .flex_grow(1.0)
                     .into(),
@@ -639,7 +647,7 @@ impl From<StepText> for Widget {
                 Text::new(step.number)
                     .size(34.0)
                     .weight(900)
-                    .color(rgb(30, 92, 220))
+                    .color(rgb(122, 167, 255))
                     .into(),
                 Column {
                     gap: Some(5.0),
@@ -647,12 +655,12 @@ impl From<StepText> for Widget {
                         Text::new(step.title)
                             .size(20.0)
                             .weight(900)
-                            .color(rgb(15, 23, 42))
+                            .color(rgb(248, 251, 255))
                             .into(),
                         Text::new(step.body)
                             .size(15.0)
                             .line_height(24.0)
-                            .color(rgb(71, 85, 105))
+                            .color(rgb(194, 205, 226))
                             .max_width(500.0)
                             .into(),
                     ],
@@ -689,13 +697,13 @@ impl From<AudienceLink> for Widget {
                 Text::new(item.title)
                     .size(18.0)
                     .weight(900)
-                    .color(rgb(15, 23, 42))
+                    .color(rgb(248, 251, 255))
                     .semantics_identifier(format!("site-route:{}", item.href))
                     .into(),
                 Text::new(item.body)
                     .size(14.0)
                     .line_height(21.0)
-                    .color(rgb(71, 85, 105))
+                    .color(rgb(194, 205, 226))
                     .max_width(230.0)
                     .into(),
             ],
@@ -726,7 +734,7 @@ impl From<Eyebrow> for Widget {
             .size(13.0)
             .weight(900)
             .letter_spacing(1.6)
-            .color(rgb(190, 109, 35))
+            .color(rgb(255, 184, 107))
             .into()
     }
 }
@@ -753,9 +761,9 @@ impl From<Cta> for Widget {
         let (_ctx, view) = fission::build::current::<DocumentationState>();
         let _tokens = &view.env().theme.tokens;
         let (background, foreground, border) = if cta.primary {
-            (rgb(30, 92, 220), Color::WHITE, rgb(30, 92, 220))
+            (rgb(122, 167, 255), rgb(6, 10, 24), rgb(122, 167, 255))
         } else {
-            (rgb(255, 255, 255), rgb(15, 23, 42), rgb(210, 219, 233))
+            (rgb(21, 29, 56), rgb(248, 251, 255), rgb(39, 51, 90))
         };
         Container::new(
             Text::new(cta.label)
@@ -792,12 +800,12 @@ impl DarkCta {
 impl From<DarkCta> for Widget {
     fn from(cta: DarkCta) -> Self {
         let (background, foreground, border) = if cta.primary {
-            (rgb(255, 255, 255), rgb(10, 20, 38), rgb(255, 255, 255))
+            (rgb(255, 184, 107), rgb(6, 10, 24), rgb(255, 184, 107))
         } else {
             (
                 rgba(255, 255, 255, 0),
-                Color::WHITE,
-                rgba(148, 163, 184, 150),
+                rgb(248, 251, 255),
+                rgba(145, 160, 190, 170),
             )
         };
         Container::new(
@@ -834,7 +842,7 @@ impl From<InlineLink> for Widget {
         Text::new(link.label)
             .size(14.0)
             .weight(900)
-            .color(rgb(30, 92, 220))
+            .color(rgb(122, 167, 255))
             .semantics_identifier(format!("site-route:{}", link.href))
             .into()
     }
@@ -855,7 +863,7 @@ impl From<SiteFooter> for Widget {
                 Text::new("Anvil storage platform")
                     .size(14.0)
                     .weight(800)
-                    .color(rgb(100, 116, 139))
+                    .color(rgb(145, 160, 190))
                     .into(),
                 Row {
                     gap: Some(14.0),
@@ -874,7 +882,7 @@ impl From<SiteFooter> for Widget {
             ..Default::default()
         })
         .padding([28.0, 28.0, 18.0, 18.0])
-        .bg(rgb(246, 241, 232))
+        .bg(rgb(7, 8, 21))
         .into()
     }
 }
