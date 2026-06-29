@@ -24,6 +24,16 @@ enabled = true
 [site.search]
 enabled = true
 
+[[site.elements]]
+placement = "body-end"
+file = "site/tutorial-tabs.html"
+route_prefixes = ["/tutorials"]
+
+[[site.elements]]
+placement = "body-end"
+file = "site/home-light-theme.html"
+routes = ["/"]
+
 [[site.nav]]
 title = "Home"
 href = "/"
@@ -31,6 +41,10 @@ href = "/"
 [[site.nav]]
 title = "Learn"
 href = "/learn/overview/"
+
+[[site.nav]]
+title = "Tutorials"
+href = "/tutorials/overview/"
 
 [[site.nav]]
 title = "Developers"
@@ -50,6 +64,13 @@ path = "/learn"
 source = "content/learn"
 template = "fission::site::documentation"
 sidebar = "site/learn-sidebar.toml"
+
+[[site.routes]]
+kind = "content"
+path = "/tutorials"
+source = "content/tutorials"
+template = "fission::site::documentation"
+sidebar = "site/tutorial-sidebar.toml"
 
 [[site.routes]]
 kind = "content"

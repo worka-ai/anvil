@@ -1,0 +1,50 @@
+[[items]]
+title = "Tutorials"
+href = "/tutorials/overview/"
+level = 0
+group = true
+
+[[items]]
+title = "Overview"
+href = "/tutorials/overview/"
+level = 1
+
+[[items]]
+title = "Buckets And Policies"
+href = "/tutorials/buckets/"
+level = 1
+
+[[items]]
+title = "Objects And Streams"
+href = "/tutorials/objects/"
+level = 1
+
+[[items]]
+title = "Indexes And Search"
+href = "/tutorials/search/"
+level = 1
+
+[[items]]
+title = "Authorization"
+href = "/tutorials/authorization/"
+level = 1
+
+[[items]]
+title = "Watch Streams"
+href = "/tutorials/watches/"
+level = 1
+
+[[items]]
+title = "PersonalDB"
+href = "/tutorials/personaldb/"
+level = 1
+
+[[items]]
+title = "Artifacts And Ingestion"
+href = "/tutorials/artifacts/"
+level = 1
+
+[[items]]
+title = "Repair And Operations"
+href = "/tutorials/operations/"
+level = 1

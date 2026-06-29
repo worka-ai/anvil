@@ -1,0 +1,13 @@
+<script>
+(function () {
+  function forceLightHome() {
+    if (location.pathname === "/" || location.pathname === "") {
+      document.documentElement.dataset.theme = "light";
+    }
+  }
+  forceLightHome();
+  document.addEventListener("click", function () {
+    setTimeout(forceLightHome, 0);
+  });
+})();
+</script>

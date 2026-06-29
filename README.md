@@ -51,6 +51,7 @@ fission site build --project-dir documentation --release
 The documentation is structured as a progressive guide:
 
 - `documentation/content/learn/` teaches the concepts from first principles.
+- `documentation/content/tutorials/` shows how to perform Anvil operations in Rust, Java, Node.js, and Python.
 - `documentation/content/developers/` shows how to build applications with Anvil.
 - `documentation/content/operators/` explains deployment, identity, indexing operations, backup, recovery, and release work.
 - `documentation/content/reference/` gives exact configuration, CLI, package, and error references.
