@@ -1363,6 +1363,10 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
+    reserved_put.metadata_mut().insert(
+        "x-anvil-internal-write-token",
+        "caller-forged".parse().unwrap(),
+    );
     assert_reserved_namespace_status(object_client.put_object(reserved_put).await);
 
     let mut get_req = Request::new(GetObjectRequest {
