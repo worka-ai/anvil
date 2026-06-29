@@ -4,6 +4,7 @@ use crate::s3_auth::{aws_chunked_decoder, sigv4_auth};
 use anvil_core::auth;
 use anvil_core::bucket_journal;
 use anvil_core::object_manager::ObjectWriteOptions;
+use anvil_core::observability::RESERVED_NAMESPACE_REJECTION_COUNT;
 use anvil_core::permissions::AnvilAction;
 use anvil_core::persistence::Object;
 use anvil_core::validation;
@@ -117,13 +118,24 @@ pub fn app(state: AppState) -> Router {
         .with_state(state.clone())
         .route_layer(middleware::from_fn(aws_chunked_decoder))
         .route_layer(middleware::from_fn_with_state(state.clone(), sigv4_auth))
-        .route_layer(middleware::from_fn(reserved_namespace_guard));
+        .route_layer(middleware::from_fn_with_state(
+            state,
+            reserved_namespace_guard,
+        ));
 
     public.merge(s3_routes)
 }
 
-async fn reserved_namespace_guard(req: Request, next: Next) -> Response {
+async fn reserved_namespace_guard(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
     if request_targets_reserved_namespace(&req) {
+        state.observability.increment_counter(
+            RESERVED_NAMESPACE_REJECTION_COUNT,
+            &[("api", "s3"), ("operation", req.method().as_str())],
+        );
         return s3_error(
             "UnauthorizedReservedNamespace",
             "UnauthorizedReservedNamespace",

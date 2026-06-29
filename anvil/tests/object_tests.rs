@@ -15,6 +15,10 @@ use futures_util::StreamExt;
 use std::time::Duration;
 use tonic::Request;
 
+use anvil::observability::{
+    OBJECT_READ_LATENCY, OBJECT_WRITE_LATENCY, PREFIX_LIST_LATENCY,
+    RESERVED_NAMESPACE_REJECTION_COUNT,
+};
 use anvil::storage::{DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES, ExternalChunkManifest};
 use anvil_test_utils::*;
 use tonic::{Code, Status};
@@ -1653,6 +1657,32 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         format!("Bearer {}", token).parse().unwrap(),
     );
     assert_reserved_namespace_status(object_client.watch_prefix(watch_reserved).await);
+
+    let metrics = cluster.states[0].observability.snapshot();
+    let reserved_rejections = metrics
+        .iter()
+        .filter(|(key, _)| {
+            key.name == RESERVED_NAMESPACE_REJECTION_COUNT
+                && key.labels.get("api").is_some_and(|value| value == "native")
+        })
+        .map(|(_, sample)| sample.count)
+        .sum::<u64>();
+    assert!(
+        reserved_rejections >= 4,
+        "native reserved namespace rejections should be counted"
+    );
+    for metric in [
+        OBJECT_WRITE_LATENCY,
+        OBJECT_READ_LATENCY,
+        PREFIX_LIST_LATENCY,
+    ] {
+        assert!(
+            metrics
+                .iter()
+                .any(|(key, sample)| key.name == metric && sample.count > 0),
+            "expected {metric} to be observed during native object API calls"
+        );
+    }
 }
 
 #[tokio::test]

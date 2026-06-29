@@ -6,6 +6,10 @@ use crate::{
     auth, bucket_journal,
     cluster::ClusterState,
     metadata_journal,
+    observability::{
+        OBJECT_READ_LATENCY, OBJECT_WRITE_LATENCY, Observability, PREFIX_LIST_LATENCY,
+        RESERVED_NAMESPACE_REJECTION_COUNT,
+    },
     permissions::AnvilAction,
     persistence::{
         Bucket, MetadataMutationReceipt, Object, ObjectVersion, ObjectVersionsPage,
@@ -44,6 +48,7 @@ pub struct ObjectManager {
     jwt_manager: Arc<auth::JwtManager>,
     encryption_key: Vec<u8>,
     watch_tx: broadcast::Sender<ObjectWatchEvent>,
+    observability: Observability,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +159,7 @@ impl ObjectManager {
         jwt_manager: Arc<auth::JwtManager>,
         anvil_secret_encryption_key: String,
         watch_tx: broadcast::Sender<ObjectWatchEvent>,
+        observability: Observability,
     ) -> Self {
         let encryption_key = hex::decode(anvil_secret_encryption_key)
             .expect("ANVIL_SECRET_ENCRYPTION_KEY must be a valid hex string");
@@ -167,7 +173,15 @@ impl ObjectManager {
             jwt_manager,
             encryption_key,
             watch_tx,
+            observability,
         }
+    }
+
+    fn record_reserved_namespace_rejection(&self, operation: &'static str) {
+        self.observability.increment_counter(
+            RESERVED_NAMESPACE_REJECTION_COUNT,
+            &[("api", "native"), ("operation", operation)],
+        );
     }
 
     pub async fn put_object(
@@ -179,6 +193,9 @@ impl ObjectManager {
         mut data_stream: impl Stream<Item = Result<Vec<u8>, Status>> + Unpin,
         options: ObjectWriteOptions,
     ) -> Result<Object, Status> {
+        let _latency = self
+            .observability
+            .latency_guard(OBJECT_WRITE_LATENCY, &[("api", "native")]);
         info!(
             tenant_id,
             bucket_name,
@@ -191,6 +208,7 @@ impl ObjectManager {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
         if validation::is_reserved_internal_key(object_key) {
+            self.record_reserved_namespace_rejection("put_object");
             return Err(Status::permission_denied("UnauthorizedReservedNamespace"));
         }
         if !validation::is_valid_object_key(object_key) {
@@ -854,10 +872,14 @@ impl ObjectManager {
         ),
         Status,
     > {
+        let _latency = self
+            .observability
+            .latency_guard(OBJECT_READ_LATENCY, &[("api", "native")]);
         if !validation::is_valid_bucket_name(&bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
         if validation::is_reserved_internal_key(&object_key) {
+            self.record_reserved_namespace_rejection("get_object");
             return Err(Status::permission_denied("UnauthorizedReservedNamespace"));
         }
         if !validation::is_valid_object_key(&object_key) {
@@ -1159,6 +1181,7 @@ impl ObjectManager {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
         if validation::is_reserved_internal_key(object_key) {
+            self.record_reserved_namespace_rejection("delete_object");
             return Err(Status::permission_denied("UnauthorizedReservedNamespace"));
         }
         if !validation::is_valid_object_key(object_key) {
@@ -1310,10 +1333,14 @@ impl ObjectManager {
         limit: i32,
         delimiter: &str,
     ) -> Result<(Vec<Object>, Vec<String>), Status> {
+        let _latency = self
+            .observability
+            .latency_guard(PREFIX_LIST_LATENCY, &[("api", "native")]);
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
         if validation::is_reserved_internal_key(prefix) {
+            self.record_reserved_namespace_rejection("list_objects");
             return Err(Status::permission_denied("UnauthorizedReservedNamespace"));
         }
         if !prefix.is_empty() && !validation::is_valid_object_key(prefix) {

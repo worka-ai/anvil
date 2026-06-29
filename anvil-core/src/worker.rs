@@ -701,6 +701,7 @@ mod tests {
             jwt_manager.clone(),
             config.anvil_secret_encryption_key.clone(),
             watch_tx,
+            crate::observability::Observability::default(),
         );
         let encryption_key = Arc::new(hex::decode(&config.anvil_secret_encryption_key).unwrap());
         execute_task_with_lease(
