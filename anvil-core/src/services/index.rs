@@ -2,8 +2,9 @@ use crate::anvil_api::index_service_server::IndexService;
 use crate::anvil_api::*;
 use crate::{
     AppState, access_control, auth, bucket_journal,
+    error_codes::AnvilErrorCode,
     formats::{
-        full_text::{Bm25Config, FullTextIndexDefinition},
+        full_text::{Bm25Config, FullTextIndexDefinition, FullTextQueryError},
         vector::VectorMetric,
     },
     full_text_segment, index_journal, index_partition_watch,
@@ -573,7 +574,7 @@ impl AppState {
                 limit: internal_candidate_limit(req.limit, &index.authorization_mode),
             },
         )
-        .map_err(|e| Status::failed_precondition(format!("{e:?}")))?;
+        .map_err(full_text_query_status)?;
         let requested_limit = query_limit(req.limit);
         let mut hits = Vec::with_capacity(search_hits.len().min(requested_limit));
         for hit in search_hits {
@@ -676,7 +677,7 @@ impl AppState {
                     limit: internal_limit,
                 },
             )
-            .map_err(|e| Status::failed_precondition(format!("{e:?}")))?;
+            .map_err(full_text_query_status)?;
             for hit in search_hits {
                 let entry = combined
                     .entry(hit.object_version_id)
@@ -988,6 +989,15 @@ fn full_text_definition(
         .get("full_text")
         .unwrap_or(&index.build_policy);
     FullTextIndexDefinition::from_json(policy).map_err(|e| Status::invalid_argument(e.to_string()))
+}
+
+fn full_text_query_status(error: FullTextQueryError) -> Status {
+    match error {
+        FullTextQueryError::PositionsDisabled => {
+            Status::failed_precondition(AnvilErrorCode::IndexDoesNotSupportQuery.as_str())
+        }
+        FullTextQueryError::EmptyPhrase => Status::invalid_argument("query_text is required"),
+    }
 }
 
 fn parse_json_field(name: &str, value: &str) -> Result<JsonValue, Status> {

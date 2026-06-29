@@ -1993,6 +1993,109 @@ async fn test_query_full_text_index_reads_latest_segment() {
 }
 
 #[tokio::test]
+async fn test_query_full_text_phrase_requires_position_enabled_index() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
+
+    let bucket_name = "index-query-phrase-no-positions-bucket".to_string();
+    bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let created = index_client
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket_name: bucket_name.clone(),
+                name: "body".to_string(),
+                kind: "full_text".to_string(),
+                selector_json: serde_json::json!({"selector": "object_body_utf8"}).to_string(),
+                extractor_json: serde_json::json!({"encoding": "utf8"}).to_string(),
+                authorization_mode: "index_only".to_string(),
+                build_policy_json: serde_json::json!({"positions": false}).to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .index
+        .expect("created index");
+
+    let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
+    let bucket = cluster.states[0]
+        .persistence
+        .get_bucket_by_name(claims.tenant_id, &bucket_name)
+        .await
+        .unwrap()
+        .expect("bucket exists");
+    let index_storage_id = anvil::index_journal::index_storage_id(
+        claims.tenant_id,
+        bucket.id,
+        created.index_id as i64,
+    );
+    let postings = build_full_text_postings(
+        &[FullTextDocument {
+            document_id: 11,
+            field_id: 1,
+            object_version_id: [11; 16],
+            authz_label_hash: [1; 32],
+            text: "quick brown fox",
+        }],
+        &Default::default(),
+    );
+    write_full_text_segment(
+        &cluster.states[0].storage,
+        FullTextSegmentWrite {
+            index_id: &index_storage_id,
+            generation: 1,
+            tokenizer: serde_json::json!({}),
+            scorer: serde_json::json!({"kind": "bm25"}),
+            source_cursor: 1,
+            authz_revision: 1,
+            built_postings: &postings,
+            document_table: b"",
+        },
+    )
+    .await
+    .unwrap();
+
+    let status = index_client
+        .query_index(authorized(
+            QueryIndexRequest {
+                bucket_name,
+                index_name: "body".to_string(),
+                query_text: "quick brown".to_string(),
+                query_vector: vec![],
+                limit: 10,
+                phrase: true,
+            },
+            &token,
+        ))
+        .await
+        .expect_err("phrase query should fail when index positions are disabled");
+
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        status.message(),
+        anvil::error_codes::AnvilErrorCode::IndexDoesNotSupportQuery.as_str()
+    );
+}
+
+#[tokio::test]
 async fn test_query_vector_index_reads_latest_segment() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
