@@ -11,6 +11,45 @@ fn run(cmd: &str, args: &[&str]) {
     assert!(status.success(), "command failed: {} {:?}", cmd, args);
 }
 
+fn docker_admin(compose_file: &std::path::Path, args: &[&str]) {
+    let mut command_args = vec![
+        "compose",
+        "-f",
+        compose_file.to_str().unwrap(),
+        "exec",
+        "-T",
+        "anvil1",
+        "admin",
+        "--storage-path",
+        "/var/lib/anvil",
+        "--anvil-secret-encryption-key",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ];
+    command_args.extend_from_slice(args);
+    run("docker", &command_args);
+}
+
+fn docker_admin_output(compose_file: &std::path::Path, args: &[&str]) -> std::process::Output {
+    let mut command_args = vec![
+        "compose",
+        "-f",
+        compose_file.to_str().unwrap(),
+        "exec",
+        "-T",
+        "anvil1",
+        "admin",
+        "--storage-path",
+        "/var/lib/anvil",
+        "--anvil-secret-encryption-key",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ];
+    command_args.extend_from_slice(args);
+    Command::new("docker")
+        .args(command_args)
+        .output()
+        .expect("failed to run docker admin command")
+}
+
 #[allow(unused)]
 async fn wait_ready(url: &str, timeout: Duration) {
     let start = Instant::now();
@@ -80,55 +119,23 @@ async fn docker_cluster_end_to_end() {
     wait_ready("http://localhost:50052/ready", Duration::from_secs(60)).await;
     wait_ready("http://localhost:50053/ready", Duration::from_secs(60)).await;
 
-    // Ensure region exists, then create tenant and app
-    let region_args: Vec<&str> = vec![
-        "run",
-        "--bin",
-        "admin",
-        "--",
-        "--anvil-secret-encryption-key",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "region",
-        "create",
-        "DOCKER_TEST",
-    ];
-    run("cargo", &region_args);
+    // Initialise the Docker node's own control plane. These commands must run
+    // inside the container because the server reads /var/lib/anvil, not the
+    // runner's local development storage.
+    docker_admin(&compose_file_path, &["region", "create", "DOCKER_TEST"]);
+    docker_admin(&compose_file_path, &["tenant", "create", "default"]);
 
-    // Create tenant and app
-    let tenant_args: Vec<&str> = vec![
-        "run",
-        "--bin",
-        "admin",
-        "--",
-        "--anvil-secret-encryption-key",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "tenant",
-        "create",
-        "default",
-    ];
-    run("cargo", &tenant_args);
-
-    let mut create_args: Vec<String> =
-        vec!["run".into(), "--bin".into(), "admin".into(), "--".into()];
-    create_args.extend(
-        [
-            "--anvil-secret-encryption-key",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    let app_out = docker_admin_output(
+        &compose_file_path,
+        &[
             "app",
             "create",
             "--tenant-name",
             "default",
             "--app-name",
             "docker-e2e-app",
-        ]
-        .into_iter()
-        .map(|s| s.to_string()),
+        ],
     );
-    let app_out = Command::new("cargo")
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .args(&create_args)
-        .output()
-        .expect("failed to create app");
     if !app_out.status.success() {
         eprintln!(
             "admin create stdout: {}",
@@ -160,24 +167,19 @@ async fn docker_cluster_end_to_end() {
     let client_id = extract_credential(&creds, "Client ID");
     let client_secret = extract_credential(&creds, "Client Secret");
 
-    // Grant wildcard policy
-    let grant_args: Vec<&str> = vec![
-        "run",
-        "--bin",
-        "admin",
-        "--",
-        "--anvil-secret-encryption-key",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "policy",
-        "grant",
-        "--app-name",
-        "docker-e2e-app",
-        "--action",
-        "*",
-        "--resource",
-        "*",
-    ];
-    run("cargo", &grant_args);
+    docker_admin(
+        &compose_file_path,
+        &[
+            "policy",
+            "grant",
+            "--app-name",
+            "docker-e2e-app",
+            "--action",
+            "*",
+            "--resource",
+            "*",
+        ],
+    );
 
     // Allow small delay
     tokio::time::sleep(Duration::from_secs(3)).await;
