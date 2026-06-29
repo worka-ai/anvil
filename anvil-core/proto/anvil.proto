@@ -239,6 +239,8 @@ message QueryIndexRequest {
     repeated float query_vector = 4;
     uint32 limit = 5;
     bool phrase = 6;
+    string path_prefix = 7;
+    string metadata_filters_json = 8;
 }
 
 message IndexQueryHit {

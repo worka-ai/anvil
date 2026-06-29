@@ -883,6 +883,8 @@ async fn test_s3_put_triggers_full_text_index_build() {
                     query_vector: vec![],
                     limit: 10,
                     phrase: false,
+                    path_prefix: String::new(),
+                    metadata_filters_json: String::new(),
                 },
                 &cluster.token,
             ))
@@ -981,6 +983,8 @@ async fn test_s3_put_metadata_field_triggers_full_text_index_build() {
                     query_vector: vec![],
                     limit: 10,
                     phrase: false,
+                    path_prefix: String::new(),
+                    metadata_filters_json: String::new(),
                 },
                 &cluster.token,
             ))
@@ -1073,6 +1077,8 @@ async fn test_s3_put_personaldb_table_column_triggers_full_text_index_build() {
                     query_vector: vec![],
                     limit: 10,
                     phrase: false,
+                    path_prefix: String::new(),
+                    metadata_filters_json: String::new(),
                 },
                 &cluster.token,
             ))
@@ -1160,6 +1166,8 @@ async fn test_s3_put_media_transcript_triggers_full_text_index_build() {
                     query_vector: vec![],
                     limit: 10,
                     phrase: false,
+                    path_prefix: String::new(),
+                    metadata_filters_json: String::new(),
                 },
                 &cluster.token,
             ))
@@ -1254,6 +1262,8 @@ async fn test_s3_put_triggers_vector_index_build() {
                     query_vector: vec![0.0, 1.0],
                     limit: 10,
                     phrase: false,
+                    path_prefix: String::new(),
+                    metadata_filters_json: String::new(),
                 },
                 &cluster.token,
             ))

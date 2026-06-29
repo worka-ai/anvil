@@ -324,6 +324,8 @@ async fn test_full_text_index_builds_from_object_write_task() {
                     query_vector: vec![],
                     limit: 10,
                     phrase: false,
+                    path_prefix: String::new(),
+                    metadata_filters_json: String::new(),
                 },
                 &token,
             ))
@@ -488,6 +490,8 @@ async fn test_full_text_index_build_extracts_json_pointer_from_object_write_task
                     query_vector: vec![],
                     limit: 10,
                     phrase: false,
+                    path_prefix: String::new(),
+                    metadata_filters_json: String::new(),
                 },
                 &token,
             ))
@@ -1173,12 +1177,14 @@ async fn test_repair_rebuilds_missing_vector_segment_from_base_journal() {
     let response = index_client
         .query_index(authorized(
             QueryIndexRequest {
-                bucket_name,
+                bucket_name: bucket_name.clone(),
                 index_name: "embedding".to_string(),
                 query_text: String::new(),
                 query_vector: vec![1.0, 0.0],
                 limit: 10,
                 phrase: false,
+                path_prefix: String::new(),
+                metadata_filters_json: String::new(),
             },
             &token,
         ))
@@ -1428,6 +1434,8 @@ async fn test_vector_index_builds_from_object_write_task() {
                     query_vector: vec![1.0, 0.0],
                     limit: 10,
                     phrase: false,
+                    path_prefix: String::new(),
+                    metadata_filters_json: String::new(),
                 },
                 &token,
             ))
@@ -1826,6 +1834,8 @@ async fn test_hybrid_index_builds_text_and_vector_segments_from_object_write_tas
                     query_vector: vec![0.0, 1.0],
                     limit: 10,
                     phrase: false,
+                    path_prefix: String::new(),
+                    metadata_filters_json: String::new(),
                 },
                 &token,
             ))
@@ -1975,6 +1985,8 @@ async fn test_query_full_text_index_reads_latest_segment() {
                 query_vector: vec![],
                 limit: 10,
                 phrase: false,
+                path_prefix: String::new(),
+                metadata_filters_json: String::new(),
             },
             &token,
         ))
@@ -2082,6 +2094,8 @@ async fn test_query_full_text_phrase_requires_position_enabled_index() {
                 query_vector: vec![],
                 limit: 10,
                 phrase: true,
+                path_prefix: String::new(),
+                metadata_filters_json: String::new(),
             },
             &token,
         ))
@@ -2221,6 +2235,8 @@ async fn test_query_vector_index_reads_latest_segment() {
                 query_vector: vec![1.0, 0.0],
                 limit: 2,
                 phrase: false,
+                path_prefix: String::new(),
+                metadata_filters_json: String::new(),
             },
             &token,
         ))
@@ -2315,7 +2331,7 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
             8,
             "etag-hybrid-a",
             Some("text/plain"),
-            None,
+            Some(serde_json::json!({"tier": "gold", "kind": "note"})),
             None,
             Some(b"alpha beta".to_vec()),
         )
@@ -2331,7 +2347,7 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
             8,
             "etag-hybrid-b",
             Some("text/plain"),
-            None,
+            Some(serde_json::json!({"tier": "silver", "kind": "note"})),
             None,
             Some(b"gamma".to_vec()),
         )
@@ -2356,7 +2372,7 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
                 field_id: 1,
                 object_version_id: *second_object.version_id.as_bytes(),
                 authz_label_hash: [2; 32],
-                text: "gamma",
+                text: "alpha gamma",
             },
         ],
         &Default::default(),
@@ -2402,12 +2418,14 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
     let response = index_client
         .query_index(authorized(
             QueryIndexRequest {
-                bucket_name,
+                bucket_name: bucket_name.clone(),
                 index_name: "body-and-vector".to_string(),
                 query_text: "alpha".to_string(),
                 query_vector: vec![1.0, 0.0],
                 limit: 10,
                 phrase: false,
+                path_prefix: String::new(),
+                metadata_filters_json: String::new(),
             },
             &token,
         ))
@@ -2424,6 +2442,32 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
     assert_eq!(response.hits[0].vector_id, 1);
     let recipe: serde_json::Value = serde_json::from_str(&response.scoring_recipe_json).unwrap();
     assert_eq!(recipe["kind"], "hybrid");
+
+    let filtered = index_client
+        .query_index(authorized(
+            QueryIndexRequest {
+                bucket_name,
+                index_name: "body-and-vector".to_string(),
+                query_text: "alpha".to_string(),
+                query_vector: vec![0.0, 1.0],
+                limit: 10,
+                phrase: false,
+                path_prefix: "docs/hybrid-a".to_string(),
+                metadata_filters_json: serde_json::json!({"tier": "gold"}).to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        filtered
+            .hits
+            .iter()
+            .map(|hit| hit.object_key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["docs/hybrid-a.txt"]
+    );
 }
 
 #[tokio::test]
@@ -2563,6 +2607,8 @@ async fn test_query_inherit_object_vector_filters_results_by_object_read_scope()
                 query_vector: vec![1.0, 0.0],
                 limit: 1,
                 phrase: false,
+                path_prefix: String::new(),
+                metadata_filters_json: String::new(),
             },
             &limited_token,
         ))
@@ -2729,6 +2775,8 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
                 query_vector: vec![],
                 limit: 1,
                 phrase: false,
+                path_prefix: String::new(),
+                metadata_filters_json: String::new(),
             },
             &limited_token,
         ))
@@ -2776,6 +2824,8 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
                 query_vector: vec![],
                 limit: 10,
                 phrase: false,
+                path_prefix: String::new(),
+                metadata_filters_json: String::new(),
             },
             &tuple_token,
         ))
@@ -3088,6 +3138,8 @@ async fn wait_for_vector_hit(
                     query_vector: query_vector.clone(),
                     limit: 10,
                     phrase: false,
+                    path_prefix: String::new(),
+                    metadata_filters_json: String::new(),
                 },
                 token,
             ))

@@ -553,6 +553,7 @@ impl AppState {
             ));
         }
         let definition = full_text_definition(index)?;
+        let filters = QueryFilters::from_request(&req)?;
         let index_storage_id =
             index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
         let Some(segment) =
@@ -571,27 +572,30 @@ impl AppState {
                 phrase: req.phrase,
                 bm25: Bm25Config::default(),
                 authorized_labels: None,
-                limit: internal_candidate_limit(req.limit, &index.authorization_mode),
+                limit: internal_candidate_limit_for_request(&req, &index.authorization_mode),
             },
         )
         .map_err(full_text_query_status)?;
         let requested_limit = query_limit(req.limit);
         let mut hits = Vec::with_capacity(search_hits.len().min(requested_limit));
         for hit in search_hits {
-            let (object_version_id, object_key) = match self
+            let object_ref = match self
                 .object_ref_for_query_hit(bucket.id, hit.object_version_id)
                 .await?
             {
                 Some(object_ref) => object_ref,
                 None if index.authorization_mode == "inherit_object" => continue,
-                None => (String::new(), String::new()),
+                None => QueryObjectRef::default(),
             };
+            if !filters.matches(&object_ref)? {
+                continue;
+            }
             if !self
                 .query_hit_visible(
                     claims,
                     &index.authorization_mode,
                     &bucket.name,
-                    &object_key,
+                    &object_ref.object_key,
                     segment.header.authz_revision,
                 )
                 .await?
@@ -601,8 +605,8 @@ impl AppState {
             hits.push(IndexQueryHit {
                 kind: "full_text".to_string(),
                 score: hit.score,
-                object_key,
-                object_version_id,
+                object_key: object_ref.object_key,
+                object_version_id: object_ref.object_version_id,
                 document_id: hit.document_id,
                 field_id: u32::from(hit.field_id),
                 vector_id: 0,
@@ -645,7 +649,8 @@ impl AppState {
         }
 
         let requested_limit = query_limit(req.limit);
-        let internal_limit = internal_candidate_limit(req.limit, &index.authorization_mode);
+        let internal_limit = internal_candidate_limit_for_request(&req, &index.authorization_mode);
+        let filters = QueryFilters::from_request(&req)?;
         let index_storage_id =
             index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
         let mut combined = BTreeMap::<[u8; 16], HybridAccum>::new();
@@ -745,20 +750,23 @@ impl AppState {
 
         let mut hits = Vec::with_capacity(ranked.len().min(requested_limit));
         for item in ranked {
-            let (object_version_id, object_key) = match self
+            let object_ref = match self
                 .object_ref_for_query_hit(bucket.id, item.object_version_id)
                 .await?
             {
                 Some(object_ref) => object_ref,
                 None if index.authorization_mode == "inherit_object" => continue,
-                None => (String::new(), String::new()),
+                None => QueryObjectRef::default(),
             };
+            if !filters.matches(&object_ref)? {
+                continue;
+            }
             if !self
                 .query_hit_visible(
                     claims,
                     &index.authorization_mode,
                     &bucket.name,
-                    &object_key,
+                    &object_ref.object_key,
                     authz_revision,
                 )
                 .await?
@@ -768,8 +776,8 @@ impl AppState {
             hits.push(IndexQueryHit {
                 kind: "hybrid".to_string(),
                 score: item.score,
-                object_key,
-                object_version_id,
+                object_key: object_ref.object_key,
+                object_version_id: object_ref.object_version_id,
                 document_id: item.document_id,
                 field_id: item.field_id,
                 vector_id: item.vector_id,
@@ -818,6 +826,7 @@ impl AppState {
         if req.query_vector.is_empty() {
             return Err(Status::invalid_argument("query_vector is required"));
         }
+        let filters = QueryFilters::from_request(&req)?;
         let index_storage_id =
             index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
         let Some(segment) =
@@ -837,26 +846,29 @@ impl AppState {
             &req.query_vector,
             metric,
             None,
-            internal_candidate_limit(req.limit, &index.authorization_mode),
+            internal_candidate_limit_for_request(&req, &index.authorization_mode),
         )
         .map_err(|e| Status::internal(e.to_string()))?;
         let requested_limit = query_limit(req.limit);
         let mut hits = Vec::with_capacity(search_hits.len().min(requested_limit));
         for hit in search_hits {
-            let (object_version_id, object_key) = match self
+            let object_ref = match self
                 .object_ref_for_query_hit(bucket.id, hit.object_version_id)
                 .await?
             {
                 Some(object_ref) => object_ref,
                 None if index.authorization_mode == "inherit_object" => continue,
-                None => (String::new(), String::new()),
+                None => QueryObjectRef::default(),
             };
+            if !filters.matches(&object_ref)? {
+                continue;
+            }
             if !self
                 .query_hit_visible(
                     claims,
                     &index.authorization_mode,
                     &bucket.name,
-                    &object_key,
+                    &object_ref.object_key,
                     segment.header.authz_revision,
                 )
                 .await?
@@ -866,8 +878,8 @@ impl AppState {
             hits.push(IndexQueryHit {
                 kind: "vector".to_string(),
                 score: hit.score,
-                object_key,
-                object_version_id,
+                object_key: object_ref.object_key,
+                object_version_id: object_ref.object_version_id,
                 document_id: 0,
                 field_id: 0,
                 vector_id: hit.vector_id,
@@ -904,14 +916,18 @@ impl AppState {
         &self,
         bucket_id: i64,
         version_bytes: [u8; 16],
-    ) -> Result<Option<(String, String)>, Status> {
+    ) -> Result<Option<QueryObjectRef>, Status> {
         let version_id = uuid::Uuid::from_bytes(version_bytes);
         let object = self
             .persistence
             .get_object_version_by_id(bucket_id, version_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(object.map(|object| (version_id.to_string(), object.key)))
+        Ok(object.map(|object| QueryObjectRef {
+            object_version_id: version_id.to_string(),
+            object_key: object.key,
+            user_meta: object.user_meta,
+        }))
     }
 
     async fn query_hit_visible(
@@ -947,6 +963,97 @@ impl AppState {
             "index_only" | "public" => Ok(true),
             _ => Ok(false),
         }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct QueryObjectRef {
+    object_version_id: String,
+    object_key: String,
+    user_meta: Option<JsonValue>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct QueryFilters {
+    path_prefix: Option<String>,
+    metadata: Vec<MetadataFilter>,
+}
+
+#[derive(Debug, Clone)]
+struct MetadataFilter {
+    field: String,
+    expected: JsonValue,
+}
+
+impl QueryFilters {
+    fn from_request(req: &QueryIndexRequest) -> Result<Self, Status> {
+        let path_prefix = if req.path_prefix.trim().is_empty() {
+            None
+        } else {
+            Some(req.path_prefix.clone())
+        };
+        let metadata = parse_metadata_filters(&req.metadata_filters_json)?;
+        Ok(Self {
+            path_prefix,
+            metadata,
+        })
+    }
+
+    fn matches(&self, object_ref: &QueryObjectRef) -> Result<bool, Status> {
+        if let Some(path_prefix) = &self.path_prefix
+            && !object_ref.object_key.starts_with(path_prefix)
+        {
+            return Ok(false);
+        }
+        if self.metadata.is_empty() {
+            return Ok(true);
+        }
+        let Some(metadata) = object_ref.user_meta.as_ref() else {
+            return Ok(false);
+        };
+        for filter in &self.metadata {
+            let Some(actual) = metadata_filter_value(metadata, &filter.field) else {
+                return Ok(false);
+            };
+            if actual != &filter.expected {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+fn parse_metadata_filters(value: &str) -> Result<Vec<MetadataFilter>, Status> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let parsed: JsonValue = serde_json::from_str(value)
+        .map_err(|e| Status::invalid_argument(format!("Invalid metadata_filters_json: {e}")))?;
+    if parsed.is_null() {
+        return Ok(Vec::new());
+    }
+    let JsonValue::Object(entries) = parsed else {
+        return Err(Status::invalid_argument(
+            "metadata_filters_json must be a JSON object",
+        ));
+    };
+    let mut filters = Vec::with_capacity(entries.len());
+    for (field, expected) in entries {
+        if field.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "metadata_filters_json field names must not be empty",
+            ));
+        }
+        filters.push(MetadataFilter { field, expected });
+    }
+    Ok(filters)
+}
+
+fn metadata_filter_value<'a>(metadata: &'a JsonValue, field: &str) -> Option<&'a JsonValue> {
+    if field.starts_with('/') {
+        metadata.pointer(field)
+    } else {
+        metadata.get(field)
     }
 }
 
@@ -1073,9 +1180,14 @@ fn query_limit(value: u32) -> usize {
     }
 }
 
-fn internal_candidate_limit(value: u32, authorization_mode: &str) -> usize {
-    let limit = query_limit(value);
-    if authorization_mode == "inherit_object" {
+fn internal_candidate_limit_for_request(
+    req: &QueryIndexRequest,
+    authorization_mode: &str,
+) -> usize {
+    let limit = query_limit(req.limit);
+    let has_non_authorization_filters =
+        !req.path_prefix.trim().is_empty() || !req.metadata_filters_json.trim().is_empty();
+    if authorization_mode == "inherit_object" || has_non_authorization_filters {
         limit.saturating_mul(20)
     } else {
         limit
@@ -1214,4 +1326,59 @@ fn index_diagnostic_record(
         details_json: diagnostic.details.to_string(),
         created_at: diagnostic.created_at.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_filters_match_path_prefix_and_metadata() {
+        let req = QueryIndexRequest {
+            path_prefix: "docs/active/".to_string(),
+            metadata_filters_json: serde_json::json!({
+                "tenant": "alpha",
+                "/nested/state": "open"
+            })
+            .to_string(),
+            ..Default::default()
+        };
+        let filters = QueryFilters::from_request(&req).unwrap();
+        let object_ref = QueryObjectRef {
+            object_version_id: "version-1".to_string(),
+            object_key: "docs/active/item.json".to_string(),
+            user_meta: Some(serde_json::json!({
+                "tenant": "alpha",
+                "nested": {"state": "open"}
+            })),
+        };
+
+        assert!(filters.matches(&object_ref).unwrap());
+    }
+
+    #[test]
+    fn query_filters_reject_non_matching_metadata_without_leaking_object() {
+        let req = QueryIndexRequest {
+            metadata_filters_json: serde_json::json!({"tenant": "alpha"}).to_string(),
+            ..Default::default()
+        };
+        let filters = QueryFilters::from_request(&req).unwrap();
+        let object_ref = QueryObjectRef {
+            object_version_id: "version-1".to_string(),
+            object_key: "docs/active/item.json".to_string(),
+            user_meta: Some(serde_json::json!({"tenant": "beta"})),
+        };
+
+        assert!(!filters.matches(&object_ref).unwrap());
+    }
+
+    #[test]
+    fn query_filters_reject_invalid_metadata_filter_shape() {
+        let req = QueryIndexRequest {
+            metadata_filters_json: "[]".to_string(),
+            ..Default::default()
+        };
+
+        assert!(QueryFilters::from_request(&req).is_err());
+    }
 }
