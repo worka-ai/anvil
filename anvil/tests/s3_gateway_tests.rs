@@ -16,6 +16,7 @@ use std::env::temp_dir;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::process::{Command, Output};
 use std::time::Duration;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
@@ -61,23 +62,17 @@ fn create_app(admin_state_path: &str, app_name: &str) -> (String, String) {
 }
 
 fn create_app_with_id(admin_state_path: &str, app_name: &str) -> (String, String, String) {
-    let admin_args = &["run", "--bin", "admin", "--"];
-    let app_output = std::process::Command::new("cargo")
-        .args(admin_args.iter().chain(&[
-            "--anvil-secret-encryption-key",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--storage-path",
-            admin_state_path,
+    let app_output = run_admin(
+        admin_state_path,
+        &[
             "app",
             "create",
             "--tenant-name",
             "default",
             "--app-name",
             app_name,
-        ]))
-        .output()
-        .unwrap();
-    assert!(app_output.status.success());
+        ],
+    );
     let creds = String::from_utf8(app_output.stdout).unwrap();
     let app_id = creds
         .lines()
@@ -95,32 +90,50 @@ fn grant_wildcard_policy(admin_state_path: &str, app_name: &str) {
 }
 
 fn grant_policy(admin_state_path: &str, app_name: &str, action: &str, resource: &str) {
-    let admin_args = &["run", "--bin", "admin", "--"];
-    let policy_args = &[
-        "policy",
-        "grant",
-        "--app-name",
-        app_name,
-        "--action",
-        action,
-        "--resource",
-        resource,
-    ];
-    let status = std::process::Command::new("cargo")
-        .args(
-            admin_args
-                .iter()
-                .chain(&[
-                    "--anvil-secret-encryption-key",
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "--storage-path",
-                    admin_state_path,
-                ])
-                .chain(policy_args.iter()),
-        )
-        .status()
-        .unwrap();
-    assert!(status.success());
+    run_admin(
+        admin_state_path,
+        &[
+            "policy",
+            "grant",
+            "--app-name",
+            app_name,
+            "--action",
+            action,
+            "--resource",
+            resource,
+        ],
+    );
+}
+
+fn run_admin(admin_state_path: &str, args: &[&str]) -> Output {
+    let mut command = admin_command(admin_state_path);
+    let output = command.args(args).output().expect("run admin binary");
+    assert!(
+        output.status.success(),
+        "admin command failed: status={:?}, args={:?}, stdout={}, stderr={}",
+        output.status.code(),
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn admin_command(admin_state_path: &str) -> Command {
+    let mut command = if let Some(admin_binary) = option_env!("CARGO_BIN_EXE_admin") {
+        Command::new(admin_binary)
+    } else {
+        let mut fallback = Command::new("cargo");
+        fallback.args(["run", "--bin", "admin", "--"]);
+        fallback
+    };
+    command.args([
+        "--anvil-secret-encryption-key",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--storage-path",
+        admin_state_path,
+    ]);
+    command
 }
 
 fn s3_client(http_base: &str, client_id: &str, client_secret: &str) -> Client {
@@ -2546,33 +2559,19 @@ async fn test_streaming_upload_decoding() {
     let (client_id, client_secret) = create_app(&cluster.admin_state_path, "streaming-decode-app");
 
     // Grant wildcard policy to the app
-    let admin_args = &["run", "--bin", "admin", "--"];
-    let policy_args = &[
-        "policy",
-        "grant",
-        "--app-name",
-        "streaming-decode-app",
-        "--action",
-        "*",
-        "--resource",
-        "*",
-    ];
-    let status = std::process::Command::new("cargo")
-        .args(
-            admin_args
-                .iter()
-                .chain(&[
-                    "--anvil-secret-encryption-key",
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "--storage-path",
-                    &cluster.admin_state_path,
-                ])
-                .chain(policy_args.iter()),
-        )
-        .status()
-        .unwrap();
-    assert!(status.success());
-
+    run_admin(
+        &cluster.admin_state_path,
+        &[
+            "policy",
+            "grant",
+            "--app-name",
+            "streaming-decode-app",
+            "--action",
+            "*",
+            "--resource",
+            "*",
+        ],
+    );
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Configure S3 client
