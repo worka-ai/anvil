@@ -6,13 +6,17 @@ on:
   pull_request:
     branches: [ main ]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write
   packages: write
 
 jobs:
   build-and-test:
-    runs-on: worka-l1
+    runs-on: ubuntu-latest
 
     steps:
     - name: Checkout repository
