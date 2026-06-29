@@ -1,6 +1,7 @@
 # This Docker Compose file is exclusively for the end-to-end test.
-# It uses an environment variable to dynamically set the image to test against.
-version: "3.8"
+# It uses environment variables to dynamically set the image and optional host
+# API ports. Cluster UDP ports are intentionally not published to the host;
+# nodes communicate over the compose network.
 
 networks:
   anvilnet:
@@ -24,8 +25,7 @@ services:
       - STORAGE_PATH=/var/lib/anvil
     command: ["anvil", "--init-cluster"]
     ports:
-      - "50051:50051"
-      - "7443:7443/udp"
+      - "${ANVIL_TEST_API1_PORT:-55051}:50051"
     volumes:
       - anvil1_data:/var/lib/anvil
     networks: [anvilnet]
@@ -55,8 +55,7 @@ services:
       - BOOTSTRAP_ADDRS=/dns4/anvil1/udp/7443/quic-v1
       - STORAGE_PATH=/var/lib/anvil
     ports:
-      - "50052:50051"
-      - "7444:7443/udp"
+      - "${ANVIL_TEST_API2_PORT:-55052}:50051"
     volumes:
       - anvil2_data:/var/lib/anvil
     networks: [anvilnet]
@@ -81,8 +80,7 @@ services:
       - BOOTSTRAP_ADDRS=/dns4/anvil1/udp/7443/quic-v1
       - STORAGE_PATH=/var/lib/anvil
     ports:
-      - "50053:50051"
-      - "7445:7443/udp"
+      - "${ANVIL_TEST_API3_PORT:-55053}:50051"
     volumes:
       - anvil3_data:/var/lib/anvil
     networks: [anvilnet]

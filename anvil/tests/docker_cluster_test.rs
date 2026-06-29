@@ -64,6 +64,20 @@ async fn wait_ready(url: &str, timeout: Duration) {
     }
 }
 
+fn host_api_port(node: u8) -> String {
+    let (name, default) = match node {
+        1 => ("ANVIL_TEST_API1_PORT", "55051"),
+        2 => ("ANVIL_TEST_API2_PORT", "55052"),
+        3 => ("ANVIL_TEST_API3_PORT", "55053"),
+        _ => panic!("unsupported Docker test node"),
+    };
+    std::env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
+fn host_api_url(node: u8) -> String {
+    format!("http://localhost:{}", host_api_port(node))
+}
+
 #[allow(dead_code)]
 #[allow(unused)]
 struct ComposeGuard {
@@ -72,7 +86,12 @@ struct ComposeGuard {
 
 impl Drop for ComposeGuard {
     fn drop(&mut self) {
-        let _ = Command::new("docker")
+        let mut command = Command::new("docker");
+        command.env(
+            "ANVIL_IMAGE",
+            std::env::var("ANVIL_IMAGE").unwrap_or_else(|_| "anvil:test".to_string()),
+        );
+        let _ = command
             .args([
                 "compose",
                 "-f",
@@ -115,9 +134,21 @@ async fn docker_cluster_end_to_end() {
     };
 
     // Wait for nodes to be ready
-    wait_ready("http://localhost:50051/ready", Duration::from_secs(60)).await;
-    wait_ready("http://localhost:50052/ready", Duration::from_secs(60)).await;
-    wait_ready("http://localhost:50053/ready", Duration::from_secs(60)).await;
+    wait_ready(
+        &format!("{}/ready", host_api_url(1)),
+        Duration::from_secs(60),
+    )
+    .await;
+    wait_ready(
+        &format!("{}/ready", host_api_url(2)),
+        Duration::from_secs(60),
+    )
+    .await;
+    wait_ready(
+        &format!("{}/ready", host_api_url(3)),
+        Duration::from_secs(60),
+    )
+    .await;
 
     // Initialise the Docker node's own control plane. These commands must run
     // inside the container because the server reads /var/lib/anvil, not the
@@ -185,11 +216,10 @@ async fn docker_cluster_end_to_end() {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Get token via gRPC
-    let mut auth_client = anvil::anvil_api::auth_service_client::AuthServiceClient::connect(
-        "http://localhost:50051".to_string(),
-    )
-    .await
-    .unwrap();
+    let mut auth_client =
+        anvil::anvil_api::auth_service_client::AuthServiceClient::connect(host_api_url(1))
+            .await
+            .unwrap();
     let token = auth_client
         .get_access_token(anvil::anvil_api::GetAccessTokenRequest {
             client_id: client_id.clone(),
@@ -202,11 +232,10 @@ async fn docker_cluster_end_to_end() {
         .access_token;
 
     // Create buckets via gRPC
-    let mut bucket_client = anvil::anvil_api::bucket_service_client::BucketServiceClient::connect(
-        "http://localhost:50051".to_string(),
-    )
-    .await
-    .unwrap();
+    let mut bucket_client =
+        anvil::anvil_api::bucket_service_client::BucketServiceClient::connect(host_api_url(1))
+            .await
+            .unwrap();
     let suffix = uuid::Uuid::new_v4().to_string();
     let private_bucket = format!("e2e-private-{}", suffix);
     let public_bucket = format!("e2e-public-{}", suffix);
@@ -236,11 +265,10 @@ async fn docker_cluster_end_to_end() {
     }
 
     // Make public bucket public
-    let mut auth_client = anvil::anvil_api::auth_service_client::AuthServiceClient::connect(
-        "http://localhost:50051".to_string(),
-    )
-    .await
-    .unwrap();
+    let mut auth_client =
+        anvil::anvil_api::auth_service_client::AuthServiceClient::connect(host_api_url(1))
+            .await
+            .unwrap();
     let mut public_req = tonic::Request::new(anvil::anvil_api::SetPublicAccessRequest {
         bucket: public_bucket.clone(),
         allow_public_read: true,
@@ -259,7 +287,7 @@ async fn docker_cluster_end_to_end() {
     let config = aws_sdk_s3::Config::builder()
         .credentials_provider(credentials)
         .region(aws_sdk_s3::config::Region::new("test-region"))
-        .endpoint_url("http://localhost:50051")
+        .endpoint_url(host_api_url(1))
         .force_path_style(true)
         .behavior_version_latest()
         .build();
@@ -301,26 +329,26 @@ async fn docker_cluster_end_to_end() {
     assert_eq!(data.as_ref(), private_content);
 
     // Read public via HTTP
-    let public_url = format!("http://localhost:50051/{}/{}", public_bucket, public_key);
+    let public_url = format!("{}/{}/{}", host_api_url(1), public_bucket, public_key);
     let public_resp = reqwest::get(&public_url).await.unwrap();
     assert_eq!(public_resp.status(), 200);
     let public_data = public_resp.bytes().await.unwrap();
     assert_eq!(public_data.as_ref(), public_content);
 
     // Private anonymous should fail
-    let private_url = format!("http://localhost:50051/{}/{}", private_bucket, private_key);
+    let private_url = format!("{}/{}/{}", host_api_url(1), private_bucket, private_key);
     let private_resp = reqwest::get(&private_url).await.unwrap();
     assert!(private_resp.status() == 403 || private_resp.status() == 404);
 
     // Anonymous List on public bucket should succeed (200) with XML
-    let public_list_url = format!("http://localhost:50051/{}?list-type=2", public_bucket);
+    let public_list_url = format!("{}/{}?list-type=2", host_api_url(1), public_bucket);
     let public_list_resp = reqwest::get(&public_list_url).await.unwrap();
     assert_eq!(public_list_resp.status(), 200);
     let public_list_body = public_list_resp.text().await.unwrap();
     assert!(public_list_body.contains("<ListBucketResult"));
 
     // Anonymous List on private bucket should be unauthorized (401/403)
-    let private_list_url = format!("http://localhost:50051/{}?list-type=2", private_bucket);
+    let private_list_url = format!("{}/{}?list-type=2", host_api_url(1), private_bucket);
     let private_list_resp = reqwest::get(&private_list_url).await.unwrap();
     assert!(private_list_resp.status() == 401 || private_list_resp.status() == 403);
 

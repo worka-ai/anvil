@@ -7,6 +7,45 @@ fn run(cmd: &str, args: &[&str]) {
     assert!(status.success(), "command failed: {} {:?}", cmd, args);
 }
 
+fn docker_admin(compose_file: &std::path::Path, args: &[&str]) {
+    let mut command_args = vec![
+        "compose",
+        "-f",
+        compose_file.to_str().unwrap(),
+        "exec",
+        "-T",
+        "anvil1",
+        "admin",
+        "--storage-path",
+        "/var/lib/anvil",
+        "--anvil-secret-encryption-key",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ];
+    command_args.extend_from_slice(args);
+    run("docker", &command_args);
+}
+
+fn docker_admin_output(compose_file: &std::path::Path, args: &[&str]) -> std::process::Output {
+    let mut command_args = vec![
+        "compose",
+        "-f",
+        compose_file.to_str().unwrap(),
+        "exec",
+        "-T",
+        "anvil1",
+        "admin",
+        "--storage-path",
+        "/var/lib/anvil",
+        "--anvil-secret-encryption-key",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ];
+    command_args.extend_from_slice(args);
+    Command::new("docker")
+        .args(command_args)
+        .output()
+        .expect("failed to run docker admin command")
+}
+
 #[allow(dead_code)]
 #[allow(unused)]
 async fn wait_ready(url: &str, timeout: Duration) {
@@ -22,6 +61,47 @@ async fn wait_ready(url: &str, timeout: Duration) {
     }
 }
 
+fn host_api_port(node: u8) -> String {
+    let (name, default) = match node {
+        1 => ("ANVIL_TEST_API1_PORT", "55051"),
+        2 => ("ANVIL_TEST_API2_PORT", "55052"),
+        3 => ("ANVIL_TEST_API3_PORT", "55053"),
+        _ => panic!("unsupported Docker test node"),
+    };
+    std::env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
+fn host_api_url(node: u8) -> String {
+    format!("http://localhost:{}", host_api_port(node))
+}
+
+async fn get_public_text_with_retry(url: &str, timeout: Duration) -> String {
+    let start = Instant::now();
+    let mut last_error = "no attempts completed".to_string();
+    loop {
+        if start.elapsed() > timeout {
+            panic!("timed out fetching {url}: {last_error}");
+        }
+
+        match reqwest::get(url).await {
+            Ok(response) if response.status().is_success() => match response.text().await {
+                Ok(text) => return text,
+                Err(error) => {
+                    last_error = format!("failed to read response body: {error}");
+                }
+            },
+            Ok(response) => {
+                last_error = format!("unexpected HTTP status {}", response.status());
+            }
+            Err(error) => {
+                last_error = format!("request failed: {error}");
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 #[allow(dead_code)]
 #[allow(unused)]
 struct ComposeGuard {
@@ -30,7 +110,12 @@ struct ComposeGuard {
 
 impl Drop for ComposeGuard {
     fn drop(&mut self) {
-        let _ = Command::new("docker")
+        let mut command = Command::new("docker");
+        command.env(
+            "ANVIL_IMAGE",
+            std::env::var("ANVIL_IMAGE").unwrap_or_else(|_| "anvil:test".to_string()),
+        );
+        let _ = command
             .args([
                 "compose",
                 "-f",
@@ -67,55 +152,27 @@ async fn hf_ingestion_config_json() {
         compose_file: compose_file_path.clone(),
     };
 
-    wait_ready("http://localhost:50051/ready", Duration::from_secs(60)).await;
+    wait_ready(
+        &format!("{}/ready", host_api_url(1)),
+        Duration::from_secs(60),
+    )
+    .await;
 
-    // Prepare region/tenant/app via admin
-    run(
-        "cargo",
-        &[
-            "run",
-            "--bin",
-            "admin",
-            "--",
-            "--anvil-secret-encryption-key",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "region",
-            "create",
-            "DOCKER_TEST",
-        ],
-    );
-    run(
-        "cargo",
-        &[
-            "run",
-            "--bin",
-            "admin",
-            "--",
-            "--anvil-secret-encryption-key",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "tenant",
-            "create",
-            "default",
-        ],
-    );
+    // Prepare region/tenant/app inside the Docker node's own storage.
+    docker_admin(&compose_file_path, &["region", "create", "DOCKER_TEST"]);
+    docker_admin(&compose_file_path, &["tenant", "create", "default"]);
 
-    let app_out = Command::new("cargo")
-        .args([
-            "run",
-            "--bin",
-            "admin",
-            "--",
-            "--anvil-secret-encryption-key",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    let app_out = docker_admin_output(
+        &compose_file_path,
+        &[
             "app",
             "create",
             "--tenant-name",
             "default",
             "--app-name",
             "hf-e2e-app",
-        ])
-        .output()
-        .expect("admin apps create");
+        ],
+    );
     assert!(
         app_out.status.success(),
         "admin apps create failed: {}",
@@ -138,16 +195,10 @@ async fn hf_ingestion_config_json() {
     let client_id = extract(&out, "Client ID");
     let client_secret = extract(&out, "Client Secret");
 
-    // Wildcard policy for simplicity in e2e
-    run(
-        "cargo",
+    // Wildcard policy for simplicity in e2e.
+    docker_admin(
+        &compose_file_path,
         &[
-            "run",
-            "--bin",
-            "admin",
-            "--",
-            "--anvil-secret-encryption-key",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "policy",
             "grant",
             "--app-name",
@@ -160,11 +211,10 @@ async fn hf_ingestion_config_json() {
     );
 
     // Get access token
-    let mut auth_client = anvil::anvil_api::auth_service_client::AuthServiceClient::connect(
-        "http://localhost:50051".to_string(),
-    )
-    .await
-    .unwrap();
+    let mut auth_client =
+        anvil::anvil_api::auth_service_client::AuthServiceClient::connect(host_api_url(1))
+            .await
+            .unwrap();
     let token = auth_client
         .get_access_token(anvil::anvil_api::GetAccessTokenRequest {
             client_id: client_id.clone(),
@@ -177,11 +227,10 @@ async fn hf_ingestion_config_json() {
         .access_token;
 
     // Create bucket
-    let mut bucket_client = anvil::anvil_api::bucket_service_client::BucketServiceClient::connect(
-        "http://localhost:50051".to_string(),
-    )
-    .await
-    .unwrap();
+    let mut bucket_client =
+        anvil::anvil_api::bucket_service_client::BucketServiceClient::connect(host_api_url(1))
+            .await
+            .unwrap();
     let mut req = tonic::Request::new(anvil::anvil_api::CreateBucketRequest {
         bucket_name: "models".into(),
         region: "DOCKER_TEST".into(),
@@ -192,10 +241,25 @@ async fn hf_ingestion_config_json() {
     );
     let _ = bucket_client.create_bucket(req).await;
 
+    // The assertions below intentionally verify unauthenticated S3-compatible
+    // HTTP reads, so the test bucket must opt into public read access.
+    let mut public_req = tonic::Request::new(anvil::anvil_api::SetPublicAccessRequest {
+        bucket: "models".into(),
+        allow_public_read: true,
+    });
+    public_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    auth_client
+        .set_public_access(public_req)
+        .await
+        .expect("make HF test bucket public");
+
     // Create HF key via public API (empty token for public repo)
     let mut key_client =
         anvil::anvil_api::hugging_face_key_service_client::HuggingFaceKeyServiceClient::connect(
-            "http://localhost:50051".to_string(),
+            host_api_url(1),
         )
         .await
         .unwrap();
@@ -213,7 +277,7 @@ async fn hf_ingestion_config_json() {
     // Start ingestion for config.json only
     let mut ing_client =
         anvil::anvil_api::hf_ingestion_service_client::HfIngestionServiceClient::connect(
-            "http://localhost:50051".to_string(),
+            host_api_url(1),
         )
         .await
         .unwrap();
@@ -266,22 +330,14 @@ async fn hf_ingestion_config_json() {
     }
 
     // Verify GET on the object returns 200 and valid JSON
-    let url = "http://localhost:50051/models/gpt-oss-20b/config.json";
-    let resp = reqwest::get(url).await.unwrap();
-    assert_eq!(resp.status(), 200);
-    let txt = resp.text().await.unwrap();
+    let url = format!("{}/models/gpt-oss-20b/config.json", host_api_url(1));
+    let txt = get_public_text_with_retry(&url, Duration::from_secs(15)).await;
     let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
     assert!(v.is_object());
 
     // Verify anvil-index.json
-    let index_url = "http://localhost:50051/models/gpt-oss-20b/anvil-index.json";
-    let index_resp = reqwest::get(index_url).await.unwrap();
-    assert_eq!(
-        index_resp.status(),
-        200,
-        "anvil-index.json should be accessible"
-    );
-    let index_txt = index_resp.text().await.unwrap();
+    let index_url = format!("{}/models/gpt-oss-20b/anvil-index.json", host_api_url(1));
+    let index_txt = get_public_text_with_retry(&index_url, Duration::from_secs(15)).await;
     let index_v: serde_json::Value = serde_json::from_str(&index_txt).unwrap();
 
     // Assert meta fields
@@ -362,9 +418,7 @@ async fn hf_ingestion_config_json() {
     }
 
     // Verify merged anvil-index.json
-    let index_resp_2 = reqwest::get(index_url).await.unwrap();
-    assert_eq!(index_resp_2.status(), 200);
-    let index_txt_2 = index_resp_2.text().await.unwrap();
+    let index_txt_2 = get_public_text_with_retry(&index_url, Duration::from_secs(15)).await;
     let index_v_2: serde_json::Value = serde_json::from_str(&index_txt_2).unwrap();
 
     // Assert meta fields
