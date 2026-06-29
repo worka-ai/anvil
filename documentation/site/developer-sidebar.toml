@@ -1,0 +1,35 @@
+[[items]]
+title = "Developer Guides"
+href = "/developers/native-api/"
+level = 0
+group = true
+
+[[items]]
+title = "Native API"
+href = "/developers/native-api/"
+level = 1
+
+[[items]]
+title = "S3 Compatibility"
+href = "/developers/s3-compatibility/"
+level = 1
+
+[[items]]
+title = "Objects And Metadata"
+href = "/developers/objects-and-metadata/"
+level = 1
+
+[[items]]
+title = "Search And Indexes"
+href = "/developers/search-and-indexes/"
+level = 1
+
+[[items]]
+title = "PersonalDB Applications"
+href = "/developers/personaldb-applications/"
+level = 1
+
+[[items]]
+title = "Source And Model Artifacts"
+href = "/developers/source-and-model-artifacts/"
+level = 1

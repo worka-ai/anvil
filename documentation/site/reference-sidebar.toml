@@ -1,0 +1,25 @@
+[[items]]
+title = "Reference"
+href = "/reference/configuration/"
+level = 0
+group = true
+
+[[items]]
+title = "Configuration"
+href = "/reference/configuration/"
+level = 1
+
+[[items]]
+title = "CLI"
+href = "/reference/cli/"
+level = 1
+
+[[items]]
+title = "Security Errors"
+href = "/reference/security-errors/"
+level = 1
+
+[[items]]
+title = "Package Publishing"
+href = "/reference/package-publishing/"
+level = 1

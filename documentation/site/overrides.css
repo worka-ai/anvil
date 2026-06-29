@@ -1,0 +1,50 @@
+:root {
+  --anvil-ink: #111827;
+  --anvil-muted: #4b5563;
+  --anvil-panel: #f8fafc;
+  --anvil-border: #d7dde8;
+  --anvil-accent: #1f6feb;
+  --anvil-accent-2: #0f766e;
+}
+
+body {
+  background: #f7f4ed;
+}
+
+main, article {
+  line-height: 1.7;
+}
+
+article h1, article h2, article h3 {
+  color: var(--anvil-ink);
+}
+
+article p, article li {
+  color: var(--anvil-muted);
+}
+
+article blockquote {
+  border-left: 4px solid var(--anvil-accent);
+  background: rgba(31, 111, 235, 0.06);
+  padding: 0.8rem 1rem;
+  border-radius: 0 12px 12px 0;
+}
+
+article table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+article th, article td {
+  border: 1px solid var(--anvil-border);
+  padding: 0.7rem;
+  vertical-align: top;
+}
+
+article th {
+  background: #eef4ff;
+}
+
+code {
+  border-radius: 6px;
+}

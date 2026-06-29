@@ -1,0 +1,73 @@
+targets = ["site"]
+
+[app]
+name = "Anvil Documentation"
+app_id = "org.anvil.storage.docs"
+
+[site]
+entry = "crate::site_app"
+base_path = "/"
+out_dir = "target/fission/site"
+default_locale = "en-GB"
+generate_sitemap = false
+generate_robots = false
+title = "Anvil"
+description = "Anvil is a production object store with native indexing, vector search, full text search, relationship authorization, watch streams, and PersonalDB witness support."
+logo = "/app-icon.png"
+favicon = "/app-icon.png"
+asset_dirs = ["assets"]
+css_files = ["site/overrides.css"]
+
+[site.code_highlighting]
+enabled = true
+
+[site.search]
+enabled = true
+
+[[site.nav]]
+title = "Home"
+href = "/"
+
+[[site.nav]]
+title = "Learn"
+href = "/learn/overview/"
+
+[[site.nav]]
+title = "Developers"
+href = "/developers/native-api/"
+
+[[site.nav]]
+title = "Operators"
+href = "/operators/deployment/"
+
+[[site.nav]]
+title = "Reference"
+href = "/reference/configuration/"
+
+[[site.routes]]
+kind = "content"
+path = "/learn"
+source = "content/learn"
+template = "fission::site::documentation"
+sidebar = "site/learn-sidebar.toml"
+
+[[site.routes]]
+kind = "content"
+path = "/developers"
+source = "content/developers"
+template = "fission::site::documentation"
+sidebar = "site/developer-sidebar.toml"
+
+[[site.routes]]
+kind = "content"
+path = "/operators"
+source = "content/operators"
+template = "fission::site::documentation"
+sidebar = "site/operator-sidebar.toml"
+
+[[site.routes]]
+kind = "content"
+path = "/reference"
+source = "content/reference"
+template = "fission::site::documentation"
+sidebar = "site/reference-sidebar.toml"
