@@ -9,7 +9,9 @@ use crate::{
     },
     full_text_segment, index_journal, index_partition_watch,
     permissions::AnvilAction,
-    search_query, validation, vector_segment,
+    search_query,
+    services::watch_envelope::{self, WatchEnvelopeParts},
+    validation, vector_segment,
 };
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
@@ -38,7 +40,7 @@ impl IndexService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
         validate_index_name(&req.name)?;
-        validate_index_kind(&req.kind)?;
+        let kind = concrete_index_kind(req.kind)?;
         let resource = index_resource(&req.bucket_name, &req.name);
         if !auth::is_authorized(AnvilAction::IndexCreate, &resource, &claims.scopes) {
             return Err(Status::permission_denied("Permission denied"));
@@ -50,7 +52,7 @@ impl IndexService for AppState {
         let extractor = parse_json_field("extractor_json", &req.extractor_json)?;
         let build_policy = parse_json_field("build_policy_json", &req.build_policy_json)?;
         validate_authorization_mode(&req.authorization_mode)?;
-        validate_index_definition_shape(&req.kind, &build_policy)?;
+        validate_index_definition_shape(kind, &build_policy)?;
 
         let index = self
             .persistence
@@ -58,7 +60,7 @@ impl IndexService for AppState {
                 claims.tenant_id,
                 bucket.id,
                 &req.name,
-                &req.kind,
+                kind,
                 selector,
                 extractor,
                 &req.authorization_mode,
@@ -401,13 +403,13 @@ impl IndexService for AppState {
             for event in snapshot {
                 last_cursor = last_cursor.max(event.cursor);
                 if tx
-                    .send(Ok(index_partition_event_response(
+                    .send(index_partition_event_response(
                         &bucket_name,
                         &index_name,
                         &index_storage_id,
                         &partition_id,
                         event,
-                    )))
+                    ))
                     .await
                     .is_err()
                 {
@@ -438,13 +440,13 @@ impl IndexService for AppState {
                 for event in events {
                     last_cursor = last_cursor.max(event.cursor);
                     if tx
-                        .send(Ok(index_partition_event_response(
+                        .send(index_partition_event_response(
                             &bucket_name,
                             &index_name,
                             &index_storage_id,
                             &partition_id,
                             event,
-                        )))
+                        ))
                         .await
                         .is_err()
                     {
@@ -581,6 +583,7 @@ impl AppState {
         )
         .map_err(full_text_query_status)?;
         let requested_limit = query_limit(req.limit);
+        let index_kind = index_kind_value_from_str(&index.kind)?;
         let mut hits = Vec::with_capacity(search_hits.len().min(requested_limit));
         for hit in search_hits {
             let object_ref = match self
@@ -607,7 +610,7 @@ impl AppState {
                 continue;
             }
             hits.push(IndexQueryHit {
-                kind: "full_text".to_string(),
+                kind: index_kind,
                 score: hit.score,
                 object_key: object_ref.object_key,
                 object_version_id: object_ref.object_version_id,
@@ -631,7 +634,7 @@ impl AppState {
 
         Ok(Response::new(QueryIndexResponse {
             hits,
-            index_kind: index.kind.clone(),
+            index_kind,
             index_generation: segment.header.generation,
             authz_revision: segment.header.authz_revision,
             scoring_recipe_json: serde_json::json!({"kind": "bm25", "k1": 1.2, "b": 0.75})
@@ -663,6 +666,7 @@ impl AppState {
         }
         let filters = QueryFilters::from_request(&req)?;
         let requested_limit = query_limit(req.limit);
+        let index_kind = index_kind_value_from_str(&index.kind)?;
         let objects = self
             .persistence
             .list_current_directory_objects(bucket)
@@ -703,7 +707,7 @@ impl AppState {
             })
             .to_string();
             hits.push(IndexQueryHit {
-                kind: index.kind.clone(),
+                kind: index_kind,
                 score: 1.0,
                 object_key: object_ref.object_key,
                 object_version_id: object_ref.object_version_id,
@@ -722,7 +726,7 @@ impl AppState {
 
         Ok(Response::new(QueryIndexResponse {
             hits,
-            index_kind: index.kind.clone(),
+            index_kind,
             index_generation: index.version.max(0) as u64,
             authz_revision: latest_authz_revision.max(0) as u64,
             scoring_recipe_json: serde_json::json!({
@@ -887,12 +891,13 @@ impl AppState {
                 })
         });
 
+        let index_kind = index_kind_value_from_str(&index.kind)?;
         let mut hits = Vec::with_capacity(candidates.len().min(requested_limit));
         for candidate in candidates {
             let item = candidate.item;
             let object_ref = candidate.object_ref;
             hits.push(IndexQueryHit {
-                kind: "hybrid".to_string(),
+                kind: index_kind,
                 score: item.score,
                 object_key: object_ref.object_key,
                 object_version_id: object_ref.object_version_id,
@@ -919,7 +924,7 @@ impl AppState {
 
         Ok(Response::new(QueryIndexResponse {
             hits,
-            index_kind: index.kind.clone(),
+            index_kind,
             index_generation: generation,
             authz_revision,
             scoring_recipe_json: serde_json::json!({
@@ -976,6 +981,7 @@ impl AppState {
         )
         .map_err(|e| Status::internal(e.to_string()))?;
         let requested_limit = query_limit(req.limit);
+        let index_kind = index_kind_value_from_str(&index.kind)?;
         let mut hits = Vec::with_capacity(search_hits.len().min(requested_limit));
         for hit in search_hits {
             let object_ref = match self
@@ -1002,7 +1008,7 @@ impl AppState {
                 continue;
             }
             hits.push(IndexQueryHit {
-                kind: "vector".to_string(),
+                kind: index_kind,
                 score: hit.score,
                 object_key: object_ref.object_key,
                 object_version_id: object_ref.object_version_id,
@@ -1026,7 +1032,7 @@ impl AppState {
 
         Ok(Response::new(QueryIndexResponse {
             hits,
-            index_kind: index.kind.clone(),
+            index_kind,
             index_generation: segment.header.generation,
             authz_revision: segment.header.authz_revision,
             scoring_recipe_json: serde_json::json!({
@@ -1331,17 +1337,32 @@ fn validate_index_name(value: &str) -> Result<(), Status> {
     Ok(())
 }
 
-fn validate_index_kind(value: &str) -> Result<(), Status> {
-    match value {
-        "path"
-        | "metadata_filter"
-        | "full_text"
-        | "vector"
-        | "hybrid"
-        | "personaldb_row_metadata"
-        | "git_source" => Ok(()),
-        _ => Err(Status::invalid_argument("Invalid index kind")),
+fn concrete_index_kind(value: i32) -> Result<&'static str, Status> {
+    let kind =
+        IndexKind::try_from(value).map_err(|_| Status::invalid_argument("Invalid index kind"))?;
+    match kind {
+        IndexKind::Unspecified => Err(Status::invalid_argument("index kind is required")),
+        IndexKind::Path => Ok("path"),
+        IndexKind::MetadataFilter => Ok("metadata_filter"),
+        IndexKind::FullText => Ok("full_text"),
+        IndexKind::Vector => Ok("vector"),
+        IndexKind::Hybrid => Ok("hybrid"),
+        IndexKind::PersonaldbRowMetadata => Ok("personaldb_row_metadata"),
+        IndexKind::GitSource => Ok("git_source"),
     }
+}
+
+pub(crate) fn index_kind_value_from_str(value: &str) -> Result<i32, Status> {
+    Ok(match value {
+        "path" => IndexKind::Path,
+        "metadata_filter" => IndexKind::MetadataFilter,
+        "full_text" => IndexKind::FullText,
+        "vector" => IndexKind::Vector,
+        "hybrid" => IndexKind::Hybrid,
+        "personaldb_row_metadata" => IndexKind::PersonaldbRowMetadata,
+        "git_source" => IndexKind::GitSource,
+        _ => return Err(Status::internal("Invalid stored index kind")),
+    } as i32)
 }
 
 fn validate_authorization_mode(value: &str) -> Result<(), Status> {
@@ -1434,7 +1455,7 @@ fn index_record(
         index_id: u64::try_from(index.id).map_err(|_| Status::internal("Invalid index id"))?,
         bucket_name: bucket_name.to_string(),
         name: index.name,
-        kind: index.kind,
+        kind: index_kind_value_from_str(&index.kind)?,
         selector_json: index.selector.to_string(),
         extractor_json: index.extractor.to_string(),
         authorization_mode: index.authorization_mode,
@@ -1452,37 +1473,73 @@ fn index_partition_event_response(
     index_storage_id: &str,
     partition_id: &str,
     event: index_partition_watch::IndexPartitionWatchEvent,
-) -> WatchIndexPartitionResponse {
+) -> Result<WatchIndexPartitionResponse, Status> {
     let (cursor_low, cursor_high) = split_u128(event.cursor);
     let (source_cursor_low, source_cursor_high) = split_u128(event.payload.source_cursor);
-    WatchIndexPartitionResponse {
+    let payload = event.payload;
+    let index_kind = index_kind_value_from_str(&payload.index_kind)?;
+    let emitted_at = payload.emitted_at.clone();
+    let generation = payload.generation;
+    let payload_hash = watch_envelope::payload_hash(&payload);
+    Ok(WatchIndexPartitionResponse {
         cursor_low,
         cursor_high,
         bucket_name: bucket_name.to_string(),
         index_name: index_name.to_string(),
         index_storage_id: index_storage_id.to_string(),
         partition_id: partition_id.to_string(),
-        event_type: event.payload.event_type,
-        index_kind: event.payload.index_kind,
-        generation: event.payload.generation,
+        event_type: payload.event_type,
+        index_kind,
+        generation,
         source_cursor_low,
         source_cursor_high,
-        source_manifest_hash: event.payload.source_manifest_hash,
-        proof_hash: event.payload.proof_hash,
-        segment_hashes: event.payload.segment_hashes,
+        source_manifest_hash: payload.source_manifest_hash,
+        proof_hash: payload.proof_hash,
+        segment_hashes: payload.segment_hashes,
         authz_revision: event.authz_revision,
-        emitted_at: event.payload.emitted_at,
-    }
+        emitted_at: emitted_at.clone(),
+        envelope: Some(watch_envelope::envelope(WatchEnvelopeParts {
+            watch_stream_id: "index_partition",
+            partition_family: "index_partition",
+            partition_id: partition_id.to_string(),
+            cursor: event.cursor,
+            mutation_id: watch_envelope::uuid_from_bytes(event.mutation_id),
+            record_kind: "index_partition".to_string(),
+            object_ref: format!("{bucket_name}/{index_name}/{partition_id}"),
+            authz_revision: event.authz_revision,
+            index_generation: generation,
+            personaldb_log_index: 0,
+            payload_hash,
+            emitted_at,
+        })),
+    })
 }
 
 fn index_definition_event_response(
     event: &crate::persistence::IndexDefinitionEvent,
 ) -> Result<WatchIndexDefinitionResponse, Status> {
+    let cursor = u64::try_from(event.id).map_err(|_| Status::internal("Invalid watch cursor"))?;
+    let emitted_at = event.created_at.to_string();
+    let payload_hash = watch_envelope::payload_hash(&event.definition);
     Ok(WatchIndexDefinitionResponse {
-        cursor: u64::try_from(event.id).map_err(|_| Status::internal("Invalid watch cursor"))?,
+        cursor,
         event_type: event.event_type.clone(),
         index: Some(index_record_from_event(event)?),
-        emitted_at: event.created_at.to_string(),
+        emitted_at: emitted_at.clone(),
+        envelope: Some(watch_envelope::envelope(WatchEnvelopeParts {
+            watch_stream_id: "index_definition",
+            partition_family: "index_definition",
+            partition_id: event.bucket_id.to_string(),
+            cursor: event.id as u128,
+            mutation_id: event.mutation_id.to_string(),
+            record_kind: "index_definition".to_string(),
+            object_ref: format!("{}/{}", event.bucket_name, event.index_name),
+            authz_revision: 0,
+            index_generation: event.index_version as u64,
+            personaldb_log_index: 0,
+            payload_hash,
+            emitted_at,
+        })),
     })
 }
 
@@ -1495,7 +1552,7 @@ fn index_record_from_event(
             .map_err(|_| Status::internal("Invalid index id"))?,
         bucket_name: event.bucket_name.clone(),
         name: event.index_name.clone(),
-        kind: json_string_field(definition, "kind")?,
+        kind: index_kind_value_from_str(&json_string_field(definition, "kind")?)?,
         selector_json: json_string_field(definition, "selector_json")?,
         extractor_json: json_string_field(definition, "extractor_json")?,
         authorization_mode: json_string_field(definition, "authorization_mode")?,

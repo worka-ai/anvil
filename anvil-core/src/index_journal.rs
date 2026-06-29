@@ -82,7 +82,6 @@ async fn append_index_definition_event_inner(
         .last()
         .map(|frame| frame.record_hash)
         .unwrap_or([0; 32]);
-    let mutation_id = uuid::Uuid::new_v4();
     let body = serde_json::to_vec(&IndexEventBody {
         cursor: event.id,
         tenant_id: event.tenant_id,
@@ -99,7 +98,7 @@ async fn append_index_definition_event_inner(
         JournalRecordKind::IndexDefinition,
         sequence,
         fence_token,
-        *mutation_id.as_bytes(),
+        *event.mutation_id.as_bytes(),
         index_key_hash(event.tenant_id, event.bucket_id, &event.index_name),
         previous_hash,
         body,
@@ -164,6 +163,7 @@ async fn write_index_definition_event_inner(
         index_name: index.name.clone(),
         event_type: event_type.to_string(),
         index_version: index.version,
+        mutation_id: uuid::Uuid::new_v4(),
         definition: index_definition_json(&bucket.name, index),
         created_at: chrono::Utc::now(),
     };
@@ -285,6 +285,7 @@ async fn read_all_index_definition_events(
             index_name: body.index_name,
             event_type: body.event_type,
             index_version: body.index_version,
+            mutation_id: uuid::Uuid::from_bytes(frame.mutation_id),
             definition: body.definition,
             created_at: chrono::DateTime::parse_from_rfc3339(&body.created_at)?
                 .with_timezone(&chrono::Utc),
@@ -480,6 +481,7 @@ mod tests {
             index_name: name.to_string(),
             event_type: event_type.to_string(),
             index_version: cursor,
+            mutation_id: uuid::Uuid::new_v4(),
             definition: json!({
                 "index_id": 100,
                 "bucket_name": "docs",

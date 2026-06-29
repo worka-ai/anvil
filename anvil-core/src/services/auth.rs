@@ -2,7 +2,9 @@ use crate::anvil_api::auth_service_server::AuthService;
 use crate::anvil_api::*;
 use crate::{
     AppState, auth, authz_derived_lag_watch, authz_journal, authz_namespace_watch,
-    authz_userset_index, crypto, permissions::AnvilAction,
+    authz_userset_index, crypto,
+    permissions::AnvilAction,
+    services::watch_envelope::{self, WatchEnvelopeParts},
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -647,8 +649,10 @@ fn zookie(revision: i64) -> String {
 fn authz_tuple_log_response(
     record: &crate::persistence::AuthzTupleRecord,
 ) -> WatchAuthzTupleLogResponse {
+    let revision = revision_to_u64(record.revision).unwrap_or_default();
+    let written_at = record.written_at.to_string();
     WatchAuthzTupleLogResponse {
-        revision: revision_to_u64(record.revision).unwrap_or_default(),
+        revision,
         namespace: record.namespace.clone(),
         object_id: record.object_id.clone(),
         relation: record.relation.clone(),
@@ -659,7 +663,24 @@ fn authz_tuple_log_response(
         written_by: record.written_by.clone(),
         reason: record.reason.clone(),
         record_hash: record.record_hash.clone(),
-        written_at: record.written_at.to_string(),
+        written_at: written_at.clone(),
+        envelope: Some(watch_envelope::envelope(WatchEnvelopeParts {
+            watch_stream_id: "authz_tuple_log",
+            partition_family: "authz_tuple",
+            partition_id: record.namespace.clone(),
+            cursor: revision.into(),
+            mutation_id: record.mutation_id.to_string(),
+            record_kind: "authz_tuple".to_string(),
+            object_ref: format!(
+                "{}:{}#{}",
+                record.namespace, record.object_id, record.relation
+            ),
+            authz_revision: revision,
+            index_generation: 0,
+            personaldb_log_index: 0,
+            payload_hash: record.record_hash.clone(),
+            emitted_at: written_at,
+        })),
     }
 }
 
@@ -667,15 +688,33 @@ fn authz_namespace_watch_response(
     event: authz_namespace_watch::AuthzNamespaceWatchEvent,
 ) -> WatchAuthzNamespaceResponse {
     let (cursor_low, cursor_high) = split_u128(event.cursor);
+    let payload = event.payload;
+    let emitted_at = payload.emitted_at.clone();
+    let namespace = payload.namespace.clone();
+    let payload_hash = watch_envelope::payload_hash(&payload);
     WatchAuthzNamespaceResponse {
         cursor_low,
         cursor_high,
-        namespace: event.payload.namespace,
-        event_type: event.payload.event_type,
+        namespace: namespace.clone(),
+        event_type: payload.event_type,
         authz_revision: event.authz_revision,
-        schema_hash: event.payload.schema_hash,
-        invalidates_derived_usersets: event.payload.invalidates_derived_usersets,
-        emitted_at: event.payload.emitted_at,
+        schema_hash: payload.schema_hash,
+        invalidates_derived_usersets: payload.invalidates_derived_usersets,
+        emitted_at: emitted_at.clone(),
+        envelope: Some(watch_envelope::envelope(WatchEnvelopeParts {
+            watch_stream_id: "authz_namespace",
+            partition_family: "authz_namespace",
+            partition_id: namespace.clone(),
+            cursor: event.cursor,
+            mutation_id: watch_envelope::uuid_from_bytes(event.mutation_id),
+            record_kind: "authz_namespace".to_string(),
+            object_ref: namespace,
+            authz_revision: event.authz_revision,
+            index_generation: 0,
+            personaldb_log_index: 0,
+            payload_hash,
+            emitted_at,
+        })),
     }
 }
 
@@ -685,20 +724,40 @@ fn authz_derived_lag_watch_response(
     let (cursor_low, cursor_high) = split_u128(event.cursor);
     let (source_cursor_low, source_cursor_high) = split_u128(event.payload.source_cursor);
     let revision_lag = event.payload.revision_lag();
+    let payload = event.payload;
+    let emitted_at = payload.emitted_at.clone();
+    let derived_index_id = payload.derived_index_id.clone();
+    let generation = payload.generation;
+    let latest_revision = payload.latest_revision;
+    let payload_hash = watch_envelope::payload_hash(&payload);
     WatchAuthzDerivedLagResponse {
         cursor_low,
         cursor_high,
-        derived_index_id: event.payload.derived_index_id,
-        derived_index_kind: event.payload.derived_index_kind,
-        processed_revision: event.payload.processed_revision,
-        latest_revision: event.payload.latest_revision,
+        derived_index_id: derived_index_id.clone(),
+        derived_index_kind: payload.derived_index_kind,
+        processed_revision: payload.processed_revision,
+        latest_revision,
         revision_lag,
         source_cursor_low,
         source_cursor_high,
-        source_manifest_hash: event.payload.source_manifest_hash,
-        generation: event.payload.generation,
+        source_manifest_hash: payload.source_manifest_hash,
+        generation,
         authz_revision: event.authz_revision,
-        emitted_at: event.payload.emitted_at,
+        emitted_at: emitted_at.clone(),
+        envelope: Some(watch_envelope::envelope(WatchEnvelopeParts {
+            watch_stream_id: "authz_derived_lag",
+            partition_family: "authz_derived_lag",
+            partition_id: derived_index_id.clone(),
+            cursor: event.cursor,
+            mutation_id: watch_envelope::uuid_from_bytes(event.mutation_id),
+            record_kind: "authz_derived_lag".to_string(),
+            object_ref: derived_index_id,
+            authz_revision: event.authz_revision,
+            index_generation: generation,
+            personaldb_log_index: 0,
+            payload_hash,
+            emitted_at,
+        })),
     }
 }
 

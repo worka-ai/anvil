@@ -1,8 +1,8 @@
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::index_service_client::IndexServiceClient;
 use anvil::anvil_api::{
-    CreateIndexRequest, GetAccessTokenRequest, QueryIndexRequest, SetPublicAccessRequest,
-    WriteAuthzTupleRequest,
+    CreateIndexRequest, GetAccessTokenRequest, IndexKind, QueryIndexRequest,
+    SetPublicAccessRequest, WriteAuthzTupleRequest,
 };
 use anvil::storage::{DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES, ExternalChunkManifest};
 use aws_sdk_s3::Client;
@@ -887,7 +887,7 @@ async fn test_s3_put_triggers_full_text_index_build() {
             CreateIndexRequest {
                 bucket_name: bucket.clone(),
                 name: "body".to_string(),
-                kind: "full_text".to_string(),
+                kind: IndexKind::FullText as i32,
                 selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
                 extractor_json: serde_json::json!({"source": "object_body_utf8"}).to_string(),
                 authorization_mode: "index_only".to_string(),
@@ -942,7 +942,7 @@ async fn test_s3_put_triggers_full_text_index_build() {
     }
 
     let response = indexed.expect("S3 object should be searchable after index task completes");
-    assert_eq!(response.index_kind, "full_text");
+    assert_eq!(response.index_kind, IndexKind::FullText as i32);
     assert!(response.index_generation >= 1);
     wait_for_completed_index_build(&cluster, Duration::from_secs(20)).await;
 }
@@ -974,7 +974,7 @@ async fn test_s3_put_metadata_field_triggers_full_text_index_build() {
             CreateIndexRequest {
                 bucket_name: bucket.clone(),
                 name: "owner".to_string(),
-                kind: "full_text".to_string(),
+                kind: IndexKind::FullText as i32,
                 selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
                 extractor_json: serde_json::json!({
                     "source": "metadata_field",
@@ -1035,7 +1035,7 @@ async fn test_s3_put_metadata_field_triggers_full_text_index_build() {
 
     let response =
         indexed.expect("S3 metadata field should be searchable after index task completes");
-    assert_eq!(response.index_kind, "full_text");
+    assert_eq!(response.index_kind, IndexKind::FullText as i32);
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "docs/s3-metadata.txt");
 }
@@ -1067,7 +1067,7 @@ async fn test_s3_put_personaldb_table_column_triggers_full_text_index_build() {
             CreateIndexRequest {
                 bucket_name: bucket.clone(),
                 name: "row-name".to_string(),
-                kind: "full_text".to_string(),
+                kind: IndexKind::FullText as i32,
                 selector_json: serde_json::json!({"prefix": "rows/"}).to_string(),
                 extractor_json: serde_json::json!({
                     "source": "personaldb_table_column",
@@ -1129,7 +1129,7 @@ async fn test_s3_put_personaldb_table_column_triggers_full_text_index_build() {
 
     let response = indexed
         .expect("S3 PersonalDB table column should be searchable after index task completes");
-    assert_eq!(response.index_kind, "full_text");
+    assert_eq!(response.index_kind, IndexKind::FullText as i32);
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "rows/items/1.json");
 }
@@ -1161,7 +1161,7 @@ async fn test_s3_put_media_transcript_triggers_full_text_index_build() {
             CreateIndexRequest {
                 bucket_name: bucket.clone(),
                 name: "media".to_string(),
-                kind: "full_text".to_string(),
+                kind: IndexKind::FullText as i32,
                 selector_json: serde_json::json!({"prefix": "media/"}).to_string(),
                 extractor_json: serde_json::json!({"source": "media_transcript"}).to_string(),
                 authorization_mode: "index_only".to_string(),
@@ -1218,7 +1218,7 @@ async fn test_s3_put_media_transcript_triggers_full_text_index_build() {
 
     let response =
         indexed.expect("S3 media transcript should be searchable after index task completes");
-    assert_eq!(response.index_kind, "full_text");
+    assert_eq!(response.index_kind, IndexKind::FullText as i32);
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "media/audio/clip.bin");
 }
@@ -1250,7 +1250,7 @@ async fn test_s3_put_triggers_vector_index_build() {
             CreateIndexRequest {
                 bucket_name: bucket.clone(),
                 name: "embedding".to_string(),
-                kind: "vector".to_string(),
+                kind: IndexKind::Vector as i32,
                 selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
                 extractor_json: serde_json::json!({"source": "object_body_json_vector"})
                     .to_string(),
@@ -1314,7 +1314,7 @@ async fn test_s3_put_triggers_vector_index_build() {
 
     let response =
         indexed.expect("S3 object vector should be searchable after index task completes");
-    assert_eq!(response.index_kind, "vector");
+    assert_eq!(response.index_kind, IndexKind::Vector as i32);
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "docs/s3-vector.json");
     wait_for_completed_index_build(&cluster, Duration::from_secs(20)).await;

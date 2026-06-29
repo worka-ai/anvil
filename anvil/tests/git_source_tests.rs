@@ -65,6 +65,17 @@ async fn test_git_source_watch_streams_snapshot_and_new_events() {
         "00000000-0000-0000-0000-000000000001"
     );
     assert_eq!(snapshot.authz_revision, 5);
+    let envelope = snapshot
+        .envelope
+        .as_ref()
+        .expect("git source watch envelope");
+    assert_eq!(envelope.watch_stream_id, "git_source");
+    assert_eq!(envelope.partition_family, "git_source");
+    assert_eq!(envelope.cursor_low, snapshot.cursor_low);
+    assert_eq!(envelope.index_generation, snapshot.generation);
+    assert_eq!(envelope.authz_revision, snapshot.authz_revision);
+    assert_eq!(envelope.record_kind, "git_source");
+    assert!(!envelope.payload_hash.is_empty());
 
     append_git_source_watch_record(
         &cluster.states[0].storage,

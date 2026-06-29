@@ -363,6 +363,7 @@ mod tests {
             operation: operation.to_string(),
             written_by: "tester".to_string(),
             reason: "test".to_string(),
+            mutation_id: uuid::Uuid::new_v4(),
             record_hash: hex::encode(hash32(format!("record-{revision}").as_bytes())),
             written_at: Utc::now(),
         }

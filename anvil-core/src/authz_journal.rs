@@ -79,6 +79,7 @@ async fn write_authz_tuple_inner(
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("authz revision overflow"))?;
     let written_at = chrono::Utc::now();
+    let mutation_id = uuid::Uuid::new_v4();
     let record_hash = authz_record_hash(AuthzRecordHashInput {
         tenant_id: input.tenant_id,
         namespace: input.namespace,
@@ -103,6 +104,7 @@ async fn write_authz_tuple_inner(
         operation: input.operation.to_string(),
         written_by: input.written_by.to_string(),
         reason: input.reason.to_string(),
+        mutation_id,
         record_hash,
         written_at,
     };
@@ -149,7 +151,6 @@ async fn append_authz_tuple_record_inner(
         .last()
         .map(|frame| frame.record_hash)
         .unwrap_or([0; 32]);
-    let mutation_id = uuid::Uuid::new_v4();
     let body = serde_json::to_vec(&AuthzTupleBody {
         revision: record.revision,
         tenant_id: record.tenant_id,
@@ -169,7 +170,7 @@ async fn append_authz_tuple_record_inner(
         JournalRecordKind::AuthzTuple,
         sequence,
         fence_token,
-        *mutation_id.as_bytes(),
+        *record.mutation_id.as_bytes(),
         tuple_key_hash(record),
         previous_hash,
         body,
@@ -495,6 +496,7 @@ async fn read_all_authz_tuple_records_from_journal(
             operation: body.operation,
             written_by: body.written_by,
             reason: body.reason,
+            mutation_id: uuid::Uuid::from_bytes(frame.mutation_id),
             record_hash: body.record_hash,
             written_at: chrono::DateTime::parse_from_rfc3339(&body.written_at)?
                 .with_timezone(&chrono::Utc),
@@ -652,6 +654,7 @@ mod tests {
             operation: operation.to_string(),
             written_by: "tester".to_string(),
             reason: "test".to_string(),
+            mutation_id: uuid::Uuid::new_v4(),
             record_hash: hex::encode(hash32(format!("record-{revision}").as_bytes())),
             written_at: Utc::now(),
         }
@@ -678,6 +681,7 @@ mod tests {
             operation: operation.to_string(),
             written_by: "tester".to_string(),
             reason: "test".to_string(),
+            mutation_id: uuid::Uuid::new_v4(),
             record_hash: hex::encode(hash32(
                 format!(
                     "record-{revision}-{namespace}-{object_id}-{relation}-{subject_kind}-{subject_id}-{operation}"

@@ -6,7 +6,7 @@ use anvil::anvil_api::{
     self, AbortMultipartRequest, AppendStreamRecordRequest, CompareAndSwapManifestRequest,
     CompleteMultipartPart, CompleteMultipartRequest, ComposeObjectRequest, ComposeObjectSource,
     CopyObjectRequest, CreateAppendStreamRequest, CreateBucketRequest, CreateIndexRequest,
-    DeleteObjectRequest, GetObjectRequest, HeadObjectRequest, InitiateMultipartRequest,
+    DeleteObjectRequest, GetObjectRequest, HeadObjectRequest, IndexKind, InitiateMultipartRequest,
     ListObjectVersionsRequest, ListObjectsRequest, NativeMutationContext, ObjectMetadata,
     PatchJsonObjectRequest, PutObjectRequest, RepairDirectoryIndexRequest,
     SealAppendStreamSegmentRequest, UploadPartMetadata, UploadPartRequest, WatchPrefixRequest,
@@ -2014,7 +2014,7 @@ async fn test_object_version_records_index_policy_snapshot_and_mutation_metadata
     let mut create_index = Request::new(CreateIndexRequest {
         bucket_name: bucket_name.clone(),
         name: "body-text".to_string(),
-        kind: "full_text".to_string(),
+        kind: IndexKind::FullText as i32,
         selector_json: serde_json::json!({"selector": "object_body_utf8"}).to_string(),
         extractor_json: serde_json::json!({"encoding": "utf8"}).to_string(),
         authorization_mode: "inherit_object".to_string(),
@@ -2397,6 +2397,14 @@ async fn test_watch_prefix_streams_snapshot_and_live_events() {
     assert_eq!(first.object_key, object_key);
     assert_eq!(first.event_type, "put");
     assert!(!first.is_delete_marker);
+    let first_envelope = first.envelope.as_ref().expect("watch event envelope");
+    assert_eq!(first_envelope.watch_stream_id, "object_prefix");
+    assert_eq!(first_envelope.partition_family, "object_metadata");
+    assert_eq!(first_envelope.cursor_low, first.cursor);
+    assert_eq!(first_envelope.record_kind, "put");
+    assert!(first_envelope.object_ref.ends_with(&object_key));
+    assert!(!first_envelope.mutation_id.is_empty());
+    assert!(!first_envelope.payload_hash.is_empty());
     let first_cursor = first.cursor;
 
     let mut delete_req = Request::new(DeleteObjectRequest {

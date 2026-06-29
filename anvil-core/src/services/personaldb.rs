@@ -61,6 +61,7 @@ use crate::{
         latest_personaldb_projection_watch_cursor, list_personaldb_group_watch_events,
         list_personaldb_projection_watch_events,
     },
+    services::watch_envelope::{self, WatchEnvelopeParts},
 };
 use tokio::sync::OwnedMutexGuard;
 use tokio::sync::mpsc;
@@ -1695,18 +1696,37 @@ fn catch_up_response(response: CoreCatchUpResponse) -> PersonalDbCatchUpResponse
 
 fn watch_response(event: PersonalDbGroupWatchEvent) -> WatchPersonalDbGroupResponse {
     let (low, high) = split_u128(event.cursor);
+    let payload = event.payload;
+    let emitted_at = payload.emitted_at.clone();
+    let database_id = payload.database_id.clone();
+    let log_index = payload.log_index;
+    let payload_hash = watch_envelope::payload_hash(&payload);
     WatchPersonalDbGroupResponse {
         cursor_low: low,
         cursor_high: high,
-        database_id: event.payload.database_id,
-        event_type: event.payload.event_type,
-        log_index: event.payload.log_index,
-        log_hash: event.payload.log_hash,
-        changeset_payload_hash: event.payload.changeset_payload_hash,
-        certificate_hash: event.payload.certificate_hash,
-        committed_head_hash: event.payload.committed_head_hash,
+        database_id: database_id.clone(),
+        event_type: payload.event_type,
+        log_index,
+        log_hash: payload.log_hash,
+        changeset_payload_hash: payload.changeset_payload_hash,
+        certificate_hash: payload.certificate_hash,
+        committed_head_hash: payload.committed_head_hash,
         authz_revision: event.authz_revision,
-        emitted_at: event.payload.emitted_at,
+        emitted_at: emitted_at.clone(),
+        envelope: Some(watch_envelope::envelope(WatchEnvelopeParts {
+            watch_stream_id: "personaldb_group",
+            partition_family: "personaldb_group",
+            partition_id: database_id.clone(),
+            cursor: event.cursor,
+            mutation_id: watch_envelope::uuid_from_bytes(event.mutation_id),
+            record_kind: "personaldb_group".to_string(),
+            object_ref: database_id,
+            authz_revision: event.authz_revision,
+            index_generation: 0,
+            personaldb_log_index: log_index,
+            payload_hash,
+            emitted_at,
+        })),
     }
 }
 
@@ -1957,20 +1977,40 @@ fn projection_watch_response(
     event: PersonalDbProjectionWatchEvent,
 ) -> WatchPersonalDbProjectionResponse {
     let (low, high) = split_u128(event.cursor);
+    let payload = event.payload;
+    let emitted_at = payload.emitted_at.clone();
+    let database_id = payload.database_id.clone();
+    let projection_id = payload.projection_id.clone();
+    let projection_log_index = payload.projection_log_index;
+    let payload_hash = watch_envelope::payload_hash(&payload);
     WatchPersonalDbProjectionResponse {
         cursor_low: low,
         cursor_high: high,
-        database_id: event.payload.database_id,
-        projection_id: event.payload.projection_id,
-        event_type: event.payload.event_type,
-        source_database_id: event.payload.source_database_id,
-        source_log_index: event.payload.source_log_index,
-        source_log_hash: event.payload.source_log_hash,
-        projection_log_index: event.payload.projection_log_index,
-        projection_log_hash: event.payload.projection_log_hash,
-        definition_hash: event.payload.definition_hash,
+        database_id: database_id.clone(),
+        projection_id: projection_id.clone(),
+        event_type: payload.event_type,
+        source_database_id: payload.source_database_id,
+        source_log_index: payload.source_log_index,
+        source_log_hash: payload.source_log_hash,
+        projection_log_index,
+        projection_log_hash: payload.projection_log_hash,
+        definition_hash: payload.definition_hash,
         authz_revision: event.authz_revision,
-        emitted_at: event.payload.emitted_at,
+        emitted_at: emitted_at.clone(),
+        envelope: Some(watch_envelope::envelope(WatchEnvelopeParts {
+            watch_stream_id: "personaldb_projection",
+            partition_family: "personaldb_projection",
+            partition_id: format!("{database_id}/{projection_id}"),
+            cursor: event.cursor,
+            mutation_id: watch_envelope::uuid_from_bytes(event.mutation_id),
+            record_kind: "personaldb_projection".to_string(),
+            object_ref: format!("{database_id}/{projection_id}"),
+            authz_revision: event.authz_revision,
+            index_generation: 0,
+            personaldb_log_index: projection_log_index,
+            payload_hash,
+            emitted_at,
+        })),
     }
 }
 

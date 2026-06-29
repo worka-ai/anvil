@@ -34,6 +34,10 @@ struct ObjectWatchPayload {
     key: String,
     event_type: String,
     version_id: Option<String>,
+    #[serde(default)]
+    mutation_id: Option<String>,
+    #[serde(default)]
+    payload_hash: Option<String>,
     etag: Option<String>,
     size: i64,
     is_delete_marker: bool,
@@ -76,6 +80,8 @@ pub async fn append_object_watch_record(
         key: event.key.clone(),
         event_type: event.event_type.clone(),
         version_id: event.version_id.map(|id| id.to_string()),
+        mutation_id: Some(event.mutation_id.to_string()),
+        payload_hash: Some(event.payload_hash.clone()),
         etag: event.etag.clone(),
         size: event.size,
         is_delete_marker: event.is_delete_marker,
@@ -156,6 +162,12 @@ pub async fn list_object_watch_events(
             .as_deref()
             .map(uuid::Uuid::parse_str)
             .transpose()?;
+        let mutation_id = payload
+            .mutation_id
+            .as_deref()
+            .map(uuid::Uuid::parse_str)
+            .transpose()?
+            .unwrap_or_else(uuid::Uuid::nil);
         let created_at =
             chrono::DateTime::parse_from_rfc3339(&payload.emitted_at)?.with_timezone(&chrono::Utc);
         events.push(ObjectWatchEvent {
@@ -166,6 +178,8 @@ pub async fn list_object_watch_events(
             key: payload.key,
             event_type: payload.event_type,
             version_id,
+            mutation_id,
+            payload_hash: payload.payload_hash.unwrap_or_default(),
             etag: payload.etag,
             size: payload.size,
             is_delete_marker: payload.is_delete_marker,
@@ -265,6 +279,8 @@ mod tests {
             key: object.key.clone(),
             event_type: event_type.to_string(),
             version_id: Some(object.version_id),
+            mutation_id: object.mutation_id,
+            payload_hash: object.content_hash.clone(),
             etag: Some(object.etag.clone()),
             size: object.size,
             is_delete_marker: false,

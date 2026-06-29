@@ -418,6 +418,14 @@ async fn test_authz_tuple_write_check_and_watch() {
     assert_eq!(watched_add.revision, add.revision);
     assert_eq!(watched_add.namespace, "document");
     assert_eq!(watched_add.operation, "add");
+    let envelope = watched_add.envelope.as_ref().expect("authz watch envelope");
+    assert_eq!(envelope.watch_stream_id, "authz_tuple_log");
+    assert_eq!(envelope.partition_family, "authz_tuple");
+    assert_eq!(envelope.cursor_low, watched_add.revision);
+    assert_eq!(envelope.authz_revision, watched_add.revision);
+    assert_eq!(envelope.record_kind, "authz_tuple");
+    assert!(envelope.object_ref.contains("document:alpha#viewer"));
+    assert!(!envelope.payload_hash.is_empty());
 
     let mut check_req = Request::new(CheckPermissionRequest {
         namespace: "document".to_string(),

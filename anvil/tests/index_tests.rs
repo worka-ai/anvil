@@ -4,7 +4,7 @@ use anvil::anvil_api::index_service_client::IndexServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::repair_service_client::RepairServiceClient;
 use anvil::anvil_api::{
-    CreateBucketRequest, CreateIndexRequest, DisableIndexRequest, DropIndexRequest,
+    CreateBucketRequest, CreateIndexRequest, DisableIndexRequest, DropIndexRequest, IndexKind,
     ListIndexDiagnosticsRequest, ListIndexesRequest, ListRepairFindingsRequest,
     NativeMutationContext, ObjectMetadata, PutObjectRequest, QueryIndexRequest, RepairIndexRequest,
     UpdateIndexRequest, WatchIndexDefinitionRequest, WatchIndexPartitionRequest,
@@ -98,7 +98,7 @@ async fn test_index_definition_lifecycle() {
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
                 name: "docs-full-text".to_string(),
-                kind: "full_text".to_string(),
+                kind: IndexKind::FullText as i32,
                 selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
                 extractor_json: serde_json::json!({"fields": [{"path": "body", "source": "utf8"}]})
                     .to_string(),
@@ -116,7 +116,7 @@ async fn test_index_definition_lifecycle() {
 
     assert_eq!(created.bucket_name, bucket_name);
     assert_eq!(created.name, "docs-full-text");
-    assert_eq!(created.kind, "full_text");
+    assert_eq!(created.kind, IndexKind::FullText as i32);
     assert_eq!(created.authorization_mode, "inherit_object");
     assert!(created.enabled);
     assert_eq!(created.version, 1);
@@ -264,6 +264,14 @@ async fn test_index_definition_lifecycle() {
             .windows(2)
             .all(|pair| pair[0].cursor < pair[1].cursor)
     );
+    for event in &events {
+        let envelope = event.envelope.as_ref().expect("index definition envelope");
+        assert_eq!(envelope.watch_stream_id, "index_definition");
+        assert_eq!(envelope.partition_family, "index_definition");
+        assert_eq!(envelope.cursor_low, event.cursor);
+        assert_eq!(envelope.record_kind, "index_definition");
+        assert!(!envelope.payload_hash.is_empty());
+    }
     assert_eq!(events[3].index.as_ref().unwrap().name, "docs-full-text");
 }
 
@@ -296,7 +304,7 @@ async fn test_query_path_and_metadata_filter_indexes_from_object_metadata() {
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
                 name: "by-path".to_string(),
-                kind: "path".to_string(),
+                kind: IndexKind::Path as i32,
                 selector_json: serde_json::json!({}).to_string(),
                 extractor_json: serde_json::json!({}).to_string(),
                 authorization_mode: "index_only".to_string(),
@@ -311,7 +319,7 @@ async fn test_query_path_and_metadata_filter_indexes_from_object_metadata() {
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
                 name: "by-meta".to_string(),
-                kind: "metadata_filter".to_string(),
+                kind: IndexKind::MetadataFilter as i32,
                 selector_json: serde_json::json!({}).to_string(),
                 extractor_json: serde_json::json!({}).to_string(),
                 authorization_mode: "index_only".to_string(),
@@ -372,9 +380,9 @@ async fn test_query_path_and_metadata_filter_indexes_from_object_metadata() {
         .unwrap()
         .into_inner();
 
-    assert_eq!(path_response.index_kind, "path");
+    assert_eq!(path_response.index_kind, IndexKind::Path as i32);
     assert_eq!(path_response.hits.len(), 2);
-    assert_eq!(path_response.hits[0].kind, "path");
+    assert_eq!(path_response.hits[0].kind, IndexKind::Path as i32);
     assert_eq!(path_response.hits[0].object_key, "docs/alpha.txt");
     assert_eq!(path_response.hits[1].object_key, "docs/beta.txt");
     let path_recipe: serde_json::Value =
@@ -403,9 +411,15 @@ async fn test_query_path_and_metadata_filter_indexes_from_object_metadata() {
         .unwrap()
         .into_inner();
 
-    assert_eq!(metadata_response.index_kind, "metadata_filter");
+    assert_eq!(
+        metadata_response.index_kind,
+        IndexKind::MetadataFilter as i32
+    );
     assert_eq!(metadata_response.hits.len(), 1);
-    assert_eq!(metadata_response.hits[0].kind, "metadata_filter");
+    assert_eq!(
+        metadata_response.hits[0].kind,
+        IndexKind::MetadataFilter as i32
+    );
     assert_eq!(metadata_response.hits[0].score, 1.0);
     assert_eq!(metadata_response.hits[0].object_key, "docs/alpha.txt");
     let hit_metadata: serde_json::Value =
@@ -445,7 +459,7 @@ async fn test_full_text_index_builds_from_object_write_task() {
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
                 name: "body".to_string(),
-                kind: "full_text".to_string(),
+                kind: IndexKind::FullText as i32,
                 selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
                 extractor_json: serde_json::json!({"source": "object_body_utf8"}).to_string(),
                 authorization_mode: "index_only".to_string(),
@@ -520,7 +534,7 @@ async fn test_full_text_index_builds_from_object_write_task() {
 
     let response =
         final_response.expect("full text index build task should make object searchable");
-    assert_eq!(response.index_kind, "full_text");
+    assert_eq!(response.index_kind, IndexKind::FullText as i32);
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "docs/alpha.txt");
 
@@ -546,13 +560,24 @@ async fn test_full_text_index_builds_from_object_write_task() {
     assert_eq!(watch_event.bucket_name, bucket_name);
     assert_eq!(watch_event.index_name, "body");
     assert_eq!(watch_event.event_type, "segment_built");
-    assert_eq!(watch_event.index_kind, "full_text");
+    assert_eq!(watch_event.index_kind, IndexKind::FullText as i32);
     assert_eq!(watch_event.generation, response.index_generation);
     assert!(!watch_event.index_storage_id.is_empty());
     assert!(!watch_event.partition_id.is_empty());
     assert!(!watch_event.source_manifest_hash.is_empty());
     assert!(!watch_event.proof_hash.is_empty());
     assert!(!watch_event.segment_hashes.is_empty());
+    let envelope = watch_event
+        .envelope
+        .as_ref()
+        .expect("index partition envelope");
+    assert_eq!(envelope.watch_stream_id, "index_partition");
+    assert_eq!(envelope.partition_family, "index_partition");
+    assert_eq!(envelope.cursor_low, watch_event.cursor_low);
+    assert_eq!(envelope.cursor_high, watch_event.cursor_high);
+    assert_eq!(envelope.index_generation, watch_event.generation);
+    assert_eq!(envelope.record_kind, "index_partition");
+    assert!(!envelope.payload_hash.is_empty());
 
     let mut tasks = Vec::new();
     let task_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -607,7 +632,7 @@ async fn test_full_text_index_build_extracts_json_pointer_from_object_write_task
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
                 name: "summary".to_string(),
-                kind: "full_text".to_string(),
+                kind: IndexKind::FullText as i32,
                 selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
                 extractor_json: serde_json::json!({
                     "source": "json_pointer",
@@ -686,7 +711,7 @@ async fn test_full_text_index_build_extracts_json_pointer_from_object_write_task
 
     let response =
         final_response.expect("json_pointer text extraction should make object searchable");
-    assert_eq!(response.index_kind, "full_text");
+    assert_eq!(response.index_kind, IndexKind::FullText as i32);
     assert_eq!(response.hits[0].object_key, "docs/report.json");
     assert!(response.hits[0].score > 0.0);
 }
@@ -1365,7 +1390,7 @@ async fn test_repair_rebuilds_missing_vector_segment_from_base_journal() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(response.index_kind, "vector");
+    assert_eq!(response.index_kind, IndexKind::Vector as i32);
     assert!(response.index_generation >= 1);
     assert!(
         response
@@ -1547,7 +1572,7 @@ async fn test_vector_index_builds_from_object_write_task() {
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
                 name: "embedding".to_string(),
-                kind: "vector".to_string(),
+                kind: IndexKind::Vector as i32,
                 selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
                 extractor_json: serde_json::json!({"source": "object_body_json_vector"})
                     .to_string(),
@@ -1629,7 +1654,7 @@ async fn test_vector_index_builds_from_object_write_task() {
     }
 
     let response = final_response.expect("vector index build task should make object searchable");
-    assert_eq!(response.index_kind, "vector");
+    assert_eq!(response.index_kind, IndexKind::Vector as i32);
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "docs/vector.json");
     assert_eq!(response.hits[0].vector_id, 1);
@@ -1729,7 +1754,7 @@ async fn test_vector_index_builds_required_media_modalities_from_object_write_ta
                 CreateIndexRequest {
                     bucket_name: bucket_name.clone(),
                     name: index_name.clone(),
-                    kind: "vector".to_string(),
+                    kind: IndexKind::Vector as i32,
                     selector_json: serde_json::json!({
                         "prefix": format!("media/{modality}/"),
                         "content_type": content_type
@@ -1760,7 +1785,7 @@ async fn test_vector_index_builds_required_media_modalities_from_object_write_ta
             &token,
         )
         .await;
-        assert_eq!(response.index_kind, "vector");
+        assert_eq!(response.index_kind, IndexKind::Vector as i32);
         assert_eq!(response.hits[0].object_key, object_key);
         let metadata: serde_json::Value =
             serde_json::from_str(&response.hits[0].metadata_json).unwrap();
@@ -1805,7 +1830,7 @@ async fn test_vector_index_build_records_dimension_mismatch_diagnostic() {
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
                 name: "embedding".to_string(),
-                kind: "vector".to_string(),
+                kind: IndexKind::Vector as i32,
                 selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
                 extractor_json: serde_json::json!({"source": "object_body_json_vector"})
                     .to_string(),
@@ -1939,7 +1964,7 @@ async fn test_hybrid_index_builds_text_and_vector_segments_from_object_write_tas
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
                 name: "body-and-vector".to_string(),
-                kind: "hybrid".to_string(),
+                kind: IndexKind::Hybrid as i32,
                 selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
                 extractor_json: serde_json::json!({
                     "text": {"source": "object_body_utf8"},
@@ -2029,7 +2054,7 @@ async fn test_hybrid_index_builds_text_and_vector_segments_from_object_write_tas
     }
 
     let response = final_response.expect("hybrid index build task should make object searchable");
-    assert_eq!(response.index_kind, "hybrid");
+    assert_eq!(response.index_kind, IndexKind::Hybrid as i32);
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "docs/hybrid.json");
     assert!(response.hits[0].score > 0.0);
@@ -2073,7 +2098,7 @@ async fn test_query_full_text_index_reads_latest_segment() {
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
                 name: "body".to_string(),
-                kind: "full_text".to_string(),
+                kind: IndexKind::FullText as i32,
                 selector_json: serde_json::json!({"selector": "object_body_utf8"}).to_string(),
                 extractor_json: serde_json::json!({"encoding": "utf8"}).to_string(),
                 authorization_mode: "index_only".to_string(),
@@ -2168,11 +2193,11 @@ async fn test_query_full_text_index_reads_latest_segment() {
         .unwrap()
         .into_inner();
 
-    assert_eq!(response.index_kind, "full_text");
+    assert_eq!(response.index_kind, IndexKind::FullText as i32);
     assert_eq!(response.index_generation, 7);
     assert_eq!(response.authz_revision, 55);
     assert_eq!(response.hits.len(), 1);
-    assert_eq!(response.hits[0].kind, "full_text");
+    assert_eq!(response.hits[0].kind, IndexKind::FullText as i32);
     assert_eq!(response.hits[0].object_key, "docs/alpha.txt");
     assert_eq!(response.hits[0].document_id, 11);
     assert!(response.hits[0].score > 0.0);
@@ -2207,7 +2232,7 @@ async fn test_query_full_text_phrase_requires_position_enabled_index() {
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
                 name: "body".to_string(),
-                kind: "full_text".to_string(),
+                kind: IndexKind::FullText as i32,
                 selector_json: serde_json::json!({"selector": "object_body_utf8"}).to_string(),
                 extractor_json: serde_json::json!({"encoding": "utf8"}).to_string(),
                 authorization_mode: "index_only".to_string(),
@@ -2312,7 +2337,7 @@ async fn test_query_vector_index_reads_latest_segment() {
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
                 name: "embedding".to_string(),
-                kind: "vector".to_string(),
+                kind: IndexKind::Vector as i32,
                 selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
                 extractor_json: serde_json::json!({"source": "object_body_utf8"}).to_string(),
                 authorization_mode: "index_only".to_string(),
@@ -2418,7 +2443,7 @@ async fn test_query_vector_index_reads_latest_segment() {
         .unwrap()
         .into_inner();
 
-    assert_eq!(response.index_kind, "vector");
+    assert_eq!(response.index_kind, IndexKind::Vector as i32);
     assert_eq!(response.index_generation, 3);
     assert_eq!(response.authz_revision, 21);
     assert_eq!(
@@ -2460,7 +2485,7 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
                 name: "body-and-vector".to_string(),
-                kind: "hybrid".to_string(),
+                kind: IndexKind::Hybrid as i32,
                 selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
                 extractor_json: serde_json::json!({
                     "text": {"source": "object_body_utf8"},
@@ -2607,10 +2632,10 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
         .unwrap()
         .into_inner();
 
-    assert_eq!(response.index_kind, "hybrid");
+    assert_eq!(response.index_kind, IndexKind::Hybrid as i32);
     assert_eq!(response.index_generation, 6);
     assert_eq!(response.authz_revision, 32);
-    assert_eq!(response.hits[0].kind, "hybrid");
+    assert_eq!(response.hits[0].kind, IndexKind::Hybrid as i32);
     assert_eq!(response.hits[0].object_key, "docs/hybrid-a.txt");
     assert_eq!(response.hits[0].document_id, 101);
     assert_eq!(response.hits[0].vector_id, 1);
@@ -2687,7 +2712,7 @@ async fn test_query_inherit_object_vector_filters_results_by_object_read_scope()
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
                 name: "embedding".to_string(),
-                kind: "vector".to_string(),
+                kind: IndexKind::Vector as i32,
                 selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
                 extractor_json: serde_json::json!({"source": "object_body_utf8"}).to_string(),
                 authorization_mode: "inherit_object".to_string(),
@@ -2843,7 +2868,7 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
                 name: "body".to_string(),
-                kind: "full_text".to_string(),
+                kind: IndexKind::FullText as i32,
                 selector_json: serde_json::json!({"selector": "object_body_utf8"}).to_string(),
                 extractor_json: serde_json::json!({"encoding": "utf8"}).to_string(),
                 authorization_mode: "inherit_object".to_string(),
@@ -3050,12 +3075,30 @@ async fn test_index_definition_rejects_invalid_policy_shape() {
         .await
         .unwrap();
 
+    let unspecified_kind = index_client
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket_name: bucket_name.clone(),
+                name: "unspecified-kind".to_string(),
+                kind: IndexKind::Unspecified as i32,
+                selector_json: "{}".to_string(),
+                extractor_json: "{}".to_string(),
+                authorization_mode: "inherit_object".to_string(),
+                build_policy_json: "{}".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(unspecified_kind.code(), tonic::Code::InvalidArgument);
+    assert_eq!(unspecified_kind.message(), "index kind is required");
+
     let invalid_kind = index_client
         .create_index(authorized(
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
                 name: "invalid-kind".to_string(),
-                kind: "unsupported".to_string(),
+                kind: 999,
                 selector_json: "{}".to_string(),
                 extractor_json: "{}".to_string(),
                 authorization_mode: "inherit_object".to_string(),
@@ -3066,13 +3109,14 @@ async fn test_index_definition_rejects_invalid_policy_shape() {
         .await
         .unwrap_err();
     assert_eq!(invalid_kind.code(), tonic::Code::InvalidArgument);
+    assert_eq!(invalid_kind.message(), "Invalid index kind");
 
     let invalid_full_text_policy = index_client
         .create_index(authorized(
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
                 name: "invalid-full-text-policy".to_string(),
-                kind: "full_text".to_string(),
+                kind: IndexKind::FullText as i32,
                 selector_json: "{}".to_string(),
                 extractor_json: "{}".to_string(),
                 authorization_mode: "inherit_object".to_string(),
@@ -3103,7 +3147,7 @@ async fn test_index_definition_rejects_invalid_policy_shape() {
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
                 name: "valid-vector".to_string(),
-                kind: "vector".to_string(),
+                kind: IndexKind::Vector as i32,
                 selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
                 extractor_json: serde_json::json!({"source": "object_body_utf8"}).to_string(),
                 authorization_mode: "inherit_object".to_string(),
@@ -3119,7 +3163,7 @@ async fn test_index_definition_rejects_invalid_policy_shape() {
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
                 name: "invalid-vector".to_string(),
-                kind: "vector".to_string(),
+                kind: IndexKind::Vector as i32,
                 selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
                 extractor_json: serde_json::json!({"source": "object_body_utf8"}).to_string(),
                 authorization_mode: "inherit_object".to_string(),
@@ -3166,7 +3210,7 @@ async fn test_index_definition_rejects_invalid_policy_shape() {
             CreateIndexRequest {
                 bucket_name,
                 name: "invalid-json".to_string(),
-                kind: "full_text".to_string(),
+                kind: IndexKind::FullText as i32,
                 selector_json: "{".to_string(),
                 extractor_json: "{}".to_string(),
                 authorization_mode: "inherit_object".to_string(),
@@ -3208,7 +3252,7 @@ async fn test_list_index_diagnostics_filters_by_index_and_severity() {
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
                 name: "body-text".to_string(),
-                kind: "full_text".to_string(),
+                kind: IndexKind::FullText as i32,
                 selector_json: serde_json::json!({"selector": "object_body_utf8"}).to_string(),
                 extractor_json: serde_json::json!({"encoding": "utf8"}).to_string(),
                 authorization_mode: "inherit_object".to_string(),
