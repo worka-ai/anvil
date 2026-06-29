@@ -196,6 +196,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
+ "anvil-storage-client",
  "anvil-storage-core",
  "anvil-storage-test-utils",
  "anyhow",

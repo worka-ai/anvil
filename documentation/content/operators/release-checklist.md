@@ -57,11 +57,16 @@ Publish Rust crates in dependency order:
 4. `anvil-storage-cli`
 5. `anvil-storage-test-utils` when publishing test support
 
-Run dry-runs before publishing:
+Run dry-runs before publishing packages whose dependencies are already available to Cargo:
 
 ```bash
 cargo publish --dry-run -p anvil-storage-client
 cargo publish --dry-run -p anvil-storage-core
+```
+
+Then publish in order. The server and CLI crates depend on the core crate by its registry package name, so their dry-runs should be run after `anvil-storage-core` is published or staged in the target registry:
+
+```bash
 cargo publish --dry-run -p anvil-storage
 cargo publish --dry-run -p anvil-storage-cli
 ```
@@ -72,8 +77,11 @@ The Rust client crate is the only native client package shipped in this release.
 
 ```bash
 cargo test -p anvil-storage-client
+cargo test -p anvil-storage --test rust_client_tests
 cargo publish --dry-run -p anvil-storage-client
 ```
+
+The first command proves the package API and generated bindings build in isolation. The second command starts a live Anvil node and proves the published Rust client can create a bucket, list buckets, stream an object upload, and stream the object back through the native API.
 
 The TypeScript, Python, Java, and Maven surfaces are not release blockers for this release.
 
