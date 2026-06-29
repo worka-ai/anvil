@@ -136,6 +136,31 @@ fn admin_command(admin_state_path: &str) -> Command {
     command
 }
 
+async fn wait_for_completed_index_build(cluster: &TestCluster, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
+        assert!(
+            !tasks.iter().any(|task| {
+                task.task_type == anvil::tasks::TaskType::IndexBuild
+                    && task.status == anvil::tasks::TaskStatus::Failed
+            }),
+            "index build task failed; tasks={tasks:?}"
+        );
+        if tasks.iter().any(|task| {
+            task.task_type == anvil::tasks::TaskType::IndexBuild
+                && task.status == anvil::tasks::TaskStatus::Completed
+        }) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "index build task did not complete in time; tasks={tasks:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 fn s3_client(http_base: &str, client_id: &str, client_secret: &str) -> Client {
     let credentials = aws_sdk_s3::config::Credentials::new(
         client_id,
@@ -919,15 +944,7 @@ async fn test_s3_put_triggers_full_text_index_build() {
     let response = indexed.expect("S3 object should be searchable after index task completes");
     assert_eq!(response.index_kind, "full_text");
     assert!(response.index_generation >= 1);
-    let tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
-    assert!(tasks.iter().any(|task| {
-        task.task_type == anvil::tasks::TaskType::IndexBuild
-            && task.status == anvil::tasks::TaskStatus::Completed
-    }));
-    assert!(!tasks.iter().any(|task| {
-        task.task_type == anvil::tasks::TaskType::IndexBuild
-            && task.status == anvil::tasks::TaskStatus::Failed
-    }));
+    wait_for_completed_index_build(&cluster, Duration::from_secs(20)).await;
 }
 
 #[tokio::test]
@@ -1300,15 +1317,7 @@ async fn test_s3_put_triggers_vector_index_build() {
     assert_eq!(response.index_kind, "vector");
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "docs/s3-vector.json");
-    let tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
-    assert!(tasks.iter().any(|task| {
-        task.task_type == anvil::tasks::TaskType::IndexBuild
-            && task.status == anvil::tasks::TaskStatus::Completed
-    }));
-    assert!(!tasks.iter().any(|task| {
-        task.task_type == anvil::tasks::TaskType::IndexBuild
-            && task.status == anvil::tasks::TaskStatus::Failed
-    }));
+    wait_for_completed_index_build(&cluster, Duration::from_secs(20)).await;
 }
 
 #[test]
