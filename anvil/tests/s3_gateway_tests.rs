@@ -14,15 +14,19 @@ use aws_sdk_s3::types::{
 use rand::random;
 use std::env::temp_dir;
 use std::future::Future;
+use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tonic::Request;
 
 use anvil_test_utils::*;
+
+static ADMIN_BINARY: OnceLock<PathBuf> = OnceLock::new();
 
 fn assert_reserved_namespace_error(error: impl std::fmt::Debug) {
     let rendered = format!("{error:?}");
@@ -120,13 +124,7 @@ fn run_admin(admin_state_path: &str, args: &[&str]) -> Output {
 }
 
 fn admin_command(admin_state_path: &str) -> Command {
-    let mut command = if let Some(admin_binary) = option_env!("CARGO_BIN_EXE_admin") {
-        Command::new(admin_binary)
-    } else {
-        let mut fallback = Command::new("cargo");
-        fallback.args(["run", "--bin", "admin", "--"]);
-        fallback
-    };
+    let mut command = Command::new(admin_binary_path());
     command.args([
         "--anvil-secret-encryption-key",
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -134,6 +132,48 @@ fn admin_command(admin_state_path: &str) -> Command {
         admin_state_path,
     ]);
     command
+}
+
+fn admin_binary_path() -> PathBuf {
+    if let Some(admin_binary) = option_env!("CARGO_BIN_EXE_admin") {
+        let path = PathBuf::from(admin_binary);
+        if path.exists() {
+            return path;
+        }
+    }
+    ADMIN_BINARY.get_or_init(build_admin_binary).clone()
+}
+
+fn build_admin_binary() -> PathBuf {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let status = Command::new(&cargo)
+        .args(["build", "--package", "anvil-server", "--bin", "admin"])
+        .status()
+        .expect("build admin binary");
+    assert!(status.success(), "cargo build --bin admin failed");
+
+    let metadata_output = Command::new(&cargo)
+        .args(["metadata", "--format-version=1"])
+        .output()
+        .expect("read cargo metadata");
+    assert!(
+        metadata_output.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&metadata_output.stderr)
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&metadata_output.stdout).expect("parse cargo metadata");
+    let target_dir = metadata["target_directory"]
+        .as_str()
+        .expect("cargo metadata target_directory");
+    let binary_name = if cfg!(windows) { "admin.exe" } else { "admin" };
+    let path = Path::new(target_dir).join("debug").join(binary_name);
+    assert!(
+        path.exists(),
+        "expected admin binary after cargo build at {}",
+        path.display()
+    );
+    path
 }
 
 async fn wait_for_completed_index_build(cluster: &TestCluster, timeout: Duration) {
