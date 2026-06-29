@@ -1,93 +1,85 @@
-# Anvil: An Open-Source Object Store for AI/ML Research
+# Anvil
 
-[![Build Status](https://github.com/worka-ai/anvil-enterprise/actions/workflows/ci.yml/badge.svg)](https://github.com/worka-ai/anvil-enterprise/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![JOSS Submission](https://joss.theoj.org/papers/10.21105/joss.XXXXX/status.svg)](https://joss.theoj.org/papers/10.21105/joss.XXXXX)
+Anvil is a production object storage platform for teams that need storage to do more than accept bytes. It stores objects, but it also keeps metadata indexes, full text search, vector search, relationship authorization, watch streams, source artifacts, and PersonalDB witnessing under one coherent system.
 
-**Anvil** is a high-performance, open-source distributed object store built in Rust. It is designed to address the data management and storage challenges inherent in modern computational research, particularly for large-scale Artificial Intelligence (AI) and Machine Learning (ML) workloads. By providing an S3-compatible interface, a native high-throughput gRPC API, and first-class support for content-addressing, Anvil serves as a foundational infrastructure layer for reproducible and efficient research.
+Most product teams start with a simple requirement: upload something and read it later. The next requirements arrive quickly: list recent project files, filter by metadata, search inside documents, find similar media, protect every result with fine-grained authorization, update live views when data changes, and sync local-first SQLite data without losing consistency. When those capabilities are assembled from unrelated systems, application code becomes the place where storage correctness is glued together.
 
----
+Anvil moves those concerns into the storage layer.
 
-## Key Features
+## What Anvil Solves
 
--   **Content-Addressable Storage:** Automatically deduplicates identical data using BLAKE3 hashing, dramatically reducing storage costs for versioned models and datasets.
--   **High-Performance gRPC Streaming:** A native gRPC API with bidirectional streaming, ideal for high-throughput ML data loaders that feed GPUs directly from storage.
--   **S3-Compatible Gateway:** Provides drop-in compatibility with the vast ecosystem of existing research tools and SDKs that support the S3 API (Boto3, MLflow, Rclone, etc.).
--   **Built for the ML Ecosystem:** Includes features like the `anvil hf ingest` command to import model repositories directly from the Hugging Face Hub.
--   **Modern, Resilient Architecture:** Built in Rust for memory safety and high concurrency, with a SWIM-like gossip protocol over QUIC for clustering and failure detection.
--   **Multi-Tenant by Design:** Provides strong logical isolation between different users, teams, or projects.
+An object store is a system that stores bytes under names. That foundation is useful, but modern applications also need to ask questions about stored data:
 
----
+- Which objects belong to this tenant, project, user, or timeline?
+- Which objects match this metadata filter?
+- Which documents contain this phrase?
+- Which images, audio clips, videos, or text records are semantically similar?
+- Which results may this caller see?
+- Which indexes have caught up to this write?
+- Which local database changes were witnessed, certified, projected, and made visible?
 
-## 🚀 Quick Start
+Anvil treats these as storage questions rather than application glue. Object identity, metadata, versions, authorization, watches, indexes, and recovery evidence are part of one product model.
 
-The fastest way to get a single-node Anvil instance running is with Docker Compose.
+## Core Capabilities
 
-1.  **Save the `docker-compose.yml`:**
-    Save the example `docker-compose.yml` from the [Getting Started Guide](./docs/01-getting-started.md) to a local file.
+- **Object storage:** buckets, keys, object versions, checksums, range reads, multipart flows, and S3-compatible access for existing tooling.
+- **Metadata and path indexes:** predictable key layouts and queryable metadata for fast listings, filters, facets, and operational navigation.
+- **Full text search:** tokenization, ranking, snippets, and authorization-safe search results over object text and extracted content.
+- **Vector search:** semantic retrieval over text, images, audio, and video using vector segments and Rust-native nearest-neighbor indexing.
+- **Relationship authorization:** Zanzibar-style tuples, permissions, caveats, and fail-closed reserved namespaces protecting every exposure path.
+- **Watch streams:** durable change streams with cursors so indexes, projections, applications, and operators can catch up without rescanning everything.
+- **PersonalDB witnessing:** SQLite changeset verification, commit certificates, snapshots, row metadata, authorized projections, and catch-up support for local-first applications.
+- **Source and model artifacts:** storage patterns for source packs, build outputs, logs, screenshots, model manifests, media derivatives, and reproducibility records.
 
-2.  **Launch Anvil:**
-    ```bash
-    docker-compose up -d
-    ```
+## Documentation
 
-3.  **Create Your First Tenant and App:**
-    Use the `admin` tool to create a tenant and an app with API credentials.
-    ```bash
-    # Create a region and a tenant
-    docker compose exec anvil1 admin region create europe-west-1
-    docker compose exec anvil1 admin tenant create my-first-tenant
+The public documentation lives in `documentation/` and is built with Fission.
 
-    # Create an app and save the credentials
-    docker compose exec anvil1 admin app create --tenant-name my-first-tenant --app-name my-cli-app
-    ```
+Start with the learning path if you are new to object storage, indexing, search, authorization, watches, or PersonalDB:
 
-4.  **Configure the Anvil CLI:**
-    Use the credentials from the previous step to configure your local `anvil` CLI.
-    ```bash
-    anvil configure --host http://localhost:50051 --client-id YOUR_CLIENT_ID --client-secret YOUR_CLIENT_SECRET
-    ```
-
----
-
-## 📘 Documentation
-
-For complete guides on deployment, architecture, and usage, please see the [**Full Documentation**](./docs/index.md).
-
--   [Getting Started](./docs/01-getting-started.md)
--   [Authentication & Permissions](./docs/03-user-guide-authentication.md)
--   [Using the S3 Gateway](./docs/04-user-guide-s3-gateway.md)
--   [Deployment Guide](./docs/06-operational-guide-deployment.md)
-
----
-
-## 🤝 Contributing
-
-We welcome contributions of all kinds! Please read our [**Contributing Guide**](./CONTRIBUTING.md) to get started. All participation in the Anvil community is governed by our [**Code of Conduct**](./CODE_OF_CONDUCT.md).
-
----
-
-## 📜 Citing Anvil
-
-If you use Anvil in your research, please cite it. Once published in JOSS, a BibTeX entry will be provided here.
-
-```bibtex
-@article{Anvil2025,
-  doi = {10.21105/joss.XXXXX},
-  url = {https://doi.org/10.21105/joss.XXXXX},
-  year = {2025},
-  publisher = {The Open Journal},
-  volume = {X},
-  number = {XX},
-  pages = {XXXXX},
-  author = {Your Name and Other Authors},
-  title = {Anvil: An Open-Source Object Store for AI/ML Research},
-  journal = {Journal of Open Source Software}
-}
+```sh
+fission site serve --project-dir documentation
 ```
 
----
+Build and check the static site:
+
+```sh
+fission site check --project-dir documentation --release
+fission site build --project-dir documentation --release
+```
+
+The documentation is structured as a progressive guide:
+
+- `documentation/content/learn/` teaches the concepts from first principles.
+- `documentation/content/developers/` shows how to build applications with Anvil.
+- `documentation/content/operators/` explains deployment, identity, indexing operations, backup, recovery, and release work.
+- `documentation/content/reference/` gives exact configuration, CLI, package, and error references.
+- `documentation/src/app.rs` contains the custom Fission marketing home page.
+
+## Development Checks
+
+Run the workspace checks before publishing or changing core behavior:
+
+```sh
+cargo fmt --all -- --check
+cargo test --workspace
+```
+
+S3 compatibility is a release priority. Changes to request signing, streaming uploads, object operations, metadata, authorization, or bucket behavior should include focused S3 gateway tests and then the full workspace test suite.
+
+## Release Surfaces
+
+An Anvil release is expected to include:
+
+- the server image;
+- Rust crates and CLI packages;
+- TypeScript and Python client package metadata and generated clients when enabled;
+- the Fission documentation site;
+- S3 compatibility smoke tests;
+- operator-facing release notes and verification evidence.
+
+See `documentation/content/operators/release-checklist.md` for the release process.
 
 ## License
 
-Anvil is licensed under the [Apache 2.0 License](./LICENSE).
+Anvil is licensed under the Apache 2.0 License. See `LICENSE`.
