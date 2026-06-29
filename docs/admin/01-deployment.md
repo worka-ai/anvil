@@ -12,7 +12,7 @@ Anvil deployment requires Anvil nodes and durable storage for each node's `STORA
 ```yaml
 services:
   anvil:
-    image: ghcr.io/worka-ai/anvil:latest
+    image: ghcr.io/anvil-storage/anvil:latest
     environment:
       REGION: local
       JWT_SECRET: change-me
@@ -46,7 +46,7 @@ The first node starts with `--init-cluster`; later nodes join using bootstrap ad
 Use the admin CLI against the native storage path of the node being configured:
 
 ```bash
-cargo run -p anvil --bin admin -- \
+cargo run -p anvil-storage --bin admin -- \
   --anvil-secret-encryption-key aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --storage-path /var/lib/anvil \
   tenant create default

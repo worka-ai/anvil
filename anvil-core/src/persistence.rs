@@ -110,6 +110,7 @@ pub struct BucketMetadataEvent {
     pub bucket_id: i64,
     pub bucket_name: String,
     pub event_type: String,
+    pub mutation_id: uuid::Uuid,
     pub bucket_metadata: JsonValue,
     pub created_at: DateTime<Utc>,
 }
@@ -241,6 +242,8 @@ pub struct ObjectWatchEvent {
     pub key: String,
     pub event_type: String,
     pub version_id: Option<uuid::Uuid>,
+    pub mutation_id: uuid::Uuid,
+    pub payload_hash: String,
     pub etag: Option<String>,
     pub size: i64,
     pub is_delete_marker: bool,
@@ -316,6 +319,7 @@ pub struct AuthzTupleRecord {
     pub operation: String,
     pub written_by: String,
     pub reason: String,
+    pub mutation_id: uuid::Uuid,
     pub record_hash: String,
     pub written_at: DateTime<Utc>,
 }
@@ -347,6 +351,7 @@ pub struct IndexDefinitionEvent {
     pub index_name: String,
     pub event_type: String,
     pub index_version: i64,
+    pub mutation_id: uuid::Uuid,
     pub definition: JsonValue,
     pub created_at: DateTime<Utc>,
 }
@@ -1853,6 +1858,8 @@ impl Persistence {
             key: object.key.clone(),
             event_type: event_type.to_string(),
             version_id: Some(object.version_id),
+            mutation_id: object.mutation_id,
+            payload_hash: object.content_hash.clone(),
             etag: Some(object.etag.clone()),
             size: object.size,
             is_delete_marker,
@@ -2258,6 +2265,7 @@ impl Persistence {
             index_name: index.name.clone(),
             event_type: event_type.to_string(),
             index_version: index.version,
+            mutation_id: uuid::Uuid::new_v4(),
             definition: serde_json::json!({
                 "index_id": index.id,
                 "bucket_name": bucket_name,

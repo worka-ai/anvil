@@ -1,8 +1,13 @@
-# Stage 1: Build the binaries
-FROM rust:latest AS builder
+# Stage 1: Build the binaries with the Rust version declared by the workspace.
+FROM rust:1.89-bookworm AS builder
 
 # Install build dependencies
-RUN apt-get update && apt-get install -y build-essential pkg-config libssl-dev protobuf-compiler
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/anvil
 
@@ -11,25 +16,35 @@ COPY . .
 
 # Build the anvil server and the admin CLI in release mode
 RUN cargo build --release --bin anvil --bin admin
-RUN cargo build --release -p anvil-cli
+RUN cargo build --release -p anvil-storage-cli
 
-# Stage 2: Create the final, minimal image
-FROM rust:latest
+# Stage 2: Create the final runtime image. Rust tooling is deliberately not
+# present in the shipped server image.
+FROM debian:bookworm-slim
 
-# Remove build dependencies and clean up apt caches
-RUN apt-get update && apt-get purge -y build-essential pkg-config libssl-dev protobuf-compiler && \
-    apt-get autoremove -y && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --uid 10001 --create-home --home-dir /var/lib/anvil --shell /usr/sbin/nologin anvil
 
 # Copy the compiled binaries from the builder stage
 COPY --from=builder /usr/src/anvil/target/release/anvil /usr/local/bin/anvil
 COPY --from=builder /usr/src/anvil/target/release/admin /usr/local/bin/admin
 COPY --from=builder /usr/src/anvil/target/release/anvil-cli /usr/local/bin/anvil-cli
 
+RUN chown -R anvil:anvil /var/lib/anvil
+
+ENV STORAGE_PATH=/var/lib/anvil
+USER anvil
+WORKDIR /var/lib/anvil
+
 # Expose the default gRPC/S3 port and a potential swarm port
 EXPOSE 50051
 EXPOSE 7443
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=5 CMD curl -fsS http://127.0.0.1:50051/ready || exit 1
 
 # Set the default command to run the anvil server
 CMD ["anvil"]

@@ -1,7 +1,23 @@
 [package]
+name = "anvil-storage-cli"
+version.workspace = true
+edition.workspace = true
+description = "Command-line client for Anvil"
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+readme.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = [".env", "*.env", "anvil-data/**", "target/**"]
+
+publish = false
+[[bin]]
 name = "anvil-cli"
-version = "0.1.0"
-edition = "2024"
+path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -15,7 +31,7 @@ serde_json = "1.0"
 confy = "0.6.1"
 dialoguer = "0.11.0"
 tokio-stream = "0.1"
-anvil = { path = "../anvil" }
+anvil = { package = "anvil-server", path = "../anvil", version = "0.1.0" }
 tempfile = "3.10.1"
 uuid = { version = "1.18", features = ["v4"] }
 

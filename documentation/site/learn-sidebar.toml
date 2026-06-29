@@ -1,0 +1,40 @@
+[[items]]
+title = "Learn Anvil"
+href = "/learn/overview/"
+level = 0
+group = true
+
+[[items]]
+title = "Overview"
+href = "/learn/overview/"
+level = 1
+
+[[items]]
+title = "Object Storage"
+href = "/learn/object-storage/"
+level = 1
+
+[[items]]
+title = "Keys And Paths"
+href = "/learn/keys-paths-and-metadata/"
+level = 1
+
+[[items]]
+title = "Indexes And Search"
+href = "/learn/indexes-and-search/"
+level = 1
+
+[[items]]
+title = "Authorisation"
+href = "/learn/authorisation/"
+level = 1
+
+[[items]]
+title = "Watches And Derived Data"
+href = "/learn/watches-and-derived-data/"
+level = 1
+
+[[items]]
+title = "PersonalDB"
+href = "/learn/personaldb/"
+level = 1

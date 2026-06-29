@@ -7,6 +7,7 @@ pub mod internal;
 pub mod object;
 pub mod personaldb;
 pub mod repair;
+pub(crate) mod watch_envelope;
 
 use crate::anvil_api::{
     auth_service_server::AuthServiceServer, bucket_service_server::BucketServiceServer,

@@ -1,8 +1,8 @@
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::index_service_client::IndexServiceClient;
 use anvil::anvil_api::{
-    CreateIndexRequest, GetAccessTokenRequest, QueryIndexRequest, SetPublicAccessRequest,
-    WriteAuthzTupleRequest,
+    CreateIndexRequest, GetAccessTokenRequest, IndexKind, QueryIndexRequest,
+    SetPublicAccessRequest, WriteAuthzTupleRequest,
 };
 use anvil::storage::{DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES, ExternalChunkManifest};
 use aws_sdk_s3::Client;
@@ -16,6 +16,7 @@ use std::env::temp_dir;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::process::{Command, Output};
 use std::time::Duration;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
@@ -61,23 +62,17 @@ fn create_app(admin_state_path: &str, app_name: &str) -> (String, String) {
 }
 
 fn create_app_with_id(admin_state_path: &str, app_name: &str) -> (String, String, String) {
-    let admin_args = &["run", "--bin", "admin", "--"];
-    let app_output = std::process::Command::new("cargo")
-        .args(admin_args.iter().chain(&[
-            "--anvil-secret-encryption-key",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--storage-path",
-            admin_state_path,
+    let app_output = run_admin(
+        admin_state_path,
+        &[
             "app",
             "create",
             "--tenant-name",
             "default",
             "--app-name",
             app_name,
-        ]))
-        .output()
-        .unwrap();
-    assert!(app_output.status.success());
+        ],
+    );
     let creds = String::from_utf8(app_output.stdout).unwrap();
     let app_id = creds
         .lines()
@@ -95,32 +90,75 @@ fn grant_wildcard_policy(admin_state_path: &str, app_name: &str) {
 }
 
 fn grant_policy(admin_state_path: &str, app_name: &str, action: &str, resource: &str) {
-    let admin_args = &["run", "--bin", "admin", "--"];
-    let policy_args = &[
-        "policy",
-        "grant",
-        "--app-name",
-        app_name,
-        "--action",
-        action,
-        "--resource",
-        resource,
-    ];
-    let status = std::process::Command::new("cargo")
-        .args(
-            admin_args
-                .iter()
-                .chain(&[
-                    "--anvil-secret-encryption-key",
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "--storage-path",
-                    admin_state_path,
-                ])
-                .chain(policy_args.iter()),
-        )
-        .status()
-        .unwrap();
-    assert!(status.success());
+    run_admin(
+        admin_state_path,
+        &[
+            "policy",
+            "grant",
+            "--app-name",
+            app_name,
+            "--action",
+            action,
+            "--resource",
+            resource,
+        ],
+    );
+}
+
+fn run_admin(admin_state_path: &str, args: &[&str]) -> Output {
+    let mut command = admin_command(admin_state_path);
+    let output = command.args(args).output().expect("run admin binary");
+    assert!(
+        output.status.success(),
+        "admin command failed: status={:?}, args={:?}, stdout={}, stderr={}",
+        output.status.code(),
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn admin_command(admin_state_path: &str) -> Command {
+    let mut command = if let Some(admin_binary) = option_env!("CARGO_BIN_EXE_admin") {
+        Command::new(admin_binary)
+    } else {
+        let mut fallback = Command::new("cargo");
+        fallback.args(["run", "--bin", "admin", "--"]);
+        fallback
+    };
+    command.args([
+        "--anvil-secret-encryption-key",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--storage-path",
+        admin_state_path,
+    ]);
+    command
+}
+
+async fn wait_for_completed_index_build(cluster: &TestCluster, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
+        assert!(
+            !tasks.iter().any(|task| {
+                task.task_type == anvil::tasks::TaskType::IndexBuild
+                    && task.status == anvil::tasks::TaskStatus::Failed
+            }),
+            "index build task failed; tasks={tasks:?}"
+        );
+        if tasks.iter().any(|task| {
+            task.task_type == anvil::tasks::TaskType::IndexBuild
+                && task.status == anvil::tasks::TaskStatus::Completed
+        }) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "index build task did not complete in time; tasks={tasks:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 fn s3_client(http_base: &str, client_id: &str, client_secret: &str) -> Client {
@@ -390,6 +428,22 @@ async fn test_s3_list_versions_and_get_filter_by_relationship_authorization() {
         "list permission alone must not reveal object keys"
     );
 
+    for key in [allowed_key, "docs/not-created.txt"] {
+        let head_denied = reader.head_object().bucket(&bucket).key(key).send().await;
+        let rendered = format!("{head_denied:?}");
+        assert!(
+            head_denied.is_err()
+                && (rendered.contains("403")
+                    || rendered.contains("Forbidden")
+                    || rendered.contains("Permission denied")),
+            "S3 HEAD without object read permission must be denied for {key}: {rendered}"
+        );
+        assert!(
+            !rendered.contains("NotFound"),
+            "S3 HEAD without object read permission must not reveal absence for {key}: {rendered}"
+        );
+    }
+
     let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
         .await
         .unwrap();
@@ -459,6 +513,14 @@ async fn test_s3_list_versions_and_get_filter_by_relationship_authorization() {
         .expect("relationship grant should allow S3 GET");
     let allowed_bytes = allowed.body.collect().await.unwrap().into_bytes();
     assert_eq!(allowed_bytes.as_ref(), b"allowed-v2");
+
+    reader
+        .head_object()
+        .bucket(&bucket)
+        .key(allowed_key)
+        .send()
+        .await
+        .expect("relationship grant should allow S3 HEAD");
 
     let denied = reader
         .get_object()
@@ -849,7 +911,7 @@ async fn test_s3_put_triggers_full_text_index_build() {
             CreateIndexRequest {
                 bucket_name: bucket.clone(),
                 name: "body".to_string(),
-                kind: "full_text".to_string(),
+                kind: IndexKind::FullText as i32,
                 selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
                 extractor_json: serde_json::json!({"source": "object_body_utf8"}).to_string(),
                 authorization_mode: "index_only".to_string(),
@@ -904,17 +966,9 @@ async fn test_s3_put_triggers_full_text_index_build() {
     }
 
     let response = indexed.expect("S3 object should be searchable after index task completes");
-    assert_eq!(response.index_kind, "full_text");
+    assert_eq!(response.index_kind, IndexKind::FullText as i32);
     assert!(response.index_generation >= 1);
-    let tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
-    assert!(tasks.iter().any(|task| {
-        task.task_type == anvil::tasks::TaskType::IndexBuild
-            && task.status == anvil::tasks::TaskStatus::Completed
-    }));
-    assert!(!tasks.iter().any(|task| {
-        task.task_type == anvil::tasks::TaskType::IndexBuild
-            && task.status == anvil::tasks::TaskStatus::Failed
-    }));
+    wait_for_completed_index_build(&cluster, Duration::from_secs(20)).await;
 }
 
 #[tokio::test]
@@ -944,7 +998,7 @@ async fn test_s3_put_metadata_field_triggers_full_text_index_build() {
             CreateIndexRequest {
                 bucket_name: bucket.clone(),
                 name: "owner".to_string(),
-                kind: "full_text".to_string(),
+                kind: IndexKind::FullText as i32,
                 selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
                 extractor_json: serde_json::json!({
                     "source": "metadata_field",
@@ -1005,7 +1059,7 @@ async fn test_s3_put_metadata_field_triggers_full_text_index_build() {
 
     let response =
         indexed.expect("S3 metadata field should be searchable after index task completes");
-    assert_eq!(response.index_kind, "full_text");
+    assert_eq!(response.index_kind, IndexKind::FullText as i32);
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "docs/s3-metadata.txt");
 }
@@ -1037,7 +1091,7 @@ async fn test_s3_put_personaldb_table_column_triggers_full_text_index_build() {
             CreateIndexRequest {
                 bucket_name: bucket.clone(),
                 name: "row-name".to_string(),
-                kind: "full_text".to_string(),
+                kind: IndexKind::FullText as i32,
                 selector_json: serde_json::json!({"prefix": "rows/"}).to_string(),
                 extractor_json: serde_json::json!({
                     "source": "personaldb_table_column",
@@ -1099,7 +1153,7 @@ async fn test_s3_put_personaldb_table_column_triggers_full_text_index_build() {
 
     let response = indexed
         .expect("S3 PersonalDB table column should be searchable after index task completes");
-    assert_eq!(response.index_kind, "full_text");
+    assert_eq!(response.index_kind, IndexKind::FullText as i32);
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "rows/items/1.json");
 }
@@ -1131,7 +1185,7 @@ async fn test_s3_put_media_transcript_triggers_full_text_index_build() {
             CreateIndexRequest {
                 bucket_name: bucket.clone(),
                 name: "media".to_string(),
-                kind: "full_text".to_string(),
+                kind: IndexKind::FullText as i32,
                 selector_json: serde_json::json!({"prefix": "media/"}).to_string(),
                 extractor_json: serde_json::json!({"source": "media_transcript"}).to_string(),
                 authorization_mode: "index_only".to_string(),
@@ -1188,7 +1242,7 @@ async fn test_s3_put_media_transcript_triggers_full_text_index_build() {
 
     let response =
         indexed.expect("S3 media transcript should be searchable after index task completes");
-    assert_eq!(response.index_kind, "full_text");
+    assert_eq!(response.index_kind, IndexKind::FullText as i32);
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "media/audio/clip.bin");
 }
@@ -1220,7 +1274,7 @@ async fn test_s3_put_triggers_vector_index_build() {
             CreateIndexRequest {
                 bucket_name: bucket.clone(),
                 name: "embedding".to_string(),
-                kind: "vector".to_string(),
+                kind: IndexKind::Vector as i32,
                 selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
                 extractor_json: serde_json::json!({"source": "object_body_json_vector"})
                     .to_string(),
@@ -1284,18 +1338,10 @@ async fn test_s3_put_triggers_vector_index_build() {
 
     let response =
         indexed.expect("S3 object vector should be searchable after index task completes");
-    assert_eq!(response.index_kind, "vector");
+    assert_eq!(response.index_kind, IndexKind::Vector as i32);
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "docs/s3-vector.json");
-    let tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
-    assert!(tasks.iter().any(|task| {
-        task.task_type == anvil::tasks::TaskType::IndexBuild
-            && task.status == anvil::tasks::TaskStatus::Completed
-    }));
-    assert!(!tasks.iter().any(|task| {
-        task.task_type == anvil::tasks::TaskType::IndexBuild
-            && task.status == anvil::tasks::TaskStatus::Failed
-    }));
+    wait_for_completed_index_build(&cluster, Duration::from_secs(20)).await;
 }
 
 #[test]
@@ -2438,6 +2484,15 @@ async fn run_s3_public_and_private_access() {
             .expect_err("reserved namespace LIST must fail");
         assert_reserved_namespace_error(list_err);
 
+        let list_versions_err = client
+            .list_object_versions()
+            .bucket(&public_bucket)
+            .prefix(reserved_prefix)
+            .send()
+            .await
+            .expect_err("reserved namespace version LIST must fail");
+        assert_reserved_namespace_error(list_versions_err);
+
         cluster.states[0]
             .persistence
             .create_object(
@@ -2466,6 +2521,23 @@ async fn run_s3_public_and_private_access() {
                 .iter()
                 .all(|object| object.key() != Some(reserved_key.as_str())),
             "S3 LIST must not reveal reserved namespace keys"
+        );
+        let root_versions = client
+            .list_object_versions()
+            .bucket(&public_bucket)
+            .send()
+            .await
+            .expect("root version listing should succeed");
+        assert!(
+            root_versions
+                .versions()
+                .iter()
+                .all(|object| !object.key().unwrap_or_default().starts_with("_anvil/"))
+                && root_versions
+                    .delete_markers()
+                    .iter()
+                    .all(|object| !object.key().unwrap_or_default().starts_with("_anvil/")),
+            "S3 version LIST must not reveal reserved namespace keys"
         );
 
         let delete_err = client
@@ -2546,33 +2618,19 @@ async fn test_streaming_upload_decoding() {
     let (client_id, client_secret) = create_app(&cluster.admin_state_path, "streaming-decode-app");
 
     // Grant wildcard policy to the app
-    let admin_args = &["run", "--bin", "admin", "--"];
-    let policy_args = &[
-        "policy",
-        "grant",
-        "--app-name",
-        "streaming-decode-app",
-        "--action",
-        "*",
-        "--resource",
-        "*",
-    ];
-    let status = std::process::Command::new("cargo")
-        .args(
-            admin_args
-                .iter()
-                .chain(&[
-                    "--anvil-secret-encryption-key",
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "--storage-path",
-                    &cluster.admin_state_path,
-                ])
-                .chain(policy_args.iter()),
-        )
-        .status()
-        .unwrap();
-    assert!(status.success());
-
+    run_admin(
+        &cluster.admin_state_path,
+        &[
+            "policy",
+            "grant",
+            "--app-name",
+            "streaming-decode-app",
+            "--action",
+            "*",
+            "--resource",
+            "*",
+        ],
+    );
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Configure S3 client

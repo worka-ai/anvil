@@ -1,14 +1,30 @@
 [package]
-name = "anvil-test-utils"
-version = "0.1.0"
-edition = "2024"
+name = "anvil-storage-test-utils"
+version.workspace = true
+edition.workspace = true
+description = "Integration test utilities for Anvil"
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+readme.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = [".env", "*.env", "anvil-data/**", "target/**"]
+
+publish = false
+[lib]
+name = "anvil_test_utils"
+path = "src/lib.rs"
 
 [features]
 enterprise = ["anvil/enterprise"]
 
 [dependencies]
-anvil = { path = "../anvil" }
-anvil-core = { path = "../anvil-core" }
+anvil = { package = "anvil-server", path = "../anvil", version = "0.1.0" }
+anvil-core = { package = "anvil-storage-core", path = "../anvil-core", version = "0.1.0" }
 anyhow = "1"
 tokio = { version = "1.47.1", features = ["full"] }
 

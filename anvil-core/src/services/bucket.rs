@@ -1,6 +1,11 @@
 use crate::anvil_api::bucket_service_server::BucketService;
 use crate::anvil_api::*;
-use crate::{AppState, auth, bucket_journal, permissions::AnvilAction, validation};
+use crate::{
+    AppState, auth, bucket_journal,
+    permissions::AnvilAction,
+    services::watch_envelope::{self, WatchEnvelopeParts},
+    validation,
+};
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -262,11 +267,28 @@ impl AppState {
 fn bucket_metadata_event_response(
     event: &crate::persistence::BucketMetadataEvent,
 ) -> Result<WatchBucketMetadataResponse, Status> {
+    let cursor = u64::try_from(event.id).map_err(|_| Status::internal("Invalid watch cursor"))?;
+    let emitted_at = event.created_at.to_string();
+    let payload_hash = watch_envelope::payload_hash(&event.bucket_metadata);
     Ok(WatchBucketMetadataResponse {
-        cursor: u64::try_from(event.id).map_err(|_| Status::internal("Invalid watch cursor"))?,
+        cursor,
         event_type: event.event_type.clone(),
         bucket: Some(bucket_from_metadata(&event.bucket_metadata)?),
-        emitted_at: event.created_at.to_string(),
+        emitted_at: emitted_at.clone(),
+        envelope: Some(watch_envelope::envelope(WatchEnvelopeParts {
+            watch_stream_id: "bucket_metadata",
+            partition_family: "bucket_metadata",
+            partition_id: event.bucket_name.clone(),
+            cursor: event.id as u128,
+            mutation_id: event.mutation_id.to_string(),
+            record_kind: "bucket_metadata".to_string(),
+            object_ref: event.bucket_name.clone(),
+            authz_revision: 0,
+            index_generation: 0,
+            personaldb_log_index: 0,
+            payload_hash,
+            emitted_at,
+        })),
     })
 }
 

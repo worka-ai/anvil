@@ -27,21 +27,31 @@ async fn wait_ready(url: &str, timeout: Duration) {
 
 #[allow(dead_code)]
 #[allow(unused)]
-struct ComposeGuard;
+struct ComposeGuard {
+    compose_file: std::path::PathBuf,
+}
 
 impl Drop for ComposeGuard {
     fn drop(&mut self) {
-        // best-effort teardown
         let _ = Command::new("docker")
-            .args(["compose", "down", "-v"])
+            .args([
+                "compose",
+                "-f",
+                self.compose_file.to_str().unwrap_or_default(),
+                "down",
+                "-v",
+            ])
             .status();
     }
 }
 
-#[ignore]
 #[tokio::test]
-#[cfg(target_os = "linux")]
 async fn docker_cluster_end_to_end() {
+    if std::env::var("ANVIL_RUN_DOCKER_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping release-gated test; set ANVIL_RUN_DOCKER_E2E=1 to run");
+        return;
+    }
+
     // This test now assumes that the Docker image has been pre-built by a previous CI step
     // and that the ANVIL_IMAGE environment variable is set to the correct image tag.
     // The CI workflow is responsible for this setup.
@@ -61,7 +71,9 @@ async fn docker_cluster_end_to_end() {
             "-d",
         ],
     );
-    let _guard = ComposeGuard;
+    let _guard = ComposeGuard {
+        compose_file: compose_file_path.clone(),
+    };
 
     // Wait for nodes to be ready
     wait_ready("http://localhost:50051/ready", Duration::from_secs(60)).await;

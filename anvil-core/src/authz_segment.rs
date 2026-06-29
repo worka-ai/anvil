@@ -227,6 +227,7 @@ fn authz_record_from_segment_record(record: SegmentRecord) -> Result<AuthzTupleR
         operation: operation_to_string(value.operation).to_string(),
         written_by: String::from_utf8(value.written_by)?,
         reason: String::from_utf8(value.reason)?,
+        mutation_id: uuid::Uuid::nil(),
         record_hash: hex::encode(value.record_hash),
         written_at: chrono::DateTime::from_timestamp_nanos(value.written_at_nanos),
     })
@@ -359,6 +360,7 @@ mod tests {
             operation: operation.to_string(),
             written_by: "node".to_string(),
             reason: "test".to_string(),
+            mutation_id: uuid::Uuid::new_v4(),
             record_hash: hex::encode(hash32(format!("record-{revision}").as_bytes())),
             written_at: Utc::now(),
         }

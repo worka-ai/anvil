@@ -334,6 +334,17 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
     assert_eq!(event.event_type, "commit");
     assert_eq!(event.log_index, 1);
     assert_eq!(event.log_hash, committed.log_hash);
+    let envelope = event
+        .envelope
+        .as_ref()
+        .expect("PersonalDB group watch envelope");
+    assert_eq!(envelope.watch_stream_id, "personaldb_group");
+    assert_eq!(envelope.partition_family, "personaldb_group");
+    assert_eq!(envelope.cursor_low, event.cursor_low);
+    assert_eq!(envelope.personaldb_log_index, event.log_index);
+    assert_eq!(envelope.authz_revision, event.authz_revision);
+    assert_eq!(envelope.record_kind, "personaldb_group");
+    assert!(!envelope.payload_hash.is_empty());
 }
 
 #[tokio::test]
@@ -915,6 +926,17 @@ async fn personaldb_projection_definition_create_get_and_watch_are_native_api_ba
     assert_eq!(event.projection_id, "projection-items");
     assert_eq!(event.source_database_id, source_database_id);
     assert_eq!(event.authz_revision, 12);
+    let envelope = event
+        .envelope
+        .as_ref()
+        .expect("PersonalDB projection watch envelope");
+    assert_eq!(envelope.watch_stream_id, "personaldb_projection");
+    assert_eq!(envelope.partition_family, "personaldb_projection");
+    assert_eq!(envelope.cursor_low, event.cursor_low);
+    assert_eq!(envelope.personaldb_log_index, event.projection_log_index);
+    assert_eq!(envelope.authz_revision, event.authz_revision);
+    assert_eq!(envelope.record_kind, "personaldb_projection");
+    assert!(!envelope.payload_hash.is_empty());
 }
 
 #[tokio::test]

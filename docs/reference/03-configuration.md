@@ -40,7 +40,7 @@ The admin CLI writes to the native storage path used by the target node.
 Example:
 
 ```bash
-cargo run -p anvil --bin admin -- \
+cargo run -p anvil-storage --bin admin -- \
   --anvil-secret-encryption-key aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --storage-path /var/lib/anvil \
   tenant create default

@@ -1,0 +1,30 @@
+[[items]]
+title = "Operator Guides"
+href = "/operators/deployment/"
+level = 0
+group = true
+
+[[items]]
+title = "Deployment"
+href = "/operators/deployment/"
+level = 1
+
+[[items]]
+title = "Identity And Access"
+href = "/operators/identity-and-access/"
+level = 1
+
+[[items]]
+title = "Index Operations"
+href = "/operators/index-operations/"
+level = 1
+
+[[items]]
+title = "Backup And Recovery"
+href = "/operators/backup-and-recovery/"
+level = 1
+
+[[items]]
+title = "Release Checklist"
+href = "/operators/release-checklist/"
+level = 1

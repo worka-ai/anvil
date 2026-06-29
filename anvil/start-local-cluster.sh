@@ -55,7 +55,7 @@ for i in $(seq 1 ${NODE_COUNT}); do
   fi
 
   echo "Starting node ${i} (QUIC: ${QUIC_PORT}, gRPC: ${GRPC_PORT}, storage: ${NODE_STORAGE_DIR})"
-  RUST_LOG="info,anvil=debug" cargo run -p anvil -- "${args[@]}" &
+  RUST_LOG="info,anvil=debug" cargo run -p anvil-storage -- "${args[@]}" &
   PIDS="$PIDS $!"
   sleep 1
 done
@@ -72,7 +72,7 @@ Local cluster started with ${NODE_COUNT} nodes.
 
 To start a debugger-attached node, run:
 
-cargo run -p anvil -- \\
+cargo run -p anvil-storage -- \\
   --jwt-secret "${JWT_SECRET}" \\
   --anvil-secret-encryption-key "${ENCRYPTION_KEY}" \\
   --cluster-secret "${CLUSTER_SECRET}" \\

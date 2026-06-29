@@ -50,6 +50,7 @@ pub mod model_journal;
 pub mod multipart_journal;
 pub mod native_idempotency;
 pub mod object_manager;
+pub mod observability;
 pub mod partition_fence;
 pub mod permissions;
 pub mod persistence;
@@ -71,7 +72,6 @@ pub mod personaldb_submit;
 pub mod personaldb_watch;
 pub mod placement;
 pub mod repair_finding;
-pub mod s3_auth;
 pub mod search_query;
 pub mod services;
 pub mod sharding;
@@ -114,6 +114,7 @@ pub struct AppState {
         broadcast::Sender<personaldb_watch::PersonalDbProjectionWatchEvent>,
     pub personaldb_commit_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     pub native_mutation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    pub observability: observability::Observability,
 }
 
 impl AppState {
@@ -140,6 +141,7 @@ impl AppState {
             tokio::sync::broadcast::channel(1024);
         let personaldb_commit_locks = Arc::new(Mutex::new(HashMap::new()));
         let native_mutation_locks = Arc::new(Mutex::new(HashMap::new()));
+        let observability = observability::Observability::default();
 
         let bucket_manager =
             bucket_manager::BucketManager::new(persistence.clone(), storage.clone());
@@ -153,6 +155,7 @@ impl AppState {
             jwt_manager.clone(),
             arc_config.anvil_secret_encryption_key.clone(),
             object_watch_tx,
+            observability.clone(),
         );
 
         Ok(Self {
@@ -173,6 +176,7 @@ impl AppState {
             personaldb_projection_watch_tx,
             personaldb_commit_locks,
             native_mutation_locks,
+            observability,
         })
     }
 }

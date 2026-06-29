@@ -462,6 +462,7 @@ fn bucket_event_from_body(sequence: u64, body: BucketJournalBody) -> Result<Buck
         bucket_id: body.bucket_id,
         bucket_name: body.bucket_name.clone(),
         event_type: bucket_event_type(&body.event).to_string(),
+        mutation_id: uuid::Uuid::parse_str(&body.mutation_id)?,
         bucket_metadata: bucket_metadata_json(&body, deleted),
         created_at: event_created_at,
     })

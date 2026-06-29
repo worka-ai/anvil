@@ -4,6 +4,8 @@ resolver = "3"
 members = [
     "anvil",
     "anvil-cli",
+    "clients/rust",
+    "documentation",
 ]
 
 [workspace.package]
@@ -13,8 +15,9 @@ readme = "README.md"
 description = "Native object store, index store, and witness layer"
 keywords = ["object-store", "storage", "search", "authorization"]
 categories = ["database-implementations"]
-authors = ["Worka <hello@worka.ai>"]
+authors = ["Anvil maintainers <maintainers@anvil.storage>"]
 license = "Apache-2.0"
-homepage = "https://github.com/worka-ai/anvil"
-repository = "https://github.com/worka-ai/anvil"
+homepage = "https://github.com/anvil-storage/anvil"
+repository = "https://github.com/anvil-storage/anvil"
+documentation = "https://github.com/anvil-storage/anvil/tree/main/documentation"
 rust-version = "1.89.0"

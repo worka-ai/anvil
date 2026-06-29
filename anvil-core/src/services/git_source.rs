@@ -3,7 +3,9 @@ use crate::anvil_api::*;
 use crate::object_manager::ObjectWriteOptions;
 use crate::{
     AppState, access_control, auth, authz_journal, git_pack, git_source_index, git_source_manifest,
-    git_source_query, git_source_watch, permissions::AnvilAction,
+    git_source_query, git_source_watch,
+    permissions::AnvilAction,
+    services::watch_envelope::{self, WatchEnvelopeParts},
 };
 use futures_util::StreamExt;
 use serde_json::json;
@@ -560,17 +562,36 @@ fn watch_git_source_response(
     event: git_source_watch::GitSourceWatchEvent,
 ) -> WatchGitSourceResponse {
     let (cursor_low, cursor_high) = split_u128(event.cursor);
+    let payload = event.payload;
+    let emitted_at = payload.emitted_at.clone();
+    let repository_id = payload.repository_id.clone();
+    let generation = payload.generation;
+    let payload_hash = watch_envelope::payload_hash(&payload);
     WatchGitSourceResponse {
         cursor_low,
         cursor_high,
-        repository_id: event.payload.repository_id,
-        event_type: event.payload.event_type,
-        generation: event.payload.generation,
-        source_hash: event.payload.source_hash,
-        index_path: event.payload.index_path,
-        pack_object_version_id: event.payload.pack_object_version_id.unwrap_or_default(),
+        repository_id: repository_id.clone(),
+        event_type: payload.event_type,
+        generation,
+        source_hash: payload.source_hash,
+        index_path: payload.index_path,
+        pack_object_version_id: payload.pack_object_version_id.unwrap_or_default(),
         authz_revision: event.authz_revision,
-        emitted_at: event.payload.emitted_at,
+        emitted_at: emitted_at.clone(),
+        envelope: Some(watch_envelope::envelope(WatchEnvelopeParts {
+            watch_stream_id: "git_source",
+            partition_family: "git_source",
+            partition_id: repository_id.clone(),
+            cursor: event.cursor,
+            mutation_id: watch_envelope::uuid_from_bytes(event.mutation_id),
+            record_kind: "git_source".to_string(),
+            object_ref: repository_id,
+            authz_revision: event.authz_revision,
+            index_generation: generation,
+            personaldb_log_index: 0,
+            payload_hash,
+            emitted_at,
+        })),
     }
 }
 

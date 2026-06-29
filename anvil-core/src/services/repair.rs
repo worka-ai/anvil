@@ -5,6 +5,7 @@ use crate::{
     permissions::AnvilAction,
     personaldb_repair,
     repair_finding::{RepairFinding, RepairSubjectRef},
+    services::index::index_kind_value_from_str,
 };
 use tonic::{Request, Response, Status};
 
@@ -39,6 +40,21 @@ impl RepairService for AppState {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         let (source_cursor_low, source_cursor_high) = split_u128(report.source_cursor);
+        let build = report
+            .build
+            .as_ref()
+            .map(|build| {
+                let (source_cursor_low, source_cursor_high) = split_u128(build.source_cursor);
+                Ok::<IndexBuildRecord, Status>(IndexBuildRecord {
+                    index_kind: index_kind_value_from_str(&build.index_kind)?,
+                    generation: build.generation,
+                    item_count: build.item_count as u64,
+                    source_cursor_low,
+                    source_cursor_high,
+                    segment_hashes: build.segment_hashes.clone(),
+                })
+            })
+            .transpose()?;
         Ok(Response::new(RepairIndexResponse {
             status: index_repair::status_name(&report.status).to_string(),
             bucket_name: report.bucket_name,
@@ -48,17 +64,7 @@ impl RepairService for AppState {
             source_cursor_high,
             reason: index_repair::status_reason(&report.status),
             finding: report.finding.as_ref().map(repair_finding_record),
-            build: report.build.as_ref().map(|build| {
-                let (source_cursor_low, source_cursor_high) = split_u128(build.source_cursor);
-                IndexBuildRecord {
-                    index_kind: build.index_kind.clone(),
-                    generation: build.generation,
-                    item_count: build.item_count as u64,
-                    source_cursor_low,
-                    source_cursor_high,
-                    segment_hashes: build.segment_hashes.clone(),
-                }
-            }),
+            build,
         }))
     }
 

@@ -10,7 +10,13 @@ static CLI_PATH: OnceLock<String> = OnceLock::new();
 fn get_cli_path() -> &'static str {
     CLI_PATH.get_or_init(|| {
         let status = Command::new("cargo")
-            .args(&["build", "--package", "anvil-cli"])
+            .args(&[
+                "build",
+                "--package",
+                "anvil-storage-cli",
+                "--bin",
+                "anvil-cli",
+            ])
             .status()
             .expect("Failed to build anvil-cli");
         assert!(status.success());

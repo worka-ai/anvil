@@ -6,7 +6,7 @@ use anvil::anvil_api::{
     self, AbortMultipartRequest, AppendStreamRecordRequest, CompareAndSwapManifestRequest,
     CompleteMultipartPart, CompleteMultipartRequest, ComposeObjectRequest, ComposeObjectSource,
     CopyObjectRequest, CreateAppendStreamRequest, CreateBucketRequest, CreateIndexRequest,
-    DeleteObjectRequest, GetObjectRequest, HeadObjectRequest, InitiateMultipartRequest,
+    DeleteObjectRequest, GetObjectRequest, HeadObjectRequest, IndexKind, InitiateMultipartRequest,
     ListObjectVersionsRequest, ListObjectsRequest, NativeMutationContext, ObjectMetadata,
     PatchJsonObjectRequest, PutObjectRequest, RepairDirectoryIndexRequest,
     SealAppendStreamSegmentRequest, UploadPartMetadata, UploadPartRequest, WatchPrefixRequest,
@@ -15,6 +15,10 @@ use futures_util::StreamExt;
 use std::time::Duration;
 use tonic::Request;
 
+use anvil::observability::{
+    OBJECT_READ_LATENCY, OBJECT_WRITE_LATENCY, PREFIX_LIST_LATENCY,
+    RESERVED_NAMESPACE_REJECTION_COUNT,
+};
 use anvil::storage::{DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES, ExternalChunkManifest};
 use anvil_test_utils::*;
 use tonic::{Code, Status};
@@ -1359,6 +1363,10 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
+    reserved_put.metadata_mut().insert(
+        "x-anvil-internal-write-token",
+        "caller-forged".parse().unwrap(),
+    );
     assert_reserved_namespace_status(object_client.put_object(reserved_put).await);
 
     let mut get_req = Request::new(GetObjectRequest {
@@ -1653,6 +1661,32 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         format!("Bearer {}", token).parse().unwrap(),
     );
     assert_reserved_namespace_status(object_client.watch_prefix(watch_reserved).await);
+
+    let metrics = cluster.states[0].observability.snapshot();
+    let reserved_rejections = metrics
+        .iter()
+        .filter(|(key, _)| {
+            key.name == RESERVED_NAMESPACE_REJECTION_COUNT
+                && key.labels.get("api").is_some_and(|value| value == "native")
+        })
+        .map(|(_, sample)| sample.count)
+        .sum::<u64>();
+    assert!(
+        reserved_rejections >= 4,
+        "native reserved namespace rejections should be counted"
+    );
+    for metric in [
+        OBJECT_WRITE_LATENCY,
+        OBJECT_READ_LATENCY,
+        PREFIX_LIST_LATENCY,
+    ] {
+        assert!(
+            metrics
+                .iter()
+                .any(|(key, sample)| key.name == metric && sample.count > 0),
+            "expected {metric} to be observed during native object API calls"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1980,7 +2014,7 @@ async fn test_object_version_records_index_policy_snapshot_and_mutation_metadata
     let mut create_index = Request::new(CreateIndexRequest {
         bucket_name: bucket_name.clone(),
         name: "body-text".to_string(),
-        kind: "full_text".to_string(),
+        kind: IndexKind::FullText as i32,
         selector_json: serde_json::json!({"selector": "object_body_utf8"}).to_string(),
         extractor_json: serde_json::json!({"encoding": "utf8"}).to_string(),
         authorization_mode: "inherit_object".to_string(),
@@ -2250,6 +2284,38 @@ async fn test_private_object_read_denied_before_payload_load() {
     assert_eq!(denied.code(), Code::PermissionDenied);
     assert_eq!(denied.message(), "Permission denied");
 
+    let mut denied_missing_req = Request::new(GetObjectRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: "private/not-created.bin".to_string(),
+        version_id: None,
+    });
+    denied_missing_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", limited_token).parse().unwrap(),
+    );
+    let denied_missing = object_client
+        .get_object(denied_missing_req)
+        .await
+        .expect_err("unauthorized missing object lookup must not reveal absence");
+    assert_eq!(denied_missing.code(), Code::PermissionDenied);
+    assert_eq!(denied_missing.message(), "Permission denied");
+
+    let mut denied_missing_head_req = Request::new(HeadObjectRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: "private/not-created.bin".to_string(),
+        version_id: None,
+    });
+    denied_missing_head_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", limited_token).parse().unwrap(),
+    );
+    let denied_missing_head = object_client
+        .head_object(denied_missing_head_req)
+        .await
+        .expect_err("unauthorized missing HEAD must not reveal absence");
+    assert_eq!(denied_missing_head.code(), Code::PermissionDenied);
+    assert_eq!(denied_missing_head.message(), "Permission denied");
+
     let mut allowed_req = Request::new(GetObjectRequest {
         bucket_name,
         object_key,
@@ -2363,6 +2429,14 @@ async fn test_watch_prefix_streams_snapshot_and_live_events() {
     assert_eq!(first.object_key, object_key);
     assert_eq!(first.event_type, "put");
     assert!(!first.is_delete_marker);
+    let first_envelope = first.envelope.as_ref().expect("watch event envelope");
+    assert_eq!(first_envelope.watch_stream_id, "object_prefix");
+    assert_eq!(first_envelope.partition_family, "object_metadata");
+    assert_eq!(first_envelope.cursor_low, first.cursor);
+    assert_eq!(first_envelope.record_kind, "put");
+    assert!(first_envelope.object_ref.ends_with(&object_key));
+    assert!(!first_envelope.mutation_id.is_empty());
+    assert!(!first_envelope.payload_hash.is_empty());
     let first_cursor = first.cursor;
 
     let mut delete_req = Request::new(DeleteObjectRequest {

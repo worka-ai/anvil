@@ -18,10 +18,10 @@ Start a local cluster:
 Run focused checks:
 
 ```bash
-cargo check -p anvil-core
-cargo check -p anvil
-cargo check -p anvil-test-utils
-cargo check -p anvil --tests
+cargo check -p anvil-storage-core
+cargo check -p anvil-storage
+cargo check -p anvil-storage-test-utils
+cargo check -p anvil-storage-storage --tests
 ```
 
 Run tests with the shared Cargo target directory managed by Cargo locking. Do not create ad-hoc target directories unless the task explicitly requires isolation.

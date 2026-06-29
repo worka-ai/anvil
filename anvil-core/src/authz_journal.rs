@@ -79,6 +79,7 @@ async fn write_authz_tuple_inner(
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("authz revision overflow"))?;
     let written_at = chrono::Utc::now();
+    let mutation_id = uuid::Uuid::new_v4();
     let record_hash = authz_record_hash(AuthzRecordHashInput {
         tenant_id: input.tenant_id,
         namespace: input.namespace,
@@ -103,6 +104,7 @@ async fn write_authz_tuple_inner(
         operation: input.operation.to_string(),
         written_by: input.written_by.to_string(),
         reason: input.reason.to_string(),
+        mutation_id,
         record_hash,
         written_at,
     };
@@ -149,7 +151,6 @@ async fn append_authz_tuple_record_inner(
         .last()
         .map(|frame| frame.record_hash)
         .unwrap_or([0; 32]);
-    let mutation_id = uuid::Uuid::new_v4();
     let body = serde_json::to_vec(&AuthzTupleBody {
         revision: record.revision,
         tenant_id: record.tenant_id,
@@ -169,7 +170,7 @@ async fn append_authz_tuple_record_inner(
         JournalRecordKind::AuthzTuple,
         sequence,
         fence_token,
-        *mutation_id.as_bytes(),
+        *record.mutation_id.as_bytes(),
         tuple_key_hash(record),
         previous_hash,
         body,
@@ -495,6 +496,7 @@ async fn read_all_authz_tuple_records_from_journal(
             operation: body.operation,
             written_by: body.written_by,
             reason: body.reason,
+            mutation_id: uuid::Uuid::from_bytes(frame.mutation_id),
             record_hash: body.record_hash,
             written_at: chrono::DateTime::parse_from_rfc3339(&body.written_at)?
                 .with_timezone(&chrono::Utc),
@@ -652,6 +654,7 @@ mod tests {
             operation: operation.to_string(),
             written_by: "tester".to_string(),
             reason: "test".to_string(),
+            mutation_id: uuid::Uuid::new_v4(),
             record_hash: hex::encode(hash32(format!("record-{revision}").as_bytes())),
             written_at: Utc::now(),
         }
@@ -678,6 +681,7 @@ mod tests {
             operation: operation.to_string(),
             written_by: "tester".to_string(),
             reason: "test".to_string(),
+            mutation_id: uuid::Uuid::new_v4(),
             record_hash: hex::encode(hash32(
                 format!(
                     "record-{revision}-{namespace}-{object_id}-{relation}-{subject_kind}-{subject_id}-{operation}"
@@ -944,6 +948,59 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn authz_journal_rejects_wrong_partition_scope_before_write() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let valid = ready_authz_permit(&storage, 42, "node-a").await;
+
+        let wrong_family = PartitionWritePermit {
+            partition_family: "object_metadata".to_string(),
+            partition_id: valid.partition_id.clone(),
+            owner_node_id: valid.owner_node_id.clone(),
+            fence_token: valid.fence_token,
+        };
+        let rejected = append_authz_tuple_record_with_permit(
+            &storage,
+            &record(1, "add"),
+            &wrong_family,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            rejected
+                .to_string()
+                .contains("does not target this authorization tuple partition")
+        );
+
+        let wrong_tenant_partition = PartitionWritePermit {
+            partition_family: valid.partition_family.clone(),
+            partition_id: hex::encode(authz_partition_id(43)),
+            owner_node_id: valid.owner_node_id,
+            fence_token: valid.fence_token,
+        };
+        let rejected = append_authz_tuple_record_with_permit(
+            &storage,
+            &record(1, "add"),
+            &wrong_tenant_partition,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            rejected
+                .to_string()
+                .contains("does not target this authorization tuple partition")
+        );
+        assert!(
+            !tokio::fs::try_exists(storage.authz_tuple_journal_path(42))
+                .await
+                .unwrap(),
+            "wrong-scope internal authz writes must fail before journal creation"
+        );
     }
 
     #[tokio::test]

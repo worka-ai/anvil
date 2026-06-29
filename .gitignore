@@ -7,3 +7,18 @@ GEMINI.md
 
 /target
 anvil-data
+
+# Local Anvil runtime state and secrets
+anvil/.env
+anvil/anvil-data/
+
+# Client package build outputs
+clients/typescript/dist/
+clients/typescript/node_modules/
+clients/typescript/*.tgz
+clients/python/build/
+clients/python/dist/
+clients/python/*.egg-info/
+clients/python/src/anvil_storage_client.egg-info/
+clients/python/src/anvil_storage_client/anvil_pb2.py
+clients/python/src/anvil_storage_client/anvil_pb2_grpc.py

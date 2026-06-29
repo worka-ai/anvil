@@ -21,6 +21,7 @@ impl InternalAnvilService for AppState {
             .get::<auth::Claims>()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?
             .clone();
+        validate_internal_claims(&claims)?;
 
         let mut stream = request.into_inner();
 
@@ -58,6 +59,7 @@ impl InternalAnvilService for AppState {
             .get::<auth::Claims>()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?
             .clone();
+        validate_internal_claims(&claims)?;
         let req = request.into_inner();
 
         let resource = format!("{}/{}", req.final_object_hash, req.shard_index);
@@ -81,6 +83,7 @@ impl InternalAnvilService for AppState {
         let claims = extensions
             .get::<auth::Claims>()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        validate_internal_claims(claims)?;
 
         let resource = format!("{}/{}", req.object_hash, req.shard_index);
         if !auth::is_authorized(AnvilAction::InternalGetShard, &resource, &claims.scopes) {
@@ -121,6 +124,7 @@ impl InternalAnvilService for AppState {
             .get::<auth::Claims>()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?
             .clone();
+        validate_internal_claims(&claims)?;
         let req = request.into_inner();
 
         let resource = format!("{}/{}", req.object_hash, req.shard_index);
@@ -134,5 +138,44 @@ impl InternalAnvilService for AppState {
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(DeleteShardResponse {}))
+    }
+}
+
+fn validate_internal_claims(claims: &auth::Claims) -> Result<(), Status> {
+    if claims.tenant_id == 0 && (claims.sub == "internal" || claims.sub == "internal-worker") {
+        return Ok(());
+    }
+    Err(Status::permission_denied(
+        "Internal service requires a node-issued token",
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::Code;
+
+    fn claims(sub: &str, tenant_id: i64) -> auth::Claims {
+        auth::Claims {
+            sub: sub.to_string(),
+            exp: usize::MAX,
+            scopes: vec!["*|*".to_string()],
+            tenant_id,
+        }
+    }
+
+    #[test]
+    fn internal_service_accepts_only_node_issued_claims() {
+        validate_internal_claims(&claims("internal", 0)).expect("internal token should pass");
+        validate_internal_claims(&claims("internal-worker", 0))
+            .expect("internal worker token should pass");
+
+        let tenant_app = validate_internal_claims(&claims("customer-app", 42))
+            .expect_err("tenant app must not call internal service");
+        assert_eq!(tenant_app.code(), Code::PermissionDenied);
+
+        let tenant_zero_app = validate_internal_claims(&claims("customer-app", 0))
+            .expect_err("tenant-zero non-internal subject must not call internal service");
+        assert_eq!(tenant_zero_app.code(), Code::PermissionDenied);
     }
 }

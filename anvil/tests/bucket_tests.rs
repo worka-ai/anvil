@@ -540,4 +540,14 @@ async fn test_watch_bucket_metadata_streams_snapshot_events() {
     assert_eq!(events[0].bucket.as_ref().unwrap().name, bucket_name);
     assert!(events[1].bucket.as_ref().unwrap().is_public_read);
     assert!(events[2].bucket.as_ref().unwrap().deleted);
+    for event in &events {
+        let envelope = event.envelope.as_ref().expect("bucket metadata envelope");
+        assert_eq!(envelope.watch_stream_id, "bucket_metadata");
+        assert_eq!(envelope.partition_family, "bucket_metadata");
+        assert_eq!(envelope.cursor_low, event.cursor);
+        assert_eq!(envelope.record_kind, "bucket_metadata");
+        assert_eq!(envelope.object_ref, bucket_name);
+        assert!(!envelope.mutation_id.is_empty());
+        assert!(!envelope.payload_hash.is_empty());
+    }
 }

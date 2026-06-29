@@ -3,7 +3,11 @@ use crate::anvil_api::*;
 use crate::native_idempotency::{self, NativeIdempotencyTarget};
 use crate::object_manager::ObjectWriteOptions;
 use crate::permissions::AnvilAction;
-use crate::{AppState, auth, authz_journal, bucket_journal, watch_log};
+use crate::{
+    AppState, auth, authz_journal, bucket_journal,
+    services::watch_envelope::{self, WatchEnvelopeParts},
+    watch_log,
+};
 use futures_util::StreamExt;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::OwnedMutexGuard;
@@ -1565,8 +1569,10 @@ fn object_authz_revision(object: &crate::persistence::Object) -> Result<u64, Sta
 fn watch_event_response(
     event: &crate::persistence::ObjectWatchEvent,
 ) -> Option<WatchPrefixResponse> {
+    let cursor = u64::try_from(event.id).ok()?;
+    let created_at = event.created_at.to_string();
     Some(WatchPrefixResponse {
-        cursor: u64::try_from(event.id).ok()?,
+        cursor,
         bucket_name: event.bucket_name.clone(),
         object_key: event.key.clone(),
         event_type: event.event_type.clone(),
@@ -1577,6 +1583,20 @@ fn watch_event_response(
         etag: event.etag.clone().unwrap_or_default(),
         size: event.size,
         is_delete_marker: event.is_delete_marker,
-        created_at: event.created_at.to_string(),
+        created_at: created_at.clone(),
+        envelope: Some(watch_envelope::envelope(WatchEnvelopeParts {
+            watch_stream_id: "object_prefix",
+            partition_family: "object_metadata",
+            partition_id: event.bucket_id.to_string(),
+            cursor: event.id as u128,
+            mutation_id: event.mutation_id.to_string(),
+            record_kind: event.event_type.clone(),
+            object_ref: format!("{}/{}", event.bucket_name, event.key),
+            authz_revision: 0,
+            index_generation: 0,
+            personaldb_log_index: 0,
+            payload_hash: event.payload_hash.clone(),
+            emitted_at: created_at,
+        })),
     })
 }

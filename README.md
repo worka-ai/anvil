@@ -1,93 +1,117 @@
-# Anvil: An Open-Source Object Store for AI/ML Research
+# Anvil
 
-[![Build Status](https://github.com/worka-ai/anvil-enterprise/actions/workflows/ci.yml/badge.svg)](https://github.com/worka-ai/anvil-enterprise/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![JOSS Submission](https://joss.theoj.org/papers/10.21105/joss.XXXXX/status.svg)](https://joss.theoj.org/papers/10.21105/joss.XXXXX)
+Anvil is a production object storage platform that makes storage, search, authorisation, live change streams, and local-first database witnessing part of one system.
 
-**Anvil** is a high-performance, open-source distributed object store built in Rust. It is designed to address the data management and storage challenges inherent in modern computational research, particularly for large-scale Artificial Intelligence (AI) and Machine Learning (ML) workloads. By providing an S3-compatible interface, a native high-throughput gRPC API, and first-class support for content-addressing, Anvil serves as a foundational infrastructure layer for reproducible and efficient research.
+Most applications begin with a simple storage requirement: put bytes under a name and read them later. Real products quickly need more. They need predictable paths, fast listings, metadata filters, text search, semantic retrieval, access checks on every result, live updates when data changes, auditable background indexing, and a way to sync local-first SQLite data without turning the application server into a pile of bespoke storage glue.
 
----
+Anvil moves those concerns into the storage layer. It stores objects, maintains indexes, evaluates relationship authorisation, exposes durable watches, and witnesses PersonalDB changesets using a single object-native architecture.
 
-## Key Features
+## What Anvil Provides
 
--   **Content-Addressable Storage:** Automatically deduplicates identical data using BLAKE3 hashing, dramatically reducing storage costs for versioned models and datasets.
--   **High-Performance gRPC Streaming:** A native gRPC API with bidirectional streaming, ideal for high-throughput ML data loaders that feed GPUs directly from storage.
--   **S3-Compatible Gateway:** Provides drop-in compatibility with the vast ecosystem of existing research tools and SDKs that support the S3 API (Boto3, MLflow, Rclone, etc.).
--   **Built for the ML Ecosystem:** Includes features like the `anvil hf ingest` command to import model repositories directly from the Hugging Face Hub.
--   **Modern, Resilient Architecture:** Built in Rust for memory safety and high concurrency, with a SWIM-like gossip protocol over QUIC for clustering and failure detection.
--   **Multi-Tenant by Design:** Provides strong logical isolation between different users, teams, or projects.
+- **Object storage:** buckets, keys, versions, checksums, range reads, multipart upload flows, copy/delete operations, S3-compatible access, and native gRPC APIs.
+- **Object-native metadata:** bucket/object state, manifests, journals, derived index records, diagnostics, source artefacts, and PersonalDB state are stored inside Anvil rather than delegated to an external relational metadata store.
+- **Path and metadata indexes:** predictable key layouts, prefix navigation, metadata selectors, filters, and facets for application and operator workflows.
+- **Full text search:** tokenisation, ranking, phrase support, snippets, and result filtering that respects authorisation before exposing matches.
+- **Vector search:** Rust-native vector segment storage and nearest-neighbour search for text, image, audio, and video-derived embeddings.
+- **Relationship authorisation:** Zanzibar-style tuples, namespace rules, caveats, derived usersets, fail-closed internal namespaces, and permission checks on object, index, source, and PersonalDB paths.
+- **Watch streams:** durable cursor-based change streams used by applications, derived indexes, projections, and recovery tooling to catch up without rescanning whole buckets.
+- **PersonalDB witnessing:** SQLite changeset validation, commit certificates, snapshots, row metadata, authorised projections, projection writeback, repair evidence, and catch-up APIs for local-first applications.
+- **Source and model artefacts:** storage patterns for git packs, source indexes, model manifests, Hugging Face ingestion, media extraction diagnostics, and reproducibility records.
+- **Operational tooling:** an admin CLI, an application CLI, Docker image publication, S3 compatibility tests, release checks, and Fission-built documentation.
 
----
+## Release Surfaces
 
-## 🚀 Quick Start
+This release ships Anvil through these supported surfaces:
 
-The fastest way to get a single-node Anvil instance running is with Docker Compose.
+- **Server:** Docker image and release binaries. The server is not published to crates.io.
+- **Rust client:** the `anvil-storage` crate, published to crates.io.
+- **CLI/admin binaries:** packaged from the server build for operators.
+- **Documentation site:** a Fission static site published independently from code releases.
+- **Protocol bindings:** generated gRPC bindings are packaged inside the Rust client; internal node-to-node services are not exposed by the public client API.
 
-1.  **Save the `docker-compose.yml`:**
-    Save the example `docker-compose.yml` from the [Getting Started Guide](./docs/01-getting-started.md) to a local file.
+## Quick Start
 
-2.  **Launch Anvil:**
-    ```bash
-    docker-compose up -d
-    ```
+Run the server from Docker:
 
-3.  **Create Your First Tenant and App:**
-    Use the `admin` tool to create a tenant and an app with API credentials.
-    ```bash
-    # Create a region and a tenant
-    docker compose exec anvil1 admin region create europe-west-1
-    docker compose exec anvil1 admin tenant create my-first-tenant
-
-    # Create an app and save the credentials
-    docker compose exec anvil1 admin app create --tenant-name my-first-tenant --app-name my-cli-app
-    ```
-
-4.  **Configure the Anvil CLI:**
-    Use the credentials from the previous step to configure your local `anvil` CLI.
-    ```bash
-    anvil configure --host http://localhost:50051 --client-id YOUR_CLIENT_ID --client-secret YOUR_CLIENT_SECRET
-    ```
-
----
-
-## 📘 Documentation
-
-For complete guides on deployment, architecture, and usage, please see the [**Full Documentation**](./docs/index.md).
-
--   [Getting Started](./docs/01-getting-started.md)
--   [Authentication & Permissions](./docs/03-user-guide-authentication.md)
--   [Using the S3 Gateway](./docs/04-user-guide-s3-gateway.md)
--   [Deployment Guide](./docs/06-operational-guide-deployment.md)
-
----
-
-## 🤝 Contributing
-
-We welcome contributions of all kinds! Please read our [**Contributing Guide**](./CONTRIBUTING.md) to get started. All participation in the Anvil community is governed by our [**Code of Conduct**](./CODE_OF_CONDUCT.md).
-
----
-
-## 📜 Citing Anvil
-
-If you use Anvil in your research, please cite it. Once published in JOSS, a BibTeX entry will be provided here.
-
-```bibtex
-@article{Anvil2025,
-  doi = {10.21105/joss.XXXXX},
-  url = {https://doi.org/10.21105/joss.XXXXX},
-  year = {2025},
-  publisher = {The Open Journal},
-  volume = {X},
-  number = {XX},
-  pages = {XXXXX},
-  author = {Your Name and Other Authors},
-  title = {Anvil: An Open-Source Object Store for AI/ML Research},
-  journal = {Journal of Open Source Software}
-}
+```sh
+docker pull ghcr.io/worka-ai/anvil:latest
+docker run --rm -p 50051:50051 -p 9000:9000 ghcr.io/worka-ai/anvil:latest
 ```
 
----
+Add the Rust client to an application:
+
+```toml
+[dependencies]
+anvil-storage = "0.1"
+```
+
+Use the client:
+
+```rust
+use anvil_storage::{AnvilClient, BucketClient};
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let client = AnvilClient::connect("http://127.0.0.1:50051", "token").await?;
+let mut buckets = client.bucket_client();
+let response = buckets.list_buckets(Default::default()).await?;
+println!("{} buckets", response.into_inner().buckets.len());
+# Ok(())
+# }
+```
+
+Existing S3-compatible tools can also speak to Anvil through the S3 gateway when configured with Anvil-issued credentials.
+
+## Documentation
+
+The public documentation lives in `documentation/` and is built with Fission.
+
+Start the local documentation site:
+
+```sh
+fission site serve --project-dir documentation
+```
+
+Build and check the static site:
+
+```sh
+fission site check --project-dir documentation --release
+fission site build --project-dir documentation --release
+```
+
+The documentation is structured as a progressive guide:
+
+- `documentation/content/learn/` teaches object storage, metadata, indexing, search, authorisation, watches, and PersonalDB from first principles.
+- `documentation/content/tutorials/` shows each operation using release-supported client surfaces.
+- `documentation/content/developers/` explains how to build applications directly on Anvil.
+- `documentation/content/operators/` covers deployment, identity, indexing operations, backup, recovery, and release work.
+- `documentation/content/reference/` defines configuration, CLI commands, package surfaces, and security errors.
+- `documentation/src/app.rs` contains the Fission marketing home page.
+
+## Development Checks
+
+Run these checks before publishing or changing core behaviour:
+
+```sh
+cargo fmt --all -- --check
+cargo test --workspace
+cargo publish --dry-run -p anvil-storage
+```
+
+Security-sensitive changes should include focused tests for the affected path and then the full workspace test suite. Request signing, token handling, reserved namespaces, object existence behaviour, relationship authorisation, S3 gateway behaviour, watch cursors, and PersonalDB witnessing are release-critical surfaces.
+
+## Release Process
+
+The release process is intentionally split by surface:
+
+1. Open a PR containing the source, documentation, CI, and release-note changes.
+2. Merge to `main` after CI passes.
+3. Let GitHub Actions build and publish the Docker image.
+4. Let the independent documentation workflow publish the Fission static site.
+5. Publish the Rust client crate with `cargo publish -p anvil-storage`.
+6. Create the GitHub release with detailed notes and links to the Docker image, crate, documentation, and verification evidence.
+
+See `documentation/content/operators/release-checklist.md` for the operator checklist.
 
 ## License
 
-Anvil is licensed under the [Apache 2.0 License](./LICENSE).
+Anvil is licensed under the Apache 2.0 License. See `LICENSE`.

@@ -1,5 +1,5 @@
 use crate::{AppState, auth::AuthenticatedBearerToken};
-use axum::{http::HeaderValue, response::Response};
+use axum::{http::HeaderMap, http::HeaderValue, response::Response};
 use http::Uri;
 use tonic::{Request, Status};
 
@@ -59,8 +59,10 @@ pub async fn save_uri_mw(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     tracing::info!(
-        "[axum_mw] Received request with headers: {:?}",
-        req.headers()
+        method = %req.method(),
+        path = %req.uri().path(),
+        headers = ?safe_header_names_for_logging(req.headers()),
+        "[axum_mw] received request"
     );
 
     // Prefer the original (unstripped) URI if we’re nested
@@ -72,6 +74,13 @@ pub async fn save_uri_mw(
 
     req.extensions_mut().insert(full_uri);
     next.run(req).await
+}
+
+fn safe_header_names_for_logging(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .keys()
+        .map(|name| name.as_str().to_ascii_lowercase())
+        .collect()
 }
 
 pub async fn request_id_mw(
@@ -89,4 +98,33 @@ pub async fn request_id_mw(
             .insert(ANVIL_REQUEST_ID_HEADER, header_value);
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn logged_headers_include_names_without_secret_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer secret-token"),
+        );
+        headers.insert(
+            "x-amz-security-token",
+            HeaderValue::from_static("session-secret"),
+        );
+        headers.insert("x-request-source", HeaderValue::from_static("test"));
+
+        let logged = format!("{:?}", safe_header_names_for_logging(&headers));
+
+        assert!(logged.contains("authorization"));
+        assert!(logged.contains("x-amz-security-token"));
+        assert!(logged.contains("x-request-source"));
+        assert!(!logged.contains("secret-token"));
+        assert!(!logged.contains("session-secret"));
+        assert!(!logged.contains("Bearer"));
+    }
 }

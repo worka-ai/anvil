@@ -13,5 +13,5 @@ Operational checks should cover:
 - node readiness endpoints;
 - cluster peer visibility;
 - object watch and index lag;
-- authorization tuple ingestion and reserved namespace rejection;
+- authorisation tuple ingestion and reserved namespace rejection;
 - backup restore drills using restored storage paths.

@@ -1,7 +1,31 @@
 [package]
+name = "anvil-server"
+version.workspace = true
+edition.workspace = true
+description = "Anvil object store server and native/S3 API implementation"
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+readme.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = [".env", "*.env", "anvil-data/**", "target/**"]
+publish = false
+
+[lib]
 name = "anvil"
-version = "0.1.0"
-edition = "2024"
+path = "src/lib.rs"
+
+[[bin]]
+name = "anvil"
+path = "src/main.rs"
+
+[[bin]]
+name = "admin"
+path = "src/bin/admin.rs"
 
 [features]
 enterprise = []
@@ -29,7 +53,7 @@ default = ["full"]
 tonic-prost = ["dep:tonic-prost"]
 
 [dependencies]
-anvil-core = { path = "../anvil-core" }
+anvil-core = { package = "anvil-storage-core", path = "../anvil-core", version = "0.1.0" }
 # Enterprise crate is private and not part of the OSS workspace.
 # Do not declare it here to keep OSS repo self-contained.
 anyhow = { version = "1" }
@@ -111,7 +135,8 @@ bcrypt = "0.15"
 tonic-prost-build = { version = "0.14.2" }
 
 [dev-dependencies]
-anvil-test-utils = { path = "../anvil-test-utils" }
+anvil-storage = { path = "../clients/rust", version = "0.1.0" }
+anvil-test-utils = { package = "anvil-storage-test-utils", path = "../anvil-test-utils", version = "0.1.0" }
 aws-config = "1.1.7"
 aws-sdk-s3 = "1.18.0"
 http-body-util = "0.1.1"
