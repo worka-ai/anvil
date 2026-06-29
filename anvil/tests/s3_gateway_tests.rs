@@ -2077,149 +2077,155 @@ async fn run_s3_public_and_private_access() {
     );
 
     // 8. Reserved internal namespaces are never readable or writable through S3.
-    let reserved_key = "_anvil/authz/tuples";
-    let reserved_url = format!("{}/{}/{}", http_base, public_bucket, reserved_key);
-
-    let reserved_get = reqwest::get(&reserved_url).await.unwrap();
-    assert_eq!(reserved_get.status(), 403);
-    assert!(
-        reserved_get
-            .text()
-            .await
-            .unwrap()
-            .contains("UnauthorizedReservedNamespace")
-    );
-
-    let reserved_head = reqwest::Client::new()
-        .head(&reserved_url)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(reserved_head.status(), 403);
-
-    let reserved_range_get = reqwest::Client::new()
-        .get(&reserved_url)
-        .header(reqwest::header::RANGE, "bytes=0-1")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(reserved_range_get.status(), 403);
-    assert!(
-        reserved_range_get
-            .text()
-            .await
-            .unwrap()
-            .contains("UnauthorizedReservedNamespace")
-    );
-
-    let put_err = client
-        .put_object()
-        .bucket(&public_bucket)
-        .key(reserved_key)
-        .body(ByteStream::from(b"must not be stored".to_vec()))
-        .send()
-        .await
-        .expect_err("reserved namespace PUT must fail");
-    assert_reserved_namespace_error(put_err);
-
-    let forged_internal_token_put = reqwest::Client::new()
-        .put(format!("{reserved_url}?internal_write_token=caller-forged"))
-        .header("x-anvil-internal-write-token", "caller-forged")
-        .body("must not be stored")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(forged_internal_token_put.status(), 403);
-    assert!(
-        forged_internal_token_put
-            .text()
-            .await
-            .unwrap()
-            .contains("UnauthorizedReservedNamespace")
-    );
-
-    let list_err = client
-        .list_objects_v2()
-        .bucket(&public_bucket)
-        .prefix("_anvil/authz/")
-        .send()
-        .await
-        .expect_err("reserved namespace LIST must fail");
-    assert_reserved_namespace_error(list_err);
-
+    let reserved_prefixes = [
+        "_anvil/meta/",
+        "_anvil/index/",
+        "_anvil/authz/",
+        "_anvil/watch/",
+        "_anvil/personaldb/",
+        "_anvil/git/",
+        "_anvil/tmp/",
+    ];
     let bucket = cluster.states[0]
         .persistence
         .get_bucket_by_name(1, &public_bucket)
         .await
         .unwrap()
         .expect("public bucket metadata should exist");
-    cluster.states[0]
-        .persistence
-        .create_object(
-            bucket.tenant_id,
-            bucket.id,
-            reserved_key,
-            &hex::encode([9; 32]),
-            0,
-            "reserved-etag",
-            None,
-            None,
-            None,
-            Some(Vec::new()),
-        )
-        .await
-        .unwrap();
-    let root_listing = client
-        .list_objects_v2()
-        .bucket(&public_bucket)
-        .send()
-        .await
-        .expect("root listing should succeed");
-    assert!(
-        root_listing
-            .contents()
-            .iter()
-            .all(|object| object.key() != Some(reserved_key)),
-        "S3 LIST must not reveal reserved namespace keys"
-    );
 
-    let delete_err = client
-        .delete_object()
-        .bucket(&public_bucket)
-        .key(reserved_key)
-        .send()
-        .await
-        .expect_err("reserved namespace DELETE must fail");
-    assert_reserved_namespace_error(delete_err);
+    for reserved_prefix in reserved_prefixes {
+        let reserved_key = format!("{reserved_prefix}s3-compat-object");
+        let reserved_url = format!("{}/{}/{}", http_base, public_bucket, reserved_key);
 
-    let personaldb_delete_err = client
-        .delete_object()
-        .bucket(&public_bucket)
-        .key("_anvil/personaldb/group")
-        .send()
-        .await
-        .expect_err("reserved PersonalDB namespace DELETE must fail");
-    assert_reserved_namespace_error(personaldb_delete_err);
+        let reserved_get = reqwest::get(&reserved_url).await.unwrap();
+        assert_eq!(reserved_get.status(), 403);
+        assert!(
+            reserved_get
+                .text()
+                .await
+                .unwrap()
+                .contains("UnauthorizedReservedNamespace")
+        );
 
-    let copy_from_reserved_err = client
-        .copy_object()
-        .bucket(&public_bucket)
-        .key("copied-from-reserved.txt")
-        .copy_source(format!("{}/{}", public_bucket, reserved_key))
-        .send()
-        .await
-        .expect_err("reserved namespace CopyObject source must fail");
-    assert_reserved_namespace_error(copy_from_reserved_err);
+        let reserved_head = reqwest::Client::new()
+            .head(&reserved_url)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reserved_head.status(), 403);
 
-    let copy_to_reserved_err = client
-        .copy_object()
-        .bucket(&public_bucket)
-        .key(reserved_key)
-        .copy_source(format!("{}/{}", public_bucket, public_key))
-        .send()
-        .await
-        .expect_err("reserved namespace CopyObject destination must fail");
-    assert_reserved_namespace_error(copy_to_reserved_err);
+        let reserved_range_get = reqwest::Client::new()
+            .get(&reserved_url)
+            .header(reqwest::header::RANGE, "bytes=0-1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reserved_range_get.status(), 403);
+        assert!(
+            reserved_range_get
+                .text()
+                .await
+                .unwrap()
+                .contains("UnauthorizedReservedNamespace")
+        );
+
+        let put_err = client
+            .put_object()
+            .bucket(&public_bucket)
+            .key(&reserved_key)
+            .body(ByteStream::from(b"must not be stored".to_vec()))
+            .send()
+            .await
+            .expect_err("reserved namespace PUT must fail");
+        assert_reserved_namespace_error(put_err);
+
+        let forged_internal_token_put = reqwest::Client::new()
+            .put(format!("{reserved_url}?internal_write_token=caller-forged"))
+            .header("x-anvil-internal-write-token", "caller-forged")
+            .body("must not be stored")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(forged_internal_token_put.status(), 403);
+        assert!(
+            forged_internal_token_put
+                .text()
+                .await
+                .unwrap()
+                .contains("UnauthorizedReservedNamespace")
+        );
+
+        let list_err = client
+            .list_objects_v2()
+            .bucket(&public_bucket)
+            .prefix(reserved_prefix)
+            .send()
+            .await
+            .expect_err("reserved namespace LIST must fail");
+        assert_reserved_namespace_error(list_err);
+
+        cluster.states[0]
+            .persistence
+            .create_object(
+                bucket.tenant_id,
+                bucket.id,
+                &reserved_key,
+                &hex::encode([9; 32]),
+                0,
+                "reserved-etag",
+                None,
+                None,
+                None,
+                Some(Vec::new()),
+            )
+            .await
+            .unwrap();
+        let root_listing = client
+            .list_objects_v2()
+            .bucket(&public_bucket)
+            .send()
+            .await
+            .expect("root listing should succeed");
+        assert!(
+            root_listing
+                .contents()
+                .iter()
+                .all(|object| object.key() != Some(reserved_key.as_str())),
+            "S3 LIST must not reveal reserved namespace keys"
+        );
+
+        let delete_err = client
+            .delete_object()
+            .bucket(&public_bucket)
+            .key(&reserved_key)
+            .send()
+            .await
+            .expect_err("reserved namespace DELETE must fail");
+        assert_reserved_namespace_error(delete_err);
+
+        let copy_from_reserved_err = client
+            .copy_object()
+            .bucket(&public_bucket)
+            .key(format!(
+                "copied-from-reserved-{}.txt",
+                reserved_prefix.trim_matches('/').replace('/', "-")
+            ))
+            .copy_source(format!("{}/{}", public_bucket, reserved_key))
+            .send()
+            .await
+            .expect_err("reserved namespace CopyObject source must fail");
+        assert_reserved_namespace_error(copy_from_reserved_err);
+
+        let copy_to_reserved_err = client
+            .copy_object()
+            .bucket(&public_bucket)
+            .key(&reserved_key)
+            .copy_source(format!("{}/{}", public_bucket, public_key))
+            .send()
+            .await
+            .expect_err("reserved namespace CopyObject destination must fail");
+        assert_reserved_namespace_error(copy_to_reserved_err);
+    }
 
     // 9. Normal S3 DELETE remains compatible and idempotent.
     client
