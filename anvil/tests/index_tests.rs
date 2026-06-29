@@ -2619,6 +2619,9 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
     assert!((recipe["text_weight"].as_f64().unwrap() - 0.55).abs() < 1e-6);
     assert!((recipe["vector_weight"].as_f64().unwrap() - 0.35).abs() < 1e-6);
     assert!((recipe["freshness_weight"].as_f64().unwrap() - 0.10).abs() < 1e-6);
+    assert_eq!(recipe["index_generations"]["full_text"], 5);
+    assert_eq!(recipe["index_generations"]["vector"], 6);
+    assert_eq!(recipe["index_generations"]["max"], 6);
     let hit_metadata: serde_json::Value =
         serde_json::from_str(&response.hits[0].metadata_json).unwrap();
     assert_eq!(hit_metadata["normalized_text_score"].as_f64().unwrap(), 1.0);

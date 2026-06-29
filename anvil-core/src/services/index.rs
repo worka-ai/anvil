@@ -754,6 +754,8 @@ impl AppState {
             index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
         let mut combined = BTreeMap::<[u8; 16], HybridAccum>::new();
         let mut generation = 0;
+        let mut text_generation = 0;
+        let mut vector_generation = 0;
         let mut authz_revision = 0;
         let has_text = !req.query_text.trim().is_empty();
         let has_vector = !req.query_vector.is_empty();
@@ -767,6 +769,7 @@ impl AppState {
             else {
                 return Err(Status::failed_precondition("IndexUnavailable"));
             };
+            text_generation = segment.header.generation;
             generation = generation.max(segment.header.generation);
             authz_revision = authz_revision.max(segment.header.authz_revision);
             let search_hits = search_query::query_full_text_segment(
@@ -803,6 +806,7 @@ impl AppState {
             if req.query_vector.len() != usize::from(segment.header.dimension) {
                 return Err(Status::invalid_argument("query_vector dimension mismatch"));
             }
+            vector_generation = segment.header.generation;
             generation = generation.max(segment.header.generation);
             authz_revision = authz_revision.max(segment.header.authz_revision);
             let metric = VectorMetric::from_name(&segment.header.metric)
@@ -922,7 +926,12 @@ impl AppState {
                 "kind": "hybrid",
                 "text_weight": text_weight,
                 "vector_weight": vector_weight,
-                "freshness_weight": freshness_weight
+                "freshness_weight": freshness_weight,
+                "index_generations": {
+                    "full_text": text_generation,
+                    "vector": vector_generation,
+                    "max": generation
+                }
             })
             .to_string(),
         }))
