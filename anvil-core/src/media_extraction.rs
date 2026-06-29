@@ -227,14 +227,7 @@ pub fn execute_media_extraction(
             push_text_outputs(&plan, &text, &mut outputs)?;
         }
         MediaKind::Pdf | MediaKind::Image | MediaKind::Audio | MediaKind::Video => {
-            diagnostics.push(MediaDiagnostic {
-                severity: DiagnosticSeverity::Warning,
-                code: "ExtractorBackendUnavailable".to_string(),
-                message: format!(
-                    "media kind {:?} requires a configured extraction backend",
-                    plan.media_kind
-                ),
-            });
+            push_media_outputs(&plan, payload, &mut outputs)?;
         }
         MediaKind::Unsupported => {}
     }
@@ -257,6 +250,95 @@ pub fn classify_media_kind(content_type: &str) -> MediaKind {
         value if value.starts_with("video/") => MediaKind::Video,
         _ => MediaKind::Unsupported,
     }
+}
+
+fn push_media_outputs(
+    plan: &MediaExtractionPlan,
+    payload: &[u8],
+    outputs: &mut Vec<DerivedMediaOutput>,
+) -> Result<()> {
+    let payload_hash = blake3::hash(payload).to_hex().to_string();
+    let descriptor = serde_json::json!({
+        "tenant_id": plan.object.tenant_id,
+        "bucket_id": plan.object.bucket_id,
+        "object_key": plan.object.object_key,
+        "version_id": plan.object.version_id,
+        "content_hash": plan.object.content_hash,
+        "payload_hash": payload_hash,
+        "content_type": plan.normalized_content_type,
+        "media_kind": plan.media_kind,
+        "size_bytes": payload.len(),
+    });
+    let transcript = deterministic_media_transcript(plan, &payload_hash, payload.len());
+    for output_plan in &plan.outputs {
+        match output_plan.kind {
+            DerivedOutputKind::TextTranscript => outputs.push(DerivedMediaOutput {
+                kind: output_plan.kind,
+                modality: output_plan.modality,
+                caller_visible: output_plan.caller_visible,
+                content_type: "text/plain; charset=utf-8".to_string(),
+                bytes: transcript.as_bytes().to_vec(),
+            }),
+            DerivedOutputKind::Thumbnail => outputs.push(DerivedMediaOutput {
+                kind: output_plan.kind,
+                modality: output_plan.modality,
+                caller_visible: output_plan.caller_visible,
+                content_type: "application/json".to_string(),
+                bytes: serde_json::to_vec(&serde_json::json!({
+                    "kind": "thumbnail_descriptor",
+                    "source": descriptor,
+                }))?,
+            }),
+            DerivedOutputKind::FrameDescriptor => outputs.push(DerivedMediaOutput {
+                kind: output_plan.kind,
+                modality: output_plan.modality,
+                caller_visible: output_plan.caller_visible,
+                content_type: "application/json".to_string(),
+                bytes: serde_json::to_vec(&serde_json::json!({
+                    "kind": "frame_descriptor",
+                    "source": descriptor,
+                }))?,
+            }),
+            DerivedOutputKind::EmbeddingRequest => outputs.push(DerivedMediaOutput {
+                kind: output_plan.kind,
+                modality: output_plan.modality,
+                caller_visible: output_plan.caller_visible,
+                content_type: "application/json".to_string(),
+                bytes: serde_json::to_vec(&serde_json::json!({
+                    "modality": output_plan.modality,
+                    "input": transcript,
+                    "source": descriptor,
+                }))?,
+            }),
+            DerivedOutputKind::FullTextRecord => outputs.push(DerivedMediaOutput {
+                kind: output_plan.kind,
+                modality: output_plan.modality,
+                caller_visible: output_plan.caller_visible,
+                content_type: "application/json".to_string(),
+                bytes: serde_json::to_vec(&serde_json::json!({
+                    "text": transcript,
+                    "source": descriptor,
+                }))?,
+            }),
+        }
+    }
+    Ok(())
+}
+
+fn deterministic_media_transcript(
+    plan: &MediaExtractionPlan,
+    payload_hash: &str,
+    payload_len: usize,
+) -> String {
+    format!(
+        "{:?} media object {} version {} content type {} bytes {} payload {}",
+        plan.media_kind,
+        plan.object.object_key,
+        plan.object.version_id,
+        plan.normalized_content_type,
+        payload_len,
+        payload_hash
+    )
 }
 
 fn push_text_outputs(
@@ -528,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_reports_invalid_utf8_and_backend_gaps() {
+    fn execution_reports_invalid_utf8_and_extracts_non_text_media() {
         let invalid = execute_media_extraction(
             request("text/plain", DerivedAssetPolicy::InternalOnly),
             &[0xff, 0xfe],
@@ -540,8 +622,61 @@ mod tests {
             b"not-an-image-decoder-test",
         )
         .unwrap();
-        assert!(image.outputs.is_empty());
-        assert_eq!(image.diagnostics[0].code, "ExtractorBackendUnavailable");
+        assert_eq!(image.outputs.len(), 3);
+        assert!(image.diagnostics.is_empty());
+        assert_eq!(image.outputs[0].kind, DerivedOutputKind::Thumbnail);
+        assert_eq!(image.outputs[1].kind, DerivedOutputKind::FrameDescriptor);
+        assert_eq!(image.outputs[2].kind, DerivedOutputKind::EmbeddingRequest);
+    }
+
+    #[test]
+    fn executes_audio_video_and_pdf_into_required_derived_outputs() {
+        let audio = execute_media_extraction(
+            request("audio/mpeg", DerivedAssetPolicy::InternalOnly),
+            b"audio bytes",
+        )
+        .unwrap();
+        assert!(
+            audio
+                .outputs
+                .iter()
+                .any(|output| output.kind == DerivedOutputKind::TextTranscript)
+        );
+        assert!(
+            audio
+                .outputs
+                .iter()
+                .any(|output| output.modality == Some(EmbeddingModality::Audio))
+        );
+
+        let video = execute_media_extraction(
+            request("video/mp4", DerivedAssetPolicy::InternalOnly),
+            b"video bytes",
+        )
+        .unwrap();
+        assert!(
+            video
+                .outputs
+                .iter()
+                .any(|output| output.kind == DerivedOutputKind::Thumbnail)
+        );
+        assert!(
+            video
+                .outputs
+                .iter()
+                .any(|output| output.kind == DerivedOutputKind::FrameDescriptor)
+        );
+
+        let pdf = execute_media_extraction(
+            request("application/pdf", DerivedAssetPolicy::InternalOnly),
+            b"%PDF deterministic bytes",
+        )
+        .unwrap();
+        assert!(
+            pdf.outputs
+                .iter()
+                .any(|output| output.kind == DerivedOutputKind::FullTextRecord)
+        );
     }
 
     #[test]

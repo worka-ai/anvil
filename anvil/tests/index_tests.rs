@@ -378,7 +378,18 @@ async fn test_full_text_index_builds_from_object_write_task() {
     assert!(!watch_event.proof_hash.is_empty());
     assert!(!watch_event.segment_hashes.is_empty());
 
-    let tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
+    let mut tasks = Vec::new();
+    let task_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < task_deadline {
+        tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
+        if tasks.iter().any(|task| {
+            task.task_type == anvil::tasks::TaskType::IndexBuild
+                && task.status == anvil::tasks::TaskStatus::Completed
+        }) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert!(tasks.iter().any(|task| {
         task.task_type == anvil::tasks::TaskType::IndexBuild
             && task.status == anvil::tasks::TaskStatus::Completed

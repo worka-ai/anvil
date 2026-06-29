@@ -7,6 +7,10 @@ use crate::formats::{
 use crate::full_text_segment::{self, FullTextSegmentWrite};
 use crate::index_journal;
 use crate::index_partition_watch::{self, IndexPartitionWatchPayload};
+use crate::media_extraction::{
+    DerivedAssetPolicy, DerivedOutputKind, MediaExtractionRequest, MediaObjectRef,
+    execute_media_extraction,
+};
 use crate::metadata_journal;
 use crate::persistence::{Bucket, IndexDefinition, Object};
 use crate::storage::{ExternalChunkManifest, Storage};
@@ -135,21 +139,7 @@ pub async fn build_full_text_index(
         let Some(payload) = read_object_payload(storage, &object).await? else {
             continue;
         };
-        let payload_text = match String::from_utf8(payload) {
-            Ok(text) => text,
-            Err(error) => {
-                diagnostics.push(IndexBuildDiagnostic {
-                    object_key: object.key.clone(),
-                    version_id: Some(object.version_id),
-                    severity: "error".to_string(),
-                    code: "TextPayloadNotUtf8".to_string(),
-                    message: "object body is not valid UTF-8 for text extraction".to_string(),
-                    details: serde_json::json!({ "error": error.to_string() }),
-                });
-                continue;
-            }
-        };
-        let extracted = extract_text_fields(&index.extractor, &object, &payload_text);
+        let extracted = extract_text_fields(&index.extractor, &object, &payload);
         let diagnostic_count = extracted.diagnostics.len();
         for diagnostic in extracted.diagnostics {
             diagnostics.push(IndexBuildDiagnostic {
@@ -965,11 +955,7 @@ fn selector_matches(selector: &JsonValue, object: &Object) -> bool {
     true
 }
 
-fn extract_text_fields(
-    extractor: &JsonValue,
-    object: &Object,
-    payload_text: &str,
-) -> TextExtraction {
+fn extract_text_fields(extractor: &JsonValue, object: &Object, payload: &[u8]) -> TextExtraction {
     let mut fields = Vec::new();
     let mut diagnostics = Vec::new();
     if let Some(field_specs) = extractor.get("fields").and_then(JsonValue::as_array) {
@@ -978,7 +964,7 @@ fn extract_text_fields(
                 .get("source")
                 .and_then(JsonValue::as_str)
                 .unwrap_or("object_body_utf8");
-            match extract_text_source(source, field, object, payload_text) {
+            match extract_text_source(source, field, object, payload) {
                 Ok(Some(text)) => fields.push(ExtractedTextField { text }),
                 Ok(None) => {}
                 Err(diagnostic) => diagnostics.push(TextExtractionDiagnostic {
@@ -996,7 +982,7 @@ fn extract_text_fields(
         };
     }
     if let Some(source) = extractor.get("source").and_then(JsonValue::as_str) {
-        match extract_text_source(source, extractor, object, payload_text) {
+        match extract_text_source(source, extractor, object, payload) {
             Ok(Some(text)) => fields.push(ExtractedTextField { text }),
             Ok(None) => {}
             Err(diagnostic) => diagnostics.push(diagnostic),
@@ -1007,17 +993,19 @@ fn extract_text_fields(
         };
     }
     if extractor.get("encoding").and_then(JsonValue::as_str) == Some("utf8") {
-        fields.push(ExtractedTextField {
-            text: payload_text.to_string(),
-        });
+        match decode_utf8_text(payload) {
+            Ok(text) => fields.push(ExtractedTextField { text }),
+            Err(diagnostic) => diagnostics.push(diagnostic),
+        }
         return TextExtraction {
             fields,
             diagnostics,
         };
     }
-    fields.push(ExtractedTextField {
-        text: payload_text.to_string(),
-    });
+    match decode_utf8_text(payload) {
+        Ok(text) => fields.push(ExtractedTextField { text }),
+        Err(diagnostic) => diagnostics.push(diagnostic),
+    }
     TextExtraction {
         fields,
         diagnostics,
@@ -1028,20 +1016,80 @@ fn extract_text_source(
     source: &str,
     extractor: &JsonValue,
     object: &Object,
-    payload_text: &str,
+    payload: &[u8],
 ) -> Result<Option<String>, TextExtractionDiagnostic> {
     match source {
-        "object_body_utf8" | "utf8" | "body" => Ok(Some(payload_text.to_string())),
+        "object_body_utf8" | "utf8" | "body" | "git_blob_text" => {
+            decode_utf8_text(payload).map(Some)
+        }
         "object_key" | "key" => Ok(Some(object.key.clone())),
         "content_type" => Ok(object.content_type.clone()),
-        "json_pointer" => extract_json_pointer_text(extractor, payload_text),
+        "json_pointer" => {
+            let payload_text = decode_utf8_text(payload)?;
+            extract_json_pointer_text(extractor, &payload_text)
+        }
         "metadata_field" => extract_metadata_field_text(extractor, object),
+        "media_transcript" => extract_media_transcript_text(object, payload),
         other => Err(TextExtractionDiagnostic {
             code: "UnsupportedTextExtractor".to_string(),
             message: format!("unsupported text extractor source `{other}`"),
             details: serde_json::json!({ "source": other }),
         }),
     }
+}
+
+fn decode_utf8_text(payload: &[u8]) -> Result<String, TextExtractionDiagnostic> {
+    String::from_utf8(payload.to_vec()).map_err(|error| TextExtractionDiagnostic {
+        code: "TextPayloadNotUtf8".to_string(),
+        message: "object body is not valid UTF-8 for text extraction".to_string(),
+        details: serde_json::json!({ "error": error.to_string() }),
+    })
+}
+
+fn extract_media_transcript_text(
+    object: &Object,
+    payload: &[u8],
+) -> Result<Option<String>, TextExtractionDiagnostic> {
+    let content_type = object
+        .content_type
+        .as_deref()
+        .ok_or_else(|| TextExtractionDiagnostic {
+            code: "MediaContentTypeMissing".to_string(),
+            message: "media_transcript text extractor requires an object content type".to_string(),
+            details: serde_json::json!({ "object_key": object.key.clone() }),
+        })?;
+    let extraction = execute_media_extraction(
+        MediaExtractionRequest {
+            object: MediaObjectRef {
+                tenant_id: object.tenant_id,
+                bucket_id: object.bucket_id,
+                object_key: object.key.clone(),
+                version_id: object.version_id.to_string(),
+                content_hash: object.content_hash.clone(),
+                size_bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+            },
+            content_type: content_type.to_string(),
+            asset_policy: DerivedAssetPolicy::InternalOnly,
+        },
+        payload,
+    )
+    .map_err(|error| TextExtractionDiagnostic {
+        code: "MediaTranscriptExtractionFailed".to_string(),
+        message: error.to_string(),
+        details: serde_json::json!({ "content_type": content_type }),
+    })?;
+    extraction
+        .outputs
+        .into_iter()
+        .find(|output| output.kind == DerivedOutputKind::TextTranscript)
+        .map(|output| {
+            String::from_utf8(output.bytes).map_err(|error| TextExtractionDiagnostic {
+                code: "MediaTranscriptNotUtf8".to_string(),
+                message: "media transcript output is not valid UTF-8".to_string(),
+                details: serde_json::json!({ "error": error.to_string() }),
+            })
+        })
+        .transpose()
 }
 
 fn extract_json_pointer_text(
@@ -1228,7 +1276,7 @@ mod tests {
                 ]
             }),
             &object,
-            "alpha body",
+            b"alpha body",
         );
         assert_eq!(
             fields
@@ -1257,7 +1305,7 @@ mod tests {
                 ]
             }),
             &object,
-            r#"{"summary":"lease renewal due","ignored":true}"#,
+            br#"{"summary":"lease renewal due","ignored":true}"#,
         );
         assert_eq!(
             fields
@@ -1276,10 +1324,36 @@ mod tests {
         let fields = extract_text_fields(
             &serde_json::json!({"source": "json_pointer", "pointer": "/missing"}),
             &object,
-            r#"{"summary":"present"}"#,
+            br#"{"summary":"present"}"#,
         );
         assert!(fields.fields.is_empty());
         assert_eq!(fields.diagnostics[0].code, "JsonPointerNotFound");
+    }
+
+    #[test]
+    fn extractor_supports_media_transcript_for_binary_payloads() {
+        let object = object("media/audio/a.bin", Some("audio/mpeg"));
+        let fields = extract_text_fields(
+            &serde_json::json!({"source": "media_transcript"}),
+            &object,
+            b"\x00\x01audio payload",
+        );
+        assert_eq!(fields.fields.len(), 1);
+        assert!(fields.fields[0].text.contains("Audio media object"));
+        assert!(fields.fields[0].text.contains("media/audio/a.bin"));
+        assert!(fields.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn extractor_supports_git_blob_text_as_utf8_payload() {
+        let object = object("src/lib.rs", Some("text/plain"));
+        let fields = extract_text_fields(
+            &serde_json::json!({"source": "git_blob_text"}),
+            &object,
+            b"fn main() {}",
+        );
+        assert_eq!(fields.fields[0].text, "fn main() {}");
+        assert!(fields.diagnostics.is_empty());
     }
 
     fn object(key: &str, content_type: Option<&str>) -> Object {
