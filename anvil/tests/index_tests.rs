@@ -688,6 +688,139 @@ async fn test_full_text_index_build_uses_source_cursor_snapshot() {
 }
 
 #[tokio::test]
+async fn test_index_enqueue_rebuilds_when_checkpoint_exists_but_proof_is_missing() {
+    let cluster = TestCluster::new(&["test-region-1"]).await;
+    let persistence = &cluster.states[0].persistence;
+    let tenant_id = 1;
+    let bucket_name = format!("index-missing-proof-{}", uuid::Uuid::new_v4());
+    let bucket = persistence
+        .create_bucket(tenant_id, &bucket_name, "test-region-1")
+        .await
+        .unwrap();
+    let index = persistence
+        .create_index_definition(
+            tenant_id,
+            bucket.id,
+            "body",
+            "full_text",
+            serde_json::json!({"prefix": "docs/"}),
+            serde_json::json!({"source": "object_body_utf8"}),
+            "index_only",
+            serde_json::json!({"positions": true}),
+        )
+        .await
+        .unwrap();
+    persistence
+        .create_index_definition_event(tenant_id, bucket.id, &bucket.name, &index, "create")
+        .await
+        .unwrap();
+    persistence
+        .create_object(
+            tenant_id,
+            bucket.id,
+            "docs/alpha.txt",
+            &hex::encode([41; 32]),
+            32,
+            "etag-alpha",
+            Some("text/plain"),
+            None,
+            None,
+            Some(b"alpha proves missing proof rebuild".to_vec()),
+        )
+        .await
+        .unwrap();
+
+    let initial_task = persistence
+        .list_tasks()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|task| {
+            task.task_type == anvil::tasks::TaskType::IndexBuild
+                && task.payload["index_id"] == serde_json::json!(index.id)
+        })
+        .expect("initial index build task should exist");
+    let source_cursor = initial_task
+        .payload
+        .get("source_cursor")
+        .and_then(serde_json::Value::as_u64)
+        .expect("initial index build task records source cursor");
+
+    persistence
+        .build_index_task(
+            tenant_id,
+            bucket.id,
+            index.id,
+            index.version,
+            u128::from(source_cursor),
+        )
+        .await
+        .unwrap()
+        .expect("index build succeeds");
+    persistence
+        .update_task_status(initial_task.id, anvil::tasks::TaskStatus::Completed)
+        .await
+        .unwrap();
+
+    let index_storage_id = anvil::index_journal::index_storage_id(tenant_id, bucket.id, index.id);
+    let signing_key = hex::decode(&cluster.states[0].config.anvil_secret_encryption_key).unwrap();
+    let checkpoint = anvil::watch_checkpoint::read_watch_checkpoint(
+        &cluster.states[0].storage,
+        "object_metadata",
+        &index_storage_id,
+        &signing_key,
+    )
+    .await
+    .unwrap()
+    .expect("index build should checkpoint object metadata cursor");
+    assert_eq!(checkpoint.cursor, u128::from(source_cursor));
+
+    let proof_head_path = cluster.states[0]
+        .storage
+        .derived_index_proof_head_path(&index_storage_id)
+        .unwrap();
+    tokio::fs::remove_file(&proof_head_path)
+        .await
+        .expect("remove proof head to simulate lost derived proof");
+
+    assert!(
+        persistence
+            .enqueue_index_build_for_index(&bucket, &index)
+            .await
+            .unwrap(),
+        "missing proof must schedule a rebuild even when checkpoint cursor is current"
+    );
+    let rebuild_task = persistence
+        .list_tasks()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|task| {
+            task.task_type == anvil::tasks::TaskType::IndexBuild
+                && task.status == anvil::tasks::TaskStatus::Pending
+                && task.payload["index_id"] == serde_json::json!(index.id)
+                && task.payload["source_cursor"] == serde_json::json!(source_cursor)
+        })
+        .expect("missing proof rebuild task should be pending");
+    assert_eq!(
+        rebuild_task.payload["catch_up_plan"]["RebuildFromManifest"]["reason"],
+        serde_json::json!("MissingProof")
+    );
+    assert_eq!(
+        rebuild_task.payload["catch_up_plan"]["RebuildFromManifest"]["resume_after_cursor"],
+        serde_json::json!(0)
+    );
+    assert!(
+        rebuild_task
+            .payload
+            .get("source_manifest_hash")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value.len() == 64),
+        "rebuild task should record the source checkpoint hash"
+    );
+}
+
+#[tokio::test]
 async fn test_repair_rebuilds_missing_full_text_segment_from_base_journal() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;

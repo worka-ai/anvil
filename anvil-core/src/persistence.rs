@@ -2319,17 +2319,52 @@ impl Persistence {
         }
         let index_storage_id =
             index_journal::index_storage_id(bucket.tenant_id, bucket.id, index.id);
-        if let Some(checkpoint) = watch_checkpoint::read_watch_checkpoint(
+        let checkpoint = watch_checkpoint::read_watch_checkpoint(
             &self.storage,
             "object_metadata",
             &index_storage_id,
             &self.partition_owner_signing_key,
         )
-        .await?
-        {
-            if checkpoint.cursor >= source_cursor {
-                return Ok(false);
-            }
+        .await?;
+        let source_manifest_hash = metadata_journal::object_metadata_source_checkpoint_hash(
+            &self.storage,
+            bucket,
+            &self.partition_owner_signing_key,
+            source_cursor,
+        )
+        .await?;
+        let latest_proof = crate::derived_index_proof::read_latest_derived_index_proof(
+            &self.storage,
+            &index_storage_id,
+            &self.partition_owner_signing_key,
+        )
+        .await
+        .ok()
+        .flatten();
+        let catch_up_plan = crate::derived_index_catchup::plan_derived_index_catch_up(
+            crate::derived_index_catchup::DerivedIndexCatchUpInput {
+                index_id: index_storage_id.clone(),
+                consumer_id: index_storage_id.clone(),
+                watch_stream_id: "object_metadata".to_string(),
+                checkpoint_cursor: checkpoint
+                    .as_ref()
+                    .map(|checkpoint| checkpoint.cursor)
+                    .unwrap_or(0),
+                retained_start_cursor: u128::from(stats.compacted_through_sequence),
+                latest_cursor: source_cursor,
+                manifest_checkpoint_cursor: u128::from(stats.compacted_through_sequence),
+                source_manifest_hash: source_manifest_hash.clone(),
+                required_source_cursor: source_cursor,
+                min_generation: index.version.max(1) as u64,
+                latest_proof,
+            },
+            &self.partition_owner_signing_key,
+        )?;
+        if matches!(
+            catch_up_plan,
+            crate::derived_index_catchup::DerivedIndexCatchUpPlan::UpToDate { .. }
+        ) {
+            return Ok(false);
         }
         self.enqueue_index_build_task(
             serde_json::json!({
@@ -2338,6 +2373,8 @@ impl Persistence {
                 "index_id": index.id,
                 "index_version": index.version,
                 "source_cursor": source_cursor,
+                "source_manifest_hash": source_manifest_hash,
+                "catch_up_plan": catch_up_plan,
             }),
             40,
         )
