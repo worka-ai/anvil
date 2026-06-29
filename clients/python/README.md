@@ -1,3 +1,7 @@
+# Anvil Python Client
+
+This package is a source preview and is not published in the current release. The current release ships the Rust client only.
+
 # anvil-storage-client
 
 Python gRPC client package for Anvil's native API.

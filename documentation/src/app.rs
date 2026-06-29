@@ -387,7 +387,7 @@ impl From<FlowSection> for Widget {
                 SectionIntro::new(
                     "How to evaluate it",
                     "Read the docs as a course, then use the tutorials as operating muscle memory.",
-                    "The Learn section teaches concepts from first principles. The tutorial section turns those concepts into operations in Rust, Java, Node.js, and Python. The operator section covers deployment, identity, indexing operations, backup, recovery, and releases.",
+                    "The Learn section teaches concepts from first principles. The tutorial section turns those concepts into operations through the Rust client shipped in this release. The operator section covers deployment, identity, indexing operations, backup, recovery, and releases.",
                 )
                 .into(),
                 Container::new(Column {
@@ -432,7 +432,7 @@ impl From<AudienceSection> for Widget {
                     wrap: FlexWrap::Wrap,
                     children: vec![
                         AudienceLink::new("Learn the model", "Concepts from first principles.", "/learn/overview/").into(),
-                        AudienceLink::new("Perform operations", "Tutorials in four languages.", "/tutorials/overview/").into(),
+                        AudienceLink::new("Perform operations", "Rust client tutorials.", "/tutorials/overview/").into(),
                         AudienceLink::new("Run production", "Deployment and operations.", "/operators/deployment/").into(),
                         AudienceLink::new("Check exact settings", "Configuration and errors.", "/reference/configuration/").into(),
                     ],

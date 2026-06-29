@@ -1,32 +1,27 @@
 # Anvil Clients
 
-This directory contains registry packaging for Anvil native API clients generated from `anvil-core/proto/anvil.proto`.
+This directory contains native API client packages generated from `anvil-core/proto/anvil.proto`. The current release ships the Rust client only; the TypeScript and Python packages are kept as source previews.
+
+## Rust / crates.io
+
+Package: `anvil-storage-client`
+
+```sh
+cargo test -p anvil-storage-client
+cargo publish --dry-run -p anvil-storage-client
+```
+
+The package ships generated protocol bindings, bearer-token helpers, and typed service-client constructors.
 
 ## TypeScript / npm
 
-Package: `anvil-storage-client`
-
-```sh
-cd clients/typescript
-npm install
-npm run build
-npm pack --dry-run
-```
-
-The package ships the canonical proto and a small `@grpc/grpc-js` dynamic loader. Strongly typed convenience wrappers can be added without changing the protobuf source of truth.
+Not published in this release.
 
 ## Python / PyPI
 
-Package: `anvil-storage-client`
+Not published in this release.
 
-```sh
-cd clients/python
-python3.12 -m pip wheel . --no-deps -w /tmp/anvil-python-wheel
-```
-
-The package ships the canonical proto and generates Python protobuf/gRPC modules during wheel build.
-
-## Synchronizing proto files
+## Synchronising proto files
 
 After editing `anvil-core/proto/anvil.proto`, run:
 
@@ -34,4 +29,4 @@ After editing `anvil-core/proto/anvil.proto`, run:
 scripts/sync-client-protos.sh
 ```
 
-This copies the canonical proto into each registry package before release.
+This copies the canonical proto into each client package before release.

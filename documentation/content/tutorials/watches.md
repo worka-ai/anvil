@@ -39,10 +39,7 @@ The exact request type differs by service, but the four client shapes are the sa
 ```anvil-tabs
 {
   "operation": "watch-pattern",
-  "rust": "let mut stream = anvil.watch_prefix(request).await?;\nwhile let Some(event) = stream.next().await {\n    let event = event?;\n    process_idempotently(&event).await?;\n    save_cursor(event.cursor).await?;\n}",
-  "java": "WatchStream<WatchPrefixResponse> stream = anvil.watchPrefix(request);\nfor (var event : stream) {\n    processIdempotently(event);\n    saveCursor(event.getCursor());\n}",
-  "node": "for await (const event of anvil.watchPrefix(request)) {\n  await processIdempotently(event);\n  await saveCursor(event.cursor);\n}",
-  "python": "for event in anvil.watch_prefix(request):\n    process_idempotently(event)\n    save_cursor(event.cursor)"
+  "rust": "let mut stream = anvil.watch_prefix(request).await?;\nwhile let Some(event) = stream.next().await {\n    let event = event?;\n    process_idempotently(&event).await?;\n    save_cursor(event.cursor).await?;\n}"
 }
 ```
 

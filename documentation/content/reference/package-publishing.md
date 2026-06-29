@@ -7,7 +7,7 @@ description: Published Anvil artefacts and how each package is meant to be used.
 
 **What this page gives you:** a reference for the artefacts an Anvil release publishes and the audience for each artefact.
 
-Anvil ships multiple packages because developers and operators enter the system through different tools. Operators need a server image. Rust users may install crates and CLI tools. TypeScript and Python users need client packages. Everyone needs documentation matching the release.
+Anvil ships multiple packages because developers and operators enter the system through different tools. Operators need a server image. Rust users may install crates and CLI tools. This release ships the Rust native client first; other language clients are outside the release scope. Everyone needs documentation matching the release.
 
 ## Docker image
 
@@ -17,20 +17,17 @@ The Docker image runs the Anvil server. It exposes the native API and S3-compati
 
 | Package | Purpose |
 | --- | --- |
-| `anvil-storage-core` | Core types, protocol bindings, storage engines, auth, indexes, PersonalDB services, and implementation internals. |
+| `anvil-storage-client` | Public Rust native API client with generated protocol bindings, bearer-token helpers, and typed service-client constructors. |
+| `anvil-storage-core` | Core types, storage engines, auth, indexes, PersonalDB services, and implementation internals. |
 | `anvil-storage-cli` | CLI implementation for user and admin command surfaces. |
 | `anvil-storage` | Server binary, admin binary, S3 gateway, and top-level release crate. |
 | `anvil-storage-test-utils` | Test utilities for integration tests and downstream validation when published. |
 
 Publish in dependency order.
 
-## TypeScript client
+## Non-Rust clients
 
-The TypeScript package is for Node.js services, web backends, automation, and developer tooling that need native Anvil APIs rather than S3 compatibility alone. It should include generated code, type declarations, protocol files, and examples.
-
-## Python client
-
-The Python package is for data workflows, importers, automation, model artefact tooling, and service integration. It should include generated gRPC modules, protocol files, package metadata, and connection examples.
+TypeScript, Python, Java, and Maven packages are not part of this release. Keep their source packages clearly marked as unreleased until they have dedicated packaging, smoke tests, and publication pipelines.
 
 ## Documentation site
 

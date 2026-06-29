@@ -5,7 +5,7 @@ description: Create groups and projections, submit SQLite changesets, catch up r
 
 # PersonalDB Witnessing
 
-**What this page gives you:** a tutorial for every operation in this area, with Rust, Java, Node.js, and Python tabs for each operation.
+**What this page gives you:** a tutorial for every operation in this area, with Rust examples for each operation.
 
 PersonalDB lets local-first applications keep SQLite as their fast local database while Anvil acts as the witness for shared truth. The witness validates changesets, records commit certificates, maintains snapshots, and exposes authorised projections. This tutorial walks through creating a group, defining projections, submitting changesets, catching up another device, and watching group or projection activity.
 
@@ -25,10 +25,7 @@ Creates a local-first database coordination group.
 ```anvil-tabs
 {
   "operation": "CreatePersonalDbGroup",
-  "rust": "use anvil_storage::client::AnvilClient;\nuse anvil_storage::proto::CreatePersonalDbGroupRequest;\n\nlet mut anvil = AnvilClient::connect(endpoint, token).await?;\nlet response = anvil.create_personal_db_group(CreatePersonalDbGroupRequest { group_id: \"notes\".into(), schema_hash: \"schemaHash\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");",
-  "java": "import dev.anvil.AnvilClient;\nimport dev.anvil.proto.CreatePersonalDbGroupRequest;\n\nAnvilClient anvil = AnvilClient.connect(endpoint, token);\nvar response = anvil.createPersonalDbGroup(\n    CreatePersonalDbGroupRequest.builder()\n        .groupId(\"notes\")\n        .schemaHash(\"schemaHash\")\n        .build()\n);\nSystem.out.println(response);",
-  "node": "import { AnvilClient } from \"@anvil/storage\";\n\nconst anvil = await AnvilClient.connect({ endpoint, token });\nconst response = await anvil.createPersonalDbGroup({ groupId: 'notes', schemaHash: 'schemaHash' });\nconsole.log(response);",
-  "python": "from anvil_storage import AnvilClient\n\nanvil = AnvilClient.connect(endpoint=endpoint, token=token)\nresponse = anvil.create_personal_db_group(group_id='notes', schema_hash='schemaHash')\nprint(response)"
+  "rust": "use anvil_storage_client::{AnvilClient, proto::CreatePersonalDbGroupRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.personaldb().create_personal_db_group(CreatePersonalDbGroupRequest { group_id: \"notes\".into(), schema_hash: \"schemaHash\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -41,10 +38,7 @@ Reads group manifest and state.
 ```anvil-tabs
 {
   "operation": "GetPersonalDbGroup",
-  "rust": "use anvil_storage::client::AnvilClient;\nuse anvil_storage::proto::GetPersonalDbGroupRequest;\n\nlet mut anvil = AnvilClient::connect(endpoint, token).await?;\nlet response = anvil.get_personal_db_group(GetPersonalDbGroupRequest { group_id: \"notes\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");",
-  "java": "import dev.anvil.AnvilClient;\nimport dev.anvil.proto.GetPersonalDbGroupRequest;\n\nAnvilClient anvil = AnvilClient.connect(endpoint, token);\nvar response = anvil.getPersonalDbGroup(\n    GetPersonalDbGroupRequest.builder()\n        .groupId(\"notes\")\n        .build()\n);\nSystem.out.println(response);",
-  "node": "import { AnvilClient } from \"@anvil/storage\";\n\nconst anvil = await AnvilClient.connect({ endpoint, token });\nconst response = await anvil.getPersonalDbGroup({ groupId: 'notes' });\nconsole.log(response);",
-  "python": "from anvil_storage import AnvilClient\n\nanvil = AnvilClient.connect(endpoint=endpoint, token=token)\nresponse = anvil.get_personal_db_group(group_id='notes')\nprint(response)"
+  "rust": "use anvil_storage_client::{AnvilClient, proto::GetPersonalDbGroupRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.personaldb().get_personal_db_group(GetPersonalDbGroupRequest { group_id: \"notes\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -57,10 +51,7 @@ Defines a server-side projection over witnessed SQLite changesets.
 ```anvil-tabs
 {
   "operation": "CreatePersonalDbProjection",
-  "rust": "use anvil_storage::client::AnvilClient;\nuse anvil_storage::proto::CreatePersonalDbProjectionRequest;\n\nlet mut anvil = AnvilClient::connect(endpoint, token).await?;\nlet response = anvil.create_personal_db_projection(CreatePersonalDbProjectionRequest { group_id: \"notes\".into(), projection_id: \"assigned_tasks\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");",
-  "java": "import dev.anvil.AnvilClient;\nimport dev.anvil.proto.CreatePersonalDbProjectionRequest;\n\nAnvilClient anvil = AnvilClient.connect(endpoint, token);\nvar response = anvil.createPersonalDbProjection(\n    CreatePersonalDbProjectionRequest.builder()\n        .groupId(\"notes\")\n        .projectionId(\"assigned_tasks\")\n        .build()\n);\nSystem.out.println(response);",
-  "node": "import { AnvilClient } from \"@anvil/storage\";\n\nconst anvil = await AnvilClient.connect({ endpoint, token });\nconst response = await anvil.createPersonalDbProjection({ groupId: 'notes', projectionId: 'assigned_tasks' });\nconsole.log(response);",
-  "python": "from anvil_storage import AnvilClient\n\nanvil = AnvilClient.connect(endpoint=endpoint, token=token)\nresponse = anvil.create_personal_db_projection(group_id='notes', projection_id='assigned_tasks')\nprint(response)"
+  "rust": "use anvil_storage_client::{AnvilClient, proto::CreatePersonalDbProjectionRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.personaldb().create_personal_db_projection(CreatePersonalDbProjectionRequest { group_id: \"notes\".into(), projection_id: \"assigned_tasks\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -73,10 +64,7 @@ Reads projection definition and status.
 ```anvil-tabs
 {
   "operation": "GetPersonalDbProjection",
-  "rust": "use anvil_storage::client::AnvilClient;\nuse anvil_storage::proto::GetPersonalDbProjectionRequest;\n\nlet mut anvil = AnvilClient::connect(endpoint, token).await?;\nlet response = anvil.get_personal_db_projection(GetPersonalDbProjectionRequest { group_id: \"notes\".into(), projection_id: \"assigned_tasks\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");",
-  "java": "import dev.anvil.AnvilClient;\nimport dev.anvil.proto.GetPersonalDbProjectionRequest;\n\nAnvilClient anvil = AnvilClient.connect(endpoint, token);\nvar response = anvil.getPersonalDbProjection(\n    GetPersonalDbProjectionRequest.builder()\n        .groupId(\"notes\")\n        .projectionId(\"assigned_tasks\")\n        .build()\n);\nSystem.out.println(response);",
-  "node": "import { AnvilClient } from \"@anvil/storage\";\n\nconst anvil = await AnvilClient.connect({ endpoint, token });\nconst response = await anvil.getPersonalDbProjection({ groupId: 'notes', projectionId: 'assigned_tasks' });\nconsole.log(response);",
-  "python": "from anvil_storage import AnvilClient\n\nanvil = AnvilClient.connect(endpoint=endpoint, token=token)\nresponse = anvil.get_personal_db_projection(group_id='notes', projection_id='assigned_tasks')\nprint(response)"
+  "rust": "use anvil_storage_client::{AnvilClient, proto::GetPersonalDbProjectionRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.personaldb().get_personal_db_projection(GetPersonalDbProjectionRequest { group_id: \"notes\".into(), projection_id: \"assigned_tasks\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -89,10 +77,7 @@ Submits a SQLite changeset for validation, certification, and replication.
 ```anvil-tabs
 {
   "operation": "SubmitPersonalDbChangeset",
-  "rust": "use anvil_storage::client::AnvilClient;\nuse anvil_storage::proto::SubmitPersonalDbChangesetRequest;\n\nlet mut anvil = AnvilClient::connect(endpoint, token).await?;\nlet response = anvil.submit_personal_db_changeset(SubmitPersonalDbChangesetRequest { group_id: \"notes\".into(), changeset: \"sqliteChangeset\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");",
-  "java": "import dev.anvil.AnvilClient;\nimport dev.anvil.proto.SubmitPersonalDbChangesetRequest;\n\nAnvilClient anvil = AnvilClient.connect(endpoint, token);\nvar response = anvil.submitPersonalDbChangeset(\n    SubmitPersonalDbChangesetRequest.builder()\n        .groupId(\"notes\")\n        .changeset(\"sqliteChangeset\")\n        .build()\n);\nSystem.out.println(response);",
-  "node": "import { AnvilClient } from \"@anvil/storage\";\n\nconst anvil = await AnvilClient.connect({ endpoint, token });\nconst response = await anvil.submitPersonalDbChangeset({ groupId: 'notes', changeset: 'sqliteChangeset' });\nconsole.log(response);",
-  "python": "from anvil_storage import AnvilClient\n\nanvil = AnvilClient.connect(endpoint=endpoint, token=token)\nresponse = anvil.submit_personal_db_changeset(group_id='notes', changeset='sqliteChangeset')\nprint(response)"
+  "rust": "use anvil_storage_client::{AnvilClient, proto::SubmitPersonalDbChangesetRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.personaldb().submit_personal_db_changeset(SubmitPersonalDbChangesetRequest { group_id: \"notes\".into(), changeset: \"sqliteChangeset\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -105,10 +90,7 @@ Returns missing commits or a snapshot instruction for a replica.
 ```anvil-tabs
 {
   "operation": "CatchUpPersonalDb",
-  "rust": "use anvil_storage::client::AnvilClient;\nuse anvil_storage::proto::CatchUpPersonalDbRequest;\n\nlet mut anvil = AnvilClient::connect(endpoint, token).await?;\nlet response = anvil.catch_up_personal_db(CatchUpPersonalDbRequest { group_id: \"notes\".into(), after_commit: \"lastCommit\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");",
-  "java": "import dev.anvil.AnvilClient;\nimport dev.anvil.proto.CatchUpPersonalDbRequest;\n\nAnvilClient anvil = AnvilClient.connect(endpoint, token);\nvar response = anvil.catchUpPersonalDb(\n    CatchUpPersonalDbRequest.builder()\n        .groupId(\"notes\")\n        .afterCommit(\"lastCommit\")\n        .build()\n);\nSystem.out.println(response);",
-  "node": "import { AnvilClient } from \"@anvil/storage\";\n\nconst anvil = await AnvilClient.connect({ endpoint, token });\nconst response = await anvil.catchUpPersonalDb({ groupId: 'notes', afterCommit: 'lastCommit' });\nconsole.log(response);",
-  "python": "from anvil_storage import AnvilClient\n\nanvil = AnvilClient.connect(endpoint=endpoint, token=token)\nresponse = anvil.catch_up_personal_db(group_id='notes', after_commit='lastCommit')\nprint(response)"
+  "rust": "use anvil_storage_client::{AnvilClient, proto::CatchUpPersonalDbRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.personaldb().catch_up_personal_db(CatchUpPersonalDbRequest { group_id: \"notes\".into(), after_commit: \"lastCommit\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -121,10 +103,7 @@ Streams group commits, snapshots, and state changes.
 ```anvil-tabs
 {
   "operation": "WatchPersonalDbGroup",
-  "rust": "use anvil_storage::client::AnvilClient;\nuse anvil_storage::proto::WatchPersonalDbGroupRequest;\n\nlet mut anvil = AnvilClient::connect(endpoint, token).await?;\nlet response = anvil.watch_personal_db_group(WatchPersonalDbGroupRequest { group_id: \"notes\".into(), after_cursor: \"lastCursor\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");",
-  "java": "import dev.anvil.AnvilClient;\nimport dev.anvil.proto.WatchPersonalDbGroupRequest;\n\nAnvilClient anvil = AnvilClient.connect(endpoint, token);\nvar response = anvil.watchPersonalDbGroup(\n    WatchPersonalDbGroupRequest.builder()\n        .groupId(\"notes\")\n        .afterCursor(\"lastCursor\")\n        .build()\n);\nSystem.out.println(response);",
-  "node": "import { AnvilClient } from \"@anvil/storage\";\n\nconst anvil = await AnvilClient.connect({ endpoint, token });\nconst response = await anvil.watchPersonalDbGroup({ groupId: 'notes', afterCursor: 'lastCursor' });\nconsole.log(response);",
-  "python": "from anvil_storage import AnvilClient\n\nanvil = AnvilClient.connect(endpoint=endpoint, token=token)\nresponse = anvil.watch_personal_db_group(group_id='notes', after_cursor='lastCursor')\nprint(response)"
+  "rust": "use anvil_storage_client::{AnvilClient, proto::WatchPersonalDbGroupRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.personaldb().watch_personal_db_group(WatchPersonalDbGroupRequest { group_id: \"notes\".into(), after_cursor: \"lastCursor\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -137,10 +116,7 @@ Streams projection build or update events.
 ```anvil-tabs
 {
   "operation": "WatchPersonalDbProjection",
-  "rust": "use anvil_storage::client::AnvilClient;\nuse anvil_storage::proto::WatchPersonalDbProjectionRequest;\n\nlet mut anvil = AnvilClient::connect(endpoint, token).await?;\nlet response = anvil.watch_personal_db_projection(WatchPersonalDbProjectionRequest { group_id: \"notes\".into(), projection_id: \"assigned_tasks\".into(), after_cursor: \"lastCursor\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");",
-  "java": "import dev.anvil.AnvilClient;\nimport dev.anvil.proto.WatchPersonalDbProjectionRequest;\n\nAnvilClient anvil = AnvilClient.connect(endpoint, token);\nvar response = anvil.watchPersonalDbProjection(\n    WatchPersonalDbProjectionRequest.builder()\n        .groupId(\"notes\")\n        .projectionId(\"assigned_tasks\")\n        .afterCursor(\"lastCursor\")\n        .build()\n);\nSystem.out.println(response);",
-  "node": "import { AnvilClient } from \"@anvil/storage\";\n\nconst anvil = await AnvilClient.connect({ endpoint, token });\nconst response = await anvil.watchPersonalDbProjection({ groupId: 'notes', projectionId: 'assigned_tasks', afterCursor: 'lastCursor' });\nconsole.log(response);",
-  "python": "from anvil_storage import AnvilClient\n\nanvil = AnvilClient.connect(endpoint=endpoint, token=token)\nresponse = anvil.watch_personal_db_projection(group_id='notes', projection_id='assigned_tasks', after_cursor='lastCursor')\nprint(response)"
+  "rust": "use anvil_storage_client::{AnvilClient, proto::WatchPersonalDbProjectionRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.personaldb().watch_personal_db_projection(WatchPersonalDbProjectionRequest { group_id: \"notes\".into(), projection_id: \"assigned_tasks\".into(), after_cursor: \"lastCursor\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 

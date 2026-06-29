@@ -1,3 +1,7 @@
+# Anvil TypeScript Client
+
+This package is a source preview and is not published in the current release. The current release ships the Rust client only.
+
 # anvil-storage-client
 
 TypeScript helper package for Anvil's native gRPC API.

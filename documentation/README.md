@@ -29,7 +29,7 @@ fission site serve --project-dir documentation
 
 - `src/app.rs` - custom Fission marketing home page.
 - `content/learn/` - progressive conceptual guide.
-- `content/tutorials/` - operation tutorials with Rust, Java, Node.js, and Python examples.
+- `content/tutorials/` - operation tutorials using the Rust client shipped in this release.
 - `content/developers/` - application development guide.
 - `content/operators/` - deployment, operations, and release guide.
 - `content/reference/` - configuration, CLI, security errors, and packages.

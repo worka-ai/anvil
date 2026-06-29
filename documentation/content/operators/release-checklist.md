@@ -1,13 +1,13 @@
 ---
 title: Release Checklist
-description: Build, test, package, publish, and verify Anvil server images, Rust crates, TypeScript clients, Python clients, and documentation.
+description: Build, test, package, publish, and verify Anvil server images, Rust crates, the Rust client, and documentation.
 ---
 
 # Release Checklist
 
 **What this page gives you:** a repeatable release process. You will know which artefacts must be built, which tests prove them, and what to verify after publishing.
 
-A release is not a tag. A release is a set of installable artefacts that operators and developers can use: server image, Rust crates, CLI, TypeScript client, Python client, protocol files, and documentation.
+A release is not a tag. A release is a set of installable artefacts that operators and developers can use: server image, Rust crates, the Rust client, CLI, protocol files, and documentation. This release intentionally ships only the Rust native client; non-Rust client packages are not release artefacts yet.
 
 ## Source verification
 
@@ -51,39 +51,31 @@ Build the production image with a fixed version tag. Then run a smoke test that 
 
 Publish Rust crates in dependency order:
 
-1. `anvil-storage-core`
-2. `anvil-storage-test-utils` when publishing test support
-3. `anvil-storage-cli`
-4. `anvil-storage`
+1. `anvil-storage-client`
+2. `anvil-storage-core`
+3. `anvil-storage`
+4. `anvil-storage-cli`
+5. `anvil-storage-test-utils` when publishing test support
 
 Run dry-runs before publishing:
 
 ```bash
+cargo publish --dry-run -p anvil-storage-client
 cargo publish --dry-run -p anvil-storage-core
-cargo publish --dry-run -p anvil-storage-cli
 cargo publish --dry-run -p anvil-storage
+cargo publish --dry-run -p anvil-storage-cli
 ```
 
-## TypeScript and Python clients
+## Rust client
 
-For TypeScript:
+The Rust client crate is the only native client package shipped in this release. It must compile, run its tests, package cleanly, and expose generated protocol bindings plus bearer-token helpers.
 
 ```bash
-cd clients/typescript
-npm ci
-npm test
-npm pack --dry-run
+cargo test -p anvil-storage-client
+cargo publish --dry-run -p anvil-storage-client
 ```
 
-For Python:
-
-```bash
-cd clients/python
-python -m build
-python -m twine check dist/*
-```
-
-Each client package should include generated protocol bindings, examples, README content, and authentication guidance.
+The TypeScript, Python, Java, and Maven surfaces are not release blockers for this release.
 
 ## Documentation
 
@@ -102,10 +94,9 @@ After publishing:
 
 1. Pull the image by tag and rerun smoke tests.
 2. Install the Rust CLI from the published crate and run read/write checks.
-3. Install the TypeScript client in a fresh project and call a read-only API.
-4. Install the Python client in a fresh virtual environment and call a read-only API.
-5. Open the documentation site and verify navigation and search.
-6. Record versions, checksums, release notes, and known limitations.
+3. Install the Rust client crate in a fresh project and call a read-only API.
+4. Open the documentation site and verify navigation and search.
+5. Record versions, checksums, release notes, and known limitations, including that non-Rust native clients are not part of this release.
 
 ## What you can do after this page
 

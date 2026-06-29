@@ -1,17 +1,17 @@
 ---
 title: Tutorials
-description: Operation-by-operation tutorials for Anvil in Rust, Java, Node.js, and Python.
+description: Operation-by-operation tutorials for Anvil using the Rust client.
 ---
 
 # Tutorials
 
-**What this page gives you:** a complete map of the task-oriented tutorials. The Learn section explains concepts. These pages show how to perform operations. Each operation includes tabs for Rust, Java, Node.js, and Python so a reader can translate the same Anvil model into the language they use.
+**What this page gives you:** a complete map of the task-oriented tutorials. The Learn section explains concepts. These pages show how to perform operations through the Rust client shipped in this release.
 
 An operation in Anvil is not just a remote procedure call. It is a storage action that passes through identity, authorisation, validation, preconditions, durable state, indexes, watch cursors, and diagnostics. The tutorials repeat that model deliberately so the safe pattern becomes muscle memory.
 
 ## Before you start
 
-You need four facts in every language:
+You need four facts for every operation:
 
 1. an Anvil endpoint;
 2. credentials or a bearer token;
@@ -32,9 +32,9 @@ The examples use production-shaped client calls. They are intentionally small, b
 | Source, Model, And Ingestion Artefacts | `PutGitPack`, `GetGitObject`, `GetGitBlobByPath`, `ListGitTree`, `WatchGitSource`, `PutModelManifest`, `ListTensors`, `GetTensor`, `GetTensors`, `CreateKey`, `ListKeys`, `DeleteKey`, `StartIngestion`, `GetIngestionStatus`, `CancelIngestion` | [Source, Model, And Ingestion Artefacts](/tutorials/artifacts/) |
 | Repair And Operator Operations | `RepairIndex`, `RepairDirectoryIndex`, `RepairAuthzDerivedIndex`, `RepairPersonalDbLogChain`, `ListRepairFindings`, `PutShard`, `GetShard`, `CommitShard`, `DeleteShard` | [Repair And Operator Operations](/tutorials/operations/) |
 
-## How to read the tabs
+## How to read the examples
 
-The four language tabs are equivalent. Do not treat one language as a different product surface. Rust, Java, Node.js, and Python clients all call the same Anvil API and should preserve the same invariants: explicit bucket and key names, idempotency for retries, preconditions for updates, authorisation on every result, and watch cursors for derived work.
+The Rust examples call the native Anvil API and preserve the same invariants every future client must preserve: explicit bucket and key names, idempotency for retries, preconditions for updates, authorisation on every result, and watch cursors for derived work. TypeScript, Python, Java, and Maven packages are not shipped in this release.
 
 ## What you can do after this page
 
