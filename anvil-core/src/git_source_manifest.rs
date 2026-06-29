@@ -27,7 +27,7 @@ pub async fn write_git_source_repository_manifest(
         tokio::fs::create_dir_all(parent).await?;
     }
     let bytes = serde_json::to_vec_pretty(manifest)?;
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(format!("json.tmp-{}", uuid::Uuid::new_v4().simple()));
     tokio::fs::write(&tmp, bytes).await?;
     tokio::fs::rename(tmp, path).await?;
     Ok(())

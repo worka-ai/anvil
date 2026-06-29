@@ -310,7 +310,7 @@ async fn write_json_atomically(path: &Path, value: &impl Serialize) -> Result<()
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(format!("json.tmp-{}", uuid::Uuid::new_v4().simple()));
     let bytes = serde_json::to_vec_pretty(value)?;
     tokio::fs::write(&tmp, bytes)
         .await
