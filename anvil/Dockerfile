@@ -24,16 +24,27 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --uid 10001 --create-home --home-dir /var/lib/anvil --shell /usr/sbin/nologin anvil
 
 # Copy the compiled binaries from the builder stage
 COPY --from=builder /usr/src/anvil/target/release/anvil /usr/local/bin/anvil
 COPY --from=builder /usr/src/anvil/target/release/admin /usr/local/bin/admin
 COPY --from=builder /usr/src/anvil/target/release/anvil-cli /usr/local/bin/anvil-cli
 
+RUN chown -R anvil:anvil /var/lib/anvil
+
+ENV STORAGE_PATH=/var/lib/anvil
+USER anvil
+WORKDIR /var/lib/anvil
+
 # Expose the default gRPC/S3 port and a potential swarm port
 EXPOSE 50051
 EXPOSE 7443
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=5 CMD curl -fsS http://127.0.0.1:50051/ready || exit 1
 
 # Set the default command to run the anvil server
 CMD ["anvil"]
