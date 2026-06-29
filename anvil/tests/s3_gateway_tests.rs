@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::Duration;
 use tokio::fs;
+use tokio::io::AsyncReadExt;
 use tonic::Request;
 
 use anvil_test_utils::*;
@@ -635,6 +636,90 @@ async fn test_s3_reads_and_lists_survive_object_metadata_compaction() {
         deleted_get.is_err(),
         "delete marker sealed during compaction must remain current"
     );
+}
+
+#[tokio::test]
+async fn test_s3_active_get_survives_object_metadata_compaction() {
+    let mut cluster = TestCluster::new(&["active-read-compact-region"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let app_name = format!("s3-active-compact-{}", uuid::Uuid::new_v4());
+    let (client_id, client_secret) = create_app(&cluster.admin_state_path, &app_name);
+    grant_wildcard_policy(&cluster.admin_state_path, &app_name);
+
+    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
+    let client = s3_client(http_base, &client_id, &client_secret);
+    let bucket = format!("s3-active-compact-{}", uuid::Uuid::new_v4());
+    let key = "large/active-read.bin";
+    let object_len = DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES + 257;
+    let payload: Vec<u8> = (0..object_len)
+        .map(|index| ((index * 31 + 17) % 251) as u8)
+        .collect();
+
+    client
+        .create_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("S3 CreateBucket should succeed");
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(payload.clone()))
+        .send()
+        .await
+        .expect("large S3 PUT should succeed");
+
+    let get = client
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("active S3 GET should start");
+    let mut reader = get.body.into_async_read();
+    let mut first = vec![0_u8; 64 * 1024];
+    reader
+        .read_exact(&mut first)
+        .await
+        .expect("read first chunk before compaction");
+    assert_eq!(first.as_slice(), &payload[..first.len()]);
+
+    let bucket_record = cluster.states[0]
+        .persistence
+        .get_bucket_by_name(1, &bucket)
+        .await
+        .unwrap()
+        .expect("bucket metadata should exist");
+    cluster.states[0]
+        .persistence
+        .compact_object_metadata(bucket_record.id)
+        .await
+        .unwrap()
+        .expect("object metadata compaction should seal a manifest");
+
+    let mut observed = first;
+    reader
+        .read_to_end(&mut observed)
+        .await
+        .expect("active GET should drain after compaction");
+    assert_eq!(observed, payload);
+
+    let post_compaction_get = client
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("subsequent GET after active-read compaction should succeed");
+    let post_compaction_body = post_compaction_get
+        .body
+        .collect()
+        .await
+        .expect("collect subsequent compacted body")
+        .into_bytes();
+    assert_eq!(post_compaction_body.as_ref(), observed.as_slice());
 }
 
 #[tokio::test]
