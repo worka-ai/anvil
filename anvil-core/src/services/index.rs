@@ -252,6 +252,10 @@ impl IndexService for AppState {
             .ok_or_else(|| Status::not_found("Index definition not found"))?;
 
         match index.kind.as_str() {
+            "path" | "metadata_filter" => {
+                self.query_metadata_backed_index(&claims, &bucket, &index, req)
+                    .await
+            }
             "full_text" => {
                 self.query_full_text_index(&claims, &bucket, &index, req)
                     .await
@@ -635,6 +639,101 @@ impl AppState {
         }))
     }
 
+    async fn query_metadata_backed_index(
+        &self,
+        claims: &auth::Claims,
+        bucket: &crate::persistence::Bucket,
+        index: &crate::persistence::IndexDefinition,
+        req: QueryIndexRequest,
+    ) -> Result<Response<QueryIndexResponse>, Status> {
+        if !req.query_text.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "query_text is not valid for path or metadata_filter indexes",
+            ));
+        }
+        if !req.query_vector.is_empty() {
+            return Err(Status::invalid_argument(
+                "query_vector is not valid for path or metadata_filter indexes",
+            ));
+        }
+        if index.kind == "metadata_filter" && req.metadata_filters_json.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "metadata_filters_json is required for metadata_filter indexes",
+            ));
+        }
+        let filters = QueryFilters::from_request(&req)?;
+        let requested_limit = query_limit(req.limit);
+        let objects = self
+            .persistence
+            .list_current_directory_objects(bucket)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let latest_authz_revision = self
+            .persistence
+            .latest_authz_revision(claims.tenant_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut hits = Vec::with_capacity(requested_limit);
+        for object in objects {
+            if validation::is_reserved_internal_key(&object.key) {
+                continue;
+            }
+            let object_ref = QueryObjectRef::from_object(&object);
+            if !filters.matches(&object_ref)? {
+                continue;
+            }
+            if !self
+                .query_hit_visible(
+                    claims,
+                    &index.authorization_mode,
+                    &bucket.name,
+                    &object_ref.object_key,
+                    u64::try_from(object_ref.authz_revision)
+                        .map_err(|_| Status::internal("Invalid authz revision"))?,
+                )
+                .await?
+            {
+                continue;
+            }
+            let metadata_json = serde_json::json!({
+                "bucket_name": bucket.name,
+                "user_metadata": object_ref.user_meta.clone(),
+                "created_at_nanos": object_ref.created_at_nanos,
+                "authz_revision": object_ref.authz_revision,
+            })
+            .to_string();
+            hits.push(IndexQueryHit {
+                kind: index.kind.clone(),
+                score: 1.0,
+                object_key: object_ref.object_key,
+                object_version_id: object_ref.object_version_id,
+                document_id: 0,
+                field_id: 0,
+                vector_id: 0,
+                chunk_id: 0,
+                source_start: 0,
+                source_len: 0,
+                metadata_json,
+            });
+            if hits.len() >= requested_limit {
+                break;
+            }
+        }
+
+        Ok(Response::new(QueryIndexResponse {
+            hits,
+            index_kind: index.kind.clone(),
+            index_generation: index.version.max(0) as u64,
+            authz_revision: latest_authz_revision.max(0) as u64,
+            scoring_recipe_json: serde_json::json!({
+                "kind": index.kind.as_str(),
+                "score": "constant",
+                "source": "object_metadata_directory",
+            })
+            .to_string(),
+        }))
+    }
+
     async fn query_hybrid_index(
         &self,
         claims: &auth::Claims,
@@ -946,6 +1045,7 @@ impl AppState {
             object_key: object.key,
             user_meta: object.user_meta,
             created_at_nanos: object.created_at.timestamp_nanos_opt().unwrap_or(0),
+            authz_revision: object.authz_revision,
         }))
     }
 
@@ -991,6 +1091,19 @@ struct QueryObjectRef {
     object_key: String,
     user_meta: Option<JsonValue>,
     created_at_nanos: i64,
+    authz_revision: i64,
+}
+
+impl QueryObjectRef {
+    fn from_object(object: &crate::persistence::Object) -> Self {
+        Self {
+            object_version_id: object.version_id.to_string(),
+            object_key: object.key.clone(),
+            user_meta: object.user_meta.clone(),
+            created_at_nanos: object.created_at.timestamp_nanos_opt().unwrap_or(0),
+            authz_revision: object.authz_revision,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]

@@ -42,6 +42,33 @@ fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
     }
 }
 
+async fn persist_index_object(
+    cluster: &TestCluster,
+    bucket_id: i64,
+    key: &str,
+    hash_seed: u8,
+    user_meta: Option<serde_json::Value>,
+) {
+    let payload = format!("payload for {key}").into_bytes();
+    let content_hash = hex::encode([hash_seed; 32]);
+    cluster.states[0]
+        .persistence
+        .create_object(
+            1,
+            bucket_id,
+            key,
+            &content_hash,
+            payload.len() as i64,
+            &content_hash,
+            Some("text/plain"),
+            user_meta,
+            None,
+            Some(payload),
+        )
+        .await
+        .expect("persist index test object");
+}
+
 #[tokio::test]
 async fn test_index_definition_lifecycle() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
@@ -238,6 +265,153 @@ async fn test_index_definition_lifecycle() {
             .all(|pair| pair[0].cursor < pair[1].cursor)
     );
     assert_eq!(events[3].index.as_ref().unwrap().name, "docs-full-text");
+}
+
+#[tokio::test]
+async fn test_query_path_and_metadata_filter_indexes_from_object_metadata() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
+
+    let bucket_name = format!("metadata-backed-index-{}", uuid::Uuid::new_v4());
+    bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    index_client
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket_name: bucket_name.clone(),
+                name: "by-path".to_string(),
+                kind: "path".to_string(),
+                selector_json: serde_json::json!({}).to_string(),
+                extractor_json: serde_json::json!({}).to_string(),
+                authorization_mode: "index_only".to_string(),
+                build_policy_json: serde_json::json!({}).to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    index_client
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket_name: bucket_name.clone(),
+                name: "by-meta".to_string(),
+                kind: "metadata_filter".to_string(),
+                selector_json: serde_json::json!({}).to_string(),
+                extractor_json: serde_json::json!({}).to_string(),
+                authorization_mode: "index_only".to_string(),
+                build_policy_json: serde_json::json!({}).to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let bucket_id = cluster.states[0]
+        .persistence
+        .get_bucket_by_name(1, &bucket_name)
+        .await
+        .unwrap()
+        .expect("bucket metadata should exist")
+        .id;
+    persist_index_object(
+        &cluster,
+        bucket_id,
+        "docs/alpha.txt",
+        1,
+        Some(serde_json::json!({"tenant": "alpha", "nested": {"state": "open"}})),
+    )
+    .await;
+    persist_index_object(
+        &cluster,
+        bucket_id,
+        "docs/beta.txt",
+        2,
+        Some(serde_json::json!({"tenant": "beta", "nested": {"state": "open"}})),
+    )
+    .await;
+    persist_index_object(
+        &cluster,
+        bucket_id,
+        "images/logo.txt",
+        3,
+        Some(serde_json::json!({"tenant": "alpha", "nested": {"state": "open"}})),
+    )
+    .await;
+
+    let path_response = index_client
+        .query_index(authorized(
+            QueryIndexRequest {
+                bucket_name: bucket_name.clone(),
+                index_name: "by-path".to_string(),
+                query_text: String::new(),
+                query_vector: vec![],
+                limit: 10,
+                phrase: false,
+                path_prefix: "docs/".to_string(),
+                metadata_filters_json: String::new(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(path_response.index_kind, "path");
+    assert_eq!(path_response.hits.len(), 2);
+    assert_eq!(path_response.hits[0].kind, "path");
+    assert_eq!(path_response.hits[0].object_key, "docs/alpha.txt");
+    assert_eq!(path_response.hits[1].object_key, "docs/beta.txt");
+    let path_recipe: serde_json::Value =
+        serde_json::from_str(&path_response.scoring_recipe_json).unwrap();
+    assert_eq!(path_recipe["source"], "object_metadata_directory");
+
+    let metadata_response = index_client
+        .query_index(authorized(
+            QueryIndexRequest {
+                bucket_name,
+                index_name: "by-meta".to_string(),
+                query_text: String::new(),
+                query_vector: vec![],
+                limit: 10,
+                phrase: false,
+                path_prefix: "docs/".to_string(),
+                metadata_filters_json: serde_json::json!({
+                    "tenant": "alpha",
+                    "/nested/state": "open"
+                })
+                .to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(metadata_response.index_kind, "metadata_filter");
+    assert_eq!(metadata_response.hits.len(), 1);
+    assert_eq!(metadata_response.hits[0].kind, "metadata_filter");
+    assert_eq!(metadata_response.hits[0].score, 1.0);
+    assert_eq!(metadata_response.hits[0].object_key, "docs/alpha.txt");
+    let hit_metadata: serde_json::Value =
+        serde_json::from_str(&metadata_response.hits[0].metadata_json).unwrap();
+    assert_eq!(hit_metadata["user_metadata"]["tenant"], "alpha");
+    assert_eq!(hit_metadata["user_metadata"]["nested"]["state"], "open");
 }
 
 #[tokio::test]
@@ -2442,13 +2616,16 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
     assert_eq!(response.hits[0].vector_id, 1);
     let recipe: serde_json::Value = serde_json::from_str(&response.scoring_recipe_json).unwrap();
     assert_eq!(recipe["kind"], "hybrid");
-    assert_eq!(recipe["text_weight"], 0.55);
-    assert_eq!(recipe["vector_weight"], 0.35);
-    assert_eq!(recipe["freshness_weight"], 0.10);
+    assert!((recipe["text_weight"].as_f64().unwrap() - 0.55).abs() < 1e-6);
+    assert!((recipe["vector_weight"].as_f64().unwrap() - 0.35).abs() < 1e-6);
+    assert!((recipe["freshness_weight"].as_f64().unwrap() - 0.10).abs() < 1e-6);
     let hit_metadata: serde_json::Value =
         serde_json::from_str(&response.hits[0].metadata_json).unwrap();
-    assert_eq!(hit_metadata["normalized_text_score"], 1.0);
-    assert_eq!(hit_metadata["normalized_vector_score"], 1.0);
+    assert_eq!(hit_metadata["normalized_text_score"].as_f64().unwrap(), 1.0);
+    assert_eq!(
+        hit_metadata["normalized_vector_score"].as_f64().unwrap(),
+        1.0
+    );
     assert!(hit_metadata["freshness_score"].as_f64().is_some());
 
     let filtered = index_client

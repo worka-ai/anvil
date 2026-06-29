@@ -1461,6 +1461,15 @@ impl Persistence {
         .await
     }
 
+    pub async fn list_current_directory_objects(&self, bucket: &Bucket) -> Result<Vec<Object>> {
+        metadata_journal::read_current_directory_objects(
+            &self.storage,
+            bucket,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
     pub async fn list_objects(
         &self,
         bucket_id: i64,
