@@ -1,61 +1,76 @@
 ---
 title: PersonalDB
-description: Learn why Anvil includes a PersonalDB witness and how SQLite changes become replicated application state.
+description: Learn PersonalDB, local-first SQLite changesets, witnesses, snapshots, projections, and authorization.
 ---
 
 # PersonalDB
 
-**Goal:** understand PersonalDB at a conceptual level: database groups, SQLite changesets, witnesses, commit certificates, snapshots, projections, and row-level authorization.
+**What this page achieves:** you will understand why PersonalDB exists, how Anvil witnesses changes, and how object storage, authorization, watches, and projections support local-first applications.
 
-PersonalDB is a replicated application data model built around SQLite-compatible changesets. A client can maintain a local SQLite database, produce changesets, and submit those changes to a witness. Anvil is that witness.
+A local-first application keeps a useful database on the user's device. The application can read quickly, work offline, and later sync changes. SQLite is a strong fit for this because it is embedded, reliable, and widely understood.
 
-## Why an object store includes a database witness
+The hard part is not storing a local database file. The hard part is coordinating accepted changes across devices and services. Which changes were committed? In what order? Who was allowed to make them? Which projections should update? Which snapshot should a new device download?
 
-Applications often need both blobs and structured local state. A project management app might store uploaded files as objects but store tasks, comments, and preferences in a local database. If the local database sync path is separate from object storage, the application must coordinate two durability and authorization systems.
+PersonalDB gives that coordination protocol a durable server-side witness. Anvil provides that witness path.
 
-Anvil integrates the witness path so object data, database changesets, row metadata, authorization, projections, snapshots, and watches live under one consistency model.
+## The problem PersonalDB solves
 
-## Database groups
+Imagine two devices editing the same project database. Each device can produce SQLite changesets. A server must decide whether each changeset is valid, authorized, and ordered. It must also make the accepted history available to other devices.
 
-A PersonalDB database group is one logical replicated database. It has:
+Without a witness, every client has to trust that every other client is honest and current. With a witness, accepted commits receive certificates and become part of a durable group history.
 
-- a registered schema;
-- a canonical changeset log;
-- a committed head;
-- commit certificates;
-- snapshots;
-- row metadata indexes;
-- optional projection groups;
-- watch streams.
+## Core nouns
 
-A group is the unit of witness ordering. Commits for one group are routed to the current owner of that group partition so sequence numbers and heads remain consistent.
+| Concept | Meaning |
+| --- | --- |
+| Group | A synchronization domain for one PersonalDB database or related database set. |
+| Commit | A proposed changeset submitted to the group. |
+| Witness | The service that validates, orders, records, and signs accepted commits. |
+| Snapshot | A compact database state at a known commit head. |
+| Projection | A derived queryable view built from accepted commits. |
+| Certificate | Proof that a commit was accepted with a specific head, policy, and hash. |
 
-## Changesets
+## Commit flow
 
-A changeset describes row-level inserts, updates, and deletes. The client submits a verified mutation envelope containing the changeset, base head, actor identity, idempotency key, and requested authorization context.
+A simplified PersonalDB commit flow is:
 
-Anvil validates the request, checks authorization, applies SQLite changeset semantics through the PersonalDB changeset module, derives row effects, appends the canonical log record, signs a commit certificate, updates row metadata, and emits watches.
+```text
+client prepares SQLite changeset
+  -> client submits changeset, base head, identity, and idempotency key
+  -> Anvil verifies authorization and group policy
+  -> Anvil validates the changeset against expected schema and head rules
+  -> Anvil records the commit in the group log
+  -> Anvil returns a signed commit certificate
+  -> watchers update snapshots and projections
+```
 
-## Commit certificates
+The certificate is important. It gives clients proof that the witness accepted the commit. Other systems can reference the certificate rather than trusting an informal response.
 
-A commit certificate is Anvil's signed statement that a changeset was accepted at a specific database head. It gives clients and downstream systems a durable proof of ordering.
+## Why Anvil is involved
 
-Certificates are important because distributed clients may reconnect, retry, or receive events out of order. The certificate anchors the commit in the witnessed log.
+Anvil already owns durable objects, metadata, authorization, watches, and derived indexes. PersonalDB needs all of those:
 
-## Snapshots
+- commit logs and snapshots are durable objects;
+- group state and row metadata need indexes;
+- authorization decides who may open, commit, read, or project;
+- watch streams notify clients and projection builders;
+- repair can rebuild projections from accepted commits;
+- source hashes and manifests make snapshots verifiable.
 
-A snapshot is a compressed SQLite database image for a database group at a known head. Snapshots let new replicas and recovering clients avoid replaying the entire log from the beginning. The snapshot manifest records which log segment range and head produced the snapshot.
+PersonalDB is not a separate side channel. It is integrated into the same storage and authorization model as objects and search.
 
 ## Projections
 
-A projection group is a derived database group built from authorized rows and columns of one or more source groups. For example, a customer-support projection might include ticket summaries and customer names but exclude private billing fields.
+A projection is a derived view over accepted database commits. For example, a task application might project open tasks by assignee, due date, and priority. A projection should not depend on unaccepted local writes. It should be built from the witness log and carry a source cursor.
 
-Projection definitions are declarative. They are not arbitrary executable SQL supplied by untrusted clients. Anvil validates and seals projection definitions before building them.
+Projection reads are authorization-checked. A caller should not learn about private rows because a projection happened to include them.
 
-## Row metadata and authorization
+## Conflict boundaries
 
-Anvil maintains row metadata for PersonalDB groups. Row metadata records ownership, resource identity, updated columns, and authorization-relevant relationships. That lets Anvil evaluate row-level authorization and build projections without trusting application servers to interpret changesets correctly.
+PersonalDB does not remove the need for application-level conflict design. It gives the application a reliable place to validate, order, and distribute changes. Applications still choose schemas, merge rules, constraints, and user experience for conflicting edits.
 
-## What you can do now
+The witness makes those decisions enforceable and auditable.
 
-You should now be able to explain why Anvil acts as a PersonalDB witness, what a database group is, why commit certificates matter, and how projections and watches fit into the model.
+## What you can do after this page
+
+You should be able to explain why local-first applications need a witness, what a PersonalDB commit certificate proves, and how Anvil stores and indexes PersonalDB state. You are now ready to move from concepts to developer guides.

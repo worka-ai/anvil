@@ -1,20 +1,20 @@
 ---
 title: Keys, Paths, And Metadata
-description: Learn how predictable object paths and metadata create fast application queries.
+description: Design object keys and metadata that are easy to query, authorize, watch, and operate.
 ---
 
 # Keys, Paths, And Metadata
 
-**Goal:** design object keys and metadata that remain understandable, fast to list, and easy to secure as a system grows.
+**What this page achieves:** you will learn how to design object names and metadata so Anvil can list, filter, secure, and watch data efficiently.
 
-Anvil lets you store any object under any valid key, but key design is an application architecture decision. A key is the first index most people create, whether they realize it or not. If keys are predictable, operators can inspect data, applications can list efficiently, and derived systems can watch focused prefixes.
+A key is not just a storage detail. It is the first index your application creates. If keys encode ownership and time clearly, your application can list and watch focused prefixes. If keys hide those facts in random names, every downstream system has to inspect metadata or object bodies to understand what the object means.
 
 ## Prefixes are query boundaries
 
 A prefix is the beginning of a key. In this key:
 
 ```text
-tenants/acme/projects/p-123/timeline/000000042.json
+tenants/acme/projects/p-123/timeline/0000000000000042.json
 ```
 
 useful prefixes include:
@@ -26,13 +26,11 @@ tenants/acme/projects/p-123/
 tenants/acme/projects/p-123/timeline/
 ```
 
-When a client lists `tenants/acme/projects/p-123/timeline/`, Anvil answers from its directory index. It does not scan every payload in the bucket. That distinction is the difference between a UI that opens instantly and a UI that degrades as data grows.
+A user interface can list the timeline prefix. A background processor can watch it. An authorization rule can grant access to it. An operator can inspect it. That is why prefix design matters.
 
-## Good key design
+## A good key tells the truth early
 
-A good key places high-cardinality or security-critical boundaries early enough that list, watch, and authorization scopes stay focused.
-
-Good:
+Put stable, high-value boundaries early in the key:
 
 ```text
 tenants/{tenant_id}/workspaces/{workspace_id}/runs/{run_id}/frames/{frame_id}.json
@@ -40,7 +38,14 @@ tenants/{tenant_id}/workspaces/{workspace_id}/assets/{sha256}/preview.png
 tenants/{tenant_id}/workspaces/{workspace_id}/source/{revision}/repo.pack
 ```
 
-Weak:
+These keys answer basic questions before the object is opened:
+
+- which tenant owns it;
+- which workspace or project it belongs to;
+- whether it is a timeline frame, asset, or source artifact;
+- whether lexical ordering matches business ordering.
+
+Compare that with weak keys:
 
 ```text
 frames/{frame_id}-{tenant_id}-{workspace_id}.json
@@ -48,53 +53,55 @@ assets/random/{uuid}.png
 uploads/latest.json
 ```
 
-The weak examples hide the domain boundary. They force downstream code to inspect metadata or object bodies before it knows what the object belongs to.
+Those names hide ownership, make listing broad, make watches noisy, and increase the chance that authorization must depend on slower metadata inspection.
 
 ## Metadata complements paths
 
-Path structure answers hierarchical questions. Metadata answers property questions. Use both.
+Paths answer hierarchical questions. Metadata answers property questions. Use both.
 
-A document key might be:
+A contract object might use this key:
 
 ```text
-tenants/acme/documents/2026/06/contract-42.pdf
+tenants/acme/projects/p-123/contracts/2026/contract-42.pdf
 ```
 
-Metadata might include:
+and this metadata:
 
 ```json
 {
   "document_type": "contract",
   "customer": "Acme Ltd",
-  "language": "en-GB",
   "status": "signed",
-  "retention_class": "legal"
+  "language": "en-GB",
+  "effective_date": "2026-06-01",
+  "renewal_owner": "legal"
 }
 ```
 
-The path is good for listing the June documents. Metadata is good for finding signed contracts across months.
+The key is good for listing contracts under one project. Metadata is good for finding signed contracts across many projects or filtering by renewal owner.
 
-## Index definitions
+## Index definitions make metadata useful
 
-An index definition tells Anvil which object fields should become queryable. An index can cover path prefixes, metadata fields, extracted text, embedding vectors, or combinations of those inputs.
+Metadata by itself is just labels. An index definition tells Anvil which labels are queryable and how they should be maintained. A metadata index can answer:
 
-A metadata index definition answers questions such as:
+- `status = signed`;
+- `customer = Acme Ltd AND document_type = contract`;
+- `effective_date >= 2026-01-01` within a prefix;
+- `language = en-GB` before full text search.
 
-- find objects where `status = signed`;
-- find objects where `customer = Acme Ltd` and `document_type = contract`;
-- list objects modified after a timestamp within a prefix.
-
-The important idea is that an index is maintained from writes and watches. Querying an index is not the same as scanning the bucket.
+Index definitions matter because production queries cannot scan every object. The index is maintained from object writes and watch streams, so query time can use a prepared structure instead of a bucket-wide scan.
 
 ## Reserved internal paths
 
-Anvil owns key prefixes under `_anvil/`. They store internal metadata, index files, authorization records, PersonalDB logs, and watch data. Public object APIs reject reads and writes to these prefixes. They are not hidden customer folders; they are a hard security boundary.
+Anvil owns paths under `_anvil/`. These are not customer folders and not public object names. They store internal metadata, index segments, authorization state, watches, PersonalDB material, and control records.
 
-If a caller tries to list, read, write, copy, or delete a reserved key, Anvil rejects the operation before checking whether such an object exists. This prevents information leaks through guessed internal paths.
+Public object APIs reject reads and writes to reserved paths before normal authorization. This is deliberate. If a caller could probe `_anvil/authz/` or `_anvil/indexes/`, the caller could learn sensitive implementation and relationship facts. Structured APIs expose safe views after authorization checks.
 
-## Pattern for application timelines
+The rule is simple: **application data never uses `_anvil/`, and client code never bypasses structured APIs to inspect it.**
 
-Many applications need append-only timelines. Use sortable keys:
+## Timeline pattern
+
+Append-only timelines are common. Use fixed-width sortable ids:
 
 ```text
 tenants/acme/workspaces/ws-1/runs/run-1/frames/0000000000000001.json
@@ -102,8 +109,19 @@ tenants/acme/workspaces/ws-1/runs/run-1/frames/0000000000000002.json
 tenants/acme/workspaces/ws-1/runs/run-1/frames/0000000000000003.json
 ```
 
-Fixed-width numbers keep lexical order equal to chronological order. Anvil can list the prefix and return frames in the intended sequence.
+Fixed width keeps lexical order equal to chronological order. That means listing the prefix returns frames in the intended sequence without extra sorting logic.
 
-## What you can do now
+## Checklist for key design
 
-You should now be able to design keys that encode ownership, scope, time, and type without forcing object-body scans. Next, learn how Anvil turns metadata, text, and embeddings into search.
+Before choosing a key shape, answer these questions:
+
+1. What is the earliest ownership boundary?
+2. What prefix will the UI list most often?
+3. What prefix will background jobs watch?
+4. Which part of the key should be lexically sortable?
+5. Which facts should be metadata rather than path segments?
+6. Which authorization relationships need to line up with prefixes?
+
+## What you can do after this page
+
+You should be able to design keys that make listing, filtering, watching, and authorization natural. Next, learn how Anvil turns paths, metadata, text, and embeddings into indexes and search.

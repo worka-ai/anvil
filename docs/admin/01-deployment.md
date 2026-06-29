@@ -12,7 +12,7 @@ Anvil deployment requires Anvil nodes and durable storage for each node's `STORA
 ```yaml
 services:
   anvil:
-    image: ghcr.io/worka-ai/anvil:latest
+    image: ghcr.io/anvil-storage/anvil:latest
     environment:
       REGION: local
       JWT_SECRET: change-me

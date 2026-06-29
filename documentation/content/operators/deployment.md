@@ -1,28 +1,67 @@
 ---
 title: Deployment
-description: Deploy Anvil nodes, configure durable storage, and understand operational topology.
+description: Deploy Anvil as a production service and understand the operational topology.
 ---
 
 # Deployment
 
-**Goal:** deploy Anvil as a production service and understand what each node needs to be correct.
+**What this page achieves:** you will understand what an Anvil deployment is, what every node needs, how distributed operation is organized, and how to prove a deployment is ready to receive production traffic.
 
-Anvil is one server process. Every node runs the same binary and can serve APIs, own partitions, execute background task leases, maintain indexes, evaluate authorization, and witness PersonalDB commits. There are no special worker-only nodes in the architecture. Background work is a leased responsibility inside the Anvil process.
+Anvil runs as one server process. Each node runs the same binary. A node can serve gRPC and S3-compatible requests, own partitions, maintain indexes, evaluate authorization, execute leased background work, and witness PersonalDB commits. There are no separate worker-only binaries. Background responsibilities are selected inside the Anvil process through leases.
 
-## Minimal deployment unit
+## Deployment model
 
-A node needs:
+A deployment contains:
 
-- the Anvil server binary;
-- durable `STORAGE_PATH`;
-- network access for gRPC/S3 API traffic;
-- cluster listen and advertise addresses for distributed deployments;
-- shared authentication and cluster secrets where nodes must trust each other;
-- backup and monitoring around the storage path.
+- one or more Anvil nodes;
+- durable storage for each node;
+- a region identity;
+- cluster authentication material;
+- API endpoints for native gRPC and S3-compatible traffic;
+- credentials for tenants, applications, and administrators;
+- monitoring, backup, and recovery automation.
 
-A one-node deployment uses the same implementation paths as a multi-node deployment. It is not a simplified storage engine.
+A single-node deployment uses the same storage and API model as a multi-node deployment. It is useful for development, small installations, and local testing. Distributed deployment is the default operational assumption for production capacity and resilience.
 
-## Docker example
+## What a node needs
+
+Each node needs:
+
+| Requirement | Why it matters |
+| --- | --- |
+| Anvil server binary | Runs native API, S3 gateway, cluster logic, and background leases. |
+| Durable `STORAGE_PATH` | Stores objects, journals, indexes, manifests, authz state, PersonalDB state, and control records. |
+| API listen address | Receives client traffic. |
+| Public API address | Tells clients and peers how to reach the node. |
+| Cluster secret | Authenticates internal node communication. |
+| Token/credential secrets | Validates client identity and protects stored secrets. |
+| Monitoring | Detects lag, rejection rates, repair findings, and storage pressure. |
+| Backups | Allows recovery of durable state. |
+
+Do not run production Anvil on ephemeral storage. If the storage path disappears, the node's durable records disappear with it.
+
+## Bootstrap sequence
+
+A production bootstrap should be repeatable:
+
+1. Prepare durable storage and secrets.
+2. Start the first node with initialization enabled.
+3. Create the first region, tenant, and administrative application.
+4. Grant only the permissions required for bootstrap automation.
+5. Start additional nodes with cluster addresses and shared cluster trust.
+6. Confirm health and membership.
+7. Run native object PUT/GET/LIST checks.
+8. Run S3 compatibility checks.
+9. Run authorization tuple and reserved namespace checks.
+10. Create a metadata index and verify query results.
+11. Start a watch and verify it receives a write event.
+12. Open a PersonalDB group and verify a commit certificate.
+
+The last four steps matter because a deployment that only serves object GET is not yet proving the integrated Anvil surface.
+
+## Container deployment
+
+A minimal container shape is:
 
 ```yaml
 services:
@@ -45,32 +84,40 @@ volumes:
   anvil_data:
 ```
 
-Use stronger secrets and dedicated volumes in production.
-
-## Bootstrap sequence
-
-1. Start the first node with cluster initialization enabled.
-2. Create the first region and tenant.
-3. Create administrative applications and policies.
-4. Start additional nodes with bootstrap addresses.
-5. Confirm each node reports health and membership.
-6. Run S3 PUT/GET/LIST smoke tests.
-7. Run native auth, index, watch, and PersonalDB smoke tests.
-
-## Storage path
-
-`STORAGE_PATH` contains object bytes, metadata journals, manifests, indexes, authorization tuples, control-plane records, PersonalDB data, source indexes, task logs, and derived proof files. Treat it as the node's durable state. Do not mount it on ephemeral disk in production.
+This example shows shape, not final security posture. Production deployments should use managed secret injection, explicit image versions, durable volumes, TLS termination or direct TLS support, and monitored health checks.
 
 ## Capacity planning
 
-Plan separately for:
+Plan capacity by workload family:
 
-- object bytes;
-- metadata and directory segments;
-- full text postings;
-- vector segments;
-- PersonalDB logs and snapshots;
+- object bytes and multipart temporary space;
+- metadata journals and compacted metadata segments;
+- directory/path indexes;
+- full text postings and stored snippets;
+- vector segments and HNSW graph memory;
+- authorization tuple logs and derived userset indexes;
+- PersonalDB commit logs, snapshots, and projections;
 - source and model artifacts;
-- temporary ingest and compaction space.
+- temporary ingestion, extraction, and repair workspace.
 
-Vector and media-heavy workloads need more CPU and memory during indexing. PersonalDB-heavy workloads need low-latency durable writes for commit logs.
+Vector and media indexing are CPU and memory heavy. PersonalDB commit witnessing is latency sensitive. Large object ingestion needs IO bandwidth and temporary space. Plan them separately rather than using only total object bytes as the capacity metric.
+
+## Readiness checks
+
+A node is ready for production only when it can prove:
+
+- API health endpoints respond;
+- object write/read/list works through native API;
+- S3 PUT/GET/HEAD/LIST/DELETE works;
+- reserved namespaces are denied through public APIs;
+- token scope authorization works;
+- relationship tuple checks work;
+- metadata index queries work;
+- watch streams deliver events;
+- PersonalDB commits return certificates;
+- metrics and logs include request ids;
+- backup and restore drill has been performed.
+
+## What you can do after this page
+
+You should be able to deploy Anvil deliberately and verify that the deployment is more than a basic object endpoint. Next, learn how to operate identity and access safely.

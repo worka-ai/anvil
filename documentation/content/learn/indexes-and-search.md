@@ -1,84 +1,104 @@
 ---
 title: Indexes And Search
-description: Learn indexing, full text search, vector search, and hybrid ranking before using Anvil search APIs.
+description: Learn indexes, full text search, vector search, hybrid ranking, and authorization-safe queries.
 ---
 
 # Indexes And Search
 
-**Goal:** understand what an index is, why search needs more than one index type, and how Anvil combines them safely.
+**What this page achieves:** you will understand why indexes exist, what full text and vector search mean, and how Anvil combines search with permissions and object versions.
 
-An index is a data structure built to answer a specific question quickly. Without an index, a system may need to inspect every object. With the right index, it can jump directly to a small candidate set.
+An index is a prepared data structure for answering a question quickly. Without an index, a system may have to inspect every object. With the right index, it can jump directly to the likely answers.
 
-Anvil supports several index families because applications ask different kinds of questions.
+The simplest index is a phone book. You could find a person by reading every page, but the alphabetical order lets you jump to the right area. Storage systems use the same idea for keys, metadata, words, vectors, and relationships.
 
-| Question | Best index family |
+## Index families in Anvil
+
+Anvil has multiple index families because applications ask different questions.
+
+| Question | Index family |
 | --- | --- |
-| What objects live under this prefix? | Directory/path index |
+| Which objects are under this prefix? | Directory/path index |
 | Which objects have `status = signed`? | Metadata index |
 | Which documents contain `payment terms`? | Full text index |
-| Which images are visually similar to this one? | Vector index |
-| Which results best match text, vector, filters, and freshness? | Hybrid search |
+| Which images or paragraphs are semantically similar? | Vector index |
+| Which source artifact introduced this file? | Source/artifact index |
+| Which users may see this object? | Authorization derived index |
+| Which database rows changed for this projection? | PersonalDB projection index |
+
+The important point is that these indexes are derived from durable source mutations. They are not casual caches. They have source cursors, manifests, generations, and repair rules.
 
 ## Full text search
 
-Full text search turns natural language text into searchable tokens. A document such as:
+Full text search helps when a user knows words that should appear in the result. Anvil tokenizes text, records terms, and ranks matches.
+
+A document containing:
 
 ```text
 The invoice is overdue and requires approval.
 ```
 
-might produce tokens like:
+might produce searchable terms such as:
 
 ```text
 invoice, overdue, requires, approval
 ```
 
-A full text index records which documents contain which terms, how often they appear, and where they appear. At query time, Anvil can rank documents by how strongly they match the query.
+A full text index records which object versions contain which terms, where the terms appear, and enough statistics to rank matches. A query for `overdue invoice` should rank that document higher than one that mentions only `invoice` once.
 
-Full text search is good when the user knows words that should appear in the result. It is not enough when the user describes meaning in different words or searches across image/audio/video embeddings.
+Full text search is not just for text files. Text can be extracted from PDFs, office documents, audio transcripts, video transcripts, or structured JSON fields.
 
 ## Vector search
 
-A vector is a list of numbers that represents meaning. An embedding model can turn text, image, audio, or video into a vector. Similar meanings produce nearby vectors.
+A vector is a list of numbers. An embedding model converts text, images, audio, or video into vectors where similar meanings are close together. This lets a user search by meaning rather than exact words.
 
-For example, these phrases may have vectors close to each other even though they do not share many words:
+For example, these phrases may be close in vector space:
 
 ```text
-"late payment"
-"invoice is overdue"
-"unpaid balance"
+late payment
+invoice is overdue
+unpaid balance
 ```
 
-Anvil stores vector indexes using HNSW, a graph-based approximate nearest-neighbor algorithm. HNSW is used because exact vector search over large collections is too expensive: comparing one query vector against every stored vector does not scale.
+A brute-force vector search compares a query vector to every stored vector. That becomes too expensive at scale. Anvil uses HNSW, a graph-based approximate nearest-neighbor index, to find good candidates quickly while keeping the persistent segment format under Anvil control.
 
-Anvil owns the persistent vector segment format. The vector engine is an implementation detail behind Anvil's index API, which keeps repair, manifests, authorization filtering, and segment verification under Anvil control.
+Approximate search means the system optimizes for fast, high-quality nearest results rather than mathematically comparing every vector. For application search, that tradeoff is usually the right one.
 
-## Metadata filters
+## Metadata filters and path scope
 
-Search usually needs filters. A user might search for `contract renewal` only inside `customer=Acme`, only under a project prefix, and only for documents created this year. Metadata filters reduce the candidate set before final ranking.
+Search is rarely global. A user usually searches inside a tenant, project, folder, media type, date range, language, status, or object class. Metadata and path filters narrow the candidate set before final scoring.
 
-Filters are not merely UI conveniences. They protect cost and relevance. A vector query across every object in every tenant would be too broad. A vector query scoped to a tenant, bucket, prefix, metadata condition, and authorization revision is a production query.
+A production query often looks conceptually like this:
 
-## Hybrid search
+```text
+within bucket documents
+under prefix tenants/acme/projects/p-123/
+where document_type = contract
+where status != archived
+matching text "renewal clause"
+near vector embedding(query)
+visible to user amy at auth revision r42
+```
 
-Hybrid search combines multiple scores. Anvil uses text score, vector score, metadata/path filters, freshness, and authorization filtering to produce a final result set.
+Anvil treats all those constraints as part of the same query plan. Search results are not useful unless they are authorized, current enough for the requested consistency, and traceable to object versions.
 
-The point is not to make every query complicated. The point is to let one API handle real product search:
+## Hybrid ranking
 
-- exact terms from full text;
-- semantic similarity from vectors;
-- structured filters from metadata;
-- predictable scope from paths;
-- safe result visibility from authorization.
+Hybrid search combines signals. Text score, vector similarity, metadata filters, path scope, freshness, and authorization all contribute to the final result set.
 
-A result is useful only if the caller is allowed to see it. Anvil applies authorization before returning results.
+Hybrid ranking exists because users mix exact and fuzzy intent. A legal user may type an exact clause name but also expect conceptually related language. A media user may search with words but expect image similarity. Anvil gives those use cases one search model rather than forcing applications to merge unrelated result lists by hand.
+
+## Authorization-safe search
+
+Search must not leak existence. If a user is not allowed to read a private document, a search query must not reveal that the document exists through result titles, counts, facets, snippets, vector neighbors, or timing side effects.
+
+Anvil applies authorization filtering as part of query execution. It also tracks the authorization revision used to expose results. If a query requires a consistency level the authorization index has not reached, Anvil waits, reports index readiness, or uses the configured consistency path rather than silently returning unsafe results.
 
 ## Watch-driven index maintenance
 
-Indexes must stay current. Anvil emits watch events from object and metadata mutations. Index builders consume those events and checkpoint their cursor. If a builder falls too far behind, it rebuilds from a manifest and resumes from a known checkpoint.
+An object write produces watch events. Index builders consume those events and checkpoint their cursor. If an index builder is behind, Anvil can report lag. If a segment fails validation, Anvil rebuilds it from manifests and source records.
 
-This is what makes indexes trustworthy. They are not ad hoc caches. They are derived data with recorded source cursors and proof of which source generation they represent.
+This is the difference between a production index and a best-effort cache. Operators can ask: which source cursor does this index represent, and can it prove that claim?
 
-## What you can do now
+## What you can do after this page
 
-You should now be able to explain the difference between directory, metadata, full text, vector, and hybrid indexes. Next, learn why authorization must be integrated with storage and search rather than bolted on after query results are returned.
+You should be able to explain directory indexes, metadata indexes, full text search, vector search, hybrid ranking, and authorization-safe query execution. Next, learn the authorization model itself.

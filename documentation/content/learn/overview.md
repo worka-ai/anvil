@@ -1,54 +1,70 @@
 ---
 title: Overview
-description: A progressive map of Anvil's concepts and why they fit together.
+description: A progressive learning path for Anvil, starting from first principles.
 ---
 
 # Overview
 
-**Goal:** understand what Anvil is, what problems it solves, and how the rest of the guide builds toward expert use.
+**What this page achieves:** by the end you should know what Anvil is, why it exists, and how to read the rest of the documentation in an order that builds real understanding.
 
-Anvil is a storage system for applications that need more than a place to put files. It stores objects, tracks versions, indexes metadata and content, evaluates relationship permissions, streams change events, and acts as a PersonalDB witness. Those capabilities are built into one product because modern applications usually need all of them at the same time.
+Anvil is a storage platform for applications that need durable objects, fast discovery, permission-aware search, real-time change streams, and local-first database coordination in one place. It starts from the familiar idea of an object store: clients put bytes under names and later fetch them back. Then it adds the pieces application teams usually attach around that store later: metadata indexes, full text search, vector search, relationship authorization, watch streams, source artifact handling, and PersonalDB witnessing.
 
-A document management system is a simple example. It needs to upload files, list folders, search document text, filter by metadata, restrict reads to authorized users, update derived views when a file changes, and prove that every write was accepted in the correct order. If those pieces are split across unrelated products, the application team has to keep them consistent. Anvil's value is that one system owns the object, the object's metadata, the indexes built from it, and the authorization revision used to expose it.
+The reason those features belong together is correctness. If an application writes a document to one system, indexes it in another, stores permissions somewhere else, streams notifications through a fourth service, and syncs local database state through a fifth service, the application is now responsible for keeping all those systems consistent. That is usually where bugs appear: stale search results, leaked private object names, projections that miss events, or local databases that disagree about which write won.
 
-## The first mental model
+Anvil gives those concerns one mutation path. A write becomes durable object state, version metadata, authorization context, watch events, and index input. A search result is filtered through the same authorization model used by direct reads. A PersonalDB commit is witnessed beside the object and index machinery that can project it into queryable data.
 
-Start with four nouns:
+## The mental model
 
-| Concept | Plain-English meaning | Why it matters |
+Start with six concepts. Every later page expands one of them.
+
+| Concept | Plain meaning | Anvil meaning |
 | --- | --- | --- |
-| Bucket | A named area that contains objects and policy. | Teams use buckets to separate data domains such as media, logs, source artifacts, or tenant assets. |
-| Object | A stored value addressed by a key. | Objects can be files, JSON records, manifests, event frames, model files, source packs, or snapshots. |
-| Index | A read-optimized view of objects or metadata. | Indexes make queries fast without forcing callers to scan every object. |
-| Authorization tuple | A relationship statement such as `document:123 viewer user:amy`. | Tuples let Anvil answer who can read or mutate which object without leaking data. |
+| Object | Named bytes plus facts about those bytes. | The durable unit stored in a bucket under a key, with versions, metadata, hashes, and policy. |
+| Bucket | A boundary around related objects. | A namespace with its own policies, index definitions, retention rules, and operational controls. |
+| Key | The name of an object. | A path-like identifier that can be designed for fast listing, watches, and authorization boundaries. |
+| Index | A shortcut for answering questions quickly. | A derived structure for path listings, metadata filters, full text search, vector search, source artifacts, authorization, and PersonalDB projections. |
+| Authorization tuple | A statement about who relates to what. | A Zanzibar-style relationship fact such as `document:123#viewer@user:amy`. |
+| Watch | A stream of durable changes. | The mechanism that keeps derived systems current without rescanning entire buckets. |
 
-Anvil treats these as one system. An object write records object bytes, metadata, directory entries, watch events, and index input. A read checks authorization before returning metadata or bytes. A search query applies authorization before returning results. A PersonalDB commit writes a durable log entry, updates row metadata, emits watches, and returns a signed commit certificate.
+A useful way to think about Anvil is: **objects are the source of record, indexes are maintained views, authorization is evaluated before exposure, and watches connect source changes to every derived view.**
 
-## What makes Anvil different
+## A simple example
 
-Most object stores focus on PUT, GET, and LIST. Those operations are necessary, but they are not enough for application state. Anvil adds the services application teams usually bolt on later:
+Imagine a product that stores contracts for many customers. The first requirement sounds easy: upload a PDF and let people download it. A basic object store can do that. The next requirements appear quickly:
 
-- full text search for text and extracted media content;
-- vector search for embeddings over text, image, audio, and video;
-- hybrid ranking that blends text, vector, path, metadata, freshness, and authorization;
-- Zanzibar-style relationship authorization with derived indexes;
-- watch streams so derived systems stay current without rescanning;
-- PersonalDB witnessing for replicated SQLite-backed application data;
-- source artifact storage and indexing for git packs and related build artifacts.
+- list all contracts for one customer and project;
+- filter contracts by status, expiry date, and renewal owner;
+- search inside extracted text;
+- find contracts semantically similar to a clause description;
+- prevent users from discovering documents they cannot access;
+- show a live activity timeline when a contract changes;
+- keep a local-first application database synchronized with accepted commits.
 
-The result is not a loose bundle of add-ons. The same mutation stream powers listing, search, authz-derived indexes, PersonalDB projections, source indexes, and operational watches. That shared base is why Anvil can provide predictable correctness: a result includes the object version and authorization revision it was produced from.
+With separate systems, every one of those requirements adds glue code. With Anvil, the object key, metadata, index definitions, authorization tuples, watch cursors, and PersonalDB witness records are all part of one storage architecture.
 
-## How to read this documentation
+## What Anvil is not
 
-Read the Learn section in order if Anvil is new to you. It teaches the concepts before asking you to operate the product. Then move to the Developer section to build against the APIs. Operators should read the Operator section after the Learn section so deployment choices make sense.
+Anvil is not a traditional filesystem. It does not expose POSIX directory semantics. It uses buckets and keys because large distributed systems need stable object identity, immutable versions, checksums, range reads, and prefix listing rather than local file handles.
 
-The recommended path is:
+Anvil is not a relational database replacement. It does not try to replace joins, SQL transactions, or relational modeling. It stores and indexes application objects and can witness PersonalDB changesets. Use a relational database when relational transactions are the right abstraction. Use Anvil when durable objects, derived indexes, authorization-aware search, and local-first data coordination are the core problem.
 
-1. [Object Storage](/learn/object-storage/) - learn what an object store is and how Anvil structures data.
-2. [Keys And Paths](/learn/keys-paths-and-metadata/) - learn how predictable paths become fast directory and metadata queries.
-3. [Indexes And Search](/learn/indexes-and-search/) - learn full text, vector, metadata, and hybrid search from first principles.
-4. [Authorization](/learn/authorization/) - learn why relationship authorization exists and how Anvil evaluates it.
-5. [Watches And Derived Data](/learn/watches-and-derived-data/) - learn how Anvil avoids repeated rescans.
-6. [PersonalDB](/learn/personaldb/) - learn how Anvil witnesses distributed SQLite-style application state.
+Anvil is not a search engine bolted onto storage. Search in Anvil is tied to object versions, metadata, authorization revisions, and watch-driven maintenance. That is why a query result can be traced back to the object and source cursor that produced it.
 
-When you finish that sequence, you should understand not only which commands to run, but why Anvil has the shape it has.
+## How to read this guide
+
+Read the Learn section in order if you are new to any concept:
+
+1. **Object Storage** explains buckets, keys, objects, versions, checksums, and metadata.
+2. **Keys, Paths, And Metadata** shows how good key design makes applications easier to build and operate.
+3. **Indexes And Search** teaches indexing, full text search, vector search, and hybrid ranking.
+4. **Authorization** introduces authentication, authorization, scopes, Zanzibar-style tuples, caveats, and safe search.
+5. **Watches And Derived Data** explains how indexes and projections stay current.
+6. **PersonalDB** explains local-first SQLite changesets, witnesses, projections, and conflict boundaries.
+
+After that, use the Developer guides to build applications and the Operator guides to run Anvil in production. The Reference section exists for exact settings, commands, packages, and errors after the mental model is clear.
+
+## What you can do after this page
+
+You should be able to explain Anvil in one sentence: **Anvil is an object storage platform where indexing, search, authorization, watches, and PersonalDB witnessing are first-class parts of the write and read path.**
+
+Next, learn the object-store model from first principles.

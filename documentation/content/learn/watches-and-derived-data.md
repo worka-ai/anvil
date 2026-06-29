@@ -1,48 +1,83 @@
 ---
 title: Watches And Derived Data
-description: Learn how Anvil streams changes and keeps indexes current without rescanning.
+description: Learn watch streams, derived indexes, cursors, lag, replay, and recovery.
 ---
 
 # Watches And Derived Data
 
-**Goal:** understand watches, cursors, derived data, and why Anvil can keep search, authorization, and projections current without repeatedly scanning buckets.
+**What this page achieves:** you will understand how Anvil turns durable mutations into current indexes, projections, notifications, and operational views without broad rescans.
 
-A watch is a stream of changes. Instead of asking "what changed since I last scanned everything?", a consumer asks Anvil to send committed mutations after a cursor.
+Derived data is data computed from source data. A full text index is derived from object content. A directory listing is derived from object keys. A PersonalDB projection is derived from committed changesets. An authorization userset index is derived from relationship tuples.
 
-A cursor is a durable position in a stream. If a consumer processes events through cursor 1000 and saves that checkpoint, it can resume at 1001 after a restart.
+Derived data is useful because it is fast to query. It is dangerous if it silently drifts from the source. Anvil uses watch streams, cursors, manifests, and validation to keep derived data trustworthy.
 
-## Why watches matter
+## The source of truth
 
-Imagine a bucket with billions of objects. A background indexer that repeatedly scans the whole bucket wastes enormous IO. Worse, it may never catch up if the bucket changes quickly.
+The source of truth is the durable mutation stream: object writes, metadata changes, tuple writes, PersonalDB commits, source artifact records, and control-plane updates. Derived systems consume that stream.
 
-A watch-driven indexer works differently:
+An index is allowed to be behind. It is not allowed to pretend it is current when it is not. That distinction is central to Anvil's design.
 
-1. it reads a manifest or checkpoint;
-2. it subscribes to mutations after a cursor;
-3. it applies each mutation to its derived index;
-4. it records the cursor it has processed;
-5. if it falls too far behind, it rebuilds from a known manifest and resumes.
+## What a watch stream is
 
-This pattern is how Anvil maintains full text indexes, vector indexes, directory indexes, derived authorization usersets, source indexes, and PersonalDB projections.
+A watch stream is an ordered feed of changes. A watcher subscribes to a bucket, prefix, index family, authorization namespace, PersonalDB group, or another scoped source. Each event has a position called a cursor.
 
-## Derived data
+A simplified event might look like:
 
-Derived data is data computed from base data. A full text posting list is derived from object text. A vector index is derived from embeddings. A PersonalDB projection is derived from source rows. A relationship index is derived from tuple writes.
+```json
+{
+  "cursor": "0000000000000042",
+  "bucket": "documents",
+  "key": "tenants/acme/contracts/contract-42.pdf",
+  "version": "v7",
+  "operation": "put",
+  "metadata_changed": true
+}
+```
 
-Derived data must prove what source it came from. Anvil records source cursor, source manifest hash, generation, and segment hashes. If those do not validate, the derived index is invalid and must rebuild.
+A consumer stores the last cursor it processed. If it restarts, it resumes from that cursor. If it falls behind retention, Anvil can rebuild from a manifest and then resume from a known point.
 
-## Leopard-style acceleration
+## Derived maintenance flow
 
-Anvil uses the watch pattern to maintain precomputed relationship and query indexes. This is similar in spirit to Leopard-style acceleration: expensive graph or query work is moved from request time to controlled derived maintenance, while request-time checks use precomputed structures that are tied to a known source revision.
+The general flow is the same for many subsystems:
 
-The benefit is not just speed. It is bounded, explainable speed. A permission check can say which authorization revision it used. A search result can say which source generation and index cursor produced it.
+```text
+client write
+  -> durable mutation record
+  -> watch event
+  -> derived builder consumes event
+  -> builder updates segment or projection
+  -> builder checkpoints cursor
+  -> query path uses current generation when consistency requirements are met
+```
 
-## What happens when a watcher falls behind
+This flow is used by directory indexes, metadata indexes, full text indexes, vector indexes, authorization derived usersets, PersonalDB projections, source artifact indexes, and operational timelines.
 
-Watch streams retain a window. If a consumer asks for a cursor older than the retained window, Anvil returns a data-loss style error for that watch. The consumer must rebuild from the relevant manifest and then resume from the manifest checkpoint.
+## Cursors and generations
 
-That failure mode is deliberate. Silent gaps would be worse. A search index that missed events but still claimed to be current would be incorrect.
+A cursor says how far a consumer has read. A generation says which sealed output is published. A manifest ties source records to derived output.
 
-## What you can do now
+For example, a full text index generation might say:
 
-You should now be able to explain why watches are the backbone of Anvil's derived systems and why cursors, manifests, and proofs matter for correctness.
+- source bucket: `documents`;
+- source manifest: `m-123`;
+- processed cursor: `c-9001`;
+- tokenizer version: `en-gb-v2`;
+- output segment hash: `...`.
+
+When a query asks for a consistency level, Anvil can check whether the index generation is new enough.
+
+## Lag is an operational signal
+
+Lag is the distance between the newest source mutation and the cursor processed by a derived system. Short lag during bursts is normal. Persistent lag means the deployment needs attention: more CPU, memory, IO, task lease capacity, or index-specific tuning.
+
+Anvil surfaces lag because hiding it creates false confidence. A user interface can show loading for strong consistency. An operator can alert on sustained lag. A developer can choose appropriate consistency requirements per query.
+
+## Replay and repair
+
+If a derived segment is missing, corrupt, or built from the wrong source generation, Anvil does not trust it. It rebuilds from durable source records and manifests. Repair is possible because base data and mutation records are authoritative.
+
+This is why Anvil treats derived data as maintained output, not hand-written state. A rebuild produces a new generation with proof of its source cursor and manifest.
+
+## What you can do after this page
+
+You should be able to explain watches, cursors, generations, lag, replay, and why derived data must prove its source. Next, learn how PersonalDB uses the same durability and authorization principles for local-first SQLite data.

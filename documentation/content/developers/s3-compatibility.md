@@ -1,88 +1,88 @@
 ---
 title: S3 Compatibility
-description: Use existing S3 tools with Anvil while understanding the boundary of the compatibility API.
+description: Use S3-compatible clients with Anvil while understanding what compatibility does and does not cover.
 ---
 
 # S3 Compatibility
 
-**Goal:** connect existing S3 clients to Anvil and understand which Anvil features require the native API.
+**What this page achieves:** you will know when S3 compatibility is the right interface, how it maps to Anvil, and where native APIs are required.
 
-Anvil provides an S3-compatible gateway for common object workflows. This lets existing tools upload, download, list, copy, and delete objects without learning the native API first.
+S3 compatibility means tools that know the S3 object API can talk to Anvil for common object operations. This is valuable because many backup tools, data importers, SDKs, and command-line workflows already understand S3-style buckets, keys, objects, metadata, range reads, and multipart uploads.
 
-## What S3 means here
+Compatibility does not mean Anvil becomes only an S3 service. Anvil has native features that S3 does not express: index definitions, relationship authorization schemas, watch streams, vector search, PersonalDB witnessing, and structured administrative diagnostics.
 
-S3 is a widely adopted HTTP object API. Clients know how to sign requests, name buckets, put objects, list prefixes, read ranges, and attach metadata. Compatibility means Anvil accepts those requests and maps them to Anvil's object model.
+## What maps cleanly
 
-Compatibility does not mean every Anvil feature can be expressed through S3. Index definitions, PersonalDB commits, relationship tuple writes, native watches, and administrative repair operations use the native API.
+These concepts map directly:
 
-## Credentials
+| S3 concept | Anvil concept |
+| --- | --- |
+| Bucket | Bucket |
+| Object key | Object key |
+| Object body | Object bytes |
+| User metadata | Object metadata |
+| ETag/checksum | Version/hash validation surface |
+| LIST prefix | Directory/prefix index query |
+| GET range | Object byte range read |
+| Conditional write/read | Version and precondition checks |
 
-Use the Anvil application client id as the S3 access key id and the Anvil client secret as the S3 secret access key. Point the client endpoint to the Anvil S3 endpoint.
+Use S3 clients for straightforward object movement: ingest files, export artifacts, sync backups, or integrate software that already expects an S3 endpoint.
 
-```bash
-export AWS_ACCESS_KEY_ID="<anvil-client-id>"
-export AWS_SECRET_ACCESS_KEY="<anvil-client-secret>"
-export AWS_DEFAULT_REGION="local"
-export ANVIL_S3_ENDPOINT="http://127.0.0.1:50051"
-```
+## What needs native APIs
 
-## Basic operations
+Use native APIs for:
 
-Create a bucket:
+- creating index definitions;
+- querying metadata indexes beyond basic object listing;
+- full text, vector, and hybrid search;
+- managing relationship authorization schemas and tuples;
+- subscribing to watch streams;
+- PersonalDB group open, commit, snapshot, and projection APIs;
+- source artifact and model ingestion workflows;
+- structured diagnostics and repair operations.
 
-```bash
-aws s3api create-bucket \
-  --endpoint-url "$ANVIL_S3_ENDPOINT" \
-  --bucket documents
-```
-
-Upload an object:
-
-```bash
-aws s3api put-object \
-  --endpoint-url "$ANVIL_S3_ENDPOINT" \
-  --bucket documents \
-  --key tenants/acme/contracts/contract-42.pdf \
-  --body ./contract-42.pdf \
-  --content-type application/pdf \
-  --metadata customer=acme,document_type=contract
-```
-
-Read metadata:
-
-```bash
-aws s3api head-object \
-  --endpoint-url "$ANVIL_S3_ENDPOINT" \
-  --bucket documents \
-  --key tenants/acme/contracts/contract-42.pdf
-```
-
-List a prefix:
-
-```bash
-aws s3api list-objects-v2 \
-  --endpoint-url "$ANVIL_S3_ENDPOINT" \
-  --bucket documents \
-  --prefix tenants/acme/contracts/
-```
-
-## Precondition and range behavior
-
-Anvil enforces ETag and date preconditions for compatibility reads and writes. Use them to avoid lost updates. Range reads are supported for standard single-range requests, which matters for media players, model readers, and resumable downloads.
+S3 clients cannot express those operations because the S3 protocol does not contain those concepts.
 
 ## Reserved namespace behavior
 
-The S3 gateway enforces the same reserved namespace rules as the native API. Keys under `_anvil/` are not readable, writable, listable, copyable, or deletable through S3. The gateway rejects them before exposing existence information.
+Anvil internal paths under `_anvil/` are not accessible through S3. This includes GET, HEAD, LIST, PUT, COPY, multipart operations, DELETE, and conditional variants. The gateway rejects those paths before normal object authorization.
 
-## When to switch to native APIs
+This protects internal metadata, index material, authorization tuples, watch checkpoints, and PersonalDB state. If you need operational insight, use structured native or admin APIs.
 
-Switch to the native API when you need to:
+## Authentication
 
-- define or query full text and vector indexes;
-- watch prefixes and indexes;
-- write relationship tuples;
-- use PersonalDB;
-- inspect source or model ingestion metadata;
-- access structured administrative diagnostics.
+S3-compatible clients normally sign requests. Anvil verifies the request identity and maps it to tenant/application authorization. Keep S3 credentials scoped to the minimum buckets and prefixes required.
 
-The intended pattern is not either/or. Many systems use S3 clients for bulk object transfer and the native API for Anvil-specific control planes.
+Do not give broad write credentials to generic automation. A sync tool that only uploads release artifacts should not have rights to delete source snapshots or inspect database group state.
+
+## Example: object import
+
+A simple import flow is:
+
+```text
+create bucket with native or admin API
+  -> configure scoped S3 credentials
+  -> run existing uploader against Anvil endpoint
+  -> verify object count and hashes
+  -> create or update index definitions with native API
+  -> query imported metadata/search through native API
+```
+
+The S3 tool moves bytes. Native Anvil APIs make those bytes searchable, authorized, watchable, and operationally visible.
+
+## Compatibility test expectations
+
+A production-compatible S3 surface should prove:
+
+- bucket create/list/delete where supported;
+- object PUT/GET/HEAD/LIST/DELETE;
+- metadata round trip;
+- range reads;
+- conditional reads and writes;
+- multipart upload and abort behavior;
+- reserved namespace rejection;
+- authorization failures do not leak object existence.
+
+## What you can build after this page
+
+You should be able to decide when S3 compatibility is enough and when native APIs are required. Next, learn how object metadata and indexes support application-level queries.

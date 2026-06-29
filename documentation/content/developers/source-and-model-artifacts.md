@@ -1,63 +1,77 @@
 ---
 title: Source And Model Artifacts
-description: Store source packs, generated artifacts, model files, and ingestion manifests in Anvil.
+description: Store source packs, generated files, model artifacts, logs, screenshots, and manifests in Anvil.
 ---
 
 # Source And Model Artifacts
 
-**Goal:** use Anvil for artifacts that must be durable, indexed, authorized, and reproducible.
+**What this page achieves:** you will learn how to store build inputs, generated outputs, model files, logs, and visual artifacts as first-class Anvil objects with metadata, hashes, indexes, and authorization.
 
-Anvil can store ordinary files, but source and model artifacts benefit from more structure. A build system needs to know which source pack produced which result. A model registry needs manifests, tensor metadata, large files, and ingestion status. Anvil stores the bytes and maintains indexes over the metadata that makes those bytes useful.
+Many platforms need to store more than user documents. They store source packs, build logs, screenshots, generated bundles, test reports, model manifests, media derivatives, and provenance records. These artifacts are not throwaway files. They need durable names, hashes, metadata, search, access control, and lifecycle management.
 
-## Source artifacts
+Anvil treats artifacts as ordinary objects plus stronger conventions.
 
-Store git pack files under predictable keys:
+## Artifact families
+
+Common families include:
+
+| Family | Example |
+| --- | --- |
+| Source | Git pack files, archive snapshots, dependency manifests |
+| Build output | Binaries, bundles, packages, checksums |
+| Logs | Compiler output, test logs, agent transcripts, task events |
+| Visual evidence | Screenshots, videos, rendered previews |
+| Models | Model files, tokenizer files, config, manifest indexes |
+| Derived media | Transcripts, thumbnails, embeddings, extracted text |
+
+Each family should have a predictable key layout and metadata schema.
+
+## Source packs
+
+A source pack captures repository state. Store it with revision metadata and a content hash:
 
 ```text
-tenants/acme/workspaces/ws-1/source/revisions/00000042/repo.pack
-tenants/acme/workspaces/ws-1/source/revisions/00000042/manifest.json
+bucket: source-artifacts
+key: tenants/acme/repos/app/revisions/sha256-{hash}/repo.pack
+metadata:
+  revision = abc123
+  branch = main
+  source_kind = git-pack
+  produced_by = ingestion-service
 ```
 
-The pack is the durable source artifact. The manifest records revision id, commit identity, tree hash, author, generated assets, and build inputs.
+The pack file is the durable object. Metadata and manifests make it discoverable and verifiable.
 
-Anvil source indexes are derived from the stored pack bytes through watch streams. If a source index is missing or invalid, Anvil rebuilds it from the pack.
+## Build logs and evidence
 
-## Generated artifacts
-
-Store generated outputs with content hashes and source references:
+Build and test systems should upload logs and evidence as objects rather than embedding large blobs in a database row. Use predictable paths:
 
 ```text
-tenants/acme/workspaces/ws-1/builds/build-77/artifacts/app-linux.run
-tenants/acme/workspaces/ws-1/builds/build-77/logs/cargo.txt
-tenants/acme/workspaces/ws-1/builds/build-77/screenshots/home.png
+tenants/acme/projects/p-123/runs/run-42/logs/cargo-build.txt
+tenants/acme/projects/p-123/runs/run-42/screenshots/home.png
+tenants/acme/projects/p-123/runs/run-42/reports/qa.json
 ```
 
-Each artifact should include metadata linking it to source revision, build id, platform, content type, and integrity hash.
+The UI can list the run prefix, fetch small summaries, and open large assets only when needed.
 
-## Model files
+## Model artifacts
 
-Large model files are normal objects, but model ingestion adds structure:
+Model artifacts can be large and multi-file. Store a manifest object that records every file, size, hash, media type, and source revision. Search and indexing can then operate over the manifest rather than guessing file relationships from loose object names.
 
-- external source identity;
-- revision;
-- included and excluded file globs;
-- destination bucket and prefix;
-- ingestion status;
-- generated `anvil-index.json` manifest;
-- tensor metadata index where applicable.
+A model manifest should answer:
 
-This lets applications query model artifacts without scanning every model file.
+- which files belong to the model;
+- which source repository and revision produced them;
+- which embedding dimensions and tokenizer apply;
+- which hashes verify each file;
+- which authorization rules apply.
 
-## Authorization
+## Search and authorization
 
-Source and model artifacts often contain sensitive data. Use relationship authorization for repository, workspace, model, and tenant boundaries. Search and index APIs must apply those same checks before exposing artifact metadata.
+Artifact search must respect the same authorization rules as ordinary objects. A user should not discover a private source pack through metadata search or a log snippet.
 
-## Verification pattern
+Index artifact metadata such as run id, revision, language, package name, model id, media type, and status. Use full text indexing for logs and extracted text. Use vector indexing for semantic search over documents, images, audio, or video when useful.
 
-For every artifact family, verify:
+## What you can build after this page
 
-1. the object exists at the expected key;
-2. the content hash matches metadata;
-3. the manifest references the same hash;
-4. the source revision or ingestion id is present;
-5. unauthorized callers cannot list, head, search, or download it.
+You should be able to design artifact storage where files, logs, screenshots, model assets, and provenance records are durable, searchable, and authorized. Move to the Operator guides when you are ready to deploy and run Anvil.

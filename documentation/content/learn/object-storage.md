@@ -1,87 +1,100 @@
 ---
 title: Object Storage
-description: Learn object storage from first principles and how Anvil stores objects.
+description: Learn buckets, keys, objects, versions, metadata, and checksums from first principles.
 ---
 
 # Object Storage
 
-**Goal:** understand buckets, keys, objects, versions, metadata, checksums, and why Anvil is an object store rather than a filesystem or SQL database.
+**What this page achieves:** you will understand what an object store is, how Anvil represents stored data, and why object storage is the base layer for the rest of Anvil.
 
-An object store stores named blobs of bytes. The bytes might be a photo, a PDF, a JSON document, a compressed event log, a model weight file, or a source package. Each object lives inside a bucket and is addressed by a key.
+An object store stores bytes under names. The bytes can be a PDF, image, JSON document, event frame, source package, media file, model artifact, or database snapshot. The name is split into two parts: a bucket and a key.
 
 ```text
-bucket: customer-assets
-key: tenants/acme/invoices/2026/06/invoice-1007.pdf
-bytes: the PDF content
-metadata: content-type=application/pdf, customer=acme, period=2026-06
+bucket: documents
+key: tenants/acme/projects/p-123/contracts/contract-42.pdf
+bytes: PDF content
+metadata: content-type=application/pdf, status=signed, customer=acme
 ```
 
-A filesystem also stores bytes, but a filesystem is optimized for local hierarchical directories, small synchronous metadata changes, and POSIX semantics. A SQL database stores rows and joins them through schemas. An object store is optimized for durable blobs, large fan-out, stable HTTP-style access, and application-defined metadata. Anvil builds on the object-store model and then adds native indexing, authorization, and watches.
+That is the simplest form of the model: put bytes at a name, then get them back later. Anvil keeps that model but adds production-grade context around it: versions, checksums, metadata indexes, authorization, watches, and derived search inputs.
+
+## Why not just use files?
+
+A local filesystem is designed for one machine and POSIX-style operations: open a file handle, read and write ranges, rename directories, apply local permissions, and rely on local metadata. Distributed applications need different properties. They need stable object names, explicit versions, content hashes, large fan-out, HTTP/gRPC access, range reads, retries, and metadata that can be indexed without opening every file.
+
+An object store does less than a filesystem in some areas and more in others. It does not pretend that `/a/b/c` is a real directory tree. It treats the slash as part of a key. That makes it easier to distribute, replicate, index, and authorize at scale.
 
 ## Buckets
 
-A bucket is a named boundary. It has its own policy, object namespace, index definitions, authorization settings, encryption settings, and operational lifecycle. Use separate buckets when the data has different policy or operational behavior.
+A bucket is a named boundary around objects. It is not just a folder. In Anvil, a bucket can carry policy, index definitions, authorization settings, retention behavior, and operational lifecycle.
 
-Good bucket boundaries are usually product-level or data-domain-level:
+Use separate buckets when data has materially different policy or operational needs:
 
 - `documents` for user-uploaded documents;
 - `media` for images, audio, and video;
-- `events` for append-only product timelines;
-- `source-artifacts` for git packs and build inputs;
-- `personaldb` for database group snapshots and derived material.
+- `events` for append-only activity frames;
+- `source-artifacts` for source packs, build outputs, and logs;
+- `personaldb` for database group material and projections.
 
-Do not create a bucket for every folder. Object keys already provide path structure inside a bucket.
+Do not create a bucket for every small folder. Keys already provide structure inside a bucket. A bucket should be a meaningful administrative and security boundary.
 
 ## Keys
 
-A key is a UTF-8 path-like string inside a bucket. Anvil normalizes keys so equivalent spelling does not create ambiguous objects. A predictable key lets both humans and machines infer where data belongs.
+A key is the object's name inside a bucket. Keys are usually path-like because humans and tools understand that shape:
 
 ```text
-tenants/acme/projects/p-123/timeline/000000042.json
+tenants/acme/projects/p-123/timeline/0000000000000042.json
 tenants/acme/projects/p-123/assets/logo.png
 tenants/acme/projects/p-123/source/main.pack
 ```
 
-The slash is a naming convention, not a real directory. Anvil maintains a directory index so prefix listing behaves like directory traversal without requiring object payload scans.
+The slash does not create a real directory. It creates a prefix. Anvil maintains directory and prefix indexes so listing `tenants/acme/projects/p-123/` is fast without scanning every object in the bucket.
 
-## Object versions
+Good keys put ownership, security scope, and time/order near the front of the name. That lets applications list and watch focused areas without reading object bodies.
 
-When an object is written, Anvil records a new version. A version record contains the object identity, key, version id, mutation id, content hash, size, metadata, storage references, authorization revision, and timestamps. Deletes are recorded as delete markers so version history remains understandable.
+## Objects and versions
 
-Versions matter because distributed applications need a stable answer to the question: which exact bytes did this result come from? If a search result says it matched `contract.pdf` at version `v7`, a later overwrite to `v8` does not invalidate the fact that the query returned `v7`.
+An object is not only the latest bytes. Every successful write creates a version record. A version records facts such as:
+
+- bucket and key;
+- version id and mutation id;
+- content hash and size;
+- user metadata;
+- storage references;
+- authorization revision;
+- creation timestamp;
+- delete marker if the write was a delete.
+
+Versions let Anvil answer exact questions. If a search result matched `contract-42.pdf` at version `v7`, a later write to `v8` does not rewrite history. The result can still point to the exact version that was indexed.
 
 ## Metadata
 
-Metadata is structured information stored with an object. Some metadata is system-owned, such as content length and content hash. Some is user-defined, such as `customer=acme` or `document_type=invoice`.
+Metadata is structured information attached to an object. Some metadata is system-owned: content length, content type, hash, version, and timestamps. Some metadata is application-owned: customer id, language, status, retention class, source revision, or media duration.
 
-Metadata exists so callers can answer questions without downloading every object:
+Metadata matters because it lets you ask questions without downloading every object:
 
-- list invoices for June;
-- filter media by language;
-- find all artifacts produced by build 123;
-- search only objects tagged as public knowledge-base content.
+- which invoices are from June;
+- which contracts are signed;
+- which images belong to this project;
+- which artifacts were produced by this build;
+- which documents use English text extraction.
 
-Anvil indexes metadata through bucket-scoped index definitions. That makes metadata a query surface rather than a passive label.
+Anvil treats metadata as a query surface. Bucket index definitions decide which fields become indexed and how queries may combine those fields with prefix, full text, vector, and authorization filters.
 
 ## Checksums and content addressing
 
-Anvil computes BLAKE3 hashes for content and control records. A hash is a compact fingerprint of bytes. If the bytes change, the hash changes. Anvil uses hashes to verify integrity, address immutable content, validate manifests, and connect derived indexes back to source data.
+Anvil computes hashes for object bytes and control records. A hash is a fingerprint: the same bytes produce the same hash, and different bytes produce a different hash with extremely high probability. Anvil uses hashes to verify downloads, validate manifests, identify immutable content, repair damaged state, and connect derived indexes to source data.
 
-This matters operationally. Repair can prove whether a segment is intact. A client can verify downloaded bytes. A derived index can prove which source manifest and cursor it was built from.
+The practical benefit is confidence. When an index segment says it was built from a manifest, Anvil can verify that manifest and the object versions behind it. When a client downloads bytes, it can prove the bytes are the expected bytes.
 
-## Inline and external payloads
+## Inline and external storage
 
-Small payloads can be stored inline with metadata journal records. Large payloads are stored as external content chunks referenced from metadata. This keeps small control files fast while preventing directory and metadata paths from dragging large object bytes through hot indexes.
+Small control payloads are cheap to store close to metadata. Large object bodies are stored as content chunks referenced by metadata. Anvil chooses the physical representation. The user-facing contract stays the same: write an object with a key and metadata, then read or query it by the supported APIs.
 
-As a user, you do not choose the physical placement for each object. You choose the bucket, key, metadata, and policy. Anvil chooses the durable internal representation.
+This split keeps hot metadata and directory operations fast without dragging large payloads into every index path.
 
-## What you can do now
+## What you can do after this page
 
-You should now be able to explain:
+You should be able to describe a bucket, key, object, version, metadata record, and checksum. You should also understand why object storage is the base model Anvil extends with indexes, authorization, and watches.
 
-- why object storage is different from local files and relational rows;
-- how a bucket and key identify data;
-- why versions and hashes matter;
-- why metadata becomes valuable only when it can be indexed.
-
-Next, learn how key design and path indexing turn object names into fast application navigation.
+Next, learn how to design keys and metadata so applications remain fast and understandable as data grows.

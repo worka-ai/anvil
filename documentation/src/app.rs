@@ -52,14 +52,14 @@ impl From<HeroSection> for Widget {
                 gap: Some(22.0),
                 children: vec![
                     Pill::new("Object storage, indexes, authz, watches, and database witnessing in one system").into(),
-                    Text::new("Stop stitching storage, search, permissions, and sync logs together.")
+                    Text::new("One storage platform for objects, search, permissions, watches, and local-first data.")
                         .size(58.0)
                         .weight(800)
                         .line_height(1.05)
                         .color(rgb(17, 24, 39))
                         .max_width(980.0)
                         .into(),
-                    Text::new("Anvil stores application objects and the systems that make those objects usable: metadata indexes, full text search, vector search, relationship authorization, watch streams, source artifacts, and PersonalDB witness logs. One mutation path feeds every derived view, so teams spend less time reconciling infrastructure and more time building product behavior.")
+                    Text::new("Anvil is for teams whose storage layer has grown beyond PUT, GET, and LIST. It keeps object bytes, metadata indexes, full text search, vector search, relationship authorization, watch streams, source artifacts, and PersonalDB witness logs in one coherent system. One write path feeds every derived view, so correctness is owned by the platform instead of scattered through application glue.")
                         .size(20.0)
                         .line_height(1.5)
                         .color(rgb(55, 65, 81))
@@ -95,10 +95,10 @@ impl From<MetricStrip> for Widget {
             gap: Some(12.0),
             wrap: FlexWrap::Wrap,
             children: vec![
-                Metric::new("One", "durable mutation stream").into(),
-                Metric::new("Five", "native index families").into(),
-                Metric::new("Zero", "public access to internal namespaces").into(),
-                Metric::new("One", "witness path for PersonalDB").into(),
+                Metric::new("1", "mutation path for objects and derived data").into(),
+                Metric::new("5+", "native index and search families").into(),
+                Metric::new("0", "public access to internal namespaces").into(),
+                Metric::new("1", "witness path for local-first databases").into(),
             ],
             ..Default::default()
         }
@@ -114,11 +114,11 @@ impl From<ProblemSection> for Widget {
         Section::new(
             "The problem",
             "Application teams keep rebuilding the same storage control plane.",
-            "A product starts with file uploads. Then it needs metadata queries, search, sharing, audit logs, real-time updates, local-first sync, source artifacts, and media indexing. If each feature lands in a separate product, correctness becomes an integration problem. Anvil makes those concerns part of the same storage system.",
+            "A product starts with files. Then it needs fast filters, semantic search, private sharing, audit trails, live updates, local-first sync, source artifacts, media indexing, and operational recovery. If each feature lands in a different system, every product team inherits distributed consistency as an application bug. Anvil makes those concerns part of one storage product.",
             vec![
-                ProblemCard::new("Object stores alone do not answer product questions.", "PUT, GET, and LIST are necessary, but users ask for signed contracts, similar images, authorized project files, and database rows that changed since their last sync.").into(),
-                ProblemCard::new("Search must respect permissions.", "A search result that leaks the existence of a private document is a security bug. Anvil filters text, vector, metadata, and hybrid results through authorization.").into(),
-                ProblemCard::new("Derived systems need a source of truth.", "Indexes, projections, and timelines stay correct only when they are tied to durable mutations, cursors, manifests, and validation proofs.").into(),
+                ProblemCard::new("Object storage alone does not answer product questions.", "PUT, GET, and LIST are necessary, but users ask for signed contracts, similar images, authorized project files, and database rows that changed since their last sync.").into(),
+                ProblemCard::new("Search without authorization leaks data.", "A result count, snippet, facet, or vector neighbor can reveal private information. Anvil filters text, vector, metadata, and hybrid results through the same authorization model as direct reads.").into(),
+                ProblemCard::new("Derived systems need proof, not hope.", "Indexes, projections, and timelines stay correct only when they are tied to durable mutations, cursors, manifests, validation proofs, and repair behavior.").into(),
             ],
         )
         .into()
@@ -133,7 +133,7 @@ impl From<FeatureGrid> for Widget {
         Section::new(
             "What Anvil gives you",
             "A coherent storage platform instead of a pile of adapters.",
-            "Each feature is useful alone. The larger value is that they share the same object identity, versioning, authorization, watch, and recovery model.",
+            "Each capability is useful on its own. The larger value is that every capability shares object identity, versioning, authorization, watch streams, recovery, and operational visibility.",
             vec![
                 FeatureCard::new("Object store", "Buckets, keys, versions, checksums, metadata, range reads, multipart flows, and S3-compatible access for existing tools.", "/learn/object-storage/").into(),
                 FeatureCard::new("Metadata and paths", "Predictable key layouts and directory indexes make application timelines, assets, source packs, and control records fast to navigate.", "/learn/keys-paths-and-metadata/").into(),
@@ -157,12 +157,12 @@ impl From<WorkflowSection> for Widget {
         Section::new(
             "How the pieces work together",
             "One object write becomes storage, indexes, watches, and authorization-aware results.",
-            "Anvil does not ask every application to coordinate search, authz, and derived state by hand. The write path records the durable object and emits the facts that downstream systems consume.",
+            "Anvil does not ask every application to coordinate search, authorization, local database witnessing, and derived state by hand. The write path records durable source facts, and every derived system consumes those facts through cursors and manifests.",
             vec![
-                StepCard::new("01", "Write", "A client writes an object or PersonalDB changeset with metadata, preconditions, and an idempotency key.").into(),
-                StepCard::new("02", "Commit", "Anvil validates identity, reserved namespaces, policy, object shape, hashes, and durable journal records before acknowledging.").into(),
-                StepCard::new("03", "Derive", "Directory, metadata, full text, vector, authz, source, and PersonalDB projection systems consume watch events and checkpoint cursors.").into(),
-                StepCard::new("04", "Serve", "Reads, listings, search, and database sync return versioned, authorized results tied back to the source mutation stream.").into(),
+                StepCard::new("01", "Write", "A client writes an object, metadata update, relationship tuple, source artifact, or PersonalDB changeset with preconditions and an idempotency key.").into(),
+                StepCard::new("02", "Commit", "Anvil validates identity, reserved namespaces, policy, shape, hashes, fences, and durable records before acknowledging the mutation.").into(),
+                StepCard::new("03", "Derive", "Path, metadata, full text, vector, authorization, source, and PersonalDB systems consume watch events and checkpoint their cursors.").into(),
+                StepCard::new("04", "Serve", "Reads, listings, search, watches, and database sync return versioned, authorized results tied back to source cursors and manifests.").into(),
             ],
         )
         .into()
@@ -203,7 +203,7 @@ impl From<FinalCta> for Widget {
                         .line_height(1.15)
                         .color(Color::WHITE)
                         .into(),
-                    Text::new("If your team is already coordinating objects, search, permissions, derived views, local database sync, and artifact storage, Anvil gives those concerns one coherent home.")
+                    Text::new("If your team is coordinating objects, search, permissions, derived views, local database sync, source artifacts, logs, and operational recovery across separate systems, Anvil gives those concerns one coherent home and one set of invariants to trust.")
                         .size(18.0)
                         .line_height(1.45)
                         .color(rgba(229, 231, 235, 255))
