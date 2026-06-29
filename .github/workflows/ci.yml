@@ -82,8 +82,9 @@ jobs:
         ANVIL_RUN_HF_E2E: "1"
       run: cargo test -p anvil-server --test docker_cluster_test --test hf_ingestion_e2e -- --nocapture --test-threads=1
 
-    # --- Release Steps ---
-    # These steps will only run on a successful push to the main branch.
+    # --- Docker publication ---
+    # Main branch pushes publish the server image. GitHub releases are created
+    # separately after docs and the Rust client crate are published.
 
     - name: Log in to GitHub Container Registry
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -93,7 +94,7 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Generate release tag
+    - name: Generate image tag
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
       id: tag
       run: echo "tag_name=v$(date +'%Y.%m.%d-%H%M%S')" >> $GITHUB_OUTPUT
@@ -121,33 +122,3 @@ jobs:
         platforms: linux/amd64
         cache-from: type=gha
         cache-to: type=gha,mode=max
-
-    - name: Prepare Release Assets
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-      run: |
-        mkdir -p release
-        image_ref="$(echo '${{ steps.meta.outputs.tags }}' | head -n1)"
-        container_id="$(docker create "$image_ref")"
-        trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
-        docker cp "$container_id":/usr/local/bin/anvil release/anvil-server
-        docker cp "$container_id":/usr/local/bin/anvil-cli release/anvil-cli
-        docker cp "$container_id":/usr/local/bin/admin release/anvil-admin
-
-    - name: Create GitHub Release
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: ${{ steps.tag.outputs.tag_name }}
-        generate_release_notes: true
-        body: |
-          ## Docker Image
-
-          You can pull the latest image using the following command:
-
-          ```sh
-          docker pull ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.tag_name }}
-          ```
-        files: |
-          release/anvil-server
-          release/anvil-cli
-          release/anvil-admin
