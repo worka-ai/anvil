@@ -728,28 +728,15 @@ impl AppState {
             }
         }
 
-        let (text_weight, vector_weight) = match (has_text, has_vector) {
-            (true, true) => (0.55, 0.35),
-            (true, false) => (1.0, 0.0),
-            (false, true) => (0.0, 1.0),
+        let (text_weight, vector_weight, freshness_weight) = match (has_text, has_vector) {
+            (true, true) => (0.55, 0.35, 0.10),
+            (true, false) => (1.0, 0.0, 0.0),
+            (false, true) => (0.0, 1.0, 0.0),
             (false, false) => unreachable!("validated above"),
         };
-        let mut ranked = combined.into_values().collect::<Vec<_>>();
-        for item in &mut ranked {
-            item.score = item
-                .text_score
-                .mul_add(text_weight, item.vector_score * vector_weight);
-        }
-        ranked.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.object_version_id.cmp(&right.object_version_id))
-        });
 
-        let mut hits = Vec::with_capacity(ranked.len().min(requested_limit));
-        for item in ranked {
+        let mut candidates = Vec::new();
+        for item in combined.into_values() {
             let object_ref = match self
                 .object_ref_for_query_hit(bucket.id, item.object_version_id)
                 .await?
@@ -773,6 +760,34 @@ impl AppState {
             {
                 continue;
             }
+            candidates.push(HybridCandidate { item, object_ref });
+        }
+
+        score_hybrid_candidates(
+            &mut candidates,
+            has_text,
+            has_vector,
+            text_weight,
+            vector_weight,
+            freshness_weight,
+        );
+        candidates.sort_by(|left, right| {
+            right
+                .item
+                .score
+                .partial_cmp(&left.item.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    left.item
+                        .object_version_id
+                        .cmp(&right.item.object_version_id)
+                })
+        });
+
+        let mut hits = Vec::with_capacity(candidates.len().min(requested_limit));
+        for candidate in candidates {
+            let item = candidate.item;
+            let object_ref = candidate.object_ref;
             hits.push(IndexQueryHit {
                 kind: "hybrid".to_string(),
                 score: item.score,
@@ -788,6 +803,9 @@ impl AppState {
                     "bucket_name": bucket.name,
                     "text_score": item.text_score,
                     "vector_score": item.vector_score,
+                    "freshness_score": item.freshness_score,
+                    "normalized_text_score": item.normalized_text_score,
+                    "normalized_vector_score": item.normalized_vector_score,
                 })
                 .to_string(),
             });
@@ -805,7 +823,7 @@ impl AppState {
                 "kind": "hybrid",
                 "text_weight": text_weight,
                 "vector_weight": vector_weight,
-                "freshness_weight": if has_text && has_vector { 0.10 } else { 0.0 }
+                "freshness_weight": freshness_weight
             })
             .to_string(),
         }))
@@ -927,6 +945,7 @@ impl AppState {
             object_version_id: version_id.to_string(),
             object_key: object.key,
             user_meta: object.user_meta,
+            created_at_nanos: object.created_at.timestamp_nanos_opt().unwrap_or(0),
         }))
     }
 
@@ -971,6 +990,7 @@ struct QueryObjectRef {
     object_version_id: String,
     object_key: String,
     user_meta: Option<JsonValue>,
+    created_at_nanos: i64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1063,6 +1083,9 @@ struct HybridAccum {
     text_score: f32,
     vector_score: f32,
     score: f32,
+    normalized_text_score: f32,
+    normalized_vector_score: f32,
+    freshness_score: f32,
     document_id: u64,
     field_id: u32,
     vector_id: u64,
@@ -1078,6 +1101,9 @@ impl HybridAccum {
             text_score: 0.0,
             vector_score: 0.0,
             score: 0.0,
+            normalized_text_score: 0.0,
+            normalized_vector_score: 0.0,
+            freshness_score: 0.0,
             document_id: 0,
             field_id: 0,
             vector_id: 0,
@@ -1085,6 +1111,70 @@ impl HybridAccum {
             source_start: 0,
             source_len: 0,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HybridCandidate {
+    item: HybridAccum,
+    object_ref: QueryObjectRef,
+}
+
+fn score_hybrid_candidates(
+    candidates: &mut [HybridCandidate],
+    has_text: bool,
+    has_vector: bool,
+    text_weight: f32,
+    vector_weight: f32,
+    freshness_weight: f32,
+) {
+    let max_text_score = candidates
+        .iter()
+        .map(|candidate| candidate.item.text_score.max(0.0))
+        .fold(0.0_f32, f32::max);
+    let max_vector_score = candidates
+        .iter()
+        .map(|candidate| candidate.item.vector_score.max(0.0))
+        .fold(0.0_f32, f32::max);
+    let (min_created_at, max_created_at) =
+        candidates
+            .iter()
+            .fold((i64::MAX, i64::MIN), |(min_seen, max_seen), candidate| {
+                (
+                    min_seen.min(candidate.object_ref.created_at_nanos),
+                    max_seen.max(candidate.object_ref.created_at_nanos),
+                )
+            });
+    let created_range = max_created_at.saturating_sub(min_created_at);
+
+    for candidate in candidates {
+        candidate.item.normalized_text_score = if has_text && max_text_score > f32::EPSILON {
+            candidate.item.text_score.max(0.0) / max_text_score
+        } else {
+            0.0
+        };
+        candidate.item.normalized_vector_score = if has_vector && max_vector_score > f32::EPSILON {
+            candidate.item.vector_score.max(0.0) / max_vector_score
+        } else {
+            0.0
+        };
+        candidate.item.freshness_score = if freshness_weight > 0.0 {
+            if created_range <= 0 {
+                1.0
+            } else {
+                candidate
+                    .object_ref
+                    .created_at_nanos
+                    .saturating_sub(min_created_at) as f32
+                    / created_range as f32
+            }
+        } else {
+            0.0
+        };
+        candidate.item.score = candidate.item.normalized_text_score.mul_add(
+            text_weight,
+            candidate.item.normalized_vector_score * vector_weight,
+        ) + candidate.item.freshness_score * freshness_weight;
     }
 }
 
@@ -1351,6 +1441,7 @@ mod tests {
                 "tenant": "alpha",
                 "nested": {"state": "open"}
             })),
+            ..Default::default()
         };
 
         assert!(filters.matches(&object_ref).unwrap());
@@ -1367,6 +1458,7 @@ mod tests {
             object_version_id: "version-1".to_string(),
             object_key: "docs/active/item.json".to_string(),
             user_meta: Some(serde_json::json!({"tenant": "beta"})),
+            ..Default::default()
         };
 
         assert!(!filters.matches(&object_ref).unwrap());
@@ -1380,5 +1472,60 @@ mod tests {
         };
 
         assert!(QueryFilters::from_request(&req).is_err());
+    }
+
+    #[test]
+    fn hybrid_scoring_normalizes_sources_and_applies_freshness() {
+        let mut candidates = vec![
+            HybridCandidate {
+                item: HybridAccum {
+                    text_score: 2.0,
+                    vector_score: 2.0,
+                    ..HybridAccum::new([1; 16])
+                },
+                object_ref: QueryObjectRef {
+                    created_at_nanos: 100,
+                    ..Default::default()
+                },
+            },
+            HybridCandidate {
+                item: HybridAccum {
+                    text_score: 2.0,
+                    vector_score: 2.0,
+                    ..HybridAccum::new([2; 16])
+                },
+                object_ref: QueryObjectRef {
+                    created_at_nanos: 200,
+                    ..Default::default()
+                },
+            },
+        ];
+
+        score_hybrid_candidates(&mut candidates, true, true, 0.55, 0.35, 0.10);
+
+        assert_eq!(candidates[0].item.normalized_text_score, 1.0);
+        assert_eq!(candidates[0].item.normalized_vector_score, 1.0);
+        assert_eq!(candidates[0].item.freshness_score, 0.0);
+        assert_eq!(candidates[1].item.freshness_score, 1.0);
+        assert!(candidates[1].item.score > candidates[0].item.score);
+    }
+
+    #[test]
+    fn hybrid_scoring_disables_freshness_for_single_source_queries() {
+        let mut candidates = vec![HybridCandidate {
+            item: HybridAccum {
+                text_score: 7.0,
+                ..HybridAccum::new([1; 16])
+            },
+            object_ref: QueryObjectRef {
+                created_at_nanos: 200,
+                ..Default::default()
+            },
+        }];
+
+        score_hybrid_candidates(&mut candidates, true, false, 1.0, 0.0, 0.0);
+
+        assert_eq!(candidates[0].item.score, 1.0);
+        assert_eq!(candidates[0].item.freshness_score, 0.0);
     }
 }

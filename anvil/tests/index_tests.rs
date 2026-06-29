@@ -2442,6 +2442,14 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
     assert_eq!(response.hits[0].vector_id, 1);
     let recipe: serde_json::Value = serde_json::from_str(&response.scoring_recipe_json).unwrap();
     assert_eq!(recipe["kind"], "hybrid");
+    assert_eq!(recipe["text_weight"], 0.55);
+    assert_eq!(recipe["vector_weight"], 0.35);
+    assert_eq!(recipe["freshness_weight"], 0.10);
+    let hit_metadata: serde_json::Value =
+        serde_json::from_str(&response.hits[0].metadata_json).unwrap();
+    assert_eq!(hit_metadata["normalized_text_score"], 1.0);
+    assert_eq!(hit_metadata["normalized_vector_score"], 1.0);
+    assert!(hit_metadata["freshness_score"].as_f64().is_some());
 
     let filtered = index_client
         .query_index(authorized(
