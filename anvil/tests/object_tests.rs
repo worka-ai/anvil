@@ -1421,6 +1421,88 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
     );
     assert_reserved_namespace_status(object_client.list_object_versions(versions_req).await);
 
+    for reserved_prefix in [
+        "_anvil/meta/",
+        "_anvil/index/",
+        "_anvil/watch/",
+        "_anvil/personaldb/",
+        "_anvil/git/",
+        "_anvil/tmp/",
+    ] {
+        let key = format!("{reserved_prefix}native-object-api");
+        let reserved_put_chunks = vec![
+            PutObjectRequest {
+                data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
+                    ObjectMetadata {
+                        bucket_name: bucket_name.clone(),
+                        object_key: key.clone(),
+                        mutation_context: Some(native_mutation_context(
+                            bucket_id,
+                            "reserved-prefix-put",
+                        )),
+                    },
+                )),
+            },
+            PutObjectRequest {
+                data: Some(anvil::anvil_api::put_object_request::Data::Chunk(
+                    b"must not persist".to_vec(),
+                )),
+            },
+        ];
+        let mut reserved_put = Request::new(tokio_stream::iter(reserved_put_chunks));
+        reserved_put.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+        assert_reserved_namespace_status(object_client.put_object(reserved_put).await);
+
+        let mut get_req = Request::new(GetObjectRequest {
+            bucket_name: bucket_name.clone(),
+            object_key: key.clone(),
+            version_id: None,
+        });
+        get_req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+        assert_reserved_namespace_status(object_client.get_object(get_req).await);
+
+        let mut head_req = Request::new(HeadObjectRequest {
+            bucket_name: bucket_name.clone(),
+            object_key: key,
+            version_id: None,
+        });
+        head_req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+        assert_reserved_namespace_status(object_client.head_object(head_req).await);
+
+        let mut list_req = Request::new(ListObjectsRequest {
+            bucket_name: bucket_name.clone(),
+            prefix: reserved_prefix.to_string(),
+            delimiter: String::new(),
+            start_after: String::new(),
+            max_keys: 100,
+        });
+        list_req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+        assert_reserved_namespace_status(object_client.list_objects(list_req).await);
+
+        let mut watch_req = Request::new(WatchPrefixRequest {
+            bucket_name: bucket_name.clone(),
+            prefix: reserved_prefix.to_string(),
+            after_cursor: 0,
+        });
+        watch_req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+        assert_reserved_namespace_status(object_client.watch_prefix(watch_req).await);
+    }
+
     let mut copy_from_reserved = Request::new(CopyObjectRequest {
         source_bucket_name: bucket_name.clone(),
         source_object_key: reserved_key.clone(),
