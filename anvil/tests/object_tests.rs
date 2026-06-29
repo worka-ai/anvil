@@ -2284,6 +2284,38 @@ async fn test_private_object_read_denied_before_payload_load() {
     assert_eq!(denied.code(), Code::PermissionDenied);
     assert_eq!(denied.message(), "Permission denied");
 
+    let mut denied_missing_req = Request::new(GetObjectRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: "private/not-created.bin".to_string(),
+        version_id: None,
+    });
+    denied_missing_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", limited_token).parse().unwrap(),
+    );
+    let denied_missing = object_client
+        .get_object(denied_missing_req)
+        .await
+        .expect_err("unauthorized missing object lookup must not reveal absence");
+    assert_eq!(denied_missing.code(), Code::PermissionDenied);
+    assert_eq!(denied_missing.message(), "Permission denied");
+
+    let mut denied_missing_head_req = Request::new(HeadObjectRequest {
+        bucket_name: bucket_name.clone(),
+        object_key: "private/not-created.bin".to_string(),
+        version_id: None,
+    });
+    denied_missing_head_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", limited_token).parse().unwrap(),
+    );
+    let denied_missing_head = object_client
+        .head_object(denied_missing_head_req)
+        .await
+        .expect_err("unauthorized missing HEAD must not reveal absence");
+    assert_eq!(denied_missing_head.code(), Code::PermissionDenied);
+    assert_eq!(denied_missing_head.message(), "Permission denied");
+
     let mut allowed_req = Request::new(GetObjectRequest {
         bucket_name,
         object_key,

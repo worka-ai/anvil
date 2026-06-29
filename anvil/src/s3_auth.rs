@@ -27,6 +27,7 @@ use time::{Date, Month, PrimitiveDateTime, Time as Tm};
 use tracing::{debug, info, warn};
 
 type HmacSha256 = Hmac<Sha256>;
+const SIGV4_MAX_CLOCK_SKEW: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone, Debug)]
 struct AwsChunkedVerification {
@@ -208,6 +209,13 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
             }
         },
     };
+    if !sigv4_timestamp_is_fresh(signing_time, SystemTime::now(), SIGV4_MAX_CLOCK_SKEW) {
+        warn!(access_key_id = %parsed.access_key_id, "SigV4 request timestamp outside allowed freshness window");
+        return Response::builder()
+            .status(403)
+            .body(Body::from("Request timestamp outside allowed SigV4 window"))
+            .unwrap();
+    }
 
     let host = effective_host(&parts);
     let scheme = detect_scheme(&parts.headers, &parts);
@@ -668,6 +676,26 @@ fn constant_time_eq_str(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
+fn sigv4_timestamp_is_fresh(
+    signing_time: SystemTime,
+    now: SystemTime,
+    allowed_skew: Duration,
+) -> bool {
+    if now
+        .duration_since(signing_time)
+        .is_ok_and(|elapsed| elapsed > allowed_skew)
+    {
+        return false;
+    }
+    if signing_time
+        .duration_since(now)
+        .is_ok_and(|ahead| ahead > allowed_skew)
+    {
+        return false;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,5 +787,30 @@ mod tests {
             .expect("unsigned legacy stream should decode");
 
         assert_eq!(decoded.as_ref(), b"hello world");
+    }
+
+    #[test]
+    fn sigv4_timestamp_freshness_accepts_only_allowed_clock_skew() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert!(sigv4_timestamp_is_fresh(
+            now - Duration::from_secs(60),
+            now,
+            SIGV4_MAX_CLOCK_SKEW
+        ));
+        assert!(sigv4_timestamp_is_fresh(
+            now + Duration::from_secs(60),
+            now,
+            SIGV4_MAX_CLOCK_SKEW
+        ));
+        assert!(!sigv4_timestamp_is_fresh(
+            now - Duration::from_secs(16 * 60),
+            now,
+            SIGV4_MAX_CLOCK_SKEW
+        ));
+        assert!(!sigv4_timestamp_is_fresh(
+            now + Duration::from_secs(16 * 60),
+            now,
+            SIGV4_MAX_CLOCK_SKEW
+        ));
     }
 }

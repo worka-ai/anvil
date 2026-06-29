@@ -887,13 +887,6 @@ message AbortMultipartResponse {
     uint64 watch_cursor = 6;
 }
 
-// Internal Service for node-to-node communication
-service InternalAnvilService {
-  rpc PutShard(stream PutShardRequest) returns (PutShardResponse);
-  rpc GetShard(GetShardRequest) returns (stream GetShardResponse);
-  rpc CommitShard(CommitShardRequest) returns (CommitShardResponse);
-  rpc DeleteShard(DeleteShardRequest) returns (DeleteShardResponse);
-}
 
 service AuthService {
   rpc GetAccessToken(GetAccessTokenRequest) returns (GetAccessTokenResponse);
@@ -1342,37 +1335,13 @@ message WatchPersonalDbProjectionResponse {
 }
 
 
-message PutShardRequest {
-    string upload_id = 1;
-    uint32 shard_index = 2;
-    bytes data = 3;
-}
 
-message PutShardResponse {}
 
-message CommitShardRequest {
-    string upload_id = 1;
-    uint32 shard_index = 2;
-    string final_object_hash = 3;
-}
 
-message CommitShardResponse {}
 
-message GetShardRequest {
-    string object_hash = 1;
-    uint32 shard_index = 2;
-}
 
-message GetShardResponse {
-    bytes data = 1;
-}
 
-message DeleteShardRequest {
-    string object_hash = 1;
-    uint32 shard_index = 2;
-}
 
-message DeleteShardResponse {}
 
 // ---------- Model Service ----------
 service ModelService {

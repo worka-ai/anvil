@@ -890,6 +890,16 @@ impl ObjectManager {
             .get_authorized_bucket(claims.as_ref(), &bucket_name)
             .await?;
 
+        if !bucket.is_public_read {
+            let claims = claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
+            if !self
+                .object_read_allowed(&claims, &bucket_name, &object_key, None)
+                .await?
+            {
+                return Err(Status::permission_denied("Permission denied"));
+            }
+        }
+
         let object = match version_id {
             Some(version_id) => {
                 let object = metadata_journal::read_object_version(
@@ -917,15 +927,6 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Object not found"))?,
         };
-        if !bucket.is_public_read {
-            let claims = claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
-            if !self
-                .object_read_allowed(&claims, &bucket_name, &object_key, None)
-                .await?
-            {
-                return Err(Status::permission_denied("Permission denied"));
-            }
-        }
 
         let (tx, rx) = mpsc::channel(4);
         let app_state = self.clone();
@@ -1285,6 +1286,16 @@ impl ObjectManager {
             .get_authorized_bucket(claims.as_ref(), bucket_name)
             .await?;
 
+        if !bucket.is_public_read {
+            let claims = claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
+            if !self
+                .object_read_allowed(&claims, bucket_name, object_key, None)
+                .await?
+            {
+                return Err(Status::permission_denied("Permission denied"));
+            }
+        }
+
         let object = match version_id {
             Some(version_id) => {
                 let object = metadata_journal::read_object_version(
@@ -1312,15 +1323,6 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Object not found"))?,
         };
-        if !bucket.is_public_read {
-            let claims = claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
-            if !self
-                .object_read_allowed(&claims, bucket_name, object_key, None)
-                .await?
-            {
-                return Err(Status::permission_denied("Permission denied"));
-            }
-        }
         Ok(object)
     }
 

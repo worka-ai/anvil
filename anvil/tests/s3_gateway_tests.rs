@@ -428,6 +428,22 @@ async fn test_s3_list_versions_and_get_filter_by_relationship_authorization() {
         "list permission alone must not reveal object keys"
     );
 
+    for key in [allowed_key, "docs/not-created.txt"] {
+        let head_denied = reader.head_object().bucket(&bucket).key(key).send().await;
+        let rendered = format!("{head_denied:?}");
+        assert!(
+            head_denied.is_err()
+                && (rendered.contains("403")
+                    || rendered.contains("Forbidden")
+                    || rendered.contains("Permission denied")),
+            "S3 HEAD without object read permission must be denied for {key}: {rendered}"
+        );
+        assert!(
+            !rendered.contains("NotFound"),
+            "S3 HEAD without object read permission must not reveal absence for {key}: {rendered}"
+        );
+    }
+
     let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
         .await
         .unwrap();
@@ -497,6 +513,14 @@ async fn test_s3_list_versions_and_get_filter_by_relationship_authorization() {
         .expect("relationship grant should allow S3 GET");
     let allowed_bytes = allowed.body.collect().await.unwrap().into_bytes();
     assert_eq!(allowed_bytes.as_ref(), b"allowed-v2");
+
+    reader
+        .head_object()
+        .bucket(&bucket)
+        .key(allowed_key)
+        .send()
+        .await
+        .expect("relationship grant should allow S3 HEAD");
 
     let denied = reader
         .get_object()
