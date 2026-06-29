@@ -7,23 +7,23 @@ description: Published Anvil artefacts and how each package is meant to be used.
 
 **What this page gives you:** a reference for the artefacts an Anvil release publishes and the audience for each artefact.
 
-Anvil ships multiple packages because developers and operators enter the system through different tools. Operators need a server image. Rust users may install crates and CLI tools. This release ships the Rust native client first; other language clients are outside the release scope. Everyone needs documentation matching the release.
+Anvil ships multiple packages because developers and operators enter the system through different tools. Operators need a server image. Rust developers may install the Rust client crate. Operators use the Docker image and release binaries. This release ships the Rust native client first; other language clients are outside the release scope. Everyone needs documentation matching the release.
 
 ## Docker image
 
 The Docker image runs the Anvil server. It exposes the native API and S3-compatible gateway according to runtime configuration. It should be pinned by version and smoke-tested before production rollout.
 
-## Rust crates
+## Rust crate
 
-| Package | Purpose |
-| --- | --- |
-| `anvil-storage-client` | Public Rust native API client with generated protocol bindings, bearer-token helpers, and typed service-client constructors. |
-| `anvil-storage-core` | Core types, storage engines, auth, indexes, PersonalDB services, and implementation internals. |
-| `anvil-storage-cli` | CLI implementation for user and admin command surfaces. |
-| `anvil-storage` | Server binary, admin binary, S3 gateway, and top-level release crate. |
-| `anvil-storage-test-utils` | Test utilities for integration tests and downstream validation when published. |
+| Package | Purpose | Published in this release |
+| --- | --- | --- |
+| `anvil-storage` | Public Rust native API client with generated protocol bindings, bearer-token helpers, and typed service-client constructors. | Yes |
+| `anvil-server` | Internal workspace package for server, admin binary, and S3 gateway builds. | No |
+| `anvil-storage-core` | Internal workspace package for storage engines, auth, indexes, PersonalDB services, and implementation internals. | No |
+| `anvil-storage-cli` | Internal workspace package for CLI implementation. | No |
+| `anvil-storage-test-utils` | Internal workspace package for integration tests and downstream validation. | No |
 
-Publish in dependency order.
+Only `anvil-storage` is a crates.io package for this release. The server is released as a Docker image and release binaries, not as a crates.io server crate.
 
 ## Non-Rust clients
 

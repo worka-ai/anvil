@@ -44,7 +44,7 @@ A tenant application can delegate only authority it already has. If `admin-api` 
 ```anvil-tabs
 {
   "operation": "GetAccessToken",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::GetAccessTokenRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, bootstrap_token).await?;\nlet response = anvil.auth().get_access_token(GetAccessTokenRequest {\n    client_id: \"admin-client-id\".into(),\n    client_secret: \"admin-client-secret\".into(),\n    scopes: vec![\n        \"policy:grant|bucket:documents/*\".into(),\n        \"authz:tuple_write|document/contract-42#viewer\".into(),\n    ],\n}).await?;\nlet admin_token = response.access_token;"
+  "rust": "use anvil_storage::{AnvilClient, proto::GetAccessTokenRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, bootstrap_token).await?;\nlet response = anvil.auth().get_access_token(GetAccessTokenRequest {\n    client_id: \"admin-client-id\".into(),\n    client_secret: \"admin-client-secret\".into(),\n    scopes: vec![\n        \"policy:grant|bucket:documents/*\".into(),\n        \"authz:tuple_write|document/contract-42#viewer\".into(),\n    ],\n}).await?;\nlet admin_token = response.access_token;"
 }
 ```
 
@@ -59,7 +59,7 @@ A tenant application can delegate only authority it already has. If `admin-api` 
 ```anvil-tabs
 {
   "operation": "GrantAccess",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::GrantAccessRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, admin_token).await?;\nanvil.grant_access(GrantAccessRequest {\n    grantee_app_id: \"reader-api\".into(),\n    resource: \"bucket:documents/*\".into(),\n    action: \"object:read\".into(),\n}).await?;"
+  "rust": "use anvil_storage::{AnvilClient, proto::GrantAccessRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, admin_token).await?;\nanvil.grant_access(GrantAccessRequest {\n    grantee_app_id: \"reader-api\".into(),\n    resource: \"bucket:documents/*\".into(),\n    action: \"object:read\".into(),\n}).await?;"
 }
 ```
 
@@ -74,7 +74,7 @@ A tenant application can delegate only authority it already has. If `admin-api` 
 ```anvil-tabs
 {
   "operation": "RevokeAccess",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::RevokeAccessRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, admin_token).await?;\nanvil.revoke_access(RevokeAccessRequest {\n    grantee_app_id: \"reader-api\".into(),\n    resource: \"bucket:documents/*\".into(),\n    action: \"object:read\".into(),\n}).await?;"
+  "rust": "use anvil_storage::{AnvilClient, proto::RevokeAccessRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, admin_token).await?;\nanvil.revoke_access(RevokeAccessRequest {\n    grantee_app_id: \"reader-api\".into(),\n    resource: \"bucket:documents/*\".into(),\n    action: \"object:read\".into(),\n}).await?;"
 }
 ```
 
@@ -89,7 +89,7 @@ A tenant application can delegate only authority it already has. If `admin-api` 
 ```anvil-tabs
 {
   "operation": "SetPublicAccess",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::SetPublicAccessRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, admin_token).await?;\nanvil.set_public_access(SetPublicAccessRequest {\n    bucket: \"public-assets\".into(),\n    allow_public_read: true,\n}).await?;"
+  "rust": "use anvil_storage::{AnvilClient, proto::SetPublicAccessRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, admin_token).await?;\nanvil.set_public_access(SetPublicAccessRequest {\n    bucket: \"public-assets\".into(),\n    allow_public_read: true,\n}).await?;"
 }
 ```
 
@@ -104,7 +104,7 @@ A tenant application can delegate only authority it already has. If `admin-api` 
 ```anvil-tabs
 {
   "operation": "WriteAuthzTuple",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::WriteAuthzTupleRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, admin_token).await?;\nlet response = anvil.auth().write_authz_tuple(WriteAuthzTupleRequest {\n    namespace: \"document\".into(),\n    object_id: \"contract-42\".into(),\n    relation: \"viewer\".into(),\n    subject_kind: \"user\".into(),\n    subject_id: \"amy\".into(),\n    caveat_hash: String::new(),\n    operation: \"add\".into(),\n    reason: \"grant contract visibility\".into(),\n}).await?;\nlet zookie = response.zookie;"
+  "rust": "use anvil_storage::{AnvilClient, proto::WriteAuthzTupleRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, admin_token).await?;\nlet response = anvil.auth().write_authz_tuple(WriteAuthzTupleRequest {\n    namespace: \"document\".into(),\n    object_id: \"contract-42\".into(),\n    relation: \"viewer\".into(),\n    subject_kind: \"user\".into(),\n    subject_id: \"amy\".into(),\n    caveat_hash: String::new(),\n    operation: \"add\".into(),\n    reason: \"grant contract visibility\".into(),\n}).await?;\nlet zookie = response.zookie;"
 }
 ```
 
@@ -119,7 +119,7 @@ A tenant application can delegate only authority it already has. If `admin-api` 
 ```anvil-tabs
 {
   "operation": "CheckPermission",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::CheckPermissionRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, reader_token).await?;\nlet response = anvil.auth().check_permission(CheckPermissionRequest {\n    namespace: \"document\".into(),\n    object_id: \"contract-42\".into(),\n    relation: \"viewer\".into(),\n    subject_kind: \"user\".into(),\n    subject_id: \"amy\".into(),\n    caveat_hash: String::new(),\n    consistency: \"at_least\".into(),\n    zookie,\n}).await?;\nassert!(response.allowed);"
+  "rust": "use anvil_storage::{AnvilClient, proto::CheckPermissionRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, reader_token).await?;\nlet response = anvil.auth().check_permission(CheckPermissionRequest {\n    namespace: \"document\".into(),\n    object_id: \"contract-42\".into(),\n    relation: \"viewer\".into(),\n    subject_kind: \"user\".into(),\n    subject_id: \"amy\".into(),\n    caveat_hash: String::new(),\n    consistency: \"at_least\".into(),\n    zookie,\n}).await?;\nassert!(response.allowed);"
 }
 ```
 
@@ -134,7 +134,7 @@ A tenant application can delegate only authority it already has. If `admin-api` 
 ```anvil-tabs
 {
   "operation": "WatchAuthzTupleLog",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::WatchAuthzTupleLogRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, admin_token).await?;\nlet mut stream = anvil.auth().watch_authz_tuple_log(WatchAuthzTupleLogRequest {\n    namespace: \"document\".into(),\n    after_revision: last_revision,\n}).await?;\nwhile let Some(event) = stream.message().await? {\n    println!(\"{} {}#{}\", event.revision, event.object_id, event.relation);\n}"
+  "rust": "use anvil_storage::{AnvilClient, proto::WatchAuthzTupleLogRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, admin_token).await?;\nlet mut stream = anvil.auth().watch_authz_tuple_log(WatchAuthzTupleLogRequest {\n    namespace: \"document\".into(),\n    after_revision: last_revision,\n}).await?;\nwhile let Some(event) = stream.message().await? {\n    println!(\"{} {}#{}\", event.revision, event.object_id, event.relation);\n}"
 }
 ```
 
@@ -149,7 +149,7 @@ A tenant application can delegate only authority it already has. If `admin-api` 
 ```anvil-tabs
 {
   "operation": "WatchAuthzNamespace",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::WatchAuthzNamespaceRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, admin_token).await?;\nlet mut stream = anvil.auth().watch_authz_namespace(WatchAuthzNamespaceRequest {\n    namespace: \"document\".into(),\n    after_cursor_low: last_cursor_low,\n    after_cursor_high: last_cursor_high,\n}).await?;\nwhile let Some(event) = stream.message().await? {\n    println!(\"{} {}\", event.namespace, event.schema_hash);\n}"
+  "rust": "use anvil_storage::{AnvilClient, proto::WatchAuthzNamespaceRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, admin_token).await?;\nlet mut stream = anvil.auth().watch_authz_namespace(WatchAuthzNamespaceRequest {\n    namespace: \"document\".into(),\n    after_cursor_low: last_cursor_low,\n    after_cursor_high: last_cursor_high,\n}).await?;\nwhile let Some(event) = stream.message().await? {\n    println!(\"{} {}\", event.namespace, event.schema_hash);\n}"
 }
 ```
 
@@ -164,7 +164,7 @@ A tenant application can delegate only authority it already has. If `admin-api` 
 ```anvil-tabs
 {
   "operation": "WatchAuthzDerivedLag",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::WatchAuthzDerivedLagRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, admin_token).await?;\nlet mut stream = anvil.auth().watch_authz_derived_lag(WatchAuthzDerivedLagRequest {\n    derived_index_id: \"userset-default\".into(),\n    after_cursor_low: last_cursor_low,\n    after_cursor_high: last_cursor_high,\n}).await?;\nwhile let Some(event) = stream.message().await? {\n    println!(\"lag={} latest={}\", event.revision_lag, event.latest_revision);\n}"
+  "rust": "use anvil_storage::{AnvilClient, proto::WatchAuthzDerivedLagRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, admin_token).await?;\nlet mut stream = anvil.auth().watch_authz_derived_lag(WatchAuthzDerivedLagRequest {\n    derived_index_id: \"userset-default\".into(),\n    after_cursor_low: last_cursor_low,\n    after_cursor_high: last_cursor_high,\n}).await?;\nwhile let Some(event) = stream.message().await? {\n    println!(\"lag={} latest={}\", event.revision_lag, event.latest_revision);\n}"
 }
 ```
 

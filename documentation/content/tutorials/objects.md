@@ -25,7 +25,7 @@ Writes object bytes and metadata as a new durable object version.
 ```anvil-tabs
 {
   "operation": "PutObject",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::PutObjectRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().put_object(PutObjectRequest { bucket_name: \"documents\".into(), object_key: \"projects/acme/contract.pdf\".into(), body: \"bytes\".into(), metadata: \"metadata\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::PutObjectRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().put_object(PutObjectRequest { bucket_name: \"documents\".into(), object_key: \"projects/acme/contract.pdf\".into(), body: \"bytes\".into(), metadata: \"metadata\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -38,7 +38,7 @@ Reads object metadata and body bytes for a selected version.
 ```anvil-tabs
 {
   "operation": "GetObject",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::GetObjectRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().get_object(GetObjectRequest { bucket_name: \"documents\".into(), object_key: \"projects/acme/contract.pdf\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::GetObjectRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().get_object(GetObjectRequest { bucket_name: \"documents\".into(), object_key: \"projects/acme/contract.pdf\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -51,7 +51,7 @@ Reads object metadata without streaming the body.
 ```anvil-tabs
 {
   "operation": "HeadObject",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::HeadObjectRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().head_object(HeadObjectRequest { bucket_name: \"documents\".into(), object_key: \"projects/acme/contract.pdf\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::HeadObjectRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().head_object(HeadObjectRequest { bucket_name: \"documents\".into(), object_key: \"projects/acme/contract.pdf\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -64,7 +64,7 @@ Lists objects by prefix and authorisation scope.
 ```anvil-tabs
 {
   "operation": "ListObjects",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::ListObjectsRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().list_objects(ListObjectsRequest { bucket_name: \"documents\".into(), prefix: \"projects/acme/\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::ListObjectsRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().list_objects(ListObjectsRequest { bucket_name: \"documents\".into(), prefix: \"projects/acme/\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -77,7 +77,7 @@ Lists previous object states for audit, recovery, or explicit version reads.
 ```anvil-tabs
 {
   "operation": "ListObjectVersions",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::ListObjectVersionsRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().list_object_versions(ListObjectVersionsRequest { bucket_name: \"documents\".into(), object_key: \"projects/acme/contract.pdf\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::ListObjectVersionsRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().list_object_versions(ListObjectVersionsRequest { bucket_name: \"documents\".into(), object_key: \"projects/acme/contract.pdf\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -90,7 +90,7 @@ Copies one object version to another key without the client re-uploading bytes.
 ```anvil-tabs
 {
   "operation": "CopyObject",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::CopyObjectRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().copy_object(CopyObjectRequest { source_bucket: \"documents\".into(), source_key: \"a.txt\".into(), target_bucket: \"documents\".into(), target_key: \"b.txt\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::CopyObjectRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().copy_object(CopyObjectRequest { source_bucket: \"documents\".into(), source_key: \"a.txt\".into(), target_bucket: \"documents\".into(), target_key: \"b.txt\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -103,7 +103,7 @@ Creates one object from ordered source object ranges or parts.
 ```anvil-tabs
 {
   "operation": "ComposeObject",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::ComposeObjectRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().compose_object(ComposeObjectRequest { bucket_name: \"documents\".into(), target_key: \"combined.bin\".into(), sources: \"sources\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::ComposeObjectRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().compose_object(ComposeObjectRequest { bucket_name: \"documents\".into(), target_key: \"combined.bin\".into(), sources: \"sources\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -116,7 +116,7 @@ Applies a structured JSON patch with preconditions.
 ```anvil-tabs
 {
   "operation": "PatchJsonObject",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::PatchJsonObjectRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().patch_json_object(PatchJsonObjectRequest { bucket_name: \"documents\".into(), object_key: \"record.json\".into(), patch: \"patch\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::PatchJsonObjectRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().patch_json_object(PatchJsonObjectRequest { bucket_name: \"documents\".into(), object_key: \"record.json\".into(), patch: \"patch\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -129,7 +129,7 @@ Updates a manifest only when its current version matches the expected value.
 ```anvil-tabs
 {
   "operation": "CompareAndSwapManifest",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::CompareAndSwapManifestRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().compare_and_swap_manifest(CompareAndSwapManifestRequest { bucket_name: \"documents\".into(), object_key: \"manifest.json\".into(), expected_version: \"v7\".into(), manifest: \"manifest\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::CompareAndSwapManifestRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().compare_and_swap_manifest(CompareAndSwapManifestRequest { bucket_name: \"documents\".into(), object_key: \"manifest.json\".into(), expected_version: \"v7\".into(), manifest: \"manifest\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -142,7 +142,7 @@ Streams object mutations below a bucket/key prefix.
 ```anvil-tabs
 {
   "operation": "WatchPrefix",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::WatchPrefixRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().watch_prefix(WatchPrefixRequest { bucket_name: \"documents\".into(), prefix: \"projects/acme/\".into(), after_cursor: \"lastCursor\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::WatchPrefixRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().watch_prefix(WatchPrefixRequest { bucket_name: \"documents\".into(), prefix: \"projects/acme/\".into(), after_cursor: \"lastCursor\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -155,7 +155,7 @@ Creates an ordered append stream for records that should become sealed segments.
 ```anvil-tabs
 {
   "operation": "CreateAppendStream",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::CreateAppendStreamRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().create_append_stream(CreateAppendStreamRequest { bucket_name: \"events\".into(), stream_name: \"audit\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::CreateAppendStreamRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().create_append_stream(CreateAppendStreamRequest { bucket_name: \"events\".into(), stream_name: \"audit\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -168,7 +168,7 @@ Appends one record to an active stream.
 ```anvil-tabs
 {
   "operation": "AppendStreamRecord",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::AppendStreamRecordRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().append_stream_record(AppendStreamRecordRequest { bucket_name: \"events\".into(), stream_name: \"audit\".into(), record: \"record\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::AppendStreamRecordRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().append_stream_record(AppendStreamRecordRequest { bucket_name: \"events\".into(), stream_name: \"audit\".into(), record: \"record\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -181,7 +181,7 @@ Closes the active segment and makes it durable for readers and derived systems.
 ```anvil-tabs
 {
   "operation": "SealAppendStreamSegment",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::SealAppendStreamSegmentRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().seal_append_stream_segment(SealAppendStreamSegmentRequest { bucket_name: \"events\".into(), stream_name: \"audit\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::SealAppendStreamSegmentRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().seal_append_stream_segment(SealAppendStreamSegmentRequest { bucket_name: \"events\".into(), stream_name: \"audit\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -194,7 +194,7 @@ Starts a large-object upload split into numbered parts.
 ```anvil-tabs
 {
   "operation": "InitiateMultipartUpload",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::InitiateMultipartUploadRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().initiate_multipart_upload(InitiateMultipartUploadRequest { bucket_name: \"media\".into(), object_key: \"video.mov\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::InitiateMultipartUploadRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().initiate_multipart_upload(InitiateMultipartUploadRequest { bucket_name: \"media\".into(), object_key: \"video.mov\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -207,7 +207,7 @@ Uploads one numbered part of a multipart object.
 ```anvil-tabs
 {
   "operation": "UploadPart",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::UploadPartRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().upload_part(UploadPartRequest { upload_id: \"uploadId\".into(), part_number: \"1\".into(), body: \"bytes\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::UploadPartRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().upload_part(UploadPartRequest { upload_id: \"uploadId\".into(), part_number: \"1\".into(), body: \"bytes\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -220,7 +220,7 @@ Assembles uploaded parts into the final object version.
 ```anvil-tabs
 {
   "operation": "CompleteMultipartUpload",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::CompleteMultipartUploadRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().complete_multipart_upload(CompleteMultipartUploadRequest { upload_id: \"uploadId\".into(), parts: \"parts\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::CompleteMultipartUploadRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().complete_multipart_upload(CompleteMultipartUploadRequest { upload_id: \"uploadId\".into(), parts: \"parts\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -233,7 +233,7 @@ Cancels an incomplete multipart upload and releases temporary state.
 ```anvil-tabs
 {
   "operation": "AbortMultipartUpload",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::AbortMultipartUploadRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().abort_multipart_upload(AbortMultipartUploadRequest { upload_id: \"uploadId\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::AbortMultipartUploadRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().abort_multipart_upload(AbortMultipartUploadRequest { upload_id: \"uploadId\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -246,7 +246,7 @@ Writes a delete marker or removes the current object state according to policy.
 ```anvil-tabs
 {
   "operation": "DeleteObject",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::DeleteObjectRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().delete_object(DeleteObjectRequest { bucket_name: \"documents\".into(), object_key: \"projects/acme/contract.pdf\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::DeleteObjectRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.objects().delete_object(DeleteObjectRequest { bucket_name: \"documents\".into(), object_key: \"projects/acme/contract.pdf\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 

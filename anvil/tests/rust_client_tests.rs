@@ -1,9 +1,9 @@
 use std::time::Duration;
 
-use anvil_storage_client::AnvilClient;
-use anvil_storage_client::proto::get_object_response;
-use anvil_storage_client::proto::put_object_request;
-use anvil_storage_client::proto::{
+use anvil_storage::AnvilClient;
+use anvil_storage::proto::get_object_response;
+use anvil_storage::proto::put_object_request;
+use anvil_storage::proto::{
     CreateBucketRequest, GetObjectRequest, ListBucketsRequest, NativeMutationContext,
     ObjectMetadata, PutObjectRequest,
 };

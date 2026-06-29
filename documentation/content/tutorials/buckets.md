@@ -25,7 +25,7 @@ Creates the policy and placement boundary that will hold related objects.
 ```anvil-tabs
 {
   "operation": "CreateBucket",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::CreateBucketRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.buckets().create_bucket(CreateBucketRequest { bucket_name: \"documents\".into(), region: \"eu-west-1\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::CreateBucketRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.buckets().create_bucket(CreateBucketRequest { bucket_name: \"documents\".into(), region: \"eu-west-1\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -38,7 +38,7 @@ Returns bucket boundaries visible to the caller.
 ```anvil-tabs
 {
   "operation": "ListBuckets",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::ListBucketsRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.buckets().list_buckets(Default::default()).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::ListBucketsRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.buckets().list_buckets(Default::default()).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -51,7 +51,7 @@ Reads the policy document currently attached to a bucket.
 ```anvil-tabs
 {
   "operation": "GetBucketPolicy",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::GetBucketPolicyRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.buckets().get_bucket_policy(GetBucketPolicyRequest { bucket_name: \"documents\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::GetBucketPolicyRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.buckets().get_bucket_policy(GetBucketPolicyRequest { bucket_name: \"documents\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -64,7 +64,7 @@ Replaces or creates a bucket policy using an explicit policy document.
 ```anvil-tabs
 {
   "operation": "PutBucketPolicy",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::PutBucketPolicyRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.buckets().put_bucket_policy(PutBucketPolicyRequest { bucket_name: \"documents\".into(), policy_json: \"{\\\"version\\\":\\\"2026-06-29\\\",\\\"statements\\\":[]}\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::PutBucketPolicyRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.buckets().put_bucket_policy(PutBucketPolicyRequest { bucket_name: \"documents\".into(), policy_json: \"{\\\"version\\\":\\\"2026-06-29\\\",\\\"statements\\\":[]}\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -77,7 +77,7 @@ Streams bucket metadata changes after a cursor.
 ```anvil-tabs
 {
   "operation": "WatchBucketMetadata",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::WatchBucketMetadataRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.buckets().watch_bucket_metadata(WatchBucketMetadataRequest { bucket_name: \"documents\".into(), after_cursor: \"lastCursor\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::WatchBucketMetadataRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.buckets().watch_bucket_metadata(WatchBucketMetadataRequest { bucket_name: \"documents\".into(), after_cursor: \"lastCursor\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -90,7 +90,7 @@ Deletes a bucket boundary after callers have decided how object lifecycle should
 ```anvil-tabs
 {
   "operation": "DeleteBucket",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::DeleteBucketRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.buckets().delete_bucket(DeleteBucketRequest { bucket_name: \"documents\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::DeleteBucketRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.buckets().delete_bucket(DeleteBucketRequest { bucket_name: \"documents\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 

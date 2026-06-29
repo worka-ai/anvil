@@ -1,5 +1,5 @@
 [package]
-name = "anvil-storage-client"
+name = "anvil-storage"
 version.workspace = true
 edition.workspace = true
 description = "Rust gRPC client for Anvil Storage"
@@ -15,7 +15,7 @@ categories.workspace = true
 exclude = ["target/**"]
 
 [lib]
-name = "anvil_storage_client"
+name = "anvil_storage"
 path = "src/lib.rs"
 
 [dependencies]

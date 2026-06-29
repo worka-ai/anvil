@@ -1,4 +1,4 @@
-use anvil_storage_client::{AnvilClient, BearerInterceptor, bearer_metadata, proto};
+use anvil_storage::{AnvilClient, BearerInterceptor, bearer_metadata, proto};
 use tonic::Request;
 use tonic::service::Interceptor;
 use tonic::transport::Endpoint;

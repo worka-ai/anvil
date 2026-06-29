@@ -1,13 +1,13 @@
 ---
 title: Release Checklist
-description: Build, test, package, publish, and verify Anvil server images, Rust crates, the Rust client, and documentation.
+description: Build, test, package, publish, and verify Anvil server images, release binaries, the Rust client crate, and documentation.
 ---
 
 # Release Checklist
 
 **What this page gives you:** a repeatable release process. You will know which artefacts must be built, which tests prove them, and what to verify after publishing.
 
-A release is not a tag. A release is a set of installable artefacts that operators and developers can use: server image, Rust crates, the Rust client, CLI, protocol files, and documentation. This release intentionally ships only the Rust native client; non-Rust client packages are not release artefacts yet.
+A release is not a tag. A release is a set of installable artefacts that operators and developers can use: server image, release binaries, the Rust client crate, protocol files, and documentation. This release intentionally ships only the Rust native client; non-Rust client packages are not release artefacts yet.
 
 ## Source verification
 
@@ -25,8 +25,8 @@ These checks prove the workspace builds and tests locally. They do not replace D
 Run environment-dependent suites when Docker and required network access are available:
 
 ```bash
-ANVIL_RUN_DOCKER_E2E=1 cargo test -p anvil-storage --test docker_cluster_test -- --nocapture
-ANVIL_RUN_HF_E2E=1 cargo test -p anvil-storage --test hf_ingestion_e2e -- --nocapture
+ANVIL_RUN_DOCKER_E2E=1 cargo test -p anvil-server --test docker_cluster_test -- --nocapture
+ANVIL_RUN_HF_E2E=1 cargo test -p anvil-server --test hf_ingestion_e2e -- --nocapture
 ```
 
 Ignored tests must be classified before release. An ignored test is either deliberately external, moved into CI with a required environment flag, or a release blocker.
@@ -47,38 +47,20 @@ Build the production image with a fixed version tag. Then run a smoke test that 
 - authorisation tuple check works;
 - metrics and logs are emitted.
 
-## Rust crates
+## Rust client crate
 
-Publish Rust crates in dependency order:
+The only crates.io artefact in this release is the Rust client crate:
 
-1. `anvil-storage-client`
-2. `anvil-storage-core`
-3. `anvil-storage`
-4. `anvil-storage-cli`
-5. `anvil-storage-test-utils` when publishing test support
+1. `anvil-storage`
 
-Run dry-runs before publishing packages whose dependencies are already available to Cargo:
+The server, admin binary, CLI implementation, core implementation crates, and test utilities are not published to crates.io in this release. Server distribution is through the Docker image and release binaries.
+
+Validate the client crate before publishing:
 
 ```bash
-cargo publish --dry-run -p anvil-storage-client
-cargo publish --dry-run -p anvil-storage-core
-```
-
-Then publish in order. The server and CLI crates depend on the core crate by its registry package name, so their dry-runs should be run after `anvil-storage-core` is published or staged in the target registry:
-
-```bash
+cargo test -p anvil-storage
+cargo test -p anvil-server --test rust_client_tests
 cargo publish --dry-run -p anvil-storage
-cargo publish --dry-run -p anvil-storage-cli
-```
-
-## Rust client
-
-The Rust client crate is the only native client package shipped in this release. It must compile, run its tests, package cleanly, and expose generated protocol bindings plus bearer-token helpers.
-
-```bash
-cargo test -p anvil-storage-client
-cargo test -p anvil-storage --test rust_client_tests
-cargo publish --dry-run -p anvil-storage-client
 ```
 
 The first command proves the package API and generated bindings build in isolation. The second command starts a live Anvil node and proves the published Rust client can create a bucket, list buckets, stream an object upload, and stream the object back through the native API.
@@ -101,8 +83,8 @@ The site must teach concepts, guide developers, guide operators, and provide exa
 After publishing:
 
 1. Pull the image by tag and rerun smoke tests.
-2. Install the Rust CLI from the published crate and run read/write checks.
-3. Install the Rust client crate in a fresh project and call a read-only API.
+2. Download or extract the release CLI binary and run read/write checks.
+3. Install the `anvil-storage` Rust client crate in a fresh project and call a read-only API.
 4. Open the documentation site and verify navigation and search.
 5. Record versions, checksums, release notes, and known limitations, including that non-Rust native clients are not part of this release.
 

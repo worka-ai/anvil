@@ -25,7 +25,7 @@ Stores a source pack and indexes commit, tree, and blob records.
 ```anvil-tabs
 {
   "operation": "PutGitPack",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::PutGitPackRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.git_sources().put_git_pack(PutGitPackRequest { repository_id: \"repo-1\".into(), bucket_name: \"source-artifacts\".into(), pack: \"packBytes\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::PutGitPackRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.git_sources().put_git_pack(PutGitPackRequest { repository_id: \"repo-1\".into(), bucket_name: \"source-artifacts\".into(), pack: \"packBytes\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -38,7 +38,7 @@ Finds where a Git object is stored inside source artefact packs.
 ```anvil-tabs
 {
   "operation": "GetGitObject",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::GetGitObjectRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.git_sources().get_git_object(GetGitObjectRequest { repository_id: \"repo-1\".into(), object_id: \"abc123\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::GetGitObjectRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.git_sources().get_git_object(GetGitObjectRequest { repository_id: \"repo-1\".into(), object_id: \"abc123\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -51,7 +51,7 @@ Resolves a repository commit and path to the stored blob location.
 ```anvil-tabs
 {
   "operation": "GetGitBlobByPath",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::GetGitBlobByPathRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.git_sources().get_git_blob_by_path(GetGitBlobByPathRequest { repository_id: \"repo-1\".into(), commit_id: \"main\".into(), tree_path: \"src/lib.rs\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::GetGitBlobByPathRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.git_sources().get_git_blob_by_path(GetGitBlobByPathRequest { repository_id: \"repo-1\".into(), commit_id: \"main\".into(), tree_path: \"src/lib.rs\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -64,7 +64,7 @@ Lists source tree entries below a commit prefix.
 ```anvil-tabs
 {
   "operation": "ListGitTree",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::ListGitTreeRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.git_sources().list_git_tree(ListGitTreeRequest { repository_id: \"repo-1\".into(), commit_id: \"main\".into(), prefix: \"src/\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::ListGitTreeRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.git_sources().list_git_tree(ListGitTreeRequest { repository_id: \"repo-1\".into(), commit_id: \"main\".into(), prefix: \"src/\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -77,7 +77,7 @@ Streams source artefact index events.
 ```anvil-tabs
 {
   "operation": "WatchGitSource",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::WatchGitSourceRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.git_sources().watch_git_source(WatchGitSourceRequest { repository_id: \"repo-1\".into(), after_cursor: \"lastCursor\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::WatchGitSourceRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.git_sources().watch_git_source(WatchGitSourceRequest { repository_id: \"repo-1\".into(), after_cursor: \"lastCursor\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -90,7 +90,7 @@ Writes a structured model manifest that points at tensor artefacts.
 ```anvil-tabs
 {
   "operation": "PutModelManifest",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::PutModelManifestRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.models().put_model_manifest(PutModelManifestRequest { model_id: \"model-1\".into(), manifest: \"manifest\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::PutModelManifestRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.models().put_model_manifest(PutModelManifestRequest { model_id: \"model-1\".into(), manifest: \"manifest\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -103,7 +103,7 @@ Lists tensors described by a model manifest.
 ```anvil-tabs
 {
   "operation": "ListTensors",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::ListTensorsRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.models().list_tensors(ListTensorsRequest { model_id: \"model-1\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::ListTensorsRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.models().list_tensors(ListTensorsRequest { model_id: \"model-1\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -116,7 +116,7 @@ Streams one tensor payload.
 ```anvil-tabs
 {
   "operation": "GetTensor",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::GetTensorRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.models().get_tensor(GetTensorRequest { model_id: \"model-1\".into(), tensor_name: \"encoder.weight\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::GetTensorRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.models().get_tensor(GetTensorRequest { model_id: \"model-1\".into(), tensor_name: \"encoder.weight\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -129,7 +129,7 @@ Streams multiple tensor payloads.
 ```anvil-tabs
 {
   "operation": "GetTensors",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::GetTensorsRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.models().get_tensors(GetTensorsRequest { model_id: \"model-1\".into(), tensor_names: \"[\\\"encoder.weight\\\",\\\"decoder.weight\\\"]\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::GetTensorsRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.models().get_tensors(GetTensorsRequest { model_id: \"model-1\".into(), tensor_names: \"[\\\"encoder.weight\\\",\\\"decoder.weight\\\"]\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -142,7 +142,7 @@ Stores an external ingestion credential by name without returning the secret.
 ```anvil-tabs
 {
   "operation": "CreateKey",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::CreateKeyRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.hugging_face_keys().create_key(CreateKeyRequest { name: \"hf-production\".into(), token: \"secret\".into(), note: \"release imports\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::CreateKeyRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.hugging_face_keys().create_key(CreateKeyRequest { name: \"hf-production\".into(), token: \"secret\".into(), note: \"release imports\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -155,7 +155,7 @@ Lists stored ingestion credentials without exposing secret values.
 ```anvil-tabs
 {
   "operation": "ListKeys",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::ListKeysRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.hugging_face_keys().list_keys(Default::default()).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::ListKeysRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.hugging_face_keys().list_keys(Default::default()).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -168,7 +168,7 @@ Deletes an external ingestion credential.
 ```anvil-tabs
 {
   "operation": "DeleteKey",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::DeleteKeyRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.hugging_face_keys().delete_key(DeleteKeyRequest { name: \"hf-production\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::DeleteKeyRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.hugging_face_keys().delete_key(DeleteKeyRequest { name: \"hf-production\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -181,7 +181,7 @@ Starts an import job into a target bucket and prefix.
 ```anvil-tabs
 {
   "operation": "StartIngestion",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::StartIngestionRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.hf_ingestion().start_ingestion(StartIngestionRequest { key_name: \"hf-production\".into(), repo: \"org/model\".into(), target_bucket: \"models\".into(), target_prefix: \"imports/model/\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::StartIngestionRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.hf_ingestion().start_ingestion(StartIngestionRequest { key_name: \"hf-production\".into(), repo: \"org/model\".into(), target_bucket: \"models\".into(), target_prefix: \"imports/model/\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -194,7 +194,7 @@ Reads import progress, completion, or failure state.
 ```anvil-tabs
 {
   "operation": "GetIngestionStatus",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::GetIngestionStatusRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.hf_ingestion().get_ingestion_status(GetIngestionStatusRequest { ingestion_id: \"ingestionId\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::GetIngestionStatusRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.hf_ingestion().get_ingestion_status(GetIngestionStatusRequest { ingestion_id: \"ingestionId\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -207,7 +207,7 @@ Requests cancellation of an active import job.
 ```anvil-tabs
 {
   "operation": "CancelIngestion",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::CancelIngestionRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.hf_ingestion().cancel_ingestion(CancelIngestionRequest { ingestion_id: \"ingestionId\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::CancelIngestionRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.hf_ingestion().cancel_ingestion(CancelIngestionRequest { ingestion_id: \"ingestionId\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 

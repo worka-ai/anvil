@@ -4,11 +4,11 @@ This directory contains native API client packages generated from `anvil-core/pr
 
 ## Rust / crates.io
 
-Package: `anvil-storage-client`
+Package: `anvil-storage`
 
 ```sh
-cargo test -p anvil-storage-client
-cargo publish --dry-run -p anvil-storage-client
+cargo test -p anvil-storage
+cargo publish --dry-run -p anvil-storage
 ```
 
 The package ships generated protocol bindings, bearer-token helpers, and typed service-client constructors.

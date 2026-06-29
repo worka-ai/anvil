@@ -1,5 +1,5 @@
 [package]
-name = "anvil-storage"
+name = "anvil-server"
 version.workspace = true
 edition.workspace = true
 description = "Anvil object store server and native/S3 API implementation"
@@ -13,6 +13,7 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 exclude = [".env", "*.env", "anvil-data/**", "target/**"]
+publish = false
 
 [lib]
 name = "anvil"
@@ -134,7 +135,7 @@ bcrypt = "0.15"
 tonic-prost-build = { version = "0.14.2" }
 
 [dev-dependencies]
-anvil-storage-client = { path = "../clients/rust", version = "0.1.0" }
+anvil-storage = { path = "../clients/rust", version = "0.1.0" }
 anvil-test-utils = { package = "anvil-storage-test-utils", path = "../anvil-test-utils", version = "0.1.0" }
 aws-config = "1.1.7"
 aws-sdk-s3 = "1.18.0"

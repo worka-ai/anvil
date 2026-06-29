@@ -25,7 +25,7 @@ Creates a derived query structure for path, metadata, full text, vector, hybrid,
 ```anvil-tabs
 {
   "operation": "CreateIndex",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::CreateIndexRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.indexes().create_index(CreateIndexRequest { bucket_name: \"documents\".into(), name: \"documents_text\".into(), kind: \"full_text\".into(), selector_json: \"selector\".into(), extractor_json: \"extractor\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::CreateIndexRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.indexes().create_index(CreateIndexRequest { bucket_name: \"documents\".into(), name: \"documents_text\".into(), kind: \"full_text\".into(), selector_json: \"selector\".into(), extractor_json: \"extractor\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -38,7 +38,7 @@ Changes selector, extractor, authorisation, or build policy while preserving the
 ```anvil-tabs
 {
   "operation": "UpdateIndex",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::UpdateIndexRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.indexes().update_index(UpdateIndexRequest { bucket_name: \"documents\".into(), name: \"documents_text\".into(), selector_json: \"selector\".into(), extractor_json: \"extractor\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::UpdateIndexRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.indexes().update_index(UpdateIndexRequest { bucket_name: \"documents\".into(), name: \"documents_text\".into(), selector_json: \"selector\".into(), extractor_json: \"extractor\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -51,7 +51,7 @@ Lists index definitions for a bucket.
 ```anvil-tabs
 {
   "operation": "ListIndexes",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::ListIndexesRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.indexes().list_indexes(ListIndexesRequest { bucket_name: \"documents\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::ListIndexesRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.indexes().list_indexes(ListIndexesRequest { bucket_name: \"documents\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -64,7 +64,7 @@ Runs a path, metadata, full text, vector, or hybrid query and filters results th
 ```anvil-tabs
 {
   "operation": "QueryIndex",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::QueryIndexRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.indexes().query_index(QueryIndexRequest { bucket_name: \"documents\".into(), name: \"documents_text\".into(), query: \"query\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::QueryIndexRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.indexes().query_index(QueryIndexRequest { bucket_name: \"documents\".into(), name: \"documents_text\".into(), query: \"query\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -77,7 +77,7 @@ Streams index definition changes so clients and workers can react.
 ```anvil-tabs
 {
   "operation": "WatchIndexDefinition",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::WatchIndexDefinitionRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.indexes().watch_index_definition(WatchIndexDefinitionRequest { bucket_name: \"documents\".into(), after_cursor: \"lastCursor\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::WatchIndexDefinitionRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.indexes().watch_index_definition(WatchIndexDefinitionRequest { bucket_name: \"documents\".into(), after_cursor: \"lastCursor\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -90,7 +90,7 @@ Streams partition progress and generation changes for derived index work.
 ```anvil-tabs
 {
   "operation": "WatchIndexPartition",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::WatchIndexPartitionRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.indexes().watch_index_partition(WatchIndexPartitionRequest { bucket_name: \"documents\".into(), name: \"documents_text\".into(), partition: \"0\".into(), after_cursor: \"lastCursor\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::WatchIndexPartitionRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.indexes().watch_index_partition(WatchIndexPartitionRequest { bucket_name: \"documents\".into(), name: \"documents_text\".into(), partition: \"0\".into(), after_cursor: \"lastCursor\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -103,7 +103,7 @@ Returns index build and query findings that explain lag, failures, or repair sta
 ```anvil-tabs
 {
   "operation": "ListIndexDiagnostics",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::ListIndexDiagnosticsRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.indexes().list_index_diagnostics(ListIndexDiagnosticsRequest { bucket_name: \"documents\".into(), name: \"documents_text\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::ListIndexDiagnosticsRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.indexes().list_index_diagnostics(ListIndexDiagnosticsRequest { bucket_name: \"documents\".into(), name: \"documents_text\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -116,7 +116,7 @@ Stops an index from serving new queries without deleting its definition immediat
 ```anvil-tabs
 {
   "operation": "DisableIndex",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::DisableIndexRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.indexes().disable_index(DisableIndexRequest { bucket_name: \"documents\".into(), name: \"documents_text\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::DisableIndexRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.indexes().disable_index(DisableIndexRequest { bucket_name: \"documents\".into(), name: \"documents_text\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -129,7 +129,7 @@ Removes the index definition and derived state when the query path is no longer 
 ```anvil-tabs
 {
   "operation": "DropIndex",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::DropIndexRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.indexes().drop_index(DropIndexRequest { bucket_name: \"documents\".into(), name: \"documents_text\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::DropIndexRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.indexes().drop_index(DropIndexRequest { bucket_name: \"documents\".into(), name: \"documents_text\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 

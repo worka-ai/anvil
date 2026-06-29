@@ -73,8 +73,8 @@ S3 compatibility is a release priority. Changes to request signing, streaming up
 An Anvil release is expected to include:
 
 - the server image;
-- Rust crates and CLI packages;
-- Rust client package metadata and generated client bindings;
+- the Rust client crate;
+- Rust client package metadata and generated protocol bindings;
 - the Fission documentation site;
 - S3 compatibility smoke tests;
 - operator-facing release notes and verification evidence.

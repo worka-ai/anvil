@@ -25,7 +25,7 @@ Rebuilds or validates index derived state from source object facts.
 ```anvil-tabs
 {
   "operation": "RepairIndex",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::RepairIndexRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.repair().repair_index(RepairIndexRequest { bucket_name: \"documents\".into(), name: \"documents_text\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::RepairIndexRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.repair().repair_index(RepairIndexRequest { bucket_name: \"documents\".into(), name: \"documents_text\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -38,7 +38,7 @@ Rebuilds or validates path listing structures.
 ```anvil-tabs
 {
   "operation": "RepairDirectoryIndex",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::RepairDirectoryIndexRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.repair().repair_directory_index(RepairDirectoryIndexRequest { bucket_name: \"documents\".into(), prefix: \"projects/acme/\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::RepairDirectoryIndexRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.repair().repair_directory_index(RepairDirectoryIndexRequest { bucket_name: \"documents\".into(), prefix: \"projects/acme/\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -51,7 +51,7 @@ Rebuilds authorisation-derived views from source tuple and namespace facts.
 ```anvil-tabs
 {
   "operation": "RepairAuthzDerivedIndex",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::RepairAuthzDerivedIndexRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.repair().repair_authz_derived_index(RepairAuthzDerivedIndexRequest { namespace: \"document\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::RepairAuthzDerivedIndexRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.repair().repair_authz_derived_index(RepairAuthzDerivedIndexRequest { namespace: \"document\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -64,7 +64,7 @@ Validates PersonalDB commit chains and reports required recovery work.
 ```anvil-tabs
 {
   "operation": "RepairPersonalDbLogChain",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::RepairPersonalDbLogChainRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.repair().repair_personal_db_log_chain(RepairPersonalDbLogChainRequest { group_id: \"notes\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::RepairPersonalDbLogChainRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.repair().repair_personal_db_log_chain(RepairPersonalDbLogChainRequest { group_id: \"notes\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -77,7 +77,7 @@ Reads repair diagnostics produced by repair jobs.
 ```anvil-tabs
 {
   "operation": "ListRepairFindings",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::ListRepairFindingsRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.repair().list_repair_findings(ListRepairFindingsRequest { scope: \"documents\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::ListRepairFindingsRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.repair().list_repair_findings(ListRepairFindingsRequest { scope: \"documents\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -93,7 +93,7 @@ Node-to-node storage write used by Anvil internals, not public application code.
 ```anvil-tabs
 {
   "operation": "PutShard",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::PutShardRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.internal().put_shard(PutShardRequest { shard_id: \"shard\".into(), body: \"bytes\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::PutShardRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.internal().put_shard(PutShardRequest { shard_id: \"shard\".into(), body: \"bytes\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -109,7 +109,7 @@ Node-to-node storage read used by Anvil internals, not public application code.
 ```anvil-tabs
 {
   "operation": "GetShard",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::GetShardRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.internal().get_shard(GetShardRequest { shard_id: \"shard\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::GetShardRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.internal().get_shard(GetShardRequest { shard_id: \"shard\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -125,7 +125,7 @@ Node-to-node shard commit used by Anvil internals, not public application code.
 ```anvil-tabs
 {
   "operation": "CommitShard",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::CommitShardRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.internal().commit_shard(CommitShardRequest { shard_id: \"shard\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::CommitShardRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.internal().commit_shard(CommitShardRequest { shard_id: \"shard\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 
@@ -141,7 +141,7 @@ Node-to-node shard deletion used by Anvil internals, not public application code
 ```anvil-tabs
 {
   "operation": "DeleteShard",
-  "rust": "use anvil_storage_client::{AnvilClient, proto::DeleteShardRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.internal().delete_shard(DeleteShardRequest { shard_id: \"shard\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
+  "rust": "use anvil_storage::{AnvilClient, proto::DeleteShardRequest};\n\nlet anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;\nlet response = anvil.internal().delete_shard(DeleteShardRequest { shard_id: \"shard\".into(), ..Default::default() }).await?;\nprintln!(\"{response:?}\");"
 }
 ```
 

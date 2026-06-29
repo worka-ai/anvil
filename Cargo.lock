@@ -191,12 +191,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "anvil-storage"
+name = "anvil-server"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
- "anvil-storage-client",
+ "anvil-storage",
  "anvil-storage-core",
  "anvil-storage-test-utils",
  "anyhow",
@@ -277,10 +277,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "anvil-storage"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
 name = "anvil-storage-cli"
 version = "0.1.0"
 dependencies = [
- "anvil-storage",
+ "anvil-server",
  "anyhow",
  "base64 0.22.1",
  "clap",
@@ -295,17 +306,6 @@ dependencies = [
  "tonic",
  "tonic-build",
  "uuid",
-]
-
-[[package]]
-name = "anvil-storage-client"
-version = "0.1.0"
-dependencies = [
- "prost",
- "tokio",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
 ]
 
 [[package]]
@@ -397,7 +397,7 @@ dependencies = [
 name = "anvil-storage-test-utils"
 version = "0.1.0"
 dependencies = [
- "anvil-storage",
+ "anvil-server",
  "anvil-storage-core",
  "anyhow",
  "aws-config",

@@ -26,7 +26,7 @@ fn cargo_path() -> String {
 fn get_admin_path() -> &'static str {
     ADMIN_PATH.get_or_init(|| {
         let status = Command::new(cargo_path())
-            .args(&["build", "--package", "anvil-storage", "--bin", "admin"])
+            .args(&["build", "--package", "anvil-server", "--bin", "admin"])
             .status()
             .expect("Failed to build admin");
         assert!(status.success());
