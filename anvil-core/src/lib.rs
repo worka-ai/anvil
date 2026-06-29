@@ -72,7 +72,6 @@ pub mod personaldb_submit;
 pub mod personaldb_watch;
 pub mod placement;
 pub mod repair_finding;
-pub mod s3_auth;
 pub mod search_query;
 pub mod services;
 pub mod sharding;
