@@ -9,6 +9,7 @@ use anvil::anvil_api::{
 };
 use anvil::anvil_personaldb_sqlite_changeset::iterate_changeset;
 use anvil::formats::hash32;
+use anvil::partition_fence::read_partition_owner;
 use anvil::personaldb_envelope::{
     PersonalDbEnvelopeDerivationInput, derive_verified_mutation_envelope,
 };
@@ -506,6 +507,129 @@ async fn personaldb_concurrent_same_base_submits_publish_one_witness_commit() {
     assert_eq!(
         caught_up.entries[0].log_record.as_ref().unwrap().entry_hash,
         successes[0].log_hash
+    );
+}
+
+#[tokio::test]
+async fn personaldb_group_owner_transfer_commits_once_across_nodes() {
+    let mut cluster = TestCluster::new(&["test-region-1", "test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(20)).await;
+
+    let token = cluster.token.clone();
+    let database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+    let mut node_a = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut node_b = PersonalDbServiceClient::connect(cluster.grpc_addrs[1].clone())
+        .await
+        .unwrap();
+
+    let genesis_hash = create_group(&mut node_a, &token, &database_id).await;
+    let first = node_a
+        .submit_personal_db_changeset(authorized(
+            submit_request(
+                &database_id,
+                &genesis_hash,
+                &token,
+                sqlite_insert_changeset_with_item(1, "alpha", &[1_u8, 2, 3]),
+            ),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.log_index, 1);
+
+    let partition_id = personaldb_group_partition_id_for_test(1, &database_id);
+    let first_owner = read_partition_owner(
+        &cluster.states[0].storage,
+        "personaldb_group",
+        &partition_id,
+        cluster.states[0]
+            .config
+            .anvil_secret_encryption_key
+            .as_bytes(),
+    )
+    .await
+    .unwrap()
+    .expect("first commit writes partition owner");
+    assert_eq!(first_owner.owner_node_id, cluster.grpc_addrs[0]);
+
+    let second = node_b
+        .submit_personal_db_changeset(authorized(
+            submit_request_at_base(
+                &database_id,
+                first.log_index,
+                &first.log_hash,
+                &token,
+                sqlite_insert_changeset_with_item(2, "beta", &[4_u8, 5, 6]),
+            ),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second.log_index, 2);
+
+    let second_owner = read_partition_owner(
+        &cluster.states[0].storage,
+        "personaldb_group",
+        &partition_id,
+        cluster.states[0]
+            .config
+            .anvil_secret_encryption_key
+            .as_bytes(),
+    )
+    .await
+    .unwrap()
+    .expect("second commit publishes new partition owner");
+    assert_eq!(second_owner.owner_node_id, cluster.grpc_addrs[1]);
+    assert_eq!(second_owner.fence_token, first_owner.fence_token + 1);
+
+    let stale_base = node_a
+        .submit_personal_db_changeset(authorized(
+            submit_request_at_base(
+                &database_id,
+                first.log_index,
+                &first.log_hash,
+                &token,
+                sqlite_insert_changeset_with_item(3, "gamma", &[7_u8, 8, 9]),
+            ),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(stale_base.code(), Code::FailedPrecondition);
+
+    let caught_up = node_b
+        .catch_up_personal_db(authorized(
+            PersonalDbCatchUpRequest {
+                tenant_id: 1,
+                database_id: database_id.clone(),
+                principal: "test-app".to_string(),
+                replica_id: "replica-owner-transfer".to_string(),
+                have_log_index: 0,
+                have_log_hash: genesis_hash,
+                max_entries: 10,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!caught_up.snapshot_required);
+    assert_eq!(
+        caught_up.entries.len(),
+        2,
+        "owner handoff must not duplicate witnessed commits"
+    );
+    assert_eq!(
+        caught_up.entries[0].log_record.as_ref().unwrap().entry_hash,
+        first.log_hash
+    );
+    assert_eq!(
+        caught_up.entries[1].log_record.as_ref().unwrap().entry_hash,
+        second.log_hash
     );
 }
 
@@ -1731,6 +1855,12 @@ async fn create_group_with_schema(
         .await
         .unwrap();
     genesis_hash
+}
+
+fn personaldb_group_partition_id_for_test(tenant_id: i64, database_id: &str) -> String {
+    hex::encode(hash32(
+        format!("personaldb_group\0{tenant_id}\0{database_id}").as_bytes(),
+    ))
 }
 
 fn projection_definition(
