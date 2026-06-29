@@ -5,10 +5,10 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/worka-ai/anvil.git",
+    "url": "git+https://github.com/anvil-storage/anvil.git",
     "directory": "clients/typescript"
   },
-  "homepage": "https://github.com/worka-ai/anvil",
+  "homepage": "https://github.com/anvil-storage/anvil",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

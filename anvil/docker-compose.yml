@@ -6,7 +6,7 @@ networks:
 
 services:
   anvil1:
-    image: ghcr.io/worka-ai/anvil:latest
+    image: ghcr.io/anvil-storage/anvil:latest
     environment:
       - RUST_LOG=info
       - REGION=DOCKER_TEST
@@ -33,7 +33,7 @@ services:
       retries: 5
 
   anvil2:
-    image: ghcr.io/worka-ai/anvil:latest
+    image: ghcr.io/anvil-storage/anvil:latest
     depends_on:
       anvil1:
         condition: service_started
@@ -58,7 +58,7 @@ services:
     networks: [anvilnet]
 
   anvil3:
-    image: ghcr.io/worka-ai/anvil:latest
+    image: ghcr.io/anvil-storage/anvil:latest
     depends_on:
       anvil1:
         condition: service_started
