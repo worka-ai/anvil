@@ -169,7 +169,7 @@ async fn hf_ingestion_config_json() {
         .get_access_token(anvil::anvil_api::GetAccessTokenRequest {
             client_id: client_id.clone(),
             client_secret: client_secret.clone(),
-            scopes: vec!["read:*".into(), "write:*".into(), "grant:*".into()],
+            scopes: vec!["*".into()],
         })
         .await
         .unwrap()
