@@ -5,57 +5,48 @@ description: Published Anvil artifacts and how each package is meant to be used.
 
 # Package Publishing
 
-**What this page achieves:** you will understand what Anvil publishes, which audience each artifact serves, and how the artifacts fit together.
+**What this page gives you:** a reference for the artifacts an Anvil release publishes and the audience for each artifact.
 
-Anvil releases ship multiple artifacts because different users enter the system in different ways. Operators need a server image. Rust developers may want crates. TypeScript and Python developers need packaged clients. Everyone needs documentation tied to the same release.
+Anvil ships multiple packages because developers and operators enter the system through different tools. Operators need a server image. Rust users may install crates and CLI tools. TypeScript and Python users need client packages. Everyone needs documentation matching the release.
 
 ## Docker image
 
-The Docker image runs the Anvil server. It is the standard deployment artifact for container environments. A release image should be pinned by version and verified with smoke tests before production rollout.
-
-The image is expected to expose the native API and S3-compatible gateway according to runtime configuration.
+The Docker image runs the Anvil server. It exposes the native API and S3-compatible gateway according to runtime configuration. It should be pinned by version and smoke-tested before production rollout.
 
 ## Rust crates
 
 | Package | Purpose |
 | --- | --- |
-| `anvil-storage-core` | Core types, generated protocol bindings, storage engines, auth, indexes, PersonalDB services, and implementation internals. |
-| `anvil-storage-cli` | Reusable CLI implementation for user and admin command surfaces. |
+| `anvil-storage-core` | Core types, protocol bindings, storage engines, auth, indexes, PersonalDB services, and implementation internals. |
+| `anvil-storage-cli` | CLI implementation for user and admin command surfaces. |
 | `anvil-storage` | Server binary, admin binary, S3 gateway, and top-level release crate. |
-| `anvil-storage-test-utils` | Test harness utilities for integration tests and downstream validation when published. |
+| `anvil-storage-test-utils` | Test utilities for integration tests and downstream validation when published. |
 
-Publish crates in dependency order so downstream packages can resolve versions cleanly.
+Publish in dependency order.
 
 ## TypeScript client
 
-The TypeScript package gives JavaScript and TypeScript applications a native API client surface. It should include generated code, type declarations, the protocol file, and examples showing authentication and a basic read/write flow.
-
-Use it when a Node.js service, web backend, or tooling script needs native Anvil APIs rather than S3 compatibility alone.
+The TypeScript package is for Node.js services, web backends, automation, and developer tooling that need native Anvil APIs rather than S3 compatibility alone. It should include generated code, type declarations, protocol files, and examples.
 
 ## Python client
 
-The Python package gives Python services and data workflows a native API client. It should include generated gRPC modules, protocol files, package metadata, and examples for connecting and issuing basic calls.
-
-Use it for data import, automation, analysis, model artifact workflows, and service integration.
+The Python package is for data workflows, importers, automation, model artifact tooling, and service integration. It should include generated gRPC modules, protocol files, package metadata, and connection examples.
 
 ## Documentation site
 
-The documentation site is part of the release. It teaches the model, guides developers, guides operators, and provides reference material. It should match the behavior of the released binaries and clients.
+The documentation site is part of the release. It teaches concepts, guides developers, guides operators, and provides reference material tied to the released behavior.
 
 ## Artifact relationship
-
-A typical adoption path is:
 
 ```text
 operator deploys Docker image
   -> administrator creates tenant/application credentials
-  -> developer installs Rust/TypeScript/Python client or configures S3 tool
+  -> developer installs a client or configures S3 tooling
   -> application writes objects and metadata
-  -> operator monitors indexes, authz, watches, and PersonalDB health
+  -> indexes, authz, watches, and PersonalDB services maintain derived state
+  -> operators monitor health and recoverability
 ```
-
-Each artifact supports one part of that path.
 
 ## What you can do after this page
 
-You should be able to identify which Anvil artifact a user needs and verify that a release includes all expected server, client, and documentation outputs.
+You should be able to identify which Anvil artifact a user needs and verify that a release includes every expected server, client, and documentation output.

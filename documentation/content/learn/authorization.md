@@ -1,90 +1,98 @@
 ---
 title: Authorization
-description: Learn identity, scopes, Zanzibar-style relationship authorization, caveats, and safe search.
+description: Learn authentication, authorization, token scopes, Zanzibar-style relationship tuples, caveats, and safe query exposure.
 ---
 
 # Authorization
 
-**What this page achieves:** you will understand the difference between authentication and authorization, why simple scopes are not enough for sharing, and how Anvil protects reads, writes, listings, search, and PersonalDB.
+**What this page gives you:** a clear model of who a caller is, what that caller may do, and how Anvil protects objects, listings, search results, watches, and PersonalDB state.
 
-Authentication answers: **who is calling?** Authorization answers: **what may that caller do?** A token can prove identity without granting permission to every object.
+Authentication and authorization are different.
 
-Anvil uses two complementary layers:
+Authentication answers: **who is calling?**
 
-1. token scopes for coarse service permissions;
-2. Zanzibar-style relationship tuples for fine-grained product permissions.
+Authorization answers: **is this caller allowed to do this action on this resource right now?**
 
-## Token scopes
+A valid identity is not enough. A user can be signed in and still not be allowed to read a private object, write a bucket, view a search snippet, or subscribe to a watch stream.
 
-A scope is an action-resource grant. Examples:
+## Coarse scopes
 
-```text
-bucket:create|*
-object:write|documents/tenants/acme/*
-object:read|documents/tenants/acme/projects/p-123/*
-index:read|documents/tenants/acme/*
-personaldb:commit|groups/acme-main
-```
+Anvil uses token scopes for coarse permissions. A scope is a bounded capability such as "read objects in this bucket" or "administer this tenant". Scopes are good for broad API access and service credentials.
 
-Scopes are fast and simple. They are useful for service accounts, ingestion jobs, administrative tools, and coarse boundaries. They are not expressive enough for rich sharing rules such as "members of the legal group may view contracts for projects they are assigned to unless a hold caveat is active".
+Scopes should be narrow. A backup job might need read access to a bucket but not permission to write authorization tuples. An ingestion worker might need write access to a prefix but not permission to delete objects.
 
-## Relationship tuples
+Scopes answer the first question: is this caller even allowed to use this API family or resource area?
 
-A relationship tuple states that a subject has a relation to an object:
+## Relationship authorization
+
+Product permissions are usually more detailed than scopes. A user might be a viewer on one document, an editor in one project, and an administrator in one workspace. Hard-coding user lists into every object is brittle.
+
+Anvil uses Zanzibar-style relationship authorization for fine-grained decisions. The model stores relationship facts called tuples:
 
 ```text
-document:contract-42#viewer@user:amy
-group:legal#member@user:amy
-document:contract-42#viewer@group:legal#member
+document:doc-42#viewer@user:amy
+project:p-123#editor@group:legal
+workspace:w-9#member@user:raj
 ```
 
-Read them as:
+A tuple says an object has a relationship to a subject. An authorization schema defines how relationships imply permissions. For example:
 
-- Amy is directly a viewer of contract 42;
-- Amy is a member of the legal group;
-- members of the legal group are viewers of contract 42.
+```text
+permission read_document = viewer or editor or owner or parent_project.viewer
+permission write_document = editor or owner
+```
 
-A namespace schema defines object types, relations, computed usersets, and tuple-to-userset rewrites. The schema tells Anvil what relationship paths are valid and how to evaluate them.
-
-## Why this is called Zanzibar-style authorization
-
-Zanzibar is a relationship-based authorization model popularized for large-scale systems. The key idea is that permissions are computed from relationship facts rather than copied into every object. Instead of writing a list of users into every document, you write relationship tuples and define how those relationships imply access.
-
-This matters because sharing is usually graph-shaped. Users belong to groups. Groups belong to organizations. Documents belong to folders. Folders belong to projects. Projects have members. A relationship model can express that structure without duplicating permission lists everywhere.
-
-## Derived authorization indexes
-
-Direct graph traversal can be expensive. Anvil maintains derived userset indexes from tuple writes and namespace schemas. These indexes precompute common relationship paths so checks stay fast.
-
-A permission check is not just a boolean. It is a boolean at a consistency point. Anvil can evaluate whether the derived authorization index has processed the revision needed for the requested operation. That is how search and listings avoid exposing stale or unauthorized results.
+Now permissions are computed from relationships rather than copied into every object.
 
 ## Caveats
 
-A caveat is a condition attached to a tuple. A relationship might be valid only until a timestamp, only for a region, only when a device posture is trusted, or only while a workflow state remains active.
+A caveat is a condition attached to a relationship. It can represent time, environment, purpose, or other policy context.
 
-Anvil validates caveat hashes and references before accepting tuple writes. That prevents a caller from inventing undefined authorization logic during a mutation. Caveat definitions are controlled schema material, not arbitrary code smuggled through object metadata.
+Examples:
 
-## Authorization and every read surface
+```text
+document:doc-42#viewer@user:amy with expires_at < 2026-12-31
+project:p-123#contractor@user:lee with network = trusted
+```
 
-Authorization must protect more than `GET object`. An attacker can learn sensitive information from search counts, prefix listings, object existence checks, vector neighbors, snippets, metadata filters, and database projection reads.
+Caveats must be defined and hashed so the system can verify exactly which condition is being used. An invalid caveat hash is a security error, not a warning.
+
+## Why search must be authorized
+
+Authorization must protect every exposure path, not only direct object reads. If a private document appears in a result count, snippet, vector neighbor, metadata facet, or watch event, the system has leaked information.
 
 Anvil applies authorization to:
 
-- object reads, writes, deletes, copies, and conditional updates;
-- prefix listing and metadata queries;
-- full text search;
+- object `GET`, `HEAD`, range reads, writes, copies, and deletes;
+- bucket listings and prefix queries;
+- metadata filters and facets;
+- full text results and snippets;
 - vector and hybrid search;
-- source artifact access;
-- watch subscriptions;
+- watch subscriptions and events;
 - PersonalDB group opens, commits, snapshots, and projections;
-- structured administrative APIs.
+- source and model artifact queries;
+- administrative diagnostics.
+
+The application should call Anvil with the caller identity and required action. It should not issue broad admin reads and filter later.
 
 ## Reserved namespaces
 
-Paths under `_anvil/` are denied before normal object authorization. They are Anvil-owned internal state. Public object APIs cannot read, list, write, copy, compose, patch, range-read, or delete them.
+Anvil owns internal paths under `_anvil/`. Public callers cannot read, list, write, copy, compose, delete, or range-read them. This is true even if a caller has broad bucket permissions.
 
-This is not a normal permission rule. It is a hard boundary. Safe information from internal state is exposed only through structured APIs that perform their own authorization checks.
+Reserved namespaces contain internal state such as index segments, authorization tuples, watch checkpoints, and PersonalDB material. Exposing them would bypass structured APIs and leak implementation details or sensitive policy state.
+
+## Authorization result categories
+
+A denied request can mean different things:
+
+| Result | Meaning | Correct response |
+| --- | --- | --- |
+| Unauthenticated | No valid caller identity. | Refresh credentials or sign in. |
+| Permission denied | Caller is known but lacks permission. | Hide the operation or request access. |
+| Invalid caveat | Policy reference is invalid. | Fix policy; do not retry blindly. |
+| Reserved namespace | Caller attempted internal path access. | Stop and fix the caller. |
+| Index not ready | Required derived authorization state is not current. | Wait or choose a weaker consistency only if safe. |
 
 ## What you can do after this page
 
-You should be able to explain scopes, relationship tuples, schemas, caveats, derived authorization indexes, and why authorization must be part of search. Next, learn how watch streams keep indexes and projections current.
+You should be able to explain scopes, relationship tuples, schemas, caveats, reserved namespaces, and why search and watches must be authorization-aware. Next, learn how watches keep indexes and derived state current.

@@ -1,102 +1,83 @@
 ---
 title: Identity And Access
-description: Operate tenants, applications, scopes, relationship tuples, schemas, and reserved namespaces.
+description: Operate Anvil authentication, scopes, relationship authorization schemas, tuples, caveats, and reserved namespace protections.
 ---
 
 # Identity And Access
 
-**What this page achieves:** you will know how to operate Anvil access control with least privilege, relationship authorization, auditability, and safe reserved namespace handling.
+**What this page gives you:** an operator's model for credentials, token scopes, relationship authorization, caveats, and safe access audits.
 
-Access control in Anvil protects every data exposure path: object reads, listings, search, vector results, watch streams, PersonalDB state, source artifacts, and administrative APIs. Operators need to understand both coarse token scopes and fine-grained relationship authorization.
+Anvil access control protects every data exposure path: object reads, listings, metadata filters, full text search, vector results, watch streams, PersonalDB state, source artifacts, and administrative APIs. Operators must manage both coarse API credentials and fine-grained relationship policy.
 
-## Tenants and applications
+## Identity layers
 
-A tenant is an administrative boundary. An application is a credentialed caller inside that boundary. Create separate applications for separate responsibilities.
+Anvil distinguishes several layers:
 
-Recommended pattern:
+1. **Credential material** proves a caller can request a token.
+2. **Token scopes** bound what broad API families and resources the caller may use.
+3. **Relationship tuples** define fine-grained product permissions.
+4. **Caveats** add conditional policy such as time or context.
+5. **Reserved namespace rules** protect internal paths regardless of normal object grants.
 
-| Application | Typical permissions |
-| --- | --- |
-| Ingestion service | Write specific buckets and metadata fields. |
-| User API service | Read/write product prefixes on behalf of users. |
-| Search worker | Read source objects and write derived index material through internal paths only via Anvil. |
-| Audit exporter | Read selected metadata and immutable logs. |
-| Break-glass admin | Broad rights, tightly controlled and monitored. |
+All layers matter. Broad credentials with weak relationship policy are unsafe. Strong relationship policy with leaked admin credentials is also unsafe.
 
-Avoid sharing one powerful application across unrelated services. When something goes wrong, you need to know which component had which authority.
+## Tenant and application credentials
 
-## Scope grants
+Create separate application credentials for separate jobs. A backup tool, ingestion worker, public API backend, and admin automation should not share one credential.
 
-A scope grant is an action-resource pattern:
+For each credential, document:
 
-```text
-bucket:create|*
-object:write|documents/tenants/acme/*
-object:read|documents/tenants/acme/*
-index:read|documents/*
-personaldb:commit|groups/acme-main
-```
+- owner;
+- purpose;
+- allowed buckets and prefixes;
+- allowed API families;
+- rotation process;
+- emergency revocation process;
+- expected request volume.
 
-Use the smallest scope that supports the job. Broad grants such as `*|*` are for controlled administration, not normal application traffic.
+## Relationship schemas
 
-Review scopes regularly. Remove grants when services are retired. Rotate application credentials after suspected exposure.
+A relationship schema defines object types, relations, and permissions. Review schemas like code. A small schema change can grant broad access.
 
-## Relationship authorization operations
+Good review questions:
 
-Relationship authorization is controlled through namespace schemas and tuple writes. Treat schema changes as production changes because they alter how permissions are computed.
+- Which relation grants read access?
+- Which relation grants write access?
+- Does parent inheritance match product expectations?
+- Are groups expanded correctly?
+- Are caveats required where time-bound access exists?
+- Can a user indirectly become an owner through an unexpected path?
 
-A safe workflow is:
+## Tuple operations
 
-1. Review the schema change.
-2. Validate tuple rewrite behavior in a staging tenant.
-3. Publish the schema revision.
-4. Monitor derived authorization index lag.
-5. Apply tuple writes with idempotency keys.
-6. Verify representative permission checks.
-7. Keep request ids for audit.
+Tuple writes are security mutations. They should be audited with request ids, actor identity, object, relation, subject, caveat reference, and source reason.
 
-Example tuple facts:
+Avoid broad tuple imports without validation. A malformed import can make data invisible or overexposed.
 
-```text
-workspace:ws-1#owner@user:amy
-workspace:ws-1#member@group:design#member
-document:doc-42#viewer@workspace:ws-1#member
-```
+## Caveat operations
 
-## Caveats
+Caveats must be defined before use and referenced by verified hash. This prevents a caller from claiming a condition name while changing its body.
 
-Caveats add conditions to tuples. Operators must control caveat definitions and hashes. A tuple referencing an unknown or invalid caveat must be rejected.
+If Anvil reports an invalid caveat hash, stop the operation and fix the policy definition or caller. Do not bypass caveat checks to unblock a workflow.
 
-Examples of caveat use:
+## Reserved namespace enforcement
 
-- access expires at a timestamp;
-- access applies only to a specific device posture;
-- access is valid only while a workflow state remains active.
+Paths under `_anvil/` are Anvil-owned. Public APIs must not read, list, write, copy, compose, delete, or range-read those paths. Operators should not grant exceptions through user-facing policy.
 
-Do not allow arbitrary callers to define caveat code as part of tuple writes. Caveats are policy material.
+Administrative insight should come from structured admin or native APIs, not by exposing internal object paths.
 
-## Reserved namespaces
+## Access audit checklist
 
-Anvil internal paths under `_anvil/` are not public object paths. Public APIs reject attempts to read, list, write, copy, compose, delete, range-read, or conditionally mutate them.
+Regularly verify:
 
-This is a hard security boundary. Operators should not build tools that bypass it. Use structured diagnostics and admin APIs to inspect internal state.
-
-## Audit requirements
-
-Record and retain:
-
-- application credential creation and rotation;
-- scope grant changes;
-- namespace schema publications;
-- tuple write request ids;
-- caveat definition changes;
-- denied authorization checks;
-- reserved namespace rejection counts;
-- derived authorization index lag;
-- break-glass administrative sessions.
-
-Audit logs are most useful when request ids connect client logs, Anvil service logs, and durable mutation records.
+- stale application credentials are removed;
+- broad scopes are justified;
+- tuple imports have source records;
+- caveat hashes match deployed definitions;
+- reserved namespace attempts are logged and investigated;
+- search and watch APIs enforce the same access model as direct object reads;
+- PersonalDB group access matches application policy.
 
 ## What you can do after this page
 
-You should be able to operate Anvil identity and access without relying on broad credentials or unsafe search filtering. Next, learn how to monitor and recover indexes.
+You should be able to operate credentials, scopes, relationship schemas, tuples, caveats, and reserved namespace protections without treating authorization as an application afterthought.

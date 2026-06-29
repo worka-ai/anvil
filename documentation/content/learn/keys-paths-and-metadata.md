@@ -1,127 +1,135 @@
 ---
-title: Keys, Paths, And Metadata
-description: Design object keys and metadata that are easy to query, authorize, watch, and operate.
+title: Keys And Paths
+description: Design object keys and metadata that make listing, indexing, authorization, watches, and operations natural.
 ---
 
-# Keys, Paths, And Metadata
+# Keys And Paths
 
-**What this page achieves:** you will learn how to design object names and metadata so Anvil can list, filter, secure, and watch data efficiently.
+**What this page gives you:** a practical model for designing object names and metadata. You will learn why key shape affects performance, security, search, watches, and operations.
 
-A key is not just a storage detail. It is the first index your application creates. If keys encode ownership and time clearly, your application can list and watch focused prefixes. If keys hide those facts in random names, every downstream system has to inspect metadata or object bodies to understand what the object means.
+A key is not just a string. It is the first index your application creates. Long before you define a full text index or a vector index, your key decides whether the system can efficiently list a tenant, watch a project, group timeline frames, or route authorization decisions.
 
-## Prefixes are query boundaries
+A good key answers a simple question: **where does this object belong?**
 
-A prefix is the beginning of a key. In this key:
+## Design from access patterns
 
-```text
-tenants/acme/projects/p-123/timeline/0000000000000042.json
-```
+Start by writing down the product questions:
 
-useful prefixes include:
+- Which objects appear on this screen?
+- Which objects are loaded together?
+- Which objects are watched for live updates?
+- Which objects share the same authorization boundary?
+- Which objects are archived, retained, or deleted together?
+- Which objects need ordering by time or sequence?
 
-```text
-tenants/acme/
-tenants/acme/projects/
-tenants/acme/projects/p-123/
-tenants/acme/projects/p-123/timeline/
-```
+Then design keys so those groups are visible in prefixes.
 
-A user interface can list the timeline prefix. A background processor can watch it. An authorization rule can grant access to it. An operator can inspect it. That is why prefix design matters.
-
-## A good key tells the truth early
-
-Put stable, high-value boundaries early in the key:
+For a project timeline:
 
 ```text
-tenants/{tenant_id}/workspaces/{workspace_id}/runs/{run_id}/frames/{frame_id}.json
-tenants/{tenant_id}/workspaces/{workspace_id}/assets/{sha256}/preview.png
-tenants/{tenant_id}/workspaces/{workspace_id}/source/{revision}/repo.pack
+tenants/acme/projects/p-123/timeline/0000000000000001.json
+tenants/acme/projects/p-123/timeline/0000000000000002.json
+tenants/acme/projects/p-123/timeline/0000000000000003.json
 ```
 
-These keys answer basic questions before the object is opened:
+The prefix `tenants/acme/projects/p-123/timeline/` now means something. A UI can list it. A watch can subscribe to it. An authorization rule can grant access to it. An operator can inspect it.
 
-- which tenant owns it;
-- which workspace or project it belongs to;
-- whether it is a timeline frame, asset, or source artifact;
-- whether lexical ordering matches business ordering.
+## Put broad ownership first
 
-Compare that with weak keys:
+Put stable ownership and scope near the front of the key:
 
 ```text
-frames/{frame_id}-{tenant_id}-{workspace_id}.json
-assets/random/{uuid}.png
-uploads/latest.json
+tenants/{tenant}/projects/{project}/documents/{document}/original.pdf
 ```
 
-Those names hide ownership, make listing broad, make watches noisy, and increase the chance that authorization must depend on slower metadata inspection.
-
-## Metadata complements paths
-
-Paths answer hierarchical questions. Metadata answers property questions. Use both.
-
-A contract object might use this key:
+This is better than:
 
 ```text
-tenants/acme/projects/p-123/contracts/2026/contract-42.pdf
+documents/{document}/tenants/{tenant}/projects/{project}/original.pdf
 ```
 
-and this metadata:
+The first form lets Anvil narrow quickly to one tenant or project. The second forces broader scanning before the important scope appears.
+
+## Use time and sequence deliberately
+
+If humans need chronological listings, include an ordered timestamp or sequence:
+
+```text
+tenants/acme/audit/2026/06/29/14/000000018439.json
+```
+
+Use fixed-width counters or sortable timestamps when lexical order should match time order. Avoid names like `latest.json` as the only source of history. Use `latest` as a pointer if needed, but store immutable events with durable ordered keys.
+
+## Avoid meaningless keys
+
+These keys are technically valid but operationally weak:
+
+```text
+9c5ee86c-1db4-4f0d-8a36-bd6a7e9c5e22
+files/blob-184928492.bin
+uploads/tmp/final-final-v3.pdf
+```
+
+They hide ownership, purpose, and access pattern. That makes listing broad, watches noisy, authorization harder to reason about, and operator diagnosis slower.
+
+Random identifiers are fine as one segment of a key. They should not be the whole model.
+
+## Metadata fills in query fields
+
+Keys express hierarchy and coarse scope. Metadata expresses fields that need filtering, sorting, ranking, or display.
+
+Example object metadata:
 
 ```json
 {
-  "document_type": "contract",
-  "customer": "Acme Ltd",
+  "kind": "document",
+  "document_id": "doc-42",
+  "title": "Master Services Agreement",
   "status": "signed",
+  "customer": "Acme Ltd",
   "language": "en-GB",
-  "effective_date": "2026-06-01",
-  "renewal_owner": "legal"
+  "created_by": "user-17",
+  "created_at": "2026-06-29T09:30:00Z"
 }
 ```
 
-The key is good for listing contracts under one project. Metadata is good for finding signed contracts across many projects or filtering by renewal owner.
+The key says the document belongs to a tenant and project. Metadata says what the document is and how product screens should filter or display it.
 
-## Index definitions make metadata useful
+## Index definitions turn metadata into queries
 
-Metadata by itself is just labels. An index definition tells Anvil which labels are queryable and how they should be maintained. A metadata index can answer:
+Metadata alone is not enough. If a query must be fast, Anvil needs an index definition that says which fields are maintained for that bucket or prefix.
 
-- `status = signed`;
-- `customer = Acme Ltd AND document_type = contract`;
-- `effective_date >= 2026-01-01` within a prefix;
-- `language = en-GB` before full text search.
+Example:
 
-Index definitions matter because production queries cannot scan every object. The index is maintained from object writes and watch streams, so query time can use a prepared structure instead of a bucket-wide scan.
-
-## Reserved internal paths
-
-Anvil owns paths under `_anvil/`. These are not customer folders and not public object names. They store internal metadata, index segments, authorization state, watches, PersonalDB material, and control records.
-
-Public object APIs reject reads and writes to reserved paths before normal authorization. This is deliberate. If a caller could probe `_anvil/authz/` or `_anvil/indexes/`, the caller could learn sensitive implementation and relationship facts. Structured APIs expose safe views after authorization checks.
-
-The rule is simple: **application data never uses `_anvil/`, and client code never bypasses structured APIs to inspect it.**
-
-## Timeline pattern
-
-Append-only timelines are common. Use fixed-width sortable ids:
-
-```text
-tenants/acme/workspaces/ws-1/runs/run-1/frames/0000000000000001.json
-tenants/acme/workspaces/ws-1/runs/run-1/frames/0000000000000002.json
-tenants/acme/workspaces/ws-1/runs/run-1/frames/0000000000000003.json
+```json
+{
+  "name": "project_documents_by_status",
+  "bucket": "documents",
+  "prefix": "tenants/{tenant}/projects/{project}/documents/",
+  "fields": ["status", "customer", "document_type", "created_at"]
+}
 ```
 
-Fixed width keeps lexical order equal to chronological order. That means listing the prefix returns frames in the intended sequence without extra sorting logic.
+Now the application can ask for signed contracts in one project without listing every object or reading every body.
 
-## Checklist for key design
+## Reserved Anvil paths
 
-Before choosing a key shape, answer these questions:
+Anvil owns internal paths under `_anvil/`. They are not user folders and not public object names. They contain internal metadata, index material, authorization state, watch checkpoints, PersonalDB state, and control records.
 
-1. What is the earliest ownership boundary?
-2. What prefix will the UI list most often?
+Public APIs must not read, list, write, copy, compose, delete, or range-read these paths. If an application sees an `UnauthorizedReservedNamespace` error, the correct response is to stop and fix the caller. Do not retry through another API.
+
+## Key design checklist
+
+Before shipping a bucket, answer these questions:
+
+1. What prefix represents one tenant, account, workspace, or security scope?
+2. What prefix represents one product screen or timeline?
 3. What prefix will background jobs watch?
-4. Which part of the key should be lexically sortable?
-5. Which facts should be metadata rather than path segments?
-6. Which authorization relationships need to line up with prefixes?
+4. Which metadata fields appear in filters, sort controls, snippets, or cards?
+5. Which fields are controlled by users and which by background systems?
+6. Which operations need optimistic preconditions?
+7. Which keys or metadata fields are sensitive and must never appear in unauthorized listings or snippets?
 
 ## What you can do after this page
 
-You should be able to design keys that make listing, filtering, watching, and authorization natural. Next, learn how Anvil turns paths, metadata, text, and embeddings into indexes and search.
+You should be able to design keys and metadata that make listing, watching, searching, authorization, and operations natural. Next, learn how Anvil turns keys, metadata, text, and vectors into indexes.

@@ -1,88 +1,88 @@
 ---
 title: S3 Compatibility
-description: Use S3-compatible clients with Anvil while understanding what compatibility does and does not cover.
+description: Use S3-compatible clients with Anvil while understanding the boundary between object compatibility and native Anvil features.
 ---
 
 # S3 Compatibility
 
-**What this page achieves:** you will know when S3 compatibility is the right interface, how it maps to Anvil, and where native APIs are required.
+**What this page gives you:** a practical understanding of what S3 compatibility means, what maps cleanly to Anvil, what requires native APIs, and how to use S3-compatible clients safely.
 
-S3 compatibility means tools that know the S3 object API can talk to Anvil for common object operations. This is valuable because many backup tools, data importers, SDKs, and command-line workflows already understand S3-style buckets, keys, objects, metadata, range reads, and multipart uploads.
+S3 compatibility means tools that speak the S3 object API can use Anvil for common object operations. That matters because many systems already know how to upload, download, list, range-read, and multipart-upload objects through an S3-style interface.
 
-Compatibility does not mean Anvil becomes only an S3 service. Anvil has native features that S3 does not express: index definitions, relationship authorization schemas, watch streams, vector search, PersonalDB witnessing, and structured administrative diagnostics.
+Compatibility does not mean Anvil is only an S3 service. S3 does not contain concepts for native index definitions, relationship authorization schemas, watch streams, vector search, PersonalDB witnessing, or structured repair. Those features use Anvil's native API.
 
 ## What maps cleanly
 
-These concepts map directly:
+| S3 concept | Anvil concept | Notes |
+| --- | --- | --- |
+| Bucket | Bucket | Policy and placement boundary. |
+| Object key | Object key | Path-like application identifier. |
+| Object body | Object bytes | Durable data for one version. |
+| User metadata | Object metadata | Queryable when indexed through native definitions. |
+| ETag/checksum | Version/hash surface | Useful for integrity and preconditions. |
+| LIST prefix | Directory/prefix query | Backed by Anvil path indexes. |
+| GET range | Range read | Authorization and version rules still apply. |
+| Multipart upload | Multipart object assembly | Useful for large artifacts. |
+| Conditional headers | Preconditions | Prevent stale or conflicting operations. |
 
-| S3 concept | Anvil concept |
-| --- | --- |
-| Bucket | Bucket |
-| Object key | Object key |
-| Object body | Object bytes |
-| User metadata | Object metadata |
-| ETag/checksum | Version/hash validation surface |
-| LIST prefix | Directory/prefix index query |
-| GET range | Object byte range read |
-| Conditional write/read | Version and precondition checks |
+Use S3-compatible clients for importers, backup tools, artifact uploaders, data pipelines, and existing libraries that only need object movement.
 
-Use S3 clients for straightforward object movement: ingest files, export artifacts, sync backups, or integrate software that already expects an S3 endpoint.
-
-## What needs native APIs
+## What requires native APIs
 
 Use native APIs for:
 
-- creating index definitions;
-- querying metadata indexes beyond basic object listing;
+- creating and updating index definitions;
+- querying metadata indexes beyond basic prefix lists;
 - full text, vector, and hybrid search;
 - managing relationship authorization schemas and tuples;
-- subscribing to watch streams;
-- PersonalDB group open, commit, snapshot, and projection APIs;
-- source artifact and model ingestion workflows;
-- structured diagnostics and repair operations.
+- subscribing to watches;
+- opening PersonalDB groups and submitting commits;
+- reading PersonalDB projections;
+- creating source and model artifact manifests;
+- inspecting diagnostics and repair findings.
 
-S3 clients cannot express those operations because the S3 protocol does not contain those concepts.
+A common pattern is to import bytes through S3, then define indexes and query them through the native API.
 
-## Reserved namespace behavior
+## Authentication and request signing
 
-Anvil internal paths under `_anvil/` are not accessible through S3. This includes GET, HEAD, LIST, PUT, COPY, multipart operations, DELETE, and conditional variants. The gateway rejects those paths before normal object authorization.
+S3-compatible requests are signed. Anvil verifies the signature, maps the credential to an Anvil identity, and then evaluates authorization for the requested bucket, key, method, and metadata exposure.
 
-This protects internal metadata, index material, authorization tuples, watch checkpoints, and PersonalDB state. If you need operational insight, use structured native or admin APIs.
+Keep S3 credentials narrow. A tool that uploads build artifacts should not have permission to delete unrelated objects, read private prefixes, or manage authorization state.
 
-## Authentication
+## Streaming and multipart behavior
 
-S3-compatible clients normally sign requests. Anvil verifies the request identity and maps it to tenant/application authorization. Keep S3 credentials scoped to the minimum buckets and prefixes required.
+Large clients often stream request bodies or use multipart uploads. Anvil verifies signed streaming payloads and validates multipart assembly. This matters because large uploads should be safe even when bodies arrive in chunks and clients retry interrupted operations.
 
-Do not give broad write credentials to generic automation. A sync tool that only uploads release artifacts should not have rights to delete source snapshots or inspect database group state.
+A production smoke test should cover:
 
-## Example: object import
+- signed single-part PUT;
+- signed streaming PUT;
+- multipart create, upload part, complete, and abort;
+- object metadata round trip;
+- range GET;
+- conditional requests;
+- list prefix behavior;
+- delete and head behavior where permitted.
 
-A simple import flow is:
+## Reserved namespaces
+
+Anvil internal paths under `_anvil/` are not public objects. S3 gateway operations reject them before normal object handling. This includes `GET`, `HEAD`, `LIST`, `PUT`, `COPY`, multipart operations, `DELETE`, conditional variants, and range reads.
+
+Applications must not use `_anvil/` as a product prefix. Operators should treat attempts to access reserved namespaces as caller bugs or suspicious activity.
+
+## Example import flow
 
 ```text
-create bucket with native or admin API
-  -> configure scoped S3 credentials
-  -> run existing uploader against Anvil endpoint
-  -> verify object count and hashes
-  -> create or update index definitions with native API
-  -> query imported metadata/search through native API
+operator creates bucket and scoped credentials
+  -> importer uploads files through S3-compatible client
+  -> client verifies counts and checksums
+  -> application/native job writes index definitions
+  -> Anvil indexes metadata, text, or vectors
+  -> application queries authorized results through native API
 ```
 
-The S3 tool moves bytes. Native Anvil APIs make those bytes searchable, authorized, watchable, and operationally visible.
-
-## Compatibility test expectations
-
-A production-compatible S3 surface should prove:
-
-- bucket create/list/delete where supported;
-- object PUT/GET/HEAD/LIST/DELETE;
-- metadata round trip;
-- range reads;
-- conditional reads and writes;
-- multipart upload and abort behavior;
-- reserved namespace rejection;
-- authorization failures do not leak object existence.
+The S3 tool moves bytes. Anvil's native model turns those bytes into searchable, authorized, watchable product data.
 
 ## What you can build after this page
 
-You should be able to decide when S3 compatibility is enough and when native APIs are required. Next, learn how object metadata and indexes support application-level queries.
+You should be able to connect existing S3-compatible tools to Anvil safely and know when to switch to native APIs for indexing, search, watches, authorization, PersonalDB, and diagnostics.

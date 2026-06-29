@@ -1,77 +1,71 @@
 ---
 title: Source And Model Artifacts
-description: Store source packs, generated files, model artifacts, logs, screenshots, and manifests in Anvil.
+description: Store source archives, build outputs, model files, logs, media, manifests, and derived records as indexed Anvil artifacts.
 ---
 
 # Source And Model Artifacts
 
-**What this page achieves:** you will learn how to store build inputs, generated outputs, model files, logs, and visual artifacts as first-class Anvil objects with metadata, hashes, indexes, and authorization.
+**What this page gives you:** a model for storing reproducible technical artifacts in Anvil. You will learn how to represent source packs, build outputs, model files, logs, screenshots, media, and manifests with object storage, metadata, search, and authorization.
 
-Many platforms need to store more than user documents. They store source packs, build logs, screenshots, generated bundles, test reports, model manifests, media derivatives, and provenance records. These artifacts are not throwaway files. They need durable names, hashes, metadata, search, access control, and lifecycle management.
+Modern systems produce many artifacts that are not ordinary user uploads: source archives, build logs, test screenshots, generated reports, model weights, tokenizer files, media extracts, embeddings, provenance records, and release bundles. These artifacts need durability, searchability, permissions, and operational traceability.
 
-Anvil treats artifacts as ordinary objects plus stronger conventions.
+Anvil treats them as first-class object data.
 
 ## Artifact families
 
-Common families include:
+Common artifact families include:
 
-| Family | Example |
-| --- | --- |
-| Source | Git pack files, archive snapshots, dependency manifests |
-| Build output | Binaries, bundles, packages, checksums |
-| Logs | Compiler output, test logs, agent transcripts, task events |
-| Visual evidence | Screenshots, videos, rendered previews |
-| Models | Model files, tokenizer files, config, manifest indexes |
-| Derived media | Transcripts, thumbnails, embeddings, extracted text |
+- source packs and repository snapshots;
+- build logs and compiler diagnostics;
+- generated binaries or packages;
+- test reports and screenshots;
+- model weights and configuration;
+- tokenizer and vocabulary files;
+- media transcodes and transcripts;
+- embedding batches;
+- release manifests and checksums.
 
-Each family should have a predictable key layout and metadata schema.
+Each family should have clear keys, metadata, retention, and authorization.
 
-## Source packs
+## Manifests
 
-A source pack captures repository state. Store it with revision metadata and a content hash:
+A manifest records the relationship between artifacts. For a build, it might include:
 
-```text
-bucket: source-artifacts
-key: tenants/acme/repos/app/revisions/sha256-{hash}/repo.pack
-metadata:
-  revision = abc123
-  branch = main
-  source_kind = git-pack
-  produced_by = ingestion-service
+```json
+{
+  "kind": "build.manifest",
+  "build_id": "1842",
+  "source_revision": "abc123",
+  "artifacts": [
+    { "key": "builds/1842/log.txt", "sha256": "..." },
+    { "key": "builds/1842/package.tar.zst", "sha256": "..." }
+  ],
+  "status": "passed"
+}
 ```
 
-The pack file is the durable object. Metadata and manifests make it discoverable and verifiable.
+The manifest is the stable record that links source, generated outputs, checksums, and status.
 
-## Build logs and evidence
+## Metadata and search
 
-Build and test systems should upload logs and evidence as objects rather than embedding large blobs in a database row. Use predictable paths:
+Index metadata such as:
 
-```text
-tenants/acme/projects/p-123/runs/run-42/logs/cargo-build.txt
-tenants/acme/projects/p-123/runs/run-42/screenshots/home.png
-tenants/acme/projects/p-123/runs/run-42/reports/qa.json
-```
+- run id;
+- revision;
+- package name;
+- model id;
+- media type;
+- language;
+- status;
+- producer;
+- created time.
 
-The UI can list the run prefix, fetch small summaries, and open large assets only when needed.
+Use full text indexing for logs, reports, transcripts, and extracted document text. Use vector indexing for semantic search over documents, images, audio, or video when useful.
 
-## Model artifacts
+## Authorization
 
-Model artifacts can be large and multi-file. Store a manifest object that records every file, size, hash, media type, and source revision. Search and indexing can then operate over the manifest rather than guessing file relationships from loose object names.
-
-A model manifest should answer:
-
-- which files belong to the model;
-- which source repository and revision produced them;
-- which embedding dimensions and tokenizer apply;
-- which hashes verify each file;
-- which authorization rules apply.
-
-## Search and authorization
-
-Artifact search must respect the same authorization rules as ordinary objects. A user should not discover a private source pack through metadata search or a log snippet.
-
-Index artifact metadata such as run id, revision, language, package name, model id, media type, and status. Use full text indexing for logs and extracted text. Use vector indexing for semantic search over documents, images, audio, or video when useful.
+Artifacts can be sensitive. A build log may include environment details. A model file may be proprietary. A source pack may contain private code. Apply relationship authorization to artifact prefixes and search results, not only direct downloads.
 
 ## What you can build after this page
 
-You should be able to design artifact storage where files, logs, screenshots, model assets, and provenance records are durable, searchable, and authorized. Move to the Operator guides when you are ready to deploy and run Anvil.
+You should be able to model technical artifacts as objects with manifests, metadata, search, and authorization so teams can find, verify, and recover them later.

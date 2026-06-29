@@ -29,6 +29,7 @@ impl From<HomePage> for Widget {
             children: vec![
                 HeroSection.into(),
                 ProblemSection.into(),
+                AdoptionSection.into(),
                 FeatureGrid.into(),
                 WorkflowSection.into(),
                 AudienceSection.into(),
@@ -51,15 +52,15 @@ impl From<HeroSection> for Widget {
             Column {
                 gap: Some(22.0),
                 children: vec![
-                    Pill::new("Object storage, indexes, authz, watches, and database witnessing in one system").into(),
-                    Text::new("One storage platform for objects, search, permissions, watches, and local-first data.")
+                    Pill::new("Object storage, search, authorization, watches, and local-first data in one platform").into(),
+                    Text::new("Stop stitching storage infrastructure together one subsystem at a time.")
                         .size(58.0)
                         .weight(800)
                         .line_height(1.05)
                         .color(rgb(17, 24, 39))
                         .max_width(980.0)
                         .into(),
-                    Text::new("Anvil is for teams whose storage layer has grown beyond PUT, GET, and LIST. It keeps object bytes, metadata indexes, full text search, vector search, relationship authorization, watch streams, source artifacts, and PersonalDB witness logs in one coherent system. One write path feeds every derived view, so correctness is owned by the platform instead of scattered through application glue.")
+                    Text::new("Anvil is a production storage platform for teams whose object store has become the foundation of product data. It stores bytes, but it also keeps metadata indexes, full text search, vector search, relationship authorization, watch streams, source artifacts, and PersonalDB witness logs under one coherent write path. The result is fewer side systems, fewer consistency gaps, and one place to reason about what data exists, who may see it, and which derived views are current.")
                         .size(20.0)
                         .line_height(1.5)
                         .color(rgb(55, 65, 81))
@@ -95,10 +96,10 @@ impl From<MetricStrip> for Widget {
             gap: Some(12.0),
             wrap: FlexWrap::Wrap,
             children: vec![
-                Metric::new("1", "mutation path for objects and derived data").into(),
-                Metric::new("5+", "native index and search families").into(),
-                Metric::new("0", "public access to internal namespaces").into(),
-                Metric::new("1", "witness path for local-first databases").into(),
+                Metric::new("1", "durable write path").into(),
+                Metric::new("5+", "index and search families").into(),
+                Metric::new("0", "public internal namespaces").into(),
+                Metric::new("1", "witness for local-first data").into(),
             ],
             ..Default::default()
         }
@@ -113,12 +114,31 @@ impl From<ProblemSection> for Widget {
     fn from(_: ProblemSection) -> Self {
         Section::new(
             "The problem",
-            "Application teams keep rebuilding the same storage control plane.",
-            "A product starts with files. Then it needs fast filters, semantic search, private sharing, audit trails, live updates, local-first sync, source artifacts, media indexing, and operational recovery. If each feature lands in a different system, every product team inherits distributed consistency as an application bug. Anvil makes those concerns part of one storage product.",
+            "Object storage is only the beginning of the product data problem.",
+            "A product starts with uploads. Then it needs fast filters, semantic search, private sharing, audit trails, live updates, local-first sync, source artifacts, media indexing, and operational recovery. If each feature lands in a different system, every product team inherits distributed consistency as application glue. Anvil makes those concerns part of one storage product.",
             vec![
                 ProblemCard::new("Object storage alone does not answer product questions.", "PUT, GET, and LIST are necessary, but users ask for signed contracts, similar images, authorized project files, and database rows that changed since their last sync.").into(),
                 ProblemCard::new("Search without authorization leaks data.", "A result count, snippet, facet, or vector neighbor can reveal private information. Anvil filters text, vector, metadata, and hybrid results through the same authorization model as direct reads.").into(),
                 ProblemCard::new("Derived systems need proof, not hope.", "Indexes, projections, and timelines stay correct only when they are tied to durable mutations, cursors, manifests, validation proofs, and repair behavior.").into(),
+            ],
+        )
+        .into()
+    }
+}
+
+#[derive(Clone)]
+struct AdoptionSection;
+
+impl From<AdoptionSection> for Widget {
+    fn from(_: AdoptionSection) -> Self {
+        Section::new(
+            "Why teams adopt it",
+            "Anvil replaces fragile storage glue with platform-owned invariants.",
+            "The value is not that Anvil has many features. The value is that the features share identity, versioning, authorization, watches, manifests, repair, and operational evidence.",
+            vec![
+                ProblemCard::new("Fewer separate systems to reconcile.", "Objects, indexes, search, watches, PersonalDB commits, and artifact manifests advance from the same durable mutation stream.").into(),
+                ProblemCard::new("Safer data exposure by default.", "Direct reads, listings, snippets, vector neighbors, projections, and watches all pass through the same authorization model.").into(),
+                ProblemCard::new("Operational proof instead of guesswork.", "Indexes publish generations, watches checkpoint cursors, repairs produce findings, and backups cover the complete state needed to recover.").into(),
             ],
         )
         .into()

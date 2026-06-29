@@ -1,77 +1,77 @@
 ---
 title: Backup And Recovery
-description: Back up Anvil state, restore nodes, and prove recovered data is correct.
+description: Back up and restore the full Anvil state, including objects, metadata, indexes, authz, watches, and PersonalDB.
 ---
 
 # Backup And Recovery
 
-**What this page achieves:** you will know what to back up, how recovery proceeds, and how to prove restored Anvil data is safe to serve.
+**What this page gives you:** a complete recovery model for Anvil. You will learn why backing up object bytes alone is incomplete and how to verify a restored deployment.
 
-Anvil's durable state lives under `STORAGE_PATH`. A backup strategy that captures only object bytes is incomplete. You must preserve metadata journals, manifests, indexes, authorization state, PersonalDB logs, source artifacts, and control-plane records.
+Anvil's durable state lives under `STORAGE_PATH`. That state includes object bytes, but it also includes the metadata and proofs that make the bytes useful and safe. A backup that captures only object bodies is not an Anvil backup.
 
-## What must be backed up
+## What must be recoverable
 
-Back up the full storage path consistently. It contains:
+A complete backup strategy covers:
 
-- object content chunks and inline payload records;
-- metadata journals and compacted metadata segments;
-- directory/path index segments;
-- manifests and source cursor proofs;
+- object bodies and multipart state;
+- object metadata journals and compaction outputs;
+- bucket and placement metadata;
+- path and directory indexes;
+- metadata index definitions and generations;
 - full text index segments and tokenizer metadata;
 - vector index segments and HNSW graph material;
-- authorization tuple logs, schemas, caveats, and derived indexes;
-- PersonalDB commit logs, snapshots, projections, and certificates;
+- authorization schemas, tuples, caveats, and derived indexes;
+- watch logs, cursors, and checkpoints;
+- PersonalDB commits, snapshots, projections, and certificates;
 - source and model artifact manifests;
-- task leases, task journals, and diagnostic records.
+- control-plane secrets where recoverable by policy;
+- diagnostic and repair findings.
 
-These pieces work together. Restoring only some of them can produce invalid derived state.
+## Backup principles
 
-## Backup consistency
+A backup should be:
 
-A backup must capture a coherent point or enough journal material for Anvil to recover to a coherent point. Do not copy random files while writes are active unless the storage layer provides snapshot semantics.
-
-Recommended pattern:
-
-1. Use volume snapshot capabilities or Anvil-supported backup coordination.
-2. Record node identity, region, software version, and configuration hash.
-3. Store backup metadata outside the same failure domain.
-4. Periodically restore into an isolated environment and verify it.
+- consistent enough to restore source facts and derived structures;
+- independently stored from the failed deployment;
+- encrypted when it contains sensitive data;
+- regularly tested through restore drills;
+- versioned so corrupted latest state does not destroy recovery options.
 
 ## Restore sequence
 
 A restore should be deliberate:
 
-1. Stop the affected node.
-2. Restore `STORAGE_PATH` from a known backup.
-3. Restore required secrets and node identity.
-4. Start Anvil in recovery mode or normal startup with validation enabled.
-5. Validate manifests, hashes, journal chains, and segment envelopes.
-6. Rebuild any derived output that cannot prove its source.
-7. Confirm health and membership.
-8. Run native object smoke tests.
-9. Run S3 compatibility smoke tests.
-10. Run authorization checks.
-11. Run index/search checks.
-12. Open PersonalDB groups and verify current heads.
-13. Confirm watch streams resume from valid cursors.
+```text
+stop affected writers or isolate target
+  -> restore durable state
+  -> start Anvil in recovery mode or controlled environment
+  -> validate object manifests and hashes
+  -> validate authorization state
+  -> validate watch cursors
+  -> validate index generations
+  -> rebuild invalid derived structures
+  -> run S3 and native API smoke tests
+  -> open PersonalDB groups and verify heads
+  -> resume normal traffic
+```
 
-## Disaster recovery drills
+Do not skip validation. A deployment that starts after restore may still have stale indexes or invalid authorization-derived state.
 
-A backup that has never been restored is only a theory. Run drills. Measure:
+## Recovery testing
 
-- time to locate a backup;
-- time to restore storage;
-- time for validation and rebuilds;
-- time for indexes to reach target cursors;
-- application-visible downtime;
-- operator steps that were unclear.
+A release-quality recovery drill should prove:
 
-Turn drill findings into runbook updates.
-
-## Data loss boundaries
-
-Anvil acknowledges writes only after required durable records are written. If the underlying storage lies about durability, loses acknowledged fsyncs, or corrupts blocks without detection, no software layer can fully compensate. Use reliable volumes and monitor storage errors.
+1. objects can be read by key and version;
+2. checksums match;
+3. prefix listings match expected counts;
+4. metadata filters return expected results;
+5. full text and vector indexes either validate or rebuild;
+6. relationship authorization decisions match expected fixtures;
+7. reserved namespaces remain inaccessible through public APIs;
+8. watches resume without event loss;
+9. PersonalDB groups open and accepted heads match certificates;
+10. clients can authenticate and perform ordinary operations.
 
 ## What you can do after this page
 
-You should be able to design backups that include the full Anvil state and run restores that prove object, index, authorization, watch, and PersonalDB correctness.
+You should be able to design and test backups that preserve the full Anvil system, not only object bytes.

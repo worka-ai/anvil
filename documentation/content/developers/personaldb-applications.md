@@ -5,72 +5,76 @@ description: Build local-first applications that use Anvil as the PersonalDB wit
 
 # PersonalDB Applications
 
-**What this page achieves:** you will learn how an application uses PersonalDB through Anvil to coordinate SQLite changesets, commits, snapshots, and projections.
+**What this page gives you:** a developer-oriented model for local-first applications using PersonalDB through Anvil. You will learn how to structure client sync, commits, snapshots, projections, and authorization.
 
-A local-first application gives each device a local database so the UI stays fast and can work with unreliable connectivity. The server-side challenge is accepting, ordering, validating, and distributing changes. Anvil's PersonalDB APIs provide that witness role.
+A local-first application reads and writes a local SQLite database. The UI stays fast because ordinary views query local state. The application still needs shared truth: accepted changes, current heads, snapshots for new devices, projections for server-side queries, and authorization rules.
 
-## Application shape
+Anvil acts as the PersonalDB witness. It validates and records commits, signs accepted heads, stores snapshots, maintains projections, and authorizes every operation.
+
+## Application components
 
 A typical application has:
 
 - a local SQLite database;
 - a PersonalDB group id;
-- a schema version;
+- schema version metadata;
 - a local commit queue;
 - a sync worker;
-- a projection reader for server-derived views;
-- authorization rules for who may open, commit, and read group data.
+- a conflict handling strategy;
+- a snapshot downloader;
+- projection readers for server-visible views;
+- authorization rules for group open, commit, snapshot, and projection reads.
 
-The local database remains useful without a network. The witness decides which changes become part of the shared history.
+Do not create a separate server database for the same shared state. That creates two sources of truth. Use PersonalDB commits and projections.
 
 ## Opening a group
 
-Opening a group gives the client the current head, schema information, snapshot options, and authorization context. A new device usually starts by downloading a snapshot at a known head, then applying later commits.
-
-Conceptual flow:
+A device opens a group to learn the current head and synchronization options:
 
 ```text
 open group
-  -> receive current head and schema
+  -> verify caller may open
+  -> receive schema information and current head
   -> download snapshot if local database is missing or too old
   -> apply commits after snapshot head
-  -> begin normal sync loop
+  -> start normal sync loop
 ```
 
-## Submitting commits
+The local database is trusted only after it is tied to a known accepted head.
 
-A commit request includes a base head, SQLite changeset, author identity, idempotency key, and schema information. Anvil verifies that the caller may commit, that the changeset is valid for the group, and that ordering rules are satisfied.
+## Submitting a commit
 
-If accepted, Anvil records the commit and returns a certificate. The client can store that certificate with local sync state.
+A commit request should include:
 
-If rejected, the client should inspect the reason. Common causes are stale base head, authorization failure, schema mismatch, invalid changeset, or conflict policy rejection.
+- group id;
+- base head;
+- schema version;
+- SQLite changeset;
+- author identity;
+- idempotency key;
+- client timestamp or logical clock when required;
+- optional conflict policy inputs.
 
-## Snapshots
+Anvil validates the request, records the commit if accepted, and returns a certificate. Store that certificate with local sync state.
 
-Snapshots compact history. A new device should not have to replay every commit from the beginning of time. Anvil stores snapshots as durable objects with hashes and source heads.
+## Handling rejection
 
-A snapshot is valid only if it proves which commit head it represents. Projection builders and clients should not trust anonymous database files without source proof.
+Common rejections:
+
+| Rejection | Meaning | Client response |
+| --- | --- | --- |
+| Stale base head | Other commits were accepted first. | Fetch commits, merge/apply, submit a new changeset. |
+| Schema mismatch | Client schema is not compatible. | Run migration or block until upgraded. |
+| Authorization denied | Caller may not open or commit. | Stop sync and surface access issue. |
+| Invalid changeset | Changeset cannot be applied safely. | Fix client bug or conflict handling. |
+| Idempotency mismatch | Same key reused for different content. | Fix retry logic. |
 
 ## Projections
 
-A projection is a server-side derived view over accepted commits. Use projections when the application needs queryable server-visible summaries, feeds, or indexes without exposing raw group data directly.
+Use projections when the server needs queryable derived views. For example, a task application may keep each device local but expose a server projection of open tasks by assignee. Projection builders consume accepted commits and write authorized queryable views.
 
-Examples:
-
-- open tasks by assignee;
-- calendar events by month;
-- unread message counts;
-- audit rows by actor;
-- media references by object key.
-
-Projection reads are authorization-checked and tied to source cursors.
-
-## Offline and retry behavior
-
-The client should queue local changes while offline. When connectivity returns, it submits commits with idempotency keys. If a request times out, retry with the same key. If the base head is stale, fetch the latest accepted commits, apply or merge them locally, then submit a new changeset.
-
-Do not invent a separate server-side database path for the same data. That creates two sources of truth. Use PersonalDB commits and projections.
+Projection reads should include caller identity. A projection row is still data exposure.
 
 ## What you can build after this page
 
-You should be able to design a local-first sync loop where Anvil witnesses accepted SQLite changes, stores snapshots, and serves authorized projections. Next, learn how to store source and model artifacts with the same object/index/auth model.
+You should be able to build a local-first sync loop where Anvil witnesses SQLite changesets, returns commit certificates, stores snapshots, and serves authorized projections.

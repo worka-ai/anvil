@@ -1,29 +1,19 @@
 ---
 title: Index Operations
-description: Monitor, repair, and reason about Anvil directory, metadata, text, vector, authz, and PersonalDB indexes.
+description: Monitor and repair Anvil path, metadata, full text, vector, authz, source, and PersonalDB indexes.
 ---
 
 # Index Operations
 
-**What this page achieves:** you will understand how to operate Anvil's derived indexes, what lag means, how rebuilds work, and what to alert on.
+**What this page gives you:** an operator's guide to index health. You will learn what index lag means, why generations matter, when rebuilds are required, and how to reason about full text, vector, authorization, and PersonalDB derived state.
 
-An index is derived from durable source mutations. This means it can be rebuilt, but it must prove which source cursor and manifest it represents. Operators should treat indexes as maintained production systems, not invisible caches.
-
-## The three facts every derived system must expose
-
-| Fact | Meaning | Operator question |
-| --- | --- | --- |
-| Source manifest | The source records used to build the output. | Can this generation prove its inputs? |
-| Source cursor | The latest mutation consumed. | How far behind is it? |
-| Generation | The published derived output. | Which version are queries using? |
-
-If any fact is missing or invalid, the index is not trustworthy.
+Indexes are maintained views over source facts. They make queries fast, but they must stay tied to durable source data. A healthy deployment needs visibility into each derived subsystem, not just object byte storage.
 
 ## Index families
 
-Monitor each family separately:
+Anvil maintains several kinds of derived structures:
 
-- directory/path indexes;
+- directory and path indexes;
 - metadata indexes;
 - full text indexes;
 - vector indexes;
@@ -32,66 +22,60 @@ Monitor each family separately:
 - PersonalDB projections;
 - media extraction outputs.
 
-A healthy metadata index does not imply the vector index is healthy. A current vector index does not imply authorization derived usersets are current.
+A healthy metadata index does not imply a healthy vector index. Each family has its own lag, generation, and repair surface.
 
 ## Lag
 
-Lag is how far a derived consumer is behind its source stream. A short burst is normal after heavy writes. Persistent lag means the system cannot keep up.
+Lag measures how far an index is behind its source stream. It should be monitored per index family and scope.
 
-Useful lag metrics include:
+Persistent lag can indicate:
 
-- `full_text_indexing_lag`;
-- `vector_indexing_lag`;
-- `authz_derived_index_lag`;
-- `personaldb_projection_lag`;
-- `watch_stream_lag`.
+- insufficient CPU or IO;
+- an embedding or extraction bottleneck;
+- a stuck watch cursor;
+- invalid source data;
+- repeated validation failure;
+- an overloaded node selected for too much background work.
 
-Alert thresholds should match product expectations. A document archive might tolerate seconds or minutes. A collaborative application may need read-your-write behavior for specific flows.
+Alert thresholds should match product expectations. A collaboration product may need near-immediate metadata and authorization updates. A media archive may tolerate longer vector indexing lag.
 
-## Rebuilds
+## Generations
 
-A rebuild creates a new index generation from durable source data:
+A generation is a published version of an index. It should have a manifest that identifies source cursor, index definition, segment files, hashes, and validation status.
 
-```text
-read source manifest
-  -> validate source records and hashes
-  -> build derived segment
-  -> write segment and proof
-  -> publish new generation
-  -> update query routing
-```
-
-During rebuild, queries should use the previous valid generation or report index readiness according to requested consistency. A corrupt generation must not silently serve results.
-
-## Vector index operations
-
-Vector indexes need special attention:
-
-- embedding model identity must match the index definition;
-- vector dimension must match exactly;
-- distance metric must match query semantics;
-- HNSW graph memory must be planned;
-- authorization filtering may require fetching more candidates than the user requested;
-- segment compaction must preserve source cursor proof.
-
-If dimension or model identity changes, treat it as a new index generation. Do not mix incompatible vectors.
+Queries should use valid generations. Rebuilding a new generation should not destroy the previous valid generation until the new one is proven and published.
 
 ## Full text operations
 
-Full text indexes depend on tokenization, extraction, language handling, and stored snippet policy. A tokenizer change is an index definition change. Rebuild affected generations so ranking and query behavior are consistent.
+Full text indexes depend on tokenization, language handling, extraction, and snippet policy. Changing tokenization or snippet behavior is an index definition change. Rebuild affected generations so ranking and snippets are consistent.
 
-Snippets must follow authorization rules. A private snippet is private data.
+Snippets are sensitive. Verify snippet storage and result exposure follow authorization policy.
+
+## Vector operations
+
+Vector indexes require careful compatibility:
+
+- embedding model identity must match;
+- dimension must match exactly;
+- distance metric must match intended semantics;
+- HNSW memory usage must be planned;
+- candidate fetching must account for authorization filtering;
+- segment compaction must preserve source cursor proof.
+
+If any of model, dimension, or metric changes, create a new index generation. Do not mix incompatible vectors.
 
 ## Repair findings
 
-Repair should produce findings rather than silently mutating state. A finding should explain:
+Repair should produce findings. A finding should say:
 
-- which bucket/index/generation is affected;
-- what validation failed;
-- which source manifest or cursor is involved;
-- what automatic repair was attempted;
+- which bucket, index, or generation is affected;
+- which invariant failed;
+- which source cursor or manifest was involved;
+- whether automatic repair was attempted;
 - whether operator action is required.
+
+Do not accept silent mutation as repair. Operators need evidence.
 
 ## What you can do after this page
 
-You should be able to explain index lag, generations, rebuilds, vector-specific risks, and repair findings. Next, learn backup and recovery.
+You should be able to monitor index lag, reason about generations, rebuild derived structures, and interpret repair findings. Next, learn backup and recovery.

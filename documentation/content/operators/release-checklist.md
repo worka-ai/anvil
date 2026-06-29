@@ -1,13 +1,13 @@
 ---
 title: Release Checklist
-description: Build, test, package, publish, and verify Anvil server, CLI, clients, and documentation.
+description: Build, test, package, publish, and verify Anvil server images, Rust crates, TypeScript clients, Python clients, and documentation.
 ---
 
 # Release Checklist
 
-**What this page achieves:** you will have a repeatable release process for server images, Rust crates, TypeScript clients, Python clients, and documentation.
+**What this page gives you:** a repeatable release process. You will know which artifacts must be built, which tests prove them, and what to verify after publishing.
 
-A release is not only a tag. It is a set of artifacts that users can install and operators can deploy. Each artifact must be built from the intended source, tested, packaged, published, and smoke-tested after publication.
+A release is not a tag. A release is a set of installable artifacts that operators and developers can use: server image, Rust crates, CLI, TypeScript client, Python client, protocol files, and documentation.
 
 ## Source verification
 
@@ -18,35 +18,34 @@ cargo fmt --all -- --check
 cargo test --workspace
 ```
 
-These checks prove the workspace builds and tests in the local environment. They do not replace Docker, client package, or deployment smoke tests.
+These checks prove the workspace builds and tests locally. They do not replace Docker, client package, S3 gateway, or deployment smoke tests.
 
 ## External smoke suites
 
-Run environment-dependent suites when Docker and network access are available:
+Run environment-dependent suites when Docker and required network access are available:
 
 ```bash
 ANVIL_RUN_DOCKER_E2E=1 cargo test -p anvil-storage --test docker_cluster_test -- --nocapture
 ANVIL_RUN_HF_E2E=1 cargo test -p anvil-storage --test hf_ingestion_e2e -- --nocapture
 ```
 
-Classify any ignored test before release. An ignored test is either deliberately external, moved into CI with a required environment flag, or a release blocker.
+Ignored tests must be classified before release. An ignored test is either deliberately external, moved into CI with a required environment flag, or a release blocker.
 
 ## Docker image
 
-Build the image with a fixed version tag and run a smoke test that covers:
+Build the production image with a fixed version tag. Then run a smoke test that proves:
 
-- container boot;
-- health/readiness;
-- tenant and app provisioning;
-- token acquisition;
-- S3 bucket create;
-- S3 PUT, GET, HEAD, LIST, DELETE;
-- reserved namespace rejection;
-- native object API;
-- basic metadata index query;
-- authorization tuple check.
-
-A container that starts is not enough. It must prove the object and security surfaces work.
+- container boots;
+- health/readiness reports ready;
+- tenant and application credentials can be created;
+- token acquisition works;
+- S3 bucket and object operations work;
+- signed streaming upload works;
+- reserved namespace access is rejected;
+- native object API works;
+- metadata index query works;
+- authorization tuple check works;
+- metrics and logs are emitted.
 
 ## Rust crates
 
@@ -65,55 +64,49 @@ cargo publish --dry-run -p anvil-storage-cli
 cargo publish --dry-run -p anvil-storage
 ```
 
-Dependent dry-runs may require already-published versions. If so, publish in order and verify each package page before moving to the next.
+## TypeScript and Python clients
 
-## TypeScript package
-
-From `clients/typescript`:
+For TypeScript:
 
 ```bash
+cd clients/typescript
 npm ci
 npm test
 npm pack --dry-run
-npm publish --access public
 ```
 
-Verify the package contains generated TypeScript entry points, the protocol file, type declarations, and README content that explains how to connect.
-
-## Python package
-
-From `clients/python`:
+For Python:
 
 ```bash
+cd clients/python
 python -m build
 python -m twine check dist/*
-python -m twine upload dist/*
 ```
 
-Verify the wheel contains generated gRPC modules, protocol files, type hints where available, and documentation for authentication and endpoint configuration.
+Each client package should include generated protocol bindings, examples, README content, and authentication guidance.
 
-## Documentation site
+## Documentation
 
-Build and verify the documentation site:
+Build and check the Fission documentation site:
 
 ```bash
 fission site check --project-dir documentation --release
 fission site build --project-dir documentation --release
 ```
 
-The published site should explain concepts, guide developers, guide operators, and provide exact reference material. Do not ship a release whose docs are only command snippets.
+The site must teach concepts, guide developers, guide operators, and provide exact reference material. Command lists alone are not release documentation.
 
 ## Post-publication verification
 
 After publishing:
 
-1. Pull the Docker image by tag and run the smoke test.
-2. Install the Rust CLI from the published crate and run basic commands.
-3. Install the npm package in a fresh project and call a read-only API.
-4. Install the Python package in a fresh virtual environment and call a read-only API.
-5. Open the documentation site and verify navigation/search.
-6. Record artifact versions, checksums, and release notes.
+1. Pull the image by tag and rerun smoke tests.
+2. Install the Rust CLI from the published crate and run read/write checks.
+3. Install the TypeScript client in a fresh project and call a read-only API.
+4. Install the Python client in a fresh virtual environment and call a read-only API.
+5. Open the documentation site and verify navigation and search.
+6. Record versions, checksums, release notes, and known limitations.
 
 ## What you can do after this page
 
-You should be able to release Anvil with a repeatable process that proves every published artifact is usable, not merely uploaded.
+You should be able to release Anvil as a coherent product instead of a collection of uploaded files.

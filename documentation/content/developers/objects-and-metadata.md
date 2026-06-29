@@ -1,41 +1,65 @@
 ---
 title: Objects And Metadata
-description: Model application data as objects, metadata, versions, and indexes.
+description: Model application data as object bodies, keys, versions, metadata, and indexes.
 ---
 
 # Objects And Metadata
 
-**What this page achieves:** you will learn how to model application data in Anvil so product screens, background jobs, and search queries can find the right objects without scanning buckets.
+**What this page gives you:** a method for turning application concepts into Anvil objects. You will learn how to decide what becomes a key, what becomes metadata, what becomes an object body, and what becomes an index.
 
-A common mistake is treating object storage as a dumping ground for files. That works for prototypes and fails as soon as a product needs timelines, filters, access rules, retention, audit, or search. In Anvil, object keys and metadata are part of the application model.
+Object modeling starts from product behavior. Do not begin with the file picker or database table. Begin with the screens, jobs, permissions, and searches your application must support.
 
-## Start from the product questions
+## Start with product questions
 
-Before choosing keys or metadata, list the questions your application must answer:
+List the questions your product must answer:
 
-- Which objects appear on this screen?
+- Which objects appear in this screen?
 - Which filters can the user apply?
-- Which objects belong to one tenant, project, or folder?
-- Which objects should a background job process?
-- Which object changes should trigger notifications?
-- Which fields are needed for authorization or retention?
+- Which objects are watched for live updates?
+- Which fields are shown in cards or tables?
+- Which objects share an authorization boundary?
+- Which background jobs process this data?
+- Which objects are retained, archived, or deleted together?
 
-The answers drive key shape and index definitions.
+The answers decide key shape, metadata fields, and index definitions.
 
-## Example: document object model
+## Choose the object body
 
-For a document system, a key might be:
+The body is the durable payload. It can be a file, a JSON envelope, a compressed archive, a snapshot, or a derived artifact.
+
+Good object body examples:
+
+- original uploaded PDF;
+- extracted text from a PDF;
+- image thumbnail;
+- model checkpoint;
+- source archive;
+- audit event JSON;
+- PersonalDB snapshot;
+- generated report bundle.
+
+Use separate objects when lifecycle, permissions, or indexing differ. For example, an original video, extracted transcript, thumbnail, and embedding manifest may be separate objects because they are produced by different jobs and queried differently.
+
+## Choose the key
+
+The key should express natural scope:
 
 ```text
 tenants/acme/projects/p-123/documents/doc-42/original.pdf
 ```
 
-Metadata might be:
+This key tells Anvil and operators where the object belongs. A document list can query the project prefix. A watch can subscribe to the prefix. Authorization can refer to the project. Backup and diagnostics can navigate the same structure.
+
+## Choose metadata
+
+Metadata should contain fields needed for listing, filtering, sorting, ranking, display, retention, and authorization context. It should not duplicate large object body content.
+
+Example:
 
 ```json
 {
+  "kind": "document",
   "document_id": "doc-42",
-  "document_type": "contract",
   "title": "Master Services Agreement",
   "customer": "Acme Ltd",
   "status": "signed",
@@ -45,50 +69,41 @@ Metadata might be:
 }
 ```
 
-That metadata supports list cards, filters, search snippets, and audit trails without reading the PDF body.
+This metadata can power a list card without reading the PDF. It can also constrain search: text search within English signed contracts for one customer.
 
-## Versions and optimistic updates
+## Define field ownership
 
-When a user edits metadata or replaces content, use preconditions. A precondition says "apply this change only if the object is still at the version I read".
+Metadata becomes fragile when many systems write the same fields. Document ownership:
 
-This prevents lost updates:
+| Field family | Typical owner |
+| --- | --- |
+| `title`, `status`, `tags` | Application UI or domain service |
+| `content_type`, `source_id` | Ingestion service |
+| `extraction_status`, `language` | Text/media extraction worker |
+| `embedding_model`, `vector_status` | Embedding worker |
+| `retention_class`, `delete_after` | Retention service |
+| `audit_actor`, `request_id` | Audit/control layer |
 
-```text
-read object head -> version v7
-user edits title
-write metadata with precondition version == v7
-```
+Use preconditions when updating metadata from stale reads.
 
-If another user wrote version `v8` first, Anvil rejects the stale write. The application can reload, merge, or ask the user what to do.
+## Define indexes
 
-## Metadata update patterns
-
-Treat metadata updates as deliberate mutations. Avoid patterns where multiple services write unrelated metadata fields without coordination. If independent services own different fields, document that ownership and use preconditions or idempotency keys.
-
-Good field ownership examples:
-
-- ingestion service owns `source_id`, `content_type`, and `import_batch`;
-- extraction worker owns `text_extraction_status` and `language`;
-- application UI owns `title`, `status`, and `tags`;
-- retention service owns `retention_class` and `delete_after`.
-
-## Index definitions
-
-A bucket can define multiple indexes for different query families:
+Create indexes around stable access patterns:
 
 | Index | Supports |
 | --- | --- |
-| `documents_by_project` | project folder listings |
-| `documents_by_status` | dashboard counts and filters |
-| `documents_by_customer` | account-level views |
-| `documents_full_text` | user text search |
-| `documents_embeddings` | semantic search |
+| `documents_by_project` | Project folder listing. |
+| `documents_by_status` | Dashboard filters and counts. |
+| `documents_by_customer` | Account views. |
+| `documents_full_text` | User text search. |
+| `documents_embeddings` | Semantic search. |
+| `documents_source_artifacts` | Build or ingestion tracing. |
 
-Do not create one enormous index for every possible query. Define indexes around stable product access patterns. Use metadata and path filters to constrain expensive search operations.
+Avoid one enormous "everything" index. Smaller, purpose-built indexes are easier to reason about, rebuild, authorize, and monitor.
 
-## Object envelopes for structured records
+## Use object envelopes for records
 
-Not every object is a file. Many applications store JSON envelopes:
+An object body can be structured data:
 
 ```json
 {
@@ -101,8 +116,8 @@ Not every object is a file. Many applications store JSON envelopes:
 }
 ```
 
-This is valid object storage. The object body is structured data, and metadata/indexes decide how it is discovered.
+This is valid object storage. It becomes especially powerful when keys, metadata, watches, and indexes all align around the timeline.
 
 ## What you can build after this page
 
-You should be able to model product data as keys, bodies, metadata, versions, and indexes. Next, learn how to query that data with metadata, full text, vector, and hybrid search.
+You should be able to design object bodies, keys, metadata, versions, and indexes from application requirements. Next, learn how to turn those indexes into product search.

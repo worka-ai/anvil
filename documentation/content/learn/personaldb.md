@@ -1,76 +1,91 @@
 ---
 title: PersonalDB
-description: Learn PersonalDB, local-first SQLite changesets, witnesses, snapshots, projections, and authorization.
+description: Learn PersonalDB, local-first SQLite changesets, witness commits, snapshots, projections, and authorization.
 ---
 
 # PersonalDB
 
-**What this page achieves:** you will understand why PersonalDB exists, how Anvil witnesses changes, and how object storage, authorization, watches, and projections support local-first applications.
+**What this page gives you:** a first-principles explanation of local-first data and the role Anvil plays as a PersonalDB witness. You will learn what changesets, heads, certificates, snapshots, and projections mean.
 
-A local-first application keeps a useful database on the user's device. The application can read quickly, work offline, and later sync changes. SQLite is a strong fit for this because it is embedded, reliable, and widely understood.
+A local-first application stores useful data on the user's device. The UI can work quickly because it reads a local database. It can continue through weak network connections because local writes are queued. The hard part is coordination: when devices reconnect, which changes are accepted, in what order, and how does every device learn the result?
 
-The hard part is not storing a local database file. The hard part is coordinating accepted changes across devices and services. Which changes were committed? In what order? Who was allowed to make them? Which projections should update? Which snapshot should a new device download?
+PersonalDB is the protocol and data model for coordinating local SQLite databases. Anvil provides the server-side witness.
 
-PersonalDB gives that coordination protocol a durable server-side witness. Anvil provides that witness path.
+## Local-first problem
 
-## The problem PersonalDB solves
+Imagine a notes app. A laptop and phone both have a local SQLite database. The user edits a note on the laptop while offline. The phone edits the same note. Later both reconnect.
 
-Imagine two devices editing the same project database. Each device can produce SQLite changesets. A server must decide whether each changeset is valid, authorized, and ordered. It must also make the accepted history available to other devices.
+The system needs to answer:
 
-Without a witness, every client has to trust that every other client is honest and current. With a witness, accepted commits receive certificates and become part of a durable group history.
+- Which changes were made?
+- Which shared history did each device start from?
+- Are the changes authorized?
+- Are they valid for the schema?
+- Do they conflict?
+- What certificate proves a change was accepted?
+- What snapshot should a new device download?
+- What server-side projection can power search or dashboards?
 
-## Core nouns
+A simple upload endpoint is not enough. The server must witness ordered changes.
 
-| Concept | Meaning |
-| --- | --- |
-| Group | A synchronization domain for one PersonalDB database or related database set. |
-| Commit | A proposed changeset submitted to the group. |
-| Witness | The service that validates, orders, records, and signs accepted commits. |
-| Snapshot | A compact database state at a known commit head. |
-| Projection | A derived queryable view built from accepted commits. |
-| Certificate | Proof that a commit was accepted with a specific head, policy, and hash. |
+## Changeset
 
-## Commit flow
+A SQLite changeset records row-level changes: inserts, updates, and deletes. It is more precise than "upload the entire database". The client can submit the changes since its last accepted head.
 
-A simplified PersonalDB commit flow is:
+A PersonalDB commit includes:
 
-```text
-client prepares SQLite changeset
-  -> client submits changeset, base head, identity, and idempotency key
-  -> Anvil verifies authorization and group policy
-  -> Anvil validates the changeset against expected schema and head rules
-  -> Anvil records the commit in the group log
-  -> Anvil returns a signed commit certificate
-  -> watchers update snapshots and projections
-```
+- group id;
+- base head;
+- schema version;
+- author identity;
+- idempotency key;
+- SQLite changeset bytes;
+- optional metadata and conflict policy inputs.
 
-The certificate is important. It gives clients proof that the witness accepted the commit. Other systems can reference the certificate rather than trusting an informal response.
+The base head says what shared history the client believed it was extending.
 
-## Why Anvil is involved
+## Witness
 
-Anvil already owns durable objects, metadata, authorization, watches, and derived indexes. PersonalDB needs all of those:
+A witness is the authority that accepts or rejects commits. Anvil verifies that the caller may commit, that the changeset applies to the expected base or conflict policy, that schema rules hold, and that the operation is idempotent.
 
-- commit logs and snapshots are durable objects;
-- group state and row metadata need indexes;
-- authorization decides who may open, commit, read, or project;
-- watch streams notify clients and projection builders;
-- repair can rebuild projections from accepted commits;
-- source hashes and manifests make snapshots verifiable.
+If accepted, Anvil records the commit and returns a certificate. The certificate proves the commit became part of the accepted history at a specific head.
 
-PersonalDB is not a separate side channel. It is integrated into the same storage and authorization model as objects and search.
+If rejected, the client must handle the reason: stale base, schema mismatch, authorization failure, invalid changeset, conflict policy rejection, or duplicate idempotency result.
 
-## Projections
+## Snapshot
 
-A projection is a derived view over accepted database commits. For example, a task application might project open tasks by assignee, due date, and priority. A projection should not depend on unaccepted local writes. It should be built from the witness log and carry a source cursor.
+A snapshot is a compact database image at a known head. Without snapshots, a new device might need to replay every commit since the group was created. With snapshots, it downloads a database at head `H`, verifies it, then applies commits after `H`.
 
-Projection reads are authorization-checked. A caller should not learn about private rows because a projection happened to include them.
+Snapshots are objects with hashes and source proof. They are not anonymous files. A snapshot must prove which commit head it represents.
 
-## Conflict boundaries
+## Projection
 
-PersonalDB does not remove the need for application-level conflict design. It gives the application a reliable place to validate, order, and distribute changes. Applications still choose schemas, merge rules, constraints, and user experience for conflicting edits.
+A projection is a server-side derived view over accepted commits. It exists when a service needs queryable server-visible data without asking every client to upload a separate database.
 
-The witness makes those decisions enforceable and auditable.
+Examples:
+
+- tasks by assignee;
+- calendar events by month;
+- unread counts;
+- audit rows by actor;
+- search records for notes;
+- media references by object key.
+
+Projection builders consume PersonalDB watch events and checkpoint cursors. Projection reads are authorization-checked like object and search reads.
+
+## How Anvil integrates PersonalDB
+
+PersonalDB needs many features Anvil already owns:
+
+- durable object storage for snapshots and changesets;
+- metadata and path indexes for group state;
+- watch streams for commits and projection builders;
+- authorization for group open, commit, snapshot, and projection reads;
+- manifests and hashes for proof;
+- backup and recovery for full durable state.
+
+That is why PersonalDB belongs inside Anvil rather than as a detached side service.
 
 ## What you can do after this page
 
-You should be able to explain why local-first applications need a witness, what a PersonalDB commit certificate proves, and how Anvil stores and indexes PersonalDB state. You are now ready to move from concepts to developer guides.
+You should be able to explain local-first data, SQLite changesets, witnessed commits, commit certificates, snapshots, projections, and how Anvil makes PersonalDB part of the same storage and authorization model.
