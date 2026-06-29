@@ -4,6 +4,7 @@ resolver = "3"
 members = [
     "anvil",
     "anvil-cli",
+    "clients/rust",
     "documentation",
 ]
 

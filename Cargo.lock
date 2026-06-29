@@ -297,6 +297,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "anvil-storage-client"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
 name = "anvil-storage-core"
 version = "0.1.0"
 dependencies = [

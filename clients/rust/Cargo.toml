@@ -1,0 +1,30 @@
+[package]
+name = "anvil-storage-client"
+version.workspace = true
+edition.workspace = true
+description = "Rust gRPC client for Anvil Storage"
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+readme = "README.md"
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = ["target/**"]
+
+[lib]
+name = "anvil_storage_client"
+path = "src/lib.rs"
+
+[dependencies]
+prost = "0.14.1"
+tonic = { version = "0.14.2", default-features = false, features = ["transport", "tls-native-roots", "codegen"] }
+tonic-prost = "0.14.2"
+
+[build-dependencies]
+tonic-prost-build = "0.14.2"
+
+[dev-dependencies]
+tokio = { version = "1.47.1", features = ["macros", "rt"] }
