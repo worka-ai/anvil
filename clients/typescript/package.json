@@ -19,6 +19,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/*.test.mjs",
     "prepack": "npm run build"
   },
   "dependencies": {

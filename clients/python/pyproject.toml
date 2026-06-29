@@ -8,11 +8,10 @@ version = "0.1.0"
 description = "Python gRPC client package for Anvil Storage"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
 authors = [{ name = "Anvil maintainers", email = "hello@worka.ai" }]
 keywords = ["object-store", "storage", "grpc", "s3"]
 classifiers = [
-  "License :: OSI Approved :: Apache Software License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
   "Topic :: System :: Distributed Computing",
