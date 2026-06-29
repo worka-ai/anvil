@@ -2460,6 +2460,15 @@ async fn run_s3_public_and_private_access() {
             .expect_err("reserved namespace LIST must fail");
         assert_reserved_namespace_error(list_err);
 
+        let list_versions_err = client
+            .list_object_versions()
+            .bucket(&public_bucket)
+            .prefix(reserved_prefix)
+            .send()
+            .await
+            .expect_err("reserved namespace version LIST must fail");
+        assert_reserved_namespace_error(list_versions_err);
+
         cluster.states[0]
             .persistence
             .create_object(
@@ -2488,6 +2497,23 @@ async fn run_s3_public_and_private_access() {
                 .iter()
                 .all(|object| object.key() != Some(reserved_key.as_str())),
             "S3 LIST must not reveal reserved namespace keys"
+        );
+        let root_versions = client
+            .list_object_versions()
+            .bucket(&public_bucket)
+            .send()
+            .await
+            .expect("root version listing should succeed");
+        assert!(
+            root_versions
+                .versions()
+                .iter()
+                .all(|object| !object.key().unwrap_or_default().starts_with("_anvil/"))
+                && root_versions
+                    .delete_markers()
+                    .iter()
+                    .all(|object| !object.key().unwrap_or_default().starts_with("_anvil/")),
+            "S3 version LIST must not reveal reserved namespace keys"
         );
 
         let delete_err = client
