@@ -7,6 +7,8 @@ FROM rust:1.96-bookworm AS builder
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    clang \
+    libclang-dev \
     pkg-config \
     libssl-dev \
     protobuf-compiler \
