@@ -479,6 +479,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn model_journal_reader_fails_closed_on_tampered_frame() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+
+        create_model_artifact(&storage, "artifact-a", 1, "models/a", &manifest(""))
+            .await
+            .unwrap();
+
+        let path = storage.model_metadata_journal_path();
+        let mut bytes = tokio::fs::read(&path).await.unwrap();
+        let header = BinaryEnvelopeHeader::decode(&bytes).unwrap();
+        let body_start = COMMON_HEADER_LEN
+            .checked_add(header.header_json.len())
+            .and_then(|offset| offset.checked_add(4))
+            .and_then(|offset| offset.checked_add(140))
+            .expect("frame body offset");
+        bytes[body_start] ^= 0x55;
+        tokio::fs::write(&path, bytes).await.unwrap();
+
+        let err = get_model_artifact(&storage, "artifact-a")
+            .await
+            .expect_err("tampered model journal must not replay partial state");
+        assert!(
+            err.to_string().contains("hash mismatch"),
+            "unexpected tamper error: {err}"
+        );
+    }
+
     async fn ready_owner(
         storage: &Storage,
         owner_node_id: &str,
