@@ -1030,6 +1030,7 @@ fn extract_text_source(
         }
         "metadata_field" => extract_metadata_field_text(extractor, object),
         "media_transcript" => extract_media_transcript_text(object, payload),
+        "personaldb_table_column" => extract_personaldb_table_column_text(extractor, payload),
         other => Err(TextExtractionDiagnostic {
             code: "UnsupportedTextExtractor".to_string(),
             message: format!("unsupported text extractor source `{other}`"),
@@ -1121,6 +1122,68 @@ fn extract_json_pointer_text(
         });
     };
     Ok(json_value_to_text(value))
+}
+
+fn extract_personaldb_table_column_text(
+    extractor: &JsonValue,
+    payload: &[u8],
+) -> Result<Option<String>, TextExtractionDiagnostic> {
+    let column = extractor
+        .get("column")
+        .or_else(|| extractor.get("column_name"))
+        .or_else(|| extractor.get("field"))
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| TextExtractionDiagnostic {
+            code: "PersonalDbTableColumnMissing".to_string(),
+            message: "personaldb_table_column text extractor requires a column name".to_string(),
+            details: serde_json::json!({ "extractor": extractor }),
+        })?;
+    let payload_text = decode_utf8_text(payload)?;
+    let row = serde_json::from_str::<JsonValue>(&payload_text).map_err(|error| {
+        TextExtractionDiagnostic {
+            code: "PersonalDbTableColumnDecodeFailed".to_string(),
+            message: "object body is not valid JSON for personaldb_table_column extraction"
+                .to_string(),
+            details: serde_json::json!({ "column": column, "error": error.to_string() }),
+        }
+    })?;
+    if let Some(expected_table) = extractor
+        .get("table")
+        .or_else(|| extractor.get("table_name"))
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.trim().is_empty())
+        && !personaldb_table_matches(&row, expected_table)
+    {
+        return Ok(None);
+    }
+    let Some(value) = personaldb_column_value(&row, column) else {
+        return Err(TextExtractionDiagnostic {
+            code: "PersonalDbTableColumnNotFound".to_string(),
+            message: "personaldb_table_column did not match a value in the row payload".to_string(),
+            details: serde_json::json!({ "column": column }),
+        });
+    };
+    Ok(json_value_to_text(value))
+}
+
+fn personaldb_table_matches(row: &JsonValue, expected_table: &str) -> bool {
+    row.get("table_name")
+        .or_else(|| row.get("table"))
+        .and_then(JsonValue::as_str)
+        == Some(expected_table)
+}
+
+fn personaldb_column_value<'a>(row: &'a JsonValue, column: &str) -> Option<&'a JsonValue> {
+    if column.starts_with('/') {
+        return row.pointer(column);
+    }
+    row.get("columns")
+        .and_then(|columns| columns.get(column))
+        .or_else(|| row.get("row").and_then(|row| row.get(column)))
+        .or_else(|| row.get("new_values").and_then(|values| values.get(column)))
+        .or_else(|| row.get("values").and_then(|values| values.get(column)))
+        .or_else(|| row.get(column))
 }
 
 fn extract_metadata_field_text(
@@ -1341,6 +1404,69 @@ mod tests {
         assert_eq!(fields.fields.len(), 1);
         assert!(fields.fields[0].text.contains("Audio media object"));
         assert!(fields.fields[0].text.contains("media/audio/a.bin"));
+        assert!(fields.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn extractor_supports_personaldb_table_column_rows() {
+        let object = object("rows/items/1.json", Some("application/json"));
+        let fields = extract_text_fields(
+            &serde_json::json!({
+                "source": "personaldb_table_column",
+                "table": "items",
+                "column": "name"
+            }),
+            &object,
+            br#"{"table_name":"items","columns":{"id":1,"name":"alpha repair order"}}"#,
+        );
+        assert_eq!(fields.fields[0].text, "alpha repair order");
+        assert!(fields.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn extractor_skips_non_matching_personaldb_table_column_rows() {
+        let object = object("rows/items/1.json", Some("application/json"));
+        let fields = extract_text_fields(
+            &serde_json::json!({
+                "source": "personaldb_table_column",
+                "table": "invoices",
+                "column": "name"
+            }),
+            &object,
+            br#"{"table_name":"items","columns":{"id":1,"name":"alpha repair order"}}"#,
+        );
+        assert!(fields.fields.is_empty());
+        assert!(fields.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn extractor_reports_missing_personaldb_table_column() {
+        let object = object("rows/items/1.json", Some("application/json"));
+        let fields = extract_text_fields(
+            &serde_json::json!({
+                "source": "personaldb_table_column",
+                "column": "name"
+            }),
+            &object,
+            br#"{"table_name":"items","columns":{"id":1}}"#,
+        );
+        assert!(fields.fields.is_empty());
+        assert_eq!(fields.diagnostics[0].code, "PersonalDbTableColumnNotFound");
+    }
+
+    #[test]
+    fn extractor_supports_personaldb_table_column_json_pointer() {
+        let object = object("rows/items/1.json", Some("application/json"));
+        let fields = extract_text_fields(
+            &serde_json::json!({
+                "source": "personaldb_table_column",
+                "table": "items",
+                "column": "/new_values/name"
+            }),
+            &object,
+            br#"{"table":"items","new_values":{"id":1,"name":"beta inspection note"}}"#,
+        );
+        assert_eq!(fields.fields[0].text, "beta inspection note");
         assert!(fields.diagnostics.is_empty());
     }
 
