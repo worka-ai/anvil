@@ -74,6 +74,14 @@ jobs:
         ANVIL_IMAGE: anvil:test
       run: cargo test -- --nocapture
 
+    - name: Run Release-Gated Docker E2E Tests
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      env:
+        ANVIL_IMAGE: anvil:test
+        ANVIL_RUN_DOCKER_E2E: "1"
+        ANVIL_RUN_HF_E2E: "1"
+      run: cargo test -p anvil-storage --test docker_cluster_test --test hf_ingestion_e2e -- --nocapture --test-threads=1
+
     # --- Release Steps ---
     # These steps will only run on a successful push to the main branch.
 
@@ -118,8 +126,12 @@ jobs:
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
       run: |
         mkdir -p release
-        docker cp $(docker create ${{ steps.meta.outputs.tags }}):/usr/local/bin/anvil-cli release/anvil
-        docker cp $(docker create ${{ steps.meta.outputs.tags }}):/usr/local/bin/admin release/anvil-admin
+        image_ref="$(echo '${{ steps.meta.outputs.tags }}' | head -n1)"
+        container_id="$(docker create "$image_ref")"
+        trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+        docker cp "$container_id":/usr/local/bin/anvil release/anvil-server
+        docker cp "$container_id":/usr/local/bin/anvil-cli release/anvil-cli
+        docker cp "$container_id":/usr/local/bin/admin release/anvil-admin
 
     - name: Create GitHub Release
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -136,5 +148,6 @@ jobs:
           docker pull ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.tag_name }}
           ```
         files: |
-          release/anvil
+          release/anvil-server
+          release/anvil-cli
           release/anvil-admin

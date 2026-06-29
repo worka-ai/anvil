@@ -5,7 +5,6 @@ use anyhow::{Result, anyhow};
 
 pub struct Context {
     pub profile: Profile,
-    pub config_path: Option<String>,
 }
 
 impl Context {
@@ -35,10 +34,7 @@ impl Context {
             profile.host = format!("http://{}", profile.host);
         }
 
-        Ok(Self {
-            profile,
-            config_path,
-        })
+        Ok(Self { profile })
     }
 
     pub async fn get_bearer_token(&self) -> anyhow::Result<String> {

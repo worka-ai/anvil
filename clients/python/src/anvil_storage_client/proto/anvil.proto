@@ -1,0 +1,1456 @@
+syntax = "proto3";
+
+package anvil;
+
+// Bucket Service
+service BucketService {
+  rpc CreateBucket(CreateBucketRequest) returns (CreateBucketResponse);
+  rpc DeleteBucket(DeleteBucketRequest) returns (DeleteBucketResponse);
+  rpc ListBuckets(ListBucketsRequest) returns (ListBucketsResponse);
+  rpc GetBucketPolicy(GetBucketPolicyRequest) returns (GetBucketPolicyResponse);
+  rpc PutBucketPolicy(PutBucketPolicyRequest) returns (PutBucketPolicyResponse);
+  rpc WatchBucketMetadata(WatchBucketMetadataRequest) returns (stream WatchBucketMetadataResponse);
+}
+
+message CreateBucketRequest {
+  string bucket_name = 1;
+  string region = 2;
+}
+
+message CreateBucketResponse {
+  int64 bucket_id = 1;
+}
+
+message DeleteBucketRequest {
+  string bucket_name = 1;
+}
+
+message DeleteBucketResponse {}
+
+message ListBucketsRequest {}
+
+message Bucket {
+    string name = 1;
+    string creation_date = 2;
+    string region = 3;
+    bool is_public_read = 4;
+    bool deleted = 5;
+    int64 bucket_id = 6;
+}
+
+message ListBucketsResponse {
+    repeated Bucket buckets = 1;
+}
+
+message GetBucketPolicyRequest {
+    string bucket_name = 1;
+}
+
+message GetBucketPolicyResponse {
+    string policy_json = 1;
+}
+
+message PutBucketPolicyRequest {
+    string bucket_name = 1;
+    string policy_json = 2;
+}
+
+message PutBucketPolicyResponse {}
+
+message WatchBucketMetadataRequest {
+    string bucket_name = 1;
+    uint64 after_cursor = 2;
+}
+
+message WatchBucketMetadataResponse {
+    uint64 cursor = 1;
+    string event_type = 2;
+    Bucket bucket = 3;
+    string emitted_at = 4;
+}
+
+
+// Index Service
+service IndexService {
+  rpc CreateIndex(CreateIndexRequest) returns (IndexDefinitionResponse);
+  rpc UpdateIndex(UpdateIndexRequest) returns (IndexDefinitionResponse);
+  rpc DisableIndex(DisableIndexRequest) returns (IndexDefinitionResponse);
+  rpc DropIndex(DropIndexRequest) returns (DropIndexResponse);
+  rpc ListIndexes(ListIndexesRequest) returns (ListIndexesResponse);
+  rpc QueryIndex(QueryIndexRequest) returns (QueryIndexResponse);
+  rpc WatchIndexDefinition(WatchIndexDefinitionRequest) returns (stream WatchIndexDefinitionResponse);
+  rpc WatchIndexPartition(WatchIndexPartitionRequest) returns (stream WatchIndexPartitionResponse);
+  rpc ListIndexDiagnostics(ListIndexDiagnosticsRequest) returns (ListIndexDiagnosticsResponse);
+}
+
+service RepairService {
+  rpc RepairIndex(RepairIndexRequest) returns (RepairIndexResponse);
+  rpc RepairDirectoryIndex(RepairDirectoryIndexRequest) returns (RepairDirectoryIndexResponse);
+  rpc RepairAuthzDerivedIndex(RepairAuthzDerivedIndexRequest) returns (RepairAuthzDerivedIndexResponse);
+  rpc RepairPersonalDbLogChain(RepairPersonalDbLogChainRequest) returns (RepairPersonalDbLogChainResponse);
+  rpc ListRepairFindings(ListRepairFindingsRequest) returns (ListRepairFindingsResponse);
+}
+
+service GitSourceService {
+  rpc PutGitPack(stream PutGitPackRequest) returns (PutGitPackResponse);
+  rpc GetGitObject(GetGitObjectRequest) returns (GetGitObjectResponse);
+  rpc GetGitBlobByPath(GetGitBlobByPathRequest) returns (GetGitBlobByPathResponse);
+  rpc ListGitTree(ListGitTreeRequest) returns (ListGitTreeResponse);
+  rpc WatchGitSource(WatchGitSourceRequest) returns (stream WatchGitSourceResponse);
+}
+
+message PutGitPackRequest {
+    oneof data {
+        GitPackMetadata metadata = 1;
+        bytes chunk = 2;
+    }
+}
+
+message GitPackMetadata {
+    string repository_id = 1;
+    string bucket_name = 2;
+}
+
+message PutGitPackResponse {
+    string repository_id = 1;
+    string bucket_name = 2;
+    string object_key = 3;
+    string version_id = 4;
+    string payload_hash = 5;
+    uint64 generation = 6;
+    string source_hash = 7;
+    string index_path = 8;
+    uint64 record_count = 9;
+    uint64 watch_cursor_low = 10;
+    uint64 watch_cursor_high = 11;
+}
+
+message GetGitObjectRequest {
+    string repository_id = 1;
+    string object_id = 2;
+}
+
+message GetGitObjectResponse {
+    repeated GitBlobLocation locations = 1;
+}
+
+message GetGitBlobByPathRequest {
+    string repository_id = 1;
+    string commit_id = 2;
+    string tree_path = 3;
+}
+
+message GetGitBlobByPathResponse {
+    GitBlobLocation location = 1;
+}
+
+message ListGitTreeRequest {
+    string repository_id = 1;
+    string commit_id = 2;
+    string prefix = 3;
+    uint32 limit = 4;
+}
+
+message ListGitTreeResponse {
+    repeated GitTreeEntryRecord entries = 1;
+}
+
+message GitBlobLocation {
+    string repository_id = 1;
+    string commit_id = 2;
+    string object_id = 3;
+    string tree_path = 4;
+    uint64 blob_start = 5;
+    uint64 blob_len = 6;
+    string pack_object_version_id = 7;
+}
+
+message GitTreeEntryRecord {
+    string tree_path = 1;
+    string object_id = 2;
+    uint64 blob_start = 3;
+    uint64 blob_len = 4;
+    string pack_object_version_id = 5;
+}
+
+message CreateIndexRequest {
+    string bucket_name = 1;
+    string name = 2;
+    string kind = 3;
+    string selector_json = 4;
+    string extractor_json = 5;
+    string authorization_mode = 6;
+    string build_policy_json = 7;
+}
+
+message UpdateIndexRequest {
+    string bucket_name = 1;
+    string name = 2;
+    string selector_json = 3;
+    string extractor_json = 4;
+    string authorization_mode = 5;
+    string build_policy_json = 6;
+}
+
+message DisableIndexRequest {
+    string bucket_name = 1;
+    string name = 2;
+}
+
+message DropIndexRequest {
+    string bucket_name = 1;
+    string name = 2;
+}
+
+message DropIndexResponse {}
+
+message ListIndexesRequest {
+    string bucket_name = 1;
+    bool include_disabled = 2;
+}
+
+message IndexDefinitionRecord {
+    uint64 index_id = 1;
+    string bucket_name = 2;
+    string name = 3;
+    string kind = 4;
+    string selector_json = 5;
+    string extractor_json = 6;
+    string authorization_mode = 7;
+    string build_policy_json = 8;
+    bool enabled = 9;
+    uint64 version = 10;
+    string created_at = 11;
+    string updated_at = 12;
+}
+
+message IndexDefinitionResponse {
+    IndexDefinitionRecord index = 1;
+}
+
+message ListIndexesResponse {
+    repeated IndexDefinitionRecord indexes = 1;
+}
+
+message QueryIndexRequest {
+    string bucket_name = 1;
+    string index_name = 2;
+    string query_text = 3;
+    repeated float query_vector = 4;
+    uint32 limit = 5;
+    bool phrase = 6;
+    string path_prefix = 7;
+    string metadata_filters_json = 8;
+}
+
+message IndexQueryHit {
+    string kind = 1;
+    float score = 2;
+    string object_key = 3;
+    string object_version_id = 4;
+    uint64 document_id = 5;
+    uint32 field_id = 6;
+    uint64 vector_id = 7;
+    uint32 chunk_id = 8;
+    uint64 source_start = 9;
+    uint32 source_len = 10;
+    string metadata_json = 11;
+}
+
+message QueryIndexResponse {
+    repeated IndexQueryHit hits = 1;
+    string index_kind = 2;
+    uint64 index_generation = 3;
+    uint64 authz_revision = 4;
+    string scoring_recipe_json = 5;
+}
+
+message WatchIndexDefinitionRequest {
+    string bucket_name = 1;
+    uint64 after_cursor = 2;
+}
+
+message WatchIndexDefinitionResponse {
+    uint64 cursor = 1;
+    string event_type = 2;
+    IndexDefinitionRecord index = 3;
+    string emitted_at = 4;
+}
+
+message WatchIndexPartitionRequest {
+    string bucket_name = 1;
+    string index_name = 2;
+    string partition_id = 3;
+    uint64 after_cursor_low = 4;
+    uint64 after_cursor_high = 5;
+}
+
+message WatchIndexPartitionResponse {
+    uint64 cursor_low = 1;
+    uint64 cursor_high = 2;
+    string bucket_name = 3;
+    string index_name = 4;
+    string index_storage_id = 5;
+    string partition_id = 6;
+    string event_type = 7;
+    string index_kind = 8;
+    uint64 generation = 9;
+    uint64 source_cursor_low = 10;
+    uint64 source_cursor_high = 11;
+    string source_manifest_hash = 12;
+    string proof_hash = 13;
+    repeated string segment_hashes = 14;
+    uint64 authz_revision = 15;
+    string emitted_at = 16;
+}
+
+message ListIndexDiagnosticsRequest {
+    string bucket_name = 1;
+    string index_name = 2;
+    uint64 after_cursor = 3;
+    uint32 limit = 4;
+    string severity = 5;
+}
+
+message IndexDiagnosticRecord {
+    uint64 cursor = 1;
+    string bucket_name = 2;
+    string index_name = 3;
+    string object_key = 4;
+    string version_id = 5;
+    string severity = 6;
+    string code = 7;
+    string message = 8;
+    string details_json = 9;
+    string created_at = 10;
+}
+
+message ListIndexDiagnosticsResponse {
+    repeated IndexDiagnosticRecord diagnostics = 1;
+}
+
+message RepairIndexRequest {
+    string bucket_name = 1;
+    string index_name = 2;
+    bool rebuild = 3;
+}
+
+message RepairIndexResponse {
+    string status = 1;
+    string bucket_name = 2;
+    string index_name = 3;
+    string index_storage_id = 4;
+    uint64 source_cursor_low = 5;
+    uint64 source_cursor_high = 6;
+    string reason = 7;
+    RepairFindingRecord finding = 8;
+    IndexBuildRecord build = 9;
+}
+
+message RepairDirectoryIndexRequest {
+    string bucket_name = 1;
+    bool rebuild = 2;
+}
+
+message RepairDirectoryIndexResponse {
+    string status = 1;
+    string bucket_name = 2;
+    uint64 source_cursor_low = 3;
+    uint64 source_cursor_high = 4;
+    uint64 expected_entry_count = 5;
+    uint64 actual_entry_count = 6;
+    string expected_snapshot_hash = 7;
+    string actual_snapshot_hash = 8;
+    string reason = 9;
+    RepairFindingRecord finding = 10;
+    string rebuilt_manifest_hash = 11;
+}
+
+message RepairAuthzDerivedIndexRequest {
+    string derived_index_id = 1;
+    bool rebuild = 2;
+}
+
+message RepairAuthzDerivedIndexResponse {
+    string status = 1;
+    string derived_index_id = 2;
+    uint64 processed_revision = 3;
+    uint64 latest_revision = 4;
+    string source_records_hash = 5;
+    string reason = 6;
+    RepairFindingRecord finding = 7;
+}
+
+message RepairPersonalDbLogChainRequest {
+    string database_id = 1;
+}
+
+message RepairPersonalDbLogChainResponse {
+    string status = 1;
+    int64 tenant_id = 2;
+    string database_id = 3;
+    uint64 committed_log_index = 4;
+    uint64 verified_log_index = 5;
+    string committed_log_hash = 6;
+    string reason = 7;
+    RepairFindingRecord finding = 8;
+}
+
+message ListRepairFindingsRequest {
+    string scope_kind = 1;
+    string scope_id = 2;
+    uint32 limit = 3;
+}
+
+message ListRepairFindingsResponse {
+    repeated RepairFindingRecord findings = 1;
+}
+
+message RepairFindingRecord {
+    string finding_id = 1;
+    string scope_kind = 2;
+    string scope_id = 3;
+    string repair_task_id = 4;
+    uint64 lease_fence_token = 5;
+    string severity = 6;
+    string status = 7;
+    string code = 8;
+    string message = 9;
+    repeated RepairSubjectRecord subjects = 10;
+    string proposed_action = 11;
+    string evidence_json = 12;
+    int64 created_at_nanos = 13;
+    string finding_hash = 14;
+}
+
+message RepairSubjectRecord {
+    string subject_kind = 1;
+    string subject_id = 2;
+    uint64 generation = 3;
+    bool has_generation = 4;
+    uint64 cursor_low = 5;
+    uint64 cursor_high = 6;
+    bool has_cursor = 7;
+    string expected_hash = 8;
+    string actual_hash = 9;
+}
+
+message IndexBuildRecord {
+    string index_kind = 1;
+    uint64 generation = 2;
+    uint64 item_count = 3;
+    uint64 source_cursor_low = 4;
+    uint64 source_cursor_high = 5;
+    repeated string segment_hashes = 6;
+}
+
+message WatchGitSourceRequest {
+    string repository_id = 1;
+    uint64 after_cursor_low = 2;
+    uint64 after_cursor_high = 3;
+}
+
+message WatchGitSourceResponse {
+    uint64 cursor_low = 1;
+    uint64 cursor_high = 2;
+    string repository_id = 3;
+    string event_type = 4;
+    uint64 generation = 5;
+    string source_hash = 6;
+    string index_path = 7;
+    string pack_object_version_id = 8;
+    uint64 authz_revision = 9;
+    string emitted_at = 10;
+}
+
+// Object Service
+service ObjectService {
+  rpc PutObject(stream PutObjectRequest) returns (PutObjectResponse);
+  rpc GetObject(GetObjectRequest) returns (stream GetObjectResponse);
+  rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
+  rpc HeadObject(HeadObjectRequest) returns (HeadObjectResponse);
+  rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+  rpc ListObjectVersions(ListObjectVersionsRequest) returns (ListObjectVersionsResponse);
+  rpc CopyObject(CopyObjectRequest) returns (CopyObjectResponse);
+  rpc ComposeObject(ComposeObjectRequest) returns (ComposeObjectResponse);
+  rpc PatchJsonObject(PatchJsonObjectRequest) returns (PatchJsonObjectResponse);
+  rpc CompareAndSwapManifest(CompareAndSwapManifestRequest) returns (CompareAndSwapManifestResponse);
+  rpc WatchPrefix(WatchPrefixRequest) returns (stream WatchPrefixResponse);
+  rpc CreateAppendStream(CreateAppendStreamRequest) returns (CreateAppendStreamResponse);
+  rpc AppendStreamRecord(AppendStreamRecordRequest) returns (AppendStreamRecordResponse);
+  rpc SealAppendStreamSegment(SealAppendStreamSegmentRequest) returns (SealAppendStreamSegmentResponse);
+  rpc InitiateMultipartUpload(InitiateMultipartRequest) returns (InitiateMultipartResponse);
+  rpc UploadPart(stream UploadPartRequest) returns (UploadPartResponse);
+  rpc CompleteMultipartUpload(CompleteMultipartRequest) returns (CompleteMultipartResponse);
+  rpc AbortMultipartUpload(AbortMultipartRequest) returns (AbortMultipartResponse);
+}
+
+message PutObjectRequest {
+    oneof data {
+        ObjectMetadata metadata = 1;
+        bytes chunk = 2;
+    }
+}
+
+message NativeMutationContext {
+    int64 tenant_id = 1;
+    int64 bucket_id = 2;
+    string principal = 3;
+    string request_id = 4;
+    string precondition = 5;
+    string authz_zookie_optional = 6;
+    string idempotency_key = 7;
+}
+
+message ObjectMetadata {
+    string bucket_name = 1;
+    string object_key = 2;
+    NativeMutationContext mutation_context = 3;
+}
+
+message PutObjectResponse {
+    string etag = 1;
+    string version_id = 2;
+    string mutation_id = 3;
+    string payload_hash = 4;
+    string record_hash = 5;
+    uint64 authz_revision = 6;
+    string index_policy_snapshot = 7;
+    uint64 watch_cursor = 8;
+}
+
+message GetObjectRequest {
+    string bucket_name = 1;
+    string object_key = 2;
+    optional string version_id = 3;
+}
+
+message GetObjectResponse {
+    oneof data {
+        ObjectInfo metadata = 1;
+        bytes chunk = 2;
+    }
+}
+
+message ObjectInfo {
+    string content_type = 1;
+    int64 content_length = 2;
+}
+
+
+message DeleteObjectRequest {
+    string bucket_name = 1;
+    string object_key = 2;
+    optional string version_id = 3;
+    NativeMutationContext mutation_context = 4;
+}
+
+message DeleteObjectResponse {
+    string version_id = 1;
+    string mutation_id = 2;
+    string payload_hash = 3;
+    string record_hash = 4;
+    uint64 authz_revision = 5;
+    string index_policy_snapshot = 6;
+    uint64 watch_cursor = 7;
+    bool delete_marker = 8;
+}
+
+message HeadObjectRequest {
+    string bucket_name = 1;
+    string object_key = 2;
+    optional string version_id = 3;
+}
+
+message HeadObjectResponse {
+    string etag = 1;
+    int64 size = 2;
+    string last_modified = 3;
+    string version_id = 4;
+    string mutation_id = 5;
+    string record_hash = 6;
+    uint64 authz_revision = 7;
+    string index_policy_snapshot = 8;
+}
+
+message ListObjectsRequest {
+    string bucket_name = 1;
+    string prefix = 2;
+    string delimiter = 3;
+    string start_after = 4;
+    int32 max_keys = 5;
+}
+
+message ObjectSummary {
+    string key = 1;
+    int64 size = 2;
+    string etag = 3;
+    string last_modified = 4;
+}
+
+message ListObjectsResponse {
+    repeated ObjectSummary objects = 1;
+    repeated string common_prefixes = 2;
+}
+
+message ListObjectVersionsRequest {
+    string bucket_name = 1;
+    string prefix = 2;
+    string key_marker = 3;
+    int32 max_keys = 4;
+    string version_id_marker = 5;
+}
+
+message ObjectVersionSummary {
+    string key = 1;
+    string version_id = 2;
+    int64 size = 3;
+    string etag = 4;
+    string last_modified = 5;
+    bool is_delete_marker = 6;
+    bool is_latest = 7;
+}
+
+message ListObjectVersionsResponse {
+    repeated ObjectVersionSummary versions = 1;
+    bool is_truncated = 2;
+    string next_key_marker = 3;
+    string next_version_id_marker = 4;
+}
+
+message InitiateMultipartRequest {
+    string bucket_name = 1;
+    string object_key = 2;
+    NativeMutationContext mutation_context = 3;
+}
+
+message InitiateMultipartResponse {
+    string upload_id = 1;
+    string version_id = 2;
+    string mutation_id = 3;
+    string payload_hash = 4;
+    string record_hash = 5;
+    uint64 authz_revision = 6;
+    uint64 watch_cursor = 7;
+}
+
+message UploadPartRequest {
+    oneof data {
+        UploadPartMetadata metadata = 1;
+        bytes chunk = 2;
+    }
+}
+
+message UploadPartMetadata {
+    string bucket_name = 1;
+    string object_key = 2;
+    string upload_id = 3;
+    int32 part_number = 4;
+    NativeMutationContext mutation_context = 5;
+}
+
+message UploadPartResponse {
+    string etag = 1;
+    string version_id = 2;
+    string mutation_id = 3;
+    string payload_hash = 4;
+    string record_hash = 5;
+    uint64 authz_revision = 6;
+    uint64 watch_cursor = 7;
+}
+
+message CompleteMultipartPart {
+    int32 part_number = 1;
+    string etag = 2;
+}
+
+message CompleteMultipartRequest {
+    string bucket_name = 1;
+    string object_key = 2;
+    string upload_id = 3;
+    repeated CompleteMultipartPart parts = 4;
+    NativeMutationContext mutation_context = 5;
+}
+
+message CopyObjectRequest {
+    string source_bucket_name = 1;
+    string source_object_key = 2;
+    optional string source_version_id = 3;
+    string destination_bucket_name = 4;
+    string destination_object_key = 5;
+    NativeMutationContext mutation_context = 6;
+}
+
+message CopyObjectResponse {
+    string etag = 1;
+    string version_id = 2;
+    string last_modified = 3;
+    string mutation_id = 4;
+    string payload_hash = 5;
+    string record_hash = 6;
+    uint64 authz_revision = 7;
+    uint64 watch_cursor = 8;
+    string index_policy_snapshot = 9;
+}
+
+message ComposeObjectSource {
+    string bucket_name = 1;
+    string object_key = 2;
+    optional string version_id = 3;
+}
+
+message ComposeObjectRequest {
+    repeated ComposeObjectSource sources = 1;
+    string destination_bucket_name = 2;
+    string destination_object_key = 3;
+    NativeMutationContext mutation_context = 4;
+}
+
+message ComposeObjectResponse {
+    string etag = 1;
+    string version_id = 2;
+    string last_modified = 3;
+    string mutation_id = 4;
+    string payload_hash = 5;
+    string record_hash = 6;
+    uint64 authz_revision = 7;
+    uint64 watch_cursor = 8;
+    string index_policy_snapshot = 9;
+}
+
+message PatchJsonObjectRequest {
+    string bucket_name = 1;
+    string object_key = 2;
+    optional string base_version_id = 3;
+    string merge_patch_json = 4;
+    NativeMutationContext mutation_context = 5;
+}
+
+message PatchJsonObjectResponse {
+    string etag = 1;
+    string version_id = 2;
+    string last_modified = 3;
+    string mutation_id = 4;
+    string payload_hash = 5;
+    string record_hash = 6;
+    uint64 authz_revision = 7;
+    uint64 watch_cursor = 8;
+    string index_policy_snapshot = 9;
+}
+
+message CompareAndSwapManifestRequest {
+    string bucket_name = 1;
+    string manifest_key = 2;
+    uint64 expected_revision = 3;
+    string manifest_json = 4;
+    NativeMutationContext mutation_context = 5;
+}
+
+message CompareAndSwapManifestResponse {
+    uint64 revision = 1;
+    string manifest_hash = 2;
+    string version_id = 3;
+    string mutation_id = 4;
+    string payload_hash = 5;
+    string record_hash = 6;
+    uint64 authz_revision = 7;
+    uint64 watch_cursor = 8;
+}
+
+message WatchPrefixRequest {
+    string bucket_name = 1;
+    string prefix = 2;
+    uint64 after_cursor = 3;
+}
+
+message WatchPrefixResponse {
+    uint64 cursor = 1;
+    string bucket_name = 2;
+    string object_key = 3;
+    string event_type = 4;
+    string version_id = 5;
+    string etag = 6;
+    int64 size = 7;
+    bool is_delete_marker = 8;
+    string created_at = 9;
+}
+
+message CreateAppendStreamRequest {
+    string bucket_name = 1;
+    string stream_key = 2;
+    NativeMutationContext mutation_context = 3;
+}
+
+message CreateAppendStreamResponse {
+    string stream_id = 1;
+    string version_id = 2;
+    string mutation_id = 3;
+    string payload_hash = 4;
+    string record_hash = 5;
+    uint64 authz_revision = 6;
+    uint64 watch_cursor = 7;
+}
+
+message AppendStreamRecordRequest {
+    string bucket_name = 1;
+    string stream_key = 2;
+    string stream_id = 3;
+    bytes payload = 4;
+    NativeMutationContext mutation_context = 5;
+}
+
+message AppendStreamRecordResponse {
+    uint64 record_sequence = 1;
+    string payload_hash = 2;
+    int64 payload_size = 3;
+    string version_id = 4;
+    string mutation_id = 5;
+    string record_hash = 6;
+    uint64 authz_revision = 7;
+    uint64 watch_cursor = 8;
+}
+
+message SealAppendStreamSegmentRequest {
+    string bucket_name = 1;
+    string stream_key = 2;
+    string stream_id = 3;
+    NativeMutationContext mutation_context = 4;
+}
+
+message SealAppendStreamSegmentResponse {
+    uint64 record_count = 1;
+    string segment_hash = 2;
+    string version_id = 3;
+    string mutation_id = 4;
+    string payload_hash = 5;
+    string record_hash = 6;
+    uint64 authz_revision = 7;
+    uint64 watch_cursor = 8;
+}
+
+message CompleteMultipartResponse {
+    string etag = 1;
+    string version_id = 2;
+    string mutation_id = 3;
+    string payload_hash = 4;
+    string record_hash = 5;
+    uint64 authz_revision = 6;
+    uint64 watch_cursor = 7;
+    string index_policy_snapshot = 8;
+}
+
+message AbortMultipartRequest {
+    string bucket_name = 1;
+    string object_key = 2;
+    string upload_id = 3;
+    NativeMutationContext mutation_context = 4;
+}
+
+message AbortMultipartResponse {
+    string version_id = 1;
+    string mutation_id = 2;
+    string payload_hash = 3;
+    string record_hash = 4;
+    uint64 authz_revision = 5;
+    uint64 watch_cursor = 6;
+}
+
+// Internal Service for node-to-node communication
+service InternalAnvilService {
+  rpc PutShard(stream PutShardRequest) returns (PutShardResponse);
+  rpc GetShard(GetShardRequest) returns (stream GetShardResponse);
+  rpc CommitShard(CommitShardRequest) returns (CommitShardResponse);
+  rpc DeleteShard(DeleteShardRequest) returns (DeleteShardResponse);
+}
+
+service AuthService {
+  rpc GetAccessToken(GetAccessTokenRequest) returns (GetAccessTokenResponse);
+  rpc GrantAccess(GrantAccessRequest) returns (GrantAccessResponse);
+  rpc RevokeAccess(RevokeAccessRequest) returns (RevokeAccessResponse);
+  rpc SetPublicAccess(SetPublicAccessRequest) returns (SetPublicAccessResponse);
+  rpc WriteAuthzTuple(WriteAuthzTupleRequest) returns (WriteAuthzTupleResponse);
+  rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
+  rpc WatchAuthzTupleLog(WatchAuthzTupleLogRequest) returns (stream WatchAuthzTupleLogResponse);
+  rpc WatchAuthzNamespace(WatchAuthzNamespaceRequest) returns (stream WatchAuthzNamespaceResponse);
+  rpc WatchAuthzDerivedLag(WatchAuthzDerivedLagRequest) returns (stream WatchAuthzDerivedLagResponse);
+}
+
+service PersonalDbService {
+  rpc CreatePersonalDbGroup(CreatePersonalDbGroupRequest) returns (PersonalDbGroupResponse);
+  rpc GetPersonalDbGroup(GetPersonalDbGroupRequest) returns (PersonalDbGroupResponse);
+  rpc CreatePersonalDbProjection(CreatePersonalDbProjectionRequest) returns (PersonalDbProjectionResponse);
+  rpc GetPersonalDbProjection(GetPersonalDbProjectionRequest) returns (PersonalDbProjectionResponse);
+  rpc SubmitPersonalDbChangeset(SubmitPersonalDbChangesetRequest) returns (SubmitPersonalDbChangesetResponse);
+  rpc CatchUpPersonalDb(PersonalDbCatchUpRequest) returns (PersonalDbCatchUpResponse);
+  rpc WatchPersonalDbGroup(WatchPersonalDbGroupRequest) returns (stream WatchPersonalDbGroupResponse);
+  rpc WatchPersonalDbProjection(WatchPersonalDbProjectionRequest) returns (stream WatchPersonalDbProjectionResponse);
+}
+
+// Hugging Face Keys (public API, policy enforced)
+service HuggingFaceKeyService {
+  rpc CreateKey(CreateHfKeyRequest) returns (CreateHfKeyResponse);
+  rpc DeleteKey(DeleteHfKeyRequest) returns (DeleteHfKeyResponse);
+  rpc ListKeys(ListHfKeysRequest) returns (ListHfKeysResponse);
+}
+
+message CreateHfKeyRequest {
+  string name = 1;
+  string token = 2; // never returned back
+  string note = 3;
+}
+message CreateHfKeyResponse {
+  string name = 1;
+  string note = 2;
+  string created_at = 3;
+}
+message DeleteHfKeyRequest { string name = 1; }
+message DeleteHfKeyResponse {}
+message ListHfKeysRequest {}
+message HfKey {
+  string name = 1;
+  string note = 2;
+  string created_at = 3;
+  string updated_at = 4;
+}
+message ListHfKeysResponse { repeated HfKey keys = 1; }
+
+// Ingestion (public API, policy enforced)
+service HfIngestionService {
+  rpc StartIngestion(StartHfIngestionRequest) returns (StartHfIngestionResponse);
+  rpc GetIngestionStatus(GetHfIngestionStatusRequest) returns (GetHfIngestionStatusResponse);
+  rpc CancelIngestion(CancelHfIngestionRequest) returns (CancelHfIngestionResponse);
+}
+
+message StartHfIngestionRequest {
+  string key_name = 1;
+  string repo = 2;
+  string revision = 3;
+  string target_bucket = 4;
+  string target_prefix = 5;
+  repeated string include_globs = 6;
+  repeated string exclude_globs = 7;
+  string target_region = 8;
+}
+message StartHfIngestionResponse { string ingestion_id = 1; }
+
+message GetHfIngestionStatusRequest { string ingestion_id = 1; }
+message GetHfIngestionStatusResponse {
+  string state = 1;
+  uint64 queued = 2;
+  uint64 downloading = 3;
+  uint64 stored = 4;
+  uint64 failed = 5;
+  string error = 6;
+  string created_at = 7;
+  string started_at = 8;
+  string finished_at = 9;
+}
+
+message CancelHfIngestionRequest { string ingestion_id = 1; }
+message CancelHfIngestionResponse {}
+
+message GetAccessTokenRequest {
+  string client_id = 1;
+  string client_secret = 2;
+  repeated string scopes = 3;
+}
+
+message GetAccessTokenResponse {
+  string access_token = 1;
+  int64 expires_in = 2;
+}
+
+message GrantAccessRequest {
+  string grantee_app_id = 1;
+  string resource = 2;
+  string action = 3;
+}
+
+message GrantAccessResponse {}
+
+message RevokeAccessRequest {
+  string grantee_app_id = 1;
+  string resource = 2;
+  string action = 3;
+}
+
+message RevokeAccessResponse {}
+
+message SetPublicAccessRequest {
+  string bucket = 1;
+  bool allow_public_read = 2;
+}
+
+message SetPublicAccessResponse {}
+
+message WriteAuthzTupleRequest {
+    string namespace = 1;
+    string object_id = 2;
+    string relation = 3;
+    string subject_kind = 4;
+    string subject_id = 5;
+    string caveat_hash = 6;
+    string operation = 7;
+    string reason = 8;
+}
+
+message WriteAuthzTupleResponse {
+    uint64 revision = 1;
+    string zookie = 2;
+    string record_hash = 3;
+}
+
+message CheckPermissionRequest {
+    string namespace = 1;
+    string object_id = 2;
+    string relation = 3;
+    string subject_kind = 4;
+    string subject_id = 5;
+    string caveat_hash = 6;
+    string consistency = 7;
+    string zookie = 8;
+}
+
+message CheckPermissionResponse {
+    bool allowed = 1;
+    uint64 revision = 2;
+    string zookie = 3;
+    string explanation_ref = 4;
+}
+
+message WatchAuthzTupleLogRequest {
+    uint64 after_revision = 1;
+    string namespace = 2;
+}
+
+message WatchAuthzTupleLogResponse {
+    uint64 revision = 1;
+    string namespace = 2;
+    string object_id = 3;
+    string relation = 4;
+    string subject_kind = 5;
+    string subject_id = 6;
+    string caveat_hash = 7;
+    string operation = 8;
+    string written_by = 9;
+    string reason = 10;
+    string record_hash = 11;
+    string written_at = 12;
+}
+
+message WatchAuthzNamespaceRequest {
+    string namespace = 1;
+    uint64 after_cursor_low = 2;
+    uint64 after_cursor_high = 3;
+}
+
+message WatchAuthzNamespaceResponse {
+    uint64 cursor_low = 1;
+    uint64 cursor_high = 2;
+    string namespace = 3;
+    string event_type = 4;
+    uint64 authz_revision = 5;
+    string schema_hash = 6;
+    bool invalidates_derived_usersets = 7;
+    string emitted_at = 8;
+}
+
+message WatchAuthzDerivedLagRequest {
+    string derived_index_id = 1;
+    uint64 after_cursor_low = 2;
+    uint64 after_cursor_high = 3;
+}
+
+message WatchAuthzDerivedLagResponse {
+    uint64 cursor_low = 1;
+    uint64 cursor_high = 2;
+    string derived_index_id = 3;
+    string derived_index_kind = 4;
+    uint64 processed_revision = 5;
+    uint64 latest_revision = 6;
+    uint64 revision_lag = 7;
+    uint64 source_cursor_low = 8;
+    uint64 source_cursor_high = 9;
+    string source_manifest_hash = 10;
+    uint64 generation = 11;
+    uint64 authz_revision = 12;
+    string emitted_at = 13;
+}
+
+message CreatePersonalDbGroupRequest {
+    string database_id = 1;
+    string schema_hash = 2;
+    string genesis_hash = 3;
+    string schema_sql = 4;
+}
+
+message GetPersonalDbGroupRequest {
+    int64 tenant_id = 1;
+    string database_id = 2;
+}
+
+message PersonalDbGroupResponse {
+    PersonalDbGroupManifestRecord manifest = 1;
+    PersonalDbCommittedHeadRecord committed_head = 2;
+}
+
+message CreatePersonalDbProjectionRequest {
+    int64 tenant_id = 1;
+    string database_id = 2;
+    string projection_definition_json = 3;
+}
+
+message GetPersonalDbProjectionRequest {
+    int64 tenant_id = 1;
+    string database_id = 2;
+    string projection_id = 3;
+}
+
+message PersonalDbProjectionResponse {
+    string projection_definition_json = 1;
+}
+
+message PersonalDbGroupManifestRecord {
+    uint32 format_version = 1;
+    string tenant_id = 2;
+    string database_id = 3;
+    string schema_hash = 4;
+    string genesis_hash = 5;
+    string created_at = 6;
+    string created_by = 7;
+    string consistency_policy = 8;
+    uint32 object_layout_version = 9;
+    uint64 active_membership_epoch = 10;
+    uint64 active_policy_epoch = 11;
+    uint64 current_row_index_generation = 12;
+    uint64 current_projection_generation = 13;
+    string manifest_hash = 14;
+    string manifest_signature = 15;
+}
+
+message PersonalDbCommittedHeadRecord {
+    uint32 format_version = 1;
+    string tenant_id = 2;
+    string database_id = 3;
+    uint64 log_index = 4;
+    string log_hash = 5;
+    string segment_path = 6;
+    uint64 row_index_generation = 7;
+    uint64 policy_epoch = 8;
+    uint64 membership_epoch = 9;
+    string schema_hash = 10;
+    string updated_at = 11;
+    string updated_by_node = 12;
+    string head_hash = 13;
+    string head_signature = 14;
+}
+
+message PersonalDbSnapshotsHeadRecord {
+    uint32 format_version = 1;
+    string tenant_id = 2;
+    string database_id = 3;
+    uint64 latest_snapshot_log_index = 4;
+    string latest_snapshot_log_hash = 5;
+    string latest_snapshot_manifest_path = 6;
+    uint32 retained_snapshot_count = 7;
+    string updated_at = 8;
+    string updated_by_node = 9;
+    string head_hash = 10;
+    string head_signature = 11;
+}
+
+message PersonalDbVoterAck {
+    string replica_id = 1;
+    uint64 log_index = 2;
+    string log_hash = 3;
+    string signature = 4;
+}
+
+message SubmitPersonalDbChangesetRequest {
+    int64 tenant_id = 1;
+    string database_id = 2;
+    string principal = 3;
+    string session_token = 4;
+    string request_id = 5;
+    string idempotency_key = 6;
+    uint64 base_log_index = 7;
+    string base_log_hash = 8;
+    uint64 client_log_epoch = 9;
+    uint64 membership_epoch = 10;
+    uint64 policy_epoch = 11;
+    string leader_replica_id = 12;
+    repeated PersonalDbVoterAck voter_acks = 13;
+    string changeset_payload_hash = 14;
+    bytes changeset_bytes = 15;
+    string client_debug_metadata_json = 16;
+}
+
+message SubmitPersonalDbChangesetResponse {
+    uint64 log_index = 1;
+    string log_hash = 2;
+    string changeset_payload_hash = 3;
+    string verified_envelope_hash = 4;
+    string certificate_hash = 5;
+    PersonalDbCommitCertificateRecord certificate = 6;
+    PersonalDbCommittedHeadRecord committed_head = 7;
+    uint64 watch_cursor_low = 8;
+    uint64 watch_cursor_high = 9;
+}
+
+message PersonalDbCommitCertificateRecord {
+    uint32 format_version = 1;
+    string tenant_id = 2;
+    string database_id = 3;
+    uint64 log_index = 4;
+    string previous_log_hash = 5;
+    string entry_hash = 6;
+    string changeset_payload_hash = 7;
+    string verified_envelope_hash = 8;
+    uint64 client_log_epoch = 9;
+    uint64 membership_epoch = 10;
+    uint64 policy_epoch = 11;
+    string leader_replica_id = 12;
+    string voter_acks_hash = 13;
+    uint64 authz_revision = 14;
+    string witness_node_id = 15;
+    string witnessed_at = 16;
+    string certificate_hash = 17;
+    string witness_signature = 18;
+}
+
+message PersonalDbCatchUpRequest {
+    int64 tenant_id = 1;
+    string database_id = 2;
+    string principal = 3;
+    string replica_id = 4;
+    uint64 have_log_index = 5;
+    string have_log_hash = 6;
+    uint32 max_entries = 7;
+}
+
+message PersonalDbCatchUpResponse {
+    bool snapshot_required = 1;
+    string snapshot_reason = 2;
+    PersonalDbCommittedHeadRecord committed_head = 3;
+    PersonalDbSnapshotsHeadRecord snapshots_head = 4;
+    repeated PersonalDbCatchUpEntry entries = 5;
+    bool has_more = 6;
+}
+
+message PersonalDbCatchUpEntry {
+    PersonalDbLogRecord log_record = 1;
+    bytes changeset_bytes = 2;
+    PersonalDbCommitCertificateRecord certificate = 3;
+    bytes certificate_json = 4;
+}
+
+message PersonalDbLogRecord {
+    uint64 log_index = 1;
+    uint64 client_log_epoch = 2;
+    uint64 membership_epoch = 3;
+    uint64 policy_epoch = 4;
+    string previous_log_hash = 5;
+    string changeset_payload_hash = 6;
+    string verified_envelope_hash = 7;
+    string certificate_hash = 8;
+    string payload_ref = 9;
+    string certificate_ref = 10;
+    bytes inline_certificate_json = 11;
+    string entry_hash = 12;
+}
+
+message WatchPersonalDbGroupRequest {
+    int64 tenant_id = 1;
+    string database_id = 2;
+    uint64 after_cursor_low = 3;
+    uint64 after_cursor_high = 4;
+}
+
+message WatchPersonalDbGroupResponse {
+    uint64 cursor_low = 1;
+    uint64 cursor_high = 2;
+    string database_id = 3;
+    string event_type = 4;
+    uint64 log_index = 5;
+    string log_hash = 6;
+    string changeset_payload_hash = 7;
+    string certificate_hash = 8;
+    string committed_head_hash = 9;
+    uint64 authz_revision = 10;
+    string emitted_at = 11;
+}
+
+message WatchPersonalDbProjectionRequest {
+    int64 tenant_id = 1;
+    string database_id = 2;
+    string projection_id = 3;
+    uint64 after_cursor_low = 4;
+    uint64 after_cursor_high = 5;
+}
+
+message WatchPersonalDbProjectionResponse {
+    uint64 cursor_low = 1;
+    uint64 cursor_high = 2;
+    string database_id = 3;
+    string projection_id = 4;
+    string event_type = 5;
+    string source_database_id = 6;
+    uint64 source_log_index = 7;
+    string source_log_hash = 8;
+    uint64 projection_log_index = 9;
+    string projection_log_hash = 10;
+    string definition_hash = 11;
+    uint64 authz_revision = 12;
+    string emitted_at = 13;
+}
+
+
+message PutShardRequest {
+    string upload_id = 1;
+    uint32 shard_index = 2;
+    bytes data = 3;
+}
+
+message PutShardResponse {}
+
+message CommitShardRequest {
+    string upload_id = 1;
+    uint32 shard_index = 2;
+    string final_object_hash = 3;
+}
+
+message CommitShardResponse {}
+
+message GetShardRequest {
+    string object_hash = 1;
+    uint32 shard_index = 2;
+}
+
+message GetShardResponse {
+    bytes data = 1;
+}
+
+message DeleteShardRequest {
+    string object_hash = 1;
+    uint32 shard_index = 2;
+}
+
+message DeleteShardResponse {}
+
+// ---------- Model Service ----------
+service ModelService {
+  rpc PutModelManifest(PutModelManifestRequest) returns (PutModelManifestResponse);
+  rpc ListTensors(ListTensorsRequest) returns (ListTensorsResponse);
+  rpc GetTensor(GetTensorRequest) returns (stream GetTensorChunk);
+  rpc GetTensors(GetTensorsRequest) returns (stream GetTensorChunk);
+}
+
+message TenantScope {
+  string tenant_id = 1;
+  string region = 2;
+}
+
+message ObjectRef {
+  string bucket = 1;
+  string key = 2;
+  string version_id = 3;
+}
+
+enum DType {
+  DTYPE_UNSPECIFIED = 0;
+  F16 = 1;
+  BF16 = 2;
+  F32 = 3;
+  F64 = 4;
+  I8 = 5;
+  I16 = 6;
+  I32 = 7;
+  I64 = 8;
+  U8 = 9;
+}
+
+message ModelManifest {
+  string schema_version = 1;
+  string artifact_id = 2;
+  string name = 3;
+  string format = 4;
+
+  message Component {
+    string path = 1;
+    uint64 size = 2;
+    string hash = 3;
+  }
+  repeated Component components = 5;
+
+  string base_artifact_id = 6;
+  repeated string delta_artifact_ids = 7;
+
+  message Signature {
+    string authority = 1;
+    bytes sig = 2;
+  }
+  repeated Signature signatures = 8;
+
+  string merkle_root = 9;
+  map<string,string> meta = 10;
+}
+
+message TensorIndexRow {
+  string tensor_name = 1;
+  string file_path = 2;
+  uint64 file_offset = 3;
+  uint64 byte_length = 4;
+  DType dtype = 5;
+  repeated uint32 shape = 6;
+  string layout = 7;
+  uint32 block_bytes = 8;
+  bytes blocks = 9;
+}
+
+message PutModelManifestRequest {
+  TenantScope scope = 1;
+  ObjectRef object = 2;
+  ModelManifest manifest = 3;
+  repeated TensorIndexRow index = 4;
+}
+
+message PutModelManifestResponse {
+  string artifact_id = 1;
+  string status = 2;
+}
+
+message ListTensorsRequest {
+  TenantScope scope = 1;
+  ObjectRef object = 2;
+  string artifact_id = 3;
+  string prefix = 4;
+  uint32 limit = 5;
+  string page_token = 6;
+}
+
+message ListTensorsResponse {
+  repeated TensorIndexRow tensors = 1;
+  string next_page_token = 2;
+}
+
+message GetTensorRequest {
+  TenantScope scope = 1;
+  ObjectRef object = 2;
+  string artifact_id = 3;
+  string tensor_name = 4;
+  repeated uint32 slice_begin = 5;
+  repeated uint32 slice_extent = 6;
+}
+
+message GetTensorChunk {
+  bytes data = 1;
+  uint64 offset = 2;
+  bool eof = 3;
+}
+
+message GetTensorsRequest {
+  TenantScope scope = 1;
+  ObjectRef object = 2;
+  string artifact_id = 3;
+  repeated string tensor_names = 4;
+}

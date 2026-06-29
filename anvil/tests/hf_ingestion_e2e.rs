@@ -24,19 +24,31 @@ async fn wait_ready(url: &str, timeout: Duration) {
 
 #[allow(dead_code)]
 #[allow(unused)]
-struct ComposeGuard;
+struct ComposeGuard {
+    compose_file: std::path::PathBuf,
+}
 
 impl Drop for ComposeGuard {
     fn drop(&mut self) {
         let _ = Command::new("docker")
-            .args(["compose", "down", "-v"])
+            .args([
+                "compose",
+                "-f",
+                self.compose_file.to_str().unwrap_or_default(),
+                "down",
+                "-v",
+            ])
             .status();
     }
 }
 
-#[ignore]
 #[tokio::test]
 async fn hf_ingestion_config_json() {
+    if std::env::var("ANVIL_RUN_HF_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping release-gated test; set ANVIL_RUN_HF_E2E=1 to run");
+        return;
+    }
+
     // Bring up cluster via compose (reuse existing compose file and image tag).
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let compose_file_path =
@@ -51,7 +63,9 @@ async fn hf_ingestion_config_json() {
             "-d",
         ],
     );
-    let _guard = ComposeGuard;
+    let _guard = ComposeGuard {
+        compose_file: compose_file_path.clone(),
+    };
 
     wait_ready("http://localhost:50051/ready", Duration::from_secs(60)).await;
 

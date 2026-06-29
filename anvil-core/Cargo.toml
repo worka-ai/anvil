@@ -1,7 +1,22 @@
 [package]
-name = "anvil-core"
-version = "0.1.0"
-edition = "2024"
+name = "anvil-storage-core"
+version.workspace = true
+edition.workspace = true
+description = "Core storage, indexing, authorization, and witness primitives for Anvil"
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+readme.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = [".env", "*.env", "anvil-data/**", "target/**"]
+
+[lib]
+name = "anvil_core"
+path = "src/lib.rs"
 
 [features]
 #Declare an enterprise feature, doesn't activate any depdendencies so leave it with an empty array
@@ -102,6 +117,8 @@ rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"
 unicode-normalization = "0.1.24"
 caseless = "0.2.2"
 unicode-segmentation = "1.13.3"
+# The transitive idna/ICU stack uses ZeroMap; keep zerovec allocation support enabled in the server graph.
+zerovec = { version = "0.11.6", default-features = false, features = ["alloc"] }
 zstd = "0.13"
 aws-sigv4 = { version = "1", features = ["sign-http", "http1", "sign-eventstream"] }
 aws-credential-types = "1"   # for Credentials

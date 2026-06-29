@@ -46,7 +46,7 @@ The first node starts with `--init-cluster`; later nodes join using bootstrap ad
 Use the admin CLI against the native storage path of the node being configured:
 
 ```bash
-cargo run -p anvil --bin admin -- \
+cargo run -p anvil-storage --bin admin -- \
   --anvil-secret-encryption-key aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --storage-path /var/lib/anvil \
   tenant create default

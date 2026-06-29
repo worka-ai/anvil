@@ -8,7 +8,7 @@ description: Run Anvil locally and create a bucket.
 Run a local Anvil node with native storage:
 
 ```bash
-cargo run -p anvil -- \
+cargo run -p anvil-storage -- \
   --jwt-secret local-jwt-secret \
   --anvil-secret-encryption-key aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --cluster-secret local-cluster-secret \
@@ -22,12 +22,12 @@ cargo run -p anvil -- \
 Create initial control-plane records with the admin CLI:
 
 ```bash
-cargo run -p anvil --bin admin -- \
+cargo run -p anvil-storage --bin admin -- \
   --anvil-secret-encryption-key aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --storage-path ./.anvil-data \
   tenant create default
 
-cargo run -p anvil --bin admin -- \
+cargo run -p anvil-storage --bin admin -- \
   --anvil-secret-encryption-key aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --storage-path ./.anvil-data \
   app create --tenant-name default --app-name demo
