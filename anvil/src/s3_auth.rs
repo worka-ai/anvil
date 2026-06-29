@@ -19,11 +19,22 @@ use axum::{
     response::Response,
 };
 
+use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use time::{Date, Month, PrimitiveDateTime, Time as Tm};
 use tracing::{debug, info, warn};
+
+type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Clone, Debug)]
+struct AwsChunkedVerification {
+    signing_key: Vec<u8>,
+    timestamp: String,
+    credential_scope: String,
+    previous_signature: String,
+}
 
 /// Middleware (Stage 2) to decode an `aws-chunked` request body.
 /// This runs AFTER `sigv4_auth`.
@@ -37,7 +48,8 @@ pub async fn aws_chunked_decoder(req: Request, next: Next) -> Response {
     };
 
     if is_streaming {
-        match decode_aws_chunked_body(body).await {
+        let verification = parts.extensions.get::<AwsChunkedVerification>().cloned();
+        match decode_aws_chunked_body(body, verification.as_ref()).await {
             Ok(decoded_bytes) => {
                 // Remove the chunked encoding header as it's no longer accurate
                 parts.headers.remove("content-encoding");
@@ -312,6 +324,29 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         }
     };
 
+    if is_streaming && payload_hash == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
+        let timestamp = parts
+            .headers
+            .get("x-amz-date")
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{}T000000Z", parsed.date));
+        req.extensions_mut().insert(AwsChunkedVerification {
+            signing_key: derive_sigv4_signing_key(
+                &secret,
+                &parsed.date,
+                &parsed.region,
+                &parsed.service,
+            ),
+            timestamp,
+            credential_scope: format!(
+                "{}/{}/{}/aws4_request",
+                parsed.date, parsed.region, parsed.service
+            ),
+            previous_signature: parsed.signature.clone(),
+        });
+    }
+
     let claims = Claims {
         sub: app_details.id.to_string(),
         tenant_id: app_details.tenant_id,
@@ -325,44 +360,39 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
 
 // ----------------- helpers -----------------
 
-/// A simple, in-memory decoder for `aws-chunked` content encoding.
-/// NOTE: This buffers the entire body and does not verify chunk signatures.
-/// A production implementation should be a true `Stream` and verify signatures.
-async fn decode_aws_chunked_body(body: Body) -> anyhow::Result<bytes::Bytes> {
+/// Decode an `aws-chunked` content-encoded body and, when SigV4 streaming
+/// verification metadata is present, verify every chunk signature in the chain.
+async fn decode_aws_chunked_body(
+    body: Body,
+    verification: Option<&AwsChunkedVerification>,
+) -> anyhow::Result<bytes::Bytes> {
     use bytes::{Buf, BytesMut};
 
-    // 1. Collect the entire raw body into a single contiguous buffer.
     let mut buffer = BytesMut::from(body.collect().await?.to_bytes());
-
-    // 2. Now parse the buffered data.
     let mut decoded = BytesMut::new();
-    loop {
-        if buffer.is_empty() {
-            break;
-        }
+    let mut previous_signature = verification.map(|v| v.previous_signature.clone());
 
-        // Find header line
+    loop {
         let header_end = buffer
             .windows(2)
             .position(|w| w == b"\r\n")
             .ok_or_else(|| anyhow::anyhow!("Malformed chunk: no header ending found"))?;
 
-        // Parse hex size
-        let header_line = &buffer[..header_end];
-        let hex_size_str = std::str::from_utf8(header_line)?
-            .split(';')
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("Malformed chunk header"))?;
-        let chunk_size = usize::from_str_radix(hex_size_str, 16)?;
-
-        // Advance buffer past the header line and its CRLF
+        let header_line = std::str::from_utf8(&buffer[..header_end])?.to_string();
+        let (chunk_size, chunk_signature) = parse_aws_chunk_header(&header_line)?;
         buffer.advance(header_end + 2);
 
         if chunk_size == 0 {
-            break; // End of stream
+            verify_aws_chunk_signature(
+                verification,
+                &mut previous_signature,
+                chunk_signature,
+                b"",
+            )?;
+            consume_aws_chunked_trailers(&mut buffer)?;
+            break;
         }
 
-        // Ensure we have enough data for the chunk payload and its trailing CRLF
         if buffer.len() < chunk_size + 2 {
             return Err(anyhow::anyhow!(
                 "Incomplete chunk data: needed {}, have {}",
@@ -371,19 +401,119 @@ async fn decode_aws_chunked_body(body: Body) -> anyhow::Result<bytes::Bytes> {
             ));
         }
 
-        // Copy the payload to our decoded buffer
-        decoded.extend_from_slice(&buffer[..chunk_size]);
-
-        // Verify the trailing CRLF
+        let chunk = buffer[..chunk_size].to_vec();
         if &buffer[chunk_size..chunk_size + 2] != b"\r\n" {
             return Err(anyhow::anyhow!("Malformed chunk: missing trailing CRLF"));
         }
-
-        // Advance the buffer past the payload and its CRLF
         buffer.advance(chunk_size + 2);
+
+        verify_aws_chunk_signature(
+            verification,
+            &mut previous_signature,
+            chunk_signature,
+            &chunk,
+        )?;
+        decoded.extend_from_slice(&chunk);
     }
 
     Ok(decoded.freeze())
+}
+
+fn verify_aws_chunk_signature(
+    verification: Option<&AwsChunkedVerification>,
+    previous_signature: &mut Option<String>,
+    chunk_signature: Option<String>,
+    chunk: &[u8],
+) -> anyhow::Result<()> {
+    let Some(v) = verification else {
+        return Ok(());
+    };
+    let supplied = chunk_signature
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Malformed chunk: missing chunk-signature"))?;
+    let previous = previous_signature
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Missing previous streaming signature"))?;
+    let expected = aws_chunk_signature(v, previous, chunk);
+    if !constant_time_eq_str(&expected, supplied) {
+        return Err(anyhow::anyhow!("Malformed chunk: chunk signature mismatch"));
+    }
+    *previous_signature = Some(supplied.to_string());
+    Ok(())
+}
+
+fn consume_aws_chunked_trailers(buffer: &mut bytes::BytesMut) -> anyhow::Result<()> {
+    use bytes::Buf;
+
+    loop {
+        let line_end = buffer
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or_else(|| anyhow::anyhow!("Malformed chunk: unterminated trailing headers"))?;
+        if line_end == 0 {
+            buffer.advance(2);
+            if !buffer.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Malformed chunk: trailing bytes after final chunk"
+                ));
+            }
+            return Ok(());
+        }
+        buffer.advance(line_end + 2);
+    }
+}
+
+fn parse_aws_chunk_header(header_line: &str) -> anyhow::Result<(usize, Option<String>)> {
+    let mut fields = header_line.split(';');
+    let hex_size = fields
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Malformed chunk header"))?;
+    let chunk_size = usize::from_str_radix(hex_size, 16)?;
+    let mut chunk_signature = None;
+    for field in fields {
+        let Some((name, value)) = field.split_once('=') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("chunk-signature") {
+            chunk_signature = Some(value.to_string());
+        }
+    }
+    Ok((chunk_size, chunk_signature))
+}
+
+fn aws_chunk_signature(
+    verification: &AwsChunkedVerification,
+    previous_signature: &str,
+    chunk: &[u8],
+) -> String {
+    let empty_hash = sha256_hex(b"");
+    let chunk_hash = sha256_hex(chunk);
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
+        verification.timestamp,
+        verification.credential_scope,
+        previous_signature,
+        empty_hash,
+        chunk_hash
+    );
+    hmac_sha256_hex(&verification.signing_key, string_to_sign.as_bytes())
+}
+
+fn derive_sigv4_signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
+    let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
+    let k_region = hmac_sha256(&k_date, region.as_bytes());
+    let k_service = hmac_sha256(&k_region, service.as_bytes());
+    hmac_sha256(&k_service, b"aws4_request")
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts keys of any size");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
+    hex::encode(hmac_sha256(key, data))
 }
 
 struct ParsedAuth {
@@ -536,4 +666,98 @@ fn constant_time_eq_str(a: &str, b: &str) -> bool {
         return false;
     }
     a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_verification() -> AwsChunkedVerification {
+        let date = "20260629";
+        let region = "test-region-1";
+        let service = "s3";
+        AwsChunkedVerification {
+            signing_key: derive_sigv4_signing_key("test-secret", date, region, service),
+            timestamp: "20260629T120000Z".to_string(),
+            credential_scope: format!("{date}/{region}/{service}/aws4_request"),
+            previous_signature: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+        }
+    }
+
+    fn signed_chunked_body(chunks: &[&[u8]], verification: &AwsChunkedVerification) -> Vec<u8> {
+        let mut previous = verification.previous_signature.clone();
+        let mut body = Vec::new();
+        for chunk in chunks {
+            let signature = aws_chunk_signature(verification, &previous, chunk);
+            body.extend_from_slice(
+                format!("{:x};chunk-signature={signature}\r\n", chunk.len()).as_bytes(),
+            );
+            body.extend_from_slice(chunk);
+            body.extend_from_slice(b"\r\n");
+            previous = signature;
+        }
+        let final_signature = aws_chunk_signature(verification, &previous, b"");
+        body.extend_from_slice(format!("0;chunk-signature={final_signature}\r\n\r\n").as_bytes());
+        body
+    }
+
+    #[tokio::test]
+    async fn aws_chunked_decoder_verifies_signed_chunk_chain() {
+        let verification = test_verification();
+        let body = signed_chunked_body(&[b"hello", b" world"], &verification);
+
+        let decoded = decode_aws_chunked_body(Body::from(body), Some(&verification))
+            .await
+            .expect("signed chunk chain should verify");
+
+        assert_eq!(decoded.as_ref(), b"hello world");
+    }
+
+    #[tokio::test]
+    async fn aws_chunked_decoder_rejects_tampered_signed_chunk() {
+        let verification = test_verification();
+        let mut body = signed_chunked_body(&[b"hello"], &verification);
+        let payload_offset = body
+            .windows(b"\r\nhello\r\n".len())
+            .position(|window| window == b"\r\nhello\r\n")
+            .expect("payload marker")
+            + 2;
+        body[payload_offset] = b'j';
+
+        let error = decode_aws_chunked_body(Body::from(body), Some(&verification))
+            .await
+            .expect_err("tampered chunk must not verify");
+
+        assert!(
+            error.to_string().contains("chunk signature mismatch"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn aws_chunked_decoder_requires_chunk_signatures_when_verifying() {
+        let verification = test_verification();
+        let body = b"5\r\nhello\r\n0\r\n\r\n".to_vec();
+
+        let error = decode_aws_chunked_body(Body::from(body), Some(&verification))
+            .await
+            .expect_err("missing chunk-signature must fail");
+
+        assert!(
+            error.to_string().contains("missing chunk-signature"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn aws_chunked_decoder_still_decodes_unsigned_legacy_streams() {
+        let body = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n".to_vec();
+
+        let decoded = decode_aws_chunked_body(Body::from(body), None)
+            .await
+            .expect("unsigned legacy stream should decode");
+
+        assert_eq!(decoded.as_ref(), b"hello world");
+    }
 }
