@@ -1,5 +1,8 @@
-# Stage 1: Build the binaries with the Rust version declared by the workspace.
-FROM rust:1.89-bookworm AS builder
+# Stage 1: Build the binaries with the release toolchain used by CI.
+# The server dependency graph uses crates whose build scripts require the
+# current stable toolchain; the published Rust client remains the crates.io
+# compatibility surface.
+FROM rust:1.96-bookworm AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
