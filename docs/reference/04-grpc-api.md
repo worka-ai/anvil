@@ -109,6 +109,7 @@ message GetObjectResponse {
 message ObjectInfo {
     string content_type = 1;
     int64 content_length = 2;
+    string version_id = 3;
 }
 
 
