@@ -143,6 +143,42 @@ async fn get_object_bytes_for_test(
     bytes
 }
 
+async fn get_object_metadata_and_bytes_for_test(
+    object_client: &mut ObjectServiceClient<tonic::transport::Channel>,
+    token: &str,
+    bucket_name: &str,
+    object_key: &str,
+    version_id: Option<String>,
+) -> (anvil_api::ObjectInfo, Vec<u8>) {
+    let mut stream = object_client
+        .get_object(authorized(
+            GetObjectRequest {
+                bucket_name: bucket_name.to_string(),
+                object_key: object_key.to_string(),
+                version_id,
+            },
+            token,
+        ))
+        .await
+        .expect("get object")
+        .into_inner();
+    let mut metadata = None;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("object chunk");
+        match chunk.data {
+            Some(anvil_api::get_object_response::Data::Metadata(info)) => {
+                metadata = Some(info);
+            }
+            Some(anvil_api::get_object_response::Data::Chunk(data)) => {
+                bytes.extend_from_slice(&data);
+            }
+            None => {}
+        }
+    }
+    (metadata.expect("get object metadata"), bytes)
+}
+
 macro_rules! assert_native_mutation_response {
     ($response:expr) => {{
         assert!(!$response.mutation_id.is_empty());
@@ -1010,6 +1046,132 @@ async fn test_delete_object_specific_version_removes_only_that_version() {
     assert_eq!(versions[0].version_id, second_put.version_id);
     assert!(versions[0].is_latest);
     assert!(!versions[0].is_delete_marker);
+}
+
+#[tokio::test]
+async fn test_get_object_without_version_id_returns_latest_version() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr).await.unwrap();
+
+    let bucket_name = format!("latest-get-{}", uuid::Uuid::new_v4());
+    let object_key = "docs/versioned.txt";
+
+    let bucket_id = bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
+
+    let first = put_object_for_test(
+        &mut object_client,
+        &token,
+        &bucket_name,
+        object_key,
+        b"version-one",
+        native_mutation_context(bucket_id, "put-first"),
+    )
+    .await
+    .unwrap();
+    let second = put_object_for_test(
+        &mut object_client,
+        &token,
+        &bucket_name,
+        object_key,
+        b"version-two",
+        native_mutation_context(bucket_id, "put-second"),
+    )
+    .await
+    .unwrap();
+    let latest = put_object_for_test(
+        &mut object_client,
+        &token,
+        &bucket_name,
+        object_key,
+        b"version-three-latest",
+        native_mutation_context(bucket_id, "put-latest"),
+    )
+    .await
+    .unwrap();
+
+    let head = object_client
+        .head_object(authorized(
+            HeadObjectRequest {
+                bucket_name: bucket_name.clone(),
+                object_key: object_key.to_string(),
+                version_id: None,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(head.version_id, latest.version_id);
+
+    let versions = object_client
+        .list_object_versions(authorized(
+            ListObjectVersionsRequest {
+                bucket_name: bucket_name.clone(),
+                prefix: object_key.to_string(),
+                key_marker: String::new(),
+                max_keys: 100,
+                version_id_marker: String::new(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .versions;
+    assert_eq!(
+        versions
+            .iter()
+            .map(|version| version.version_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            latest.version_id.as_str(),
+            second.version_id.as_str(),
+            first.version_id.as_str()
+        ]
+    );
+    assert!(versions[0].is_latest);
+    assert!(versions[1..].iter().all(|version| !version.is_latest));
+
+    let (metadata, downloaded) = get_object_metadata_and_bytes_for_test(
+        &mut object_client,
+        &token,
+        &bucket_name,
+        object_key,
+        None,
+    )
+    .await;
+    assert_eq!(metadata.version_id, latest.version_id);
+    assert_eq!(metadata.content_length, "version-three-latest".len() as i64);
+    assert_eq!(downloaded, b"version-three-latest");
+
+    let (first_metadata, first_downloaded) = get_object_metadata_and_bytes_for_test(
+        &mut object_client,
+        &token,
+        &bucket_name,
+        object_key,
+        Some(first.version_id.clone()),
+    )
+    .await;
+    assert_eq!(first_metadata.version_id, first.version_id);
+    assert_eq!(first_downloaded, b"version-one");
 }
 
 #[tokio::test]

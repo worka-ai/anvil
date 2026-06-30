@@ -128,6 +128,7 @@ impl ObjectService for AppState {
             let info = ObjectInfo {
                 content_type: object.content_type.clone().unwrap_or_default(),
                 content_length: object.size,
+                version_id: object.version_id.to_string(),
             };
             if tx
                 .send(Ok(GetObjectResponse {
