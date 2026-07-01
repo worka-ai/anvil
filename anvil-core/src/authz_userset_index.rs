@@ -353,6 +353,7 @@ mod tests {
     ) -> AuthzTupleRecord {
         AuthzTupleRecord {
             revision,
+            revision_ordinal: 0,
             tenant_id: 42,
             namespace: namespace.to_string(),
             object_id: object_id.to_string(),

@@ -178,13 +178,17 @@ impl Storage {
             .join("diagnostics.anjournal")
     }
 
-    pub fn task_lease_path(&self, task_id: &str) -> Result<PathBuf> {
+    pub fn task_lease_path(&self, tenant_id: i64, task_id: &str) -> Result<PathBuf> {
+        if tenant_id < 0 {
+            anyhow::bail!("task lease tenant id must be nonnegative");
+        }
         ensure_safe_internal_component(task_id, "task id")?;
         Ok(self
             .storage_path
             .join("_anvil")
             .join("tasks")
             .join("leases")
+            .join(format!("tenant-{tenant_id}"))
             .join(format!("{task_id}.json")))
     }
 

@@ -5,13 +5,14 @@ use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::repair_service_client::RepairServiceClient;
 use anvil::anvil_api::{
     AcquireTaskLeaseRequest, AuthzTupleMutation, CheckPermissionRequest, CheckPermissionsRequest,
-    CheckpointTaskLeaseRequest, CreateBucketRequest, GetAccessTokenRequest, GetObjectRequest,
-    GrantAccessRequest, ListAuthzObjectsRequest, ListAuthzSubjectsRequest, ListBucketsRequest,
-    ListObjectVersionsRequest, ListObjectsRequest, ListRepairFindingsRequest,
-    NativeMutationContext, ObjectMetadata, PutObjectRequest, ReadAuthzTuplesRequest,
-    ReadTaskLeaseRequest, RepairAuthzDerivedIndexRequest, RevokeAccessRequest,
-    SetPublicAccessRequest, WatchAuthzDerivedLagRequest, WatchAuthzNamespaceRequest,
-    WatchAuthzTupleLogRequest, WriteAuthzTupleRequest, WriteAuthzTuplesRequest,
+    CheckpointTaskLeaseRequest, CreateBucketRequest, ForceReleaseTaskLeaseRequest,
+    GetAccessTokenRequest, GetObjectRequest, GrantAccessRequest, ListAuthzObjectsRequest,
+    ListAuthzSubjectsRequest, ListBucketsRequest, ListObjectVersionsRequest, ListObjectsRequest,
+    ListRepairFindingsRequest, NativeMutationContext, ObjectMetadata, PutObjectRequest,
+    ReadAuthzTuplesRequest, ReadTaskLeaseRequest, RepairAuthzDerivedIndexRequest,
+    RevokeAccessRequest, SetPublicAccessRequest, WatchAuthzDerivedLagRequest,
+    WatchAuthzNamespaceRequest, WatchAuthzTupleLogRequest, WriteAuthzTupleRequest,
+    WriteAuthzTuplesRequest,
 };
 use anvil::authz_derived_lag_watch::{
     AuthzDerivedLagWatchPayload, append_authz_derived_lag_watch_record,
@@ -635,8 +636,9 @@ async fn test_authz_batch_read_and_list_operations() {
         .unwrap()
         .into_inner();
     assert_eq!(written.results.len(), 4);
-    assert_eq!(written.revision, 4);
-    assert_eq!(written.zookie, "authz:4");
+    assert!(written.results.iter().all(|result| result.revision == 1));
+    assert_eq!(written.revision, 1);
+    assert_eq!(written.zookie, "authz:1");
 
     let mut first_page = Request::new(ReadAuthzTuplesRequest {
         namespace: "document".to_string(),
@@ -653,6 +655,20 @@ async fn test_authz_batch_read_and_list_operations() {
     assert_eq!(first_page.tuples.len(), 1);
     assert_eq!(first_page.tuples[0].object_id, "alpha");
     assert!(!first_page.next_page_token.is_empty());
+
+    let mut wrong_filter_page = Request::new(ReadAuthzTuplesRequest {
+        namespace: "document".to_string(),
+        object_id: "beta".to_string(),
+        page_size: 1,
+        page_token: first_page.next_page_token.clone(),
+        ..Default::default()
+    });
+    add_bearer(&mut wrong_filter_page, &token);
+    let wrong_filter = auth_client
+        .read_authz_tuples(wrong_filter_page)
+        .await
+        .unwrap_err();
+    assert_eq!(wrong_filter.code(), tonic::Code::InvalidArgument);
 
     let mut second_page = Request::new(ReadAuthzTuplesRequest {
         namespace: "document".to_string(),
@@ -690,7 +706,7 @@ async fn test_authz_batch_read_and_list_operations() {
             .collect::<Vec<_>>(),
         vec![true, false]
     );
-    assert_eq!(checks.revision, 4);
+    assert_eq!(checks.revision, 1);
 
     let mut objects = Request::new(ListAuthzObjectsRequest {
         namespace: "document".to_string(),
@@ -726,6 +742,63 @@ async fn test_authz_batch_read_and_list_operations() {
 }
 
 #[tokio::test]
+async fn test_authz_tuple_batch_failure_is_atomic() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    let mut invalid_batch = Request::new(WriteAuthzTuplesRequest {
+        mutations: vec![
+            authz_mutation("document", "alpha", "viewer", "user", "alice", "add"),
+            AuthzTupleMutation {
+                namespace: "document".to_string(),
+                object_id: "beta".to_string(),
+                relation: "viewer".to_string(),
+                subject_kind: "user".to_string(),
+                subject_id: "alice".to_string(),
+                caveat_hash: "not-a-hex32-caveat".to_string(),
+                operation: "add".to_string(),
+                reason: "invalid".to_string(),
+            },
+        ],
+    });
+    add_bearer(&mut invalid_batch, &token);
+    let err = auth_client
+        .write_authz_tuples(invalid_batch)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert_eq!(
+        cluster.states[0]
+            .persistence
+            .latest_authz_revision(1)
+            .await
+            .unwrap(),
+        0,
+        "failed authz batches must not advance the tenant revision"
+    );
+
+    let mut valid_batch = Request::new(WriteAuthzTuplesRequest {
+        mutations: vec![
+            authz_mutation("document", "alpha", "viewer", "user", "alice", "add"),
+            authz_mutation("document", "beta", "viewer", "user", "alice", "add"),
+        ],
+    });
+    add_bearer(&mut valid_batch, &token);
+    let valid = auth_client
+        .write_authz_tuples(valid_batch)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(valid.revision, 1);
+    assert!(valid.results.iter().all(|result| result.revision == 1));
+}
+
+#[tokio::test]
 async fn test_coordination_task_lease_grpc_flow() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
@@ -741,10 +814,10 @@ async fn test_coordination_task_lease_grpc_flow() {
         task_kind: "posthorn_delivery".to_string(),
         partition_family: "posthorn_queue".to_string(),
         partition_id: "44".repeat(32),
-        owner_node_id: "posthorn-worker-a".to_string(),
+        owner_label: "posthorn-worker-a".to_string(),
         source_cursor_low: 10,
         source_cursor_high: 0,
-        ttl_nanos: 60_000_000_000,
+        requested_ttl_nanos: 60_000_000_000,
     });
     add_bearer(&mut acquire, &token);
     let acquired = coordination_client
@@ -757,11 +830,15 @@ async fn test_coordination_task_lease_grpc_flow() {
     assert_eq!(acquired.task_id, task_id);
     assert_eq!(acquired.fence_token, 1);
     assert_eq!(acquired.source_cursor_low, 10);
+    assert_eq!(acquired.owner_label, "posthorn-worker-a");
+    assert_eq!(acquired.owner_tenant_id, 1);
+    assert_eq!(acquired.owner_principal_kind, "app");
+    assert_eq!(acquired.owner_principal_id, "test-app");
+    assert!(!acquired.owner_actor_instance_id.is_empty());
     assert!(!acquired.lease_hash.is_empty());
 
     let mut checkpoint = Request::new(CheckpointTaskLeaseRequest {
         task_id: task_id.to_string(),
-        owner_node_id: "posthorn-worker-a".to_string(),
         fence_token: acquired.fence_token,
         checkpoint_cursor_low: 42,
         checkpoint_cursor_high: 0,
@@ -788,6 +865,239 @@ async fn test_coordination_task_lease_grpc_flow() {
         .into_inner();
     assert!(read.found);
     assert_eq!(read.lease.expect("lease").checkpoint_cursor_low, 42);
+}
+
+#[tokio::test]
+async fn test_coordination_task_lease_security_invariants() {
+    let mut cluster = TestCluster::new_with_config(&["test-region-1"], |config| {
+        config.task_lease_ttl_secs = 2;
+    })
+    .await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let write_scope = vec![
+        "coordination:lease_read|task_lease/*".to_string(),
+        "coordination:lease_write|task_lease/*".to_string(),
+    ];
+    let admin_scope = vec!["coordination:lease_admin|task_lease/*".to_string()];
+    let token_a = cluster.states[0]
+        .jwt_manager
+        .mint_token("lease-app-a".to_string(), write_scope.clone(), 1)
+        .unwrap();
+    let token_b = cluster.states[0]
+        .jwt_manager
+        .mint_token("lease-app-b".to_string(), write_scope.clone(), 1)
+        .unwrap();
+    let token_tenant_b = cluster.states[0]
+        .jwt_manager
+        .mint_token("lease-app-tenant-b".to_string(), write_scope.clone(), 2)
+        .unwrap();
+    let admin_token = cluster.states[0]
+        .jwt_manager
+        .mint_token("lease-admin".to_string(), admin_scope, 1)
+        .unwrap();
+
+    let mut client = CoordinationServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    let task_id = "posthorn-security-invariants";
+    let mut acquire = Request::new(AcquireTaskLeaseRequest {
+        task_id: task_id.to_string(),
+        task_kind: "posthorn_delivery".to_string(),
+        partition_family: "posthorn_queue".to_string(),
+        partition_id: "55".repeat(32),
+        owner_label: "shared-worker-label".to_string(),
+        source_cursor_low: 7,
+        source_cursor_high: 0,
+        requested_ttl_nanos: 600_000_000_000,
+    });
+    add_bearer(&mut acquire, &token_a);
+    let first = client
+        .acquire_task_lease(acquire)
+        .await
+        .unwrap()
+        .into_inner()
+        .lease
+        .expect("lease");
+    assert_eq!(first.owner_label, "shared-worker-label");
+    assert_eq!(first.owner_principal_id, "lease-app-a");
+    assert!(first.expires_at_nanos - first.acquired_at_nanos <= 2_000_000_000);
+
+    let mut wrong_owner_checkpoint = Request::new(CheckpointTaskLeaseRequest {
+        task_id: task_id.to_string(),
+        fence_token: first.fence_token,
+        checkpoint_cursor_low: 8,
+        checkpoint_cursor_high: 0,
+    });
+    add_bearer(&mut wrong_owner_checkpoint, &token_b);
+    let err = client
+        .checkpoint_task_lease(wrong_owner_checkpoint)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert_eq!(err.message(), "LeaseOwnerMismatch");
+
+    let mut same_label_acquire = Request::new(AcquireTaskLeaseRequest {
+        task_id: task_id.to_string(),
+        task_kind: "posthorn_delivery".to_string(),
+        partition_family: "posthorn_queue".to_string(),
+        partition_id: "55".repeat(32),
+        owner_label: "shared-worker-label".to_string(),
+        source_cursor_low: 8,
+        source_cursor_high: 0,
+        requested_ttl_nanos: 1_000_000_000,
+    });
+    add_bearer(&mut same_label_acquire, &token_b);
+    let err = client
+        .acquire_task_lease(same_label_acquire)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(err.message(), "LeaseHeld");
+
+    let mut unauthorized_release = Request::new(ForceReleaseTaskLeaseRequest {
+        task_id: task_id.to_string(),
+    });
+    add_bearer(&mut unauthorized_release, &token_a);
+    let err = client
+        .force_release_task_lease(unauthorized_release)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    let mut force_release = Request::new(ForceReleaseTaskLeaseRequest {
+        task_id: task_id.to_string(),
+    });
+    add_bearer(&mut force_release, &admin_token);
+    let release = client
+        .force_release_task_lease(force_release)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(release.released);
+    assert_eq!(
+        release.previous_lease.expect("previous").fence_token,
+        first.fence_token
+    );
+
+    let mut read_released = Request::new(ReadTaskLeaseRequest {
+        task_id: task_id.to_string(),
+    });
+    add_bearer(&mut read_released, &token_a);
+    assert!(
+        !client
+            .read_task_lease(read_released)
+            .await
+            .unwrap()
+            .into_inner()
+            .found
+    );
+
+    let stale_task_id = "posthorn-stale-fence";
+    let mut short_acquire = Request::new(AcquireTaskLeaseRequest {
+        task_id: stale_task_id.to_string(),
+        task_kind: "posthorn_delivery".to_string(),
+        partition_family: "posthorn_queue".to_string(),
+        partition_id: "66".repeat(32),
+        owner_label: "lease-app-a".to_string(),
+        source_cursor_low: 1,
+        source_cursor_high: 0,
+        requested_ttl_nanos: 1,
+    });
+    add_bearer(&mut short_acquire, &token_a);
+    let stale_first = client
+        .acquire_task_lease(short_acquire)
+        .await
+        .unwrap()
+        .into_inner()
+        .lease
+        .expect("lease");
+    tokio::time::sleep(Duration::from_millis(2)).await;
+
+    let mut renewed = Request::new(AcquireTaskLeaseRequest {
+        task_id: stale_task_id.to_string(),
+        task_kind: "posthorn_delivery".to_string(),
+        partition_family: "posthorn_queue".to_string(),
+        partition_id: "66".repeat(32),
+        owner_label: "lease-app-a".to_string(),
+        source_cursor_low: 2,
+        source_cursor_high: 0,
+        requested_ttl_nanos: 1_000_000_000,
+    });
+    add_bearer(&mut renewed, &token_a);
+    let stale_second = client
+        .acquire_task_lease(renewed)
+        .await
+        .unwrap()
+        .into_inner()
+        .lease
+        .expect("lease");
+    assert_eq!(stale_second.fence_token, stale_first.fence_token + 1);
+
+    let mut stale_checkpoint = Request::new(CheckpointTaskLeaseRequest {
+        task_id: stale_task_id.to_string(),
+        fence_token: stale_first.fence_token,
+        checkpoint_cursor_low: 3,
+        checkpoint_cursor_high: 0,
+    });
+    add_bearer(&mut stale_checkpoint, &token_a);
+    let err = client
+        .checkpoint_task_lease(stale_checkpoint)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(err.message(), "StaleFence");
+
+    let tenant_b_task_id = "tenant-b-isolated";
+    let mut tenant_b_acquire = Request::new(AcquireTaskLeaseRequest {
+        task_id: tenant_b_task_id.to_string(),
+        task_kind: "posthorn_delivery".to_string(),
+        partition_family: "posthorn_queue".to_string(),
+        partition_id: "77".repeat(32),
+        owner_label: "tenant-b-worker".to_string(),
+        source_cursor_low: 1,
+        source_cursor_high: 0,
+        requested_ttl_nanos: 1_000_000_000,
+    });
+    add_bearer(&mut tenant_b_acquire, &token_tenant_b);
+    let tenant_b_lease = client
+        .acquire_task_lease(tenant_b_acquire)
+        .await
+        .unwrap()
+        .into_inner()
+        .lease
+        .expect("lease");
+    assert_eq!(tenant_b_lease.owner_tenant_id, 2);
+
+    let mut tenant_a_checkpoint = Request::new(CheckpointTaskLeaseRequest {
+        task_id: tenant_b_task_id.to_string(),
+        fence_token: tenant_b_lease.fence_token,
+        checkpoint_cursor_low: 2,
+        checkpoint_cursor_high: 0,
+    });
+    add_bearer(&mut tenant_a_checkpoint, &token_a);
+    assert!(
+        client
+            .checkpoint_task_lease(tenant_a_checkpoint)
+            .await
+            .is_err()
+    );
+
+    let mut tenant_b_read = Request::new(ReadTaskLeaseRequest {
+        task_id: tenant_b_task_id.to_string(),
+    });
+    add_bearer(&mut tenant_b_read, &token_tenant_b);
+    let tenant_b_read = client
+        .read_task_lease(tenant_b_read)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(tenant_b_read.found);
+    assert_eq!(
+        tenant_b_read.lease.expect("tenant b lease").owner_tenant_id,
+        2
+    );
 }
 
 #[tokio::test]

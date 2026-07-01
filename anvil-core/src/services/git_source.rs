@@ -355,6 +355,7 @@ impl AppState {
                 manifest.bucket_name, manifest.object_key
             )],
             tenant_id,
+            jti: None,
         };
         let (_object, stream) = self
             .object_manager

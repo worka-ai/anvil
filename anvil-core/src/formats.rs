@@ -325,6 +325,7 @@ pub enum JournalRecordKind {
     AppendMetadata = 15,
     ManifestCas = 16,
     HfMetadata = 17,
+    AuthzTupleBatch = 18,
 }
 
 impl JournalRecordKind {
@@ -347,6 +348,7 @@ impl JournalRecordKind {
             15 => Ok(Self::AppendMetadata),
             16 => Ok(Self::ManifestCas),
             17 => Ok(Self::HfMetadata),
+            18 => Ok(Self::AuthzTupleBatch),
             other => Err(FormatError::UnsupportedFamily(other)),
         }
     }

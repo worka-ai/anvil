@@ -85,6 +85,7 @@ pub enum AnvilAction {
     // Coordination actions
     CoordinationLeaseRead,
     CoordinationLeaseWrite,
+    CoordinationLeaseAdmin,
 
     // Internal actions
     InternalPutShard,
@@ -174,6 +175,7 @@ impl fmt::Display for AnvilAction {
             // Coordination actions
             AnvilAction::CoordinationLeaseRead => "coordination:lease_read",
             AnvilAction::CoordinationLeaseWrite => "coordination:lease_write",
+            AnvilAction::CoordinationLeaseAdmin => "coordination:lease_admin",
 
             // Internal actions
             AnvilAction::InternalPutShard => "internal:put_shard",
@@ -268,6 +270,7 @@ impl FromStr for AnvilAction {
             // Coordination actions
             "coordination:lease_read" => Ok(AnvilAction::CoordinationLeaseRead),
             "coordination:lease_write" => Ok(AnvilAction::CoordinationLeaseWrite),
+            "coordination:lease_admin" => Ok(AnvilAction::CoordinationLeaseAdmin),
 
             // Internal actions
             "internal:put_shard" => Ok(AnvilAction::InternalPutShard),
@@ -319,6 +322,7 @@ mod tests {
             AnvilAction::CoordinationAll,
             AnvilAction::CoordinationLeaseRead,
             AnvilAction::CoordinationLeaseWrite,
+            AnvilAction::CoordinationLeaseAdmin,
             AnvilAction::InternalPutShard,
             AnvilAction::InternalDeleteShard,
         ];

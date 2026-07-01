@@ -154,7 +154,7 @@ mod tests {
     use super::*;
     use crate::{
         derived_index_proof::DerivedIndexProof,
-        task_lease::{TaskLeaseAcquire, acquire_task_lease, checkpoint_task_lease},
+        task_lease::{TaskLeaseAcquire, TaskLeaseOwner, acquire_task_lease, checkpoint_task_lease},
     };
     use tempfile::tempdir;
 
@@ -228,7 +228,7 @@ mod tests {
         checkpoint_task_lease(
             &storage,
             &first.task_id,
-            "node-a",
+            &TaskLeaseOwner::node("node-a"),
             first.fence_token,
             42,
             20,
@@ -323,7 +323,7 @@ mod tests {
             task_kind: "index_build".to_string(),
             partition_family: "full_text_index".to_string(),
             partition_id: hex::encode([8; 32]),
-            owner_node_id: owner_node_id.to_string(),
+            owner: TaskLeaseOwner::node(owner_node_id),
             source_cursor,
             now_nanos,
             ttl_nanos,

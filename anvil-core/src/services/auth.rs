@@ -3,9 +3,14 @@ use crate::anvil_api::*;
 use crate::{
     AppState, auth, authz_derived_lag_watch, authz_journal, authz_namespace_watch,
     authz_userset_index, crypto,
+    formats::hash32,
     permissions::AnvilAction,
     services::watch_envelope::{self, WatchEnvelopeParts},
 };
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -236,16 +241,37 @@ impl AuthService for AppState {
             validate_authz_tuple_mutation(&claims, mutation)?;
         }
 
-        let mut results = Vec::with_capacity(req.mutations.len());
-        let mut latest_revision = 0;
-        for mutation in req.mutations {
-            let record = write_authz_tuple_record(self, &claims, mutation).await?;
-            latest_revision = latest_revision.max(record.revision);
-            results.push(write_authz_tuple_response(&record)?);
-        }
+        let mutations = req
+            .mutations
+            .into_iter()
+            .map(|mutation| crate::persistence::AuthzTupleBatchMutation {
+                namespace: mutation.namespace,
+                object_id: mutation.object_id,
+                relation: mutation.relation,
+                subject_kind: mutation.subject_kind,
+                subject_id: mutation.subject_id,
+                caveat_hash: mutation.caveat_hash,
+                operation: mutation.operation,
+                reason: mutation.reason,
+            })
+            .collect();
+        let records = self
+            .persistence
+            .write_authz_tuple_batch(claims.tenant_id, mutations, &claims.sub)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let latest_revision = records
+            .iter()
+            .map(|record| record.revision)
+            .max()
+            .unwrap_or(0);
+        emit_authz_tuple_batch_side_effects(self, claims.tenant_id, &records).await?;
 
         Ok(Response::new(WriteAuthzTuplesResponse {
-            results,
+            results: records
+                .iter()
+                .map(write_authz_tuple_response)
+                .collect::<Result<Vec<_>, _>>()?,
             revision: revision_to_u64(latest_revision)?,
             zookie: zookie(latest_revision),
         }))
@@ -272,9 +298,31 @@ impl AuthService for AppState {
         if !auth::is_authorized(AnvilAction::AuthzTupleRead, &resource, &claims.scopes) {
             return Err(Status::permission_denied("Permission denied"));
         }
-        let consistency = AuthzConsistency::from_request(&req.consistency, &req.zookie)?;
-        let response_revision =
-            resolve_authz_response_revision(&self.storage, claims.tenant_id, consistency).await?;
+        let filter_hash = authz_page_filter_hash(
+            "read_tuples",
+            &[
+                &req.namespace,
+                &req.object_id,
+                &req.relation,
+                &req.subject_kind,
+                &req.subject_id,
+                &req.caveat_hash,
+            ],
+        );
+        let page_token = parse_authz_page_token(
+            &req.page_token,
+            claims.tenant_id,
+            &filter_hash,
+            self.config.jwt_secret.as_bytes(),
+        )?;
+        let response_revision = match page_token.as_ref() {
+            Some(token) => token.revision,
+            None => {
+                let consistency = AuthzConsistency::from_request(&req.consistency, &req.zookie)?;
+                resolve_authz_response_revision(&self.storage, claims.tenant_id, consistency)
+                    .await?
+            }
+        };
         let records = authz_journal::read_current_authz_tuples_at_revision(
             &self.storage,
             claims.tenant_id,
@@ -290,7 +338,15 @@ impl AuthService for AppState {
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
-        let (records, next_page_token) = paginate(records, req.page_size, &req.page_token)?;
+        let (records, next_page_token) = paginate_authz(
+            records,
+            req.page_size,
+            page_token.as_ref().map(|token| token.offset).unwrap_or(0),
+            claims.tenant_id,
+            response_revision,
+            &filter_hash,
+            self.config.jwt_secret.as_bytes(),
+        )?;
 
         Ok(Response::new(ReadAuthzTuplesResponse {
             tuples: records
@@ -373,9 +429,30 @@ impl AuthService for AppState {
         if !auth::is_authorized(AnvilAction::AuthzTupleRead, &resource, &claims.scopes) {
             return Err(Status::permission_denied("Permission denied"));
         }
-        let consistency = AuthzConsistency::from_request(&req.consistency, &req.zookie)?;
-        let response_revision =
-            resolve_authz_response_revision(&self.storage, claims.tenant_id, consistency).await?;
+        let filter_hash = authz_page_filter_hash(
+            "list_objects",
+            &[
+                &req.namespace,
+                &req.relation,
+                &req.subject_kind,
+                &req.subject_id,
+                &req.caveat_hash,
+            ],
+        );
+        let page_token = parse_authz_page_token(
+            &req.page_token,
+            claims.tenant_id,
+            &filter_hash,
+            self.config.jwt_secret.as_bytes(),
+        )?;
+        let response_revision = match page_token.as_ref() {
+            Some(token) => token.revision,
+            None => {
+                let consistency = AuthzConsistency::from_request(&req.consistency, &req.zookie)?;
+                resolve_authz_response_revision(&self.storage, claims.tenant_id, consistency)
+                    .await?
+            }
+        };
         let object_ids = authz_journal::list_current_authz_objects_at_revision(
             &self.storage,
             claims.tenant_id,
@@ -388,7 +465,15 @@ impl AuthService for AppState {
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
-        let (object_ids, next_page_token) = paginate(object_ids, req.page_size, &req.page_token)?;
+        let (object_ids, next_page_token) = paginate_authz(
+            object_ids,
+            req.page_size,
+            page_token.as_ref().map(|token| token.offset).unwrap_or(0),
+            claims.tenant_id,
+            response_revision,
+            &filter_hash,
+            self.config.jwt_secret.as_bytes(),
+        )?;
 
         Ok(Response::new(ListAuthzObjectsResponse {
             object_ids,
@@ -416,9 +501,29 @@ impl AuthService for AppState {
         if !auth::is_authorized(AnvilAction::AuthzTupleRead, &resource, &claims.scopes) {
             return Err(Status::permission_denied("Permission denied"));
         }
-        let consistency = AuthzConsistency::from_request(&req.consistency, &req.zookie)?;
-        let response_revision =
-            resolve_authz_response_revision(&self.storage, claims.tenant_id, consistency).await?;
+        let filter_hash = authz_page_filter_hash(
+            "list_subjects",
+            &[
+                &req.namespace,
+                &req.object_id,
+                &req.relation,
+                &req.subject_kind,
+            ],
+        );
+        let page_token = parse_authz_page_token(
+            &req.page_token,
+            claims.tenant_id,
+            &filter_hash,
+            self.config.jwt_secret.as_bytes(),
+        )?;
+        let response_revision = match page_token.as_ref() {
+            Some(token) => token.revision,
+            None => {
+                let consistency = AuthzConsistency::from_request(&req.consistency, &req.zookie)?;
+                resolve_authz_response_revision(&self.storage, claims.tenant_id, consistency)
+                    .await?
+            }
+        };
         let subjects = authz_journal::list_current_authz_subjects_at_revision(
             &self.storage,
             claims.tenant_id,
@@ -430,7 +535,15 @@ impl AuthService for AppState {
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
-        let (subjects, next_page_token) = paginate(subjects, req.page_size, &req.page_token)?;
+        let (subjects, next_page_token) = paginate_authz(
+            subjects,
+            req.page_size,
+            page_token.as_ref().map(|token| token.offset).unwrap_or(0),
+            claims.tenant_id,
+            response_revision,
+            &filter_hash,
+            self.config.jwt_secret.as_bytes(),
+        )?;
 
         Ok(Response::new(ListAuthzSubjectsResponse {
             subjects: subjects
@@ -795,7 +908,23 @@ async fn emit_authz_tuple_write_side_effects(
     tenant_id: i64,
     record: &crate::persistence::AuthzTupleRecord,
 ) -> Result<(), Status> {
-    let _ = state.authz_watch_tx.send(record.clone());
+    emit_authz_tuple_batch_side_effects(state, tenant_id, std::slice::from_ref(record)).await
+}
+
+async fn emit_authz_tuple_batch_side_effects(
+    state: &AppState,
+    tenant_id: i64,
+    records: &[crate::persistence::AuthzTupleRecord],
+) -> Result<(), Status> {
+    let Some(last_record) = records
+        .iter()
+        .max_by_key(|record| (record.revision, record.revision_ordinal))
+    else {
+        return Ok(());
+    };
+    for record in records {
+        let _ = state.authz_watch_tx.send(record.clone());
+    }
     let derived = authz_userset_index::rebuild_derived_userset_index(
         &state.storage,
         tenant_id,
@@ -803,12 +932,12 @@ async fn emit_authz_tuple_write_side_effects(
     )
     .await
     .map_err(|e| Status::internal(e.to_string()))?;
-    let processed_revision = revision_to_u64(record.revision)?;
+    let processed_revision = revision_to_u64(last_record.revision)?;
     authz_derived_lag_watch::append_authz_derived_lag_watch_record(
         &state.storage,
         tenant_id,
         u128::from(processed_revision),
-        mutation_id_from_record_hash(&record.record_hash),
+        mutation_id_from_record_hash(&last_record.record_hash),
         authz_derived_lag_watch::AuthzDerivedLagWatchPayload {
             derived_index_id: authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID.to_string(),
             derived_index_kind: "userset".to_string(),
@@ -974,19 +1103,30 @@ fn optional_str(value: &str) -> Option<&str> {
     if value.is_empty() { None } else { Some(value) }
 }
 
-fn paginate<T>(
+fn paginate_authz<T>(
     values: Vec<T>,
     page_size: u32,
-    page_token: &str,
+    offset: usize,
+    tenant_id: i64,
+    revision: i64,
+    filter_hash: &str,
+    signing_key: &[u8],
 ) -> Result<(Vec<T>, String), Status> {
-    let offset = parse_page_token(page_token)?;
     let limit = normalize_page_size(page_size);
     if offset >= values.len() {
         return Ok((Vec::new(), String::new()));
     }
     let next_offset = offset.saturating_add(limit);
     let next_page_token = if next_offset < values.len() {
-        next_offset.to_string()
+        encode_authz_page_token(
+            AuthzPageTokenClaims {
+                tenant_id,
+                revision,
+                filter_hash,
+                offset: next_offset,
+            },
+            signing_key,
+        )?
     } else {
         String::new()
     };
@@ -996,13 +1136,102 @@ fn paginate<T>(
     ))
 }
 
-fn parse_page_token(value: &str) -> Result<usize, Status> {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuthzPageToken {
+    version: u8,
+    tenant_id: i64,
+    revision: i64,
+    filter_hash: String,
+    offset: usize,
+    signature: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AuthzPageTokenClaims<'a> {
+    tenant_id: i64,
+    revision: i64,
+    filter_hash: &'a str,
+    offset: usize,
+}
+
+fn parse_authz_page_token(
+    value: &str,
+    expected_tenant_id: i64,
+    expected_filter_hash: &str,
+    signing_key: &[u8],
+) -> Result<Option<AuthzPageToken>, Status> {
     if value.is_empty() {
-        return Ok(0);
+        return Ok(None);
     }
-    value
-        .parse::<usize>()
-        .map_err(|_| Status::invalid_argument("page_token must be an integer offset"))
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| Status::invalid_argument("Invalid authz page token"))?;
+    let token: AuthzPageToken = serde_json::from_slice(&bytes)
+        .map_err(|_| Status::invalid_argument("Invalid authz page token"))?;
+    if token.version != 1
+        || token.tenant_id != expected_tenant_id
+        || token.filter_hash != expected_filter_hash
+    {
+        return Err(Status::invalid_argument(
+            "Authz page token does not match this request",
+        ));
+    }
+    let expected = sign_authz_page_token(
+        AuthzPageTokenClaims {
+            tenant_id: token.tenant_id,
+            revision: token.revision,
+            filter_hash: &token.filter_hash,
+            offset: token.offset,
+        },
+        signing_key,
+    )?;
+    if token.signature != expected {
+        return Err(Status::invalid_argument("Invalid authz page token"));
+    }
+    Ok(Some(token))
+}
+
+fn encode_authz_page_token(
+    claims: AuthzPageTokenClaims<'_>,
+    signing_key: &[u8],
+) -> Result<String, Status> {
+    let token = AuthzPageToken {
+        version: 1,
+        tenant_id: claims.tenant_id,
+        revision: claims.revision,
+        filter_hash: claims.filter_hash.to_string(),
+        offset: claims.offset,
+        signature: sign_authz_page_token(claims, signing_key)?,
+    };
+    let bytes = serde_json::to_vec(&token)
+        .map_err(|_| Status::internal("Failed to encode authz page token"))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn sign_authz_page_token(
+    claims: AuthzPageTokenClaims<'_>,
+    signing_key: &[u8],
+) -> Result<String, Status> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(signing_key)
+        .map_err(|_| Status::internal("Invalid authz page token signing key"))?;
+    mac.update(b"authz-page-token-v1");
+    mac.update(&claims.tenant_id.to_le_bytes());
+    mac.update(&claims.revision.to_le_bytes());
+    mac.update(&(claims.filter_hash.len() as u64).to_le_bytes());
+    mac.update(claims.filter_hash.as_bytes());
+    mac.update(&(claims.offset as u64).to_le_bytes());
+    Ok(base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
+}
+
+fn authz_page_filter_hash(kind: &str, values: &[&str]) -> String {
+    let mut input = Vec::new();
+    input.extend_from_slice(&(kind.len() as u64).to_le_bytes());
+    input.extend_from_slice(kind.as_bytes());
+    for value in values {
+        input.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        input.extend_from_slice(value.as_bytes());
+    }
+    hex::encode(hash32(&input))
 }
 
 fn normalize_page_size(value: u32) -> usize {
