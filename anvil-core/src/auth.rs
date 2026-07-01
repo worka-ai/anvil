@@ -197,6 +197,10 @@ fn action_covers_required(token_action: &AnvilAction, required_action: &AnvilAct
             required_action,
             AnvilAction::RepairRead | AnvilAction::RepairRun
         ),
+        AnvilAction::CoordinationAll => matches!(
+            required_action,
+            AnvilAction::CoordinationLeaseRead | AnvilAction::CoordinationLeaseWrite
+        ),
         _ => token_action == required_action, // Exact match for specific actions
     }
 }
@@ -352,6 +356,26 @@ mod tests {
         assert!(!is_authorized(
             AnvilAction::IndexUpdate,
             "tenant-1-bucket-7/body",
+            &token_scopes
+        ));
+    }
+
+    #[test]
+    fn coordination_wildcard_covers_lease_actions() {
+        let token_scopes = vec!["coordination:*|task_lease/posthorn-*".to_string()];
+        assert!(is_authorized(
+            AnvilAction::CoordinationLeaseRead,
+            "task_lease/posthorn-delivery-alpha",
+            &token_scopes
+        ));
+        assert!(is_authorized(
+            AnvilAction::CoordinationLeaseWrite,
+            "task_lease/posthorn-delivery-alpha",
+            &token_scopes
+        ));
+        assert!(!is_authorized(
+            AnvilAction::AuthzTupleWrite,
+            "task_lease/posthorn-delivery-alpha",
             &token_scopes
         ));
     }

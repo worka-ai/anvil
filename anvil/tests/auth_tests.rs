@@ -1,14 +1,17 @@
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
+use anvil::anvil_api::coordination_service_client::CoordinationServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::repair_service_client::RepairServiceClient;
 use anvil::anvil_api::{
-    CheckPermissionRequest, CreateBucketRequest, GetAccessTokenRequest, GetObjectRequest,
-    GrantAccessRequest, ListBucketsRequest, ListObjectVersionsRequest, ListObjectsRequest,
-    ListRepairFindingsRequest, NativeMutationContext, ObjectMetadata, PutObjectRequest,
-    RepairAuthzDerivedIndexRequest, RevokeAccessRequest, SetPublicAccessRequest,
-    WatchAuthzDerivedLagRequest, WatchAuthzNamespaceRequest, WatchAuthzTupleLogRequest,
-    WriteAuthzTupleRequest,
+    AcquireTaskLeaseRequest, AuthzTupleMutation, CheckPermissionRequest, CheckPermissionsRequest,
+    CheckpointTaskLeaseRequest, CreateBucketRequest, GetAccessTokenRequest, GetObjectRequest,
+    GrantAccessRequest, ListAuthzObjectsRequest, ListAuthzSubjectsRequest, ListBucketsRequest,
+    ListObjectVersionsRequest, ListObjectsRequest, ListRepairFindingsRequest,
+    NativeMutationContext, ObjectMetadata, PutObjectRequest, ReadAuthzTuplesRequest,
+    ReadTaskLeaseRequest, RepairAuthzDerivedIndexRequest, RevokeAccessRequest,
+    SetPublicAccessRequest, WatchAuthzDerivedLagRequest, WatchAuthzNamespaceRequest,
+    WatchAuthzTupleLogRequest, WriteAuthzTupleRequest, WriteAuthzTuplesRequest,
 };
 use anvil::authz_derived_lag_watch::{
     AuthzDerivedLagWatchPayload, append_authz_derived_lag_watch_record,
@@ -202,6 +205,26 @@ fn write_authz_tuple_request(
     operation: &str,
 ) -> WriteAuthzTupleRequest {
     WriteAuthzTupleRequest {
+        namespace: namespace.to_string(),
+        object_id: object_id.to_string(),
+        relation: relation.to_string(),
+        subject_kind: subject_kind.to_string(),
+        subject_id: subject_id.to_string(),
+        caveat_hash: String::new(),
+        operation: operation.to_string(),
+        reason: "test".to_string(),
+    }
+}
+
+fn authz_mutation(
+    namespace: &str,
+    object_id: &str,
+    relation: &str,
+    subject_kind: &str,
+    subject_id: &str,
+    operation: &str,
+) -> AuthzTupleMutation {
+    AuthzTupleMutation {
         namespace: namespace.to_string(),
         object_id: object_id.to_string(),
         relation: relation.to_string(),
@@ -585,6 +608,186 @@ async fn test_authz_tuple_write_check_and_watch() {
         .await
         .unwrap_err();
     assert_eq!(unavailable.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn test_authz_batch_read_and_list_operations() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    let mut write = Request::new(WriteAuthzTuplesRequest {
+        mutations: vec![
+            authz_mutation("document", "alpha", "viewer", "user", "alice", "add"),
+            authz_mutation("document", "beta", "viewer", "user", "alice", "add"),
+            authz_mutation("document", "beta", "viewer", "user", "alice", "remove"),
+            authz_mutation("document", "alpha", "editor", "user", "bob", "add"),
+        ],
+    });
+    add_bearer(&mut write, &token);
+    let written = auth_client
+        .write_authz_tuples(write)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(written.results.len(), 4);
+    assert_eq!(written.revision, 4);
+    assert_eq!(written.zookie, "authz:4");
+
+    let mut first_page = Request::new(ReadAuthzTuplesRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        page_size: 1,
+        ..Default::default()
+    });
+    add_bearer(&mut first_page, &token);
+    let first_page = auth_client
+        .read_authz_tuples(first_page)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first_page.tuples.len(), 1);
+    assert_eq!(first_page.tuples[0].object_id, "alpha");
+    assert!(!first_page.next_page_token.is_empty());
+
+    let mut second_page = Request::new(ReadAuthzTuplesRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        page_size: 1,
+        page_token: first_page.next_page_token,
+        ..Default::default()
+    });
+    add_bearer(&mut second_page, &token);
+    let second_page = auth_client
+        .read_authz_tuples(second_page)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second_page.tuples.len(), 1);
+    assert!(second_page.next_page_token.is_empty());
+
+    let mut checks = Request::new(CheckPermissionsRequest {
+        checks: vec![
+            check_permission_request("document", "alpha", "viewer", "user", "alice", "latest", ""),
+            check_permission_request("document", "beta", "viewer", "user", "alice", "latest", ""),
+        ],
+    });
+    add_bearer(&mut checks, &token);
+    let checks = auth_client
+        .check_permissions(checks)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        checks
+            .results
+            .iter()
+            .map(|result| result.allowed)
+            .collect::<Vec<_>>(),
+        vec![true, false]
+    );
+    assert_eq!(checks.revision, 4);
+
+    let mut objects = Request::new(ListAuthzObjectsRequest {
+        namespace: "document".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: String::new(),
+        ..Default::default()
+    });
+    add_bearer(&mut objects, &token);
+    let objects = auth_client
+        .list_authz_objects(objects)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(objects.object_ids, vec!["alpha".to_string()]);
+
+    let mut subjects = Request::new(ListAuthzSubjectsRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "editor".to_string(),
+        subject_kind: "user".to_string(),
+        ..Default::default()
+    });
+    add_bearer(&mut subjects, &token);
+    let subjects = auth_client
+        .list_authz_subjects(subjects)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(subjects.subjects.len(), 1);
+    assert_eq!(subjects.subjects[0].subject_id, "bob");
+}
+
+#[tokio::test]
+async fn test_coordination_task_lease_grpc_flow() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut coordination_client = CoordinationServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    let task_id = "posthorn-delivery-alpha";
+    let mut acquire = Request::new(AcquireTaskLeaseRequest {
+        task_id: task_id.to_string(),
+        task_kind: "posthorn_delivery".to_string(),
+        partition_family: "posthorn_queue".to_string(),
+        partition_id: "44".repeat(32),
+        owner_node_id: "posthorn-worker-a".to_string(),
+        source_cursor_low: 10,
+        source_cursor_high: 0,
+        ttl_nanos: 60_000_000_000,
+    });
+    add_bearer(&mut acquire, &token);
+    let acquired = coordination_client
+        .acquire_task_lease(acquire)
+        .await
+        .unwrap()
+        .into_inner()
+        .lease
+        .expect("lease");
+    assert_eq!(acquired.task_id, task_id);
+    assert_eq!(acquired.fence_token, 1);
+    assert_eq!(acquired.source_cursor_low, 10);
+    assert!(!acquired.lease_hash.is_empty());
+
+    let mut checkpoint = Request::new(CheckpointTaskLeaseRequest {
+        task_id: task_id.to_string(),
+        owner_node_id: "posthorn-worker-a".to_string(),
+        fence_token: acquired.fence_token,
+        checkpoint_cursor_low: 42,
+        checkpoint_cursor_high: 0,
+    });
+    add_bearer(&mut checkpoint, &token);
+    let checkpointed = coordination_client
+        .checkpoint_task_lease(checkpoint)
+        .await
+        .unwrap()
+        .into_inner()
+        .lease
+        .expect("lease");
+    assert_eq!(checkpointed.checkpoint_cursor_low, 42);
+    assert_eq!(checkpointed.fence_token, acquired.fence_token);
+
+    let mut read = Request::new(ReadTaskLeaseRequest {
+        task_id: task_id.to_string(),
+    });
+    add_bearer(&mut read, &token);
+    let read = coordination_client
+        .read_task_lease(read)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(read.found);
+    assert_eq!(read.lease.expect("lease").checkpoint_cursor_low, 42);
 }
 
 #[tokio::test]

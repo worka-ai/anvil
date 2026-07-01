@@ -193,69 +193,113 @@ impl AuthService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
-        validate_tuple_field("namespace", &req.namespace)?;
-        validate_tuple_field("object_id", &req.object_id)?;
-        validate_tuple_field("relation", &req.relation)?;
-        validate_tuple_field("subject_kind", &req.subject_kind)?;
-        validate_tuple_field("subject_id", &req.subject_id)?;
-        validate_caveat_hash(&req.caveat_hash)?;
-        let operation = match req.operation.as_str() {
-            "add" | "remove" => req.operation.as_str(),
-            _ => return Err(Status::invalid_argument("operation must be add or remove")),
-        };
-        let resource = authz_resource(&req.namespace, &req.object_id, &req.relation);
-        if !auth::is_authorized(AnvilAction::AuthzTupleWrite, &resource, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
-
-        let record = self
-            .persistence
-            .write_authz_tuple(
-                claims.tenant_id,
-                &req.namespace,
-                &req.object_id,
-                &req.relation,
-                &req.subject_kind,
-                &req.subject_id,
-                &req.caveat_hash,
-                operation,
-                &claims.sub,
-                &req.reason,
-            )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let _ = self.authz_watch_tx.send(record.clone());
-        let derived = authz_userset_index::rebuild_derived_userset_index(
-            &self.storage,
-            claims.tenant_id,
-            authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-        let processed_revision = revision_to_u64(record.revision)?;
-        authz_derived_lag_watch::append_authz_derived_lag_watch_record(
-            &self.storage,
-            claims.tenant_id,
-            u128::from(processed_revision),
-            mutation_id_from_record_hash(&record.record_hash),
-            authz_derived_lag_watch::AuthzDerivedLagWatchPayload {
-                derived_index_id: authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID.to_string(),
-                derived_index_kind: "userset".to_string(),
-                processed_revision: derived.processed_revision,
-                latest_revision: processed_revision,
-                source_cursor: u128::from(processed_revision),
-                source_manifest_hash: derived.source_records_hash,
-                generation: derived.generation,
-                emitted_at: chrono::Utc::now().to_rfc3339(),
+        let record = write_authz_tuple_record(
+            self,
+            &claims,
+            AuthzTupleMutation {
+                namespace: req.namespace,
+                object_id: req.object_id,
+                relation: req.relation,
+                subject_kind: req.subject_kind,
+                subject_id: req.subject_id,
+                caveat_hash: req.caveat_hash,
+                operation: req.operation,
+                reason: req.reason,
             },
         )
+        .await?;
+
+        Ok(Response::new(write_authz_tuple_response(&record)?))
+    }
+
+    async fn write_authz_tuples(
+        &self,
+        request: Request<WriteAuthzTuplesRequest>,
+    ) -> Result<Response<WriteAuthzTuplesResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        if req.mutations.is_empty() {
+            return Err(Status::invalid_argument(
+                "mutations must contain at least one tuple",
+            ));
+        }
+        if req.mutations.len() > 1000 {
+            return Err(Status::invalid_argument(
+                "mutations must contain no more than 1000 tuples",
+            ));
+        }
+        for mutation in &req.mutations {
+            validate_authz_tuple_mutation(&claims, mutation)?;
+        }
+
+        let mut results = Vec::with_capacity(req.mutations.len());
+        let mut latest_revision = 0;
+        for mutation in req.mutations {
+            let record = write_authz_tuple_record(self, &claims, mutation).await?;
+            latest_revision = latest_revision.max(record.revision);
+            results.push(write_authz_tuple_response(&record)?);
+        }
+
+        Ok(Response::new(WriteAuthzTuplesResponse {
+            results,
+            revision: revision_to_u64(latest_revision)?,
+            zookie: zookie(latest_revision),
+        }))
+    }
+
+    async fn read_authz_tuples(
+        &self,
+        request: Request<ReadAuthzTuplesRequest>,
+    ) -> Result<Response<ReadAuthzTuplesResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        validate_optional_tuple_field("namespace", &req.namespace)?;
+        validate_optional_tuple_field("object_id", &req.object_id)?;
+        validate_optional_tuple_field("relation", &req.relation)?;
+        validate_optional_tuple_field("subject_kind", &req.subject_kind)?;
+        validate_optional_tuple_field("subject_id", &req.subject_id)?;
+        validate_caveat_hash(&req.caveat_hash)?;
+
+        let resource = authz_filter_resource(&req.namespace, &req.object_id, &req.relation);
+        if !auth::is_authorized(AnvilAction::AuthzTupleRead, &resource, &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+        let consistency = AuthzConsistency::from_request(&req.consistency, &req.zookie)?;
+        let response_revision =
+            resolve_authz_response_revision(&self.storage, claims.tenant_id, consistency).await?;
+        let records = authz_journal::read_current_authz_tuples_at_revision(
+            &self.storage,
+            claims.tenant_id,
+            authz_journal::AuthzTupleFilter {
+                namespace: optional_filter_value(req.namespace),
+                object_id: optional_filter_value(req.object_id),
+                relation: optional_filter_value(req.relation),
+                subject_kind: optional_filter_value(req.subject_kind),
+                subject_id: optional_filter_value(req.subject_id),
+                caveat_hash: optional_filter_value(req.caveat_hash),
+            },
+            response_revision,
+        )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
+        let (records, next_page_token) = paginate(records, req.page_size, &req.page_token)?;
 
-        Ok(Response::new(WriteAuthzTupleResponse {
-            revision: revision_to_u64(record.revision)?,
-            zookie: zookie(record.revision),
-            record_hash: record.record_hash,
+        Ok(Response::new(ReadAuthzTuplesResponse {
+            tuples: records
+                .into_iter()
+                .map(|record| authz_tuple_response(&record))
+                .collect::<Result<Vec<_>, _>>()?,
+            revision: revision_to_u64(response_revision)?,
+            zookie: zookie(response_revision),
+            next_page_token,
         }))
     }
 
@@ -269,35 +313,73 @@ impl AuthService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
+        Ok(Response::new(
+            check_permission_response(self, &claims, req).await?,
+        ))
+    }
+
+    async fn check_permissions(
+        &self,
+        request: Request<CheckPermissionsRequest>,
+    ) -> Result<Response<CheckPermissionsResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        if req.checks.is_empty() {
+            return Err(Status::invalid_argument(
+                "checks must contain at least one request",
+            ));
+        }
+        if req.checks.len() > 1000 {
+            return Err(Status::invalid_argument(
+                "checks must contain no more than 1000 requests",
+            ));
+        }
+
+        let mut results = Vec::with_capacity(req.checks.len());
+        let mut latest_revision = 0;
+        for check in req.checks {
+            let response = check_permission_response(self, &claims, check).await?;
+            latest_revision = latest_revision.max(response.revision);
+            results.push(response);
+        }
+
+        Ok(Response::new(CheckPermissionsResponse {
+            results,
+            revision: latest_revision,
+            zookie: format!("authz:{latest_revision}"),
+        }))
+    }
+
+    async fn list_authz_objects(
+        &self,
+        request: Request<ListAuthzObjectsRequest>,
+    ) -> Result<Response<ListAuthzObjectsResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
         validate_tuple_field("namespace", &req.namespace)?;
-        validate_tuple_field("object_id", &req.object_id)?;
         validate_tuple_field("relation", &req.relation)?;
         validate_tuple_field("subject_kind", &req.subject_kind)?;
         validate_tuple_field("subject_id", &req.subject_id)?;
         validate_caveat_hash(&req.caveat_hash)?;
-        let resource = authz_resource(&req.namespace, &req.object_id, &req.relation);
-        if !auth::is_authorized(AnvilAction::AuthzCheck, &resource, &claims.scopes) {
+        let resource = authz_filter_resource(&req.namespace, "", &req.relation);
+        if !auth::is_authorized(AnvilAction::AuthzTupleRead, &resource, &claims.scopes) {
             return Err(Status::permission_denied("Permission denied"));
         }
         let consistency = AuthzConsistency::from_request(&req.consistency, &req.zookie)?;
-        let latest_revision = authz_journal::latest_authz_revision(&self.storage, claims.tenant_id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        if let Some(required_revision) = consistency.required_revision()
-            && latest_revision < required_revision
-        {
-            return Err(Status::failed_precondition("AuthzRevisionUnavailable"));
-        }
-
-        let response_revision = match consistency {
-            AuthzConsistency::Exact(revision) => revision,
-            AuthzConsistency::Latest | AuthzConsistency::AtLeast(_) => latest_revision,
-        };
-        let allowed = authz_journal::resolve_permission_at_revision(
+        let response_revision =
+            resolve_authz_response_revision(&self.storage, claims.tenant_id, consistency).await?;
+        let object_ids = authz_journal::list_current_authz_objects_at_revision(
             &self.storage,
             claims.tenant_id,
             &req.namespace,
-            &req.object_id,
             &req.relation,
             &req.subject_kind,
             &req.subject_id,
@@ -306,16 +388,62 @@ impl AuthService for AppState {
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
+        let (object_ids, next_page_token) = paginate(object_ids, req.page_size, &req.page_token)?;
 
-        Ok(Response::new(CheckPermissionResponse {
-            allowed,
+        Ok(Response::new(ListAuthzObjectsResponse {
+            object_ids,
             revision: revision_to_u64(response_revision)?,
             zookie: zookie(response_revision),
-            explanation_ref: if allowed {
-                "tuple_or_userset_match".to_string()
-            } else {
-                "no_current_tuple_or_userset".to_string()
-            },
+            next_page_token,
+        }))
+    }
+
+    async fn list_authz_subjects(
+        &self,
+        request: Request<ListAuthzSubjectsRequest>,
+    ) -> Result<Response<ListAuthzSubjectsResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        validate_tuple_field("namespace", &req.namespace)?;
+        validate_tuple_field("object_id", &req.object_id)?;
+        validate_tuple_field("relation", &req.relation)?;
+        validate_optional_tuple_field("subject_kind", &req.subject_kind)?;
+        let resource = authz_resource(&req.namespace, &req.object_id, &req.relation);
+        if !auth::is_authorized(AnvilAction::AuthzTupleRead, &resource, &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+        let consistency = AuthzConsistency::from_request(&req.consistency, &req.zookie)?;
+        let response_revision =
+            resolve_authz_response_revision(&self.storage, claims.tenant_id, consistency).await?;
+        let subjects = authz_journal::list_current_authz_subjects_at_revision(
+            &self.storage,
+            claims.tenant_id,
+            &req.namespace,
+            &req.object_id,
+            &req.relation,
+            optional_str(req.subject_kind.as_str()),
+            response_revision,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+        let (subjects, next_page_token) = paginate(subjects, req.page_size, &req.page_token)?;
+
+        Ok(Response::new(ListAuthzSubjectsResponse {
+            subjects: subjects
+                .into_iter()
+                .map(|subject| AuthzSubject {
+                    subject_kind: subject.subject_kind,
+                    subject_id: subject.subject_id,
+                    caveat_hash: subject.caveat_hash,
+                })
+                .collect(),
+            revision: revision_to_u64(response_revision)?,
+            zookie: zookie(response_revision),
+            next_page_token,
         }))
     }
 
@@ -565,6 +693,20 @@ fn authz_resource(namespace: &str, object_id: &str, relation: &str) -> String {
     format!("{}/{}#{}", namespace, object_id, relation)
 }
 
+fn authz_filter_resource(namespace: &str, object_id: &str, relation: &str) -> String {
+    match (
+        namespace.is_empty(),
+        object_id.is_empty(),
+        relation.is_empty(),
+    ) {
+        (true, _, _) => "*".to_string(),
+        (false, true, true) => namespace.to_string(),
+        (false, true, false) => format!("{namespace}/*#{relation}"),
+        (false, false, true) => format!("{namespace}/{object_id}#*"),
+        (false, false, false) => authz_resource(namespace, object_id, relation),
+    }
+}
+
 fn validate_tuple_field(name: &str, value: &str) -> Result<(), Status> {
     if value.is_empty() {
         return Err(Status::invalid_argument(format!(
@@ -577,6 +719,13 @@ fn validate_tuple_field(name: &str, value: &str) -> Result<(), Status> {
         )));
     }
     Ok(())
+}
+
+fn validate_optional_tuple_field(name: &str, value: &str) -> Result<(), Status> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    validate_tuple_field(name, value)
 }
 
 fn validate_caveat_hash(value: &str) -> Result<(), Status> {
@@ -592,6 +741,152 @@ fn validate_watch_component(name: &str, value: &str) -> Result<(), Status> {
         )));
     }
     Ok(())
+}
+
+async fn write_authz_tuple_record(
+    state: &AppState,
+    claims: &auth::Claims,
+    req: AuthzTupleMutation,
+) -> Result<crate::persistence::AuthzTupleRecord, Status> {
+    let operation = validate_authz_tuple_mutation(claims, &req)?;
+    let record = state
+        .persistence
+        .write_authz_tuple(
+            claims.tenant_id,
+            &req.namespace,
+            &req.object_id,
+            &req.relation,
+            &req.subject_kind,
+            &req.subject_id,
+            &req.caveat_hash,
+            operation,
+            &claims.sub,
+            &req.reason,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+    emit_authz_tuple_write_side_effects(state, claims.tenant_id, &record).await?;
+    Ok(record)
+}
+
+fn validate_authz_tuple_mutation<'a>(
+    claims: &auth::Claims,
+    req: &'a AuthzTupleMutation,
+) -> Result<&'a str, Status> {
+    validate_tuple_field("namespace", &req.namespace)?;
+    validate_tuple_field("object_id", &req.object_id)?;
+    validate_tuple_field("relation", &req.relation)?;
+    validate_tuple_field("subject_kind", &req.subject_kind)?;
+    validate_tuple_field("subject_id", &req.subject_id)?;
+    validate_caveat_hash(&req.caveat_hash)?;
+    let operation = match req.operation.as_str() {
+        "add" | "remove" => req.operation.as_str(),
+        _ => return Err(Status::invalid_argument("operation must be add or remove")),
+    };
+    let resource = authz_resource(&req.namespace, &req.object_id, &req.relation);
+    if !auth::is_authorized(AnvilAction::AuthzTupleWrite, &resource, &claims.scopes) {
+        return Err(Status::permission_denied("Permission denied"));
+    }
+    Ok(operation)
+}
+
+async fn emit_authz_tuple_write_side_effects(
+    state: &AppState,
+    tenant_id: i64,
+    record: &crate::persistence::AuthzTupleRecord,
+) -> Result<(), Status> {
+    let _ = state.authz_watch_tx.send(record.clone());
+    let derived = authz_userset_index::rebuild_derived_userset_index(
+        &state.storage,
+        tenant_id,
+        authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID,
+    )
+    .await
+    .map_err(|e| Status::internal(e.to_string()))?;
+    let processed_revision = revision_to_u64(record.revision)?;
+    authz_derived_lag_watch::append_authz_derived_lag_watch_record(
+        &state.storage,
+        tenant_id,
+        u128::from(processed_revision),
+        mutation_id_from_record_hash(&record.record_hash),
+        authz_derived_lag_watch::AuthzDerivedLagWatchPayload {
+            derived_index_id: authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID.to_string(),
+            derived_index_kind: "userset".to_string(),
+            processed_revision: derived.processed_revision,
+            latest_revision: processed_revision,
+            source_cursor: u128::from(processed_revision),
+            source_manifest_hash: derived.source_records_hash,
+            generation: derived.generation,
+            emitted_at: chrono::Utc::now().to_rfc3339(),
+        },
+    )
+    .await
+    .map_err(|e| Status::internal(e.to_string()))?;
+    Ok(())
+}
+
+async fn check_permission_response(
+    state: &AppState,
+    claims: &auth::Claims,
+    req: CheckPermissionRequest,
+) -> Result<CheckPermissionResponse, Status> {
+    validate_tuple_field("namespace", &req.namespace)?;
+    validate_tuple_field("object_id", &req.object_id)?;
+    validate_tuple_field("relation", &req.relation)?;
+    validate_tuple_field("subject_kind", &req.subject_kind)?;
+    validate_tuple_field("subject_id", &req.subject_id)?;
+    validate_caveat_hash(&req.caveat_hash)?;
+    let resource = authz_resource(&req.namespace, &req.object_id, &req.relation);
+    if !auth::is_authorized(AnvilAction::AuthzCheck, &resource, &claims.scopes) {
+        return Err(Status::permission_denied("Permission denied"));
+    }
+    let consistency = AuthzConsistency::from_request(&req.consistency, &req.zookie)?;
+    let response_revision =
+        resolve_authz_response_revision(&state.storage, claims.tenant_id, consistency).await?;
+    let allowed = authz_journal::resolve_permission_at_revision(
+        &state.storage,
+        claims.tenant_id,
+        &req.namespace,
+        &req.object_id,
+        &req.relation,
+        &req.subject_kind,
+        &req.subject_id,
+        &req.caveat_hash,
+        response_revision,
+    )
+    .await
+    .map_err(|e| Status::internal(e.to_string()))?;
+
+    Ok(CheckPermissionResponse {
+        allowed,
+        revision: revision_to_u64(response_revision)?,
+        zookie: zookie(response_revision),
+        explanation_ref: if allowed {
+            "tuple_or_userset_match".to_string()
+        } else {
+            "no_current_tuple_or_userset".to_string()
+        },
+    })
+}
+
+async fn resolve_authz_response_revision(
+    storage: &crate::storage::Storage,
+    tenant_id: i64,
+    consistency: AuthzConsistency,
+) -> Result<i64, Status> {
+    let latest_revision = authz_journal::latest_authz_revision(storage, tenant_id)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+    if let Some(required_revision) = consistency.required_revision()
+        && latest_revision < required_revision
+    {
+        return Err(Status::failed_precondition("AuthzRevisionUnavailable"));
+    }
+
+    Ok(match consistency {
+        AuthzConsistency::Exact(revision) => revision,
+        AuthzConsistency::Latest | AuthzConsistency::AtLeast(_) => latest_revision,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -644,6 +939,78 @@ fn revision_to_u64(revision: i64) -> Result<u64, Status> {
 
 fn zookie(revision: i64) -> String {
     format!("authz:{}", revision.max(0))
+}
+
+fn write_authz_tuple_response(
+    record: &crate::persistence::AuthzTupleRecord,
+) -> Result<WriteAuthzTupleResponse, Status> {
+    Ok(WriteAuthzTupleResponse {
+        revision: revision_to_u64(record.revision)?,
+        zookie: zookie(record.revision),
+        record_hash: record.record_hash.clone(),
+    })
+}
+
+fn authz_tuple_response(
+    record: &crate::persistence::AuthzTupleRecord,
+) -> Result<AuthzTuple, Status> {
+    Ok(AuthzTuple {
+        namespace: record.namespace.clone(),
+        object_id: record.object_id.clone(),
+        relation: record.relation.clone(),
+        subject_kind: record.subject_kind.clone(),
+        subject_id: record.subject_id.clone(),
+        caveat_hash: record.caveat_hash.clone(),
+        revision: revision_to_u64(record.revision)?,
+        zookie: zookie(record.revision),
+    })
+}
+
+fn optional_filter_value(value: String) -> Option<String> {
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn optional_str(value: &str) -> Option<&str> {
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn paginate<T>(
+    values: Vec<T>,
+    page_size: u32,
+    page_token: &str,
+) -> Result<(Vec<T>, String), Status> {
+    let offset = parse_page_token(page_token)?;
+    let limit = normalize_page_size(page_size);
+    if offset >= values.len() {
+        return Ok((Vec::new(), String::new()));
+    }
+    let next_offset = offset.saturating_add(limit);
+    let next_page_token = if next_offset < values.len() {
+        next_offset.to_string()
+    } else {
+        String::new()
+    };
+    Ok((
+        values.into_iter().skip(offset).take(limit).collect(),
+        next_page_token,
+    ))
+}
+
+fn parse_page_token(value: &str) -> Result<usize, Status> {
+    if value.is_empty() {
+        return Ok(0);
+    }
+    value
+        .parse::<usize>()
+        .map_err(|_| Status::invalid_argument("page_token must be an integer offset"))
+}
+
+fn normalize_page_size(value: u32) -> usize {
+    if value == 0 {
+        1000
+    } else {
+        usize::try_from(value.min(1000)).unwrap_or(1000)
+    }
 }
 
 fn authz_tuple_log_response(

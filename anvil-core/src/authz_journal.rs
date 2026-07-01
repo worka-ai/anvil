@@ -56,6 +56,23 @@ pub struct AuthzTupleWrite<'a> {
     pub reason: &'a str,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuthzTupleFilter {
+    pub namespace: Option<String>,
+    pub object_id: Option<String>,
+    pub relation: Option<String>,
+    pub subject_kind: Option<String>,
+    pub subject_id: Option<String>,
+    pub caveat_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AuthzSubjectRef {
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub caveat_hash: String,
+}
+
 pub(crate) async fn write_authz_tuple_with_permit(
     storage: &Storage,
     input: AuthzTupleWrite<'_>,
@@ -327,6 +344,124 @@ pub async fn list_authz_tuple_log(
         records.truncate(limit);
     }
     Ok(records)
+}
+
+pub async fn read_current_authz_tuples_at_revision(
+    storage: &Storage,
+    tenant_id: i64,
+    filter: AuthzTupleFilter,
+    revision: i64,
+) -> Result<Vec<AuthzTupleRecord>> {
+    let mut records: Vec<_> = current_authz_view_at_revision(storage, tenant_id, revision)
+        .await?
+        .into_values()
+        .filter(|record| record.operation == "add")
+        .filter(|record| matches_authz_tuple_filter(record, &filter))
+        .collect();
+    records.sort_by(|left, right| {
+        (
+            &left.namespace,
+            &left.object_id,
+            &left.relation,
+            &left.subject_kind,
+            &left.subject_id,
+            &left.caveat_hash,
+        )
+            .cmp(&(
+                &right.namespace,
+                &right.object_id,
+                &right.relation,
+                &right.subject_kind,
+                &right.subject_id,
+                &right.caveat_hash,
+            ))
+    });
+    Ok(records)
+}
+
+pub async fn list_current_authz_objects_at_revision(
+    storage: &Storage,
+    tenant_id: i64,
+    namespace: &str,
+    relation: &str,
+    subject_kind: &str,
+    subject_id: &str,
+    caveat_hash: &str,
+    revision: i64,
+) -> Result<Vec<String>> {
+    let filter = AuthzTupleFilter {
+        namespace: Some(namespace.to_string()),
+        relation: Some(relation.to_string()),
+        subject_kind: Some(subject_kind.to_string()),
+        subject_id: Some(subject_id.to_string()),
+        caveat_hash: Some(caveat_hash.to_string()),
+        ..AuthzTupleFilter::default()
+    };
+    let records =
+        read_current_authz_tuples_at_revision(storage, tenant_id, filter, revision).await?;
+    Ok(records
+        .into_iter()
+        .map(|record| record.object_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect())
+}
+
+pub async fn list_current_authz_subjects_at_revision(
+    storage: &Storage,
+    tenant_id: i64,
+    namespace: &str,
+    object_id: &str,
+    relation: &str,
+    subject_kind: Option<&str>,
+    revision: i64,
+) -> Result<Vec<AuthzSubjectRef>> {
+    let filter = AuthzTupleFilter {
+        namespace: Some(namespace.to_string()),
+        object_id: Some(object_id.to_string()),
+        relation: Some(relation.to_string()),
+        subject_kind: subject_kind.map(str::to_string),
+        ..AuthzTupleFilter::default()
+    };
+    let records =
+        read_current_authz_tuples_at_revision(storage, tenant_id, filter, revision).await?;
+    Ok(records
+        .into_iter()
+        .map(|record| AuthzSubjectRef {
+            subject_kind: record.subject_kind,
+            subject_id: record.subject_id,
+            caveat_hash: record.caveat_hash,
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect())
+}
+
+fn matches_authz_tuple_filter(record: &AuthzTupleRecord, filter: &AuthzTupleFilter) -> bool {
+    filter
+        .namespace
+        .as_ref()
+        .is_none_or(|value| record.namespace == *value)
+        && filter
+            .object_id
+            .as_ref()
+            .is_none_or(|value| record.object_id == *value)
+        && filter
+            .relation
+            .as_ref()
+            .is_none_or(|value| record.relation == *value)
+        && filter
+            .subject_kind
+            .as_ref()
+            .is_none_or(|value| record.subject_kind == *value)
+        && filter
+            .subject_id
+            .as_ref()
+            .is_none_or(|value| record.subject_id == *value)
+        && filter
+            .caveat_hash
+            .as_ref()
+            .is_none_or(|value| record.caveat_hash == *value)
 }
 
 async fn current_authz_view_at_revision(
@@ -891,6 +1026,88 @@ mod tests {
             )
             .await
             .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn authz_current_tuple_reads_filter_active_adds_only() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        for record in [
+            tuple(1, "document", "alpha", "viewer", "user", "alice", "add"),
+            tuple(2, "document", "beta", "viewer", "user", "alice", "add"),
+            tuple(3, "document", "beta", "viewer", "user", "alice", "remove"),
+            tuple(4, "document", "alpha", "editor", "user", "bob", "add"),
+        ] {
+            append_authz_tuple_record(&storage, &record).await.unwrap();
+        }
+
+        let active_viewers = read_current_authz_tuples_at_revision(
+            &storage,
+            42,
+            AuthzTupleFilter {
+                namespace: Some("document".to_string()),
+                relation: Some("viewer".to_string()),
+                subject_kind: Some("user".to_string()),
+                subject_id: Some("alice".to_string()),
+                caveat_hash: Some(String::new()),
+                ..AuthzTupleFilter::default()
+            },
+            4,
+        )
+        .await
+        .unwrap();
+        assert_eq!(active_viewers.len(), 1);
+        assert_eq!(active_viewers[0].object_id, "alpha");
+
+        let historical_viewers = read_current_authz_tuples_at_revision(
+            &storage,
+            42,
+            AuthzTupleFilter {
+                namespace: Some("document".to_string()),
+                relation: Some("viewer".to_string()),
+                subject_kind: Some("user".to_string()),
+                subject_id: Some("alice".to_string()),
+                caveat_hash: Some(String::new()),
+                ..AuthzTupleFilter::default()
+            },
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            historical_viewers
+                .iter()
+                .map(|record| record.object_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
+
+        assert_eq!(
+            list_current_authz_objects_at_revision(
+                &storage, 42, "document", "viewer", "user", "alice", "", 4
+            )
+            .await
+            .unwrap(),
+            vec!["alpha".to_string()]
+        );
+        assert_eq!(
+            list_current_authz_subjects_at_revision(
+                &storage,
+                42,
+                "document",
+                "alpha",
+                "editor",
+                Some("user"),
+                4
+            )
+            .await
+            .unwrap(),
+            vec![AuthzSubjectRef {
+                subject_kind: "user".to_string(),
+                subject_id: "bob".to_string(),
+                caveat_hash: String::new(),
+            }]
         );
     }
 

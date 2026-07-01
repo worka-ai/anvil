@@ -2841,6 +2841,40 @@ impl Persistence {
         .await
     }
 
+    pub async fn acquire_named_task_lease(
+        &self,
+        request: task_lease::TaskLeaseAcquire,
+    ) -> Result<task_lease::TaskLease> {
+        task_lease::acquire_task_lease(&self.storage, request, &self.partition_owner_signing_key)
+            .await
+    }
+
+    pub async fn checkpoint_named_task_lease(
+        &self,
+        task_id: &str,
+        owner_node_id: &str,
+        fence_token: u64,
+        checkpoint_cursor: u128,
+    ) -> Result<task_lease::TaskLease> {
+        task_lease::checkpoint_task_lease(
+            &self.storage,
+            task_id,
+            owner_node_id,
+            fence_token,
+            checkpoint_cursor,
+            current_time_nanos()?,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub async fn read_named_task_lease(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<task_lease::TaskLease>> {
+        task_lease::read_task_lease(&self.storage, task_id, &self.partition_owner_signing_key).await
+    }
+
     pub async fn read_task_execution_lease(
         &self,
         task_id: i64,

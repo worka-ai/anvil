@@ -895,10 +895,21 @@ service AuthService {
   rpc RevokeAccess(RevokeAccessRequest) returns (RevokeAccessResponse);
   rpc SetPublicAccess(SetPublicAccessRequest) returns (SetPublicAccessResponse);
   rpc WriteAuthzTuple(WriteAuthzTupleRequest) returns (WriteAuthzTupleResponse);
+  rpc WriteAuthzTuples(WriteAuthzTuplesRequest) returns (WriteAuthzTuplesResponse);
+  rpc ReadAuthzTuples(ReadAuthzTuplesRequest) returns (ReadAuthzTuplesResponse);
   rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
+  rpc CheckPermissions(CheckPermissionsRequest) returns (CheckPermissionsResponse);
+  rpc ListAuthzObjects(ListAuthzObjectsRequest) returns (ListAuthzObjectsResponse);
+  rpc ListAuthzSubjects(ListAuthzSubjectsRequest) returns (ListAuthzSubjectsResponse);
   rpc WatchAuthzTupleLog(WatchAuthzTupleLogRequest) returns (stream WatchAuthzTupleLogResponse);
   rpc WatchAuthzNamespace(WatchAuthzNamespaceRequest) returns (stream WatchAuthzNamespaceResponse);
   rpc WatchAuthzDerivedLag(WatchAuthzDerivedLagRequest) returns (stream WatchAuthzDerivedLagResponse);
+}
+
+service CoordinationService {
+  rpc AcquireTaskLease(AcquireTaskLeaseRequest) returns (TaskLeaseResponse);
+  rpc CheckpointTaskLease(CheckpointTaskLeaseRequest) returns (TaskLeaseResponse);
+  rpc ReadTaskLease(ReadTaskLeaseRequest) returns (ReadTaskLeaseResponse);
 }
 
 service PersonalDbService {
@@ -1026,6 +1037,58 @@ message WriteAuthzTupleResponse {
     string record_hash = 3;
 }
 
+message AuthzTuple {
+    string namespace = 1;
+    string object_id = 2;
+    string relation = 3;
+    string subject_kind = 4;
+    string subject_id = 5;
+    string caveat_hash = 6;
+    uint64 revision = 7;
+    string zookie = 8;
+}
+
+message AuthzTupleMutation {
+    string namespace = 1;
+    string object_id = 2;
+    string relation = 3;
+    string subject_kind = 4;
+    string subject_id = 5;
+    string caveat_hash = 6;
+    string operation = 7;
+    string reason = 8;
+}
+
+message WriteAuthzTuplesRequest {
+    repeated AuthzTupleMutation mutations = 1;
+}
+
+message WriteAuthzTuplesResponse {
+    repeated WriteAuthzTupleResponse results = 1;
+    uint64 revision = 2;
+    string zookie = 3;
+}
+
+message ReadAuthzTuplesRequest {
+    string namespace = 1;
+    string object_id = 2;
+    string relation = 3;
+    string subject_kind = 4;
+    string subject_id = 5;
+    string caveat_hash = 6;
+    string consistency = 7;
+    string zookie = 8;
+    uint32 page_size = 9;
+    string page_token = 10;
+}
+
+message ReadAuthzTuplesResponse {
+    repeated AuthzTuple tuples = 1;
+    uint64 revision = 2;
+    string zookie = 3;
+    string next_page_token = 4;
+}
+
 message CheckPermissionRequest {
     string namespace = 1;
     string object_id = 2;
@@ -1042,6 +1105,110 @@ message CheckPermissionResponse {
     uint64 revision = 2;
     string zookie = 3;
     string explanation_ref = 4;
+}
+
+message CheckPermissionsRequest {
+    repeated CheckPermissionRequest checks = 1;
+}
+
+message CheckPermissionsResponse {
+    repeated CheckPermissionResponse results = 1;
+    uint64 revision = 2;
+    string zookie = 3;
+}
+
+message ListAuthzObjectsRequest {
+    string namespace = 1;
+    string relation = 2;
+    string subject_kind = 3;
+    string subject_id = 4;
+    string caveat_hash = 5;
+    string consistency = 6;
+    string zookie = 7;
+    uint32 page_size = 8;
+    string page_token = 9;
+}
+
+message ListAuthzObjectsResponse {
+    repeated string object_ids = 1;
+    uint64 revision = 2;
+    string zookie = 3;
+    string next_page_token = 4;
+}
+
+message ListAuthzSubjectsRequest {
+    string namespace = 1;
+    string object_id = 2;
+    string relation = 3;
+    string subject_kind = 4;
+    string consistency = 5;
+    string zookie = 6;
+    uint32 page_size = 7;
+    string page_token = 8;
+}
+
+message AuthzSubject {
+    string subject_kind = 1;
+    string subject_id = 2;
+    string caveat_hash = 3;
+}
+
+message ListAuthzSubjectsResponse {
+    repeated AuthzSubject subjects = 1;
+    uint64 revision = 2;
+    string zookie = 3;
+    string next_page_token = 4;
+}
+
+message AcquireTaskLeaseRequest {
+    string task_id = 1;
+    string task_kind = 2;
+    string partition_family = 3;
+    string partition_id = 4;
+    string owner_node_id = 5;
+    uint64 source_cursor_low = 6;
+    uint64 source_cursor_high = 7;
+    int64 ttl_nanos = 8;
+}
+
+message CheckpointTaskLeaseRequest {
+    string task_id = 1;
+    string owner_node_id = 2;
+    uint64 fence_token = 3;
+    uint64 checkpoint_cursor_low = 4;
+    uint64 checkpoint_cursor_high = 5;
+}
+
+message ReadTaskLeaseRequest {
+    string task_id = 1;
+}
+
+message TaskLease {
+    string task_id = 1;
+    string task_kind = 2;
+    string partition_family = 3;
+    string partition_id = 4;
+    string owner_node_id = 5;
+    uint64 fence_token = 6;
+    uint64 source_cursor_low = 7;
+    uint64 source_cursor_high = 8;
+    uint64 checkpoint_cursor_low = 9;
+    uint64 checkpoint_cursor_high = 10;
+    uint64 lease_epoch = 11;
+    int64 acquired_at_nanos = 12;
+    int64 expires_at_nanos = 13;
+    int64 updated_at_nanos = 14;
+    string lease_hash = 15;
+    string lease_signature = 16;
+}
+
+message TaskLeaseResponse {
+    TaskLease lease = 1;
+}
+
+message ReadTaskLeaseResponse {
+    TaskLease lease = 1;
+    bool found = 2;
 }
 
 message WatchAuthzTupleLogRequest {
