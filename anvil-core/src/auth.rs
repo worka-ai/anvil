@@ -173,6 +173,8 @@ fn action_covers_required(token_action: &AnvilAction, required_action: &AnvilAct
                 | AnvilAction::AuthzTupleRead
                 | AnvilAction::AuthzCheck
                 | AnvilAction::AuthzWatch
+                | AnvilAction::AuthzSchemaRead
+                | AnvilAction::AuthzSchemaWrite
         ),
         AnvilAction::IndexAll => matches!(
             required_action,

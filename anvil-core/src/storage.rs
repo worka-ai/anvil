@@ -464,6 +464,21 @@ impl Storage {
             .join(format!("{namespace}.anwatch")))
     }
 
+    pub fn authz_namespace_schema_path(&self, tenant_id: i64, namespace: &str) -> Result<PathBuf> {
+        ensure_safe_internal_component(namespace, "authorization namespace")?;
+        Ok(self
+            .authz_namespace_schema_dir(tenant_id)
+            .join(format!("{namespace}.json")))
+    }
+
+    pub fn authz_namespace_schema_dir(&self, tenant_id: i64) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("authz")
+            .join("schemas")
+            .join(format!("tenant-{tenant_id}"))
+    }
+
     pub fn git_source_watch_path(&self, tenant_id: i64, repository_id: &str) -> Result<PathBuf> {
         ensure_safe_internal_component(repository_id, "git repository id")?;
         Ok(self

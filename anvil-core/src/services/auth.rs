@@ -1,7 +1,7 @@
 use crate::anvil_api::auth_service_server::AuthService;
 use crate::anvil_api::*;
 use crate::{
-    AppState, auth, authz_derived_lag_watch, authz_journal, authz_namespace_watch,
+    AppState, auth, authz_derived_lag_watch, authz_journal, authz_namespace_watch, authz_schema,
     authz_userset_index, crypto,
     formats::hash32,
     permissions::AnvilAction,
@@ -557,6 +557,125 @@ impl AuthService for AppState {
             revision: revision_to_u64(response_revision)?,
             zookie: zookie(response_revision),
             next_page_token,
+        }))
+    }
+
+    async fn apply_authz_schema(
+        &self,
+        request: Request<ApplyAuthzSchemaRequest>,
+    ) -> Result<Response<ApplyAuthzSchemaResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        if req.namespaces.is_empty() {
+            return Err(Status::invalid_argument(
+                "namespaces must contain at least one schema",
+            ));
+        }
+        if req.namespaces.len() > 1000 {
+            return Err(Status::invalid_argument(
+                "namespaces must contain no more than 1000 schemas",
+            ));
+        }
+
+        let mut records = Vec::with_capacity(req.namespaces.len());
+        let authz_revision = authz_journal::latest_authz_revision(&self.storage, claims.tenant_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))
+            .and_then(revision_to_u64)?
+            .max(1);
+        for namespace in req.namespaces {
+            validate_tuple_field("namespace", &namespace.namespace)?;
+            if !auth::is_authorized(
+                AnvilAction::AuthzSchemaWrite,
+                &namespace.namespace,
+                &claims.scopes,
+            ) {
+                return Err(Status::permission_denied("Permission denied"));
+            }
+            let record = authz_schema::write_authz_namespace_schema(
+                &self.storage,
+                claims.tenant_id,
+                namespace,
+                authz_revision,
+                &claims.sub,
+                &req.reason,
+            )
+            .await
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            authz_namespace_watch::append_authz_namespace_watch_record(
+                &self.storage,
+                claims.tenant_id,
+                u128::from(record.schema_version),
+                mutation_id_from_record_hash(&record.record_hash),
+                authz_namespace_watch::AuthzNamespaceWatchPayload {
+                    namespace: record.namespace.clone(),
+                    event_type: "schema_changed".to_string(),
+                    authz_revision,
+                    schema_hash: record.schema_hash.clone(),
+                    invalidates_derived_usersets: true,
+                    emitted_at: record.applied_at.clone(),
+                },
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+            records.push(record);
+        }
+        let schema_version = records
+            .iter()
+            .map(|record| record.schema_version)
+            .max()
+            .unwrap_or(0);
+        Ok(Response::new(ApplyAuthzSchemaResponse {
+            namespaces: records.iter().map(authz_schema::schema_response).collect(),
+            schema_version,
+        }))
+    }
+
+    async fn get_authz_schema(
+        &self,
+        request: Request<GetAuthzSchemaRequest>,
+    ) -> Result<Response<GetAuthzSchemaResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        if !req.namespace.is_empty() {
+            validate_tuple_field("namespace", &req.namespace)?;
+        }
+        let resource = if req.namespace.is_empty() {
+            "*".to_string()
+        } else {
+            req.namespace.clone()
+        };
+        if !auth::is_authorized(AnvilAction::AuthzSchemaRead, &resource, &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+        let records = if req.namespace.is_empty() {
+            authz_schema::list_authz_namespace_schemas(&self.storage, claims.tenant_id).await
+        } else {
+            authz_schema::read_authz_namespace_schema(
+                &self.storage,
+                claims.tenant_id,
+                &req.namespace,
+            )
+            .await
+            .map(|record| record.into_iter().collect())
+        }
+        .map_err(|e| Status::internal(e.to_string()))?;
+        let schema_version = records
+            .iter()
+            .map(|record| record.schema_version)
+            .max()
+            .unwrap_or(0);
+        Ok(Response::new(GetAuthzSchemaResponse {
+            namespaces: records.iter().map(authz_schema::schema_response).collect(),
+            schema_version,
         }))
     }
 

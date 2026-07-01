@@ -56,6 +56,8 @@ pub enum AnvilAction {
     AuthzTupleRead,
     AuthzCheck,
     AuthzWatch,
+    AuthzSchemaRead,
+    AuthzSchemaWrite,
 
     // Index actions
     IndexCreate,
@@ -146,6 +148,8 @@ impl fmt::Display for AnvilAction {
             AnvilAction::AuthzTupleRead => "authz:tuple_read",
             AnvilAction::AuthzCheck => "authz:check",
             AnvilAction::AuthzWatch => "authz:watch",
+            AnvilAction::AuthzSchemaRead => "authz:schema_read",
+            AnvilAction::AuthzSchemaWrite => "authz:schema_write",
 
             // Index actions
             AnvilAction::IndexCreate => "index:create",
@@ -241,6 +245,8 @@ impl FromStr for AnvilAction {
             "authz:tuple_read" => Ok(AnvilAction::AuthzTupleRead),
             "authz:check" => Ok(AnvilAction::AuthzCheck),
             "authz:watch" => Ok(AnvilAction::AuthzWatch),
+            "authz:schema_read" => Ok(AnvilAction::AuthzSchemaRead),
+            "authz:schema_write" => Ok(AnvilAction::AuthzSchemaWrite),
 
             // Index actions
             "index:create" => Ok(AnvilAction::IndexCreate),
@@ -308,6 +314,8 @@ mod tests {
             AnvilAction::HfIngestionCreate,
             AnvilAction::PolicyGrant,
             AnvilAction::AuthzCheck,
+            AnvilAction::AuthzSchemaRead,
+            AnvilAction::AuthzSchemaWrite,
             AnvilAction::IndexCreate,
             AnvilAction::IndexWatch,
             AnvilAction::PersonalDbCreate,

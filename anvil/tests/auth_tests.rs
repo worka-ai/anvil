@@ -4,15 +4,16 @@ use anvil::anvil_api::coordination_service_client::CoordinationServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::repair_service_client::RepairServiceClient;
 use anvil::anvil_api::{
-    AcquireTaskLeaseRequest, AuthzTupleMutation, CheckPermissionRequest, CheckPermissionsRequest,
+    AcquireTaskLeaseRequest, ApplyAuthzSchemaRequest, AuthzNamespaceSchema, AuthzRelationRule,
+    AuthzRelationSchema, AuthzTupleMutation, CheckPermissionRequest, CheckPermissionsRequest,
     CheckpointTaskLeaseRequest, CreateBucketRequest, ForceReleaseTaskLeaseRequest,
-    GetAccessTokenRequest, GetObjectRequest, GrantAccessRequest, ListAuthzObjectsRequest,
-    ListAuthzSubjectsRequest, ListBucketsRequest, ListObjectVersionsRequest, ListObjectsRequest,
-    ListRepairFindingsRequest, NativeMutationContext, ObjectMetadata, PutObjectRequest,
-    ReadAuthzTuplesRequest, ReadTaskLeaseRequest, RepairAuthzDerivedIndexRequest,
-    RevokeAccessRequest, SetPublicAccessRequest, WatchAuthzDerivedLagRequest,
-    WatchAuthzNamespaceRequest, WatchAuthzTupleLogRequest, WriteAuthzTupleRequest,
-    WriteAuthzTuplesRequest,
+    GetAccessTokenRequest, GetAuthzSchemaRequest, GetObjectRequest, GrantAccessRequest,
+    ListAuthzObjectsRequest, ListAuthzSubjectsRequest, ListBucketsRequest,
+    ListObjectVersionsRequest, ListObjectsRequest, ListRepairFindingsRequest,
+    NativeMutationContext, ObjectMetadata, PutObjectRequest, ReadAuthzTuplesRequest,
+    ReadTaskLeaseRequest, RepairAuthzDerivedIndexRequest, RevokeAccessRequest,
+    SetPublicAccessRequest, WatchAuthzDerivedLagRequest, WatchAuthzNamespaceRequest,
+    WatchAuthzTupleLogRequest, WriteAuthzTupleRequest, WriteAuthzTuplesRequest,
 };
 use anvil::authz_derived_lag_watch::{
     AuthzDerivedLagWatchPayload, append_authz_derived_lag_watch_record,
@@ -1661,6 +1662,94 @@ async fn test_authz_namespace_watch_streams_snapshot_and_new_events() {
         .unwrap();
     assert_eq!(live.cursor_low, 2);
     assert_eq!(live.authz_revision, 11);
+}
+
+#[tokio::test]
+async fn test_apply_authz_schema_persists_and_emits_namespace_watch() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let schema = AuthzNamespaceSchema {
+        namespace: "document".to_string(),
+        relations: vec![AuthzRelationSchema {
+            relation: "viewer".to_string(),
+            rules: vec![
+                AuthzRelationRule {
+                    kind: "inherit".to_string(),
+                    relation: "editor".to_string(),
+                    tuple_relation: String::new(),
+                    target_relation: String::new(),
+                },
+                AuthzRelationRule {
+                    kind: "computed".to_string(),
+                    relation: String::new(),
+                    tuple_relation: "parent_folder".to_string(),
+                    target_relation: "viewer".to_string(),
+                },
+            ],
+        }],
+        schema_json: r#"{"namespaces":{"document":{"rules":{"viewer":[{"Inherit":"editor"}]}}}}"#
+            .to_string(),
+        schema_hash: String::new(),
+        schema_version: 0,
+        authz_revision: 0,
+        applied_at: String::new(),
+    };
+
+    let mut apply = Request::new(ApplyAuthzSchemaRequest {
+        namespaces: vec![schema],
+        reason: "test schema apply".to_string(),
+    });
+    add_bearer(&mut apply, &cluster.token);
+    let applied = auth_client
+        .apply_authz_schema(apply)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(applied.schema_version, 1);
+    assert_eq!(applied.namespaces.len(), 1);
+    assert_eq!(applied.namespaces[0].namespace, "document");
+    assert_eq!(applied.namespaces[0].schema_version, 1);
+    assert!(!applied.namespaces[0].schema_hash.is_empty());
+
+    let mut get_one = Request::new(GetAuthzSchemaRequest {
+        namespace: "document".to_string(),
+    });
+    add_bearer(&mut get_one, &cluster.token);
+    let fetched = auth_client
+        .get_authz_schema(get_one)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(fetched.schema_version, 1);
+    assert_eq!(
+        fetched.namespaces[0].schema_hash,
+        applied.namespaces[0].schema_hash
+    );
+
+    let mut watch_req = Request::new(WatchAuthzNamespaceRequest {
+        namespace: "document".to_string(),
+        after_cursor_low: 0,
+        after_cursor_high: 0,
+    });
+    add_bearer(&mut watch_req, &cluster.token);
+    let mut stream = auth_client
+        .watch_authz_namespace(watch_req)
+        .await
+        .unwrap()
+        .into_inner();
+    let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.namespace, "document");
+    assert_eq!(event.event_type, "schema_changed");
+    assert_eq!(event.schema_hash, applied.namespaces[0].schema_hash);
+    assert!(event.invalidates_derived_usersets);
 }
 
 #[tokio::test]
