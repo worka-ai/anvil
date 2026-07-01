@@ -1044,10 +1044,11 @@ async fn emit_authz_tuple_batch_side_effects(
     for record in records {
         let _ = state.authz_watch_tx.send(record.clone());
     }
-    let derived = authz_userset_index::rebuild_derived_userset_index(
+    let derived = authz_userset_index::advance_derived_userset_index_from_batch(
         &state.storage,
         tenant_id,
         authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID,
+        records,
     )
     .await
     .map_err(|e| Status::internal(e.to_string()))?;

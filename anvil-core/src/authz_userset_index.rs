@@ -1,4 +1,9 @@
-use crate::{authz_journal, formats::hash32, persistence::AuthzTupleRecord, storage::Storage};
+use crate::{
+    authz_journal::{self, AuthzTupleFilter},
+    formats::hash32,
+    persistence::AuthzTupleRecord,
+    storage::Storage,
+};
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -109,6 +114,110 @@ pub async fn rebuild_derived_userset_index(
     Ok(index)
 }
 
+pub async fn advance_derived_userset_index_from_batch(
+    storage: &Storage,
+    tenant_id: i64,
+    derived_index_id: &str,
+    batch_records: &[AuthzTupleRecord],
+) -> Result<AuthzDerivedUsersetIndex> {
+    let Some(target_revision) = batch_records
+        .iter()
+        .map(|record| {
+            if record.tenant_id != tenant_id {
+                return Err(anyhow!("authorization userset batch tenant mismatch"));
+            }
+            u64::try_from(record.revision)
+                .map_err(|_| anyhow!("authorization userset revision must be nonnegative"))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .max()
+    else {
+        return read_derived_userset_index(storage, tenant_id, derived_index_id)
+            .await?
+            .ok_or_else(|| anyhow!("authorization userset index does not exist"));
+    };
+
+    let all_records = authz_journal::list_authz_tuple_log(storage, tenant_id, 0, "", 0).await?;
+    let existing = match read_derived_userset_index(storage, tenant_id, derived_index_id).await? {
+        Some(existing) if existing.processed_revision + 1 >= target_revision => existing,
+        _ => {
+            let rebuilt =
+                build_derived_userset_index_from_records(tenant_id, derived_index_id, all_records)?;
+            write_derived_userset_index(storage, &rebuilt).await?;
+            return Ok(rebuilt);
+        }
+    };
+
+    if existing.processed_revision >= target_revision {
+        return Ok(existing);
+    }
+
+    let current_records = authz_journal::read_current_authz_tuples_at_revision(
+        storage,
+        tenant_id,
+        AuthzTupleFilter::default(),
+        i64::try_from(target_revision)
+            .map_err(|_| anyhow!("authorization userset revision exceeds supported range"))?,
+    )
+    .await?;
+    let current = current_tuple_map(current_records);
+    let impacted = impacted_usersets(&current, batch_records)?;
+    if impacted.is_empty() {
+        let mut advanced = existing;
+        advanced.processed_revision = target_revision;
+        advanced.source_record_count = all_records.len() as u64;
+        advanced.source_records_hash = source_records_hash(&all_records)?;
+        advanced.generation = target_revision;
+        advanced.built_at = Utc::now().to_rfc3339();
+        advanced.index_hash = hash_derived_userset_index(&advanced)?;
+        write_derived_userset_index(storage, &advanced).await?;
+        return Ok(advanced);
+    }
+
+    let mut entries = existing
+        .entries
+        .into_iter()
+        .filter(|entry| {
+            !impacted.contains(&UsersetRef {
+                namespace: entry.namespace.clone(),
+                object_id: entry.object_id.clone(),
+                relation: entry.relation.clone(),
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    for userset in &impacted {
+        let mut visited = BTreeSet::new();
+        for subject in expand_userset_subjects(&current, userset, &mut visited)? {
+            entries.insert(AuthzDerivedUsersetEntry {
+                namespace: userset.namespace.clone(),
+                object_id: userset.object_id.clone(),
+                relation: userset.relation.clone(),
+                subject_kind: subject.kind,
+                subject_id: subject.id,
+                caveat_hash: subject.caveat_hash,
+            });
+        }
+    }
+
+    let mut advanced = AuthzDerivedUsersetIndex {
+        version: 1,
+        tenant_id,
+        derived_index_id: derived_index_id.to_string(),
+        processed_revision: target_revision,
+        source_record_count: all_records.len() as u64,
+        source_records_hash: source_records_hash(&all_records)?,
+        generation: target_revision,
+        entries: entries.into_iter().collect(),
+        built_at: Utc::now().to_rfc3339(),
+        index_hash: String::new(),
+    };
+    advanced.index_hash = hash_derived_userset_index(&advanced)?;
+    validate_derived_userset_index(&advanced, tenant_id, derived_index_id)?;
+    write_derived_userset_index(storage, &advanced).await?;
+    Ok(advanced)
+}
+
 pub async fn build_expected_derived_userset_index(
     storage: &Storage,
     tenant_id: i64,
@@ -159,10 +268,7 @@ fn build_derived_userset_index_from_records(
         .unwrap_or(0)
         .max(0) as u64;
     let source_records_hash = source_records_hash(&records)?;
-    let mut current = BTreeMap::new();
-    for record in &records {
-        current.insert(TupleViewKey::from(record), record.clone());
-    }
+    let current = current_tuple_map(records.clone());
 
     let mut usersets = BTreeSet::new();
     for record in current.values() {
@@ -202,6 +308,62 @@ fn build_derived_userset_index_from_records(
     };
     index.index_hash = hash_derived_userset_index(&index)?;
     Ok(index)
+}
+
+fn current_tuple_map(records: Vec<AuthzTupleRecord>) -> BTreeMap<TupleViewKey, AuthzTupleRecord> {
+    let mut current = BTreeMap::new();
+    for record in records {
+        current.insert(TupleViewKey::from(&record), record);
+    }
+    current
+}
+
+fn impacted_usersets(
+    current: &BTreeMap<TupleViewKey, AuthzTupleRecord>,
+    batch_records: &[AuthzTupleRecord],
+) -> Result<BTreeSet<UsersetRef>> {
+    let mut reverse_edges = BTreeMap::<UsersetRef, BTreeSet<UsersetRef>>::new();
+    for record in current.values() {
+        if record.operation != "add"
+            || record.subject_kind != "userset"
+            || !record.caveat_hash.is_empty()
+        {
+            continue;
+        }
+        let Some(child) = parse_userset_subject(&record.subject_id)? else {
+            continue;
+        };
+        reverse_edges.entry(child).or_default().insert(UsersetRef {
+            namespace: record.namespace.clone(),
+            object_id: record.object_id.clone(),
+            relation: record.relation.clone(),
+        });
+    }
+
+    let mut impacted = BTreeSet::new();
+    let mut stack = Vec::new();
+    for record in batch_records {
+        let userset = UsersetRef {
+            namespace: record.namespace.clone(),
+            object_id: record.object_id.clone(),
+            relation: record.relation.clone(),
+        };
+        if impacted.insert(userset.clone()) {
+            stack.push(userset);
+        }
+    }
+
+    while let Some(userset) = stack.pop() {
+        let Some(parents) = reverse_edges.get(&userset) else {
+            continue;
+        };
+        for parent in parents {
+            if impacted.insert(parent.clone()) {
+                stack.push(parent.clone());
+            }
+        }
+    }
+    Ok(impacted)
 }
 
 fn expand_userset_subjects(
@@ -408,7 +570,7 @@ mod tests {
         subject_kind: &str,
         subject_id: &str,
         operation: &str,
-    ) {
+    ) -> AuthzTupleRecord {
         write_authz_tuple_with_permit(
             storage,
             AuthzTupleWrite {
@@ -427,7 +589,7 @@ mod tests {
             PARTITION_OWNER_KEY,
         )
         .await
-        .unwrap();
+        .unwrap()
     }
 
     #[test]
@@ -540,5 +702,119 @@ mod tests {
             .unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn derived_userset_index_advances_from_watch_batch_without_full_rebuild() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let permit = ready_authz_permit(&storage, 42).await;
+
+        let group_member = write_tuple(
+            &storage,
+            &permit,
+            "group",
+            "engineering",
+            "member",
+            "user",
+            "alice",
+            "add",
+        )
+        .await;
+        let first = advance_derived_userset_index_from_batch(
+            &storage,
+            42,
+            DEFAULT_DERIVED_USERSET_INDEX_ID,
+            std::slice::from_ref(&group_member),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.processed_revision, 1);
+        assert!(first.entries.iter().any(|entry| {
+            entry.namespace == "group"
+                && entry.object_id == "engineering"
+                && entry.relation == "member"
+                && entry.subject_id == "alice"
+        }));
+
+        let document_userset = write_tuple(
+            &storage,
+            &permit,
+            "document",
+            "alpha",
+            "viewer",
+            "userset",
+            "group/engineering#member",
+            "add",
+        )
+        .await;
+        let second = advance_derived_userset_index_from_batch(
+            &storage,
+            42,
+            DEFAULT_DERIVED_USERSET_INDEX_ID,
+            std::slice::from_ref(&document_userset),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.processed_revision, 2);
+        assert!(second.entries.iter().any(|entry| {
+            entry.namespace == "document"
+                && entry.object_id == "alpha"
+                && entry.relation == "viewer"
+                && entry.subject_id == "alice"
+        }));
+
+        let unrelated = write_tuple(
+            &storage, &permit, "document", "beta", "viewer", "user", "bob", "add",
+        )
+        .await;
+        advance_derived_userset_index_from_batch(
+            &storage,
+            42,
+            DEFAULT_DERIVED_USERSET_INDEX_ID,
+            std::slice::from_ref(&unrelated),
+        )
+        .await
+        .unwrap();
+
+        let remove_member = write_tuple(
+            &storage,
+            &permit,
+            "group",
+            "engineering",
+            "member",
+            "user",
+            "alice",
+            "remove",
+        )
+        .await;
+        let advanced = advance_derived_userset_index_from_batch(
+            &storage,
+            42,
+            DEFAULT_DERIVED_USERSET_INDEX_ID,
+            std::slice::from_ref(&remove_member),
+        )
+        .await
+        .unwrap();
+        assert_eq!(advanced.processed_revision, 4);
+        assert!(!advanced.entries.iter().any(|entry| {
+            entry.namespace == "document"
+                && entry.object_id == "alpha"
+                && entry.relation == "viewer"
+                && entry.subject_id == "alice"
+        }));
+        assert!(advanced.entries.iter().any(|entry| {
+            entry.namespace == "document"
+                && entry.object_id == "beta"
+                && entry.relation == "viewer"
+                && entry.subject_id == "bob"
+        }));
+
+        let expected =
+            build_expected_derived_userset_index(&storage, 42, DEFAULT_DERIVED_USERSET_INDEX_ID)
+                .await
+                .unwrap();
+        assert_eq!(advanced.source_records_hash, expected.source_records_hash);
+        assert_eq!(advanced.entries, expected.entries);
     }
 }
