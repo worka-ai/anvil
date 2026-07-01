@@ -911,6 +911,7 @@ service AuthService {
 service CoordinationService {
   rpc AcquireTaskLease(AcquireTaskLeaseRequest) returns (TaskLeaseResponse);
   rpc CheckpointTaskLease(CheckpointTaskLeaseRequest) returns (TaskLeaseResponse);
+  rpc CommitTaskLease(CommitTaskLeaseRequest) returns (CommitTaskLeaseResponse);
   rpc ReadTaskLease(ReadTaskLeaseRequest) returns (ReadTaskLeaseResponse);
   rpc ForceReleaseTaskLease(ForceReleaseTaskLeaseRequest) returns (ForceReleaseTaskLeaseResponse);
 }
@@ -1225,6 +1226,15 @@ message CheckpointTaskLeaseRequest {
     uint64 checkpoint_cursor_high = 5;
 }
 
+message CommitTaskLeaseRequest {
+    string task_id = 1;
+    reserved 2;
+    reserved "owner_node_id";
+    uint64 fence_token = 3;
+    uint64 committed_cursor_low = 4;
+    uint64 committed_cursor_high = 5;
+}
+
 message ReadTaskLeaseRequest {
     string task_id = 1;
 }
@@ -1263,6 +1273,11 @@ message TaskLeaseResponse {
 message ReadTaskLeaseResponse {
     TaskLease lease = 1;
     bool found = 2;
+}
+
+message CommitTaskLeaseResponse {
+    bool committed = 1;
+    TaskLease previous_lease = 2;
 }
 
 message ForceReleaseTaskLeaseResponse {

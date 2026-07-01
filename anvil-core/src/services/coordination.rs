@@ -87,6 +87,44 @@ impl CoordinationService for AppState {
         }))
     }
 
+    async fn commit_task_lease(
+        &self,
+        request: Request<CommitTaskLeaseRequest>,
+    ) -> Result<Response<CommitTaskLeaseResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        validate_task_lease_id(&req.task_id)?;
+        let resource = task_lease_resource(&req.task_id);
+        if !auth::is_authorized(
+            AnvilAction::CoordinationLeaseWrite,
+            &resource,
+            &claims.scopes,
+        ) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+
+        let owner = lease_owner_from_claims(&claims, "");
+        let lease = self
+            .persistence
+            .commit_named_task_lease(
+                &req.task_id,
+                &owner,
+                req.fence_token,
+                join_u128(req.committed_cursor_low, req.committed_cursor_high),
+            )
+            .await
+            .map_err(lease_error_status)?;
+
+        Ok(Response::new(CommitTaskLeaseResponse {
+            committed: true,
+            previous_lease: Some(task_lease_response(lease)),
+        }))
+    }
+
     async fn read_task_lease(
         &self,
         request: Request<ReadTaskLeaseRequest>,

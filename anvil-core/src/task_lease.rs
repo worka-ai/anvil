@@ -245,6 +245,48 @@ pub async fn checkpoint_task_lease(
     Ok(lease)
 }
 
+pub async fn commit_task_lease(
+    storage: &Storage,
+    task_id: &str,
+    owner: &TaskLeaseOwner,
+    fence_token: u64,
+    committed_cursor: u128,
+    now_nanos: i64,
+    signing_key: &[u8],
+) -> Result<TaskLease> {
+    let _guard = TaskLeaseWriteGuard::acquire(storage, owner.tenant_id, task_id).await?;
+    let Some(mut lease) =
+        read_task_lease_unlocked(storage, owner.tenant_id, task_id, signing_key).await?
+    else {
+        return Err(anyhow!("task lease does not exist"));
+    };
+    lease.verify(signing_key)?;
+    if !lease.owner.same_security_owner(owner) {
+        return Err(anyhow!("{LEASE_OWNER_MISMATCH}: task lease owner mismatch"));
+    }
+    if lease.fence_token != fence_token {
+        return Err(anyhow!("{STALE_FENCE}: task lease fence token mismatch"));
+    }
+    if lease.expires_at_nanos <= now_nanos {
+        return Err(anyhow!("{LEASE_EXPIRED}: task lease expired"));
+    }
+    if committed_cursor < lease.checkpoint_cursor {
+        return Err(anyhow!(
+            "{STALE_FENCE}: task lease commit cannot move backwards"
+        ));
+    }
+    lease.checkpoint_cursor = committed_cursor;
+    lease.updated_at_nanos = now_nanos;
+    let committed = lease.seal(signing_key)?;
+    let path = storage.task_lease_path(owner.tenant_id, task_id)?;
+    match tokio::fs::remove_file(&path).await {
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(err).with_context(|| format!("remove {}", path.display())),
+    }
+    Ok(committed)
+}
+
 pub async fn read_task_lease(
     storage: &Storage,
     tenant_id: i64,
@@ -477,6 +519,62 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             checkpointed
+        );
+    }
+
+    #[tokio::test]
+    async fn task_lease_commit_requires_owner_and_fence_then_removes_lease() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let owner = TaskLeaseOwner::node("node-a");
+        let other = TaskLeaseOwner::node("node-b");
+        let lease = acquire_task_lease(&storage, acquire(owner.clone(), 100, 500), KEY)
+            .await
+            .unwrap();
+
+        let wrong_owner = commit_task_lease(
+            &storage,
+            "index-build-alpha",
+            &other,
+            lease.fence_token,
+            10,
+            200,
+            KEY,
+        )
+        .await
+        .unwrap_err();
+        assert!(wrong_owner.to_string().contains(LEASE_OWNER_MISMATCH));
+
+        let stale = commit_task_lease(
+            &storage,
+            "index-build-alpha",
+            &owner,
+            lease.fence_token + 1,
+            10,
+            200,
+            KEY,
+        )
+        .await
+        .unwrap_err();
+        assert!(stale.to_string().contains(STALE_FENCE));
+
+        let committed = commit_task_lease(
+            &storage,
+            "index-build-alpha",
+            &owner,
+            lease.fence_token,
+            12,
+            200,
+            KEY,
+        )
+        .await
+        .unwrap();
+        assert_eq!(committed.checkpoint_cursor, 12);
+        assert!(
+            read_task_lease(&storage, 0, "index-build-alpha", KEY)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

@@ -6,9 +6,9 @@ use anvil::anvil_api::repair_service_client::RepairServiceClient;
 use anvil::anvil_api::{
     AcquireTaskLeaseRequest, ApplyAuthzSchemaRequest, AuthzNamespaceSchema, AuthzRelationRule,
     AuthzRelationSchema, AuthzTupleMutation, CheckPermissionRequest, CheckPermissionsRequest,
-    CheckpointTaskLeaseRequest, CreateBucketRequest, ForceReleaseTaskLeaseRequest,
-    GetAccessTokenRequest, GetAuthzSchemaRequest, GetObjectRequest, GrantAccessRequest,
-    ListAuthzObjectsRequest, ListAuthzSubjectsRequest, ListBucketsRequest,
+    CheckpointTaskLeaseRequest, CommitTaskLeaseRequest, CreateBucketRequest,
+    ForceReleaseTaskLeaseRequest, GetAccessTokenRequest, GetAuthzSchemaRequest, GetObjectRequest,
+    GrantAccessRequest, ListAuthzObjectsRequest, ListAuthzSubjectsRequest, ListBucketsRequest,
     ListObjectVersionsRequest, ListObjectsRequest, ListRepairFindingsRequest,
     NativeMutationContext, ObjectMetadata, PutObjectRequest, ReadAuthzTuplesRequest,
     ReadTaskLeaseRequest, RepairAuthzDerivedIndexRequest, RevokeAccessRequest,
@@ -866,6 +866,40 @@ async fn test_coordination_task_lease_grpc_flow() {
         .into_inner();
     assert!(read.found);
     assert_eq!(read.lease.expect("lease").checkpoint_cursor_low, 42);
+
+    let mut commit = Request::new(CommitTaskLeaseRequest {
+        task_id: task_id.to_string(),
+        fence_token: acquired.fence_token,
+        committed_cursor_low: 50,
+        committed_cursor_high: 0,
+    });
+    add_bearer(&mut commit, &token);
+    let committed = coordination_client
+        .commit_task_lease(commit)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(committed.committed);
+    assert_eq!(
+        committed
+            .previous_lease
+            .expect("committed lease")
+            .checkpoint_cursor_low,
+        50
+    );
+
+    let mut read_committed = Request::new(ReadTaskLeaseRequest {
+        task_id: task_id.to_string(),
+    });
+    add_bearer(&mut read_committed, &token);
+    assert!(
+        !coordination_client
+            .read_task_lease(read_committed)
+            .await
+            .unwrap()
+            .into_inner()
+            .found
+    );
 }
 
 #[tokio::test]
@@ -1047,6 +1081,17 @@ async fn test_coordination_task_lease_security_invariants() {
         .checkpoint_task_lease(stale_checkpoint)
         .await
         .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(err.message(), "StaleFence");
+
+    let mut stale_commit = Request::new(CommitTaskLeaseRequest {
+        task_id: stale_task_id.to_string(),
+        fence_token: stale_first.fence_token,
+        committed_cursor_low: 3,
+        committed_cursor_high: 0,
+    });
+    add_bearer(&mut stale_commit, &token_a);
+    let err = client.commit_task_lease(stale_commit).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert_eq!(err.message(), "StaleFence");
 

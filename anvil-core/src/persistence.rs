@@ -2913,6 +2913,25 @@ impl Persistence {
         .await
     }
 
+    pub async fn commit_named_task_lease(
+        &self,
+        task_id: &str,
+        owner: &task_lease::TaskLeaseOwner,
+        fence_token: u64,
+        committed_cursor: u128,
+    ) -> Result<task_lease::TaskLease> {
+        task_lease::commit_task_lease(
+            &self.storage,
+            task_id,
+            owner,
+            fence_token,
+            committed_cursor,
+            current_time_nanos()?,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
     pub async fn read_named_task_lease(
         &self,
         tenant_id: i64,
