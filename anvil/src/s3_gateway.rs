@@ -497,6 +497,13 @@ async fn list_buckets(State(state): State<AppState>, req: Request) -> Response {
             );
         }
     };
+    let checked_route = match s3_checked_route(&state, s3_host_route(&req), Some(claims)).await {
+        Ok(checked_route) => checked_route,
+        Err(response) => return response,
+    };
+    let claims = checked_route
+        .claims
+        .expect("authenticated delete bucket path supplied claims");
 
     match state
         .bucket_manager
@@ -1094,6 +1101,13 @@ async fn post_bucket(
             );
         }
     };
+    let checked_route = match s3_checked_route(&state, s3_host_route(&req), Some(claims)).await {
+        Ok(checked_route) => checked_route,
+        Err(response) => return response,
+    };
+    let claims = checked_route
+        .claims
+        .expect("authenticated post bucket path supplied claims");
 
     if q.contains_key("delete") {
         let bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
@@ -2195,6 +2209,13 @@ async fn put_object(
             );
         }
     };
+    let checked_route = match s3_checked_route(&state, s3_host_route(&req), Some(claims)).await {
+        Ok(checked_route) => checked_route,
+        Err(response) => return response,
+    };
+    let claims = checked_route
+        .claims
+        .expect("authenticated put object path supplied claims");
     let copy_source = match req.headers().get("x-amz-copy-source") {
         Some(value) => match value.to_str() {
             Ok(value) => Some(value.to_owned()),
@@ -2353,6 +2374,13 @@ async fn post_object(
             );
         }
     };
+    let checked_route = match s3_checked_route(&state, s3_host_route(&req), Some(claims)).await {
+        Ok(checked_route) => checked_route,
+        Err(response) => return response,
+    };
+    let claims = checked_route
+        .claims
+        .expect("authenticated post object path supplied claims");
 
     if q.contains_key("uploads") {
         return initiate_multipart_upload(state, claims, bucket, key).await;
@@ -2669,6 +2697,13 @@ async fn delete_object(
             );
         }
     };
+    let checked_route = match s3_checked_route(&state, s3_host_route(&req), Some(claims)).await {
+        Ok(checked_route) => checked_route,
+        Err(response) => return response,
+    };
+    let claims = checked_route
+        .claims
+        .expect("authenticated delete object path supplied claims");
 
     if let Some(upload_id) = q.get("uploadId") {
         let upload_id = match uuid::Uuid::parse_str(upload_id) {
