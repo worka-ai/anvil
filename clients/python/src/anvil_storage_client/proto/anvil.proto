@@ -18,6 +18,7 @@ service AdminService {
 
   rpc CreateRegion(CreateRegionRequest) returns (RegionResponse);
   rpc ActivateRegion(ActivateRegionRequest) returns (RegionResponse);
+  rpc SetRegionReadOnly(SetRegionReadOnlyRequest) returns (RegionResponse);
   rpc DrainRegion(DrainRegionRequest) returns (DrainOperationResponse);
   rpc RemoveRegion(RemoveRegionRequest) returns (AdminMutationResponse);
   rpc ListRegions(ListRegionsRequest) returns (ListRegionsResponse);
@@ -31,6 +32,7 @@ service AdminService {
   rpc RegisterNode(RegisterNodeRequest) returns (NodeResponse);
   rpc ActivateNode(ActivateNodeRequest) returns (NodeResponse);
   rpc DrainNode(DrainNodeRequest) returns (DrainOperationResponse);
+  rpc ForceOfflineNode(ForceOfflineNodeRequest) returns (NodeResponse);
   rpc RemoveNode(RemoveNodeRequest) returns (AdminMutationResponse);
   rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
 }
@@ -322,6 +324,11 @@ message ActivateRegionRequest {
   string region = 2;
 }
 
+message SetRegionReadOnlyRequest {
+  AdminRequestContext context = 1;
+  string region = 2;
+}
+
 message DrainRegionRequest {
   AdminRequestContext context = 1;
   string region = 2;
@@ -389,6 +396,11 @@ message DrainNodeRequest {
   string node_id = 2;
   uint64 graceful_timeout_ms = 3;
   bool force_after_timeout = 4;
+}
+
+message ForceOfflineNodeRequest {
+  AdminRequestContext context = 1;
+  string node_id = 2;
 }
 
 message RemoveNodeRequest {

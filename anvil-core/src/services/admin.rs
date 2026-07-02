@@ -410,6 +410,29 @@ impl AdminService for AppState {
         }))
     }
 
+    async fn set_region_read_only(
+        &self,
+        request: Request<SetRegionReadOnlyRequest>,
+    ) -> Result<Response<RegionResponse>, Status> {
+        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let req = request.into_inner();
+        let context = require_mutation_context(req.context.as_ref(), false)?;
+        let region = self
+            .persistence
+            .transition_region_descriptor(
+                &req.region,
+                context.expected_generation,
+                CoreLifecycleState::ReadOnly,
+            )
+            .await
+            .map_err(lifecycle_status)?;
+        Ok(Response::new(RegionResponse {
+            request_id: context.request_id.clone(),
+            region: Some(region_descriptor_to_proto(region)),
+            audit_event_id: audit_event_id(&principal, context),
+        }))
+    }
+
     async fn drain_region(
         &self,
         request: Request<DrainRegionRequest>,
@@ -690,6 +713,30 @@ impl AdminService for AppState {
             resource_id: node.node_id,
             state: lifecycle_state_to_proto(node.state),
             generation: node.generation,
+            audit_event_id: audit_event_id(&principal, context),
+        }))
+    }
+
+    async fn force_offline_node(
+        &self,
+        request: Request<ForceOfflineNodeRequest>,
+    ) -> Result<Response<NodeResponse>, Status> {
+        let principal = require_admin(&request, self, AnvilAdminCapability::ManageNodes)?;
+        let req = request.into_inner();
+        let context = require_mutation_context(req.context.as_ref(), false)?;
+        let node = self
+            .persistence
+            .transition_node_descriptor(
+                &req.node_id,
+                context.expected_generation,
+                CoreLifecycleState::Offline,
+                None,
+            )
+            .await
+            .map_err(lifecycle_status)?;
+        Ok(Response::new(NodeResponse {
+            request_id: context.request_id.clone(),
+            node: Some(node_descriptor_to_proto(node)),
             audit_event_id: audit_event_id(&principal, context),
         }))
     }

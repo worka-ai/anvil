@@ -58,6 +58,13 @@ pub enum RegionCommands {
         #[clap(long)]
         region: String,
     },
+    /// Set an active region read-only
+    SetReadOnly {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        region: String,
+    },
     /// Drain an active region
     Drain {
         #[clap(flatten)]
@@ -173,6 +180,13 @@ pub enum NodeCommands {
         graceful_timeout_ms: u64,
         #[clap(long, action = clap::ArgAction::SetTrue)]
         force_after_timeout: bool,
+    },
+    /// Force an active or draining node offline
+    ForceOffline {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        node_id: String,
     },
     /// Remove a drained node
     Remove {
@@ -548,6 +562,19 @@ async fn handle_region_command(
                 .into_inner();
             print_json(&response)?;
         }
+        RegionCommands::SetReadOnly { context, region } => {
+            let response = client
+                .set_region_read_only(with_auth(
+                    api::SetRegionReadOnlyRequest {
+                        context: Some(context.to_context()),
+                        region: region.clone(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
         RegionCommands::Drain {
             context,
             region,
@@ -762,6 +789,19 @@ async fn handle_node_command(
                         node_id: node_id.clone(),
                         graceful_timeout_ms: *graceful_timeout_ms,
                         force_after_timeout: *force_after_timeout,
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        NodeCommands::ForceOffline { context, node_id } => {
+            let response = client
+                .force_offline_node(with_auth(
+                    api::ForceOfflineNodeRequest {
+                        context: Some(context.to_context()),
+                        node_id: node_id.clone(),
                     },
                     token,
                 )?)
@@ -1073,11 +1113,128 @@ fn normalize_enum_value(value: &str) -> String {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::net::SocketAddr;
+    use std::time::{Duration, Instant};
+    use tempfile::TempDir;
+    use tokio::net::TcpStream;
+    use tokio::task::JoinHandle;
 
     #[derive(Parser)]
     struct TestAdminCli {
         #[clap(subcommand)]
         command: AdminCommands,
+    }
+
+    struct AdminCliNode {
+        admin_url: String,
+        state: anvil::AppState,
+        handle: JoinHandle<()>,
+        _temp: TempDir,
+    }
+
+    impl Drop for AdminCliNode {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    async fn spawn_admin_cli_node() -> AdminCliNode {
+        let temp = tempfile::tempdir().unwrap();
+        let storage_path = temp.path().join("cli-node");
+        let public_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let public_addr = public_listener.local_addr().unwrap();
+        let admin_addr = admin_listener.local_addr().unwrap();
+
+        let config = anvil::config::Config {
+            cluster_secret: Some("cli-test-cluster-secret".to_string()),
+            jwt_secret: "cli-test-secret".to_string(),
+            anvil_secret_encryption_key:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            cluster_listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".to_string(),
+            public_cluster_addrs: vec![],
+            metadata_cache_ttl_secs: 1,
+            public_api_addr: format!("http://{public_addr}"),
+            api_listen_addr: public_addr.to_string(),
+            admin_listen_addr: admin_addr.to_string(),
+            mesh_id: "mesh-cli-test".to_string(),
+            region: "eu-west-1".to_string(),
+            cell_id: "cell-a".to_string(),
+            public_region_base_domain: "eu-west-1.anvil-storage.test".to_string(),
+            bootstrap_addrs: vec![],
+            init_cluster: false,
+            enable_mdns: false,
+            storage_path: storage_path.to_string_lossy().into_owned(),
+            node_id_path: storage_path.join("node-id").to_string_lossy().into_owned(),
+            cluster_keypair_path: storage_path
+                .join("cluster-keypair.pb")
+                .to_string_lossy()
+                .into_owned(),
+            personaldb_snapshot_entry_threshold: 1024,
+            personaldb_snapshot_payload_bytes_threshold: 64 * 1024 * 1024,
+            ..anvil::config::Config::default()
+        };
+
+        let state = anvil::AppState::new(config, None).await.unwrap();
+        let swarm = anvil::cluster::create_swarm(state.config.clone())
+            .await
+            .unwrap();
+        let state_for_handle = state.clone();
+        let handle = tokio::spawn(async move {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            anvil::start_node_with_admin_listener(
+                public_listener,
+                Some(admin_listener),
+                state_for_handle,
+                swarm,
+                rx,
+            )
+            .await
+            .unwrap();
+        });
+
+        wait_for_tcp_port(admin_addr, Duration::from_secs(5)).await;
+
+        AdminCliNode {
+            admin_url: format!("http://{admin_addr}"),
+            state,
+            handle,
+            _temp: temp,
+        }
+    }
+
+    async fn wait_for_tcp_port(addr: SocketAddr, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if TcpStream::connect(addr).await.is_ok() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for admin listener on {addr}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    fn mutation_options(label: &str, expected_generation: u64) -> MutationOptions {
+        MutationOptions {
+            request_id: Some(format!("req-{label}")),
+            idempotency_key: Some(format!("idem-{label}")),
+            audit_reason: format!("test {label}"),
+            expected_generation,
+        }
+    }
+
+    fn admin_token(node: &AdminCliNode) -> String {
+        node.state
+            .jwt_manager
+            .mint_token(
+                "cli-admin-principal".to_string(),
+                vec!["anvil_admin:*|anvil_admin:cluster:mesh-cli-test".to_string()],
+                0,
+            )
+            .unwrap()
     }
 
     #[test]
@@ -1258,5 +1415,249 @@ mod tests {
         assert_eq!(context.audit_reason, "dns verified");
         assert_eq!(context.expected_generation, 7);
         assert_eq!(hostname, "cdn.example.com");
+    }
+
+    #[test]
+    fn missing_lifecycle_commands_parse_with_mutation_context() {
+        let region_cli = TestAdminCli::try_parse_from([
+            "admin",
+            "region",
+            "set-read-only",
+            "--audit-reason",
+            "maintenance window",
+            "--expected-generation",
+            "11",
+            "--region",
+            "eu-west-1",
+        ])
+        .unwrap();
+        let AdminCommands::Region {
+            command: RegionCommands::SetReadOnly { context, region },
+        } = region_cli.command
+        else {
+            panic!("expected region set-read-only command");
+        };
+        assert_eq!(context.audit_reason, "maintenance window");
+        assert_eq!(context.expected_generation, 11);
+        assert_eq!(region, "eu-west-1");
+
+        let node_cli = TestAdminCli::try_parse_from([
+            "admin",
+            "node",
+            "force-offline",
+            "--audit-reason",
+            "lost heartbeat",
+            "--expected-generation",
+            "12",
+            "--node-id",
+            "node-a",
+        ])
+        .unwrap();
+        let AdminCommands::Node {
+            command: NodeCommands::ForceOffline { context, node_id },
+        } = node_cli.command
+        else {
+            panic!("expected node force-offline command");
+        };
+        assert_eq!(context.audit_reason, "lost heartbeat");
+        assert_eq!(context.expected_generation, 12);
+        assert_eq!(node_id, "node-a");
+    }
+
+    #[tokio::test]
+    async fn missing_lifecycle_cli_handlers_call_admin_service_and_persist_state() {
+        let node = spawn_admin_cli_node().await;
+        let token = admin_token(&node);
+        let mut client = AdminServiceClient::connect(node.admin_url.clone())
+            .await
+            .unwrap();
+
+        handle_region_command(
+            &RegionCommands::Create {
+                context: mutation_options("cli-create-region", 0),
+                region: "eu-west-1".to_string(),
+                public_base_url: "https://eu-west-1.anvil-storage.test".to_string(),
+                virtual_host_suffix: "eu-west-1.anvil-storage.test".to_string(),
+                placement_weight: 100,
+                default_cell: Some("cell-a".to_string()),
+            },
+            &mut client,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        handle_cell_command(
+            &CellCommands::Register {
+                context: mutation_options("cli-register-cell", 0),
+                region: "eu-west-1".to_string(),
+                cell_id: "cell-a".to_string(),
+                placement_weight: 100,
+            },
+            &mut client,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        let cell = node
+            .state
+            .persistence
+            .list_cell_descriptors(Some("eu-west-1"))
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        handle_cell_command(
+            &CellCommands::Activate {
+                context: mutation_options("cli-activate-cell", cell.generation),
+                region: "eu-west-1".to_string(),
+                cell_id: "cell-a".to_string(),
+            },
+            &mut client,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        let region = node
+            .state
+            .persistence
+            .list_region_descriptors()
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        handle_region_command(
+            &RegionCommands::Activate {
+                context: mutation_options("cli-activate-region", region.generation),
+                region: "eu-west-1".to_string(),
+            },
+            &mut client,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        let active_region = node
+            .state
+            .persistence
+            .list_region_descriptors()
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        handle_region_command(
+            &RegionCommands::SetReadOnly {
+                context: mutation_options("cli-set-region-read-only", active_region.generation),
+                region: "eu-west-1".to_string(),
+            },
+            &mut client,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        let read_only_region = node
+            .state
+            .persistence
+            .list_region_descriptors()
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(
+            read_only_region.state,
+            anvil::mesh_lifecycle::LifecycleState::ReadOnly
+        );
+
+        handle_region_command(
+            &RegionCommands::Activate {
+                context: mutation_options(
+                    "cli-reactivate-read-only-region",
+                    read_only_region.generation,
+                ),
+                region: "eu-west-1".to_string(),
+            },
+            &mut client,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        handle_node_command(
+            &NodeCommands::Register {
+                context: mutation_options("cli-register-node", 0),
+                node_id: "node-a".to_string(),
+                region: "eu-west-1".to_string(),
+                cell_id: "cell-a".to_string(),
+                libp2p_peer_id: "peer-a".to_string(),
+                public_api_addr: "http://127.0.0.1:50051".to_string(),
+                public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
+                capabilities: vec![NodeCapabilityArg::Object, NodeCapabilityArg::Admin],
+            },
+            &mut client,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        let registered_node = node
+            .state
+            .persistence
+            .list_node_descriptors(Some("eu-west-1"), Some("cell-a"))
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        handle_node_command(
+            &NodeCommands::Activate {
+                context: mutation_options("cli-activate-node", registered_node.generation),
+                node_id: "node-a".to_string(),
+            },
+            &mut client,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        let active_node = node
+            .state
+            .persistence
+            .list_node_descriptors(Some("eu-west-1"), Some("cell-a"))
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        handle_node_command(
+            &NodeCommands::ForceOffline {
+                context: mutation_options("cli-force-offline-node", active_node.generation),
+                node_id: "node-a".to_string(),
+            },
+            &mut client,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        let offline_node = node
+            .state
+            .persistence
+            .list_node_descriptors(Some("eu-west-1"), Some("cell-a"))
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(
+            offline_node.state,
+            anvil::mesh_lifecycle::LifecycleState::Offline
+        );
     }
 }

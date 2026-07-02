@@ -273,6 +273,55 @@ async fn admin_lifecycle_rejects_invalid_region_cell_and_node_transitions() {
         .unwrap();
     assert_eq!(region.state, 2);
 
+    let read_only_region = client
+        .set_region_read_only(with_auth(
+            tonic::Request::new(SetRegionReadOnlyRequest {
+                context: Some(context("set-region-read-only", region.generation)),
+                region: "eu-west-1".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .region
+        .unwrap();
+    assert_eq!(read_only_region.state, 3);
+    assert_eq!(read_only_region.generation, region.generation + 1);
+
+    let listed_regions = client
+        .list_regions(with_auth(
+            tonic::Request::new(ListRegionsRequest { page: None }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed_regions.regions.len(), 1);
+    assert_eq!(listed_regions.regions[0].state, 3);
+    assert_eq!(
+        listed_regions.regions[0].generation,
+        read_only_region.generation
+    );
+
+    let region = client
+        .activate_region(with_auth(
+            tonic::Request::new(ActivateRegionRequest {
+                context: Some(context(
+                    "reactivate-read-only-region",
+                    read_only_region.generation,
+                )),
+                region: "eu-west-1".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .region
+        .unwrap();
+    assert_eq!(region.state, 2);
+
     let remove_active_region = client
         .remove_region(with_auth(
             tonic::Request::new(RemoveRegionRequest {
@@ -346,6 +395,53 @@ async fn admin_lifecycle_rejects_invalid_region_cell_and_node_transitions() {
         .await
         .unwrap_err();
     assert_eq!(remove_active_node.code(), Code::FailedPrecondition);
+
+    let offline_node = client
+        .force_offline_node(with_auth(
+            tonic::Request::new(ForceOfflineNodeRequest {
+                context: Some(context("force-offline-node", active_node.generation)),
+                node_id: "node-a".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .node
+        .unwrap();
+    assert_eq!(offline_node.state, 7);
+    assert_eq!(offline_node.generation, active_node.generation + 1);
+
+    let listed_offline = client
+        .list_nodes(with_auth(
+            tonic::Request::new(ListNodesRequest {
+                region: "eu-west-1".to_string(),
+                cell_id: "cell-a".to_string(),
+                page: None,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed_offline.nodes.len(), 1);
+    assert_eq!(listed_offline.nodes[0].state, 7);
+    assert_eq!(listed_offline.nodes[0].generation, offline_node.generation);
+
+    let active_node = client
+        .activate_node(with_auth(
+            tonic::Request::new(ActivateNodeRequest {
+                context: Some(context("reactivate-offline-node", offline_node.generation)),
+                node_id: "node-a".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .node
+        .unwrap();
+    assert_eq!(active_node.state, 2);
 
     let drained = client
         .drain_node(with_auth(
