@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tokio::sync::mpsc::Sender;
 
 use crate::{
@@ -39,6 +39,36 @@ pub struct Persistence {
     object_metadata_compaction_frame_threshold: u64,
     object_metadata_compaction_bytes_threshold: u64,
     task_lease_ttl_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionDrainBucketOverride {
+    pub tenant_id: String,
+    pub bucket_name: String,
+    pub disposition: crate::mesh_lifecycle::BucketDrainDisposition,
+    pub reason: String,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionDrainBucketDecision {
+    pub tenant_id: String,
+    pub bucket_name: String,
+    pub bucket_locator_generation_before: u64,
+    pub bucket_locator_generation_after: u64,
+    pub status_before: mesh_directory::BucketLocatorStatus,
+    pub status_after: mesh_directory::BucketLocatorStatus,
+    pub disposition: crate::mesh_lifecycle::BucketDrainDisposition,
+    pub reason: String,
+    pub expires_at: Option<String>,
+    pub exception_written: bool,
+    pub locator_updated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionDrainPlanReport {
+    pub region: String,
+    pub decisions: Vec<RegionDrainBucketDecision>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -788,8 +818,169 @@ impl Persistence {
         .map_err(Into::into)
     }
 
+    pub async fn apply_region_drain_plan(
+        &self,
+        region: &str,
+        default_disposition: crate::mesh_lifecycle::BucketDrainDisposition,
+        overrides: Vec<RegionDrainBucketOverride>,
+    ) -> Result<RegionDrainPlanReport> {
+        let mut overrides_by_bucket = HashMap::new();
+        for override_ in overrides {
+            let key = (override_.tenant_id.clone(), override_.bucket_name.clone());
+            if overrides_by_bucket.insert(key.clone(), override_).is_some() {
+                return Err(anyhow!(
+                    "duplicate bucket drain override for tenant {} bucket {}",
+                    key.0,
+                    key.1
+                ));
+            }
+        }
+
+        let mut locators = self.bucket_locators_in_region(region).await?;
+        locators.sort_by(|left, right| {
+            left.tenant_id
+                .as_str()
+                .cmp(right.tenant_id.as_str())
+                .then(left.bucket_name.as_str().cmp(right.bucket_name.as_str()))
+        });
+        let drainable_locator_keys = locators
+            .iter()
+            .filter(|locator| locator.status != mesh_directory::BucketLocatorStatus::Deleted)
+            .map(|locator| {
+                (
+                    locator.tenant_id.as_str().to_string(),
+                    locator.bucket_name.as_str().to_string(),
+                )
+            })
+            .collect::<HashSet<_>>();
+        for (tenant_id, bucket_name) in overrides_by_bucket.keys() {
+            if !drainable_locator_keys.contains(&(tenant_id.clone(), bucket_name.clone())) {
+                return Err(anyhow!(
+                    "bucket drain override for tenant {tenant_id} bucket {bucket_name} does not match an active bucket locator in region {region}"
+                ));
+            }
+        }
+
+        let mut decisions = Vec::new();
+        for locator in locators {
+            if locator.status == mesh_directory::BucketLocatorStatus::Deleted {
+                continue;
+            }
+            let tenant_id = locator.tenant_id.as_str().to_string();
+            let bucket_name = locator.bucket_name.as_str().to_string();
+            let override_ = overrides_by_bucket.get(&(tenant_id.clone(), bucket_name.clone()));
+            let disposition = override_
+                .map(|override_| override_.disposition)
+                .unwrap_or(default_disposition);
+            let reason = override_
+                .map(|override_| override_.reason.clone())
+                .unwrap_or_else(|| "region drain default disposition".to_string());
+            let expires_at = override_.and_then(|override_| override_.expires_at.clone());
+
+            let status_before = locator.status;
+            let mut status_after = status_before;
+            let mut exception_written = false;
+            match disposition {
+                crate::mesh_lifecycle::BucketDrainDisposition::BlockUntilEmpty => {}
+                crate::mesh_lifecycle::BucketDrainDisposition::RemainProxyOnly
+                | crate::mesh_lifecycle::BucketDrainDisposition::ReadOnlyUntilRemoved => {
+                    status_after = mesh_directory::BucketLocatorStatus::ReadOnly;
+                    crate::mesh_lifecycle::upsert_bucket_drain_exception(
+                        &self.storage,
+                        crate::mesh_lifecycle::BucketDrainExceptionInput {
+                            tenant_id: tenant_id.clone(),
+                            bucket_name: bucket_name.clone(),
+                            region: region.to_string(),
+                            disposition,
+                            reason: reason.clone(),
+                            expires_at: expires_at.clone(),
+                        },
+                    )
+                    .await?;
+                    exception_written = true;
+                }
+                crate::mesh_lifecycle::BucketDrainDisposition::DeleteAfterRetention => {
+                    status_after = mesh_directory::BucketLocatorStatus::Draining;
+                }
+            }
+
+            let mut generation_after = locator.generation;
+            let mut locator_updated = false;
+            if status_after != status_before {
+                let mut updated = locator.clone();
+                updated.status = status_after;
+                updated.updated_at = Utc::now().to_rfc3339();
+                updated.generation = updated.generation.saturating_add(1);
+                self.write_mesh_bucket_locator_descriptor(&updated).await?;
+                generation_after = updated.generation;
+                locator_updated = true;
+            }
+
+            decisions.push(RegionDrainBucketDecision {
+                tenant_id,
+                bucket_name,
+                bucket_locator_generation_before: locator.generation,
+                bucket_locator_generation_after: generation_after,
+                status_before,
+                status_after,
+                disposition,
+                reason,
+                expires_at,
+                exception_written,
+                locator_updated,
+            });
+        }
+
+        Ok(RegionDrainPlanReport {
+            region: region.to_string(),
+            decisions,
+        })
+    }
+
     pub fn cache(&self) -> &MetadataCache {
         &self.cache
+    }
+
+    async fn bucket_locators_in_region(
+        &self,
+        region: &str,
+    ) -> Result<Vec<mesh_directory::BucketLocatorDescriptor>> {
+        let records = mesh_directory::list_routing_records(
+            &self.storage,
+            Some(mesh_directory::RoutingRecordFamily::BucketLocator),
+        )
+        .await?;
+        let mut locators = Vec::new();
+        for record in records {
+            let locator: mesh_directory::BucketLocatorDescriptor =
+                serde_json::from_str(&record.payload_json)?;
+            if locator.home_region.as_str() == region {
+                locators.push(locator);
+            }
+        }
+        Ok(locators)
+    }
+
+    async fn write_mesh_bucket_locator_descriptor(
+        &self,
+        locator: &mesh_directory::BucketLocatorDescriptor,
+    ) -> Result<()> {
+        let permit = self
+            .mesh_control_write_permit(
+                mesh_directory::RoutingRecordFamily::BucketLocator,
+                &locator.partition(),
+            )
+            .await?;
+        mesh_directory::write_bucket_locator(
+            &self.storage,
+            locator,
+            mesh_directory::MeshControlWriteAuthority {
+                permit: &permit,
+                signing_key: &self.partition_owner_signing_key,
+            },
+        )
+        .await?;
+        Ok(())
     }
 
     async fn global_write_permit(
@@ -4530,6 +4721,157 @@ mod tests {
             completion_err
                 .to_string()
                 .contains("still name the region as primary")
+        );
+    }
+
+    #[tokio::test]
+    async fn region_drain_applies_read_only_exceptions_to_bucket_locators() {
+        let temp = tempdir().unwrap();
+        let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+        let (region, _, _) = register_active_mesh_placement(&persistence).await;
+        let tenant = persistence
+            .create_tenant("tenant-a", "unused")
+            .await
+            .unwrap();
+        persistence
+            .create_bucket(tenant.id, "docs", "test-region")
+            .await
+            .unwrap();
+
+        let draining = persistence
+            .transition_region_descriptor(
+                "test-region",
+                region.generation,
+                crate::mesh_lifecycle::LifecycleState::Draining,
+            )
+            .await
+            .unwrap();
+        let report = persistence
+            .apply_region_drain_plan(
+                "test-region",
+                crate::mesh_lifecycle::BucketDrainDisposition::BlockUntilEmpty,
+                vec![RegionDrainBucketOverride {
+                    tenant_id: tenant.id.to_string(),
+                    bucket_name: "docs".to_string(),
+                    disposition: crate::mesh_lifecycle::BucketDrainDisposition::RemainProxyOnly,
+                    reason: "customer-approved delayed migration".to_string(),
+                    expires_at: Some("2026-08-02T00:00:00Z".to_string()),
+                }],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.decisions.len(), 1);
+        let decision = &report.decisions[0];
+        assert_eq!(
+            decision.status_before,
+            mesh_directory::BucketLocatorStatus::Active
+        );
+        assert_eq!(
+            decision.status_after,
+            mesh_directory::BucketLocatorStatus::ReadOnly
+        );
+        assert!(decision.exception_written);
+        assert!(decision.locator_updated);
+
+        let locator = persistence
+            .get_mesh_bucket_locator(tenant.id, "docs")
+            .await
+            .unwrap()
+            .expect("bucket locator");
+        assert_eq!(
+            locator.status,
+            mesh_directory::BucketLocatorStatus::ReadOnly
+        );
+        assert_eq!(locator.generation, 2);
+
+        let exceptions = crate::mesh_lifecycle::list_bucket_drain_exceptions(
+            &persistence.storage,
+            Some("test-region"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(exceptions.len(), 1);
+        assert_eq!(
+            exceptions[0].disposition,
+            crate::mesh_lifecycle::BucketDrainDisposition::RemainProxyOnly
+        );
+
+        let full_drain_err = persistence
+            .transition_region_descriptor(
+                "test-region",
+                draining.generation,
+                crate::mesh_lifecycle::LifecycleState::Drained,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            full_drain_err
+                .to_string()
+                .contains("still name the region as primary")
+        );
+
+        let drained_with_exceptions = persistence
+            .transition_region_descriptor(
+                "test-region",
+                draining.generation,
+                crate::mesh_lifecycle::LifecycleState::DrainedWithExceptions,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            drained_with_exceptions.state,
+            crate::mesh_lifecycle::LifecycleState::DrainedWithExceptions
+        );
+    }
+
+    #[tokio::test]
+    async fn region_drain_delete_after_retention_keeps_region_from_exception_completion() {
+        let temp = tempdir().unwrap();
+        let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+        let (region, _, _) = register_active_mesh_placement(&persistence).await;
+        let tenant = persistence
+            .create_tenant("tenant-a", "unused")
+            .await
+            .unwrap();
+        persistence
+            .create_bucket(tenant.id, "docs", "test-region")
+            .await
+            .unwrap();
+
+        let draining = persistence
+            .transition_region_descriptor(
+                "test-region",
+                region.generation,
+                crate::mesh_lifecycle::LifecycleState::Draining,
+            )
+            .await
+            .unwrap();
+        let report = persistence
+            .apply_region_drain_plan(
+                "test-region",
+                crate::mesh_lifecycle::BucketDrainDisposition::DeleteAfterRetention,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report.decisions[0].status_after,
+            mesh_directory::BucketLocatorStatus::Draining
+        );
+
+        let completion_err = persistence
+            .transition_region_descriptor(
+                "test-region",
+                draining.generation,
+                crate::mesh_lifecycle::LifecycleState::DrainedWithExceptions,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            completion_err
+                .to_string()
+                .contains("do not have a valid read-only drain exception")
         );
     }
 

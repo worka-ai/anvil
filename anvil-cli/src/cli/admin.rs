@@ -702,6 +702,7 @@ impl BucketDrainOverrideArg {
             bucket_name: self.bucket_name.clone(),
             disposition: self.disposition.to_proto(),
             reason: self.reason.clone(),
+            expires_at: String::new(),
         }
     }
 }

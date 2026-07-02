@@ -15,6 +15,7 @@ pub const REGION_DESCRIPTOR_SCHEMA: &str = "anvil.mesh.region.v1";
 pub const CELL_DESCRIPTOR_SCHEMA: &str = "anvil.mesh.cell.v1";
 pub const NODE_DESCRIPTOR_SCHEMA: &str = "anvil.mesh.node.v1";
 pub const ACTIVATION_CHECKPOINT_SCHEMA: &str = "anvil.mesh.activation_checkpoint.v1";
+pub const BUCKET_DRAIN_EXCEPTION_SCHEMA: &str = "anvil.mesh.bucket_drain_exception.v1";
 
 #[derive(Debug, Error)]
 pub enum LifecycleError {
@@ -85,6 +86,30 @@ pub enum NodeCapability {
     PersonalDb,
     Gateway,
     Admin,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum BucketDrainDisposition {
+    BlockUntilEmpty,
+    RemainProxyOnly,
+    ReadOnlyUntilRemoved,
+    DeleteAfterRetention,
+}
+
+impl BucketDrainDisposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BlockUntilEmpty => "block_until_empty",
+            Self::RemainProxyOnly => "remain_proxy_only",
+            Self::ReadOnlyUntilRemoved => "read_only_until_removed",
+            Self::DeleteAfterRetention => "delete_after_retention",
+        }
+    }
+
+    pub fn allows_drained_exception(self) -> bool {
+        matches!(self, Self::RemainProxyOnly | Self::ReadOnlyUntilRemoved)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -198,6 +223,28 @@ pub struct ActivationCheckpointStream {
     pub digest: ControlRecordDigest,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BucketDrainExceptionDescriptor {
+    pub schema: String,
+    pub tenant_id: String,
+    pub bucket_name: String,
+    pub region: String,
+    pub disposition: BucketDrainDisposition,
+    pub reason: String,
+    pub expires_at: Option<String>,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketDrainExceptionInput {
+    pub tenant_id: String,
+    pub bucket_name: String,
+    pub region: String,
+    pub disposition: BucketDrainDisposition,
+    pub reason: String,
+    pub expires_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MeshLifecycleState {
     pub regions: BTreeMap<String, RegionDescriptor>,
@@ -205,6 +252,8 @@ pub struct MeshLifecycleState {
     pub nodes: BTreeMap<String, NodeDescriptor>,
     #[serde(default)]
     pub host_aliases: BTreeMap<String, HostAliasDescriptor>,
+    #[serde(default)]
+    pub bucket_drain_exceptions: BTreeMap<String, BucketDrainExceptionDescriptor>,
 }
 
 pub async fn read_state(storage: &Storage) -> LifecycleResult<MeshLifecycleState> {
@@ -725,6 +774,64 @@ pub async fn list_host_aliases(
         .collect())
 }
 
+pub async fn upsert_bucket_drain_exception(
+    storage: &Storage,
+    input: BucketDrainExceptionInput,
+) -> LifecycleResult<BucketDrainExceptionDescriptor> {
+    require_identifier(&input.tenant_id, "bucket drain exception tenant id")?;
+    require_identifier(&input.bucket_name, "bucket drain exception bucket name")?;
+    require_identifier(&input.region, "bucket drain exception region")?;
+    require_nonempty(&input.reason, "bucket drain exception reason")?;
+    if !input.disposition.allows_drained_exception() {
+        return Err(LifecycleError::InvalidArgument(format!(
+            "bucket drain exception disposition must be remain_proxy_only or read_only_until_removed, got {}",
+            input.disposition.as_str()
+        )));
+    }
+    if let Some(expires_at) = &input.expires_at {
+        require_nonempty(expires_at, "bucket drain exception expires_at")?;
+    }
+
+    let mut state = read_state(storage).await?;
+    let key = bucket_drain_exception_key(&input.region, &input.tenant_id, &input.bucket_name);
+    let generation = state
+        .bucket_drain_exceptions
+        .get(&key)
+        .map_or(1, |existing| existing.generation.saturating_add(1));
+    let descriptor = BucketDrainExceptionDescriptor {
+        schema: BUCKET_DRAIN_EXCEPTION_SCHEMA.to_string(),
+        tenant_id: input.tenant_id,
+        bucket_name: input.bucket_name,
+        region: input.region,
+        disposition: input.disposition,
+        reason: input.reason,
+        expires_at: input.expires_at,
+        generation,
+    };
+    state
+        .bucket_drain_exceptions
+        .insert(key, descriptor.clone());
+    write_state(storage, &state).await?;
+    Ok(descriptor)
+}
+
+pub async fn list_bucket_drain_exceptions(
+    storage: &Storage,
+    region_filter: Option<&str>,
+) -> LifecycleResult<Vec<BucketDrainExceptionDescriptor>> {
+    if let Some(region) = region_filter.filter(|region| !region.is_empty()) {
+        require_identifier(region, "bucket drain exception region")?;
+    }
+    Ok(read_state(storage)
+        .await?
+        .bucket_drain_exceptions
+        .into_values()
+        .filter(|exception| {
+            region_filter.is_none_or(|region| region.is_empty() || exception.region == region)
+        })
+        .collect())
+}
+
 pub fn validate_host_alias_transition(
     from: HostAliasState,
     to: HostAliasState,
@@ -970,9 +1077,18 @@ async fn ensure_region_drain_completion_is_supported(
                 )))
             }
         }
-        LifecycleState::DrainedWithExceptions => Err(LifecycleError::InvalidArgument(format!(
-            "region {region} drain exceptions are not implemented; block_until_empty requires no bucket locator to name the region as primary"
-        ))),
+        LifecycleState::DrainedWithExceptions => {
+            let blockers = bucket_locators_without_valid_drain_exception(storage, region).await?;
+            if blockers.is_empty() {
+                Ok(())
+            } else {
+                Err(LifecycleError::InvalidArgument(format!(
+                    "region {region} drain cannot complete with exceptions: {} bucket locator(s) do not have a valid read-only drain exception: {}",
+                    blockers.len(),
+                    blockers.join(", ")
+                )))
+            }
+        }
         _ => Ok(()),
     }
 }
@@ -1011,6 +1127,71 @@ async fn bucket_locators_blocking_region_drain(
 
 fn bucket_locator_blocks_region_drain(status: BucketLocatorStatus) -> bool {
     !matches!(status, BucketLocatorStatus::Deleted)
+}
+
+async fn bucket_locators_without_valid_drain_exception(
+    storage: &Storage,
+    region: &str,
+) -> LifecycleResult<Vec<String>> {
+    let state = read_state(storage).await?;
+    let records = mesh_directory::list_routing_records(
+        storage,
+        Some(mesh_directory::RoutingRecordFamily::BucketLocator),
+    )
+    .await
+    .map_err(|err| {
+        LifecycleError::InvalidArgument(format!(
+            "could not inspect bucket locators for region drain: {err}"
+        ))
+    })?;
+    let mut blockers = Vec::new();
+    for record in records {
+        let locator: BucketLocatorDescriptor =
+            serde_json::from_str(&record.payload_json).map_err(|err| {
+                LifecycleError::InvalidArgument(format!(
+                    "bucket locator {} is invalid: {err}",
+                    record.record_key
+                ))
+            })?;
+        if locator.home_region.as_str() != region
+            || !bucket_locator_blocks_region_drain(locator.status)
+        {
+            continue;
+        }
+        let exception_key = bucket_drain_exception_key(
+            region,
+            locator.tenant_id.as_str(),
+            locator.bucket_name.as_str(),
+        );
+        let Some(exception) = state.bucket_drain_exceptions.get(&exception_key) else {
+            blockers.push(format!(
+                "{}:{:?}:missing_exception",
+                record.record_key, locator.status
+            ));
+            continue;
+        };
+        if locator.status != BucketLocatorStatus::ReadOnly {
+            blockers.push(format!(
+                "{}:{:?}:exception_requires_read_only_locator",
+                record.record_key, locator.status
+            ));
+            continue;
+        }
+        if !exception.disposition.allows_drained_exception() {
+            blockers.push(format!(
+                "{}:{:?}:invalid_exception_disposition:{}",
+                record.record_key,
+                locator.status,
+                exception.disposition.as_str()
+            ));
+            continue;
+        }
+    }
+    Ok(blockers)
+}
+
+pub fn bucket_drain_exception_key(region: &str, tenant_id: &str, bucket_name: &str) -> String {
+    format!("{region}/{tenant_id}/{bucket_name}")
 }
 
 fn ensure_generation(

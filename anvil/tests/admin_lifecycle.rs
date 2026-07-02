@@ -672,6 +672,175 @@ async fn admin_lifecycle_rejects_invalid_region_cell_and_node_transitions() {
 }
 
 #[tokio::test]
+async fn admin_region_drain_applies_bucket_dispositions_and_exceptions() {
+    let node = spawn_admin_node().await;
+    let token = admin_token(&node);
+    let mut client = AdminServiceClient::connect(node.admin_url.clone())
+        .await
+        .unwrap();
+
+    let region = client
+        .create_region(with_auth(
+            tonic::Request::new(CreateRegionRequest {
+                context: Some(context("create-drain-region", 0)),
+                region: "eu-west-1".to_string(),
+                public_base_url: "https://eu-west-1.anvil-storage.test".to_string(),
+                virtual_host_suffix: "eu-west-1.anvil-storage.test".to_string(),
+                placement_weight: 100,
+                default_cell: "cell-a".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .region
+        .unwrap();
+    let cell = client
+        .register_cell(with_auth(
+            tonic::Request::new(RegisterCellRequest {
+                context: Some(context("register-drain-cell", 0)),
+                region: "eu-west-1".to_string(),
+                cell_id: "cell-a".to_string(),
+                placement_weight: 100,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .cell
+        .unwrap();
+    client
+        .activate_cell(with_auth(
+            tonic::Request::new(ActivateCellRequest {
+                context: Some(context("activate-drain-cell", cell.generation)),
+                region: "eu-west-1".to_string(),
+                cell_id: "cell-a".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap();
+    let local_node_id = node.state.config.node_id.clone();
+    let node_descriptor = client
+        .register_node(with_auth(
+            tonic::Request::new(RegisterNodeRequest {
+                context: Some(context("register-drain-node", 0)),
+                node_id: local_node_id.clone(),
+                region: "eu-west-1".to_string(),
+                cell_id: "cell-a".to_string(),
+                libp2p_peer_id: "peer-a".to_string(),
+                public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
+                public_api_addr: "http://127.0.0.1:50051".to_string(),
+                capabilities: vec![1, 5],
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .node
+        .unwrap();
+    client
+        .activate_node(with_auth(
+            tonic::Request::new(ActivateNodeRequest {
+                context: Some(context("activate-drain-node", node_descriptor.generation)),
+                node_id: local_node_id,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap();
+    let region = client
+        .activate_region(with_auth(
+            tonic::Request::new(ActivateRegionRequest {
+                context: Some(context("activate-drain-region", region.generation)),
+                region: "eu-west-1".to_string(),
+                activation_checkpoint_json: empty_activation_checkpoint_json(
+                    "mesh-test",
+                    "eu-west-1",
+                ),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .region
+        .unwrap();
+
+    let tenant = node
+        .state
+        .persistence
+        .create_tenant("tenant-a", "tenant-a-idempotency")
+        .await
+        .unwrap();
+    node.state
+        .persistence
+        .create_bucket(tenant.id, "docs", "eu-west-1")
+        .await
+        .unwrap();
+
+    let drained = client
+        .drain_region(with_auth(
+            tonic::Request::new(DrainRegionRequest {
+                context: Some(context("drain-region-with-exception", region.generation)),
+                region: "eu-west-1".to_string(),
+                default_disposition: 1,
+                bucket_overrides: vec![BucketDrainOverride {
+                    tenant_id: tenant.id.to_string(),
+                    bucket_name: "docs".to_string(),
+                    disposition: 2,
+                    reason: "customer-approved delayed migration".to_string(),
+                    expires_at: "2026-08-02T00:00:00Z".to_string(),
+                }],
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(drained.state, 4);
+
+    let locator = node
+        .state
+        .persistence
+        .get_mesh_bucket_locator(tenant.id, "docs")
+        .await
+        .unwrap()
+        .expect("bucket locator");
+    assert_eq!(format!("{:?}", locator.status), "ReadOnly");
+    let exceptions =
+        anvil::mesh_lifecycle::list_bucket_drain_exceptions(&node.state.storage, Some("eu-west-1"))
+            .await
+            .unwrap();
+    assert_eq!(exceptions.len(), 1);
+    assert_eq!(exceptions[0].bucket_name, "docs");
+
+    let audit = client
+        .list_audit_events(with_auth(
+            tonic::Request::new(ListAuditEventsRequest {
+                request_id: "list-drain-audit".to_string(),
+                principal_id: String::new(),
+                resource_id: "region:eu-west-1".to_string(),
+                action: "admin.region.drain".to_string(),
+                page: None,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(audit.events.len(), 1);
+    assert!(
+        audit.events[0]
+            .details_json
+            .contains("bucket_disposition_decisions")
+    );
+}
+
+#[tokio::test]
 async fn admin_tenant_app_and_bucket_workflow_issues_usable_credentials() {
     let node = spawn_admin_node().await;
     let token = admin_token(&node);

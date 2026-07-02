@@ -837,6 +837,13 @@ impl AdminService for AppState {
         let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
+        let default_disposition =
+            region_drain_disposition_from_proto(req.default_disposition, true)?;
+        let bucket_overrides = req
+            .bucket_overrides
+            .iter()
+            .map(bucket_drain_override_from_proto)
+            .collect::<Result<Vec<_>, _>>()?;
         let region = self
             .persistence
             .transition_region_descriptor(
@@ -846,11 +853,16 @@ impl AdminService for AppState {
             )
             .await
             .map_err(lifecycle_status)?;
+        let drain_report = self
+            .persistence
+            .apply_region_drain_plan(&region.region, default_disposition, bucket_overrides)
+            .await
+            .map_err(|err| Status::failed_precondition(err.to_string()))?;
         let mut details = region_audit_details(&region);
         add_audit_detail(
             &mut details,
             "default_disposition",
-            json!(region_drain_disposition_name(req.default_disposition)),
+            json!(default_disposition.as_str()),
         );
         add_audit_detail(
             &mut details,
@@ -861,6 +873,11 @@ impl AdminService for AppState {
             &mut details,
             "bucket_overrides",
             json!(bucket_drain_overrides_details(&req.bucket_overrides)),
+        );
+        add_audit_detail(
+            &mut details,
+            "bucket_disposition_decisions",
+            region_drain_plan_details(&drain_report),
         );
         let audit_event_id = record_admin_audit_event(
             self,
@@ -2596,9 +2613,77 @@ fn bucket_drain_overrides_details(overrides: &[BucketDrainOverride]) -> Vec<serd
                 "disposition": region_drain_disposition_name(override_.disposition),
                 "disposition_code": override_.disposition,
                 "reason": &override_.reason,
+                "expires_at": none_if_empty(&override_.expires_at),
             })
         })
         .collect()
+}
+
+fn bucket_drain_override_from_proto(
+    override_: &BucketDrainOverride,
+) -> Result<persistence::RegionDrainBucketOverride, Status> {
+    let disposition = region_drain_disposition_from_proto(override_.disposition, false)?;
+    if override_.tenant_id.trim().is_empty() {
+        return Err(Status::invalid_argument(
+            "bucket drain override tenant_id is required",
+        ));
+    }
+    if override_.bucket_name.trim().is_empty() {
+        return Err(Status::invalid_argument(
+            "bucket drain override bucket_name is required",
+        ));
+    }
+    if override_.reason.trim().is_empty() && disposition.allows_drained_exception() {
+        return Err(Status::invalid_argument(
+            "bucket drain override reason is required for drain exceptions",
+        ));
+    }
+    Ok(persistence::RegionDrainBucketOverride {
+        tenant_id: override_.tenant_id.trim().to_string(),
+        bucket_name: override_.bucket_name.trim().to_string(),
+        disposition,
+        reason: override_.reason.trim().to_string(),
+        expires_at: none_if_empty(&override_.expires_at).map(str::to_string),
+    })
+}
+
+fn region_drain_disposition_from_proto(
+    value: i32,
+    unspecified_defaults_to_block: bool,
+) -> Result<mesh_lifecycle::BucketDrainDisposition, Status> {
+    match value {
+        0 if unspecified_defaults_to_block => {
+            Ok(mesh_lifecycle::BucketDrainDisposition::BlockUntilEmpty)
+        }
+        1 => Ok(mesh_lifecycle::BucketDrainDisposition::BlockUntilEmpty),
+        2 => Ok(mesh_lifecycle::BucketDrainDisposition::RemainProxyOnly),
+        3 => Ok(mesh_lifecycle::BucketDrainDisposition::ReadOnlyUntilRemoved),
+        4 => Ok(mesh_lifecycle::BucketDrainDisposition::DeleteAfterRetention),
+        _ => Err(Status::invalid_argument(format!(
+            "unsupported region drain disposition code {value}"
+        ))),
+    }
+}
+
+fn region_drain_plan_details(report: &persistence::RegionDrainPlanReport) -> serde_json::Value {
+    json!({
+        "region": &report.region,
+        "decisions": report.decisions.iter().map(|decision| {
+            json!({
+                "tenant_id": &decision.tenant_id,
+                "bucket_name": &decision.bucket_name,
+                "disposition": decision.disposition.as_str(),
+                "reason": &decision.reason,
+                "expires_at": decision.expires_at.as_deref(),
+                "status_before": format!("{:?}", decision.status_before),
+                "status_after": format!("{:?}", decision.status_after),
+                "bucket_locator_generation_before": decision.bucket_locator_generation_before,
+                "bucket_locator_generation_after": decision.bucket_locator_generation_after,
+                "exception_written": decision.exception_written,
+                "locator_updated": decision.locator_updated,
+            })
+        }).collect::<Vec<_>>()
+    })
 }
 
 fn region_drain_disposition_name(value: i32) -> &'static str {

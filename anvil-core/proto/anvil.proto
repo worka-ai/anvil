@@ -389,6 +389,7 @@ message BucketDrainOverride {
   string bucket_name = 2;
   RegionDrainDisposition disposition = 3;
   string reason = 4;
+  string expires_at = 5;
 }
 
 message DrainOperationResponse {
