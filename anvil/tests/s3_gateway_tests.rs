@@ -416,7 +416,7 @@ async fn test_s3_custom_host_alias_routes_to_bucket_prefix() {
             &routing_config,
             CreateHostAliasDescriptor {
                 hostname: hostname.clone(),
-                tenant_id: "default".to_string(),
+                tenant_id: "1".to_string(),
                 bucket_name: bucket.clone(),
                 region: "test-region-1".to_string(),
                 prefix: "public/".to_string(),

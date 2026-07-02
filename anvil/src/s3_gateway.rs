@@ -9,7 +9,7 @@ use anvil_core::observability::RESERVED_NAMESPACE_REJECTION_COUNT;
 use anvil_core::permissions::AnvilAction;
 use anvil_core::persistence::Object;
 use anvil_core::routing::{
-    self, HostAliasDescriptor, ObjectRoute, RouteRequest, RoutingConfig, RoutingError,
+    self, HostAliasDescriptor, ObjectRoute, RouteRequest, RouteSource, RoutingConfig, RoutingError,
 };
 use anvil_core::validation;
 use axum::{
@@ -293,6 +293,65 @@ fn s3_routed_bucket_without_key(req: &Request) -> Option<String> {
         .map(|route| route.bucket)
 }
 
+async fn s3_route_checked_claims(
+    state: &AppState,
+    route: Option<ObjectRoute>,
+    claims: Option<Claims>,
+) -> Result<Option<Claims>, Response> {
+    let Some(route) = route else {
+        return Ok(claims);
+    };
+    let Some(claims) = claims else {
+        return Ok(None);
+    };
+
+    let route_tenant_id = match route.source {
+        RouteSource::HostAlias { .. } => route.tenant.parse::<i64>().map_err(|_| {
+            s3_error(
+                "InvalidRequest",
+                "Host alias target tenant id is invalid",
+                axum::http::StatusCode::BAD_REQUEST,
+            )
+        })?,
+        RouteSource::PathStyle | RouteSource::VirtualHost => {
+            let descriptor = state
+                .persistence
+                .get_mesh_tenant_name_locator(&route.tenant)
+                .await
+                .map_err(|error| {
+                    s3_error(
+                        "InvalidRequest",
+                        &format!("Failed to resolve tenant route: {error}"),
+                        axum::http::StatusCode::BAD_REQUEST,
+                    )
+                })?
+                .ok_or_else(|| {
+                    s3_error(
+                        "NoSuchTenant",
+                        "The specified tenant does not exist",
+                        axum::http::StatusCode::NOT_FOUND,
+                    )
+                })?;
+            descriptor.tenant_id.as_str().parse::<i64>().map_err(|_| {
+                s3_error(
+                    "InvalidRequest",
+                    "Tenant route resolved to an invalid tenant id",
+                    axum::http::StatusCode::BAD_REQUEST,
+                )
+            })?
+        }
+    };
+
+    if route_tenant_id != claims.tenant_id {
+        return Err(s3_error(
+            "AccessDenied",
+            "Credentials are not valid for routed tenant",
+            axum::http::StatusCode::FORBIDDEN,
+        ));
+    }
+    Ok(Some(claims))
+}
+
 fn s3_query_map(uri: &Uri) -> HashMap<String, String> {
     uri.query()
         .map(|query| {
@@ -497,6 +556,11 @@ async fn create_bucket(
                 axum::http::StatusCode::FORBIDDEN,
             );
         }
+    };
+    let claims = match s3_route_checked_claims(&state, s3_host_route(&req), Some(claims)).await {
+        Ok(Some(claims)) => claims,
+        Ok(None) => unreachable!("authenticated create bucket path supplied claims"),
+        Err(response) => return response,
     };
 
     if q.contains_key("versioning") {
@@ -748,6 +812,11 @@ async fn head_bucket(
             );
         }
     };
+    let claims = match s3_route_checked_claims(&state, s3_host_route(&req), Some(claims)).await {
+        Ok(Some(claims)) => claims,
+        Ok(None) => unreachable!("authenticated head bucket path supplied claims"),
+        Err(response) => return response,
+    };
 
     match bucket_journal::read_current_bucket(&state.storage, claims.tenant_id, &bucket_name).await
     {
@@ -781,7 +850,16 @@ async fn list_objects(
     }
     let Path(bucket) = bucket;
     let bucket = s3_routed_bucket(&req, bucket);
-    let claims = req.extensions().get::<Claims>().cloned();
+    let claims = match s3_route_checked_claims(
+        &state,
+        s3_host_route(&req),
+        req.extensions().get::<Claims>().cloned(),
+    )
+    .await
+    {
+        Ok(claims) => claims,
+        Err(response) => return response,
+    };
 
     if q.contains_key("versions") {
         let request_is_authenticated = req.extensions().get::<Claims>().is_some();
@@ -1722,7 +1800,16 @@ async fn get_object(
     }
     (bucket, key) = s3_routed_bucket_key(&req, bucket, key);
 
-    let claims = req.extensions().get::<Claims>().cloned();
+    let claims = match s3_route_checked_claims(
+        &state,
+        s3_host_route(&req),
+        req.extensions().get::<Claims>().cloned(),
+    )
+    .await
+    {
+        Ok(claims) => claims,
+        Err(response) => return response,
+    };
     if let Some(upload_id) = q.get("uploadId") {
         let claims = match claims {
             Some(claims) => claims,
@@ -2677,7 +2764,16 @@ async fn head_object(
     }
     (bucket, key) = s3_routed_bucket_key(&req, bucket, key);
 
-    let claims = req.extensions().get::<Claims>().cloned();
+    let claims = match s3_route_checked_claims(
+        &state,
+        s3_host_route(&req),
+        req.extensions().get::<Claims>().cloned(),
+    )
+    .await
+    {
+        Ok(claims) => claims,
+        Err(response) => return response,
+    };
     let version_id = match parse_s3_version_id(&q) {
         Ok(version_id) => version_id,
         Err(response) => return response,
