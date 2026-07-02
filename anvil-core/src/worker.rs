@@ -698,6 +698,7 @@ mod tests {
             ShardManager::new(),
             storage.clone(),
             config.region.clone(),
+            config.cross_region_routing_policy,
             jwt_manager.clone(),
             config.anvil_secret_encryption_key.clone(),
             watch_tx,
