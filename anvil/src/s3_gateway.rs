@@ -8,11 +8,13 @@ use anvil_core::object_manager::{ObjectLinkReadMode, ObjectWriteOptions};
 use anvil_core::observability::RESERVED_NAMESPACE_REJECTION_COUNT;
 use anvil_core::permissions::AnvilAction;
 use anvil_core::persistence::Object;
+use anvil_core::routing::{self, ObjectRoute, RouteRequest, RoutingConfig, RoutingError};
 use anvil_core::validation;
 use axum::{
     Router,
     body::Body,
     extract::{Path, Query, Request, State},
+    http::{self, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, put},
@@ -117,14 +119,179 @@ pub fn app(state: AppState) -> Router {
                 .head(head_object),
         )
         .with_state(state.clone())
-        .route_layer(middleware::from_fn(aws_chunked_decoder))
-        .route_layer(middleware::from_fn_with_state(state.clone(), sigv4_auth))
-        .route_layer(middleware::from_fn_with_state(
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            reserved_namespace_guard,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            s3_host_routing,
+        ))
+        .layer(middleware::from_fn(aws_chunked_decoder))
+        .layer(middleware::from_fn_with_state(state.clone(), sigv4_auth))
+        .layer(middleware::from_fn_with_state(
             state,
             reserved_namespace_guard,
         ));
 
     public.merge(s3_routes)
+}
+
+#[derive(Debug, Clone)]
+struct S3HostRoute(ObjectRoute);
+
+async fn s3_host_routing(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
+    let Some(config) = s3_routing_config(&state) else {
+        return next.run(req).await;
+    };
+    let Some(host) = request_host(&req).map(str::to_owned) else {
+        return next.run(req).await;
+    };
+
+    // TODO: Load active custom host aliases from the mesh directory once the
+    // host-alias storage hot path is available to the S3 gateway.
+    let aliases = [];
+    match routing::parse_object_route(
+        RouteRequest {
+            host: &host,
+            path: req.uri().path(),
+        },
+        &config,
+        &aliases,
+    ) {
+        Ok(route) => {
+            if let Err(err) = rewrite_s3_host_route_uri(&mut req, &route) {
+                return s3_routing_error(err);
+            }
+            req.extensions_mut().insert(S3HostRoute(route));
+            next.run(req).await
+        }
+        Err(RoutingError::UnknownHost) => next.run(req).await,
+        Err(err) => s3_routing_error(err),
+    }
+}
+
+fn s3_routing_config(state: &AppState) -> Option<RoutingConfig> {
+    let configured = state.config.public_region_base_domain.trim();
+    if configured.is_empty() {
+        return None;
+    }
+
+    let region_prefix = format!("{}.", state.region);
+    let base_domain = configured
+        .strip_prefix(&region_prefix)
+        .unwrap_or(configured);
+    RoutingConfig::new(base_domain).ok()
+}
+
+fn request_host(req: &Request) -> Option<&str> {
+    req.headers()
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| req.uri().authority().map(|authority| authority.as_str()))
+}
+
+fn rewrite_s3_host_route_uri(req: &mut Request, route: &ObjectRoute) -> Result<(), RoutingError> {
+    let mut parts = req.uri().clone().into_parts();
+    let path = s3_route_rewrite_path(route);
+    let path_and_query = match req.uri().query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path,
+    };
+    parts.path_and_query = Some(
+        path_and_query
+            .parse()
+            .map_err(|_| RoutingError::InvalidPath)?,
+    );
+    let uri = Uri::from_parts(parts).map_err(|_| RoutingError::InvalidPath)?;
+    *req.uri_mut() = uri;
+    Ok(())
+}
+
+fn s3_route_rewrite_path(route: &ObjectRoute) -> String {
+    let mut path = String::new();
+    path.push('/');
+    push_percent_encoded_path(&mut path, &route.bucket, true);
+    path.push('/');
+    push_percent_encoded_path(&mut path, &route.key, false);
+    path
+}
+
+fn push_percent_encoded_path(out: &mut String, value: &str, encode_slash: bool) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            b'/' if !encode_slash => out.push(byte as char),
+            _ => {
+                out.push('%');
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+        }
+    }
+}
+
+fn s3_routing_error(err: RoutingError) -> Response {
+    s3_error(
+        "InvalidRequest",
+        &err.to_string(),
+        axum::http::StatusCode::BAD_REQUEST,
+    )
+}
+
+fn s3_host_route(req: &Request) -> Option<ObjectRoute> {
+    req.extensions()
+        .get::<S3HostRoute>()
+        .map(|route| route.0.clone())
+}
+
+fn s3_routed_bucket(req: &Request, fallback_bucket: String) -> String {
+    s3_host_route(req)
+        .map(|route| route.bucket)
+        .unwrap_or(fallback_bucket)
+}
+
+fn s3_routed_bucket_key(
+    req: &Request,
+    fallback_bucket: String,
+    fallback_key: String,
+) -> (String, String) {
+    s3_host_route(req)
+        .map(|route| (route.bucket, route.key))
+        .unwrap_or((fallback_bucket, fallback_key))
+}
+
+fn s3_routed_object(req: &Request) -> Option<(String, String)> {
+    s3_host_route(req)
+        .filter(|route| !route.key.is_empty())
+        .map(|route| (route.bucket, route.key))
+}
+
+fn s3_routed_bucket_without_key(req: &Request) -> Option<String> {
+    s3_host_route(req)
+        .filter(|route| route.key.is_empty())
+        .map(|route| route.bucket)
+}
+
+fn s3_query_map(uri: &Uri) -> HashMap<String, String> {
+    uri.query()
+        .map(|query| {
+            query
+                .split('&')
+                .filter(|pair| !pair.is_empty())
+                .map(|pair| {
+                    let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+                    (
+                        percent_decode_query_component(name),
+                        percent_decode_query_component(value),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn reserved_namespace_guard(
@@ -147,6 +314,12 @@ async fn reserved_namespace_guard(
 }
 
 fn request_targets_reserved_namespace(req: &Request) -> bool {
+    if let Some(route) = s3_host_route(req) {
+        if !route.key.is_empty() && validation::is_reserved_internal_key(&route.key) {
+            return true;
+        }
+    }
+
     let path = req.uri().path().trim_start_matches('/');
     let mut parts = path.splitn(2, '/');
     let _bucket = parts.next();
@@ -222,6 +395,11 @@ fn hex_value(byte: u8) -> Option<u8> {
 }
 
 async fn list_buckets(State(state): State<AppState>, req: Request) -> Response {
+    if let Some(bucket) = s3_routed_bucket_without_key(&req) {
+        let q = s3_query_map(req.uri());
+        return Box::pin(list_objects(State(state), Path(bucket), Query(q), req)).await;
+    }
+
     let claims = match req.extensions().get::<Claims>().cloned() {
         Some(c) => c,
         None => {
@@ -279,13 +457,17 @@ async fn list_buckets(State(state): State<AppState>, req: Request) -> Response {
 
 async fn create_bucket(
     State(state): State<AppState>,
-    Path(bucket): Path<String>,
+    Path(mut bucket): Path<String>,
     Query(q): Query<HashMap<String, String>>,
     req: Request,
 ) -> Response {
     // The S3 `CreateBucket` operation can contain an XML body with the location
     // constraint. We must consume the body for the handler to be matched correctly,
     // even if we don't use the content for now.
+    if let Some((bucket, key)) = s3_routed_object(&req) {
+        return Box::pin(put_object(State(state), Path((bucket, key)), Query(q), req)).await;
+    }
+    bucket = s3_routed_bucket(&req, bucket);
 
     // Claims may be absent for anonymous; handler will enforce bucket public access
     let claims = req.extensions().get::<Claims>().cloned();
@@ -444,9 +626,21 @@ async fn put_bucket_versioning_response(
 
 async fn delete_bucket(
     State(state): State<AppState>,
-    Path(bucket): Path<String>,
+    Path(mut bucket): Path<String>,
     req: Request,
 ) -> Response {
+    if let Some((bucket, key)) = s3_routed_object(&req) {
+        let q = s3_query_map(req.uri());
+        return Box::pin(delete_object(
+            State(state),
+            Path((bucket, key)),
+            Query(q),
+            req,
+        ))
+        .await;
+    }
+    bucket = s3_routed_bucket(&req, bucket);
+
     let claims = match req.extensions().get::<Claims>().cloned() {
         Some(c) => c,
         None => {
@@ -512,9 +706,21 @@ fn s3_redirect(region: &str) -> Response {
 
 async fn head_bucket(
     State(state): State<AppState>,
-    Path(bucket_name): Path<String>,
+    Path(mut bucket_name): Path<String>,
     req: Request,
 ) -> Response {
+    if let Some((bucket, key)) = s3_routed_object(&req) {
+        let q = s3_query_map(req.uri());
+        return Box::pin(head_object(
+            State(state),
+            Path((bucket, key)),
+            Query(q),
+            req,
+        ))
+        .await;
+    }
+    bucket_name = s3_routed_bucket(&req, bucket_name);
+
     let claims = match req.extensions().get::<Claims>().cloned() {
         Some(c) => c,
         None => {
@@ -553,6 +759,11 @@ async fn list_objects(
     Query(q): Query<HashMap<String, String>>,
     req: Request,
 ) -> Response {
+    if let Some((bucket, key)) = s3_routed_object(&req) {
+        return Box::pin(get_object(State(state), Path((bucket, key)), Query(q), req)).await;
+    }
+    let Path(bucket) = bucket;
+    let bucket = s3_routed_bucket(&req, bucket);
     let claims = req.extensions().get::<Claims>().cloned();
 
     if q.contains_key("versions") {
@@ -746,10 +957,21 @@ async fn list_objects(
 
 async fn post_bucket(
     State(state): State<AppState>,
-    Path(bucket): Path<String>,
+    Path(mut bucket): Path<String>,
     Query(q): Query<HashMap<String, String>>,
     req: Request,
 ) -> Response {
+    if let Some((bucket, key)) = s3_routed_object(&req) {
+        return Box::pin(post_object(
+            State(state),
+            Path((bucket, key)),
+            Query(q),
+            req,
+        ))
+        .await;
+    }
+    bucket = s3_routed_bucket(&req, bucket);
+
     let claims = match req.extensions().get::<Claims>().cloned() {
         Some(claims) => claims,
         None => {
@@ -1474,10 +1696,15 @@ async fn readiness_check(State(state): State<AppState>) -> Response {
 
 async fn get_object(
     State(state): State<AppState>,
-    Path((bucket, key)): Path<(String, String)>,
+    Path((mut bucket, mut key)): Path<(String, String)>,
     Query(q): Query<HashMap<String, String>>,
     req: Request,
 ) -> Response {
+    if let Some(bucket) = s3_routed_bucket_without_key(&req) {
+        return Box::pin(list_objects(State(state), Path(bucket), Query(q), req)).await;
+    }
+    (bucket, key) = s3_routed_bucket_key(&req, bucket, key);
+
     let claims = req.extensions().get::<Claims>().cloned();
     if let Some(upload_id) = q.get("uploadId") {
         let claims = match claims {
@@ -1820,10 +2047,15 @@ async fn list_multipart_parts_response(
 
 async fn put_object(
     State(state): State<AppState>,
-    Path((bucket, key)): Path<(String, String)>,
+    Path((mut bucket, mut key)): Path<(String, String)>,
     Query(q): Query<HashMap<String, String>>,
     req: Request,
 ) -> Response {
+    if let Some(bucket) = s3_routed_bucket_without_key(&req) {
+        return Box::pin(create_bucket(State(state), Path(bucket), Query(q), req)).await;
+    }
+    (bucket, key) = s3_routed_bucket_key(&req, bucket, key);
+
     let claims = match req.extensions().get::<Claims>().cloned() {
         Some(c) => c,
         None => {
@@ -1973,10 +2205,15 @@ async fn put_object(
 
 async fn post_object(
     State(state): State<AppState>,
-    Path((bucket, key)): Path<(String, String)>,
+    Path((mut bucket, mut key)): Path<(String, String)>,
     Query(q): Query<HashMap<String, String>>,
     req: Request,
 ) -> Response {
+    if let Some(bucket) = s3_routed_bucket_without_key(&req) {
+        return Box::pin(post_bucket(State(state), Path(bucket), Query(q), req)).await;
+    }
+    (bucket, key) = s3_routed_bucket_key(&req, bucket, key);
+
     let claims = match req.extensions().get::<Claims>().cloned() {
         Some(c) => c,
         None => {
@@ -2284,10 +2521,15 @@ fn copy_status_to_response(status: tonic::Status, not_found_code: &str) -> Respo
 
 async fn delete_object(
     State(state): State<AppState>,
-    Path((bucket, key)): Path<(String, String)>,
+    Path((mut bucket, mut key)): Path<(String, String)>,
     Query(q): Query<HashMap<String, String>>,
     req: Request,
 ) -> Response {
+    if let Some(bucket) = s3_routed_bucket_without_key(&req) {
+        return Box::pin(delete_bucket(State(state), Path(bucket), req)).await;
+    }
+    (bucket, key) = s3_routed_bucket_key(&req, bucket, key);
+
     let claims = match req.extensions().get::<Claims>().cloned() {
         Some(c) => c,
         None => {
@@ -2409,10 +2651,15 @@ async fn abort_multipart_upload(
 
 async fn head_object(
     State(state): State<AppState>,
-    Path((bucket, key)): Path<(String, String)>,
+    Path((mut bucket, mut key)): Path<(String, String)>,
     Query(q): Query<HashMap<String, String>>,
     req: Request,
 ) -> Response {
+    if let Some(bucket) = s3_routed_bucket_without_key(&req) {
+        return Box::pin(head_bucket(State(state), Path(bucket), req)).await;
+    }
+    (bucket, key) = s3_routed_bucket_key(&req, bucket, key);
+
     let claims = req.extensions().get::<Claims>().cloned();
     let version_id = match parse_s3_version_id(&q) {
         Ok(version_id) => version_id,

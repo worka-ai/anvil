@@ -263,6 +263,91 @@ async fn get_token_for_scopes(
 }
 
 #[tokio::test]
+async fn test_s3_regional_host_routing_reads_same_object_and_rejects_dotted_hosts() {
+    let mut cluster = TestCluster::new_with_config(&["test-region-1"], |config| {
+        config.public_region_base_domain = "test-region-1.anvil-storage.test".to_string();
+    })
+    .await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
+    let s3 = s3_client(http_base, "test-app", "test-secret");
+    let bucket = format!("host-route-{}", uuid::Uuid::new_v4());
+    let key = "nested/host-routed.txt";
+    let body = b"regional host routing resolves the same object";
+
+    s3.create_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("CreateBucket should succeed");
+    s3.put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(body))
+        .send()
+        .await
+        .expect("PutObject should succeed");
+
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut public_req = tonic::Request::new(SetPublicAccessRequest {
+        bucket: bucket.clone(),
+        allow_public_read: true,
+    });
+    public_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", cluster.token).parse().unwrap(),
+    );
+    auth_client.set_public_access(public_req).await.unwrap();
+
+    let http = reqwest::Client::new();
+    let path_style = http
+        .get(format!("{http_base}/default/{bucket}/{key}"))
+        .header(reqwest::header::HOST, "test-region-1.anvil-storage.test")
+        .send()
+        .await
+        .expect("path-style regional GET should send");
+    assert_eq!(path_style.status(), reqwest::StatusCode::OK);
+    assert_eq!(path_style.bytes().await.unwrap().as_ref(), body);
+
+    let virtual_host = http
+        .get(format!("{http_base}/{key}"))
+        .header(
+            reqwest::header::HOST,
+            format!("{bucket}.default.test-region-1.anvil-storage.test"),
+        )
+        .send()
+        .await
+        .expect("virtual-host regional GET should send");
+    assert_eq!(virtual_host.status(), reqwest::StatusCode::OK);
+    assert_eq!(virtual_host.bytes().await.unwrap().as_ref(), body);
+
+    let dotted_bucket = http
+        .get(format!("{http_base}/{key}"))
+        .header(
+            reqwest::header::HOST,
+            format!("assets.{bucket}.default.test-region-1.anvil-storage.test"),
+        )
+        .send()
+        .await
+        .expect("dotted bucket host form should send");
+    assert_eq!(dotted_bucket.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let dotted_tenant = http
+        .get(format!("{http_base}/{key}"))
+        .header(
+            reqwest::header::HOST,
+            format!("{bucket}.team.default.test-region-1.anvil-storage.test"),
+        )
+        .send()
+        .await
+        .expect("dotted tenant host form should send");
+    assert_eq!(dotted_tenant.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn test_s3_put_write_etag_preconditions() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;

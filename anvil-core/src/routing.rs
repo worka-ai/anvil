@@ -161,7 +161,7 @@ pub fn join_alias_prefix(prefix: &str, request_path: &str) -> Result<String, Rou
         (false, true) => prefix.to_string(),
         (false, false) => format!("{prefix}/{request_path}"),
     };
-    decode_and_validate_object_key(&raw_joined)
+    decode_and_validate_route_key(&raw_joined)
 }
 
 fn parse_native_route(
@@ -233,16 +233,19 @@ fn parse_path_style_path(path: &str) -> Result<(String, String, String), Routing
     {
         return Err(RoutingError::InvalidPath);
     }
-    let key = decode_and_validate_object_key(key)?;
+    let key = decode_and_validate_route_key(key)?;
     Ok((tenant, bucket, key))
 }
 
 fn decode_path_key(path: &str) -> Result<String, RoutingError> {
-    decode_and_validate_object_key(path.trim_start_matches('/'))
+    decode_and_validate_route_key(path.trim_start_matches('/'))
 }
 
-fn decode_and_validate_object_key(raw: &str) -> Result<String, RoutingError> {
+fn decode_and_validate_route_key(raw: &str) -> Result<String, RoutingError> {
     let decoded = percent_decode_utf8(raw)?;
+    if decoded.is_empty() {
+        return Ok(decoded);
+    }
     if !validation::is_valid_object_key(&decoded) {
         if decoded.starts_with('/') || decoded.split('/').any(|seg| seg == "." || seg == "..") {
             return Err(RoutingError::PathTraversal);
@@ -483,6 +486,35 @@ mod tests {
         assert_eq!(route.region, "eu-west-1");
         assert_eq!(route.key, "latest.exe");
         assert_eq!(route.source, RouteSource::VirtualHost);
+    }
+
+    #[test]
+    fn parses_bucket_level_regional_routes_with_empty_key() {
+        let path_style = parse_object_route(
+            RouteRequest {
+                host: "eu-west-1.anvil-storage.com",
+                path: "/acme/releases",
+            },
+            &config(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(path_style.bucket, "releases");
+        assert_eq!(path_style.key, "");
+        assert_eq!(path_style.source, RouteSource::PathStyle);
+
+        let virtual_host = parse_object_route(
+            RouteRequest {
+                host: "releases.acme.eu-west-1.anvil-storage.com",
+                path: "/",
+            },
+            &config(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(virtual_host.bucket, "releases");
+        assert_eq!(virtual_host.key, "");
+        assert_eq!(virtual_host.source, RouteSource::VirtualHost);
     }
 
     #[test]
