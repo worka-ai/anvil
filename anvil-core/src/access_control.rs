@@ -1,4 +1,9 @@
-use crate::{auth, authz_journal, permissions::AnvilAction, storage::Storage};
+use crate::{
+    auth, authz_journal,
+    authz_scope::{DEFAULT_AUTHZ_REALM_ID, encode_realm_namespace},
+    permissions::AnvilAction,
+    storage::Storage,
+};
 use anyhow::Result;
 
 pub const APP_SUBJECT_KIND: &str = "app";
@@ -43,7 +48,7 @@ pub async fn relationship_allows(
     authz_journal::resolve_permission_at_revision(
         storage,
         claims.tenant_id,
-        namespace,
+        &encode_realm_namespace(DEFAULT_AUTHZ_REALM_ID, namespace),
         object_id,
         relation,
         APP_SUBJECT_KIND,

@@ -2,7 +2,12 @@ use crate::anvil_api::auth_service_server::AuthService;
 use crate::anvil_api::*;
 use crate::{
     AppState, auth, authz_derived_lag_watch, authz_journal, authz_namespace_watch,
-    authz_realm_schema, authz_schema, authz_userset_index, crypto,
+    authz_realm_schema, authz_schema,
+    authz_scope::{
+        DEFAULT_AUTHZ_REALM_ID, decode_realm_namespace, decode_userset_subject_realm,
+        encode_optional_realm_namespace, encode_realm_namespace, encode_userset_subject_realm,
+    },
+    authz_userset_index, crypto,
     formats::hash32,
     permissions::AnvilAction,
     services::watch_envelope::{self, WatchEnvelopeParts},
@@ -250,8 +255,12 @@ impl AuthService for AppState {
                 namespace: encode_realm_namespace(&scope.authz_realm_id, &mutation.namespace),
                 object_id: mutation.object_id,
                 relation: mutation.relation,
+                subject_id: encode_userset_subject_realm(
+                    &scope.authz_realm_id,
+                    &mutation.subject_kind,
+                    &mutation.subject_id,
+                ),
                 subject_kind: mutation.subject_kind,
-                subject_id: mutation.subject_id,
                 caveat_hash: mutation.caveat_hash,
                 operation: mutation.operation,
                 reason: mutation.reason,
@@ -561,8 +570,12 @@ impl AuthService for AppState {
             subjects: subjects
                 .into_iter()
                 .map(|subject| AuthzSubject {
+                    subject_id: decode_userset_subject_realm(
+                        &scope.authz_realm_id,
+                        &subject.subject_kind,
+                        &subject.subject_id,
+                    ),
                     subject_kind: subject.subject_kind,
-                    subject_id: subject.subject_id,
                     caveat_hash: subject.caveat_hash,
                 })
                 .collect(),
@@ -1141,7 +1154,7 @@ fn resolve_authz_scope(
 ) -> Result<AuthzScope, Status> {
     let mut resolved = scope.cloned().unwrap_or_else(|| AuthzScope {
         anvil_storage_tenant_id: claims.tenant_id.to_string(),
-        authz_realm_id: "default".to_string(),
+        authz_realm_id: DEFAULT_AUTHZ_REALM_ID.to_string(),
     });
     if resolved.anvil_storage_tenant_id.is_empty() {
         resolved.anvil_storage_tenant_id = claims.tenant_id.to_string();
@@ -1175,22 +1188,6 @@ fn resolve_batch_scope(
         }
     }
     Ok(scope)
-}
-
-fn encode_realm_namespace(realm_id: &str, namespace: &str) -> String {
-    format!("realm__{realm_id}__{namespace}")
-}
-
-fn encode_optional_realm_namespace(realm_id: &str, namespace: &str) -> String {
-    if namespace.is_empty() {
-        String::new()
-    } else {
-        encode_realm_namespace(realm_id, namespace)
-    }
-}
-
-fn decode_realm_namespace<'a>(realm_id: &str, namespace: &'a str) -> Option<&'a str> {
-    namespace.strip_prefix(&format!("realm__{realm_id}__"))
 }
 
 fn record_belongs_to_realm(record: &crate::persistence::AuthzTupleRecord, realm_id: &str) -> bool {
@@ -1275,7 +1272,11 @@ async fn write_authz_tuple_record(
             &req.object_id,
             &req.relation,
             &req.subject_kind,
-            &req.subject_id,
+            &encode_userset_subject_realm(
+                &scope.authz_realm_id,
+                &req.subject_kind,
+                &req.subject_id,
+            ),
             &req.caveat_hash,
             operation,
             &claims.sub,
@@ -1510,7 +1511,11 @@ fn authz_tuple_response_for_realm(
         object_id: record.object_id.clone(),
         relation: record.relation.clone(),
         subject_kind: record.subject_kind.clone(),
-        subject_id: record.subject_id.clone(),
+        subject_id: decode_userset_subject_realm(
+            realm_id,
+            &record.subject_kind,
+            &record.subject_id,
+        ),
         caveat_hash: record.caveat_hash.clone(),
         revision: revision_to_u64(record.revision)?,
         zookie: zookie(record.revision),
@@ -1710,6 +1715,8 @@ fn authz_tuple_log_response_for_realm(
     if let Some(namespace) = decode_realm_namespace(realm_id, &response.namespace) {
         response.namespace = namespace.to_string();
     }
+    response.subject_id =
+        decode_userset_subject_realm(realm_id, &response.subject_kind, &response.subject_id);
     response
 }
 
