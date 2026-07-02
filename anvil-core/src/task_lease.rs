@@ -296,6 +296,41 @@ pub async fn read_task_lease(
     read_task_lease_unlocked(storage, tenant_id, task_id, signing_key).await
 }
 
+pub async fn list_active_task_leases_for_node(
+    storage: &Storage,
+    owner_node_id: &str,
+    now_nanos: i64,
+    signing_key: &[u8],
+) -> Result<Vec<TaskLease>> {
+    let root = storage.task_lease_root_path();
+    let mut out = Vec::new();
+    let mut tenant_dirs = match tokio::fs::read_dir(&root).await {
+        Ok(tenant_dirs) => tenant_dirs,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(out),
+        Err(err) => return Err(err).with_context(|| format!("read {}", root.display())),
+    };
+    while let Some(tenant_entry) = tenant_dirs.next_entry().await? {
+        if !tenant_entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let mut files = tokio::fs::read_dir(tenant_entry.path()).await?;
+        while let Some(file_entry) = files.next_entry().await? {
+            if file_entry.path().extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(lease) = read_json_optional::<TaskLease>(&file_entry.path()).await? else {
+                continue;
+            };
+            lease.verify(signing_key)?;
+            if lease.owner_node_id() == owner_node_id && lease.expires_at_nanos > now_nanos {
+                out.push(lease);
+            }
+        }
+    }
+    out.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+    Ok(out)
+}
+
 pub async fn force_release_task_lease(
     storage: &Storage,
     tenant_id: i64,

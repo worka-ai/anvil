@@ -15,9 +15,11 @@ use crate::{
     index_journal, index_repair, manifest_journal, mesh_control_stream, mesh_directory,
     metadata_journal, model_journal, multipart_journal, object_links,
     partition_fence::{
-        AcquireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal, OwnershipResource,
-        OwnershipResourceKind, PartitionOwnerStatus, PartitionRecoveryAcquire,
+        AcquireOwnership, ForceExpireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal,
+        OwnershipResource, OwnershipResourceKind, PartitionOwnerStatus, PartitionRecoveryAcquire,
         PartitionWritePermit, RenewOwnership, acquire_ownership, acquire_partition_recovery,
+        force_expire_ownership, force_expire_partition_owner_for_node,
+        list_active_ownership_fences_for_node, list_partition_owners_for_node,
         publish_partition_ready, read_ownership_fence, read_partition_owner, renew_ownership,
     },
     personaldb_repair, repair_finding,
@@ -1005,6 +1007,8 @@ impl Persistence {
                 return owner.write_permit().map_err(Into::into);
             }
         }
+        self.ensure_owner_node_can_acquire_new_partition(partition_family)
+            .await?;
 
         let now_nanos = Utc::now()
             .timestamp_nanos_opt()
@@ -1035,6 +1039,39 @@ impl Persistence {
         )
         .await?;
         ready.write_permit().map_err(Into::into)
+    }
+
+    async fn ensure_owner_node_can_acquire_new_partition(
+        &self,
+        partition_family: &str,
+    ) -> Result<()> {
+        if matches!(
+            partition_family,
+            "control_plane" | mesh_directory::CONTROL_PARTITION_FAMILY
+        ) {
+            return Ok(());
+        }
+        let nodes = crate::mesh_lifecycle::list_nodes(&self.storage, None, None)
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        let Some(node) = nodes
+            .into_iter()
+            .find(|node| node.node_id == self.owner_node_id)
+        else {
+            return Ok(());
+        };
+        if node.state == crate::mesh_lifecycle::LifecycleState::Active {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "node {} is {:?} and cannot acquire new partition ownership for {}",
+            self.owner_node_id,
+            node.state,
+            partition_family
+        ))
     }
 
     async fn control_write_permit(&self) -> Result<PartitionWritePermit> {
@@ -1737,6 +1774,32 @@ impl Persistence {
                 resource_kind: "node",
                 resource_id: node_id.to_string(),
             })?;
+        if node.generation != expected_generation {
+            return Err(crate::mesh_lifecycle::LifecycleError::GenerationConflict {
+                resource_kind: "node",
+                resource_id: node_id.to_string(),
+                expected: expected_generation,
+                current: node.generation,
+            });
+        }
+        crate::mesh_lifecycle::validate_node_transition(node.state, target).map_err(|_| {
+            crate::mesh_lifecycle::LifecycleError::LifecycleTransitionDenied {
+                resource_kind: "node",
+                resource_id: node_id.to_string(),
+                from: node.state,
+                to: target,
+            }
+        })?;
+        match target {
+            crate::mesh_lifecycle::LifecycleState::Drained => {
+                self.ensure_node_has_no_runtime_ownership(node_id).await?;
+            }
+            crate::mesh_lifecycle::LifecycleState::Offline
+            | crate::mesh_lifecycle::LifecycleState::Removed => {
+                self.force_expire_node_runtime_ownership(node_id).await?;
+            }
+            _ => {}
+        }
         let record_key = format!("{}/{}/{}", node.region, node.cell_id, node.node_id);
         let partition = crate::mesh_lifecycle::lifecycle_control_partition(
             crate::mesh_lifecycle::NODE_DESCRIPTOR_STREAM_FAMILY,
@@ -1763,6 +1826,187 @@ impl Persistence {
             },
         )
         .await
+    }
+
+    pub async fn node_runtime_ownership_blockers(
+        &self,
+        node_id: &str,
+    ) -> crate::mesh_lifecycle::LifecycleResult<Vec<String>> {
+        let now_nanos = current_time_nanos().map_err(|err| {
+            crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+        })?;
+        self.node_runtime_ownership_blockers_at(node_id, now_nanos)
+            .await
+    }
+
+    async fn ensure_node_has_no_runtime_ownership(
+        &self,
+        node_id: &str,
+    ) -> crate::mesh_lifecycle::LifecycleResult<()> {
+        let blockers = self.node_runtime_ownership_blockers(node_id).await?;
+        if blockers.is_empty() {
+            return Ok(());
+        }
+        Err(crate::mesh_lifecycle::LifecycleError::InvalidArgument(
+            format!(
+                "node {node_id} drain cannot complete: {} runtime ownership record(s) still exist: {}",
+                blockers.len(),
+                blockers.join(", ")
+            ),
+        ))
+    }
+
+    async fn node_runtime_ownership_blockers_at(
+        &self,
+        node_id: &str,
+        now_nanos: i64,
+    ) -> crate::mesh_lifecycle::LifecycleResult<Vec<String>> {
+        let mut blockers = Vec::new();
+        let partition_owners = list_partition_owners_for_node(
+            &self.storage,
+            node_id,
+            &self.partition_owner_signing_key,
+        )
+        .await
+        .map_err(|err| crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string()))?;
+        blockers.extend(partition_owners.into_iter().map(|owner| {
+            format!(
+                "partition_owner:{}/{}:{:?}:fence={}",
+                owner.partition_family, owner.partition_id, owner.status, owner.fence_token
+            )
+        }));
+
+        let ownership_fences = list_active_ownership_fences_for_node(
+            &self.storage,
+            node_id,
+            now_nanos,
+            &self.partition_owner_signing_key,
+        )
+        .await
+        .map_err(|err| crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string()))?;
+        blockers.extend(ownership_fences.into_iter().map(|record| {
+            format!(
+                "ownership_fence:{}/{}:{:?}:fence={}",
+                record.resource.resource_kind.as_str(),
+                record.resource.resource_id,
+                record.state,
+                record.fence
+            )
+        }));
+
+        let task_leases = task_lease::list_active_task_leases_for_node(
+            &self.storage,
+            node_id,
+            now_nanos,
+            &self.partition_owner_signing_key,
+        )
+        .await
+        .map_err(|err| crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string()))?;
+        blockers.extend(task_leases.into_iter().map(|lease| {
+            format!(
+                "task_lease:{}:{}:fence={}",
+                lease.task_kind, lease.task_id, lease.fence_token
+            )
+        }));
+        blockers.sort();
+        Ok(blockers)
+    }
+
+    async fn force_expire_node_runtime_ownership(
+        &self,
+        node_id: &str,
+    ) -> crate::mesh_lifecycle::LifecycleResult<()> {
+        let now_nanos = current_time_nanos().map_err(|err| {
+            crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+        })?;
+        let partition_owners = list_partition_owners_for_node(
+            &self.storage,
+            node_id,
+            &self.partition_owner_signing_key,
+        )
+        .await
+        .map_err(|err| crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string()))?;
+        for owner in partition_owners {
+            force_expire_partition_owner_for_node(
+                &self.storage,
+                &owner.partition_family,
+                &owner.partition_id,
+                node_id,
+                now_nanos,
+                &self.partition_owner_signing_key,
+            )
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        }
+
+        let ownership_fences = list_active_ownership_fences_for_node(
+            &self.storage,
+            node_id,
+            now_nanos,
+            &self.partition_owner_signing_key,
+        )
+        .await
+        .map_err(|err| crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string()))?;
+        let admin = OwnershipPrincipal {
+            tenant_id: 0,
+            principal_kind: "node_admin".to_string(),
+            principal_id: self.owner_node_id.clone(),
+            actor_instance_id: self.owner_node_id.clone(),
+            display_name: self.owner_node_id.clone(),
+            region: self.region.clone(),
+            cell: self.cell_id.clone(),
+        };
+        for record in ownership_fences {
+            let mut admin = admin.clone();
+            admin.tenant_id = record.owner.tenant_id;
+            force_expire_ownership(
+                &self.storage,
+                ForceExpireOwnership {
+                    request_id: format!(
+                        "node-force-expire-{}-{}",
+                        node_id,
+                        record.resource.resource_id.replace('/', "-")
+                    ),
+                    idempotency_key: format!(
+                        "node-force-expire-{}-{}-{}",
+                        node_id, record.resource.resource_id, record.fence
+                    ),
+                    resource: record.resource,
+                    admin: admin.clone(),
+                    reason: format!("node {node_id} transitioned to non-owning lifecycle state"),
+                    now_nanos,
+                },
+                &self.partition_owner_signing_key,
+            )
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        }
+
+        let task_leases = task_lease::list_active_task_leases_for_node(
+            &self.storage,
+            node_id,
+            now_nanos,
+            &self.partition_owner_signing_key,
+        )
+        .await
+        .map_err(|err| crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string()))?;
+        for lease in task_leases {
+            task_lease::force_release_task_lease(
+                &self.storage,
+                lease.owner.tenant_id,
+                &lease.task_id,
+                &self.partition_owner_signing_key,
+            )
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        }
+        Ok(())
     }
 
     pub async fn list_node_descriptors(
@@ -5058,6 +5302,239 @@ mod tests {
             completion_err
                 .to_string()
                 .contains("do not have a valid read-only drain exception")
+        );
+    }
+
+    #[tokio::test]
+    async fn node_drain_completion_requires_no_runtime_ownership_and_force_offline_expires_it() {
+        let temp = tempdir().unwrap();
+        let mut config = test_config(temp.path());
+        config.public_api_addr = "admin-node".to_string();
+        let persistence = Persistence::new(&config, None).unwrap();
+        let now_nanos = current_time_nanos().unwrap();
+        let ttl_nanos = i64::try_from(MAX_OWNERSHIP_LEASE_MS)
+            .unwrap()
+            .saturating_mul(1_000_000);
+
+        let region = persistence
+            .create_region_descriptor(crate::mesh_lifecycle::CreateRegionDescriptor {
+                mesh_id: "default".to_string(),
+                region: "test-region".to_string(),
+                public_base_url: "https://test-region.anvil-storage.test".to_string(),
+                virtual_host_suffix: "test-region.anvil-storage.test".to_string(),
+                placement_weight: 100,
+                default_cell: Some("default".to_string()),
+            })
+            .await
+            .unwrap();
+        let cell = persistence
+            .register_cell_descriptor(crate::mesh_lifecycle::RegisterCellDescriptor {
+                mesh_id: "default".to_string(),
+                region: "test-region".to_string(),
+                cell_id: "default".to_string(),
+                placement_weight: 100,
+            })
+            .await
+            .unwrap();
+        persistence
+            .transition_cell_descriptor(
+                "test-region",
+                "default",
+                cell.generation,
+                crate::mesh_lifecycle::LifecycleState::Active,
+            )
+            .await
+            .unwrap();
+        persistence
+            .transition_region_descriptor(
+                "test-region",
+                region.generation,
+                crate::mesh_lifecycle::LifecycleState::Active,
+            )
+            .await
+            .unwrap();
+        let worker = persistence
+            .register_node_descriptor(crate::mesh_lifecycle::RegisterNodeDescriptor {
+                mesh_id: "default".to_string(),
+                node_id: "worker-node".to_string(),
+                region: "test-region".to_string(),
+                cell_id: "default".to_string(),
+                libp2p_peer_id: "peer-worker-node".to_string(),
+                public_api_addr: "worker-node".to_string(),
+                public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7444/quic-v1".to_string()],
+                capabilities: vec![crate::mesh_lifecycle::NodeCapability::Object],
+            })
+            .await
+            .unwrap();
+        let worker = persistence
+            .transition_node_descriptor(
+                "worker-node",
+                worker.generation,
+                crate::mesh_lifecycle::LifecycleState::Active,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let partition_owner = crate::partition_fence::acquire_partition_recovery(
+            &persistence.storage,
+            crate::partition_fence::PartitionRecoveryAcquire {
+                partition_family: "object_metadata".to_string(),
+                partition_id: hex::encode([8; 32]),
+                owner_node_id: "worker-node".to_string(),
+                recovered_through_sequence: 0,
+                recovered_manifest_hash: hex::encode([0; 32]),
+                now_nanos,
+            },
+            &persistence.partition_owner_signing_key,
+        )
+        .await
+        .unwrap();
+        let partition_owner = crate::partition_fence::publish_partition_ready(
+            &persistence.storage,
+            &partition_owner.partition_family,
+            &partition_owner.partition_id,
+            "worker-node",
+            partition_owner.fence_token,
+            1,
+            &hex::encode([1; 32]),
+            now_nanos.saturating_add(1),
+            &persistence.partition_owner_signing_key,
+        )
+        .await
+        .unwrap();
+        let stale_partition_permit = partition_owner.write_permit().unwrap();
+
+        crate::partition_fence::acquire_ownership(
+            &persistence.storage,
+            crate::partition_fence::AcquireOwnership {
+                request_id: "worker-control-acquire".to_string(),
+                idempotency_key: "worker-control-acquire".to_string(),
+                resource: crate::partition_fence::OwnershipResource {
+                    resource_kind: crate::partition_fence::OwnershipResourceKind::WatchPartition,
+                    resource_id: "watch/alpha".to_string(),
+                },
+                owner: crate::partition_fence::OwnershipPrincipal {
+                    tenant_id: 0,
+                    principal_kind: "node".to_string(),
+                    principal_id: "worker-node".to_string(),
+                    actor_instance_id: "worker-node".to_string(),
+                    display_name: "worker-node".to_string(),
+                    region: "test-region".to_string(),
+                    cell: "default".to_string(),
+                },
+                now_nanos,
+                ttl_nanos,
+            },
+            &persistence.partition_owner_signing_key,
+        )
+        .await
+        .unwrap();
+
+        let task_lease = crate::task_lease::acquire_task_lease(
+            &persistence.storage,
+            crate::task_lease::TaskLeaseAcquire {
+                task_id: "worker-task".to_string(),
+                task_kind: "index-build".to_string(),
+                partition_family: "index_partition".to_string(),
+                partition_id: hex::encode([9; 32]),
+                owner: crate::task_lease::TaskLeaseOwner::node("worker-node"),
+                source_cursor: 1,
+                now_nanos,
+                ttl_nanos,
+            },
+            &persistence.partition_owner_signing_key,
+        )
+        .await
+        .unwrap();
+
+        let draining = persistence
+            .transition_node_descriptor(
+                "worker-node",
+                worker.generation,
+                crate::mesh_lifecycle::LifecycleState::Draining,
+                Some(crate::mesh_lifecycle::NodeDrainDescriptor {
+                    started_at: "2026-07-02T00:00:00Z".to_string(),
+                    graceful_timeout_ms: 1000,
+                    force_after_timeout: false,
+                }),
+            )
+            .await
+            .unwrap();
+        let blockers = persistence
+            .node_runtime_ownership_blockers("worker-node")
+            .await
+            .unwrap();
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker.starts_with("partition_owner:object_metadata/"))
+        );
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker.starts_with("ownership_fence:watch_partition/watch/alpha"))
+        );
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker == "task_lease:index-build:worker-task:fence=1")
+        );
+
+        let drained = persistence
+            .transition_node_descriptor(
+                "worker-node",
+                draining.generation,
+                crate::mesh_lifecycle::LifecycleState::Drained,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(drained.to_string().contains("drain cannot complete"));
+
+        let offline = persistence
+            .transition_node_descriptor(
+                "worker-node",
+                draining.generation,
+                crate::mesh_lifecycle::LifecycleState::Offline,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            offline.state,
+            crate::mesh_lifecycle::LifecycleState::Offline
+        );
+        assert!(
+            persistence
+                .node_runtime_ownership_blockers("worker-node")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let stale_rejection = crate::partition_fence::validate_partition_write(
+            &persistence.storage,
+            &stale_partition_permit,
+            &persistence.partition_owner_signing_key,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            stale_rejection.code,
+            crate::error_codes::AnvilErrorCode::PartitionNotOwned
+        );
+        assert!(
+            crate::task_lease::checkpoint_task_lease(
+                &persistence.storage,
+                &task_lease.task_id,
+                &task_lease.owner,
+                task_lease.fence_token,
+                task_lease.source_cursor,
+                now_nanos.saturating_add(2),
+                &persistence.partition_owner_signing_key,
+            )
+            .await
+            .is_err()
         );
     }
 

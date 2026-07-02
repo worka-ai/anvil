@@ -628,6 +628,146 @@ pub async fn read_ownership_fence(
     read_ownership_fence_unlocked(storage, tenant_id, resource, signing_key).await
 }
 
+pub async fn list_partition_owners(
+    storage: &Storage,
+    signing_key: &[u8],
+) -> Result<Vec<PartitionOwnerState>> {
+    let root = storage.partition_owners_root_path();
+    let mut out = Vec::new();
+    let mut families = match tokio::fs::read_dir(&root).await {
+        Ok(families) => families,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(out),
+        Err(err) => return Err(err).with_context(|| format!("read {}", root.display())),
+    };
+    while let Some(family_entry) = families.next_entry().await? {
+        let file_type = family_entry.file_type().await?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let family = family_entry.file_name().to_string_lossy().into_owned();
+        if family.starts_with("ownership-") {
+            continue;
+        }
+        let mut files = tokio::fs::read_dir(family_entry.path()).await?;
+        while let Some(file_entry) = files.next_entry().await? {
+            if file_entry.path().extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(owner) = read_json_optional::<PartitionOwnerState>(&file_entry.path()).await?
+            else {
+                continue;
+            };
+            owner.verify(signing_key)?;
+            out.push(owner);
+        }
+    }
+    out.sort_by(|left, right| {
+        left.partition_family
+            .cmp(&right.partition_family)
+            .then(left.partition_id.cmp(&right.partition_id))
+    });
+    Ok(out)
+}
+
+pub async fn list_partition_owners_for_node(
+    storage: &Storage,
+    owner_node_id: &str,
+    signing_key: &[u8],
+) -> Result<Vec<PartitionOwnerState>> {
+    Ok(list_partition_owners(storage, signing_key)
+        .await?
+        .into_iter()
+        .filter(|owner| owner.owner_node_id == owner_node_id)
+        .collect())
+}
+
+pub async fn force_expire_partition_owner_for_node(
+    storage: &Storage,
+    partition_family: &str,
+    partition_id: &str,
+    owner_node_id: &str,
+    now_nanos: i64,
+    signing_key: &[u8],
+) -> Result<Option<PartitionOwnerState>> {
+    let Some(mut owner) =
+        read_partition_owner(storage, partition_family, partition_id, signing_key).await?
+    else {
+        return Ok(None);
+    };
+    if owner.owner_node_id != owner_node_id {
+        return Ok(None);
+    }
+    owner.owner_node_id = format!("expired-{owner_node_id}");
+    owner.fence_token = owner.fence_token.saturating_add(1);
+    owner.recovery_epoch = owner.recovery_epoch.saturating_add(1);
+    owner.status = PartitionOwnerStatus::Recovering;
+    owner.updated_at_nanos = now_nanos;
+    owner = owner.seal(signing_key)?;
+    write_partition_owner(storage, &owner).await?;
+    Ok(Some(owner))
+}
+
+pub async fn list_ownership_fences(
+    storage: &Storage,
+    signing_key: &[u8],
+) -> Result<Vec<OwnershipFenceRecord>> {
+    let root = storage.partition_owners_root_path();
+    let mut out = Vec::new();
+    let mut families = match tokio::fs::read_dir(&root).await {
+        Ok(families) => families,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(out),
+        Err(err) => return Err(err).with_context(|| format!("read {}", root.display())),
+    };
+    while let Some(family_entry) = families.next_entry().await? {
+        let file_type = family_entry.file_type().await?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let family = family_entry.file_name().to_string_lossy().into_owned();
+        if !family.starts_with("ownership-") {
+            continue;
+        }
+        let mut files = tokio::fs::read_dir(family_entry.path()).await?;
+        while let Some(file_entry) = files.next_entry().await? {
+            if file_entry.path().extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(record) =
+                read_json_optional::<OwnershipFenceRecord>(&file_entry.path()).await?
+            else {
+                continue;
+            };
+            record.verify(signing_key)?;
+            out.push(record);
+        }
+    }
+    out.sort_by(|left, right| {
+        left.resource
+            .resource_kind
+            .as_str()
+            .cmp(right.resource.resource_kind.as_str())
+            .then(left.resource.resource_id.cmp(&right.resource.resource_id))
+    });
+    Ok(out)
+}
+
+pub async fn list_active_ownership_fences_for_node(
+    storage: &Storage,
+    owner_node_id: &str,
+    now_nanos: i64,
+    signing_key: &[u8],
+) -> Result<Vec<OwnershipFenceRecord>> {
+    Ok(list_ownership_fences(storage, signing_key)
+        .await?
+        .into_iter()
+        .filter(|record| {
+            record.owner.principal_kind == "node"
+                && record.owner.actor_instance_id == owner_node_id
+                && record.is_active_unexpired(now_nanos)
+        })
+        .collect())
+}
+
 pub async fn acquire_partition_recovery(
     storage: &Storage,
     request: PartitionRecoveryAcquire,

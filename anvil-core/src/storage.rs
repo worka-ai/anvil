@@ -312,6 +312,20 @@ impl Storage {
             .join(format!("{partition_id}.json")))
     }
 
+    pub fn partition_owners_root_path(&self) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("control")
+            .join("partition-owners")
+    }
+
+    pub fn task_lease_root_path(&self) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("tasks")
+            .join("leases")
+    }
+
     pub fn model_metadata_journal_path(&self) -> PathBuf {
         self.storage_path
             .join("_anvil")
