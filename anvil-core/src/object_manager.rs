@@ -928,20 +928,19 @@ impl ObjectManager {
             .ok_or_else(|| Status::not_found("Object not found"))?,
         };
 
+        if let Some(inline_payload) = object.inline_payload.clone() {
+            let chunks = inline_payload
+                .chunks(1024 * 64)
+                .map(|chunk| Ok(chunk.to_vec()))
+                .collect::<Vec<Result<Vec<u8>, Status>>>();
+            return Ok((object, Box::pin(futures_util::stream::iter(chunks))));
+        }
+
         let (tx, rx) = mpsc::channel(4);
         let app_state = self.clone();
         let object_clone = object.clone();
 
         tokio::spawn(async move {
-            if let Some(inline_payload) = object_clone.inline_payload.clone() {
-                for chunk in inline_payload.chunks(1024 * 64) {
-                    if tx.send(Ok(chunk.to_vec())).await.is_err() {
-                        break;
-                    }
-                }
-                return;
-            }
-
             if let Some(manifest) = object_clone
                 .shard_map
                 .as_ref()

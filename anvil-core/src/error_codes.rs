@@ -24,10 +24,15 @@ pub enum AnvilErrorCode {
     PersonalDbSnapshotInvalid,
     PayloadHashMismatch,
     UnsupportedFormatVersion,
+    LeaseHeld,
+    LeaseExpired,
+    StaleFence,
+    LeaseOwnerMismatch,
+    LeaseCasConflict,
 }
 
 impl AnvilErrorCode {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 29] = [
         Self::Unauthorized,
         Self::UnauthorizedReservedNamespace,
         Self::ForbiddenByPolicy,
@@ -52,6 +57,11 @@ impl AnvilErrorCode {
         Self::PersonalDbSnapshotInvalid,
         Self::PayloadHashMismatch,
         Self::UnsupportedFormatVersion,
+        Self::LeaseHeld,
+        Self::LeaseExpired,
+        Self::StaleFence,
+        Self::LeaseOwnerMismatch,
+        Self::LeaseCasConflict,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -82,6 +92,11 @@ impl AnvilErrorCode {
             Self::PersonalDbSnapshotInvalid => "PersonalDbSnapshotInvalid",
             Self::PayloadHashMismatch => "PayloadHashMismatch",
             Self::UnsupportedFormatVersion => "UnsupportedFormatVersion",
+            Self::LeaseHeld => "LeaseHeld",
+            Self::LeaseExpired => "LeaseExpired",
+            Self::StaleFence => "StaleFence",
+            Self::LeaseOwnerMismatch => "LeaseOwnerMismatch",
+            Self::LeaseCasConflict => "LeaseCasConflict",
         }
     }
 }
@@ -141,6 +156,11 @@ mod tests {
                 "PersonalDbSnapshotInvalid",
                 "PayloadHashMismatch",
                 "UnsupportedFormatVersion",
+                "LeaseHeld",
+                "LeaseExpired",
+                "StaleFence",
+                "LeaseOwnerMismatch",
+                "LeaseCasConflict",
             ]
         );
     }

@@ -13,6 +13,8 @@ pub struct Claims {
     pub exp: usize,  // Expiration time
     pub scopes: Vec<String>,
     pub tenant_id: i64,
+    #[serde(default)]
+    pub jti: Option<String>,
 }
 
 #[derive(Debug)]
@@ -41,6 +43,7 @@ impl JwtManager {
             exp: expiration as usize,
             scopes,
             tenant_id,
+            jti: Some(uuid::Uuid::new_v4().to_string()),
         };
 
         encode(
@@ -170,6 +173,8 @@ fn action_covers_required(token_action: &AnvilAction, required_action: &AnvilAct
                 | AnvilAction::AuthzTupleRead
                 | AnvilAction::AuthzCheck
                 | AnvilAction::AuthzWatch
+                | AnvilAction::AuthzSchemaRead
+                | AnvilAction::AuthzSchemaWrite
         ),
         AnvilAction::IndexAll => matches!(
             required_action,
@@ -196,6 +201,12 @@ fn action_covers_required(token_action: &AnvilAction, required_action: &AnvilAct
         AnvilAction::RepairAll => matches!(
             required_action,
             AnvilAction::RepairRead | AnvilAction::RepairRun
+        ),
+        AnvilAction::CoordinationAll => matches!(
+            required_action,
+            AnvilAction::CoordinationLeaseRead
+                | AnvilAction::CoordinationLeaseWrite
+                | AnvilAction::CoordinationLeaseAdmin
         ),
         _ => token_action == required_action, // Exact match for specific actions
     }
@@ -352,6 +363,26 @@ mod tests {
         assert!(!is_authorized(
             AnvilAction::IndexUpdate,
             "tenant-1-bucket-7/body",
+            &token_scopes
+        ));
+    }
+
+    #[test]
+    fn coordination_wildcard_covers_lease_actions() {
+        let token_scopes = vec!["coordination:*|task_lease/posthorn-*".to_string()];
+        assert!(is_authorized(
+            AnvilAction::CoordinationLeaseRead,
+            "task_lease/posthorn-delivery-alpha",
+            &token_scopes
+        ));
+        assert!(is_authorized(
+            AnvilAction::CoordinationLeaseWrite,
+            "task_lease/posthorn-delivery-alpha",
+            &token_scopes
+        ));
+        assert!(!is_authorized(
+            AnvilAction::AuthzTupleWrite,
+            "task_lease/posthorn-delivery-alpha",
             &token_scopes
         ));
     }

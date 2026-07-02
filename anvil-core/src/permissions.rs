@@ -10,16 +10,17 @@ pub enum AnvilAction {
     All, // Matches *:*
 
     // Wildcard actions
-    BucketAll,      // Matches bucket:*
-    ObjectAll,      // Matches object:*
-    HfKeyAll,       // Matches hf_key:*
-    HfIngestionAll, // Matches hf_ingestion:*
-    PolicyAll,      // Matches policy:*
-    AuthzAll,       // Matches authz:*
-    IndexAll,       // Matches index:*
-    PersonalDbAll,  // Matches personaldb:*
-    GitSourceAll,   // Matches git_source:*
-    RepairAll,      // Matches repair:*
+    BucketAll,       // Matches bucket:*
+    ObjectAll,       // Matches object:*
+    HfKeyAll,        // Matches hf_key:*
+    HfIngestionAll,  // Matches hf_ingestion:*
+    PolicyAll,       // Matches policy:*
+    AuthzAll,        // Matches authz:*
+    IndexAll,        // Matches index:*
+    PersonalDbAll,   // Matches personaldb:*
+    GitSourceAll,    // Matches git_source:*
+    RepairAll,       // Matches repair:*
+    CoordinationAll, // Matches coordination:*
 
     // Bucket actions
     BucketCreate,
@@ -55,6 +56,8 @@ pub enum AnvilAction {
     AuthzTupleRead,
     AuthzCheck,
     AuthzWatch,
+    AuthzSchemaRead,
+    AuthzSchemaWrite,
 
     // Index actions
     IndexCreate,
@@ -81,6 +84,11 @@ pub enum AnvilAction {
     RepairRead,
     RepairRun,
 
+    // Coordination actions
+    CoordinationLeaseRead,
+    CoordinationLeaseWrite,
+    CoordinationLeaseAdmin,
+
     // Internal actions
     InternalPutShard,
     InternalGetShard,
@@ -104,6 +112,7 @@ impl fmt::Display for AnvilAction {
             AnvilAction::PersonalDbAll => "personaldb:*",
             AnvilAction::GitSourceAll => "git_source:*",
             AnvilAction::RepairAll => "repair:*",
+            AnvilAction::CoordinationAll => "coordination:*",
 
             // Bucket actions
             AnvilAction::BucketCreate => "bucket:create",
@@ -139,6 +148,8 @@ impl fmt::Display for AnvilAction {
             AnvilAction::AuthzTupleRead => "authz:tuple_read",
             AnvilAction::AuthzCheck => "authz:check",
             AnvilAction::AuthzWatch => "authz:watch",
+            AnvilAction::AuthzSchemaRead => "authz:schema_read",
+            AnvilAction::AuthzSchemaWrite => "authz:schema_write",
 
             // Index actions
             AnvilAction::IndexCreate => "index:create",
@@ -164,6 +175,11 @@ impl fmt::Display for AnvilAction {
             // Repair actions
             AnvilAction::RepairRead => "repair:read",
             AnvilAction::RepairRun => "repair:run",
+
+            // Coordination actions
+            AnvilAction::CoordinationLeaseRead => "coordination:lease_read",
+            AnvilAction::CoordinationLeaseWrite => "coordination:lease_write",
+            AnvilAction::CoordinationLeaseAdmin => "coordination:lease_admin",
 
             // Internal actions
             AnvilAction::InternalPutShard => "internal:put_shard",
@@ -193,6 +209,7 @@ impl FromStr for AnvilAction {
             "personaldb:*" => Ok(AnvilAction::PersonalDbAll),
             "git_source:*" => Ok(AnvilAction::GitSourceAll),
             "repair:*" => Ok(AnvilAction::RepairAll),
+            "coordination:*" => Ok(AnvilAction::CoordinationAll),
 
             // Bucket actions
             "bucket:create" => Ok(AnvilAction::BucketCreate),
@@ -228,6 +245,8 @@ impl FromStr for AnvilAction {
             "authz:tuple_read" => Ok(AnvilAction::AuthzTupleRead),
             "authz:check" => Ok(AnvilAction::AuthzCheck),
             "authz:watch" => Ok(AnvilAction::AuthzWatch),
+            "authz:schema_read" => Ok(AnvilAction::AuthzSchemaRead),
+            "authz:schema_write" => Ok(AnvilAction::AuthzSchemaWrite),
 
             // Index actions
             "index:create" => Ok(AnvilAction::IndexCreate),
@@ -253,6 +272,11 @@ impl FromStr for AnvilAction {
             // Repair actions
             "repair:read" => Ok(AnvilAction::RepairRead),
             "repair:run" => Ok(AnvilAction::RepairRun),
+
+            // Coordination actions
+            "coordination:lease_read" => Ok(AnvilAction::CoordinationLeaseRead),
+            "coordination:lease_write" => Ok(AnvilAction::CoordinationLeaseWrite),
+            "coordination:lease_admin" => Ok(AnvilAction::CoordinationLeaseAdmin),
 
             // Internal actions
             "internal:put_shard" => Ok(AnvilAction::InternalPutShard),
@@ -290,6 +314,8 @@ mod tests {
             AnvilAction::HfIngestionCreate,
             AnvilAction::PolicyGrant,
             AnvilAction::AuthzCheck,
+            AnvilAction::AuthzSchemaRead,
+            AnvilAction::AuthzSchemaWrite,
             AnvilAction::IndexCreate,
             AnvilAction::IndexWatch,
             AnvilAction::PersonalDbCreate,
@@ -301,6 +327,10 @@ mod tests {
             AnvilAction::GitSourceWatch,
             AnvilAction::RepairRead,
             AnvilAction::RepairRun,
+            AnvilAction::CoordinationAll,
+            AnvilAction::CoordinationLeaseRead,
+            AnvilAction::CoordinationLeaseWrite,
+            AnvilAction::CoordinationLeaseAdmin,
             AnvilAction::InternalPutShard,
             AnvilAction::InternalDeleteShard,
         ];

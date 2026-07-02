@@ -161,6 +161,7 @@ mod tests {
             exp: usize::MAX,
             scopes: vec!["*|*".to_string()],
             tenant_id,
+            jti: None,
         }
     }
 

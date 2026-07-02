@@ -309,6 +309,8 @@ pub struct ManifestCasResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthzTupleRecord {
     pub revision: i64,
+    #[serde(default)]
+    pub revision_ordinal: u32,
     pub tenant_id: i64,
     pub namespace: String,
     pub object_id: String,
@@ -322,6 +324,18 @@ pub struct AuthzTupleRecord {
     pub mutation_id: uuid::Uuid,
     pub record_hash: String,
     pub written_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthzTupleBatchMutation {
+    pub namespace: String,
+    pub object_id: String,
+    pub relation: String,
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub caveat_hash: String,
+    pub operation: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2057,6 +2071,37 @@ impl Persistence {
         .await
     }
 
+    pub async fn write_authz_tuple_batch(
+        &self,
+        tenant_id: i64,
+        mutations: Vec<AuthzTupleBatchMutation>,
+        written_by: &str,
+    ) -> Result<Vec<AuthzTupleRecord>> {
+        let permit = self.authz_write_permit(tenant_id).await?;
+        let writes = mutations
+            .iter()
+            .map(|mutation| authz_journal::AuthzTupleWrite {
+                tenant_id,
+                namespace: mutation.namespace.as_str(),
+                object_id: mutation.object_id.as_str(),
+                relation: mutation.relation.as_str(),
+                subject_kind: mutation.subject_kind.as_str(),
+                subject_id: mutation.subject_id.as_str(),
+                caveat_hash: mutation.caveat_hash.as_str(),
+                operation: mutation.operation.as_str(),
+                written_by,
+                reason: mutation.reason.as_str(),
+            })
+            .collect();
+        authz_journal::write_authz_tuple_batch_with_permit(
+            &self.storage,
+            writes,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
     pub async fn check_authz_tuple(
         &self,
         tenant_id: i64,
@@ -2814,7 +2859,7 @@ impl Persistence {
                 task_kind: task.task_type.as_str().to_string(),
                 partition_family: target.partition_family,
                 partition_id: target.partition_id,
-                owner_node_id: self.owner_node_id.clone(),
+                owner: task_lease::TaskLeaseOwner::node(self.owner_node_id.clone()),
                 source_cursor: target.source_cursor,
                 now_nanos,
                 ttl_nanos,
@@ -2832,10 +2877,84 @@ impl Persistence {
         task_lease::checkpoint_task_lease(
             &self.storage,
             &lease.task_id,
-            &self.owner_node_id,
+            &task_lease::TaskLeaseOwner::node(self.owner_node_id.clone()),
             lease.fence_token,
             checkpoint_cursor,
             current_time_nanos()?,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub async fn acquire_named_task_lease(
+        &self,
+        request: task_lease::TaskLeaseAcquire,
+    ) -> Result<task_lease::TaskLease> {
+        task_lease::acquire_task_lease(&self.storage, request, &self.partition_owner_signing_key)
+            .await
+    }
+
+    pub async fn checkpoint_named_task_lease(
+        &self,
+        task_id: &str,
+        owner: &task_lease::TaskLeaseOwner,
+        fence_token: u64,
+        checkpoint_cursor: u128,
+    ) -> Result<task_lease::TaskLease> {
+        task_lease::checkpoint_task_lease(
+            &self.storage,
+            task_id,
+            owner,
+            fence_token,
+            checkpoint_cursor,
+            current_time_nanos()?,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub async fn commit_named_task_lease(
+        &self,
+        task_id: &str,
+        owner: &task_lease::TaskLeaseOwner,
+        fence_token: u64,
+        committed_cursor: u128,
+    ) -> Result<task_lease::TaskLease> {
+        task_lease::commit_task_lease(
+            &self.storage,
+            task_id,
+            owner,
+            fence_token,
+            committed_cursor,
+            current_time_nanos()?,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub async fn read_named_task_lease(
+        &self,
+        tenant_id: i64,
+        task_id: &str,
+    ) -> Result<Option<task_lease::TaskLease>> {
+        task_lease::read_task_lease(
+            &self.storage,
+            tenant_id,
+            task_id,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub async fn force_release_named_task_lease(
+        &self,
+        tenant_id: i64,
+        task_id: &str,
+    ) -> Result<Option<task_lease::TaskLease>> {
+        task_lease::force_release_task_lease(
+            &self.storage,
+            tenant_id,
+            task_id,
             &self.partition_owner_signing_key,
         )
         .await
@@ -2847,6 +2966,7 @@ impl Persistence {
     ) -> Result<Option<task_lease::TaskLease>> {
         task_lease::read_task_lease(
             &self.storage,
+            0,
             &task_lease_id(task_id)?,
             &self.partition_owner_signing_key,
         )
@@ -3863,7 +3983,7 @@ mod tests {
             .acquire_task_execution_lease(&task)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("owned by another active node"));
+        assert!(err.to_string().contains(task_lease::LEASE_HELD));
 
         let checkpointed = persistence
             .checkpoint_task_execution_lease(&lease, lease.source_cursor)

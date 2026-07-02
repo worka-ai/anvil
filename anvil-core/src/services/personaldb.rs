@@ -1501,6 +1501,7 @@ async fn authorize_personaldb_row_effects(
                 exp: 0,
                 scopes: actor.scopes.clone(),
                 tenant_id: actor.tenant_id,
+                jti: None,
             };
             if !access_control::scope_or_relationship_allows(
                 storage,
@@ -1837,6 +1838,7 @@ async fn personaldb_actor_access_allowed(
         exp: 0,
         scopes: actor.scopes.clone(),
         tenant_id: actor.tenant_id,
+        jti: None,
     };
     personaldb_access_allowed(storage, &claims, database_id, action, relation).await
 }

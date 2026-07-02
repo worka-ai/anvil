@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod bucket;
+pub mod coordination;
 pub mod git_source;
 pub mod huggingface;
 pub mod index;
@@ -11,6 +12,7 @@ pub(crate) mod watch_envelope;
 
 use crate::anvil_api::{
     auth_service_server::AuthServiceServer, bucket_service_server::BucketServiceServer,
+    coordination_service_server::CoordinationServiceServer,
     git_source_service_server::GitSourceServiceServer,
     hf_ingestion_service_server::HfIngestionServiceServer,
     hugging_face_key_service_server::HuggingFaceKeyServiceServer,
@@ -59,6 +61,10 @@ pub fn create_grpc_router(state: AppState, auth_interceptor: AuthInterceptorFn) 
         auth_closure.clone(),
     ))
     .add_service(BucketServiceServer::with_interceptor(
+        state.clone(),
+        auth_closure.clone(),
+    ))
+    .add_service(CoordinationServiceServer::with_interceptor(
         state.clone(),
         auth_closure.clone(),
     ))

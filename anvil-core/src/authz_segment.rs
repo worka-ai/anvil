@@ -202,10 +202,15 @@ fn authz_record_from_segment_record(record: SegmentRecord) -> Result<AuthzTupleR
     let revision_end = revision_start
         .checked_add(8)
         .ok_or_else(|| anyhow!("authz tuple segment key revision overflow"))?;
-    if record.key.len() != revision_end {
+    if record.key.len() != revision_end && record.key.len() != revision_end + 4 {
         return Err(anyhow!("authz tuple segment key has trailing bytes"));
     }
     let key_revision = u64::from_le_bytes(record.key[revision_start..revision_end].try_into()?);
+    let revision_ordinal = if record.key.len() == revision_end + 4 {
+        u32::from_le_bytes(record.key[revision_end..revision_end + 4].try_into()?)
+    } else {
+        0
+    };
     let (value, value_used) = TupleValue::decode(&record.value)?;
     if value_used != record.value.len() {
         return Err(anyhow!("authz tuple segment value has trailing bytes"));
@@ -217,6 +222,7 @@ fn authz_record_from_segment_record(record: SegmentRecord) -> Result<AuthzTupleR
     }
     Ok(AuthzTupleRecord {
         revision: i64::try_from(value.revision).context("authz revision exceeds i64")?,
+        revision_ordinal,
         tenant_id: 0,
         namespace: String::from_utf8(key.namespace)?,
         object_id: String::from_utf8(key.object_id)?,
@@ -244,6 +250,7 @@ fn segment_key(record: &AuthzTupleRecord) -> Result<Vec<u8>> {
     };
     let mut encoded = key.encode();
     encoded.extend_from_slice(&u64::try_from(record.revision)?.to_le_bytes());
+    encoded.extend_from_slice(&record.revision_ordinal.to_le_bytes());
     Ok(encoded)
 }
 
@@ -350,6 +357,7 @@ mod tests {
     fn record(revision: i64, operation: &str) -> AuthzTupleRecord {
         AuthzTupleRecord {
             revision,
+            revision_ordinal: 0,
             tenant_id: 7,
             namespace: "document".to_string(),
             object_id: "alpha".to_string(),
