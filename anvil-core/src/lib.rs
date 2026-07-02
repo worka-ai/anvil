@@ -48,6 +48,7 @@ pub mod index_partition_watch;
 pub mod index_repair;
 pub mod manifest_journal;
 pub mod media_extraction;
+pub mod mesh_directory;
 pub mod mesh_lifecycle;
 pub mod metadata_journal;
 pub mod middleware;
