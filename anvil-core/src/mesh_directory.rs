@@ -1,8 +1,12 @@
+use crate::storage::Storage;
 use crate::validation;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::fmt;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 
 pub const MESH_DIRECTORY_ROOT: &str = "_anvil/control/v1/mesh";
 pub const TENANT_NAME_SCHEMA: &str = "anvil.mesh.tenant_name.v1";
@@ -13,7 +17,7 @@ const TENANT_NAME_PARTITION_DOMAIN: &str = "tenant-name";
 const TENANT_LOCATOR_PARTITION_DOMAIN: &str = "tenant-locator";
 const BUCKET_LOCATOR_PARTITION_DOMAIN: &str = "bucket-locator";
 
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[derive(Debug, Error)]
 pub enum MeshDirectoryError {
     #[error("invalid tenant name: {0}")]
     InvalidTenantName(String),
@@ -26,9 +30,48 @@ pub enum MeshDirectoryError {
         tenant_id: String,
         bucket_name: String,
     },
+    #[error("mesh directory record not found: {0}")]
+    NotFound(String),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
 }
 
 pub type MeshDirectoryResult<T> = Result<T, MeshDirectoryError>;
+
+impl PartialEq for MeshDirectoryError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::InvalidTenantName(a), Self::InvalidTenantName(b)) => a == b,
+            (Self::InvalidBucketName(a), Self::InvalidBucketName(b)) => a == b,
+            (
+                Self::InvalidIdentifier {
+                    field: field_a,
+                    value: value_a,
+                },
+                Self::InvalidIdentifier {
+                    field: field_b,
+                    value: value_b,
+                },
+            ) => field_a == field_b && value_a == value_b,
+            (
+                Self::DuplicateBucketLocator {
+                    tenant_id: tenant_a,
+                    bucket_name: bucket_a,
+                },
+                Self::DuplicateBucketLocator {
+                    tenant_id: tenant_b,
+                    bucket_name: bucket_b,
+                },
+            ) => tenant_a == tenant_b && bucket_a == bucket_b,
+            (Self::NotFound(a), Self::NotFound(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for MeshDirectoryError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -276,6 +319,28 @@ pub struct TenantNameDescriptor {
 }
 
 impl TenantNameDescriptor {
+    pub fn active(
+        mesh_id: MeshId,
+        tenant_name: TenantName,
+        tenant_id: TenantId,
+        now: impl Into<String>,
+    ) -> MeshDirectoryResult<Self> {
+        let now = now.into();
+        require_nonempty(&now, "timestamp")?;
+        Ok(Self {
+            schema: TENANT_NAME_SCHEMA.to_string(),
+            mesh_id,
+            tenant_name,
+            tenant_id,
+            status: TenantNameStatus::Active,
+            idempotency_key: None,
+            reservation_expires_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+            generation: 1,
+        })
+    }
+
     pub fn descriptor_key(&self) -> String {
         self.tenant_name.descriptor_key()
     }
@@ -304,6 +369,29 @@ pub struct TenantLocatorDescriptor {
 }
 
 impl TenantLocatorDescriptor {
+    pub fn active(
+        mesh_id: MeshId,
+        tenant_id: TenantId,
+        tenant_name: TenantName,
+        home_region: RegionName,
+        now: impl Into<String>,
+    ) -> MeshDirectoryResult<Self> {
+        let now = now.into();
+        require_nonempty(&now, "timestamp")?;
+        Ok(Self {
+            schema: TENANT_LOCATOR_SCHEMA.to_string(),
+            mesh_id,
+            tenant_id,
+            tenant_name,
+            home_region,
+            status: TenantLocatorStatus::Active,
+            profile_revision: 1,
+            created_at: now.clone(),
+            updated_at: now,
+            generation: 1,
+        })
+    }
+
     pub fn descriptor_key(&self) -> String {
         self.tenant_id.descriptor_key()
     }
@@ -456,6 +544,99 @@ pub fn stable_partition_prefix(canonical_key: &[u8]) -> String {
     let digest = blake3::hash(canonical_key);
     let bytes = digest.as_bytes();
     format!("{:02x}{:02x}", bytes[0], bytes[1])
+}
+
+pub async fn write_tenant_records(
+    storage: &Storage,
+    tenant_name: &TenantNameDescriptor,
+    tenant_locator: &TenantLocatorDescriptor,
+) -> MeshDirectoryResult<()> {
+    write_descriptor(storage, &tenant_name.descriptor_key(), tenant_name).await?;
+    write_descriptor(storage, &tenant_locator.descriptor_key(), tenant_locator).await?;
+    Ok(())
+}
+
+pub async fn write_bucket_locator(
+    storage: &Storage,
+    locator: &BucketLocatorDescriptor,
+) -> MeshDirectoryResult<()> {
+    write_descriptor(storage, &locator.descriptor_key(), locator).await
+}
+
+pub async fn read_tenant_name_descriptor(
+    storage: &Storage,
+    tenant_name: &TenantName,
+) -> MeshDirectoryResult<Option<TenantNameDescriptor>> {
+    read_optional_descriptor(storage, &tenant_name.descriptor_key()).await
+}
+
+pub async fn read_tenant_locator_descriptor(
+    storage: &Storage,
+    tenant_id: &TenantId,
+) -> MeshDirectoryResult<Option<TenantLocatorDescriptor>> {
+    read_optional_descriptor(storage, &tenant_id.descriptor_key()).await
+}
+
+pub async fn read_bucket_locator(
+    storage: &Storage,
+    key: &BucketLocatorKey,
+) -> MeshDirectoryResult<Option<BucketLocatorDescriptor>> {
+    read_optional_descriptor(storage, &key.descriptor_key()).await
+}
+
+async fn write_descriptor<T: Serialize>(
+    storage: &Storage,
+    descriptor_key: &str,
+    descriptor: &T,
+) -> MeshDirectoryResult<()> {
+    let path = descriptor_path(storage, descriptor_key)?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp_path = path.with_extension(format!("json.tmp-{}", uuid::Uuid::new_v4()));
+    let mut file = tokio::fs::File::create(&tmp_path).await?;
+    let bytes = serde_json::to_vec_pretty(descriptor)?;
+    file.write_all(&bytes).await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(tmp_path, path).await?;
+    Ok(())
+}
+
+async fn read_optional_descriptor<T: for<'de> Deserialize<'de>>(
+    storage: &Storage,
+    descriptor_key: &str,
+) -> MeshDirectoryResult<Option<T>> {
+    let path = descriptor_path(storage, descriptor_key)?;
+    match tokio::fs::read(path).await {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn descriptor_path(storage: &Storage, descriptor_key: &str) -> MeshDirectoryResult<PathBuf> {
+    let relative = descriptor_key
+        .strip_prefix(MESH_DIRECTORY_ROOT)
+        .and_then(|value| value.strip_prefix('/'))
+        .ok_or_else(|| MeshDirectoryError::InvalidIdentifier {
+            field: "descriptor key",
+            value: descriptor_key.to_string(),
+        })?;
+    if relative
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(MeshDirectoryError::InvalidIdentifier {
+            field: "descriptor key",
+            value: descriptor_key.to_string(),
+        });
+    }
+    Ok(relative
+        .split('/')
+        .fold(storage.mesh_directory_root_path(), |path, segment| {
+            path.join(Path::new(segment))
+        }))
 }
 
 fn partition_key_bytes(domain: &str, components: &[&str]) -> Vec<u8> {

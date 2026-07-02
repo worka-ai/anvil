@@ -91,6 +91,14 @@ impl Storage {
             .join("mesh-lifecycle.json")
     }
 
+    pub fn mesh_directory_root_path(&self) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("control")
+            .join("v1")
+            .join("mesh")
+    }
+
     pub fn metadata_journal_path(&self, tenant_id: i64, bucket_id: i64) -> PathBuf {
         self.storage_path
             .join("_anvil")

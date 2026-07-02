@@ -12,7 +12,7 @@ use crate::{
     cluster::MetadataEvent,
     config::Config,
     control_journal, directory_repair, hf_journal, index_builder, index_diagnostic_journal,
-    index_journal, index_repair, manifest_journal, metadata_journal, model_journal,
+    index_journal, index_repair, manifest_journal, mesh_directory, metadata_journal, model_journal,
     multipart_journal, object_links,
     partition_fence::{
         PartitionOwnerStatus, PartitionRecoveryAcquire, PartitionWritePermit,
@@ -28,6 +28,9 @@ pub struct Persistence {
     storage: Storage,
     cache: MetadataCache,
     event_publisher: Option<Sender<MetadataEvent>>,
+    mesh_id: String,
+    region: String,
+    cell_id: String,
     owner_node_id: String,
     partition_owner_signing_key: Vec<u8>,
     personaldb_signing_key: Vec<u8>,
@@ -525,6 +528,9 @@ impl Persistence {
             storage: Storage::new_at_sync(&config.storage_path)?,
             cache: MetadataCache::new(config),
             event_publisher,
+            mesh_id: nonempty_or(&config.mesh_id, "default"),
+            region: nonempty_or(&config.region, "default"),
+            cell_id: nonempty_or(&config.cell_id, "default"),
             owner_node_id: persistence_owner_node_id(config),
             partition_owner_signing_key: hex::decode(&config.anvil_secret_encryption_key)?,
             personaldb_signing_key: config.anvil_secret_encryption_key.as_bytes().to_vec(),
@@ -544,6 +550,74 @@ impl Persistence {
         if let Some(sender) = &self.event_publisher {
             let _ = sender.send(event).await;
         }
+    }
+
+    async fn write_mesh_tenant_locators(&self, tenant: &Tenant) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mesh_id = mesh_directory::MeshId::new(self.mesh_id.clone())?;
+        let tenant_id = mesh_directory::TenantId::new(tenant.id.to_string())?;
+        let tenant_name = mesh_directory::TenantName::canonicalize(&tenant.name)?;
+        let home_region = mesh_directory::RegionName::new(self.region.clone())?;
+        let name_descriptor = mesh_directory::TenantNameDescriptor::active(
+            mesh_id.clone(),
+            tenant_name.clone(),
+            tenant_id.clone(),
+            now.clone(),
+        )?;
+        let locator_descriptor = mesh_directory::TenantLocatorDescriptor::active(
+            mesh_id,
+            tenant_id,
+            tenant_name,
+            home_region,
+            now,
+        )?;
+        mesh_directory::write_tenant_records(&self.storage, &name_descriptor, &locator_descriptor)
+            .await?;
+        Ok(())
+    }
+
+    async fn write_mesh_bucket_locator(&self, bucket: &Bucket) -> Result<()> {
+        let now = bucket.created_at.to_rfc3339();
+        let mesh_id = mesh_directory::MeshId::new(self.mesh_id.clone())?;
+        let tenant_id = mesh_directory::TenantId::new(bucket.tenant_id.to_string())?;
+        let bucket_name = mesh_directory::BucketName::canonicalize(&bucket.name)?;
+        let bucket_id = mesh_directory::BucketId::new(bucket.id.to_string())?;
+        let home_region = mesh_directory::RegionName::new(bucket.region.clone())?;
+        let home_cell = mesh_directory::CellId::new(self.cell_id.clone())?;
+        let object_prefix = format!("objects/{tenant_id}/{bucket_name}/");
+        let locator = mesh_directory::BucketLocatorDescriptor::active(
+            mesh_id,
+            tenant_id,
+            bucket_name,
+            bucket_id,
+            home_region,
+            home_cell,
+            "regional-primary",
+            object_prefix,
+            now,
+        )?;
+        mesh_directory::write_bucket_locator(&self.storage, &locator).await?;
+        Ok(())
+    }
+
+    pub async fn get_mesh_tenant_name_locator(
+        &self,
+        tenant_name: &str,
+    ) -> Result<Option<mesh_directory::TenantNameDescriptor>> {
+        let tenant_name = mesh_directory::TenantName::canonicalize(tenant_name)?;
+        Ok(mesh_directory::read_tenant_name_descriptor(&self.storage, &tenant_name).await?)
+    }
+
+    pub async fn get_mesh_bucket_locator(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+    ) -> Result<Option<mesh_directory::BucketLocatorDescriptor>> {
+        let key = mesh_directory::BucketLocatorKey::new(
+            mesh_directory::TenantId::new(tenant_id.to_string())?,
+            mesh_directory::BucketName::canonicalize(bucket_name)?,
+        );
+        Ok(mesh_directory::read_bucket_locator(&self.storage, &key).await?)
     }
 
     pub fn cache(&self) -> &MetadataCache {
@@ -1138,13 +1212,15 @@ impl Persistence {
 
     pub async fn create_tenant(&self, name: &str, _api_key: &str) -> Result<Tenant> {
         let permit = self.control_write_permit().await?;
-        control_journal::create_tenant_with_permit(
+        let tenant = control_journal::create_tenant_with_permit(
             &self.storage,
             name,
             &permit,
             &self.partition_owner_signing_key,
         )
-        .await
+        .await?;
+        self.write_mesh_tenant_locators(&tenant).await?;
+        Ok(tenant)
     }
 
     pub async fn create_app(
@@ -1266,6 +1342,9 @@ impl Persistence {
         )
         .await
         .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        self.write_mesh_bucket_locator(&bucket)
+            .await
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
         self.cache
             .insert_bucket(tenant_id, name.to_string(), bucket.clone())
             .await;
@@ -3848,6 +3927,15 @@ fn persistence_owner_node_id(config: &Config) -> String {
     "local-anvil-node".to_string()
 }
 
+fn nonempty_or(value: &str, fallback: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        fallback.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 fn current_time_nanos() -> Result<i64> {
     Utc::now()
         .timestamp_nanos_opt()
@@ -3933,6 +4021,47 @@ mod tests {
         }
         assert!(!frames.is_empty());
         assert!(frames.iter().all(|frame| frame.fence_token == header_fence));
+    }
+
+    #[tokio::test]
+    async fn tenant_and_bucket_creation_materialise_mesh_directory_locators() {
+        let temp = tempdir().unwrap();
+        let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+
+        let tenant = persistence
+            .create_tenant("tenant-a", "unused")
+            .await
+            .unwrap();
+        let bucket = persistence
+            .create_bucket(tenant.id, "docs", "eu-west-1")
+            .await
+            .unwrap();
+
+        let tenant_name = persistence
+            .get_mesh_tenant_name_locator("tenant-a")
+            .await
+            .unwrap()
+            .expect("tenant-name locator");
+        assert_eq!(tenant_name.tenant_id.as_str(), tenant.id.to_string());
+        assert_eq!(tenant_name.status, mesh_directory::TenantNameStatus::Active);
+
+        let bucket_locator = persistence
+            .get_mesh_bucket_locator(tenant.id, "docs")
+            .await
+            .unwrap()
+            .expect("bucket locator");
+        assert_eq!(bucket_locator.tenant_id.as_str(), tenant.id.to_string());
+        assert_eq!(bucket_locator.bucket_name.as_str(), "docs");
+        assert_eq!(bucket_locator.bucket_id.as_str(), bucket.id.to_string());
+        assert_eq!(bucket_locator.home_region.as_str(), "eu-west-1");
+        assert_eq!(
+            bucket_locator.descriptor_key(),
+            format!(
+                "_anvil/control/v1/mesh/buckets/{}/{}/docs.json",
+                bucket_locator.partition(),
+                tenant.id
+            )
+        );
     }
 
     #[tokio::test]
