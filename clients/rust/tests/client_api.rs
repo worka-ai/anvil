@@ -43,6 +43,23 @@ fn generated_proto_exports_core_service_types() {
         region: "eu-west-1".to_string(),
     };
     assert_eq!(request.bucket_name, "documents");
+
+    let scope = proto::AuthzScope {
+        anvil_storage_tenant_id: "storage".to_string(),
+        authz_realm_id: "realm".to_string(),
+    };
+    let schema_ref = proto::AuthzSchemaRef {
+        schema_id: "default".to_string(),
+        schema_revision: 1,
+        schema_digest: "digest".to_string(),
+    };
+    let bind = proto::BindAuthzSchemaRequest {
+        scope: Some(scope),
+        schema_ref: Some(schema_ref),
+        expected_binding_generation: Some(1),
+        reason: "test".to_string(),
+    };
+    assert_eq!(bind.expected_binding_generation, Some(1));
 }
 
 #[test]

@@ -13,6 +13,7 @@ pub mod auth;
 pub mod authz_derived_lag_watch;
 pub mod authz_journal;
 pub mod authz_namespace_watch;
+pub mod authz_realm_schema;
 pub mod authz_repair;
 pub mod authz_schema;
 pub mod authz_segment;

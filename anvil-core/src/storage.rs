@@ -479,6 +479,51 @@ impl Storage {
             .join(format!("tenant-{tenant_id}"))
     }
 
+    pub fn authz_schema_revision_path(
+        &self,
+        tenant_id: i64,
+        schema_id: &str,
+        revision: u64,
+    ) -> Result<PathBuf> {
+        ensure_safe_internal_component(schema_id, "authorization schema id")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("authz")
+            .join("v2")
+            .join(format!("tenant-{tenant_id}"))
+            .join("schemas")
+            .join(schema_id)
+            .join("revisions")
+            .join(format!("{revision:020}.json")))
+    }
+
+    pub fn authz_schema_latest_path(&self, tenant_id: i64, schema_id: &str) -> Result<PathBuf> {
+        ensure_safe_internal_component(schema_id, "authorization schema id")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("authz")
+            .join("v2")
+            .join(format!("tenant-{tenant_id}"))
+            .join("schemas")
+            .join(schema_id)
+            .join("latest.json"))
+    }
+
+    pub fn authz_schema_binding_path(&self, tenant_id: i64, realm_id: &str) -> Result<PathBuf> {
+        ensure_safe_internal_component(realm_id, "authorization realm id")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("authz")
+            .join("v2")
+            .join(format!("tenant-{tenant_id}"))
+            .join("realms")
+            .join(realm_id)
+            .join("schema-binding.json"))
+    }
+
     pub fn git_source_watch_path(&self, tenant_id: i64, repository_id: &str) -> Result<PathBuf> {
         ensure_safe_internal_component(repository_id, "git repository id")?;
         Ok(self

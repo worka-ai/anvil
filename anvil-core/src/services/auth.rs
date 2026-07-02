@@ -1,8 +1,8 @@
 use crate::anvil_api::auth_service_server::AuthService;
 use crate::anvil_api::*;
 use crate::{
-    AppState, auth, authz_derived_lag_watch, authz_journal, authz_namespace_watch, authz_schema,
-    authz_userset_index, crypto,
+    AppState, auth, authz_derived_lag_watch, authz_journal, authz_namespace_watch,
+    authz_realm_schema, authz_schema, authz_userset_index, crypto,
     formats::hash32,
     permissions::AnvilAction,
     services::watch_envelope::{self, WatchEnvelopeParts},
@@ -210,6 +210,7 @@ impl AuthService for AppState {
                 caveat_hash: req.caveat_hash,
                 operation: req.operation,
                 reason: req.reason,
+                scope: req.scope,
             },
         )
         .await?;
@@ -240,12 +241,13 @@ impl AuthService for AppState {
         for mutation in &req.mutations {
             validate_authz_tuple_mutation(&claims, mutation)?;
         }
+        let scope = resolve_batch_scope(&claims, req.scope.as_ref(), &req.mutations)?;
 
         let mutations = req
             .mutations
             .into_iter()
             .map(|mutation| crate::persistence::AuthzTupleBatchMutation {
-                namespace: mutation.namespace,
+                namespace: encode_realm_namespace(&scope.authz_realm_id, &mutation.namespace),
                 object_id: mutation.object_id,
                 relation: mutation.relation,
                 subject_kind: mutation.subject_kind,
@@ -293,6 +295,7 @@ impl AuthService for AppState {
         validate_optional_tuple_component("subject_kind", &req.subject_kind)?;
         validate_optional_tuple_field("subject_id", &req.subject_id)?;
         validate_caveat_hash(&req.caveat_hash)?;
+        let scope = resolve_authz_scope(&claims, req.scope.as_ref())?;
 
         let resource = authz_filter_resource(&req.namespace, &req.object_id, &req.relation);
         if !auth::is_authorized(AnvilAction::AuthzTupleRead, &resource, &claims.scopes) {
@@ -301,6 +304,7 @@ impl AuthService for AppState {
         let filter_hash = authz_page_filter_hash(
             "read_tuples",
             &[
+                &scope.authz_realm_id,
                 &req.namespace,
                 &req.object_id,
                 &req.relation,
@@ -327,7 +331,10 @@ impl AuthService for AppState {
             &self.storage,
             claims.tenant_id,
             authz_journal::AuthzTupleFilter {
-                namespace: optional_filter_value(req.namespace),
+                namespace: optional_filter_value(encode_optional_realm_namespace(
+                    &scope.authz_realm_id,
+                    &req.namespace,
+                )),
                 object_id: optional_filter_value(req.object_id),
                 relation: optional_filter_value(req.relation),
                 subject_kind: optional_filter_value(req.subject_kind),
@@ -338,6 +345,7 @@ impl AuthService for AppState {
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
+        let records = filter_records_for_realm(records, &scope.authz_realm_id);
         let (records, next_page_token) = paginate_authz(
             records,
             req.page_size,
@@ -351,7 +359,7 @@ impl AuthService for AppState {
         Ok(Response::new(ReadAuthzTuplesResponse {
             tuples: records
                 .into_iter()
-                .map(|record| authz_tuple_response(&record))
+                .map(|record| authz_tuple_response_for_realm(&record, &scope.authz_realm_id))
                 .collect::<Result<Vec<_>, _>>()?,
             revision: revision_to_u64(response_revision)?,
             zookie: zookie(response_revision),
@@ -425,6 +433,7 @@ impl AuthService for AppState {
         validate_tuple_component("subject_kind", &req.subject_kind)?;
         validate_tuple_field("subject_id", &req.subject_id)?;
         validate_caveat_hash(&req.caveat_hash)?;
+        let scope = resolve_authz_scope(&claims, req.scope.as_ref())?;
         let resource = authz_filter_resource(&req.namespace, "", &req.relation);
         if !auth::is_authorized(AnvilAction::AuthzTupleRead, &resource, &claims.scopes) {
             return Err(Status::permission_denied("Permission denied"));
@@ -432,6 +441,7 @@ impl AuthService for AppState {
         let filter_hash = authz_page_filter_hash(
             "list_objects",
             &[
+                &scope.authz_realm_id,
                 &req.namespace,
                 &req.relation,
                 &req.subject_kind,
@@ -456,7 +466,7 @@ impl AuthService for AppState {
         let object_ids = authz_journal::list_current_authz_objects_at_revision(
             &self.storage,
             claims.tenant_id,
-            &req.namespace,
+            &encode_realm_namespace(&scope.authz_realm_id, &req.namespace),
             &req.relation,
             &req.subject_kind,
             &req.subject_id,
@@ -497,6 +507,7 @@ impl AuthService for AppState {
         validate_tuple_field("object_id", &req.object_id)?;
         validate_tuple_component("relation", &req.relation)?;
         validate_optional_tuple_component("subject_kind", &req.subject_kind)?;
+        let scope = resolve_authz_scope(&claims, req.scope.as_ref())?;
         let resource = authz_resource(&req.namespace, &req.object_id, &req.relation);
         if !auth::is_authorized(AnvilAction::AuthzTupleRead, &resource, &claims.scopes) {
             return Err(Status::permission_denied("Permission denied"));
@@ -504,6 +515,7 @@ impl AuthService for AppState {
         let filter_hash = authz_page_filter_hash(
             "list_subjects",
             &[
+                &scope.authz_realm_id,
                 &req.namespace,
                 &req.object_id,
                 &req.relation,
@@ -527,7 +539,7 @@ impl AuthService for AppState {
         let subjects = authz_journal::list_current_authz_subjects_at_revision(
             &self.storage,
             claims.tenant_id,
-            &req.namespace,
+            &encode_realm_namespace(&scope.authz_realm_id, &req.namespace),
             &req.object_id,
             &req.relation,
             optional_str(req.subject_kind.as_str()),
@@ -557,6 +569,141 @@ impl AuthService for AppState {
             revision: revision_to_u64(response_revision)?,
             zookie: zookie(response_revision),
             next_page_token,
+        }))
+    }
+
+    async fn put_authz_schema(
+        &self,
+        request: Request<PutAuthzSchemaRequest>,
+    ) -> Result<Response<PutAuthzSchemaResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        validate_storage_tenant(&claims, &req.anvil_storage_tenant_id)?;
+        validate_tuple_component("schema_id", &req.schema_id)?;
+        if req.namespaces.is_empty() {
+            return Err(Status::invalid_argument(
+                "namespaces must contain at least one schema",
+            ));
+        }
+        for namespace in &req.namespaces {
+            validate_tuple_component("namespace", &namespace.namespace)?;
+            if !auth::is_authorized(
+                AnvilAction::AuthzSchemaWrite,
+                &namespace.namespace,
+                &claims.scopes,
+            ) {
+                return Err(Status::permission_denied("Permission denied"));
+            }
+        }
+        let authz_revision = authz_journal::latest_authz_revision(&self.storage, claims.tenant_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))
+            .and_then(revision_to_u64)?
+            .saturating_add(1);
+        let record = authz_realm_schema::put_schema_revision(
+            &self.storage,
+            claims.tenant_id,
+            &req.schema_id,
+            req.namespaces,
+            authz_revision,
+            &claims.sub,
+            &req.reason,
+        )
+        .await
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        Ok(Response::new(PutAuthzSchemaResponse {
+            schema_ref: Some(schema_ref_response(&record.schema_ref)),
+            authz_revision,
+            zookie: zookie(u64_to_i64(authz_revision)?),
+        }))
+    }
+
+    async fn bind_authz_schema(
+        &self,
+        request: Request<BindAuthzSchemaRequest>,
+    ) -> Result<Response<BindAuthzSchemaResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        let scope = resolve_authz_scope(&claims, req.scope.as_ref())?;
+        let schema_ref = req
+            .schema_ref
+            .ok_or_else(|| Status::invalid_argument("schema_ref is required"))?;
+        validate_tuple_component("schema_id", &schema_ref.schema_id)?;
+        if !auth::is_authorized(
+            AnvilAction::AuthzSchemaWrite,
+            &scope.authz_realm_id,
+            &claims.scopes,
+        ) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+        let authz_revision = authz_journal::latest_authz_revision(&self.storage, claims.tenant_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))
+            .and_then(revision_to_u64)?
+            .saturating_add(1);
+        let binding = authz_realm_schema::bind_schema(
+            &self.storage,
+            claims.tenant_id,
+            &scope.authz_realm_id,
+            authz_realm_schema::StoredSchemaRef {
+                schema_id: schema_ref.schema_id,
+                schema_revision: schema_ref.schema_revision,
+                schema_digest: schema_ref.schema_digest,
+            },
+            req.expected_binding_generation,
+            authz_revision,
+            &claims.sub,
+            &req.reason,
+        )
+        .await
+        .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        Ok(Response::new(BindAuthzSchemaResponse {
+            scope: Some(scope),
+            schema_ref: Some(schema_ref_response(&binding.schema_ref)),
+            binding_generation: binding.binding_generation,
+            authz_revision,
+            zookie: zookie(u64_to_i64(authz_revision)?),
+        }))
+    }
+
+    async fn get_authz_schema_binding(
+        &self,
+        request: Request<GetAuthzSchemaBindingRequest>,
+    ) -> Result<Response<GetAuthzSchemaBindingResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        let scope = resolve_authz_scope(&claims, req.scope.as_ref())?;
+        if !auth::is_authorized(
+            AnvilAction::AuthzSchemaRead,
+            &scope.authz_realm_id,
+            &claims.scopes,
+        ) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+        let binding = authz_realm_schema::read_schema_binding(
+            &self.storage,
+            claims.tenant_id,
+            &scope.authz_realm_id,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found("schema binding not found"))?;
+        Ok(Response::new(GetAuthzSchemaBindingResponse {
+            scope: Some(scope),
+            schema_ref: Some(schema_ref_response(&binding.schema_ref)),
+            binding_generation: binding.binding_generation,
         }))
     }
 
@@ -645,6 +792,27 @@ impl AuthService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
+        if !req.schema_id.is_empty() {
+            validate_storage_tenant(&claims, &req.anvil_storage_tenant_id)?;
+            validate_tuple_component("schema_id", &req.schema_id)?;
+            if !auth::is_authorized(AnvilAction::AuthzSchemaRead, &req.schema_id, &claims.scopes) {
+                return Err(Status::permission_denied("Permission denied"));
+            }
+            let record = authz_realm_schema::read_schema_revision(
+                &self.storage,
+                claims.tenant_id,
+                &req.schema_id,
+                req.schema_revision,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("schema not found"))?;
+            return Ok(Response::new(GetAuthzSchemaResponse {
+                namespaces: record.namespaces,
+                schema_version: record.schema_ref.schema_revision,
+                schema_ref: Some(schema_ref_response(&record.schema_ref)),
+            }));
+        }
         if !req.namespace.is_empty() {
             validate_tuple_component("namespace", &req.namespace)?;
         }
@@ -676,6 +844,7 @@ impl AuthService for AppState {
         Ok(Response::new(GetAuthzSchemaResponse {
             namespaces: records.iter().map(authz_schema::schema_response).collect(),
             schema_version,
+            schema_ref: None,
         }))
     }
 
@@ -689,6 +858,7 @@ impl AuthService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
+        let scope = resolve_authz_scope(&claims, req.scope.as_ref())?;
         let resource = if req.namespace.is_empty() {
             "*".to_string()
         } else {
@@ -704,7 +874,7 @@ impl AuthService for AppState {
             &self.storage,
             claims.tenant_id,
             after_revision,
-            &req.namespace,
+            &encode_optional_realm_namespace(&scope.authz_realm_id, &req.namespace),
             1000,
         )
         .await
@@ -716,7 +886,10 @@ impl AuthService for AppState {
             for record in snapshot {
                 last_revision = last_revision.max(record.revision);
                 if tx
-                    .send(Ok(authz_tuple_log_response(&record)))
+                    .send(Ok(authz_tuple_log_response_for_realm(
+                        &record,
+                        &scope.authz_realm_id,
+                    )))
                     .await
                     .is_err()
                 {
@@ -729,13 +902,22 @@ impl AuthService for AppState {
                     Ok(record) => {
                         if record.tenant_id != claims.tenant_id
                             || record.revision <= last_revision
-                            || (!req.namespace.is_empty() && record.namespace != req.namespace)
+                            || !record_belongs_to_realm(&record, &scope.authz_realm_id)
+                            || (!req.namespace.is_empty()
+                                && record.namespace
+                                    != encode_realm_namespace(
+                                        &scope.authz_realm_id,
+                                        &req.namespace,
+                                    ))
                         {
                             continue;
                         }
                         last_revision = record.revision;
                         if tx
-                            .send(Ok(authz_tuple_log_response(&record)))
+                            .send(Ok(authz_tuple_log_response_for_realm(
+                                &record,
+                                &scope.authz_realm_id,
+                            )))
                             .await
                             .is_err()
                         {
@@ -939,6 +1121,92 @@ fn authz_filter_resource(namespace: &str, object_id: &str, relation: &str) -> St
     }
 }
 
+fn validate_storage_tenant(
+    claims: &auth::Claims,
+    anvil_storage_tenant_id: &str,
+) -> Result<(), Status> {
+    if anvil_storage_tenant_id.is_empty() || anvil_storage_tenant_id == claims.tenant_id.to_string()
+    {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(
+            "authz scope storage tenant does not match authenticated tenant",
+        ))
+    }
+}
+
+fn resolve_authz_scope(
+    claims: &auth::Claims,
+    scope: Option<&AuthzScope>,
+) -> Result<AuthzScope, Status> {
+    let mut resolved = scope.cloned().unwrap_or_else(|| AuthzScope {
+        anvil_storage_tenant_id: claims.tenant_id.to_string(),
+        authz_realm_id: "default".to_string(),
+    });
+    if resolved.anvil_storage_tenant_id.is_empty() {
+        resolved.anvil_storage_tenant_id = claims.tenant_id.to_string();
+    }
+    validate_storage_tenant(claims, &resolved.anvil_storage_tenant_id)?;
+    validate_tuple_component("authz_realm_id", &resolved.authz_realm_id)?;
+    Ok(resolved)
+}
+
+fn resolve_batch_scope(
+    claims: &auth::Claims,
+    request_scope: Option<&AuthzScope>,
+    mutations: &[AuthzTupleMutation],
+) -> Result<AuthzScope, Status> {
+    let scope = resolve_authz_scope(
+        claims,
+        request_scope.or_else(|| {
+            mutations
+                .first()
+                .and_then(|mutation| mutation.scope.as_ref())
+        }),
+    )?;
+    for mutation in mutations {
+        if let Some(mutation_scope) = mutation.scope.as_ref() {
+            let mutation_scope = resolve_authz_scope(claims, Some(mutation_scope))?;
+            if mutation_scope != scope {
+                return Err(Status::invalid_argument(
+                    "authz tuple batch must target one authz scope",
+                ));
+            }
+        }
+    }
+    Ok(scope)
+}
+
+fn encode_realm_namespace(realm_id: &str, namespace: &str) -> String {
+    format!("realm__{realm_id}__{namespace}")
+}
+
+fn encode_optional_realm_namespace(realm_id: &str, namespace: &str) -> String {
+    if namespace.is_empty() {
+        String::new()
+    } else {
+        encode_realm_namespace(realm_id, namespace)
+    }
+}
+
+fn decode_realm_namespace<'a>(realm_id: &str, namespace: &'a str) -> Option<&'a str> {
+    namespace.strip_prefix(&format!("realm__{realm_id}__"))
+}
+
+fn record_belongs_to_realm(record: &crate::persistence::AuthzTupleRecord, realm_id: &str) -> bool {
+    decode_realm_namespace(realm_id, &record.namespace).is_some()
+}
+
+fn filter_records_for_realm(
+    records: Vec<crate::persistence::AuthzTupleRecord>,
+    realm_id: &str,
+) -> Vec<crate::persistence::AuthzTupleRecord> {
+    records
+        .into_iter()
+        .filter(|record| record_belongs_to_realm(record, realm_id))
+        .collect()
+}
+
 fn validate_tuple_field(name: &str, value: &str) -> Result<(), Status> {
     if value.is_empty() {
         return Err(Status::invalid_argument(format!(
@@ -998,11 +1266,12 @@ async fn write_authz_tuple_record(
     req: AuthzTupleMutation,
 ) -> Result<crate::persistence::AuthzTupleRecord, Status> {
     let operation = validate_authz_tuple_mutation(claims, &req)?;
+    let scope = resolve_authz_scope(claims, req.scope.as_ref())?;
     let record = state
         .persistence
         .write_authz_tuple(
             claims.tenant_id,
-            &req.namespace,
+            &encode_realm_namespace(&scope.authz_realm_id, &req.namespace),
             &req.object_id,
             &req.relation,
             &req.subject_kind,
@@ -1102,6 +1371,7 @@ async fn check_permission_response(
     validate_tuple_component("subject_kind", &req.subject_kind)?;
     validate_tuple_field("subject_id", &req.subject_id)?;
     validate_caveat_hash(&req.caveat_hash)?;
+    let scope = resolve_authz_scope(claims, req.scope.as_ref())?;
     let resource = authz_resource(&req.namespace, &req.object_id, &req.relation);
     if !auth::is_authorized(AnvilAction::AuthzCheck, &resource, &claims.scopes) {
         return Err(Status::permission_denied("Permission denied"));
@@ -1112,7 +1382,7 @@ async fn check_permission_response(
     let allowed = authz_journal::resolve_permission_at_revision(
         &state.storage,
         claims.tenant_id,
-        &req.namespace,
+        &encode_realm_namespace(&scope.authz_realm_id, &req.namespace),
         &req.object_id,
         &req.relation,
         &req.subject_kind,
@@ -1203,8 +1473,20 @@ fn revision_to_u64(revision: i64) -> Result<u64, Status> {
     u64::try_from(revision).map_err(|_| Status::internal("Invalid authz revision"))
 }
 
+fn u64_to_i64(revision: u64) -> Result<i64, Status> {
+    i64::try_from(revision).map_err(|_| Status::internal("Invalid authz revision"))
+}
+
 fn zookie(revision: i64) -> String {
     format!("authz:{}", revision.max(0))
+}
+
+fn schema_ref_response(record: &authz_realm_schema::StoredSchemaRef) -> AuthzSchemaRef {
+    AuthzSchemaRef {
+        schema_id: record.schema_id.clone(),
+        schema_revision: record.schema_revision,
+        schema_digest: record.schema_digest.clone(),
+    }
 }
 
 fn write_authz_tuple_response(
@@ -1217,11 +1499,14 @@ fn write_authz_tuple_response(
     })
 }
 
-fn authz_tuple_response(
+fn authz_tuple_response_for_realm(
     record: &crate::persistence::AuthzTupleRecord,
+    realm_id: &str,
 ) -> Result<AuthzTuple, Status> {
+    let namespace = decode_realm_namespace(realm_id, &record.namespace)
+        .ok_or_else(|| Status::internal("authz tuple namespace is outside requested realm"))?;
     Ok(AuthzTuple {
-        namespace: record.namespace.clone(),
+        namespace: namespace.to_string(),
         object_id: record.object_id.clone(),
         relation: record.relation.clone(),
         subject_kind: record.subject_kind.clone(),
@@ -1415,6 +1700,17 @@ fn authz_tuple_log_response(
             emitted_at: written_at,
         })),
     }
+}
+
+fn authz_tuple_log_response_for_realm(
+    record: &crate::persistence::AuthzTupleRecord,
+    realm_id: &str,
+) -> WatchAuthzTupleLogResponse {
+    let mut response = authz_tuple_log_response(record);
+    if let Some(namespace) = decode_realm_namespace(realm_id, &response.namespace) {
+        response.namespace = namespace.to_string();
+    }
+    response
 }
 
 fn authz_namespace_watch_response(

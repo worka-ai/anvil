@@ -3015,6 +3015,7 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
                 caveat_hash: "".to_string(),
                 operation: "add".to_string(),
                 reason: "index query inherited object authz test".to_string(),
+                scope: None,
             },
             &cluster.token,
         ))

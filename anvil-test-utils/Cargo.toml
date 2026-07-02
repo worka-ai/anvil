@@ -23,8 +23,8 @@ path = "src/lib.rs"
 enterprise = ["anvil/enterprise"]
 
 [dependencies]
-anvil = { package = "anvil-server", path = "../anvil", version = "0.1.0" }
-anvil-core = { package = "anvil-storage-core", path = "../anvil-core", version = "0.1.0" }
+anvil = { package = "anvil-server", path = "../anvil", version = "0.2.0" }
+anvil-core = { package = "anvil-storage-core", path = "../anvil-core", version = "0.2.0" }
 anyhow = "1"
 tokio = { version = "1.47.1", features = ["full"] }
 

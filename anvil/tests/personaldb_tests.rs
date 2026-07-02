@@ -735,6 +735,7 @@ async fn personaldb_row_mutation_can_be_authorized_by_relationship_tuple() {
                 caveat_hash: String::new(),
                 operation: "add".to_string(),
                 reason: "test".to_string(),
+                scope: None,
             },
             &token,
         ))
@@ -1105,6 +1106,7 @@ async fn personaldb_projection_resource_relation_filter_uses_authz_index() {
                 caveat_hash: String::new(),
                 operation: "add".to_string(),
                 reason: "allow projection target".to_string(),
+                scope: None,
             },
             &token,
         ))

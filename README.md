@@ -42,18 +42,17 @@ Add the Rust client to an application:
 
 ```toml
 [dependencies]
-anvil-storage = "0.1"
+anvil-storage = "0.2"
 ```
 
 Use the client:
 
 ```rust
-use anvil_storage::{AnvilClient, BucketClient};
+use anvil_storage::{AnvilClient, proto::ListBucketsRequest};
 
-# async fn example() -> Result<(), Box<dyn std::error::Error>> {
-let client = AnvilClient::connect("http://127.0.0.1:50051", "token").await?;
-let mut buckets = client.bucket_client();
-let response = buckets.list_buckets(Default::default()).await?;
+# async fn example(endpoint: String, token: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+let client = AnvilClient::connect_with_bearer(endpoint, token).await?;
+let response = client.buckets().list_buckets(ListBucketsRequest {}).await?;
 println!("{} buckets", response.into_inner().buckets.len());
 # Ok(())
 # }

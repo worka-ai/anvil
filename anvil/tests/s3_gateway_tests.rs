@@ -236,6 +236,7 @@ fn write_authz_tuple_request(
         caveat_hash: String::new(),
         operation: operation.to_string(),
         reason: "test".to_string(),
+        scope: None,
     }
 }
 

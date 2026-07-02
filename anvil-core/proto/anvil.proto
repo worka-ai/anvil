@@ -908,6 +908,9 @@ service AuthService {
   rpc CheckPermissions(CheckPermissionsRequest) returns (CheckPermissionsResponse);
   rpc ListAuthzObjects(ListAuthzObjectsRequest) returns (ListAuthzObjectsResponse);
   rpc ListAuthzSubjects(ListAuthzSubjectsRequest) returns (ListAuthzSubjectsResponse);
+  rpc PutAuthzSchema(PutAuthzSchemaRequest) returns (PutAuthzSchemaResponse);
+  rpc BindAuthzSchema(BindAuthzSchemaRequest) returns (BindAuthzSchemaResponse);
+  rpc GetAuthzSchemaBinding(GetAuthzSchemaBindingRequest) returns (GetAuthzSchemaBindingResponse);
   rpc ApplyAuthzSchema(ApplyAuthzSchemaRequest) returns (ApplyAuthzSchemaResponse);
   rpc GetAuthzSchema(GetAuthzSchemaRequest) returns (GetAuthzSchemaResponse);
   rpc WatchAuthzTupleLog(WatchAuthzTupleLogRequest) returns (stream WatchAuthzTupleLogResponse);
@@ -1031,6 +1034,17 @@ message SetPublicAccessRequest {
 
 message SetPublicAccessResponse {}
 
+message AuthzScope {
+    string anvil_storage_tenant_id = 1;
+    string authz_realm_id = 2;
+}
+
+message AuthzSchemaRef {
+    string schema_id = 1;
+    uint64 schema_revision = 2;
+    string schema_digest = 3;
+}
+
 message WriteAuthzTupleRequest {
     string namespace = 1;
     string object_id = 2;
@@ -1040,6 +1054,7 @@ message WriteAuthzTupleRequest {
     string caveat_hash = 6;
     string operation = 7;
     string reason = 8;
+    AuthzScope scope = 9;
 }
 
 message WriteAuthzTupleResponse {
@@ -1068,10 +1083,12 @@ message AuthzTupleMutation {
     string caveat_hash = 6;
     string operation = 7;
     string reason = 8;
+    AuthzScope scope = 9;
 }
 
 message WriteAuthzTuplesRequest {
     repeated AuthzTupleMutation mutations = 1;
+    AuthzScope scope = 2;
 }
 
 message WriteAuthzTuplesResponse {
@@ -1091,6 +1108,7 @@ message ReadAuthzTuplesRequest {
     string zookie = 8;
     uint32 page_size = 9;
     string page_token = 10;
+    AuthzScope scope = 11;
 }
 
 message ReadAuthzTuplesResponse {
@@ -1109,6 +1127,7 @@ message CheckPermissionRequest {
     string caveat_hash = 6;
     string consistency = 7;
     string zookie = 8;
+    AuthzScope scope = 9;
 }
 
 message CheckPermissionResponse {
@@ -1138,6 +1157,7 @@ message ListAuthzObjectsRequest {
     string zookie = 7;
     uint32 page_size = 8;
     string page_token = 9;
+    AuthzScope scope = 10;
 }
 
 message ListAuthzObjectsResponse {
@@ -1156,6 +1176,7 @@ message ListAuthzSubjectsRequest {
     string zookie = 6;
     uint32 page_size = 7;
     string page_token = 8;
+    AuthzScope scope = 9;
 }
 
 message AuthzSubject {
@@ -1193,6 +1214,44 @@ message AuthzNamespaceSchema {
     string applied_at = 14;
 }
 
+message PutAuthzSchemaRequest {
+    string anvil_storage_tenant_id = 1;
+    string schema_id = 2;
+    repeated AuthzNamespaceSchema namespaces = 3;
+    string reason = 4;
+}
+
+message PutAuthzSchemaResponse {
+    AuthzSchemaRef schema_ref = 1;
+    uint64 authz_revision = 2;
+    string zookie = 3;
+}
+
+message BindAuthzSchemaRequest {
+    AuthzScope scope = 1;
+    AuthzSchemaRef schema_ref = 2;
+    optional uint64 expected_binding_generation = 3;
+    string reason = 4;
+}
+
+message BindAuthzSchemaResponse {
+    AuthzScope scope = 1;
+    AuthzSchemaRef schema_ref = 2;
+    uint64 binding_generation = 3;
+    uint64 authz_revision = 4;
+    string zookie = 5;
+}
+
+message GetAuthzSchemaBindingRequest {
+    AuthzScope scope = 1;
+}
+
+message GetAuthzSchemaBindingResponse {
+    AuthzScope scope = 1;
+    AuthzSchemaRef schema_ref = 2;
+    uint64 binding_generation = 3;
+}
+
 message ApplyAuthzSchemaRequest {
     repeated AuthzNamespaceSchema namespaces = 1;
     string reason = 2;
@@ -1205,11 +1264,15 @@ message ApplyAuthzSchemaResponse {
 
 message GetAuthzSchemaRequest {
     string namespace = 1;
+    string anvil_storage_tenant_id = 2;
+    string schema_id = 3;
+    optional uint64 schema_revision = 4;
 }
 
 message GetAuthzSchemaResponse {
     repeated AuthzNamespaceSchema namespaces = 1;
     uint64 schema_version = 2;
+    AuthzSchemaRef schema_ref = 3;
 }
 
 message AcquireTaskLeaseRequest {
@@ -1295,6 +1358,7 @@ message ForceReleaseTaskLeaseResponse {
 message WatchAuthzTupleLogRequest {
     uint64 after_revision = 1;
     string namespace = 2;
+    AuthzScope scope = 3;
 }
 
 message WatchAuthzTupleLogResponse {

@@ -5,15 +5,17 @@ use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::repair_service_client::RepairServiceClient;
 use anvil::anvil_api::{
     AcquireTaskLeaseRequest, ApplyAuthzSchemaRequest, AuthzNamespaceSchema, AuthzRelationRule,
-    AuthzRelationSchema, AuthzTupleMutation, CheckPermissionRequest, CheckPermissionsRequest,
-    CheckpointTaskLeaseRequest, CommitTaskLeaseRequest, CreateBucketRequest,
-    ForceReleaseTaskLeaseRequest, GetAccessTokenRequest, GetAuthzSchemaRequest, GetObjectRequest,
+    AuthzRelationSchema, AuthzScope, AuthzTupleMutation, BindAuthzSchemaRequest,
+    CheckPermissionRequest, CheckPermissionsRequest, CheckpointTaskLeaseRequest,
+    CommitTaskLeaseRequest, CreateBucketRequest, ForceReleaseTaskLeaseRequest,
+    GetAccessTokenRequest, GetAuthzSchemaBindingRequest, GetAuthzSchemaRequest, GetObjectRequest,
     GrantAccessRequest, ListAuthzObjectsRequest, ListAuthzSubjectsRequest, ListBucketsRequest,
     ListObjectVersionsRequest, ListObjectsRequest, ListRepairFindingsRequest,
-    NativeMutationContext, ObjectMetadata, PutObjectRequest, ReadAuthzTuplesRequest,
-    ReadTaskLeaseRequest, RepairAuthzDerivedIndexRequest, RevokeAccessRequest,
-    SetPublicAccessRequest, WatchAuthzDerivedLagRequest, WatchAuthzNamespaceRequest,
-    WatchAuthzTupleLogRequest, WriteAuthzTupleRequest, WriteAuthzTuplesRequest,
+    NativeMutationContext, ObjectMetadata, PutAuthzSchemaRequest, PutObjectRequest,
+    ReadAuthzTuplesRequest, ReadTaskLeaseRequest, RepairAuthzDerivedIndexRequest,
+    RevokeAccessRequest, SetPublicAccessRequest, WatchAuthzDerivedLagRequest,
+    WatchAuthzNamespaceRequest, WatchAuthzTupleLogRequest, WriteAuthzTupleRequest,
+    WriteAuthzTuplesRequest,
 };
 use anvil::authz_derived_lag_watch::{
     AuthzDerivedLagWatchPayload, append_authz_derived_lag_watch_record,
@@ -215,6 +217,7 @@ fn write_authz_tuple_request(
         caveat_hash: String::new(),
         operation: operation.to_string(),
         reason: "test".to_string(),
+        scope: None,
     }
 }
 
@@ -235,6 +238,7 @@ fn authz_mutation(
         caveat_hash: String::new(),
         operation: operation.to_string(),
         reason: "test".to_string(),
+        scope: None,
     }
 }
 
@@ -256,6 +260,7 @@ fn check_permission_request(
         caveat_hash: String::new(),
         consistency: consistency.to_string(),
         zookie: zookie.to_string(),
+        scope: None,
     }
 }
 
@@ -408,6 +413,7 @@ async fn test_authz_tuple_write_check_and_watch() {
         caveat_hash: String::new(),
         operation: "add".to_string(),
         reason: "grant viewer".to_string(),
+        scope: None,
     });
     write_add.metadata_mut().insert(
         "authorization",
@@ -425,6 +431,7 @@ async fn test_authz_tuple_write_check_and_watch() {
     let mut watch_req = Request::new(WatchAuthzTupleLogRequest {
         after_revision: 0,
         namespace: "document".to_string(),
+        scope: None,
     });
     watch_req.metadata_mut().insert(
         "authorization",
@@ -461,6 +468,7 @@ async fn test_authz_tuple_write_check_and_watch() {
         caveat_hash: String::new(),
         consistency: "latest".to_string(),
         zookie: String::new(),
+        scope: None,
     });
     check_req.metadata_mut().insert(
         "authorization",
@@ -483,6 +491,7 @@ async fn test_authz_tuple_write_check_and_watch() {
         caveat_hash: String::new(),
         consistency: "exact".to_string(),
         zookie: add.zookie.clone(),
+        scope: None,
     });
     exact_add_req.metadata_mut().insert(
         "authorization",
@@ -505,6 +514,7 @@ async fn test_authz_tuple_write_check_and_watch() {
         caveat_hash: String::new(),
         operation: "remove".to_string(),
         reason: "revoke viewer".to_string(),
+        scope: None,
     });
     write_remove.metadata_mut().insert(
         "authorization",
@@ -534,6 +544,7 @@ async fn test_authz_tuple_write_check_and_watch() {
         caveat_hash: String::new(),
         consistency: "latest".to_string(),
         zookie: String::new(),
+        scope: None,
     });
     check_req.metadata_mut().insert(
         "authorization",
@@ -556,6 +567,7 @@ async fn test_authz_tuple_write_check_and_watch() {
         caveat_hash: String::new(),
         consistency: "at_least".to_string(),
         zookie: add.zookie,
+        scope: None,
     });
     at_least_add_req.metadata_mut().insert(
         "authorization",
@@ -578,6 +590,7 @@ async fn test_authz_tuple_write_check_and_watch() {
         caveat_hash: String::new(),
         consistency: "exact".to_string(),
         zookie: "authz:1".to_string(),
+        scope: None,
     });
     exact_add_after_remove_req.metadata_mut().insert(
         "authorization",
@@ -600,6 +613,7 @@ async fn test_authz_tuple_write_check_and_watch() {
         caveat_hash: String::new(),
         consistency: "exact".to_string(),
         zookie: "authz:999".to_string(),
+        scope: None,
     });
     unavailable_req.metadata_mut().insert(
         "authorization",
@@ -629,6 +643,7 @@ async fn test_authz_batch_read_and_list_operations() {
             authz_mutation("document", "beta", "viewer", "user", "alice", "remove"),
             authz_mutation("document", "alpha", "editor", "user", "bob", "add"),
         ],
+        scope: None,
     });
     add_bearer(&mut write, &token);
     let written = auth_client
@@ -645,6 +660,7 @@ async fn test_authz_batch_read_and_list_operations() {
         namespace: "document".to_string(),
         object_id: "alpha".to_string(),
         page_size: 1,
+        scope: None,
         ..Default::default()
     });
     add_bearer(&mut first_page, &token);
@@ -662,6 +678,7 @@ async fn test_authz_batch_read_and_list_operations() {
         object_id: "beta".to_string(),
         page_size: 1,
         page_token: first_page.next_page_token.clone(),
+        scope: None,
         ..Default::default()
     });
     add_bearer(&mut wrong_filter_page, &token);
@@ -676,6 +693,7 @@ async fn test_authz_batch_read_and_list_operations() {
         object_id: "alpha".to_string(),
         page_size: 1,
         page_token: first_page.next_page_token,
+        scope: None,
         ..Default::default()
     });
     add_bearer(&mut second_page, &token);
@@ -715,6 +733,7 @@ async fn test_authz_batch_read_and_list_operations() {
         subject_kind: "user".to_string(),
         subject_id: "alice".to_string(),
         caveat_hash: String::new(),
+        scope: None,
         ..Default::default()
     });
     add_bearer(&mut objects, &token);
@@ -730,6 +749,7 @@ async fn test_authz_batch_read_and_list_operations() {
         object_id: "alpha".to_string(),
         relation: "editor".to_string(),
         subject_kind: "user".to_string(),
+        scope: None,
         ..Default::default()
     });
     add_bearer(&mut subjects, &token);
@@ -757,6 +777,7 @@ async fn test_authz_batch_watch_and_pagination_are_revision_bound() {
             authz_mutation("document", "beta", "viewer", "user", "bob", "add"),
             authz_mutation("document", "gamma", "viewer", "user", "charlie", "add"),
         ],
+        scope: None,
     });
     add_bearer(&mut first_batch, &token);
     let first_batch = auth_client
@@ -773,6 +794,7 @@ async fn test_authz_batch_watch_and_pagination_are_revision_bound() {
     let mut watch_req = Request::new(WatchAuthzTupleLogRequest {
         after_revision: 0,
         namespace: "document".to_string(),
+        scope: None,
     });
     add_bearer(&mut watch_req, &token);
     let mut stream = watch_client
@@ -807,6 +829,7 @@ async fn test_authz_batch_watch_and_pagination_are_revision_bound() {
     let mut first_page = Request::new(ReadAuthzTuplesRequest {
         namespace: "document".to_string(),
         page_size: 1,
+        scope: None,
         ..Default::default()
     });
     add_bearer(&mut first_page, &token);
@@ -822,6 +845,7 @@ async fn test_authz_batch_watch_and_pagination_are_revision_bound() {
         mutations: vec![authz_mutation(
             "document", "delta", "viewer", "user", "dana", "add",
         )],
+        scope: None,
     });
     add_bearer(&mut second_batch, &token);
     let second_batch = auth_client
@@ -835,6 +859,7 @@ async fn test_authz_batch_watch_and_pagination_are_revision_bound() {
         namespace: "document".to_string(),
         page_size: 100,
         page_token: first_page.next_page_token,
+        scope: None,
         ..Default::default()
     });
     add_bearer(&mut revision_bound_page, &token);
@@ -855,6 +880,7 @@ async fn test_authz_batch_watch_and_pagination_are_revision_bound() {
     let mut latest_page = Request::new(ReadAuthzTuplesRequest {
         namespace: "document".to_string(),
         page_size: 100,
+        scope: None,
         ..Default::default()
     });
     add_bearer(&mut latest_page, &token);
@@ -894,8 +920,10 @@ async fn test_authz_tuple_batch_failure_is_atomic() {
                 caveat_hash: "not-a-hex32-caveat".to_string(),
                 operation: "add".to_string(),
                 reason: "invalid".to_string(),
+                scope: None,
             },
         ],
+        scope: None,
     });
     add_bearer(&mut invalid_batch, &token);
     let err = auth_client
@@ -918,6 +946,7 @@ async fn test_authz_tuple_batch_failure_is_atomic() {
             authz_mutation("document", "alpha", "viewer", "user", "alice", "add"),
             authz_mutation("bad/slash", "beta", "viewer", "user", "alice", "add"),
         ],
+        scope: None,
     });
     add_bearer(&mut unsafe_component_batch, &token);
     let err = auth_client
@@ -940,6 +969,7 @@ async fn test_authz_tuple_batch_failure_is_atomic() {
             authz_mutation("document", "alpha", "viewer", "user", "alice", "add"),
             authz_mutation("document", "beta", "viewer", "user", "alice", "add"),
         ],
+        scope: None,
     });
     add_bearer(&mut valid_batch, &token);
     let valid = auth_client
@@ -965,6 +995,7 @@ async fn test_authz_accepts_arbitrary_safe_subject_kind() {
         mutations: vec![authz_mutation(
             "document", "doc-1", "viewer", "folder", "folder-1", "add",
         )],
+        scope: None,
     });
     add_bearer(&mut write, &token);
     let written = auth_client
@@ -996,6 +1027,7 @@ async fn test_authz_accepts_arbitrary_safe_subject_kind() {
         zookie: String::new(),
         page_size: 10,
         page_token: String::new(),
+        scope: None,
     });
     add_bearer(&mut read, &token);
     let read = auth_client
@@ -1373,6 +1405,7 @@ async fn test_authz_tuple_rejects_invalid_caveat_hash_before_writing() {
         caveat_hash: "not-a-hex32-caveat".to_string(),
         operation: "add".to_string(),
         reason: "invalid caveat".to_string(),
+        scope: None,
     });
     add_bearer(&mut invalid_write, &token);
     let status = auth_client
@@ -1399,6 +1432,7 @@ async fn test_authz_tuple_rejects_invalid_caveat_hash_before_writing() {
         caveat_hash: "not-a-hex32-caveat".to_string(),
         consistency: "latest".to_string(),
         zookie: String::new(),
+        scope: None,
     });
     add_bearer(&mut invalid_check, &token);
     let status = auth_client
@@ -1970,6 +2004,9 @@ async fn test_apply_authz_schema_persists_and_emits_namespace_watch() {
 
     let mut get_one = Request::new(GetAuthzSchemaRequest {
         namespace: "document".to_string(),
+        anvil_storage_tenant_id: String::new(),
+        schema_id: String::new(),
+        schema_revision: None,
     });
     add_bearer(&mut get_one, &cluster.token);
     let fetched = auth_client
@@ -2003,6 +2040,140 @@ async fn test_apply_authz_schema_persists_and_emits_namespace_watch() {
     assert_eq!(event.event_type, "schema_changed");
     assert_eq!(event.schema_hash, applied.namespaces[0].schema_hash);
     assert!(event.invalidates_derived_usersets);
+}
+
+#[tokio::test]
+async fn test_authz_schema_put_bind_and_realm_scoped_tuples() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let scope_a = AuthzScope {
+        anvil_storage_tenant_id: "1".to_string(),
+        authz_realm_id: "realm_a".to_string(),
+    };
+    let scope_b = AuthzScope {
+        anvil_storage_tenant_id: "1".to_string(),
+        authz_realm_id: "realm_b".to_string(),
+    };
+    let schema = AuthzNamespaceSchema {
+        namespace: "document".to_string(),
+        relations: vec![AuthzRelationSchema {
+            relation: "viewer".to_string(),
+            rules: vec![],
+        }],
+        schema_json: r#"{"namespaces":{"document":{"rules":{"viewer":[]}}}}"#.to_string(),
+        schema_hash: String::new(),
+        schema_version: 0,
+        authz_revision: 0,
+        applied_at: String::new(),
+    };
+
+    let mut put = Request::new(PutAuthzSchemaRequest {
+        anvil_storage_tenant_id: "1".to_string(),
+        schema_id: "default".to_string(),
+        namespaces: vec![schema],
+        reason: "realm schema test".to_string(),
+    });
+    add_bearer(&mut put, &cluster.token);
+    let schema_ref = auth_client
+        .put_authz_schema(put)
+        .await
+        .unwrap()
+        .into_inner()
+        .schema_ref
+        .unwrap();
+    assert_eq!(schema_ref.schema_id, "default");
+    assert_eq!(schema_ref.schema_revision, 1);
+    assert!(!schema_ref.schema_digest.is_empty());
+
+    for scope in [&scope_a, &scope_b] {
+        let mut bind = Request::new(BindAuthzSchemaRequest {
+            scope: Some(scope.clone()),
+            schema_ref: Some(schema_ref.clone()),
+            expected_binding_generation: None,
+            reason: "bind test schema".to_string(),
+        });
+        add_bearer(&mut bind, &cluster.token);
+        let binding = auth_client
+            .bind_authz_schema(bind)
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(binding.binding_generation, 1);
+    }
+
+    let mut get_binding = Request::new(GetAuthzSchemaBindingRequest {
+        scope: Some(scope_a.clone()),
+    });
+    add_bearer(&mut get_binding, &cluster.token);
+    let binding = auth_client
+        .get_authz_schema_binding(get_binding)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        binding.schema_ref.unwrap().schema_digest,
+        schema_ref.schema_digest
+    );
+
+    let mut write = Request::new(WriteAuthzTupleRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: String::new(),
+        operation: "add".to_string(),
+        reason: "realm tuple".to_string(),
+        scope: Some(scope_a.clone()),
+    });
+    add_bearer(&mut write, &cluster.token);
+    auth_client.write_authz_tuple(write).await.unwrap();
+
+    let mut check_a = Request::new(CheckPermissionRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: String::new(),
+        consistency: "latest".to_string(),
+        zookie: String::new(),
+        scope: Some(scope_a),
+    });
+    add_bearer(&mut check_a, &cluster.token);
+    assert!(
+        auth_client
+            .check_permission(check_a)
+            .await
+            .unwrap()
+            .into_inner()
+            .allowed
+    );
+
+    let mut check_b = Request::new(CheckPermissionRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: String::new(),
+        consistency: "latest".to_string(),
+        zookie: String::new(),
+        scope: Some(scope_b),
+    });
+    add_bearer(&mut check_b, &cluster.token);
+    assert!(
+        !auth_client
+            .check_permission(check_b)
+            .await
+            .unwrap()
+            .into_inner()
+            .allowed
+    );
 }
 
 #[tokio::test]
