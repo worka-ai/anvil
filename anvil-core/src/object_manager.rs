@@ -16,6 +16,7 @@ use crate::{
         ObjectWatchEvent, Persistence,
     },
     placement::PlacementManager,
+    routing::{self, CrossRegionRoutingPolicy},
     sharding::ShardManager,
     storage::{ExternalChunkManifest, Storage},
     validation, watch_log,
@@ -27,6 +28,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
+use tonic::metadata::MetadataValue;
 use tracing::info;
 
 const INLINE_PAYLOAD_MAX_BYTES: i64 = 64 * 1024;
@@ -45,6 +47,7 @@ pub struct ObjectManager {
     sharder: ShardManager,
     storage: Storage,
     region: String,
+    cross_region_routing_policy: CrossRegionRoutingPolicy,
     jwt_manager: Arc<auth::JwtManager>,
     encryption_key: Vec<u8>,
     watch_tx: broadcast::Sender<ObjectWatchEvent>,
@@ -174,6 +177,7 @@ impl ObjectManager {
         sharder: ShardManager,
         storage: Storage,
         region: String,
+        cross_region_routing_policy: CrossRegionRoutingPolicy,
         jwt_manager: Arc<auth::JwtManager>,
         anvil_secret_encryption_key: String,
         watch_tx: broadcast::Sender<ObjectWatchEvent>,
@@ -188,6 +192,7 @@ impl ObjectManager {
             sharder,
             storage,
             region,
+            cross_region_routing_policy,
             jwt_manager,
             encryption_key,
             watch_tx,
@@ -1911,13 +1916,46 @@ impl ObjectManager {
         }?;
 
         if bucket.region != self.region {
-            return Err(Status::failed_precondition(format!(
-                "Bucket is in region {}",
-                bucket.region
-            )));
+            return Err(self.remote_bucket_status(&bucket.region));
         }
 
         Ok(bucket)
+    }
+
+    fn remote_bucket_status(&self, bucket_region: &str) -> Status {
+        let action = routing::remote_bucket_routing_action(self.cross_region_routing_policy, false);
+        let (code, message, action_name) = match action {
+            routing::RemoteBucketRoutingAction::Redirect => (
+                tonic::Code::FailedPrecondition,
+                format!("Bucket is in region {bucket_region}; redirect required"),
+                "redirect",
+            ),
+            routing::RemoteBucketRoutingAction::Proxy => (
+                tonic::Code::Unavailable,
+                format!("Bucket is in region {bucket_region}; native proxy is unavailable"),
+                "proxy_unavailable",
+            ),
+            routing::RemoteBucketRoutingAction::RejectLocalOnly => (
+                tonic::Code::FailedPrecondition,
+                format!("Bucket is in region {bucket_region}; cross-region routing is disabled"),
+                "local_only",
+            ),
+            routing::RemoteBucketRoutingAction::ProxyUnavailable => (
+                tonic::Code::Unavailable,
+                format!("Bucket is in region {bucket_region}; cross-region proxy is unavailable"),
+                "proxy_unavailable",
+            ),
+        };
+        let mut status = Status::new(code, message);
+        if let Ok(value) = MetadataValue::try_from(bucket_region) {
+            status.metadata_mut().insert("x-anvil-bucket-region", value);
+        }
+        if let Ok(value) = MetadataValue::try_from(action_name) {
+            status
+                .metadata_mut()
+                .insert("x-anvil-cross-region-action", value);
+        }
+        status
     }
 
     async fn resolve_followed_link(

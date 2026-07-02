@@ -164,6 +164,7 @@ impl AppState {
             sharder.clone(),
             storage.clone(),
             arc_config.region.clone(),
+            arc_config.cross_region_routing_policy,
             jwt_manager.clone(),
             arc_config.anvil_secret_encryption_key.clone(),
             object_watch_tx,

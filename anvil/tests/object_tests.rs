@@ -189,6 +189,104 @@ macro_rules! assert_native_mutation_response {
 }
 
 #[tokio::test]
+async fn native_object_routes_apply_cross_region_policy_before_local_metadata() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut object_client = ObjectServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: "remote-bucket".to_string(),
+                region: "test-region-2".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let err = object_client
+        .get_object(authorized(
+            GetObjectRequest {
+                bucket_name: "remote-bucket".to_string(),
+                object_key: "any.txt".to_string(),
+                version_id: None,
+            },
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(
+        err.metadata().get("x-anvil-bucket-region").unwrap(),
+        "test-region-2"
+    );
+    assert_eq!(
+        err.metadata().get("x-anvil-cross-region-action").unwrap(),
+        "redirect"
+    );
+}
+
+#[tokio::test]
+async fn native_object_routes_report_proxy_required_as_unavailable_when_proxy_is_absent() {
+    let mut cluster = TestCluster::new_with_config(&["test-region-1"], |config| {
+        config.cross_region_routing_policy =
+            anvil::routing::CrossRegionRoutingPolicy::ProxyRequired;
+    })
+    .await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut object_client = ObjectServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: "remote-bucket".to_string(),
+                region: "test-region-2".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let err = object_client
+        .list_objects(authorized(
+            ListObjectsRequest {
+                bucket_name: "remote-bucket".to_string(),
+                prefix: String::new(),
+                start_after: String::new(),
+                delimiter: String::new(),
+                max_keys: 100,
+            },
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable);
+    assert_eq!(
+        err.metadata().get("x-anvil-bucket-region").unwrap(),
+        "test-region-2"
+    );
+    assert_eq!(
+        err.metadata().get("x-anvil-cross-region-action").unwrap(),
+        "proxy_unavailable"
+    );
+}
+
+#[tokio::test]
 async fn test_native_mutations_require_valid_context() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
