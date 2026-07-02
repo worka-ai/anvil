@@ -839,7 +839,13 @@ pub async fn read_host_alias_descriptor(
     storage: &Storage,
     hostname: &str,
 ) -> MeshDirectoryResult<Option<routing::HostAliasDescriptor>> {
-    read_optional_descriptor(storage, &host_alias_descriptor_key(hostname)?).await
+    let hostname = routing::normalize_alias_hostname(hostname).map_err(|_| {
+        MeshDirectoryError::InvalidIdentifier {
+            field: "hostname",
+            value: hostname.to_string(),
+        }
+    })?;
+    read_typed_routing_descriptor(storage, RoutingRecordFamily::HostAlias, &hostname).await
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1249,33 +1255,59 @@ pub async fn read_tenant_name_descriptor(
     storage: &Storage,
     tenant_name: &TenantName,
 ) -> MeshDirectoryResult<Option<TenantNameDescriptor>> {
-    read_optional_descriptor(storage, &tenant_name.descriptor_key()).await
+    read_typed_routing_descriptor(
+        storage,
+        RoutingRecordFamily::TenantName,
+        tenant_name.as_str(),
+    )
+    .await
 }
 
 pub async fn read_tenant_locator_descriptor(
     storage: &Storage,
     tenant_id: &TenantId,
 ) -> MeshDirectoryResult<Option<TenantLocatorDescriptor>> {
-    read_optional_descriptor(storage, &tenant_id.descriptor_key()).await
+    read_typed_routing_descriptor(
+        storage,
+        RoutingRecordFamily::TenantLocator,
+        tenant_id.as_str(),
+    )
+    .await
 }
 
 pub async fn read_bucket_locator(
     storage: &Storage,
     key: &BucketLocatorKey,
 ) -> MeshDirectoryResult<Option<BucketLocatorDescriptor>> {
-    read_optional_descriptor(storage, &key.descriptor_key()).await
+    let record_key = format!("{}/{}", key.tenant_id.as_str(), key.bucket_name.as_str());
+    read_typed_routing_descriptor(storage, RoutingRecordFamily::BucketLocator, &record_key).await
 }
 
 pub async fn list_routing_records(
     storage: &Storage,
     family_filter: Option<RoutingRecordFamily>,
 ) -> MeshDirectoryResult<Vec<RoutingRecordDescriptor>> {
-    let mut records = Vec::new();
+    let mut records = BTreeMap::new();
     let families: Vec<_> = family_filter
         .map(|family| vec![family])
         .unwrap_or_else(|| RoutingRecordFamily::all().into_iter().collect());
 
     for family in families {
+        for record in list_projected_routing_records(storage, family).await? {
+            records.insert((record.family, record.record_key.clone()), record);
+        }
+        overlay_control_stream_routing_records(storage, family, &mut records).await?;
+    }
+
+    Ok(records.into_values().collect())
+}
+
+pub async fn list_projected_routing_records(
+    storage: &Storage,
+    family: RoutingRecordFamily,
+) -> MeshDirectoryResult<Vec<RoutingRecordDescriptor>> {
+    let mut records = Vec::new();
+    {
         let family_root = storage
             .mesh_directory_root_path()
             .join(family.directory_segment());
@@ -1311,11 +1343,103 @@ pub async fn list_routing_records(
             });
         }
     }
-
     records.sort_by(|left, right| {
         (left.family, left.record_key.as_str()).cmp(&(right.family, right.record_key.as_str()))
     });
     Ok(records)
+}
+
+async fn overlay_control_stream_routing_records(
+    storage: &Storage,
+    family: RoutingRecordFamily,
+    records: &mut BTreeMap<(RoutingRecordFamily, String), RoutingRecordDescriptor>,
+) -> MeshDirectoryResult<()> {
+    let stream_family = family.stream_family();
+    let family_path = storage
+        .mesh_control_stream_family_path(stream_family)
+        .map_err(|err| MeshDirectoryError::ControlStreamWrite {
+            stream_family: stream_family.to_string(),
+            partition: String::new(),
+            message: err.to_string(),
+        })?;
+    let mut entries = match tokio::fs::read_dir(&family_path).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("anlog") {
+            continue;
+        }
+        let partition = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| MeshDirectoryError::ControlStreamWrite {
+                stream_family: stream_family.to_string(),
+                partition: String::new(),
+                message: format!("invalid control stream file name {}", path.display()),
+            })?
+            .to_string();
+        let log = mesh_control_stream::read_control_stream_log(&path)
+            .await
+            .map_err(|err| MeshDirectoryError::ControlStreamWrite {
+                stream_family: stream_family.to_string(),
+                partition: partition.clone(),
+                message: err.to_string(),
+            })?;
+        if log.partial_final_frame.is_some() {
+            return Err(MeshDirectoryError::ControlStreamWrite {
+                stream_family: stream_family.to_string(),
+                partition,
+                message: "control stream has a partial final frame".to_string(),
+            });
+        }
+        for record in log.records {
+            let header: serde_json::Value = serde_json::from_slice(&record.frame.header_json)
+                .map_err(|err| MeshDirectoryError::ControlStreamWrite {
+                    stream_family: stream_family.to_string(),
+                    partition: partition.clone(),
+                    message: err.to_string(),
+                })?;
+            if header
+                .get("stream_family")
+                .and_then(serde_json::Value::as_str)
+                != Some(stream_family)
+                || header.get("partition").and_then(serde_json::Value::as_str)
+                    != Some(partition.as_str())
+            {
+                return Err(MeshDirectoryError::ControlStreamWrite {
+                    stream_family: stream_family.to_string(),
+                    partition: partition.clone(),
+                    message: "control stream header scope does not match path".to_string(),
+                });
+            }
+            let record_key = header
+                .get("record_key")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| MeshDirectoryError::ControlStreamWrite {
+                    stream_family: stream_family.to_string(),
+                    partition: partition.clone(),
+                    message: "control stream header missing record_key".to_string(),
+                })?;
+            let operation = header
+                .get("operation")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if matches!(operation, "delete" | "deleted") {
+                records.remove(&(family, record_key.to_string()));
+                continue;
+            }
+            let descriptor = routing_record_descriptor_from_payload(
+                family,
+                record_key,
+                record.frame.payload_json,
+            )?;
+            records.insert((family, record_key.to_string()), descriptor);
+        }
+    }
+    Ok(())
 }
 
 pub fn routing_record_partition_for_key(
@@ -1355,20 +1479,125 @@ pub async fn read_routing_record_descriptor(
     family: RoutingRecordFamily,
     record_key: &str,
 ) -> MeshDirectoryResult<RoutingRecordDescriptor> {
+    read_routing_record_from_source_of_truth(storage, family, record_key)
+        .await?
+        .ok_or_else(|| MeshDirectoryError::NotFound(record_key.to_string()))
+}
+
+async fn read_routing_record_from_source_of_truth(
+    storage: &Storage,
+    family: RoutingRecordFamily,
+    record_key: &str,
+) -> MeshDirectoryResult<Option<RoutingRecordDescriptor>> {
+    let projected = read_projected_routing_record_descriptor(storage, family, record_key).await?;
+    let streamed = latest_routing_record_from_control_stream(storage, family, record_key).await?;
+    let Some(streamed) = streamed else {
+        return Ok(projected);
+    };
+    if projected.as_ref().is_none_or(|projected| {
+        projected.generation != streamed.generation
+            || serde_json::from_str::<serde_json::Value>(&projected.payload_json).ok()
+                != serde_json::from_str::<serde_json::Value>(&streamed.payload_json).ok()
+    }) {
+        rebuild_routing_record_projection_from_payload(
+            storage,
+            family,
+            record_key,
+            streamed.payload_json.as_bytes(),
+        )
+        .await?;
+    }
+    Ok(Some(streamed))
+}
+
+async fn latest_routing_record_from_control_stream(
+    storage: &Storage,
+    family: RoutingRecordFamily,
+    record_key: &str,
+) -> MeshDirectoryResult<Option<RoutingRecordDescriptor>> {
+    let partition = routing_record_partition_for_key(family, record_key)?;
+    let stream_family = family.stream_family();
+    let stream_path = storage
+        .mesh_control_stream_path(stream_family, &partition)
+        .map_err(|err| MeshDirectoryError::ControlStreamWrite {
+            stream_family: stream_family.to_string(),
+            partition: partition.clone(),
+            message: err.to_string(),
+        })?;
+    let Some(record) = mesh_control_stream::latest_projected_record_from_control_stream(
+        stream_path,
+        stream_family,
+        &partition,
+        record_key,
+    )
+    .await
+    .map_err(|err| MeshDirectoryError::ControlStreamWrite {
+        stream_family: stream_family.to_string(),
+        partition,
+        message: err.to_string(),
+    })?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(routing_record_descriptor_from_payload(
+        family,
+        &record.record_key,
+        record.payload_json,
+    )?))
+}
+
+async fn read_projected_routing_record_descriptor(
+    storage: &Storage,
+    family: RoutingRecordFamily,
+    record_key: &str,
+) -> MeshDirectoryResult<Option<RoutingRecordDescriptor>> {
     let descriptor_key = routing_record_descriptor_key_for_key(family, record_key)?;
     let path = descriptor_path(storage, &descriptor_key)?;
-    let payload_json = tokio::fs::read_to_string(&path).await?;
-    let payload: serde_json::Value = serde_json::from_str(&payload_json)?;
+    match tokio::fs::read(&path).await {
+        Ok(payload_json) => Ok(Some(routing_record_descriptor_from_payload(
+            family,
+            record_key,
+            payload_json,
+        )?)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+async fn read_typed_routing_descriptor<T: for<'de> Deserialize<'de>>(
+    storage: &Storage,
+    family: RoutingRecordFamily,
+    record_key: &str,
+) -> MeshDirectoryResult<Option<T>> {
+    let Some(record) =
+        read_routing_record_from_source_of_truth(storage, family, record_key).await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::from_str(&record.payload_json)?))
+}
+
+fn routing_record_descriptor_from_payload(
+    family: RoutingRecordFamily,
+    record_key: &str,
+    payload_json: Vec<u8>,
+) -> MeshDirectoryResult<RoutingRecordDescriptor> {
+    let payload: serde_json::Value = serde_json::from_slice(&payload_json)?;
     Ok(RoutingRecordDescriptor {
         family,
         record_key: record_key.to_string(),
         partition: routing_record_partition_for_key(family, record_key)?,
-        descriptor_key,
+        descriptor_key: routing_record_descriptor_key_for_key(family, record_key)?,
         generation: payload
             .get("generation")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
-        payload_json,
+        payload_json: String::from_utf8(payload_json).map_err(|err| {
+            MeshDirectoryError::InvalidIdentifier {
+                field: "routing record payload",
+                value: err.to_string(),
+            }
+        })?,
     })
 }
 
@@ -1404,7 +1633,7 @@ pub async fn rebuild_routing_record_projection_from_payload(
             write_descriptor(storage, &expected_descriptor_key, &descriptor).await?;
         }
     }
-    read_routing_record_descriptor(storage, family, record_key).await
+    routing_record_descriptor_from_payload(family, record_key, payload_json.to_vec())
 }
 
 async fn write_descriptor<T: Serialize>(
@@ -1469,18 +1698,6 @@ async fn create_descriptor<T: Serialize>(
     file.write_all(&bytes).await?;
     file.sync_all().await?;
     Ok(())
-}
-
-async fn read_optional_descriptor<T: for<'de> Deserialize<'de>>(
-    storage: &Storage,
-    descriptor_key: &str,
-) -> MeshDirectoryResult<Option<T>> {
-    let path = descriptor_path(storage, descriptor_key)?;
-    match tokio::fs::read(path).await {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err.into()),
-    }
 }
 
 fn descriptor_path(storage: &Storage, descriptor_key: &str) -> MeshDirectoryResult<PathBuf> {
@@ -1892,6 +2109,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn routing_reads_and_lists_use_control_stream_when_projection_is_stale_or_missing() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let tenant_name = TenantName::canonicalize("Acme").unwrap();
+        let tenant_id = TenantId::new("tenant_01").unwrap();
+        let reserved = TenantNameDescriptor::reserved(
+            MeshId::new("mesh_01").unwrap(),
+            tenant_name.clone(),
+            tenant_id.clone(),
+            "req-1",
+            "2026-07-02T00:05:00Z",
+            NOW,
+        )
+        .unwrap();
+        let name_permit = mesh_permit(
+            &storage,
+            RoutingRecordFamily::TenantName,
+            &reserved.partition(),
+        )
+        .await;
+        let name_authority = authority(&name_permit);
+        reserve_tenant_name(&storage, &reserved, name_authority)
+            .await
+            .unwrap();
+        let active =
+            activate_tenant_name(&storage, &tenant_name, &tenant_id, 1, NOW, name_authority)
+                .await
+                .unwrap();
+        let path = descriptor_path(&storage, &active.descriptor_key()).unwrap();
+        let mut stale_projection: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        stale_projection["tenant_id"] = serde_json::json!("tenant_wrong");
+        stale_projection["generation"] = serde_json::json!(99);
+        tokio::fs::write(&path, serde_json::to_vec_pretty(&stale_projection).unwrap())
+            .await
+            .unwrap();
+
+        let read = read_tenant_name_descriptor(&storage, &tenant_name)
+            .await
+            .unwrap()
+            .expect("tenant-name from stream");
+        assert_eq!(read.tenant_id.as_str(), "tenant_01");
+        assert_eq!(read.generation, 2);
+        let repaired_projection: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        assert_eq!(repaired_projection["tenant_id"], "tenant_01");
+        assert_eq!(repaired_projection["generation"], 2);
+
+        tokio::fs::remove_file(&path).await.unwrap();
+        let recovered = read_tenant_name_descriptor(&storage, &tenant_name)
+            .await
+            .unwrap()
+            .expect("tenant-name rebuilt from stream");
+        assert_eq!(recovered.tenant_id.as_str(), "tenant_01");
+        assert!(path.exists());
+
+        let listed = list_routing_records(&storage, Some(RoutingRecordFamily::TenantName))
+            .await
+            .unwrap();
+        let listed_acme = listed
+            .iter()
+            .find(|record| record.record_key == "acme")
+            .expect("acme listed from stream");
+        let listed_payload: serde_json::Value =
+            serde_json::from_str(&listed_acme.payload_json).unwrap();
+        assert_eq!(listed_payload["tenant_id"], "tenant_01");
+        assert_eq!(listed_acme.generation, 2);
+    }
+
+    #[tokio::test]
     async fn tenant_name_reservation_rejects_competing_tenant_ids_and_stale_generations() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
@@ -2037,6 +2324,14 @@ mod tests {
 
         assert_eq!(recovered.status, TenantNameStatus::Tombstoned);
         assert_eq!(recovered.generation, 2);
+
+        let listed = list_routing_records(&storage, Some(RoutingRecordFamily::TenantName))
+            .await
+            .unwrap();
+        assert!(listed.iter().any(|record| {
+            record.record_key == tenant_name.as_str()
+                && record.payload_json.contains("\"status\":\"tombstoned\"")
+        }));
     }
 
     fn locator(tenant_id: &str, bucket_id: &str) -> BucketLocatorDescriptor {

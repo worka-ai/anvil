@@ -725,23 +725,24 @@ impl Persistence {
         &self,
         family_filter: Option<mesh_directory::RoutingRecordFamily>,
     ) -> Result<Vec<mesh_control_stream::ControlProjectionDiagnostic>> {
-        let records = mesh_directory::list_routing_records(&self.storage, family_filter).await?;
         let mut by_stream =
             BTreeMap::<(mesh_directory::RoutingRecordFamily, String), Vec<_>>::new();
-        for record in records {
-            by_stream
-                .entry((record.family, record.partition.clone()))
-                .or_default()
-                .push(mesh_control_stream::ControlProjectionRecord::new(
-                    record.record_key,
-                    record.generation,
-                    record.payload_json.into_bytes(),
-                ));
-        }
         for family in family_filter
             .map(|family| vec![family])
             .unwrap_or_else(|| mesh_directory::RoutingRecordFamily::all().to_vec())
         {
+            for record in
+                mesh_directory::list_projected_routing_records(&self.storage, family).await?
+            {
+                by_stream
+                    .entry((record.family, record.partition.clone()))
+                    .or_default()
+                    .push(mesh_control_stream::ControlProjectionRecord::new(
+                        record.record_key,
+                        record.generation,
+                        record.payload_json.into_bytes(),
+                    ));
+            }
             let stream_family = family.stream_family();
             let family_path = self
                 .storage

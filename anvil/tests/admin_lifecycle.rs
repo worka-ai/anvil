@@ -1037,10 +1037,14 @@ async fn admin_routing_records_list_and_repair_mesh_locators() {
         .unwrap()
         .into_inner()
         .records;
+    let stream_backed_after_delete = missing_after_delete
+        .iter()
+        .find(|record| record.record_key == format!("{}/route-bucket", tenant.id))
+        .expect("routing lists should continue from the control stream when projection is missing");
     assert!(
-        !missing_after_delete
-            .iter()
-            .any(|record| record.record_key == format!("{}/route-bucket", tenant.id))
+        stream_backed_after_delete
+            .payload_json
+            .contains("\"bucket_name\":\"route-bucket\"")
     );
     let diagnostics_after_delete = client
         .list_diagnostics(with_auth(
