@@ -8,11 +8,16 @@ use crate::mesh_lifecycle::{
 };
 use crate::object_links;
 use crate::persistence;
+use crate::repair_finding::{RepairFinding, RepairSubjectRef};
 use crate::routing::{
     self, HostAliasDescriptor as CoreHostAliasDescriptor, HostAliasState as CoreHostAliasState,
     RoutingConfig,
 };
-use crate::{AppState, auth, crypto, mesh_directory, persistence::Bucket};
+use crate::{
+    AppState, auth, authz_repair, crypto, directory_repair, index_repair, mesh_directory,
+    persistence::Bucket, personaldb_repair,
+};
+use serde_json::json;
 use tonic::{Request, Response, Status};
 
 #[tonic::async_trait]
@@ -984,6 +989,135 @@ impl AdminService for AppState {
             idempotent_replay: false,
         }))
     }
+
+    async fn run_repair(
+        &self,
+        request: Request<RunRepairRequest>,
+    ) -> Result<Response<RepairTaskResponse>, Status> {
+        let principal = require_admin(&request, self, AnvilAdminCapability::RunRepair)?;
+        let req = request.into_inner();
+        let context = require_admin_action_context(req.context.as_ref())?;
+        let request_id = context.request_id.clone();
+        let audit_event_id = audit_event_id(&principal, context);
+
+        let response = match req.repair_kind {
+            1 => run_index_repair(self, &request_id, &audit_event_id, &req).await?,
+            2 => run_directory_index_repair(self, &request_id, &audit_event_id, &req).await?,
+            3 => run_authz_derived_index_repair(self, &request_id, &audit_event_id, &req).await?,
+            4 => run_personaldb_log_chain_repair(self, &request_id, &audit_event_id, &req).await?,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "repair_kind must select a supported repair backend",
+                ));
+            }
+        };
+
+        Ok(Response::new(response))
+    }
+
+    async fn list_diagnostics(
+        &self,
+        request: Request<ListDiagnosticsRequest>,
+    ) -> Result<Response<DiagnosticsResponse>, Status> {
+        require_admin(&request, self, AnvilAdminCapability::ViewDiagnostics)?;
+        let req = request.into_inner();
+        let request_id = require_request_id(&req.request_id)?.to_string();
+        let page = req.page.as_ref();
+        let cursor = page
+            .map(|page| page.cursor.trim())
+            .filter(|cursor| !cursor.is_empty())
+            .map(|cursor| {
+                cursor
+                    .parse::<i64>()
+                    .map_err(|_| Status::invalid_argument("diagnostic cursor is invalid"))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let limit = page_limit(page);
+        let source = req.source.trim();
+
+        if !req.severity.trim().is_empty() {
+            validate_diagnostic_severity(&req.severity)?;
+        }
+
+        if source.is_empty() || source == "index" || source == "index_diagnostic_journal" {
+            if !req.tenant_id.trim().is_empty() && !req.bucket_name.trim().is_empty() {
+                let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
+                let bucket = self
+                    .persistence
+                    .get_bucket_by_name(tenant_id, &req.bucket_name)
+                    .await
+                    .map_err(|err| Status::internal(err.to_string()))?
+                    .ok_or_else(|| Status::not_found("Bucket not found"))?;
+                let mut diagnostics = self
+                    .persistence
+                    .list_index_diagnostics(
+                        tenant_id,
+                        bucket.id,
+                        &req.index_name,
+                        &req.severity,
+                        cursor,
+                        i32::try_from(limit + 1)
+                            .map_err(|_| Status::invalid_argument("diagnostic limit is invalid"))?,
+                    )
+                    .await
+                    .map_err(|err| Status::internal(err.to_string()))?
+                    .into_iter()
+                    .map(index_diagnostic_to_admin_record)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let has_more = diagnostics.len() > limit;
+                if has_more {
+                    diagnostics.truncate(limit);
+                }
+                let next_cursor = if has_more {
+                    diagnostics
+                        .last()
+                        .map(|diagnostic| diagnostic.cursor.to_string())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                return Ok(Response::new(DiagnosticsResponse {
+                    request_id,
+                    page: Some(PageResponse {
+                        next_cursor,
+                        has_more,
+                    }),
+                    diagnostics,
+                    data_source: "index_diagnostic_journal".to_string(),
+                }));
+            }
+        }
+
+        Ok(Response::new(DiagnosticsResponse {
+            request_id,
+            page: Some(PageResponse {
+                next_cursor: String::new(),
+                has_more: false,
+            }),
+            diagnostics: Vec::new(),
+            data_source: "no_matching_diagnostic_backend".to_string(),
+        }))
+    }
+
+    async fn list_audit_events(
+        &self,
+        request: Request<ListAuditEventsRequest>,
+    ) -> Result<Response<AuditEventsResponse>, Status> {
+        require_admin(&request, self, AnvilAdminCapability::ViewAuditLog)?;
+        let req = request.into_inner();
+        let request_id = require_request_id(&req.request_id)?.to_string();
+
+        Ok(Response::new(AuditEventsResponse {
+            request_id,
+            page: Some(PageResponse {
+                next_cursor: String::new(),
+                has_more: false,
+            }),
+            events: Vec::new(),
+            data_source: "audit_log_unavailable".to_string(),
+        }))
+    }
 }
 
 fn require_admin<T>(
@@ -1031,6 +1165,336 @@ fn require_mutation_context(
         ));
     }
     Ok(context)
+}
+
+fn require_admin_action_context(
+    context: Option<&AdminRequestContext>,
+) -> Result<&AdminRequestContext, Status> {
+    let context = context.ok_or_else(|| Status::invalid_argument("Missing admin context"))?;
+    require_request_id(&context.request_id)?;
+    if context.idempotency_key.trim().is_empty() {
+        return Err(Status::invalid_argument(
+            "Admin idempotency_key is required",
+        ));
+    }
+    if context.audit_reason.trim().is_empty() {
+        return Err(Status::invalid_argument("Admin audit_reason is required"));
+    }
+    Ok(context)
+}
+
+fn require_request_id(request_id: &str) -> Result<&str, Status> {
+    let request_id = request_id.trim();
+    if request_id.is_empty() {
+        return Err(Status::invalid_argument("Admin request_id is required"));
+    }
+    Ok(request_id)
+}
+
+async fn run_index_repair(
+    state: &AppState,
+    request_id: &str,
+    audit_event_id: &str,
+    req: &RunRepairRequest,
+) -> Result<RepairTaskResponse, Status> {
+    let tenant_id = resolve_tenant_id(state, &req.tenant_id).await?;
+    require_nonempty_admin_field(&req.bucket_name, "bucket_name")?;
+    require_nonempty_admin_field(&req.index_name, "index_name")?;
+    let bucket = state
+        .persistence
+        .get_bucket_by_name(tenant_id, &req.bucket_name)
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?
+        .ok_or_else(|| Status::not_found("Bucket not found"))?;
+    let report = state
+        .persistence
+        .repair_index_from_base_journal(tenant_id, &bucket.name, &req.index_name, req.rebuild)
+        .await
+        .map_err(|err| Status::failed_precondition(err.to_string()))?;
+    let (source_cursor_low, source_cursor_high) = split_u128_admin(report.source_cursor);
+    let findings = report
+        .finding
+        .as_ref()
+        .map(repair_finding_to_admin_proto)
+        .transpose()?
+        .into_iter()
+        .collect::<Vec<_>>();
+    let repair_task_id = findings
+        .first()
+        .map(|finding| finding.repair_task_id.clone())
+        .unwrap_or_default();
+
+    Ok(RepairTaskResponse {
+        request_id: request_id.to_string(),
+        repair_task_id,
+        status: index_repair::status_name(&report.status).to_string(),
+        scope_kind: "index".to_string(),
+        scope_id: format!(
+            "tenant-{tenant_id}-bucket-{}-index-{}",
+            bucket.id, report.index_name
+        ),
+        findings,
+        audit_event_id: audit_event_id.to_string(),
+        details_json: json!({
+            "repair_kind": "index",
+            "bucket_name": report.bucket_name,
+            "index_name": report.index_name,
+            "index_storage_id": report.index_storage_id,
+            "source_cursor_low": source_cursor_low,
+            "source_cursor_high": source_cursor_high,
+            "reason": index_repair::status_reason(&report.status),
+            "rebuilt": report.build.is_some(),
+        })
+        .to_string(),
+    })
+}
+
+async fn run_directory_index_repair(
+    state: &AppState,
+    request_id: &str,
+    audit_event_id: &str,
+    req: &RunRepairRequest,
+) -> Result<RepairTaskResponse, Status> {
+    let tenant_id = resolve_tenant_id(state, &req.tenant_id).await?;
+    require_nonempty_admin_field(&req.bucket_name, "bucket_name")?;
+    let bucket = state
+        .persistence
+        .get_bucket_by_name(tenant_id, &req.bucket_name)
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?
+        .ok_or_else(|| Status::not_found("Bucket not found"))?;
+    let report = state
+        .persistence
+        .repair_directory_index(tenant_id, &bucket.name, req.rebuild)
+        .await
+        .map_err(|err| Status::failed_precondition(err.to_string()))?;
+    let (source_cursor_low, source_cursor_high) = split_u128_admin(report.source_cursor);
+    let findings = report
+        .finding
+        .as_ref()
+        .map(repair_finding_to_admin_proto)
+        .transpose()?
+        .into_iter()
+        .collect::<Vec<_>>();
+    let repair_task_id = findings
+        .first()
+        .map(|finding| finding.repair_task_id.clone())
+        .unwrap_or_default();
+    let actual = report.actual.as_ref();
+
+    Ok(RepairTaskResponse {
+        request_id: request_id.to_string(),
+        repair_task_id,
+        status: directory_repair::status_name(&report.status).to_string(),
+        scope_kind: "bucket".to_string(),
+        scope_id: format!("tenant-{tenant_id}-bucket-{}", bucket.id),
+        findings,
+        audit_event_id: audit_event_id.to_string(),
+        details_json: json!({
+            "repair_kind": "directory_index",
+            "bucket_name": report.bucket_name,
+            "source_cursor_low": source_cursor_low,
+            "source_cursor_high": source_cursor_high,
+            "expected_entry_count": report.expected.entry_count,
+            "actual_entry_count": actual.map(|snapshot| snapshot.entry_count).unwrap_or_default(),
+            "expected_snapshot_hash": report.expected.snapshot_hash,
+            "actual_snapshot_hash": actual.map(|snapshot| snapshot.snapshot_hash.clone()).unwrap_or_default(),
+            "reason": directory_repair::status_reason(&report.status),
+            "rebuilt_manifest_hash": report
+                .rebuilt
+                .as_ref()
+                .map(|rebuilt| rebuilt.manifest_hash.clone())
+                .unwrap_or_default(),
+        })
+        .to_string(),
+    })
+}
+
+async fn run_authz_derived_index_repair(
+    state: &AppState,
+    request_id: &str,
+    audit_event_id: &str,
+    req: &RunRepairRequest,
+) -> Result<RepairTaskResponse, Status> {
+    let tenant_id = resolve_tenant_id(state, &req.tenant_id).await?;
+    require_nonempty_admin_field(&req.derived_index_id, "derived_index_id")?;
+    let report = state
+        .persistence
+        .repair_authz_derived_userset_index(tenant_id, &req.derived_index_id, req.rebuild)
+        .await
+        .map_err(|err| Status::failed_precondition(err.to_string()))?;
+    let findings = report
+        .finding
+        .as_ref()
+        .map(repair_finding_to_admin_proto)
+        .transpose()?
+        .into_iter()
+        .collect::<Vec<_>>();
+    let repair_task_id = findings
+        .first()
+        .map(|finding| finding.repair_task_id.clone())
+        .unwrap_or_default();
+
+    Ok(RepairTaskResponse {
+        request_id: request_id.to_string(),
+        repair_task_id,
+        status: authz_repair::status_name(&report.status).to_string(),
+        scope_kind: "authz_derived_index".to_string(),
+        scope_id: format!("tenant-{tenant_id}-authz-{}", report.derived_index_id),
+        findings,
+        audit_event_id: audit_event_id.to_string(),
+        details_json: json!({
+            "repair_kind": "authz_derived_index",
+            "derived_index_id": report.derived_index_id,
+            "processed_revision": report.processed_revision,
+            "latest_revision": report.latest_revision,
+            "source_records_hash": report.source_records_hash,
+            "reason": authz_repair::status_reason(&report.status),
+            "rebuilt": report.rebuilt_index.is_some(),
+        })
+        .to_string(),
+    })
+}
+
+async fn run_personaldb_log_chain_repair(
+    state: &AppState,
+    request_id: &str,
+    audit_event_id: &str,
+    req: &RunRepairRequest,
+) -> Result<RepairTaskResponse, Status> {
+    let tenant_id = resolve_tenant_id(state, &req.tenant_id).await?;
+    require_nonempty_admin_field(&req.database_id, "database_id")?;
+    let report = state
+        .persistence
+        .repair_personaldb_log_chain(tenant_id, &req.database_id)
+        .await
+        .map_err(|err| Status::failed_precondition(err.to_string()))?;
+    let findings = report
+        .finding
+        .as_ref()
+        .map(repair_finding_to_admin_proto)
+        .transpose()?
+        .into_iter()
+        .collect::<Vec<_>>();
+    let repair_task_id = findings
+        .first()
+        .map(|finding| finding.repair_task_id.clone())
+        .unwrap_or_default();
+
+    Ok(RepairTaskResponse {
+        request_id: request_id.to_string(),
+        repair_task_id,
+        status: personaldb_repair::status_name(&report.status).to_string(),
+        scope_kind: "personaldb".to_string(),
+        scope_id: format!("tenant-{tenant_id}-database-{}", report.database_id),
+        findings,
+        audit_event_id: audit_event_id.to_string(),
+        details_json: json!({
+            "repair_kind": "personaldb_log_chain",
+            "database_id": report.database_id,
+            "committed_log_index": report.committed_log_index,
+            "verified_log_index": report.verified_log_index,
+            "committed_log_hash": report.committed_log_hash,
+            "reason": personaldb_repair::status_reason(&report.status),
+        })
+        .to_string(),
+    })
+}
+
+fn require_nonempty_admin_field(value: &str, field: &'static str) -> Result<(), Status> {
+    if value.trim().is_empty() {
+        return Err(Status::invalid_argument(format!("{field} is required")));
+    }
+    Ok(())
+}
+
+fn validate_diagnostic_severity(value: &str) -> Result<(), Status> {
+    match value {
+        "info" | "warning" | "error" => Ok(()),
+        _ => Err(Status::invalid_argument("Invalid diagnostic severity")),
+    }
+}
+
+fn index_diagnostic_to_admin_record(
+    diagnostic: persistence::IndexDiagnostic,
+) -> Result<DiagnosticRecord, Status> {
+    let cursor =
+        u64::try_from(diagnostic.id).map_err(|_| Status::internal("Invalid diagnostic cursor"))?;
+    Ok(DiagnosticRecord {
+        diagnostic_id: format!("index-diagnostic-{cursor}"),
+        scope_kind: "index".to_string(),
+        scope_id: diagnostic
+            .index_id
+            .map(|index_id| {
+                format!(
+                    "tenant-{}-bucket-{}-index-{}",
+                    diagnostic.tenant_id, diagnostic.bucket_id, index_id
+                )
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "tenant-{}-bucket-{}-index-{}",
+                    diagnostic.tenant_id, diagnostic.bucket_id, diagnostic.index_name
+                )
+            }),
+        source: "index_diagnostic_journal".to_string(),
+        severity: diagnostic.severity,
+        code: diagnostic.code,
+        message: diagnostic.message,
+        object_key: diagnostic.object_key,
+        version_id: diagnostic
+            .version_id
+            .map(|version_id| version_id.to_string())
+            .unwrap_or_default(),
+        details_json: diagnostic.details.to_string(),
+        created_at_nanos: diagnostic
+            .created_at
+            .timestamp_nanos_opt()
+            .ok_or_else(|| Status::internal("Invalid diagnostic timestamp"))?,
+        cursor,
+    })
+}
+
+fn repair_finding_to_admin_proto(finding: &RepairFinding) -> Result<RepairFindingRecord, Status> {
+    Ok(RepairFindingRecord {
+        finding_id: finding.finding_id.clone(),
+        scope_kind: finding.scope_kind.clone(),
+        scope_id: finding.scope_id.clone(),
+        repair_task_id: finding.repair_task_id.clone(),
+        lease_fence_token: finding.lease_fence_token,
+        severity: format!("{:?}", finding.severity),
+        status: format!("{:?}", finding.status),
+        code: finding.code.clone(),
+        message: finding.message.clone(),
+        subjects: finding
+            .subjects
+            .iter()
+            .map(repair_subject_to_admin_proto)
+            .collect(),
+        proposed_action: format!("{:?}", finding.proposed_action),
+        evidence_json: serde_json::to_string(&finding.evidence).unwrap_or_default(),
+        created_at_nanos: finding.created_at_nanos,
+        finding_hash: finding.finding_hash.clone().unwrap_or_default(),
+    })
+}
+
+fn repair_subject_to_admin_proto(subject: &RepairSubjectRef) -> RepairSubjectRecord {
+    let (cursor_low, cursor_high) = subject.cursor.map(split_u128_admin).unwrap_or((0, 0));
+    RepairSubjectRecord {
+        subject_kind: subject.subject_kind.clone(),
+        subject_id: subject.subject_id.clone(),
+        generation: subject.generation.unwrap_or_default(),
+        has_generation: subject.generation.is_some(),
+        cursor_low,
+        cursor_high,
+        has_cursor: subject.cursor.is_some(),
+        expected_hash: subject.expected_hash.clone().unwrap_or_default(),
+        actual_hash: subject.actual_hash.clone().unwrap_or_default(),
+    }
+}
+
+fn split_u128_admin(value: u128) -> (u64, u64) {
+    (value as u64, (value >> 64) as u64)
 }
 
 fn audit_event_id(principal: &AdminPrincipal, context: &AdminRequestContext) -> String {

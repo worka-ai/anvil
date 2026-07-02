@@ -10,7 +10,9 @@ pub enum AnvilAdminCapability {
     ManageRouting,
     ManageHostAliases,
     ManageLinks,
+    RunRepair,
     ViewDiagnostics,
+    ViewAuditLog,
 }
 
 impl AnvilAdminCapability {
@@ -24,7 +26,9 @@ impl AnvilAdminCapability {
             Self::ManageRouting => "manage_routing",
             Self::ManageHostAliases => "manage_host_aliases",
             Self::ManageLinks => "manage_links",
+            Self::RunRepair => "run_repair",
             Self::ViewDiagnostics => "view_diagnostics",
+            Self::ViewAuditLog => "view_audit_log",
         }
     }
 

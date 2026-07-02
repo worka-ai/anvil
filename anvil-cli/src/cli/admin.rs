@@ -52,6 +52,21 @@ pub enum AdminCommands {
         #[clap(subcommand)]
         command: RoutingCommands,
     },
+    /// Run administrative repair jobs
+    Repair {
+        #[clap(subcommand)]
+        command: RepairCommands,
+    },
+    /// List administrative diagnostics
+    Diagnostics {
+        #[clap(subcommand)]
+        command: DiagnosticsCommands,
+    },
+    /// List administrative audit events
+    Audit {
+        #[clap(subcommand)]
+        command: AuditCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -445,6 +460,67 @@ pub enum RoutingCommands {
     },
 }
 
+#[derive(Subcommand)]
+pub enum RepairCommands {
+    /// Run a repair backend synchronously and return its structured report
+    Run {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long, value_enum)]
+        repair_kind: RepairKindArg,
+        #[clap(long)]
+        tenant_id: String,
+        #[clap(long)]
+        bucket_name: Option<String>,
+        #[clap(long)]
+        index_name: Option<String>,
+        #[clap(long)]
+        derived_index_id: Option<String>,
+        #[clap(long)]
+        database_id: Option<String>,
+        #[clap(long, action = clap::ArgAction::SetTrue)]
+        rebuild: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DiagnosticsCommands {
+    /// List diagnostics from available administrative diagnostic backends
+    List {
+        #[clap(long)]
+        request_id: Option<String>,
+        #[clap(long)]
+        source: Option<String>,
+        #[clap(long)]
+        tenant_id: Option<String>,
+        #[clap(long)]
+        bucket_name: Option<String>,
+        #[clap(long)]
+        index_name: Option<String>,
+        #[clap(long)]
+        severity: Option<String>,
+        #[clap(flatten)]
+        page: PageOptions,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AuditCommands {
+    /// List audit events from the administrative audit backend
+    List {
+        #[clap(long)]
+        request_id: Option<String>,
+        #[clap(long)]
+        principal_id: Option<String>,
+        #[clap(long)]
+        resource_id: Option<String>,
+        #[clap(long)]
+        action: Option<String>,
+        #[clap(flatten)]
+        page: PageOptions,
+    },
+}
+
 #[derive(Args, Debug, Clone)]
 pub struct MutationOptions {
     /// AdminRequestContext.request_id. Defaults to a generated UUID.
@@ -557,6 +633,26 @@ impl RoutingRecordFamilyArg {
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum RepairKindArg {
+    Index,
+    DirectoryIndex,
+    AuthzDerivedIndex,
+    #[value(alias = "personal-db-log-chain", alias = "personal_db_log_chain")]
+    PersonaldbLogChain,
+}
+
+impl RepairKindArg {
+    fn to_proto(self) -> i32 {
+        match self {
+            Self::Index => 1,
+            Self::DirectoryIndex => 2,
+            Self::AuthzDerivedIndex => 3,
+            Self::PersonaldbLogChain => 4,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum RegionDrainDispositionArg {
     BlockUntilEmpty,
     RemainProxyOnly,
@@ -652,6 +748,15 @@ pub async fn handle_admin_command(command: &AdminCommands, ctx: &Context) -> any
         }
         AdminCommands::Routing { command } => {
             handle_routing_command(command, &mut client, &token).await?
+        }
+        AdminCommands::Repair { command } => {
+            handle_repair_command(command, &mut client, &token).await?
+        }
+        AdminCommands::Diagnostics { command } => {
+            handle_diagnostics_command(command, &mut client, &token).await?
+        }
+        AdminCommands::Audit { command } => {
+            handle_audit_command(command, &mut client, &token).await?
         }
     }
 
@@ -1387,6 +1492,115 @@ async fn handle_routing_command(
     Ok(())
 }
 
+async fn handle_repair_command(
+    command: &RepairCommands,
+    client: &mut AdminServiceClient<tonic::transport::Channel>,
+    token: &str,
+) -> anyhow::Result<()> {
+    match command {
+        RepairCommands::Run {
+            context,
+            repair_kind,
+            tenant_id,
+            bucket_name,
+            index_name,
+            derived_index_id,
+            database_id,
+            rebuild,
+        } => {
+            let response = client
+                .run_repair(with_auth(
+                    api::RunRepairRequest {
+                        context: Some(context.to_context()),
+                        repair_kind: repair_kind.to_proto(),
+                        tenant_id: tenant_id.clone(),
+                        bucket_name: bucket_name.clone().unwrap_or_default(),
+                        index_name: index_name.clone().unwrap_or_default(),
+                        derived_index_id: derived_index_id.clone().unwrap_or_default(),
+                        database_id: database_id.clone().unwrap_or_default(),
+                        rebuild: *rebuild,
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_diagnostics_command(
+    command: &DiagnosticsCommands,
+    client: &mut AdminServiceClient<tonic::transport::Channel>,
+    token: &str,
+) -> anyhow::Result<()> {
+    match command {
+        DiagnosticsCommands::List {
+            request_id,
+            source,
+            tenant_id,
+            bucket_name,
+            index_name,
+            severity,
+            page,
+        } => {
+            let response = client
+                .list_diagnostics(with_auth(
+                    api::ListDiagnosticsRequest {
+                        request_id: request_id_or_cli(request_id),
+                        source: source.clone().unwrap_or_default(),
+                        tenant_id: tenant_id.clone().unwrap_or_default(),
+                        bucket_name: bucket_name.clone().unwrap_or_default(),
+                        index_name: index_name.clone().unwrap_or_default(),
+                        severity: severity.clone().unwrap_or_default(),
+                        page: page.to_page_request(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_audit_command(
+    command: &AuditCommands,
+    client: &mut AdminServiceClient<tonic::transport::Channel>,
+    token: &str,
+) -> anyhow::Result<()> {
+    match command {
+        AuditCommands::List {
+            request_id,
+            principal_id,
+            resource_id,
+            action,
+            page,
+        } => {
+            let response = client
+                .list_audit_events(with_auth(
+                    api::ListAuditEventsRequest {
+                        request_id: request_id_or_cli(request_id),
+                        principal_id: principal_id.clone().unwrap_or_default(),
+                        resource_id: resource_id.clone().unwrap_or_default(),
+                        action: action.clone().unwrap_or_default(),
+                        page: page.to_page_request(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn with_auth<T>(message: T, token: &str) -> anyhow::Result<tonic::Request<T>> {
     let mut request = tonic::Request::new(message);
     request.metadata_mut().insert(
@@ -1396,6 +1610,12 @@ fn with_auth<T>(message: T, token: &str) -> anyhow::Result<tonic::Request<T>> {
         })?,
     );
     Ok(request)
+}
+
+fn request_id_or_cli(request_id: &Option<String>) -> String {
+    request_id
+        .clone()
+        .unwrap_or_else(|| format!("cli-{}", uuid::Uuid::new_v4()))
 }
 
 fn print_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
@@ -1825,6 +2045,119 @@ mod tests {
     }
 
     #[test]
+    fn repair_diagnostics_and_audit_commands_parse() {
+        let repair_cli = TestAdminCli::try_parse_from([
+            "admin",
+            "repair",
+            "run",
+            "--audit-reason",
+            "verify directory",
+            "--expected-generation",
+            "0",
+            "--repair-kind",
+            "directory-index",
+            "--tenant-id",
+            "acme",
+            "--bucket-name",
+            "releases",
+            "--rebuild",
+        ])
+        .unwrap();
+        let AdminCommands::Repair {
+            command:
+                RepairCommands::Run {
+                    context,
+                    repair_kind,
+                    tenant_id,
+                    bucket_name,
+                    rebuild,
+                    ..
+                },
+        } = repair_cli.command
+        else {
+            panic!("expected repair run command");
+        };
+        assert_eq!(context.audit_reason, "verify directory");
+        assert_eq!(context.expected_generation, 0);
+        assert_eq!(repair_kind.to_proto(), 2);
+        assert_eq!(tenant_id, "acme");
+        assert_eq!(bucket_name.as_deref(), Some("releases"));
+        assert!(rebuild);
+
+        let diagnostics_cli = TestAdminCli::try_parse_from([
+            "admin",
+            "diagnostics",
+            "list",
+            "--request-id",
+            "req-diag",
+            "--source",
+            "index",
+            "--tenant-id",
+            "acme",
+            "--bucket-name",
+            "releases",
+            "--severity",
+            "warning",
+            "--limit",
+            "10",
+        ])
+        .unwrap();
+        let AdminCommands::Diagnostics {
+            command:
+                DiagnosticsCommands::List {
+                    request_id,
+                    source,
+                    tenant_id,
+                    bucket_name,
+                    severity,
+                    page,
+                    ..
+                },
+        } = diagnostics_cli.command
+        else {
+            panic!("expected diagnostics list command");
+        };
+        assert_eq!(request_id.as_deref(), Some("req-diag"));
+        assert_eq!(source.as_deref(), Some("index"));
+        assert_eq!(tenant_id.as_deref(), Some("acme"));
+        assert_eq!(bucket_name.as_deref(), Some("releases"));
+        assert_eq!(severity.as_deref(), Some("warning"));
+        assert_eq!(page.limit, Some(10));
+
+        let audit_cli = TestAdminCli::try_parse_from([
+            "admin",
+            "audit",
+            "list",
+            "--request-id",
+            "req-audit",
+            "--principal-id",
+            "admin-a",
+            "--resource-id",
+            "bucket/releases",
+            "--action",
+            "run_repair",
+        ])
+        .unwrap();
+        let AdminCommands::Audit {
+            command:
+                AuditCommands::List {
+                    request_id,
+                    principal_id,
+                    resource_id,
+                    action,
+                    ..
+                },
+        } = audit_cli.command
+        else {
+            panic!("expected audit list command");
+        };
+        assert_eq!(request_id.as_deref(), Some("req-audit"));
+        assert_eq!(principal_id.as_deref(), Some("admin-a"));
+        assert_eq!(resource_id.as_deref(), Some("bucket/releases"));
+        assert_eq!(action.as_deref(), Some("run_repair"));
+    }
+
+    #[test]
     fn tenant_app_and_bucket_admin_commands_parse() {
         let tenant_cli = TestAdminCli::try_parse_from([
             "admin",
@@ -1920,6 +2253,123 @@ mod tests {
         assert_eq!(tenant_id, "acme");
         assert_eq!(bucket_name, "releases");
         assert!(allow);
+    }
+
+    #[tokio::test]
+    async fn admin_repair_diagnostics_and_audit_handlers_return_structured_responses() {
+        let node = spawn_admin_cli_node().await;
+        let token = admin_token(&node);
+        let mut client = AdminServiceClient::connect(node.admin_url.clone())
+            .await
+            .unwrap();
+
+        client
+            .create_tenant(
+                with_auth(
+                    api::CreateTenantRequest {
+                        context: Some(mutation_options("admin-diag-tenant", 0).to_context()),
+                        name: "acme".to_string(),
+                        home_region: "eu-west-1".to_string(),
+                    },
+                    &token,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        client
+            .create_bucket_admin(
+                with_auth(
+                    api::CreateBucketAdminRequest {
+                        context: Some(mutation_options("admin-diag-bucket", 0).to_context()),
+                        tenant_id: "acme".to_string(),
+                        bucket_name: "releases".to_string(),
+                        region: "eu-west-1".to_string(),
+                    },
+                    &token,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let repair = client
+            .run_repair(
+                with_auth(
+                    api::RunRepairRequest {
+                        context: Some(mutation_options("admin-directory-repair", 0).to_context()),
+                        repair_kind: RepairKindArg::DirectoryIndex.to_proto(),
+                        tenant_id: "acme".to_string(),
+                        bucket_name: "releases".to_string(),
+                        index_name: String::new(),
+                        derived_index_id: String::new(),
+                        database_id: String::new(),
+                        rebuild: false,
+                    },
+                    &token,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(repair.request_id, "req-admin-directory-repair");
+        assert_eq!(repair.status, "empty_source");
+        assert_eq!(repair.scope_kind, "bucket");
+        assert!(repair.findings.is_empty());
+        assert!(repair.audit_event_id.contains("req-admin-directory-repair"));
+
+        let diagnostics = client
+            .list_diagnostics(
+                with_auth(
+                    api::ListDiagnosticsRequest {
+                        request_id: "req-admin-diagnostics".to_string(),
+                        source: "index".to_string(),
+                        tenant_id: "acme".to_string(),
+                        bucket_name: "releases".to_string(),
+                        index_name: String::new(),
+                        severity: String::new(),
+                        page: Some(api::PageRequest {
+                            cursor: String::new(),
+                            limit: 5,
+                        }),
+                    },
+                    &token,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(diagnostics.request_id, "req-admin-diagnostics");
+        assert_eq!(diagnostics.data_source, "index_diagnostic_journal");
+        assert!(diagnostics.diagnostics.is_empty());
+        assert!(!diagnostics.page.unwrap().has_more);
+
+        let audit = client
+            .list_audit_events(
+                with_auth(
+                    api::ListAuditEventsRequest {
+                        request_id: "req-admin-audit".to_string(),
+                        principal_id: "admin-a".to_string(),
+                        resource_id: "bucket/releases".to_string(),
+                        action: "run_repair".to_string(),
+                        page: Some(api::PageRequest {
+                            cursor: String::new(),
+                            limit: 5,
+                        }),
+                    },
+                    &token,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(audit.request_id, "req-admin-audit");
+        assert_eq!(audit.data_source, "audit_log_unavailable");
+        assert!(audit.events.is_empty());
+        assert!(!audit.page.unwrap().has_more);
     }
 
     #[tokio::test]

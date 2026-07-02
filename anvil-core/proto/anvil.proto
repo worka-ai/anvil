@@ -44,6 +44,10 @@ service AdminService {
 
   rpc ListRoutingRecords(ListRoutingRecordsRequest) returns (ListRoutingRecordsResponse);
   rpc RepairRoutingRecord(RepairRoutingRecordRequest) returns (AdminMutationResponse);
+
+  rpc RunRepair(RunRepairRequest) returns (RepairTaskResponse);
+  rpc ListDiagnostics(ListDiagnosticsRequest) returns (DiagnosticsResponse);
+  rpc ListAuditEvents(ListAuditEventsRequest) returns (AuditEventsResponse);
 }
 
 message AdminRequestContext {
@@ -134,6 +138,14 @@ enum RoutingRecordFamily {
   ROUTING_RECORD_FAMILY_TENANT_LOCATOR = 2;
   ROUTING_RECORD_FAMILY_BUCKET_LOCATOR = 3;
   ROUTING_RECORD_FAMILY_HOST_ALIAS = 4;
+}
+
+enum RepairKind {
+  REPAIR_KIND_UNSPECIFIED = 0;
+  REPAIR_KIND_INDEX = 1;
+  REPAIR_KIND_DIRECTORY_INDEX = 2;
+  REPAIR_KIND_AUTHZ_DERIVED_INDEX = 3;
+  REPAIR_KIND_PERSONALDB_LOG_CHAIN = 4;
 }
 
 message NodeDrainDescriptor {
@@ -546,6 +558,86 @@ message RepairRoutingRecordRequest {
   AdminRequestContext context = 1;
   RoutingRecordFamily family = 2;
   string record_key = 3;
+}
+
+message RunRepairRequest {
+  AdminRequestContext context = 1;
+  RepairKind repair_kind = 2;
+  string tenant_id = 3;
+  string bucket_name = 4;
+  string index_name = 5;
+  string derived_index_id = 6;
+  string database_id = 7;
+  bool rebuild = 8;
+}
+
+message RepairTaskResponse {
+  string request_id = 1;
+  string repair_task_id = 2;
+  string status = 3;
+  string scope_kind = 4;
+  string scope_id = 5;
+  repeated RepairFindingRecord findings = 6;
+  string audit_event_id = 7;
+  string details_json = 8;
+}
+
+message ListDiagnosticsRequest {
+  string request_id = 1;
+  string source = 2;
+  string tenant_id = 3;
+  string bucket_name = 4;
+  string index_name = 5;
+  string severity = 6;
+  PageRequest page = 7;
+}
+
+message DiagnosticRecord {
+  string diagnostic_id = 1;
+  string scope_kind = 2;
+  string scope_id = 3;
+  string source = 4;
+  string severity = 5;
+  string code = 6;
+  string message = 7;
+  string object_key = 8;
+  string version_id = 9;
+  string details_json = 10;
+  int64 created_at_nanos = 11;
+  uint64 cursor = 12;
+}
+
+message DiagnosticsResponse {
+  string request_id = 1;
+  PageResponse page = 2;
+  repeated DiagnosticRecord diagnostics = 3;
+  string data_source = 4;
+}
+
+message ListAuditEventsRequest {
+  string request_id = 1;
+  string principal_id = 2;
+  string resource_id = 3;
+  string action = 4;
+  PageRequest page = 5;
+}
+
+message AuditEventRecord {
+  string audit_event_id = 1;
+  string request_id = 2;
+  string principal_id = 3;
+  string resource_id = 4;
+  string action = 5;
+  string audit_reason = 6;
+  string created_at = 7;
+  string details_json = 8;
+}
+
+message AuditEventsResponse {
+  string request_id = 1;
+  PageResponse page = 2;
+  repeated AuditEventRecord events = 3;
+  string data_source = 4;
 }
 
 // Bucket Service
