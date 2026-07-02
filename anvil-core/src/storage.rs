@@ -99,6 +99,23 @@ impl Storage {
             .join("mesh")
     }
 
+    pub fn mesh_control_stream_path(
+        &self,
+        stream_family: &str,
+        partition: &str,
+    ) -> Result<PathBuf> {
+        ensure_safe_internal_component(stream_family, "control stream family")?;
+        ensure_control_stream_partition(partition)?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("control")
+            .join("v1")
+            .join("streams")
+            .join(stream_family)
+            .join(format!("{partition}.anlog")))
+    }
+
     pub fn metadata_journal_path(&self, tenant_id: i64, bucket_id: i64) -> PathBuf {
         self.storage_path
             .join("_anvil")
@@ -1106,6 +1123,18 @@ fn ensure_safe_internal_component(value: &str, context: &str) -> Result<()> {
 fn ensure_hash_hex(value: &str, context: &str) -> Result<()> {
     if value.len() != 64 || !value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
         anyhow::bail!("{context} must be 32 bytes encoded as hex");
+    }
+    Ok(())
+}
+
+fn ensure_control_stream_partition(value: &str) -> Result<()> {
+    if value.len() != 4
+        || !value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        anyhow::bail!("control stream partition must be four lowercase hex characters");
     }
     Ok(())
 }
