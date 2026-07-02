@@ -1,7 +1,9 @@
 use crate::mesh_control_stream::{
-    ControlRecordDigest, ControlStreamSequence, read_control_checkpoint, read_control_stream_log,
+    ControlRecordDigest, ControlStreamFrame, ControlStreamSequence, read_control_checkpoint,
+    read_control_stream_log,
 };
 use crate::mesh_directory::{self, BucketLocatorDescriptor, BucketLocatorStatus};
+use crate::partition_fence::{self, PartitionWritePermit};
 use crate::routing::{self, HostAliasDescriptor, HostAliasState, RoutingConfig};
 use crate::storage::Storage;
 use chrono::{SecondsFormat, Utc};
@@ -16,6 +18,10 @@ pub const CELL_DESCRIPTOR_SCHEMA: &str = "anvil.mesh.cell.v1";
 pub const NODE_DESCRIPTOR_SCHEMA: &str = "anvil.mesh.node.v1";
 pub const ACTIVATION_CHECKPOINT_SCHEMA: &str = "anvil.mesh.activation_checkpoint.v1";
 pub const BUCKET_DRAIN_EXCEPTION_SCHEMA: &str = "anvil.mesh.bucket_drain_exception.v1";
+pub const REGION_DESCRIPTOR_STREAM_FAMILY: &str = "region_descriptor";
+pub const CELL_DESCRIPTOR_STREAM_FAMILY: &str = "cell_descriptor";
+pub const NODE_DESCRIPTOR_STREAM_FAMILY: &str = "node_descriptor";
+const CONTROL_MUTATION_SCHEMA: &str = "anvil.mesh.control_mutation.v1";
 
 #[derive(Debug, Error)]
 pub enum LifecycleError {
@@ -245,6 +251,12 @@ pub struct BucketDrainExceptionInput {
     pub expires_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct LifecycleControlWriteAuthority<'a> {
+    pub permit: &'a PartitionWritePermit,
+    pub signing_key: &'a [u8],
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MeshLifecycleState {
     pub regions: BTreeMap<String, RegionDescriptor>,
@@ -284,6 +296,22 @@ pub async fn create_region(
     storage: &Storage,
     input: CreateRegionDescriptor,
 ) -> LifecycleResult<RegionDescriptor> {
+    create_region_inner(storage, input, None).await
+}
+
+pub async fn create_region_with_control(
+    storage: &Storage,
+    input: CreateRegionDescriptor,
+    authority: LifecycleControlWriteAuthority<'_>,
+) -> LifecycleResult<RegionDescriptor> {
+    create_region_inner(storage, input, Some(authority)).await
+}
+
+async fn create_region_inner(
+    storage: &Storage,
+    input: CreateRegionDescriptor,
+    authority: Option<LifecycleControlWriteAuthority<'_>>,
+) -> LifecycleResult<RegionDescriptor> {
     require_identifier(&input.mesh_id, "mesh id")?;
     require_identifier(&input.region, "region")?;
     require_nonempty(&input.public_base_url, "public base url")?;
@@ -317,6 +345,21 @@ pub async fn create_region(
     state
         .regions
         .insert(descriptor.region.clone(), descriptor.clone());
+    if let Some(authority) = authority {
+        append_lifecycle_control_mutation(
+            storage,
+            REGION_DESCRIPTOR_STREAM_FAMILY,
+            &lifecycle_control_partition(REGION_DESCRIPTOR_STREAM_FAMILY, &descriptor.region),
+            &descriptor.region,
+            "create",
+            None,
+            descriptor.generation,
+            &descriptor.mesh_id,
+            &descriptor,
+            authority,
+        )
+        .await?;
+    }
     write_state(storage, &state).await?;
     Ok(descriptor)
 }
@@ -326,6 +369,33 @@ pub async fn transition_region(
     region: &str,
     expected_generation: u64,
     target: LifecycleState,
+) -> LifecycleResult<RegionDescriptor> {
+    transition_region_inner(storage, region, expected_generation, target, None).await
+}
+
+pub async fn transition_region_with_control(
+    storage: &Storage,
+    region: &str,
+    expected_generation: u64,
+    target: LifecycleState,
+    authority: LifecycleControlWriteAuthority<'_>,
+) -> LifecycleResult<RegionDescriptor> {
+    transition_region_inner(
+        storage,
+        region,
+        expected_generation,
+        target,
+        Some(authority),
+    )
+    .await
+}
+
+async fn transition_region_inner(
+    storage: &Storage,
+    region: &str,
+    expected_generation: u64,
+    target: LifecycleState,
+    authority: Option<LifecycleControlWriteAuthority<'_>>,
 ) -> LifecycleResult<RegionDescriptor> {
     require_identifier(region, "region")?;
     let mut state = read_state(storage).await?;
@@ -359,6 +429,21 @@ pub async fn transition_region(
     descriptor.updated_at = timestamp_now();
     descriptor.generation = descriptor.generation.saturating_add(1);
     let out = descriptor.clone();
+    if let Some(authority) = authority {
+        append_lifecycle_control_mutation(
+            storage,
+            REGION_DESCRIPTOR_STREAM_FAMILY,
+            &lifecycle_control_partition(REGION_DESCRIPTOR_STREAM_FAMILY, &out.region),
+            &out.region,
+            "upsert",
+            Some(expected_generation),
+            out.generation,
+            &out.mesh_id,
+            &out,
+            authority,
+        )
+        .await?;
+    }
     write_state(storage, &state).await?;
     Ok(out)
 }
@@ -375,6 +460,33 @@ pub async fn activate_region(
     region: &str,
     expected_generation: u64,
     checkpoint: &ActivationCheckpoint,
+) -> LifecycleResult<RegionDescriptor> {
+    activate_region_inner(storage, region, expected_generation, checkpoint, None).await
+}
+
+pub async fn activate_region_with_control(
+    storage: &Storage,
+    region: &str,
+    expected_generation: u64,
+    checkpoint: &ActivationCheckpoint,
+    authority: LifecycleControlWriteAuthority<'_>,
+) -> LifecycleResult<RegionDescriptor> {
+    activate_region_inner(
+        storage,
+        region,
+        expected_generation,
+        checkpoint,
+        Some(authority),
+    )
+    .await
+}
+
+async fn activate_region_inner(
+    storage: &Storage,
+    region: &str,
+    expected_generation: u64,
+    checkpoint: &ActivationCheckpoint,
+    authority: Option<LifecycleControlWriteAuthority<'_>>,
 ) -> LifecycleResult<RegionDescriptor> {
     require_identifier(region, "region")?;
 
@@ -410,6 +522,21 @@ pub async fn activate_region(
     descriptor.updated_at = timestamp_now();
     descriptor.generation = descriptor.generation.saturating_add(1);
     let out = descriptor.clone();
+    if let Some(authority) = authority {
+        append_lifecycle_control_mutation(
+            storage,
+            REGION_DESCRIPTOR_STREAM_FAMILY,
+            &lifecycle_control_partition(REGION_DESCRIPTOR_STREAM_FAMILY, &out.region),
+            &out.region,
+            "upsert",
+            Some(expected_generation),
+            out.generation,
+            &out.mesh_id,
+            &out,
+            authority,
+        )
+        .await?;
+    }
     write_state(storage, &state).await?;
     Ok(out)
 }
@@ -448,6 +575,22 @@ pub async fn register_cell(
     storage: &Storage,
     input: RegisterCellDescriptor,
 ) -> LifecycleResult<CellDescriptor> {
+    register_cell_inner(storage, input, None).await
+}
+
+pub async fn register_cell_with_control(
+    storage: &Storage,
+    input: RegisterCellDescriptor,
+    authority: LifecycleControlWriteAuthority<'_>,
+) -> LifecycleResult<CellDescriptor> {
+    register_cell_inner(storage, input, Some(authority)).await
+}
+
+async fn register_cell_inner(
+    storage: &Storage,
+    input: RegisterCellDescriptor,
+    authority: Option<LifecycleControlWriteAuthority<'_>>,
+) -> LifecycleResult<CellDescriptor> {
     require_identifier(&input.mesh_id, "mesh id")?;
     require_identifier(&input.region, "region")?;
     require_identifier(&input.cell_id, "cell id")?;
@@ -480,6 +623,22 @@ pub async fn register_cell(
         generation: 1,
     };
     state.cells.insert(key, descriptor.clone());
+    if let Some(authority) = authority {
+        let record_key = cell_record_key(&descriptor.region, &descriptor.cell_id)?;
+        append_lifecycle_control_mutation(
+            storage,
+            CELL_DESCRIPTOR_STREAM_FAMILY,
+            &lifecycle_control_partition(CELL_DESCRIPTOR_STREAM_FAMILY, &record_key),
+            &record_key,
+            "create",
+            None,
+            descriptor.generation,
+            &descriptor.mesh_id,
+            &descriptor,
+            authority,
+        )
+        .await?;
+    }
     write_state(storage, &state).await?;
     Ok(descriptor)
 }
@@ -490,6 +649,36 @@ pub async fn transition_cell(
     cell_id: &str,
     expected_generation: u64,
     target: LifecycleState,
+) -> LifecycleResult<CellDescriptor> {
+    transition_cell_inner(storage, region, cell_id, expected_generation, target, None).await
+}
+
+pub async fn transition_cell_with_control(
+    storage: &Storage,
+    region: &str,
+    cell_id: &str,
+    expected_generation: u64,
+    target: LifecycleState,
+    authority: LifecycleControlWriteAuthority<'_>,
+) -> LifecycleResult<CellDescriptor> {
+    transition_cell_inner(
+        storage,
+        region,
+        cell_id,
+        expected_generation,
+        target,
+        Some(authority),
+    )
+    .await
+}
+
+async fn transition_cell_inner(
+    storage: &Storage,
+    region: &str,
+    cell_id: &str,
+    expected_generation: u64,
+    target: LifecycleState,
+    authority: Option<LifecycleControlWriteAuthority<'_>>,
 ) -> LifecycleResult<CellDescriptor> {
     let key = cell_key(region, cell_id)?;
     let mut state = read_state(storage).await?;
@@ -513,6 +702,22 @@ pub async fn transition_cell(
     descriptor.updated_at = timestamp_now();
     descriptor.generation = descriptor.generation.saturating_add(1);
     let out = descriptor.clone();
+    if let Some(authority) = authority {
+        let record_key = cell_record_key(&out.region, &out.cell_id)?;
+        append_lifecycle_control_mutation(
+            storage,
+            CELL_DESCRIPTOR_STREAM_FAMILY,
+            &lifecycle_control_partition(CELL_DESCRIPTOR_STREAM_FAMILY, &record_key),
+            &record_key,
+            "upsert",
+            Some(expected_generation),
+            out.generation,
+            &out.mesh_id,
+            &out,
+            authority,
+        )
+        .await?;
+    }
     write_state(storage, &state).await?;
     Ok(out)
 }
@@ -538,6 +743,22 @@ pub async fn list_cells(
 pub async fn register_node(
     storage: &Storage,
     input: RegisterNodeDescriptor,
+) -> LifecycleResult<NodeDescriptor> {
+    register_node_inner(storage, input, None).await
+}
+
+pub async fn register_node_with_control(
+    storage: &Storage,
+    input: RegisterNodeDescriptor,
+    authority: LifecycleControlWriteAuthority<'_>,
+) -> LifecycleResult<NodeDescriptor> {
+    register_node_inner(storage, input, Some(authority)).await
+}
+
+async fn register_node_inner(
+    storage: &Storage,
+    input: RegisterNodeDescriptor,
+    authority: Option<LifecycleControlWriteAuthority<'_>>,
 ) -> LifecycleResult<NodeDescriptor> {
     require_identifier(&input.mesh_id, "mesh id")?;
     require_identifier(&input.node_id, "node id")?;
@@ -593,6 +814,23 @@ pub async fn register_node(
     state
         .nodes
         .insert(descriptor.node_id.clone(), descriptor.clone());
+    if let Some(authority) = authority {
+        let record_key =
+            node_record_key(&descriptor.region, &descriptor.cell_id, &descriptor.node_id)?;
+        append_lifecycle_control_mutation(
+            storage,
+            NODE_DESCRIPTOR_STREAM_FAMILY,
+            &lifecycle_control_partition(NODE_DESCRIPTOR_STREAM_FAMILY, &record_key),
+            &record_key,
+            "create",
+            None,
+            descriptor.generation,
+            &descriptor.mesh_id,
+            &descriptor,
+            authority,
+        )
+        .await?;
+    }
     write_state(storage, &state).await?;
     Ok(descriptor)
 }
@@ -603,6 +841,36 @@ pub async fn transition_node(
     expected_generation: u64,
     target: LifecycleState,
     drain: Option<NodeDrainDescriptor>,
+) -> LifecycleResult<NodeDescriptor> {
+    transition_node_inner(storage, node_id, expected_generation, target, drain, None).await
+}
+
+pub async fn transition_node_with_control(
+    storage: &Storage,
+    node_id: &str,
+    expected_generation: u64,
+    target: LifecycleState,
+    drain: Option<NodeDrainDescriptor>,
+    authority: LifecycleControlWriteAuthority<'_>,
+) -> LifecycleResult<NodeDescriptor> {
+    transition_node_inner(
+        storage,
+        node_id,
+        expected_generation,
+        target,
+        drain,
+        Some(authority),
+    )
+    .await
+}
+
+async fn transition_node_inner(
+    storage: &Storage,
+    node_id: &str,
+    expected_generation: u64,
+    target: LifecycleState,
+    drain: Option<NodeDrainDescriptor>,
+    authority: Option<LifecycleControlWriteAuthority<'_>>,
 ) -> LifecycleResult<NodeDescriptor> {
     require_identifier(node_id, "node id")?;
     let mut state = read_state(storage).await?;
@@ -642,6 +910,22 @@ pub async fn transition_node(
     descriptor.updated_at = timestamp_now();
     descriptor.generation = descriptor.generation.saturating_add(1);
     let out = descriptor.clone();
+    if let Some(authority) = authority {
+        let record_key = node_record_key(&out.region, &out.cell_id, &out.node_id)?;
+        append_lifecycle_control_mutation(
+            storage,
+            NODE_DESCRIPTOR_STREAM_FAMILY,
+            &lifecycle_control_partition(NODE_DESCRIPTOR_STREAM_FAMILY, &record_key),
+            &record_key,
+            "upsert",
+            Some(expected_generation),
+            out.generation,
+            &out.mesh_id,
+            &out,
+            authority,
+        )
+        .await?;
+    }
     write_state(storage, &state).await?;
     Ok(out)
 }
@@ -1194,6 +1478,123 @@ pub fn bucket_drain_exception_key(region: &str, tenant_id: &str, bucket_name: &s
     format!("{region}/{tenant_id}/{bucket_name}")
 }
 
+pub fn lifecycle_control_partition(stream_family: &str, record_key: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(stream_family.as_bytes());
+    hasher.update(b":");
+    hasher.update(record_key.as_bytes());
+    let digest = hasher.finalize();
+    let bytes = digest.as_bytes();
+    format!("{:02x}{:02x}", bytes[0], bytes[1])
+}
+
+pub fn lifecycle_control_stream_families() -> [&'static str; 3] {
+    [
+        REGION_DESCRIPTOR_STREAM_FAMILY,
+        CELL_DESCRIPTOR_STREAM_FAMILY,
+        NODE_DESCRIPTOR_STREAM_FAMILY,
+    ]
+}
+
+async fn append_lifecycle_control_mutation<T: Serialize>(
+    storage: &Storage,
+    stream_family: &str,
+    partition: &str,
+    record_key: &str,
+    operation: &str,
+    expected_generation: Option<u64>,
+    new_generation: u64,
+    mesh_id: &str,
+    payload: &T,
+    authority: LifecycleControlWriteAuthority<'_>,
+) -> LifecycleResult<()> {
+    require_identifier(stream_family, "control stream family")?;
+    require_identifier(partition, "control stream partition")?;
+    require_control_record_key(record_key)?;
+    let expected_partition_id = mesh_directory::control_partition_id(stream_family, partition);
+    if authority.permit.partition_family != mesh_directory::CONTROL_PARTITION_FAMILY {
+        return Err(LifecycleError::InvalidArgument(format!(
+            "invalid lifecycle control write permit: expected partition family {}, got {}",
+            mesh_directory::CONTROL_PARTITION_FAMILY,
+            authority.permit.partition_family
+        )));
+    }
+    if authority.permit.partition_id != expected_partition_id {
+        return Err(LifecycleError::InvalidArgument(
+            "invalid lifecycle control write permit: partition id does not match stream"
+                .to_string(),
+        ));
+    }
+    partition_fence::validate_partition_write(storage, authority.permit, authority.signing_key)
+        .await
+        .map_err(|rejection| {
+            LifecycleError::InvalidArgument(format!(
+                "lifecycle control write fence rejected for {stream_family}/{partition}: {}: {}",
+                rejection.code.as_str(),
+                rejection.reason
+            ))
+        })?;
+
+    let stream_path = storage
+        .mesh_control_stream_path(stream_family, partition)
+        .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
+    let existing_log = read_control_stream_log(&stream_path)
+        .await
+        .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
+    let sequence = existing_log
+        .records
+        .last()
+        .map(|record| record.metadata.sequence.get().saturating_add(1))
+        .unwrap_or(1);
+    let payload_json = serde_json::to_vec(payload)?;
+    let digest = ControlRecordDigest::blake3(&payload_json);
+    let header_json = serde_json::to_vec(&serde_json::json!({
+        "schema": CONTROL_MUTATION_SCHEMA,
+        "mesh_id": mesh_id,
+        "stream_family": stream_family,
+        "partition": partition,
+        "sequence": ControlStreamSequence::new(sequence)
+            .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?,
+        "record_key": record_key,
+        "operation": operation,
+        "expected_generation": expected_generation,
+        "new_generation": new_generation,
+        "writer_node_id": authority.permit.owner_node_id.as_str(),
+        "writer_fence": authority.permit.fence_token,
+        "idempotency_key": null,
+        "record_digest": digest.as_str(),
+        "created_at": Utc::now().to_rfc3339(),
+    }))?;
+    let frame = ControlStreamFrame::new(header_json, payload_json);
+    crate::mesh_control_stream::append_control_stream_frame(stream_path, &frame)
+        .await
+        .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
+    Ok(())
+}
+
+fn cell_record_key(region: &str, cell_id: &str) -> LifecycleResult<String> {
+    require_identifier(region, "cell record region")?;
+    require_identifier(cell_id, "cell record cell id")?;
+    Ok(format!("{region}/{cell_id}"))
+}
+
+fn node_record_key(region: &str, cell_id: &str, node_id: &str) -> LifecycleResult<String> {
+    require_identifier(region, "node record region")?;
+    require_identifier(cell_id, "node record cell id")?;
+    require_identifier(node_id, "node record node id")?;
+    Ok(format!("{region}/{cell_id}/{node_id}"))
+}
+
+fn require_control_record_key(value: &str) -> LifecycleResult<()> {
+    require_nonempty(value, "control record key")?;
+    if value.contains("//") || value.chars().any(|ch| ch == '\0' || ch.is_control()) {
+        return Err(LifecycleError::InvalidArgument(
+            "control record key contains an invalid character".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_generation(
     resource_kind: &'static str,
     resource_id: &str,
@@ -1359,8 +1760,11 @@ async fn existing_control_stream_partitions(
     storage: &Storage,
 ) -> LifecycleResult<Vec<(String, String)>> {
     let mut streams = Vec::new();
-    for family in mesh_directory::RoutingRecordFamily::all() {
-        let stream_family = family.stream_family();
+    let stream_families = mesh_directory::RoutingRecordFamily::all()
+        .into_iter()
+        .map(|family| family.stream_family())
+        .chain(lifecycle_control_stream_families().into_iter());
+    for stream_family in stream_families {
         let family_path = storage
             .mesh_control_stream_family_path(stream_family)
             .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;

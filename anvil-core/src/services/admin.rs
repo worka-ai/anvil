@@ -772,14 +772,11 @@ impl AdminService for AppState {
         let checkpoint =
             mesh_lifecycle::parse_activation_checkpoint_json(&req.activation_checkpoint_json)
                 .map_err(lifecycle_status)?;
-        let region = mesh_lifecycle::activate_region(
-            &self.storage,
-            &req.region,
-            context.expected_generation,
-            &checkpoint,
-        )
-        .await
-        .map_err(lifecycle_status)?;
+        let region = self
+            .persistence
+            .activate_region_descriptor(&req.region, context.expected_generation, &checkpoint)
+            .await
+            .map_err(lifecycle_status)?;
         let mut details = region_audit_details(&region);
         add_audit_detail(&mut details, "activation_checkpoint", json!(&checkpoint));
         let audit_event_id = record_admin_audit_event(

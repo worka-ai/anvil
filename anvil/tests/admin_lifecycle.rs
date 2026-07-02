@@ -126,24 +126,16 @@ fn context(label: &str, expected_generation: u64) -> AdminRequestContext {
     }
 }
 
-fn empty_activation_checkpoint_json(mesh_id: &str, region: &str) -> String {
-    serde_json::json!({
-        "schema": anvil::mesh_lifecycle::ACTIVATION_CHECKPOINT_SCHEMA,
-        "mesh_id": mesh_id,
-        "region": region,
-        "created_at": "2026-07-02T00:00:00Z",
-        "required_streams": []
-    })
-    .to_string()
-}
-
 async fn activation_checkpoint_json_from_existing_streams(
     node: &AdminNode,
     region: &str,
 ) -> String {
     let mut required_streams = Vec::new();
-    for family in anvil::mesh_directory::RoutingRecordFamily::all() {
-        let stream_family = family.stream_family();
+    let stream_families = anvil::mesh_directory::RoutingRecordFamily::all()
+        .into_iter()
+        .map(|family| family.stream_family())
+        .chain(anvil::mesh_lifecycle::lifecycle_control_stream_families().into_iter());
+    for stream_family in stream_families {
         let family_path = node
             .state
             .storage
@@ -516,10 +508,11 @@ async fn admin_lifecycle_rejects_invalid_region_cell_and_node_transitions() {
             tonic::Request::new(ActivateRegionRequest {
                 context: Some(context("activate-region", region.generation)),
                 region: "eu-west-1".to_string(),
-                activation_checkpoint_json: empty_activation_checkpoint_json(
-                    "mesh-test",
+                activation_checkpoint_json: activation_checkpoint_json_from_existing_streams(
+                    &node,
                     "eu-west-1",
-                ),
+                )
+                .await,
             }),
             &token,
         ))
@@ -569,10 +562,11 @@ async fn admin_lifecycle_rejects_invalid_region_cell_and_node_transitions() {
                     read_only_region.generation,
                 )),
                 region: "eu-west-1".to_string(),
-                activation_checkpoint_json: empty_activation_checkpoint_json(
-                    "mesh-test",
+                activation_checkpoint_json: activation_checkpoint_json_from_existing_streams(
+                    &node,
                     "eu-west-1",
-                ),
+                )
+                .await,
             }),
             &token,
         ))
@@ -771,10 +765,11 @@ async fn admin_region_drain_applies_bucket_dispositions_and_exceptions() {
             tonic::Request::new(ActivateRegionRequest {
                 context: Some(context("activate-drain-region", region.generation)),
                 region: "eu-west-1".to_string(),
-                activation_checkpoint_json: empty_activation_checkpoint_json(
-                    "mesh-test",
+                activation_checkpoint_json: activation_checkpoint_json_from_existing_streams(
+                    &node,
                     "eu-west-1",
-                ),
+                )
+                .await,
             }),
             &token,
         ))
@@ -1227,10 +1222,11 @@ async fn admin_host_aliases_are_generation_checked_and_lifecycle_managed() {
             tonic::Request::new(ActivateRegionRequest {
                 context: Some(context("alias-activate-region", region.generation)),
                 region: "eu-west-1".to_string(),
-                activation_checkpoint_json: empty_activation_checkpoint_json(
-                    "mesh-test",
+                activation_checkpoint_json: activation_checkpoint_json_from_existing_streams(
+                    &node,
                     "eu-west-1",
-                ),
+                )
+                .await,
             }),
             &token,
         ))

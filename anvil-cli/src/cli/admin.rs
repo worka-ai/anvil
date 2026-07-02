@@ -1785,8 +1785,67 @@ mod tests {
             .unwrap()
     }
 
-    fn write_empty_activation_checkpoint(temp: &TempDir, file_name: &str) -> PathBuf {
-        let path = temp.path().join(file_name);
+    async fn write_activation_checkpoint_from_existing_streams(
+        node: &AdminCliNode,
+        file_name: &str,
+    ) -> PathBuf {
+        let path = node._temp.path().join(file_name);
+        let mut required_streams = Vec::new();
+        let stream_families = anvil::mesh_directory::RoutingRecordFamily::all()
+            .into_iter()
+            .map(|family| family.stream_family())
+            .chain(anvil::mesh_lifecycle::lifecycle_control_stream_families().into_iter());
+        for stream_family in stream_families {
+            let family_path = node
+                .state
+                .storage
+                .mesh_control_stream_family_path(stream_family)
+                .unwrap();
+            let mut entries = match tokio::fs::read_dir(&family_path).await {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => panic!("read control stream directory {family_path:?}: {err}"),
+            };
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                let path = entry.path();
+                if path.extension().and_then(|value| value.to_str()) != Some("anlog") {
+                    continue;
+                }
+                let Some(partition) = path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                let log = anvil::mesh_control_stream::read_control_stream_log(&path)
+                    .await
+                    .unwrap();
+                let Some(record) = log.records.last() else {
+                    continue;
+                };
+                anvil::mesh_control_stream::write_control_checkpoint(
+                    &node.state.storage,
+                    &anvil::mesh_control_stream::ControlCheckpointRecord::new(
+                        "mesh-cli-test",
+                        "eu-west-1",
+                        stream_family,
+                        &partition,
+                        record.metadata.sequence,
+                        record.metadata.record_digest.clone(),
+                        "2026-07-02T00:00:00Z",
+                    ),
+                )
+                .await
+                .unwrap();
+                required_streams.push(serde_json::json!({
+                    "stream_family": stream_family,
+                    "partition": partition,
+                    "sequence": record.metadata.sequence.get(),
+                    "digest": record.metadata.record_digest.as_str(),
+                }));
+            }
+        }
         std::fs::write(
             &path,
             serde_json::json!({
@@ -1794,7 +1853,7 @@ mod tests {
                 "mesh_id": "mesh-cli-test",
                 "region": "eu-west-1",
                 "created_at": "2026-07-02T00:00:00Z",
-                "required_streams": []
+                "required_streams": required_streams
             })
             .to_string(),
         )
@@ -2515,7 +2574,7 @@ mod tests {
             .next()
             .unwrap();
         let activation_checkpoint =
-            write_empty_activation_checkpoint(&node._temp, "activate-region.json");
+            write_activation_checkpoint_from_existing_streams(&node, "activate-region.json").await;
         handle_region_command(
             &RegionCommands::Activate {
                 context: mutation_options("cli-activate-region", region.generation),

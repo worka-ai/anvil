@@ -1059,14 +1059,37 @@ impl Persistence {
         .await
     }
 
+    async fn mesh_control_write_permit_for_stream(
+        &self,
+        stream_family: &str,
+        partition: &str,
+    ) -> Result<PartitionWritePermit> {
+        self.ensure_mesh_control_stream_ownership(stream_family, partition)
+            .await?;
+        self.global_write_permit(
+            mesh_directory::CONTROL_PARTITION_FAMILY,
+            mesh_directory::control_partition_id(stream_family, partition),
+        )
+        .await
+    }
+
     async fn ensure_mesh_control_ownership(
         &self,
         family: mesh_directory::RoutingRecordFamily,
         partition: &str,
     ) -> Result<()> {
+        self.ensure_mesh_control_stream_ownership(family.stream_family(), partition)
+            .await
+    }
+
+    async fn ensure_mesh_control_stream_ownership(
+        &self,
+        stream_family: &str,
+        partition: &str,
+    ) -> Result<()> {
         let resource = OwnershipResource {
             resource_kind: OwnershipResourceKind::ControlPartition,
-            resource_id: format!("{}/{}", family.stream_family(), partition),
+            resource_id: format!("{stream_family}/{partition}"),
         };
         let owner = self.ownership_principal();
         let now_nanos = Utc::now()
@@ -1505,7 +1528,28 @@ impl Persistence {
         &self,
         input: crate::mesh_lifecycle::CreateRegionDescriptor,
     ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::RegionDescriptor> {
-        crate::mesh_lifecycle::create_region(&self.storage, input).await
+        let partition = crate::mesh_lifecycle::lifecycle_control_partition(
+            crate::mesh_lifecycle::REGION_DESCRIPTOR_STREAM_FAMILY,
+            &input.region,
+        );
+        let permit = self
+            .mesh_control_write_permit_for_stream(
+                crate::mesh_lifecycle::REGION_DESCRIPTOR_STREAM_FAMILY,
+                &partition,
+            )
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        crate::mesh_lifecycle::create_region_with_control(
+            &self.storage,
+            input,
+            crate::mesh_lifecycle::LifecycleControlWriteAuthority {
+                permit: &permit,
+                signing_key: &self.partition_owner_signing_key,
+            },
+        )
+        .await
     }
 
     pub async fn transition_region_descriptor(
@@ -1514,8 +1558,62 @@ impl Persistence {
         expected_generation: u64,
         target: crate::mesh_lifecycle::LifecycleState,
     ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::RegionDescriptor> {
-        crate::mesh_lifecycle::transition_region(&self.storage, region, expected_generation, target)
+        let partition = crate::mesh_lifecycle::lifecycle_control_partition(
+            crate::mesh_lifecycle::REGION_DESCRIPTOR_STREAM_FAMILY,
+            region,
+        );
+        let permit = self
+            .mesh_control_write_permit_for_stream(
+                crate::mesh_lifecycle::REGION_DESCRIPTOR_STREAM_FAMILY,
+                &partition,
+            )
             .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        crate::mesh_lifecycle::transition_region_with_control(
+            &self.storage,
+            region,
+            expected_generation,
+            target,
+            crate::mesh_lifecycle::LifecycleControlWriteAuthority {
+                permit: &permit,
+                signing_key: &self.partition_owner_signing_key,
+            },
+        )
+        .await
+    }
+
+    pub async fn activate_region_descriptor(
+        &self,
+        region: &str,
+        expected_generation: u64,
+        checkpoint: &crate::mesh_lifecycle::ActivationCheckpoint,
+    ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::RegionDescriptor> {
+        let partition = crate::mesh_lifecycle::lifecycle_control_partition(
+            crate::mesh_lifecycle::REGION_DESCRIPTOR_STREAM_FAMILY,
+            region,
+        );
+        let permit = self
+            .mesh_control_write_permit_for_stream(
+                crate::mesh_lifecycle::REGION_DESCRIPTOR_STREAM_FAMILY,
+                &partition,
+            )
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        crate::mesh_lifecycle::activate_region_with_control(
+            &self.storage,
+            region,
+            expected_generation,
+            checkpoint,
+            crate::mesh_lifecycle::LifecycleControlWriteAuthority {
+                permit: &permit,
+                signing_key: &self.partition_owner_signing_key,
+            },
+        )
+        .await
     }
 
     pub async fn list_region_descriptors(
@@ -1528,7 +1626,29 @@ impl Persistence {
         &self,
         input: crate::mesh_lifecycle::RegisterCellDescriptor,
     ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::CellDescriptor> {
-        crate::mesh_lifecycle::register_cell(&self.storage, input).await
+        let record_key = format!("{}/{}", input.region, input.cell_id);
+        let partition = crate::mesh_lifecycle::lifecycle_control_partition(
+            crate::mesh_lifecycle::CELL_DESCRIPTOR_STREAM_FAMILY,
+            &record_key,
+        );
+        let permit = self
+            .mesh_control_write_permit_for_stream(
+                crate::mesh_lifecycle::CELL_DESCRIPTOR_STREAM_FAMILY,
+                &partition,
+            )
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        crate::mesh_lifecycle::register_cell_with_control(
+            &self.storage,
+            input,
+            crate::mesh_lifecycle::LifecycleControlWriteAuthority {
+                permit: &permit,
+                signing_key: &self.partition_owner_signing_key,
+            },
+        )
+        .await
     }
 
     pub async fn transition_cell_descriptor(
@@ -1538,12 +1658,30 @@ impl Persistence {
         expected_generation: u64,
         target: crate::mesh_lifecycle::LifecycleState,
     ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::CellDescriptor> {
-        crate::mesh_lifecycle::transition_cell(
+        let record_key = format!("{region}/{cell_id}");
+        let partition = crate::mesh_lifecycle::lifecycle_control_partition(
+            crate::mesh_lifecycle::CELL_DESCRIPTOR_STREAM_FAMILY,
+            &record_key,
+        );
+        let permit = self
+            .mesh_control_write_permit_for_stream(
+                crate::mesh_lifecycle::CELL_DESCRIPTOR_STREAM_FAMILY,
+                &partition,
+            )
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        crate::mesh_lifecycle::transition_cell_with_control(
             &self.storage,
             region,
             cell_id,
             expected_generation,
             target,
+            crate::mesh_lifecycle::LifecycleControlWriteAuthority {
+                permit: &permit,
+                signing_key: &self.partition_owner_signing_key,
+            },
         )
         .await
     }
@@ -1559,7 +1697,29 @@ impl Persistence {
         &self,
         input: crate::mesh_lifecycle::RegisterNodeDescriptor,
     ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::NodeDescriptor> {
-        crate::mesh_lifecycle::register_node(&self.storage, input).await
+        let record_key = format!("{}/{}/{}", input.region, input.cell_id, input.node_id);
+        let partition = crate::mesh_lifecycle::lifecycle_control_partition(
+            crate::mesh_lifecycle::NODE_DESCRIPTOR_STREAM_FAMILY,
+            &record_key,
+        );
+        let permit = self
+            .mesh_control_write_permit_for_stream(
+                crate::mesh_lifecycle::NODE_DESCRIPTOR_STREAM_FAMILY,
+                &partition,
+            )
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        crate::mesh_lifecycle::register_node_with_control(
+            &self.storage,
+            input,
+            crate::mesh_lifecycle::LifecycleControlWriteAuthority {
+                permit: &permit,
+                signing_key: &self.partition_owner_signing_key,
+            },
+        )
+        .await
     }
 
     pub async fn transition_node_descriptor(
@@ -1569,12 +1729,38 @@ impl Persistence {
         target: crate::mesh_lifecycle::LifecycleState,
         drain: Option<crate::mesh_lifecycle::NodeDrainDescriptor>,
     ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::NodeDescriptor> {
-        crate::mesh_lifecycle::transition_node(
+        let node = crate::mesh_lifecycle::list_nodes(&self.storage, None, None)
+            .await?
+            .into_iter()
+            .find(|node| node.node_id == node_id)
+            .ok_or_else(|| crate::mesh_lifecycle::LifecycleError::NotFound {
+                resource_kind: "node",
+                resource_id: node_id.to_string(),
+            })?;
+        let record_key = format!("{}/{}/{}", node.region, node.cell_id, node.node_id);
+        let partition = crate::mesh_lifecycle::lifecycle_control_partition(
+            crate::mesh_lifecycle::NODE_DESCRIPTOR_STREAM_FAMILY,
+            &record_key,
+        );
+        let permit = self
+            .mesh_control_write_permit_for_stream(
+                crate::mesh_lifecycle::NODE_DESCRIPTOR_STREAM_FAMILY,
+                &partition,
+            )
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        crate::mesh_lifecycle::transition_node_with_control(
             &self.storage,
             node_id,
             expected_generation,
             target,
             drain,
+            crate::mesh_lifecycle::LifecycleControlWriteAuthority {
+                permit: &permit,
+                signing_key: &self.partition_owner_signing_key,
+            },
         )
         .await
     }
