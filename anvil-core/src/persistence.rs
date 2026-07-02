@@ -3915,6 +3915,9 @@ impl Persistence {
 }
 
 fn persistence_owner_node_id(config: &Config) -> String {
+    if !config.node_id.is_empty() {
+        return config.node_id.clone();
+    }
     if !config.public_api_addr.is_empty() {
         return config.public_api_addr.clone();
     }

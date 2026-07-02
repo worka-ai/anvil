@@ -583,6 +583,9 @@ impl AppState {
     }
 
     fn personaldb_node_id(&self) -> String {
+        if !self.config.node_id.is_empty() {
+            return self.config.node_id.clone();
+        }
         if !self.config.public_api_addr.is_empty() {
             return self.config.public_api_addr.clone();
         }

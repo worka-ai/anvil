@@ -1,4 +1,7 @@
 use clap::Parser;
+use std::path::{Path, PathBuf};
+
+use anyhow::Result;
 
 /// A distributed storage and compute system.
 #[derive(Parser, Debug, Clone, Default)]
@@ -49,10 +52,16 @@ pub struct Config {
     pub public_region_base_domain: String,
 
     /// Path used by operators to persist this node's stable lifecycle identity.
+    /// Defaults to `<storage_path>/node-id` when left empty.
     #[arg(long, env, default_value = "")]
     pub node_id_path: String,
 
+    /// Resolved stable node id loaded from `node_id_path` during startup.
+    #[arg(skip)]
+    pub node_id: String,
+
     /// Path used to persist the libp2p keypair backing the cluster identity.
+    /// Defaults to `<storage_path>/cluster-keypair.pb` when left empty.
     #[arg(long, env, default_value = "")]
     pub cluster_keypair_path: String,
 
@@ -106,5 +115,77 @@ impl Config {
         let mut me = Self::default();
         args.clone_into(&mut me);
         me
+    }
+
+    pub fn resolved_node_id_path(&self) -> PathBuf {
+        resolve_identity_path(
+            &self.node_id_path,
+            &self.storage_path,
+            crate::cluster_identity::DEFAULT_NODE_ID_FILE,
+        )
+    }
+
+    pub fn resolved_cluster_keypair_path(&self) -> PathBuf {
+        resolve_identity_path(
+            &self.cluster_keypair_path,
+            &self.storage_path,
+            crate::cluster_identity::DEFAULT_CLUSTER_KEYPAIR_FILE,
+        )
+    }
+
+    pub fn with_persisted_identity(mut self) -> Result<Self> {
+        let node_id_path = self.resolved_node_id_path();
+        let cluster_keypair_path = self.resolved_cluster_keypair_path();
+
+        self.node_id = crate::cluster_identity::load_or_create_node_id(&node_id_path)?;
+        crate::cluster_identity::load_or_create_cluster_keypair(&cluster_keypair_path)?;
+        self.node_id_path = node_id_path.to_string_lossy().into_owned();
+        self.cluster_keypair_path = cluster_keypair_path.to_string_lossy().into_owned();
+
+        Ok(self)
+    }
+}
+
+fn resolve_identity_path(configured_path: &str, storage_path: &str, default_file: &str) -> PathBuf {
+    let configured_path = configured_path.trim();
+    if configured_path.is_empty() {
+        return Path::new(storage_path).join(default_file);
+    }
+    PathBuf::from(configured_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn persisted_identity_uses_storage_defaults_and_reloads() {
+        let temp = tempdir().unwrap();
+        let storage_path = temp.path().join("storage");
+        let config = Config {
+            storage_path: storage_path.to_string_lossy().into_owned(),
+            ..Config::default()
+        };
+
+        let first = config.with_persisted_identity().unwrap();
+        let restarted = Config {
+            storage_path: storage_path.to_string_lossy().into_owned(),
+            ..Config::default()
+        }
+        .with_persisted_identity()
+        .unwrap();
+
+        assert_eq!(first.node_id, restarted.node_id);
+        assert_eq!(
+            PathBuf::from(&first.node_id_path),
+            storage_path.join("node-id")
+        );
+        assert_eq!(
+            PathBuf::from(&first.cluster_keypair_path),
+            storage_path.join("cluster-keypair.pb")
+        );
+        assert!(Path::new(&first.node_id_path).exists());
+        assert!(Path::new(&first.cluster_keypair_path).exists());
     }
 }

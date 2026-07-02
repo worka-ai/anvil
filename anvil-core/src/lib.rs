@@ -24,6 +24,7 @@ pub mod bucket_journal;
 pub mod bucket_manager;
 pub mod cache;
 pub mod cluster;
+pub mod cluster_identity;
 pub mod config;
 pub mod control_journal;
 pub mod crypto;
@@ -130,6 +131,7 @@ impl AppState {
         config: Config,
         event_publisher: Option<tokio::sync::mpsc::Sender<cluster::MetadataEvent>>,
     ) -> Result<Self> {
+        let config = config.with_persisted_identity()?;
         let arc_config = Arc::new(config);
         let jwt_manager = Arc::new(JwtManager::new(arc_config.jwt_secret.clone()));
         let storage = storage::Storage::new_at(&arc_config.storage_path).await?;
