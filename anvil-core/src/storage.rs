@@ -116,6 +116,27 @@ impl Storage {
             .join(format!("{partition}.anlog")))
     }
 
+    pub fn admin_audit_event_root(&self) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("control")
+            .join("admin-audit")
+    }
+
+    pub fn admin_audit_event_path(
+        &self,
+        created_at: &str,
+        audit_event_id: &str,
+    ) -> Result<PathBuf> {
+        let day = created_at.get(0..10).unwrap_or("unknown-day");
+        ensure_safe_internal_component(day, "admin audit day")?;
+        let digest = blake3::hash(audit_event_id.as_bytes()).to_hex().to_string();
+        Ok(self
+            .admin_audit_event_root()
+            .join(day)
+            .join(format!("{digest}.json")))
+    }
+
     pub fn metadata_journal_path(&self, tenant_id: i64, bucket_id: i64) -> PathBuf {
         self.storage_path
             .join("_anvil")

@@ -1,4 +1,5 @@
 use super::admin_cursor::{self, AdminCursorBinding};
+use crate::admin_audit::{self, AdminAuditEvent, AuditEventFilter};
 use crate::admin_auth::{self, AdminPrincipal, AnvilAdminCapability};
 use crate::anvil_api::admin_service_server::AdminService;
 use crate::anvil_api::*;
@@ -18,6 +19,7 @@ use crate::{
     AppState, auth, authz_repair, crypto, directory_repair, index_repair, mesh_directory,
     persistence::Bucket, personaldb_repair,
 };
+use chrono::Utc;
 use serde_json::json;
 use tonic::{Request, Response, Status};
 
@@ -1090,6 +1092,20 @@ impl AdminService for AppState {
                 ));
             }
         };
+        record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.repair.run",
+            &response.repair_task_id,
+            json!({
+                "repair_kind": req.repair_kind,
+                "scope_kind": response.scope_kind,
+                "scope_id": response.scope_id,
+                "status": response.status,
+            }),
+        )
+        .await?;
 
         Ok(Response::new(response))
     }
@@ -1183,18 +1199,71 @@ impl AdminService for AppState {
         &self,
         request: Request<ListAuditEventsRequest>,
     ) -> Result<Response<AuditEventsResponse>, Status> {
-        require_admin(&request, self, AnvilAdminCapability::ViewAuditLog)?;
+        let principal = require_admin(&request, self, AnvilAdminCapability::ViewAuditLog)?;
         let req = request.into_inner();
         let request_id = require_request_id(&req.request_id)?.to_string();
+        let page = req.page.as_ref();
+        let limit = page_limit(page);
+        let mut events = admin_audit::list_audit_events(
+            &self.storage,
+            AuditEventFilter {
+                principal_id: none_if_empty(&req.principal_id),
+                resource_id: none_if_empty(&req.resource_id),
+                action: none_if_empty(&req.action),
+            },
+        )
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
+        let revision = admin_cursor::collection_revision(
+            events
+                .iter()
+                .map(|event| (event.audit_event_id.as_str(), 1_u64)),
+        );
+        let filters = [
+            ("principal_id", req.principal_id.as_str()),
+            ("resource_id", req.resource_id.as_str()),
+            ("action", req.action.as_str()),
+        ];
+        let binding = AdminCursorBinding {
+            scope: "admin.list_audit_events.v1",
+            filters: &filters,
+            principal: &principal,
+            limit,
+            revision: &revision,
+            sort: "created_at.audit_event_id.asc",
+        };
+        let cursor =
+            admin_cursor::decode_page_cursor(page, &binding, self.config.jwt_secret.as_bytes())?;
+        events.retain(|event| {
+            cursor
+                .as_deref()
+                .is_none_or(|cursor| audit_cursor_position(event).as_str() > cursor)
+        });
+        events.truncate(limit + 1);
+        let has_more = events.len() > limit;
+        if has_more {
+            events.truncate(limit);
+        }
+        let next_cursor = if has_more {
+            events.last().map_or(Ok(String::new()), |event| {
+                admin_cursor::encode_next_cursor(
+                    &audit_cursor_position(event),
+                    &binding,
+                    self.config.jwt_secret.as_bytes(),
+                )
+            })?
+        } else {
+            String::new()
+        };
 
         Ok(Response::new(AuditEventsResponse {
             request_id,
             page: Some(PageResponse {
-                next_cursor: String::new(),
-                has_more: false,
+                next_cursor,
+                has_more,
             }),
-            events: Vec::new(),
-            data_source: "audit_log_unavailable".to_string(),
+            events: events.into_iter().map(audit_event_to_proto).collect(),
+            data_source: "admin_audit_log".to_string(),
         }))
     }
 }
@@ -1578,6 +1647,50 @@ fn split_u128_admin(value: u128) -> (u64, u64) {
 
 fn audit_event_id(principal: &AdminPrincipal, context: &AdminRequestContext) -> String {
     format!("audit:{}:{}", principal.principal_id, context.request_id)
+}
+
+async fn record_admin_audit_event(
+    state: &AppState,
+    principal: &AdminPrincipal,
+    context: &AdminRequestContext,
+    action: &str,
+    resource_id: &str,
+    details: serde_json::Value,
+) -> Result<String, Status> {
+    let audit_event_id = audit_event_id(principal, context);
+    let event = AdminAuditEvent {
+        schema: admin_audit::ADMIN_AUDIT_EVENT_SCHEMA.to_string(),
+        audit_event_id: audit_event_id.clone(),
+        request_id: context.request_id.clone(),
+        principal_id: principal.principal_id.clone(),
+        resource_id: resource_id.to_string(),
+        action: action.to_string(),
+        audit_reason: context.audit_reason.clone(),
+        created_at: Utc::now().to_rfc3339(),
+        details_json: serde_json::to_string(&details)
+            .map_err(|_| Status::internal("Failed to encode admin audit details"))?,
+    };
+    admin_audit::append_audit_event(&state.storage, &event)
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
+    Ok(audit_event_id)
+}
+
+fn audit_cursor_position(event: &AdminAuditEvent) -> String {
+    format!("{}:{}", event.created_at, event.audit_event_id)
+}
+
+fn audit_event_to_proto(event: AdminAuditEvent) -> AuditEventRecord {
+    AuditEventRecord {
+        audit_event_id: event.audit_event_id,
+        request_id: event.request_id,
+        principal_id: event.principal_id,
+        resource_id: event.resource_id,
+        action: event.action,
+        audit_reason: event.audit_reason,
+        created_at: event.created_at,
+        details_json: event.details_json,
+    }
 }
 
 fn principal_label(principal: &AdminPrincipal) -> String {

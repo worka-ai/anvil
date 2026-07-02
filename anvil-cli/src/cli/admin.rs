@@ -2384,9 +2384,9 @@ mod tests {
                 with_auth(
                     api::ListAuditEventsRequest {
                         request_id: "req-admin-audit".to_string(),
-                        principal_id: "admin-a".to_string(),
-                        resource_id: "bucket/releases".to_string(),
-                        action: "run_repair".to_string(),
+                        principal_id: String::new(),
+                        resource_id: String::new(),
+                        action: "admin.repair.run".to_string(),
                         page: Some(api::PageRequest {
                             cursor: String::new(),
                             limit: 5,
@@ -2400,8 +2400,10 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(audit.request_id, "req-admin-audit");
-        assert_eq!(audit.data_source, "audit_log_unavailable");
-        assert!(audit.events.is_empty());
+        assert_eq!(audit.data_source, "admin_audit_log");
+        assert_eq!(audit.events.len(), 1);
+        assert_eq!(audit.events[0].request_id, "req-admin-directory-repair");
+        assert_eq!(audit.events[0].action, "admin.repair.run");
         assert!(!audit.page.unwrap().has_more);
     }
 
