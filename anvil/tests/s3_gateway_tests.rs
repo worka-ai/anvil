@@ -4,6 +4,8 @@ use anvil::anvil_api::{
     CreateIndexRequest, GetAccessTokenRequest, IndexKind, QueryIndexRequest,
     SetPublicAccessRequest, WriteAuthzTupleRequest,
 };
+use anvil::mesh_lifecycle::{CreateHostAliasDescriptor, CreateRegionDescriptor, LifecycleState};
+use anvil::routing::{HostAliasState, RoutingConfig};
 use anvil::storage::{DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES, ExternalChunkManifest};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
@@ -266,6 +268,7 @@ async fn get_token_for_scopes(
 async fn test_s3_regional_host_routing_reads_same_object_and_rejects_dotted_hosts() {
     let mut cluster = TestCluster::new_with_config(&["test-region-1"], |config| {
         config.public_region_base_domain = "test-region-1.anvil-storage.test".to_string();
+        config.mesh_id = "mesh-test".to_string();
     })
     .await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
@@ -345,6 +348,97 @@ async fn test_s3_regional_host_routing_reads_same_object_and_rejects_dotted_host
         .await
         .expect("dotted tenant host form should send");
     assert_eq!(dotted_tenant.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_s3_custom_host_alias_routes_to_bucket_prefix() {
+    let mut cluster = TestCluster::new_with_config(&["test-region-1"], |config| {
+        config.public_region_base_domain = "test-region-1.anvil-storage.test".to_string();
+        config.mesh_id = "mesh-test".to_string();
+    })
+    .await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
+    let s3 = s3_client(http_base, "test-app", "test-secret");
+    let bucket = format!("host-alias-{}", uuid::Uuid::new_v4());
+    let key = "public/latest.exe";
+    let body = b"custom host alias resolves through the configured prefix";
+
+    s3.create_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("CreateBucket should succeed");
+    s3.put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(body))
+        .send()
+        .await
+        .expect("PutObject should succeed");
+
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut public_req = tonic::Request::new(SetPublicAccessRequest {
+        bucket: bucket.clone(),
+        allow_public_read: true,
+    });
+    public_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", cluster.token).parse().unwrap(),
+    );
+    auth_client.set_public_access(public_req).await.unwrap();
+
+    let persistence = &cluster.states[0].persistence;
+    let region = persistence
+        .create_region_descriptor(CreateRegionDescriptor {
+            mesh_id: cluster.states[0].config.mesh_id.clone(),
+            region: "test-region-1".to_string(),
+            public_base_url: "https://test-region-1.anvil-storage.test".to_string(),
+            virtual_host_suffix: "test-region-1.anvil-storage.test".to_string(),
+            placement_weight: 100,
+            default_cell: None,
+        })
+        .await
+        .expect("region descriptor should be created");
+    persistence
+        .transition_region_descriptor("test-region-1", region.generation, LifecycleState::Active)
+        .await
+        .expect("region descriptor should activate");
+
+    let hostname = format!("assets-{}.example.test", uuid::Uuid::new_v4().simple());
+    let routing_config =
+        RoutingConfig::new("anvil-storage.test").expect("valid routing base domain");
+    let alias = persistence
+        .create_host_alias_descriptor(
+            &routing_config,
+            CreateHostAliasDescriptor {
+                hostname: hostname.clone(),
+                tenant_id: "default".to_string(),
+                bucket_name: bucket.clone(),
+                region: "test-region-1".to_string(),
+                prefix: "public/".to_string(),
+            },
+        )
+        .await
+        .expect("host alias should be created");
+    let alias = persistence
+        .transition_host_alias_descriptor(&hostname, alias.generation, HostAliasState::Active)
+        .await
+        .expect("host alias should activate");
+    assert_eq!(alias.state, HostAliasState::Active);
+
+    let response = reqwest::Client::new()
+        .get(format!("{http_base}/latest.exe"))
+        .header(reqwest::header::HOST, hostname)
+        .send()
+        .await
+        .expect("custom host alias GET should send");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.bytes().await.unwrap().as_ref(), body);
 }
 
 #[tokio::test]

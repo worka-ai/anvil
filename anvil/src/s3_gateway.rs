@@ -8,7 +8,9 @@ use anvil_core::object_manager::{ObjectLinkReadMode, ObjectWriteOptions};
 use anvil_core::observability::RESERVED_NAMESPACE_REJECTION_COUNT;
 use anvil_core::permissions::AnvilAction;
 use anvil_core::persistence::Object;
-use anvil_core::routing::{self, ObjectRoute, RouteRequest, RoutingConfig, RoutingError};
+use anvil_core::routing::{
+    self, HostAliasDescriptor, ObjectRoute, RouteRequest, RoutingConfig, RoutingError,
+};
 use anvil_core::validation;
 use axum::{
     Router,
@@ -148,9 +150,10 @@ async fn s3_host_routing(State(state): State<AppState>, mut req: Request, next: 
         return next.run(req).await;
     };
 
-    // TODO: Load active custom host aliases from the mesh directory once the
-    // host-alias storage hot path is available to the S3 gateway.
-    let aliases = [];
+    let aliases = match active_s3_host_aliases(&state).await {
+        Ok(aliases) => aliases,
+        Err(response) => return response,
+    };
     match routing::parse_object_route(
         RouteRequest {
             host: &host,
@@ -168,6 +171,20 @@ async fn s3_host_routing(State(state): State<AppState>, mut req: Request, next: 
         }
         Err(RoutingError::UnknownHost) => next.run(req).await,
         Err(err) => s3_routing_error(err),
+    }
+}
+
+async fn active_s3_host_aliases(state: &AppState) -> Result<Vec<HostAliasDescriptor>, Response> {
+    match state.persistence.list_host_alias_descriptors(None).await {
+        Ok(aliases) => Ok(aliases
+            .into_iter()
+            .filter(|alias| alias.state == routing::HostAliasState::Active)
+            .collect()),
+        Err(error) => Err(s3_error(
+            "InternalError",
+            &format!("Failed to load host aliases: {error}"),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        )),
     }
 }
 
