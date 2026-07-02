@@ -1,6 +1,9 @@
 use crate::validation;
+use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+pub const HOST_ALIAS_DESCRIPTOR_SCHEMA: &str = "anvil.mesh.host_alias.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingConfig {
@@ -19,12 +22,15 @@ impl RoutingConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostAliasDescriptor {
+    pub schema: String,
     pub hostname: String,
     pub tenant_id: String,
     pub bucket_name: String,
     pub region: String,
     pub prefix: String,
     pub state: HostAliasState,
+    pub created_at: String,
+    pub updated_at: String,
     pub generation: u64,
 }
 
@@ -37,17 +43,21 @@ impl HostAliasDescriptor {
         prefix: impl Into<String>,
         config: &RoutingConfig,
     ) -> Result<Self, RoutingError> {
-        let hostname = normalize_host(&hostname.into())?;
+        let hostname = normalize_alias_hostname(&hostname.into())?;
         if native_host_kind(&hostname, &config.base_domain).is_some() {
             return Err(RoutingError::NativeHostAliasOverlap);
         }
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         Ok(Self {
+            schema: HOST_ALIAS_DESCRIPTOR_SCHEMA.to_string(),
             hostname,
             tenant_id: tenant_id.into(),
             bucket_name: bucket_name.into(),
             region: region.into(),
             prefix: prefix.into(),
             state: HostAliasState::Active,
+            created_at: now.clone(),
+            updated_at: now,
             generation: 1,
         })
     }
@@ -60,6 +70,10 @@ pub enum HostAliasState {
     Active,
     Suspended,
     Deleted,
+}
+
+pub fn normalize_alias_hostname(hostname: &str) -> Result<String, RoutingError> {
+    normalize_host(hostname)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

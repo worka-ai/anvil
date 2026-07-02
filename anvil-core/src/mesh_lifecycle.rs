@@ -1,3 +1,4 @@
+use crate::routing::{self, HostAliasDescriptor, HostAliasState, RoutingConfig};
 use crate::storage::Storage;
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -155,11 +156,22 @@ pub struct RegisterNodeDescriptor {
     pub capabilities: Vec<NodeCapability>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateHostAliasDescriptor {
+    pub hostname: String,
+    pub tenant_id: String,
+    pub bucket_name: String,
+    pub region: String,
+    pub prefix: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MeshLifecycleState {
     pub regions: BTreeMap<String, RegionDescriptor>,
     pub cells: BTreeMap<String, CellDescriptor>,
     pub nodes: BTreeMap<String, NodeDescriptor>,
+    #[serde(default)]
+    pub host_aliases: BTreeMap<String, HostAliasDescriptor>,
 }
 
 pub async fn read_state(storage: &Storage) -> LifecycleResult<MeshLifecycleState> {
@@ -488,6 +500,145 @@ pub async fn list_nodes(
     Ok(nodes)
 }
 
+pub async fn create_host_alias(
+    storage: &Storage,
+    config: &RoutingConfig,
+    input: CreateHostAliasDescriptor,
+) -> LifecycleResult<HostAliasDescriptor> {
+    require_identifier(&input.tenant_id, "tenant id")?;
+    require_identifier(&input.bucket_name, "bucket name")?;
+    require_identifier(&input.region, "region")?;
+    let hostname = routing::normalize_alias_hostname(&input.hostname)
+        .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
+
+    let mut state = read_state(storage).await?;
+    match state.regions.get(&input.region) {
+        Some(region) if region.state == LifecycleState::Active => {}
+        Some(_) => {
+            return Err(LifecycleError::InvalidArgument(
+                "host alias region must be active".to_string(),
+            ));
+        }
+        None => {
+            return Err(LifecycleError::NotFound {
+                resource_kind: "region",
+                resource_id: input.region,
+            });
+        }
+    }
+    if state.host_aliases.contains_key(&hostname) {
+        return Err(LifecycleError::AlreadyExists {
+            resource_kind: "host alias",
+            resource_id: hostname,
+        });
+    }
+
+    let mut descriptor = HostAliasDescriptor::active(
+        hostname,
+        input.tenant_id,
+        input.bucket_name,
+        input.region,
+        input.prefix,
+        config,
+    )
+    .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
+    descriptor.state = HostAliasState::PendingVerification;
+    let out = descriptor.clone();
+    state.host_aliases.insert(out.hostname.clone(), descriptor);
+    write_state(storage, &state).await?;
+    Ok(out)
+}
+
+pub async fn transition_host_alias(
+    storage: &Storage,
+    hostname: &str,
+    expected_generation: u64,
+    target: HostAliasState,
+) -> LifecycleResult<HostAliasDescriptor> {
+    let hostname = routing::normalize_alias_hostname(hostname)
+        .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
+    let mut state = read_state(storage).await?;
+    let descriptor =
+        state
+            .host_aliases
+            .get_mut(&hostname)
+            .ok_or_else(|| LifecycleError::NotFound {
+                resource_kind: "host alias",
+                resource_id: hostname.clone(),
+            })?;
+    ensure_generation(
+        "host alias",
+        &hostname,
+        descriptor.generation,
+        expected_generation,
+    )?;
+    validate_host_alias_transition(descriptor.state, target).map_err(|_| {
+        LifecycleError::LifecycleTransitionDenied {
+            resource_kind: "host alias",
+            resource_id: hostname.clone(),
+            from: lifecycle_state_for_host_alias(descriptor.state),
+            to: lifecycle_state_for_host_alias(target),
+        }
+    })?;
+    descriptor.state = target;
+    descriptor.updated_at = timestamp_now();
+    descriptor.generation = descriptor.generation.saturating_add(1);
+    let out = descriptor.clone();
+    write_state(storage, &state).await?;
+    Ok(out)
+}
+
+pub async fn list_host_aliases(
+    storage: &Storage,
+    region_filter: Option<&str>,
+) -> LifecycleResult<Vec<HostAliasDescriptor>> {
+    if let Some(region) = region_filter.filter(|region| !region.is_empty()) {
+        require_identifier(region, "region")?;
+    }
+    Ok(read_state(storage)
+        .await?
+        .host_aliases
+        .into_values()
+        .filter(|alias| {
+            region_filter.is_none_or(|region| region.is_empty() || alias.region == region)
+        })
+        .collect())
+}
+
+pub fn validate_host_alias_transition(
+    from: HostAliasState,
+    to: HostAliasState,
+) -> LifecycleResult<()> {
+    use HostAliasState::*;
+    if matches!(
+        (from, to),
+        (PendingVerification, Active)
+            | (PendingVerification, Deleted)
+            | (Active, Suspended)
+            | (Active, Deleted)
+            | (Suspended, Active)
+            | (Suspended, Deleted)
+    ) {
+        Ok(())
+    } else {
+        Err(LifecycleError::LifecycleTransitionDenied {
+            resource_kind: "host alias",
+            resource_id: String::new(),
+            from: lifecycle_state_for_host_alias(from),
+            to: lifecycle_state_for_host_alias(to),
+        })
+    }
+}
+
+fn lifecycle_state_for_host_alias(state: HostAliasState) -> LifecycleState {
+    match state {
+        HostAliasState::PendingVerification => LifecycleState::Joining,
+        HostAliasState::Active => LifecycleState::Active,
+        HostAliasState::Suspended => LifecycleState::ReadOnly,
+        HostAliasState::Deleted => LifecycleState::Removed,
+    }
+}
+
 pub fn validate_node_transition(from: LifecycleState, to: LifecycleState) -> LifecycleResult<()> {
     use LifecycleState::*;
     if matches!(
@@ -765,5 +916,72 @@ mod tests {
 
         let replayed = read_state(&storage).await.unwrap();
         assert_eq!(replayed.nodes["node-a"].state, LifecycleState::Draining);
+    }
+
+    #[tokio::test]
+    async fn host_aliases_are_generation_checked_and_region_bound() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let routing_config = RoutingConfig::new("anvil-storage.com").unwrap();
+
+        let region = create_region(
+            &storage,
+            CreateRegionDescriptor {
+                mesh_id: "mesh-a".to_string(),
+                region: "eu-west-1".to_string(),
+                public_base_url: "https://eu-west-1.anvil-storage.com".to_string(),
+                virtual_host_suffix: "eu-west-1.anvil-storage.com".to_string(),
+                placement_weight: 100,
+                default_cell: None,
+            },
+        )
+        .await
+        .unwrap();
+        transition_region(
+            &storage,
+            "eu-west-1",
+            region.generation,
+            LifecycleState::Active,
+        )
+        .await
+        .unwrap();
+
+        let alias = create_host_alias(
+            &storage,
+            &routing_config,
+            CreateHostAliasDescriptor {
+                hostname: "CDN.Example.Com.".to_string(),
+                tenant_id: "tenant-acme".to_string(),
+                bucket_name: "releases".to_string(),
+                region: "eu-west-1".to_string(),
+                prefix: "public/".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(alias.hostname, "cdn.example.com");
+        assert_eq!(alias.state, HostAliasState::PendingVerification);
+        let stale = transition_host_alias(&storage, "cdn.example.com", 99, HostAliasState::Active)
+            .await
+            .unwrap_err();
+        assert!(matches!(stale, LifecycleError::GenerationConflict { .. }));
+
+        let active = transition_host_alias(
+            &storage,
+            "cdn.example.com",
+            alias.generation,
+            HostAliasState::Active,
+        )
+        .await
+        .unwrap();
+        assert_eq!(active.state, HostAliasState::Active);
+        assert_eq!(active.generation, 2);
+
+        let aliases = list_host_aliases(&storage, Some("eu-west-1"))
+            .await
+            .unwrap();
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0].hostname, "cdn.example.com");
     }
 }
