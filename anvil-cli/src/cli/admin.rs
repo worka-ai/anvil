@@ -22,6 +22,16 @@ pub enum AdminCommands {
         #[clap(subcommand)]
         command: NodeCommands,
     },
+    /// Manage object links
+    Link {
+        #[clap(subcommand)]
+        command: LinkCommands,
+    },
+    /// Manage custom host aliases
+    HostAlias {
+        #[clap(subcommand)]
+        command: HostAliasCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -182,6 +192,135 @@ pub enum NodeCommands {
     },
 }
 
+#[derive(Subcommand)]
+pub enum LinkCommands {
+    /// Create a symlink-like object link
+    Create {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        tenant_id: String,
+        #[clap(long)]
+        bucket_name: String,
+        #[clap(long)]
+        link_key: String,
+        #[clap(long)]
+        target_key: String,
+        #[clap(long)]
+        target_version: Option<String>,
+        #[clap(long, value_enum, default_value_t = ObjectLinkResolutionArg::Follow)]
+        resolution: ObjectLinkResolutionArg,
+        #[clap(long, action = clap::ArgAction::SetTrue)]
+        allow_dangling: bool,
+    },
+    /// Update an existing object link
+    Update {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        tenant_id: String,
+        #[clap(long)]
+        bucket_name: String,
+        #[clap(long)]
+        link_key: String,
+        #[clap(long)]
+        target_key: String,
+        #[clap(long)]
+        target_version: Option<String>,
+        #[clap(long, value_enum, default_value_t = ObjectLinkResolutionArg::Follow)]
+        resolution: ObjectLinkResolutionArg,
+        #[clap(long, action = clap::ArgAction::SetTrue)]
+        allow_dangling: bool,
+    },
+    /// Delete an object link entry without deleting its target
+    Delete {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        tenant_id: String,
+        #[clap(long)]
+        bucket_name: String,
+        #[clap(long)]
+        link_key: String,
+    },
+    /// Read object link metadata
+    Read {
+        #[clap(long)]
+        request_id: Option<String>,
+        #[clap(long)]
+        tenant_id: String,
+        #[clap(long)]
+        bucket_name: String,
+        #[clap(long)]
+        link_key: String,
+    },
+    /// List object links in a bucket
+    List {
+        #[clap(long)]
+        tenant_id: String,
+        #[clap(long)]
+        bucket_name: String,
+        #[clap(long)]
+        prefix: Option<String>,
+        #[clap(flatten)]
+        page: PageOptions,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum HostAliasCommands {
+    /// Create a custom host alias in pending verification state
+    Create {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        hostname: String,
+        #[clap(long)]
+        tenant_id: String,
+        #[clap(long)]
+        bucket_name: String,
+        #[clap(long)]
+        region: String,
+        #[clap(long, default_value = "")]
+        prefix: String,
+    },
+    /// Activate a verified host alias
+    Activate {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        hostname: String,
+    },
+    /// Suspend an active host alias
+    Suspend {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        hostname: String,
+    },
+    /// Delete a host alias descriptor
+    Delete {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        hostname: String,
+    },
+    /// Read host alias metadata
+    Read {
+        #[clap(long)]
+        request_id: Option<String>,
+        #[clap(long)]
+        hostname: String,
+    },
+    /// List host aliases
+    List {
+        #[clap(long)]
+        region: Option<String>,
+        #[clap(flatten)]
+        page: PageOptions,
+    },
+}
+
 #[derive(Args, Debug, Clone)]
 pub struct MutationOptions {
     /// AdminRequestContext.request_id. Defaults to a generated UUID.
@@ -254,6 +393,22 @@ impl NodeCapabilityArg {
             Self::Personaldb => 3,
             Self::Gateway => 4,
             Self::Admin => 5,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, ValueEnum)]
+pub enum ObjectLinkResolutionArg {
+    #[default]
+    Follow,
+    Redirect,
+}
+
+impl ObjectLinkResolutionArg {
+    fn to_proto(self) -> i32 {
+        match self {
+            Self::Follow => 1,
+            Self::Redirect => 2,
         }
     }
 }
@@ -338,6 +493,12 @@ pub async fn handle_admin_command(command: &AdminCommands, ctx: &Context) -> any
         }
         AdminCommands::Node { command } => {
             handle_node_command(command, &mut client, &token).await?
+        }
+        AdminCommands::Link { command } => {
+            handle_link_command(command, &mut client, &token).await?
+        }
+        AdminCommands::HostAlias { command } => {
+            handle_host_alias_command(command, &mut client, &token).await?
         }
     }
 
@@ -644,6 +805,240 @@ async fn handle_node_command(
     Ok(())
 }
 
+async fn handle_link_command(
+    command: &LinkCommands,
+    client: &mut AdminServiceClient<tonic::transport::Channel>,
+    token: &str,
+) -> anyhow::Result<()> {
+    match command {
+        LinkCommands::Create {
+            context,
+            tenant_id,
+            bucket_name,
+            link_key,
+            target_key,
+            target_version,
+            resolution,
+            allow_dangling,
+        } => {
+            let response = client
+                .create_object_link(with_auth(
+                    api::CreateObjectLinkRequest {
+                        context: Some(context.to_context()),
+                        tenant_id: tenant_id.clone(),
+                        bucket_name: bucket_name.clone(),
+                        link_key: link_key.clone(),
+                        target_key: target_key.clone(),
+                        target_version: target_version.clone().unwrap_or_default(),
+                        resolution: resolution.to_proto(),
+                        allow_dangling: *allow_dangling,
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        LinkCommands::Update {
+            context,
+            tenant_id,
+            bucket_name,
+            link_key,
+            target_key,
+            target_version,
+            resolution,
+            allow_dangling,
+        } => {
+            let response = client
+                .update_object_link(with_auth(
+                    api::UpdateObjectLinkRequest {
+                        context: Some(context.to_context()),
+                        tenant_id: tenant_id.clone(),
+                        bucket_name: bucket_name.clone(),
+                        link_key: link_key.clone(),
+                        target_key: target_key.clone(),
+                        target_version: target_version.clone().unwrap_or_default(),
+                        resolution: resolution.to_proto(),
+                        allow_dangling: *allow_dangling,
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        LinkCommands::Delete {
+            context,
+            tenant_id,
+            bucket_name,
+            link_key,
+        } => {
+            let response = client
+                .delete_object_link(with_auth(
+                    api::DeleteObjectLinkRequest {
+                        context: Some(context.to_context()),
+                        tenant_id: tenant_id.clone(),
+                        bucket_name: bucket_name.clone(),
+                        link_key: link_key.clone(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        LinkCommands::Read {
+            request_id,
+            tenant_id,
+            bucket_name,
+            link_key,
+        } => {
+            let response = client
+                .read_object_link(with_auth(
+                    api::ReadObjectLinkRequest {
+                        request_id: request_id
+                            .clone()
+                            .unwrap_or_else(|| format!("cli-{}", uuid::Uuid::new_v4())),
+                        tenant_id: tenant_id.clone(),
+                        bucket_name: bucket_name.clone(),
+                        link_key: link_key.clone(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        LinkCommands::List {
+            tenant_id,
+            bucket_name,
+            prefix,
+            page,
+        } => {
+            let response = client
+                .list_object_links(with_auth(
+                    api::ListObjectLinksRequest {
+                        tenant_id: tenant_id.clone(),
+                        bucket_name: bucket_name.clone(),
+                        prefix: prefix.clone().unwrap_or_default(),
+                        page: page.to_page_request(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_host_alias_command(
+    command: &HostAliasCommands,
+    client: &mut AdminServiceClient<tonic::transport::Channel>,
+    token: &str,
+) -> anyhow::Result<()> {
+    match command {
+        HostAliasCommands::Create {
+            context,
+            hostname,
+            tenant_id,
+            bucket_name,
+            region,
+            prefix,
+        } => {
+            let response = client
+                .create_host_alias(with_auth(
+                    api::CreateHostAliasRequest {
+                        context: Some(context.to_context()),
+                        hostname: hostname.clone(),
+                        tenant_id: tenant_id.clone(),
+                        bucket_name: bucket_name.clone(),
+                        region: region.clone(),
+                        prefix: prefix.clone(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        HostAliasCommands::Activate { context, hostname } => {
+            let response = client
+                .activate_host_alias(with_auth(
+                    api::ActivateHostAliasRequest {
+                        context: Some(context.to_context()),
+                        hostname: hostname.clone(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        HostAliasCommands::Suspend { context, hostname } => {
+            let response = client
+                .suspend_host_alias(with_auth(
+                    api::SuspendHostAliasRequest {
+                        context: Some(context.to_context()),
+                        hostname: hostname.clone(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        HostAliasCommands::Delete { context, hostname } => {
+            let response = client
+                .delete_host_alias(with_auth(
+                    api::DeleteHostAliasRequest {
+                        context: Some(context.to_context()),
+                        hostname: hostname.clone(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        HostAliasCommands::Read {
+            request_id,
+            hostname,
+        } => {
+            let response = client
+                .read_host_alias(with_auth(
+                    api::ReadHostAliasRequest {
+                        request_id: request_id
+                            .clone()
+                            .unwrap_or_else(|| format!("cli-{}", uuid::Uuid::new_v4())),
+                        hostname: hostname.clone(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        HostAliasCommands::List { region, page } => {
+            let response = client
+                .list_host_aliases(with_auth(
+                    api::ListHostAliasesRequest {
+                        region: region.clone().unwrap_or_default(),
+                        page: page.to_page_request(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn with_auth<T>(message: T, token: &str) -> anyhow::Result<tonic::Request<T>> {
     let mut request = tonic::Request::new(message);
     request.metadata_mut().insert(
@@ -782,5 +1177,86 @@ mod tests {
         assert_eq!(NodeCapabilityArg::Personaldb.to_proto(), 3);
         assert_eq!(NodeCapabilityArg::Gateway.to_proto(), 4);
         assert_eq!(NodeCapabilityArg::Admin.to_proto(), 5);
+    }
+
+    #[test]
+    fn object_link_resolution_maps_to_proto_values() {
+        assert_eq!(ObjectLinkResolutionArg::Follow.to_proto(), 1);
+        assert_eq!(ObjectLinkResolutionArg::Redirect.to_proto(), 2);
+    }
+
+    #[test]
+    fn link_create_parses_required_context_and_target() {
+        let cli = TestAdminCli::try_parse_from([
+            "admin",
+            "link",
+            "create",
+            "--audit-reason",
+            "publish latest",
+            "--expected-generation",
+            "0",
+            "--tenant-id",
+            "tenant-a",
+            "--bucket-name",
+            "releases",
+            "--link-key",
+            "latest.exe",
+            "--target-key",
+            "my-app-v1.exe",
+            "--resolution",
+            "redirect",
+        ])
+        .unwrap();
+
+        let AdminCommands::Link {
+            command:
+                LinkCommands::Create {
+                    context,
+                    tenant_id,
+                    bucket_name,
+                    link_key,
+                    target_key,
+                    resolution,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected link create command");
+        };
+
+        assert_eq!(context.audit_reason, "publish latest");
+        assert_eq!(context.expected_generation, 0);
+        assert_eq!(tenant_id, "tenant-a");
+        assert_eq!(bucket_name, "releases");
+        assert_eq!(link_key, "latest.exe");
+        assert_eq!(target_key, "my-app-v1.exe");
+        assert_eq!(resolution.to_proto(), 2);
+    }
+
+    #[test]
+    fn host_alias_activate_requires_expected_generation_and_reason() {
+        let cli = TestAdminCli::try_parse_from([
+            "admin",
+            "host-alias",
+            "activate",
+            "--audit-reason",
+            "dns verified",
+            "--expected-generation",
+            "7",
+            "--hostname",
+            "cdn.example.com",
+        ])
+        .unwrap();
+
+        let AdminCommands::HostAlias {
+            command: HostAliasCommands::Activate { context, hostname },
+        } = cli.command
+        else {
+            panic!("expected host-alias activate command");
+        };
+
+        assert_eq!(context.audit_reason, "dns verified");
+        assert_eq!(context.expected_generation, 7);
+        assert_eq!(hostname, "cdn.example.com");
     }
 }
