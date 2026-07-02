@@ -838,6 +838,26 @@ async fn admin_region_drain_applies_bucket_dispositions_and_exceptions() {
             .details_json
             .contains("bucket_disposition_decisions")
     );
+    let disposition_audit = client
+        .list_audit_events(with_auth(
+            tonic::Request::new(ListAuditEventsRequest {
+                request_id: "list-bucket-disposition-audit".to_string(),
+                principal_id: String::new(),
+                resource_id: format!("tenant:{}:bucket:docs:region:eu-west-1", tenant.id),
+                action: "admin.region.bucket_disposition".to_string(),
+                page: None,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(disposition_audit.events.len(), 1);
+    assert!(
+        disposition_audit.events[0]
+            .details_json
+            .contains("remain_proxy_only")
+    );
 }
 
 #[tokio::test]

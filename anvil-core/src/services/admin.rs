@@ -888,6 +888,37 @@ impl AdminService for AppState {
             details,
         )
         .await?;
+        for decision in &drain_report.decisions {
+            record_admin_audit_event_with_suffix(
+                self,
+                &principal,
+                context,
+                "admin.region.bucket_disposition",
+                &format!(
+                    "tenant:{}:bucket:{}:region:{}",
+                    decision.tenant_id, decision.bucket_name, drain_report.region
+                ),
+                json!({
+                    "region": &drain_report.region,
+                    "tenant_id": &decision.tenant_id,
+                    "bucket_name": &decision.bucket_name,
+                    "disposition": decision.disposition.as_str(),
+                    "reason": &decision.reason,
+                    "expires_at": decision.expires_at.as_deref(),
+                    "status_before": format!("{:?}", decision.status_before),
+                    "status_after": format!("{:?}", decision.status_after),
+                    "bucket_locator_generation_before": decision.bucket_locator_generation_before,
+                    "bucket_locator_generation_after": decision.bucket_locator_generation_after,
+                    "exception_written": decision.exception_written,
+                    "locator_updated": decision.locator_updated,
+                }),
+                &format!(
+                    "bucket-disposition-{}-{}",
+                    decision.tenant_id, decision.bucket_name
+                ),
+            )
+            .await?;
+        }
         Ok(Response::new(DrainOperationResponse {
             request_id: context.request_id.clone(),
             resource_id: region.region,
@@ -2476,6 +2507,19 @@ fn audit_event_id(principal: &AdminPrincipal, context: &AdminRequestContext) -> 
     format!("audit:{}:{}", principal.principal_id, context.request_id)
 }
 
+fn audit_event_id_with_suffix(
+    principal: &AdminPrincipal,
+    context: &AdminRequestContext,
+    suffix: &str,
+) -> String {
+    format!(
+        "audit:{}:{}:{}",
+        principal.principal_id,
+        context.request_id,
+        safe_audit_id_suffix(suffix)
+    )
+}
+
 async fn record_admin_audit_event(
     state: &AppState,
     principal: &AdminPrincipal,
@@ -2500,6 +2544,46 @@ async fn record_admin_audit_event(
         .await
         .map_err(|err| Status::internal(err.to_string()))?;
     Ok(audit_event_id)
+}
+
+async fn record_admin_audit_event_with_suffix(
+    state: &AppState,
+    principal: &AdminPrincipal,
+    context: &AdminRequestContext,
+    action: &str,
+    resource_id: &str,
+    details: serde_json::Value,
+    suffix: &str,
+) -> Result<String, Status> {
+    let audit_event_id = audit_event_id_with_suffix(principal, context, suffix);
+    let event = AdminAuditEvent {
+        schema: admin_audit::ADMIN_AUDIT_EVENT_SCHEMA.to_string(),
+        audit_event_id: audit_event_id.clone(),
+        request_id: context.request_id.clone(),
+        principal_id: principal.principal_id.clone(),
+        resource_id: resource_id.to_string(),
+        action: action.to_string(),
+        audit_reason: context.audit_reason.clone(),
+        created_at: Utc::now().to_rfc3339(),
+        details_json: admin_audit_details_json(context, details)?,
+    };
+    admin_audit::append_audit_event(&state.storage, &event)
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
+    Ok(audit_event_id)
+}
+
+fn safe_audit_id_suffix(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn admin_audit_details_json(
