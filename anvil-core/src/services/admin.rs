@@ -1183,6 +1183,39 @@ impl AdminService for AppState {
                 }));
             }
         }
+        if source.is_empty() || source == "mesh" || source == "mesh_lifecycle" {
+            let diagnostics = mesh_lifecycle_diagnostics(self)
+                .await?
+                .into_iter()
+                .filter(|diagnostic| {
+                    req.severity.trim().is_empty() || diagnostic.severity == req.severity
+                })
+                .filter(|diagnostic| diagnostic.cursor > cursor as u64)
+                .take(limit + 1)
+                .collect::<Vec<_>>();
+            let has_more = diagnostics.len() > limit;
+            let mut diagnostics = diagnostics;
+            if has_more {
+                diagnostics.truncate(limit);
+            }
+            let next_cursor = if has_more {
+                diagnostics
+                    .last()
+                    .map(|diagnostic| diagnostic.cursor.to_string())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            return Ok(Response::new(DiagnosticsResponse {
+                request_id,
+                page: Some(PageResponse {
+                    next_cursor,
+                    has_more,
+                }),
+                diagnostics,
+                data_source: "mesh_lifecycle".to_string(),
+            }));
+        }
 
         Ok(Response::new(DiagnosticsResponse {
             request_id,
@@ -1601,6 +1634,140 @@ fn index_diagnostic_to_admin_record(
             .ok_or_else(|| Status::internal("Invalid diagnostic timestamp"))?,
         cursor,
     })
+}
+
+async fn mesh_lifecycle_diagnostics(state: &AppState) -> Result<Vec<DiagnosticRecord>, Status> {
+    let mut diagnostics = Vec::new();
+    let mut cursor = 1_u64;
+    let mut push = |scope_kind: &str,
+                    scope_id: String,
+                    severity: &str,
+                    code: &str,
+                    message: String,
+                    details: serde_json::Value| {
+        diagnostics.push(DiagnosticRecord {
+            diagnostic_id: format!("mesh-diagnostic-{cursor}"),
+            scope_kind: scope_kind.to_string(),
+            scope_id,
+            source: "mesh_lifecycle".to_string(),
+            severity: severity.to_string(),
+            code: code.to_string(),
+            message,
+            object_key: String::new(),
+            version_id: String::new(),
+            details_json: details.to_string(),
+            created_at_nanos: Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+            cursor,
+        });
+        cursor = cursor.saturating_add(1);
+    };
+
+    for region in state
+        .persistence
+        .list_region_descriptors()
+        .await
+        .map_err(lifecycle_status)?
+    {
+        if region.state != CoreLifecycleState::Active {
+            push(
+                "region",
+                region.region.clone(),
+                match region.state {
+                    CoreLifecycleState::Draining
+                    | CoreLifecycleState::Drained
+                    | CoreLifecycleState::DrainedWithExceptions
+                    | CoreLifecycleState::Offline
+                    | CoreLifecycleState::Removed => "warning",
+                    _ => "info",
+                },
+                "mesh_region_not_active",
+                format!(
+                    "region {} is {:?}; new writable placement is disabled",
+                    region.region, region.state
+                ),
+                json!({
+                    "generation": region.generation,
+                    "state": format!("{:?}", region.state),
+                    "default_cell": region.default_cell,
+                }),
+            );
+        }
+    }
+
+    for cell in state
+        .persistence
+        .list_cell_descriptors(None)
+        .await
+        .map_err(lifecycle_status)?
+    {
+        if cell.state != CoreLifecycleState::Active {
+            push(
+                "cell",
+                format!("{}/{}", cell.region, cell.cell_id),
+                "info",
+                "mesh_cell_not_active",
+                format!(
+                    "cell {}/{} is {:?}; node activation and placement are disabled",
+                    cell.region, cell.cell_id, cell.state
+                ),
+                json!({
+                    "generation": cell.generation,
+                    "state": format!("{:?}", cell.state),
+                    "placement_weight": cell.placement_weight,
+                }),
+            );
+        }
+    }
+
+    for node in state
+        .persistence
+        .list_node_descriptors(None, None)
+        .await
+        .map_err(lifecycle_status)?
+    {
+        if node.state != CoreLifecycleState::Active {
+            push(
+                "node",
+                node.node_id.clone(),
+                match node.state {
+                    CoreLifecycleState::Draining
+                    | CoreLifecycleState::Drained
+                    | CoreLifecycleState::Offline
+                    | CoreLifecycleState::Removed => "warning",
+                    _ => "info",
+                },
+                "mesh_node_not_active",
+                format!(
+                    "node {} is {:?}; new ownership should not be assigned",
+                    node.node_id, node.state
+                ),
+                json!({
+                    "generation": node.generation,
+                    "state": format!("{:?}", node.state),
+                    "region": node.region,
+                    "cell_id": node.cell_id,
+                    "drain": node.drain,
+                }),
+            );
+        }
+    }
+
+    let routing_record_count = state
+        .persistence
+        .list_mesh_routing_records(None)
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?
+        .len();
+    push(
+        "mesh",
+        state.config.mesh_id.clone(),
+        "info",
+        "mesh_routing_projection_summary",
+        format!("mesh routing projection has {routing_record_count} records"),
+        json!({ "routing_record_count": routing_record_count }),
+    );
+
+    Ok(diagnostics)
 }
 
 fn repair_finding_to_admin_proto(finding: &RepairFinding) -> Result<RepairFindingRecord, Status> {
