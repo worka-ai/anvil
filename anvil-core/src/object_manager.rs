@@ -1902,6 +1902,18 @@ impl ObjectManager {
         }
 
         let tenant_id = route_tenant_id.or_else(|| claims.map(|claims| claims.tenant_id));
+        if let Some(tenant_id) = tenant_id
+            && let Some(locator) = self
+                .persistence
+                .get_mesh_bucket_locator(tenant_id, bucket_name)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+            && locator.status != crate::mesh_directory::BucketLocatorStatus::Deleted
+            && locator.home_region.as_str() != self.region.as_str()
+        {
+            return Err(self.remote_bucket_status(locator.home_region.as_str()));
+        }
+
         let bucket = match tenant_id {
             Some(tenant_id) => {
                 bucket_journal::read_current_bucket(&self.storage, tenant_id, bucket_name)
