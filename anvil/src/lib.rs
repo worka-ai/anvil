@@ -15,6 +15,7 @@ pub mod s3_auth;
 
 pub async fn run(
     listener: tokio::net::TcpListener,
+    admin_listener: tokio::net::TcpListener,
     config: anvil_core::config::Config,
 ) -> Result<()> {
     let (tx, rx) = tokio::sync::mpsc::channel(100);
@@ -22,11 +23,21 @@ pub async fn run(
     let swarm = anvil_core::cluster::create_swarm(state.config.clone()).await?;
 
     // Then start the node
-    start_node(listener, state, swarm, rx).await
+    start_node_with_admin_listener(listener, Some(admin_listener), state, swarm, rx).await
 }
 
 pub async fn start_node(
     listener: tokio::net::TcpListener,
+    state: AppState,
+    swarm: libp2p::Swarm<anvil_core::cluster::ClusterBehaviour>,
+    outbound_events_rx: tokio::sync::mpsc::Receiver<anvil_core::cluster::MetadataEvent>,
+) -> Result<()> {
+    start_node_with_admin_listener(listener, None, state, swarm, outbound_events_rx).await
+}
+
+pub async fn start_node_with_admin_listener(
+    listener: tokio::net::TcpListener,
+    admin_listener: Option<tokio::net::TcpListener>,
     state: AppState,
     mut swarm: libp2p::Swarm<anvil_core::cluster::ClusterBehaviour>,
     outbound_events_rx: tokio::sync::mpsc::Receiver<anvil_core::cluster::MetadataEvent>,
@@ -62,10 +73,16 @@ pub async fn start_node(
         anvil_core::services::create_grpc_router(state.clone(), auth_interceptor.clone());
 
     if let Some(ext) = ENTERPRISE_EXTENDER.get() {
-        grpc_router = ext(grpc_router, state.clone(), auth_interceptor);
+        grpc_router = ext(grpc_router, state.clone(), auth_interceptor.clone());
     }
 
     let grpc_axum = anvil_core::services::create_axum_router(grpc_router);
+    let admin_axum = admin_listener.as_ref().map(|_| {
+        anvil_core::services::create_axum_router(anvil_core::services::create_admin_grpc_router(
+            state.clone(),
+            auth_interceptor.clone(),
+        ))
+    });
     let s3_app = s3_gateway::app(state.clone());
 
     let app = tower::service_fn(move |req: axum::extract::Request| {
@@ -93,6 +110,13 @@ pub async fn start_node(
 
     let addr = listener.local_addr()?;
     info!("Anvil server (gRPC & S3) listening on {}", addr);
+    let admin_addr = admin_listener
+        .as_ref()
+        .map(tokio::net::TcpListener::local_addr)
+        .transpose()?;
+    if let Some(admin_addr) = admin_addr {
+        info!("Anvil admin gRPC listener available on {}", admin_addr);
+    }
 
     // Spawn the gossip service to run in the background.
     let gossip_task = tokio::spawn(anvil_core::cluster::run_gossip(
@@ -105,11 +129,26 @@ pub async fn start_node(
     ));
     let server_task =
         tokio::spawn(async move { axum::serve(listener, app.into_make_service()).await });
+    let admin_server_task = admin_listener
+        .zip(admin_axum)
+        .map(|(admin_listener, admin_app)| {
+            tokio::spawn(
+                async move { axum::serve(admin_listener, admin_app.into_make_service()).await },
+            )
+        });
 
     // Run both tasks concurrently.
-    let (server_result, gossip_result) = tokio::join!(server_task, gossip_task);
-    server_result??;
-    gossip_result??;
+    if let Some(admin_server_task) = admin_server_task {
+        let (server_result, admin_result, gossip_result) =
+            tokio::join!(server_task, admin_server_task, gossip_task);
+        server_result??;
+        admin_result??;
+        gossip_result??;
+    } else {
+        let (server_result, gossip_result) = tokio::join!(server_task, gossip_task);
+        server_result??;
+        gossip_result??;
+    }
 
     Ok(())
 }

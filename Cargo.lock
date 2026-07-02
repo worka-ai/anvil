@@ -347,6 +347,7 @@ dependencies = [
  "hyper 1.7.0",
  "hyper-rustls 0.27.7",
  "hyper-util",
+ "idna 1.1.0",
  "jsonwebtoken",
  "lazy_static",
  "libp2p",

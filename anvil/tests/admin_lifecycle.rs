@@ -1,0 +1,379 @@
+use anvil::anvil_api::admin_service_client::AdminServiceClient;
+use anvil::anvil_api::*;
+use anvil_test_utils::wait_for_port;
+use std::time::Duration;
+use tempfile::TempDir;
+use tokio::task::JoinHandle;
+use tonic::Code;
+
+struct AdminNode {
+    public_url: String,
+    admin_url: String,
+    state: anvil::AppState,
+    handle: JoinHandle<()>,
+    _temp: TempDir,
+}
+
+impl Drop for AdminNode {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+async fn spawn_admin_node() -> AdminNode {
+    let temp = tempfile::tempdir().unwrap();
+    let storage_path = temp.path().join("node-a");
+    let public_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let public_addr = public_listener.local_addr().unwrap();
+    let admin_addr = admin_listener.local_addr().unwrap();
+
+    let config = anvil::config::Config {
+        cluster_secret: Some("test-cluster-secret".to_string()),
+        jwt_secret: "test-secret".to_string(),
+        anvil_secret_encryption_key:
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        cluster_listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".to_string(),
+        public_cluster_addrs: vec![],
+        metadata_cache_ttl_secs: 1,
+        public_api_addr: format!("http://{public_addr}"),
+        api_listen_addr: public_addr.to_string(),
+        admin_listen_addr: admin_addr.to_string(),
+        mesh_id: "mesh-test".to_string(),
+        region: "eu-west-1".to_string(),
+        cell_id: "cell-a".to_string(),
+        public_region_base_domain: "eu-west-1.anvil-storage.test".to_string(),
+        bootstrap_addrs: vec![],
+        init_cluster: false,
+        enable_mdns: false,
+        storage_path: storage_path.to_string_lossy().into_owned(),
+        node_id_path: storage_path.join("node-id").to_string_lossy().into_owned(),
+        cluster_keypair_path: storage_path
+            .join("cluster-keypair.pb")
+            .to_string_lossy()
+            .into_owned(),
+        personaldb_snapshot_entry_threshold: 1024,
+        personaldb_snapshot_payload_bytes_threshold: 64 * 1024 * 1024,
+        ..anvil::config::Config::default()
+    };
+
+    let state = anvil::AppState::new(config, None).await.unwrap();
+    let swarm = anvil::cluster::create_swarm(state.config.clone())
+        .await
+        .unwrap();
+    let state_for_handle = state.clone();
+    let handle = tokio::spawn(async move {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        anvil::start_node_with_admin_listener(
+            public_listener,
+            Some(admin_listener),
+            state_for_handle,
+            swarm,
+            rx,
+        )
+        .await
+        .unwrap();
+    });
+
+    assert!(wait_for_port(public_addr, Duration::from_secs(5)).await);
+    assert!(wait_for_port(admin_addr, Duration::from_secs(5)).await);
+
+    AdminNode {
+        public_url: format!("http://{public_addr}"),
+        admin_url: format!("http://{admin_addr}"),
+        state,
+        handle,
+        _temp: temp,
+    }
+}
+
+fn admin_token(node: &AdminNode) -> String {
+    node.state
+        .jwt_manager
+        .mint_token(
+            "admin-principal".to_string(),
+            vec!["anvil_admin:*|anvil_admin:cluster:mesh-test".to_string()],
+            0,
+        )
+        .unwrap()
+}
+
+fn non_admin_token(node: &AdminNode) -> String {
+    node.state
+        .jwt_manager
+        .mint_token(
+            "object-principal".to_string(),
+            vec!["bucket:read|*".to_string()],
+            0,
+        )
+        .unwrap()
+}
+
+fn with_auth<T>(mut request: tonic::Request<T>, token: &str) -> tonic::Request<T> {
+    request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    request
+}
+
+fn context(label: &str, expected_generation: u64) -> AdminRequestContext {
+    AdminRequestContext {
+        request_id: format!("req-{label}"),
+        idempotency_key: format!("idem-{label}"),
+        audit_reason: format!("test {label}"),
+        expected_generation,
+    }
+}
+
+#[tokio::test]
+async fn admin_service_is_absent_public_present_admin_and_requires_auth() {
+    let node = spawn_admin_node().await;
+    let admin_token = admin_token(&node);
+    let non_admin_token = non_admin_token(&node);
+
+    let mut public_client = AdminServiceClient::connect(node.public_url.clone())
+        .await
+        .unwrap();
+    let public_err = public_client
+        .list_regions(with_auth(
+            tonic::Request::new(ListRegionsRequest { page: None }),
+            &admin_token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(public_err.code(), Code::Unimplemented);
+
+    let mut admin_client = AdminServiceClient::connect(node.admin_url.clone())
+        .await
+        .unwrap();
+    let unauthenticated = admin_client
+        .list_regions(tonic::Request::new(ListRegionsRequest { page: None }))
+        .await
+        .unwrap_err();
+    assert_eq!(unauthenticated.code(), Code::Unauthenticated);
+
+    let denied = admin_client
+        .list_regions(with_auth(
+            tonic::Request::new(ListRegionsRequest { page: None }),
+            &non_admin_token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), Code::PermissionDenied);
+
+    let response = admin_client
+        .list_regions(with_auth(
+            tonic::Request::new(ListRegionsRequest { page: None }),
+            &admin_token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.regions.is_empty());
+}
+
+#[tokio::test]
+async fn admin_lifecycle_rejects_invalid_region_cell_and_node_transitions() {
+    let node = spawn_admin_node().await;
+    let token = admin_token(&node);
+    let mut client = AdminServiceClient::connect(node.admin_url.clone())
+        .await
+        .unwrap();
+
+    let region = client
+        .create_region(with_auth(
+            tonic::Request::new(CreateRegionRequest {
+                context: Some(context("create-region", 0)),
+                region: "eu-west-1".to_string(),
+                public_base_url: "https://eu-west-1.anvil-storage.test".to_string(),
+                virtual_host_suffix: "eu-west-1.anvil-storage.test".to_string(),
+                placement_weight: 100,
+                default_cell: "cell-a".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .region
+        .unwrap();
+    assert_eq!(region.state, 1);
+
+    let drain_joining_region = client
+        .drain_region(with_auth(
+            tonic::Request::new(DrainRegionRequest {
+                context: Some(context("drain-joining-region", region.generation)),
+                region: "eu-west-1".to_string(),
+                default_disposition: 1,
+                bucket_overrides: vec![],
+            }),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(drain_joining_region.code(), Code::FailedPrecondition);
+
+    let cell = client
+        .register_cell(with_auth(
+            tonic::Request::new(RegisterCellRequest {
+                context: Some(context("register-cell", 0)),
+                region: "eu-west-1".to_string(),
+                cell_id: "cell-a".to_string(),
+                placement_weight: 100,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .cell
+        .unwrap();
+
+    let drain_joining_cell = client
+        .drain_cell(with_auth(
+            tonic::Request::new(DrainCellRequest {
+                context: Some(context("drain-joining-cell", cell.generation)),
+                region: "eu-west-1".to_string(),
+                cell_id: "cell-a".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(drain_joining_cell.code(), Code::FailedPrecondition);
+
+    let cell = client
+        .activate_cell(with_auth(
+            tonic::Request::new(ActivateCellRequest {
+                context: Some(context("activate-cell", cell.generation)),
+                region: "eu-west-1".to_string(),
+                cell_id: "cell-a".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .cell
+        .unwrap();
+    assert_eq!(cell.state, 2);
+
+    let region = client
+        .activate_region(with_auth(
+            tonic::Request::new(ActivateRegionRequest {
+                context: Some(context("activate-region", region.generation)),
+                region: "eu-west-1".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .region
+        .unwrap();
+    assert_eq!(region.state, 2);
+
+    let remove_active_region = client
+        .remove_region(with_auth(
+            tonic::Request::new(RemoveRegionRequest {
+                context: Some(context("remove-active-region", region.generation)),
+                region: "eu-west-1".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(remove_active_region.code(), Code::FailedPrecondition);
+
+    let registered_node = client
+        .register_node(with_auth(
+            tonic::Request::new(RegisterNodeRequest {
+                context: Some(context("register-node", 0)),
+                node_id: "node-a".to_string(),
+                region: "eu-west-1".to_string(),
+                cell_id: "cell-a".to_string(),
+                libp2p_peer_id: "peer-a".to_string(),
+                public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
+                public_api_addr: "http://127.0.0.1:50051".to_string(),
+                capabilities: vec![1, 5],
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .node
+        .unwrap();
+    assert_eq!(registered_node.state, 1);
+
+    let drain_joining_node = client
+        .drain_node(with_auth(
+            tonic::Request::new(DrainNodeRequest {
+                context: Some(context("drain-joining-node", registered_node.generation)),
+                node_id: "node-a".to_string(),
+                graceful_timeout_ms: 1000,
+                force_after_timeout: false,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(drain_joining_node.code(), Code::FailedPrecondition);
+
+    let active_node = client
+        .activate_node(with_auth(
+            tonic::Request::new(ActivateNodeRequest {
+                context: Some(context("activate-node", registered_node.generation)),
+                node_id: "node-a".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .node
+        .unwrap();
+    assert_eq!(active_node.state, 2);
+
+    let remove_active_node = client
+        .remove_node(with_auth(
+            tonic::Request::new(RemoveNodeRequest {
+                context: Some(context("remove-active-node", active_node.generation)),
+                node_id: "node-a".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(remove_active_node.code(), Code::FailedPrecondition);
+
+    let drained = client
+        .drain_node(with_auth(
+            tonic::Request::new(DrainNodeRequest {
+                context: Some(context("drain-node", active_node.generation)),
+                node_id: "node-a".to_string(),
+                graceful_timeout_ms: 1000,
+                force_after_timeout: false,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(drained.state, 4);
+
+    let listed = client
+        .list_nodes(with_auth(
+            tonic::Request::new(ListNodesRequest {
+                region: "eu-west-1".to_string(),
+                cell_id: "cell-a".to_string(),
+                page: None,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.nodes.len(), 1);
+    assert_eq!(listed.nodes[0].state, 4);
+}

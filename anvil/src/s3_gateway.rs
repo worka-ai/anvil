@@ -3,7 +3,8 @@ use crate::auth::Claims;
 use crate::s3_auth::{aws_chunked_decoder, sigv4_auth};
 use anvil_core::auth;
 use anvil_core::bucket_journal;
-use anvil_core::object_manager::ObjectWriteOptions;
+use anvil_core::object_links;
+use anvil_core::object_manager::{ObjectLinkReadMode, ObjectWriteOptions};
 use anvil_core::observability::RESERVED_NAMESPACE_REJECTION_COUNT;
 use anvil_core::permissions::AnvilAction;
 use anvil_core::persistence::Object;
@@ -1506,6 +1507,9 @@ async fn get_object(
         Ok(version_id) => version_id,
         Err(response) => return response,
     };
+    if is_link_metadata_request(req.headers()) {
+        return get_object_link_metadata_response(state, claims, &bucket, &key, version_id).await;
+    }
     let requested_range = match parse_http_range(req.headers(), None) {
         Ok(range) => range,
         Err(response) => return response,
@@ -1513,10 +1517,15 @@ async fn get_object(
 
     match state
         .object_manager
-        .get_object(claims, bucket, key, version_id)
+        .get_object_with_link_mode(claims, bucket, key, version_id, ObjectLinkReadMode::Follow)
         .await
     {
-        Ok((object, stream)) => {
+        Ok(result) => {
+            let anvil_core::object_manager::ObjectReadResult {
+                object,
+                stream,
+                followed_link,
+            } = result;
             if let Some(response) =
                 evaluate_object_preconditions(req.headers(), &object.etag, object.created_at)
             {
@@ -1544,6 +1553,7 @@ async fn get_object(
                 .header("ETag", object.etag)
                 .header("Accept-Ranges", "bytes")
                 .header("x-amz-version-id", object.version_id.to_string());
+            builder = add_followed_link_headers(builder, followed_link.as_ref());
             builder = add_s3_user_metadata_headers(builder, object.user_meta.as_ref());
             if let Some(range) = range {
                 builder = builder.header(
@@ -1595,6 +1605,142 @@ async fn get_object(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             ),
         },
+    }
+}
+
+async fn get_object_link_metadata_response(
+    state: AppState,
+    claims: Option<Claims>,
+    bucket: &str,
+    key: &str,
+    version_id: Option<uuid::Uuid>,
+) -> Response {
+    match state
+        .object_manager
+        .read_object_link(claims.clone(), bucket, key, version_id)
+        .await
+    {
+        Ok(descriptor) => {
+            let body = match serde_json::to_vec(&descriptor) {
+                Ok(body) => body,
+                Err(error) => {
+                    return s3_error(
+                        "InternalError",
+                        &error.to_string(),
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    );
+                }
+            };
+            let builder = Response::builder()
+                .status(axum::http::StatusCode::OK)
+                .header("Content-Type", object_links::LINK_METADATA_CONTENT_TYPE)
+                .header("Content-Length", body.len())
+                .header("ETag", object_links::link_metadata_etag(&descriptor));
+            add_link_descriptor_headers(builder, &descriptor)
+                .body(Body::from(body))
+                .unwrap()
+        }
+        Err(status) => link_status_to_response(status, claims.is_some()),
+    }
+}
+
+async fn head_object_link_metadata_response(
+    state: AppState,
+    claims: Option<Claims>,
+    bucket: &str,
+    key: &str,
+    version_id: Option<uuid::Uuid>,
+) -> Response {
+    match state
+        .object_manager
+        .read_object_link(claims.clone(), bucket, key, version_id)
+        .await
+    {
+        Ok(descriptor) => {
+            let content_length = serde_json::to_vec(&descriptor)
+                .map(|body| body.len())
+                .unwrap_or(0);
+            let builder = Response::builder()
+                .status(axum::http::StatusCode::OK)
+                .header("Content-Type", object_links::LINK_METADATA_CONTENT_TYPE)
+                .header("Content-Length", content_length)
+                .header("ETag", object_links::link_metadata_etag(&descriptor));
+            add_link_descriptor_headers(builder, &descriptor)
+                .body(Body::empty())
+                .unwrap()
+        }
+        Err(status) => link_status_to_response(status, claims.is_some()),
+    }
+}
+
+fn is_link_metadata_request(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get("x-anvil-link-mode")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("metadata"))
+}
+
+fn add_followed_link_headers(
+    builder: axum::http::response::Builder,
+    followed_link: Option<&object_links::FollowedObjectLink>,
+) -> axum::http::response::Builder {
+    let Some(followed_link) = followed_link else {
+        return builder;
+    };
+    add_link_descriptor_headers(builder, &followed_link.descriptor)
+}
+
+fn add_link_descriptor_headers(
+    builder: axum::http::response::Builder,
+    descriptor: &object_links::ObjectLinkDescriptor,
+) -> axum::http::response::Builder {
+    builder
+        .header("x-anvil-object-kind", "link")
+        .header("x-anvil-link-key", descriptor.link_key.clone())
+        .header("x-anvil-link-generation", descriptor.generation.to_string())
+        .header(
+            "x-anvil-link-target-version",
+            descriptor.target_version.clone().unwrap_or_default(),
+        )
+}
+
+fn link_status_to_response(status: tonic::Status, has_claims: bool) -> Response {
+    match status.code() {
+        tonic::Code::NotFound => {
+            if has_claims {
+                s3_error(
+                    "NoSuchKey",
+                    status.message(),
+                    axum::http::StatusCode::NOT_FOUND,
+                )
+            } else {
+                s3_error(
+                    "AccessDenied",
+                    status.message(),
+                    axum::http::StatusCode::FORBIDDEN,
+                )
+            }
+        }
+        tonic::Code::PermissionDenied => s3_error(
+            "AccessDenied",
+            status.message(),
+            axum::http::StatusCode::FORBIDDEN,
+        ),
+        tonic::Code::FailedPrecondition => s3_error(
+            status.message(),
+            status.message(),
+            axum::http::StatusCode::PRECONDITION_FAILED,
+        ),
+        tonic::Code::InvalidArgument => s3_error(
+            "InvalidArgument",
+            status.message(),
+            axum::http::StatusCode::BAD_REQUEST,
+        ),
+        _ => s3_error(
+            "InternalError",
+            status.message(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
@@ -2272,13 +2418,26 @@ async fn head_object(
         Ok(version_id) => version_id,
         Err(response) => return response,
     };
+    if is_link_metadata_request(req.headers()) {
+        return head_object_link_metadata_response(state, claims, &bucket, &key, version_id).await;
+    }
 
     match state
         .object_manager
-        .head_object(claims, &bucket, &key, version_id)
+        .head_object_with_link_mode(
+            claims,
+            &bucket,
+            &key,
+            version_id,
+            ObjectLinkReadMode::Follow,
+        )
         .await
     {
-        Ok(object) => {
+        Ok(result) => {
+            let anvil_core::object_manager::ObjectHeadResult {
+                object,
+                followed_link,
+            } = result;
             if let Some(response) =
                 evaluate_object_preconditions(req.headers(), &object.etag, object.created_at)
             {
@@ -2294,6 +2453,7 @@ async fn head_object(
                 .header("ETag", object.etag)
                 .header("Accept-Ranges", "bytes")
                 .header("x-amz-version-id", object.version_id.to_string());
+            let builder = add_followed_link_headers(builder, followed_link.as_ref());
             add_s3_user_metadata_headers(builder, object.user_meta.as_ref())
                 .body(Body::empty())
                 .unwrap()

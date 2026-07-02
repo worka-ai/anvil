@@ -15,10 +15,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .api_listen_addr
         .parse::<SocketAddr>()
         .expect("Invalid gRPC bind address");
+    let admin_addr = config
+        .admin_listen_addr
+        .parse::<SocketAddr>()
+        .expect("Invalid admin gRPC bind address");
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
 
     info!("Anvil server (gRPC & S3) listening on {}", addr);
+    info!("Anvil admin server (gRPC) listening on {}", admin_addr);
 
-    run(listener, config).await?;
+    run(listener, admin_listener, config).await?;
     Ok(())
 }

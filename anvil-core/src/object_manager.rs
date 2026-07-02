@@ -5,7 +5,7 @@ use crate::{
     },
     auth, bucket_journal,
     cluster::ClusterState,
-    metadata_journal,
+    metadata_journal, object_links,
     observability::{
         OBJECT_READ_LATENCY, OBJECT_WRITE_LATENCY, Observability, PREFIX_LIST_LATENCY,
         RESERVED_NAMESPACE_REJECTION_COUNT,
@@ -87,6 +87,24 @@ pub struct AbortMultipartUploadResult {
 pub struct ObjectWriteOptions {
     pub content_type: Option<String>,
     pub user_metadata: Option<JsonValue>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectLinkReadMode {
+    Follow,
+    Metadata,
+}
+
+pub struct ObjectReadResult {
+    pub object: Object,
+    pub stream: Pin<Box<dyn Stream<Item = Result<Vec<u8>, Status>> + Send + 'static>>,
+    pub followed_link: Option<object_links::FollowedObjectLink>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectHeadResult {
+    pub object: Object,
+    pub followed_link: Option<object_links::FollowedObjectLink>,
 }
 
 async fn commit_temp_payload(
@@ -872,6 +890,26 @@ impl ObjectManager {
         ),
         Status,
     > {
+        let result = self
+            .get_object_with_link_mode(
+                claims,
+                bucket_name,
+                object_key,
+                version_id,
+                ObjectLinkReadMode::Follow,
+            )
+            .await?;
+        Ok((result.object, result.stream))
+    }
+
+    pub async fn get_object_with_link_mode(
+        &self,
+        claims: Option<auth::Claims>,
+        bucket_name: String,
+        object_key: String,
+        version_id: Option<uuid::Uuid>,
+        link_mode: ObjectLinkReadMode,
+    ) -> Result<ObjectReadResult, Status> {
         let _latency = self
             .observability
             .latency_guard(OBJECT_READ_LATENCY, &[("api", "native")]);
@@ -891,16 +929,18 @@ impl ObjectManager {
             .await?;
 
         if !bucket.is_public_read {
-            let claims = claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
+            let claims = claims
+                .as_ref()
+                .ok_or_else(|| Status::permission_denied("Permission denied"))?;
             if !self
-                .object_read_allowed(&claims, &bucket_name, &object_key, None)
+                .object_read_allowed(claims, &bucket_name, &object_key, None)
                 .await?
             {
                 return Err(Status::permission_denied("Permission denied"));
             }
         }
 
-        let object = match version_id {
+        let mut object = match version_id {
             Some(version_id) => {
                 let object = metadata_journal::read_object_version(
                     &self.storage,
@@ -927,13 +967,28 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Object not found"))?,
         };
+        let mut followed_link = None;
+        if version_id.is_none() && object.kind == object_links::ObjectEntryKind::Link {
+            if link_mode == ObjectLinkReadMode::Metadata {
+                return Err(Status::failed_precondition("ObjectLinkMetadataRead"));
+            }
+            let (target, link) = self
+                .resolve_followed_link(&bucket, object, claims.as_ref())
+                .await?;
+            object = target;
+            followed_link = Some(link);
+        }
 
         if let Some(inline_payload) = object.inline_payload.clone() {
             let chunks = inline_payload
                 .chunks(1024 * 64)
                 .map(|chunk| Ok(chunk.to_vec()))
                 .collect::<Vec<Result<Vec<u8>, Status>>>();
-            return Ok((object, Box::pin(futures_util::stream::iter(chunks))));
+            return Ok(ObjectReadResult {
+                object,
+                stream: Box::pin(futures_util::stream::iter(chunks)),
+                followed_link,
+            });
         }
 
         let (tx, rx) = mpsc::channel(4);
@@ -1167,7 +1222,11 @@ impl ObjectManager {
             }
         });
 
-        Ok((object, Box::pin(ReceiverStream::new(rx))))
+        Ok(ObjectReadResult {
+            object,
+            stream: Box::pin(ReceiverStream::new(rx)),
+            followed_link,
+        })
     }
 
     pub async fn delete_object(
@@ -1271,6 +1330,26 @@ impl ObjectManager {
         object_key: &str,
         version_id: Option<uuid::Uuid>,
     ) -> Result<Object, Status> {
+        Ok(self
+            .head_object_with_link_mode(
+                claims,
+                bucket_name,
+                object_key,
+                version_id,
+                ObjectLinkReadMode::Follow,
+            )
+            .await?
+            .object)
+    }
+
+    pub async fn head_object_with_link_mode(
+        &self,
+        claims: Option<auth::Claims>,
+        bucket_name: &str,
+        object_key: &str,
+        version_id: Option<uuid::Uuid>,
+        link_mode: ObjectLinkReadMode,
+    ) -> Result<ObjectHeadResult, Status> {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
@@ -1286,16 +1365,18 @@ impl ObjectManager {
             .await?;
 
         if !bucket.is_public_read {
-            let claims = claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
+            let claims = claims
+                .as_ref()
+                .ok_or_else(|| Status::permission_denied("Permission denied"))?;
             if !self
-                .object_read_allowed(&claims, bucket_name, object_key, None)
+                .object_read_allowed(claims, bucket_name, object_key, None)
                 .await?
             {
                 return Err(Status::permission_denied("Permission denied"));
             }
         }
 
-        let object = match version_id {
+        let mut object = match version_id {
             Some(version_id) => {
                 let object = metadata_journal::read_object_version(
                     &self.storage,
@@ -1322,7 +1403,81 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Object not found"))?,
         };
-        Ok(object)
+        let mut followed_link = None;
+        if version_id.is_none() && object.kind == object_links::ObjectEntryKind::Link {
+            if link_mode == ObjectLinkReadMode::Metadata {
+                return Err(Status::failed_precondition("ObjectLinkMetadataRead"));
+            }
+            let (target, link) = self
+                .resolve_followed_link(&bucket, object, claims.as_ref())
+                .await?;
+            object = target;
+            followed_link = Some(link);
+        }
+        Ok(ObjectHeadResult {
+            object,
+            followed_link,
+        })
+    }
+
+    pub async fn read_object_link(
+        &self,
+        claims: Option<auth::Claims>,
+        bucket_name: &str,
+        object_key: &str,
+        version_id: Option<uuid::Uuid>,
+    ) -> Result<object_links::ObjectLinkDescriptor, Status> {
+        if !validation::is_valid_bucket_name(bucket_name) {
+            return Err(Status::invalid_argument("Invalid bucket name"));
+        }
+        if validation::is_reserved_internal_key(object_key) {
+            return Err(Status::permission_denied("UnauthorizedReservedNamespace"));
+        }
+        if !validation::is_valid_object_key(object_key) {
+            return Err(Status::invalid_argument("Invalid object key"));
+        }
+
+        let bucket = self
+            .get_authorized_bucket(claims.as_ref(), bucket_name)
+            .await?;
+        if !bucket.is_public_read {
+            let claims = claims
+                .as_ref()
+                .ok_or_else(|| Status::permission_denied("Permission denied"))?;
+            if !self
+                .object_read_allowed(claims, bucket_name, object_key, None)
+                .await?
+            {
+                return Err(Status::permission_denied("Permission denied"));
+            }
+        }
+
+        let object = match version_id {
+            Some(version_id) => metadata_journal::read_object_version(
+                &self.storage,
+                &bucket,
+                &self.encryption_key,
+                object_key,
+                version_id,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Object link not found"))?,
+            None => metadata_journal::read_current_object(
+                &self.storage,
+                &bucket,
+                &self.encryption_key,
+                object_key,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Object link not found"))?,
+        };
+        if object.deleted_at.is_some() || object.kind != object_links::ObjectEntryKind::Link {
+            return Err(Status::not_found("Object link not found"));
+        }
+        object_links::link_descriptor(&bucket.name, &object)
+            .ok_or_else(|| Status::internal("Object link descriptor missing"))
     }
 
     pub async fn list_objects(
@@ -1655,6 +1810,86 @@ impl ObjectManager {
         }
 
         Ok(bucket)
+    }
+
+    async fn resolve_followed_link(
+        &self,
+        bucket: &Bucket,
+        initial_link: Object,
+        claims: Option<&auth::Claims>,
+    ) -> Result<(Object, object_links::FollowedObjectLink), Status> {
+        let initial_descriptor = object_links::link_descriptor(&bucket.name, &initial_link)
+            .ok_or_else(|| Status::internal("Object link descriptor missing"))?;
+        if initial_descriptor.resolution != object_links::ObjectLinkResolution::Follow {
+            return Err(Status::failed_precondition("ObjectLinkRedirectRequired"));
+        }
+
+        let mut current_link = initial_link;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..object_links::MAX_LINK_RESOLUTION_DEPTH {
+            let Some(link) = current_link.link.clone() else {
+                return Err(Status::failed_precondition("InvalidObjectLink"));
+            };
+            let seen_key = format!("{}:{}", current_link.key, current_link.version_id);
+            if !seen.insert(seen_key) {
+                return Err(Status::failed_precondition("ObjectLinkLoop"));
+            }
+            if !bucket.is_public_read {
+                let claims =
+                    claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
+                if !self
+                    .object_read_allowed(claims, &bucket.name, &link.target_key, None)
+                    .await?
+                {
+                    return Err(Status::permission_denied("Permission denied"));
+                }
+            }
+
+            let target = match link.target_version {
+                Some(version_id) => {
+                    metadata_journal::read_object_version(
+                        &self.storage,
+                        bucket,
+                        &self.encryption_key,
+                        &link.target_key,
+                        version_id,
+                    )
+                    .await
+                }
+                None => {
+                    metadata_journal::read_current_object(
+                        &self.storage,
+                        bucket,
+                        &self.encryption_key,
+                        &link.target_key,
+                    )
+                    .await
+                }
+            }
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::failed_precondition("DanglingObjectLink"))?;
+            if target.deleted_at.is_some() {
+                return Err(Status::failed_precondition("DanglingObjectLink"));
+            }
+            match target.kind {
+                object_links::ObjectEntryKind::Blob => {
+                    let response_etag = object_links::followed_link_etag(&current_link, &target)
+                        .ok_or_else(|| Status::internal("Object link ETag missing"))?;
+                    let mut served = target;
+                    served.etag = response_etag.clone();
+                    let followed = object_links::FollowedObjectLink {
+                        descriptor: initial_descriptor,
+                        response_etag,
+                        target_version: served.version_id,
+                    };
+                    return Ok((served, followed));
+                }
+                object_links::ObjectEntryKind::Link => {
+                    current_link = target;
+                }
+            }
+        }
+        Err(Status::failed_precondition("ObjectLinkDepthExceeded"))
     }
 
     async fn object_read_allowed(

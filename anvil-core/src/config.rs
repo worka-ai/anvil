@@ -28,9 +28,33 @@ pub struct Config {
     #[arg(long, env, default_value = "0.0.0.0:50051")]
     pub api_listen_addr: String,
 
+    /// The address to bind the administrative gRPC service to.
+    #[arg(long, env, default_value = "127.0.0.1:50052")]
+    pub admin_listen_addr: String,
+
+    /// Stable mesh identifier for administrative and lifecycle records.
+    #[arg(long, env, default_value = "default")]
+    pub mesh_id: String,
+
     /// The current region this node is operating in.
     #[arg(long, env)]
     pub region: String,
+
+    /// The current cell this node is operating in.
+    #[arg(long, env, default_value = "default")]
+    pub cell_id: String,
+
+    /// Region host suffix advertised for virtual-host routing.
+    #[arg(long, env, default_value = "")]
+    pub public_region_base_domain: String,
+
+    /// Path used by operators to persist this node's stable lifecycle identity.
+    #[arg(long, env, default_value = "")]
+    pub node_id_path: String,
+
+    /// Path used to persist the libp2p keypair backing the cluster identity.
+    #[arg(long, env, default_value = "")]
+    pub cluster_keypair_path: String,
 
     /// A list of bootstrap addresses for joining a cluster.
     #[arg(long, env, use_value_delimiter = true, value_delimiter = ',')]

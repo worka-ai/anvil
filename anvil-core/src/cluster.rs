@@ -11,6 +11,7 @@ use libp2p::{
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -139,7 +140,7 @@ impl From<mdns::Event> for ClusterEvent {
 }
 
 pub async fn create_swarm(config: Arc<crate::config::Config>) -> Result<Swarm<ClusterBehaviour>> {
-    let local_key = identity::Keypair::generate_ed25519();
+    let local_key = load_or_create_cluster_keypair(&config.cluster_keypair_path).await?;
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
         .with_tokio()
@@ -175,6 +176,27 @@ pub async fn create_swarm(config: Arc<crate::config::Config>) -> Result<Swarm<Cl
     swarm.listen_on(cluster_listen_addr)?;
 
     Ok(swarm)
+}
+
+async fn load_or_create_cluster_keypair(path: &str) -> Result<identity::Keypair> {
+    if path.trim().is_empty() {
+        return Ok(identity::Keypair::generate_ed25519());
+    }
+
+    let path = Path::new(path);
+    match tokio::fs::read(path).await {
+        Ok(bytes) => identity::Keypair::from_protobuf_encoding(&bytes).map_err(Into::into),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            let keypair = identity::Keypair::generate_ed25519();
+            let bytes = keypair.to_protobuf_encoding()?;
+            tokio::fs::write(path, bytes).await?;
+            Ok(keypair)
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 // Function to configure and run the gossip service.

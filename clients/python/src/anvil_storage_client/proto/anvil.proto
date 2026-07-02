@@ -2,6 +2,306 @@ syntax = "proto3";
 
 package anvil;
 
+service AdminService {
+  rpc CreateRegion(CreateRegionRequest) returns (RegionResponse);
+  rpc ActivateRegion(ActivateRegionRequest) returns (RegionResponse);
+  rpc DrainRegion(DrainRegionRequest) returns (DrainOperationResponse);
+  rpc RemoveRegion(RemoveRegionRequest) returns (AdminMutationResponse);
+  rpc ListRegions(ListRegionsRequest) returns (ListRegionsResponse);
+
+  rpc RegisterCell(RegisterCellRequest) returns (CellResponse);
+  rpc ActivateCell(ActivateCellRequest) returns (CellResponse);
+  rpc DrainCell(DrainCellRequest) returns (DrainOperationResponse);
+  rpc RemoveCell(RemoveCellRequest) returns (AdminMutationResponse);
+  rpc ListCells(ListCellsRequest) returns (ListCellsResponse);
+
+  rpc RegisterNode(RegisterNodeRequest) returns (NodeResponse);
+  rpc ActivateNode(ActivateNodeRequest) returns (NodeResponse);
+  rpc DrainNode(DrainNodeRequest) returns (DrainOperationResponse);
+  rpc RemoveNode(RemoveNodeRequest) returns (AdminMutationResponse);
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+}
+
+message AdminRequestContext {
+  string request_id = 1;
+  string idempotency_key = 2;
+  string audit_reason = 3;
+  uint64 expected_generation = 4;
+}
+
+message AdminPrincipal {
+  string principal_id = 1;
+  string tenant_id = 2;
+  repeated string authenticated_methods = 3;
+}
+
+message AdminMutationResponse {
+  string request_id = 1;
+  string resource_id = 2;
+  uint64 generation = 3;
+  string audit_event_id = 4;
+  bool idempotent_replay = 5;
+}
+
+message AdminError {
+  string request_id = 1;
+  string code = 2;
+  string message = 3;
+  string resource_id = 4;
+  uint64 current_generation = 5;
+}
+
+message PageRequest {
+  string cursor = 1;
+  uint32 limit = 2;
+}
+
+message PageResponse {
+  string next_cursor = 1;
+  bool has_more = 2;
+}
+
+enum NodeCapability {
+  NODE_CAPABILITY_UNSPECIFIED = 0;
+  NODE_CAPABILITY_OBJECT = 1;
+  NODE_CAPABILITY_INDEX = 2;
+  NODE_CAPABILITY_PERSONALDB = 3;
+  NODE_CAPABILITY_GATEWAY = 4;
+  NODE_CAPABILITY_ADMIN = 5;
+}
+
+enum ObjectLinkResolution {
+  OBJECT_LINK_RESOLUTION_UNSPECIFIED = 0;
+  OBJECT_LINK_RESOLUTION_FOLLOW = 1;
+  OBJECT_LINK_RESOLUTION_REDIRECT = 2;
+}
+
+enum RegionDrainDisposition {
+  REGION_DRAIN_DISPOSITION_UNSPECIFIED = 0;
+  REGION_DRAIN_DISPOSITION_BLOCK_UNTIL_EMPTY = 1;
+  REGION_DRAIN_DISPOSITION_REMAIN_PROXY_ONLY = 2;
+  REGION_DRAIN_DISPOSITION_READ_ONLY_UNTIL_REMOVED = 3;
+  REGION_DRAIN_DISPOSITION_DELETE_AFTER_RETENTION = 4;
+}
+
+enum LifecycleState {
+  LIFECYCLE_STATE_UNSPECIFIED = 0;
+  LIFECYCLE_STATE_JOINING = 1;
+  LIFECYCLE_STATE_ACTIVE = 2;
+  LIFECYCLE_STATE_READ_ONLY = 3;
+  LIFECYCLE_STATE_DRAINING = 4;
+  LIFECYCLE_STATE_DRAINED = 5;
+  LIFECYCLE_STATE_DRAINED_WITH_EXCEPTIONS = 6;
+  LIFECYCLE_STATE_OFFLINE = 7;
+  LIFECYCLE_STATE_REMOVED = 8;
+}
+
+message NodeDrainDescriptor {
+  string started_at = 1;
+  uint64 graceful_timeout_ms = 2;
+  bool force_after_timeout = 3;
+}
+
+message NodeDescriptor {
+  string schema = 1;
+  string mesh_id = 2;
+  string node_id = 3;
+  string region = 4;
+  string cell_id = 5;
+  string libp2p_peer_id = 6;
+  string public_api_addr = 7;
+  repeated string public_cluster_addrs = 8;
+  repeated NodeCapability capabilities = 9;
+  LifecycleState state = 10;
+  NodeDrainDescriptor drain = 11;
+  string last_heartbeat_at = 12;
+  string created_at = 13;
+  string updated_at = 14;
+  uint64 generation = 15;
+}
+
+message RegionDescriptor {
+  string schema = 1;
+  string mesh_id = 2;
+  string region = 3;
+  LifecycleState state = 4;
+  string public_base_url = 5;
+  string virtual_host_suffix = 6;
+  uint32 placement_weight = 7;
+  string default_cell = 8;
+  string created_at = 9;
+  string updated_at = 10;
+  uint64 generation = 11;
+}
+
+message CellDescriptor {
+  string schema = 1;
+  string mesh_id = 2;
+  string region = 3;
+  string cell_id = 4;
+  LifecycleState state = 5;
+  uint32 placement_weight = 6;
+  string created_at = 7;
+  string updated_at = 8;
+  uint64 generation = 9;
+}
+
+message ObjectLinkDescriptor {
+  string schema = 1;
+  string tenant_id = 2;
+  string bucket_name = 3;
+  string link_key = 4;
+  string target_key = 5;
+  string target_version = 6;
+  ObjectLinkResolution resolution = 7;
+  bool allow_dangling = 8;
+  string created_at = 9;
+  string updated_at = 10;
+  uint64 generation = 11;
+}
+
+message BucketDrainOverride {
+  string tenant_id = 1;
+  string bucket_name = 2;
+  RegionDrainDisposition disposition = 3;
+  string reason = 4;
+}
+
+message DrainOperationResponse {
+  string request_id = 1;
+  string resource_id = 2;
+  LifecycleState state = 3;
+  uint64 generation = 4;
+  string audit_event_id = 5;
+}
+
+message CreateRegionRequest {
+  AdminRequestContext context = 1;
+  string region = 2;
+  string public_base_url = 3;
+  string virtual_host_suffix = 4;
+  uint32 placement_weight = 5;
+  string default_cell = 6;
+}
+
+message ActivateRegionRequest {
+  AdminRequestContext context = 1;
+  string region = 2;
+}
+
+message DrainRegionRequest {
+  AdminRequestContext context = 1;
+  string region = 2;
+  RegionDrainDisposition default_disposition = 3;
+  repeated BucketDrainOverride bucket_overrides = 4;
+}
+
+message RemoveRegionRequest {
+  AdminRequestContext context = 1;
+  string region = 2;
+}
+
+message ListRegionsRequest {
+  PageRequest page = 1;
+}
+
+message RegisterCellRequest {
+  AdminRequestContext context = 1;
+  string region = 2;
+  string cell_id = 3;
+  uint32 placement_weight = 4;
+}
+
+message ActivateCellRequest {
+  AdminRequestContext context = 1;
+  string region = 2;
+  string cell_id = 3;
+}
+
+message DrainCellRequest {
+  AdminRequestContext context = 1;
+  string region = 2;
+  string cell_id = 3;
+}
+
+message RemoveCellRequest {
+  AdminRequestContext context = 1;
+  string region = 2;
+  string cell_id = 3;
+}
+
+message ListCellsRequest {
+  string region = 1;
+  PageRequest page = 2;
+}
+
+message RegisterNodeRequest {
+  AdminRequestContext context = 1;
+  string node_id = 2;
+  string region = 3;
+  string cell_id = 4;
+  string libp2p_peer_id = 5;
+  repeated string public_cluster_addrs = 6;
+  string public_api_addr = 7;
+  repeated NodeCapability capabilities = 8;
+}
+
+message ActivateNodeRequest {
+  AdminRequestContext context = 1;
+  string node_id = 2;
+}
+
+message DrainNodeRequest {
+  AdminRequestContext context = 1;
+  string node_id = 2;
+  uint64 graceful_timeout_ms = 3;
+  bool force_after_timeout = 4;
+}
+
+message RemoveNodeRequest {
+  AdminRequestContext context = 1;
+  string node_id = 2;
+}
+
+message ListNodesRequest {
+  string region = 1;
+  string cell_id = 2;
+  PageRequest page = 3;
+}
+
+message NodeResponse {
+  string request_id = 1;
+  NodeDescriptor node = 2;
+  string audit_event_id = 3;
+}
+
+message RegionResponse {
+  string request_id = 1;
+  RegionDescriptor region = 2;
+  string audit_event_id = 3;
+}
+
+message CellResponse {
+  string request_id = 1;
+  CellDescriptor cell = 2;
+  string audit_event_id = 3;
+}
+
+message ListNodesResponse {
+  PageResponse page = 1;
+  repeated NodeDescriptor nodes = 2;
+}
+
+message ListRegionsResponse {
+  PageResponse page = 1;
+  repeated RegionDescriptor regions = 2;
+}
+
+message ListCellsResponse {
+  PageResponse page = 1;
+  repeated CellDescriptor cells = 2;
+}
+
 // Bucket Service
 service BucketService {
   rpc CreateBucket(CreateBucketRequest) returns (CreateBucketResponse);
@@ -908,6 +1208,9 @@ service AuthService {
   rpc CheckPermissions(CheckPermissionsRequest) returns (CheckPermissionsResponse);
   rpc ListAuthzObjects(ListAuthzObjectsRequest) returns (ListAuthzObjectsResponse);
   rpc ListAuthzSubjects(ListAuthzSubjectsRequest) returns (ListAuthzSubjectsResponse);
+  rpc PutAuthzSchema(PutAuthzSchemaRequest) returns (PutAuthzSchemaResponse);
+  rpc BindAuthzSchema(BindAuthzSchemaRequest) returns (BindAuthzSchemaResponse);
+  rpc GetAuthzSchemaBinding(GetAuthzSchemaBindingRequest) returns (GetAuthzSchemaBindingResponse);
   rpc ApplyAuthzSchema(ApplyAuthzSchemaRequest) returns (ApplyAuthzSchemaResponse);
   rpc GetAuthzSchema(GetAuthzSchemaRequest) returns (GetAuthzSchemaResponse);
   rpc WatchAuthzTupleLog(WatchAuthzTupleLogRequest) returns (stream WatchAuthzTupleLogResponse);
@@ -1031,6 +1334,17 @@ message SetPublicAccessRequest {
 
 message SetPublicAccessResponse {}
 
+message AuthzScope {
+    string anvil_storage_tenant_id = 1;
+    string authz_realm_id = 2;
+}
+
+message AuthzSchemaRef {
+    string schema_id = 1;
+    uint64 schema_revision = 2;
+    string schema_digest = 3;
+}
+
 message WriteAuthzTupleRequest {
     string namespace = 1;
     string object_id = 2;
@@ -1040,6 +1354,7 @@ message WriteAuthzTupleRequest {
     string caveat_hash = 6;
     string operation = 7;
     string reason = 8;
+    AuthzScope scope = 9;
 }
 
 message WriteAuthzTupleResponse {
@@ -1068,10 +1383,12 @@ message AuthzTupleMutation {
     string caveat_hash = 6;
     string operation = 7;
     string reason = 8;
+    AuthzScope scope = 9;
 }
 
 message WriteAuthzTuplesRequest {
     repeated AuthzTupleMutation mutations = 1;
+    AuthzScope scope = 2;
 }
 
 message WriteAuthzTuplesResponse {
@@ -1091,6 +1408,7 @@ message ReadAuthzTuplesRequest {
     string zookie = 8;
     uint32 page_size = 9;
     string page_token = 10;
+    AuthzScope scope = 11;
 }
 
 message ReadAuthzTuplesResponse {
@@ -1109,6 +1427,7 @@ message CheckPermissionRequest {
     string caveat_hash = 6;
     string consistency = 7;
     string zookie = 8;
+    AuthzScope scope = 9;
 }
 
 message CheckPermissionResponse {
@@ -1138,6 +1457,7 @@ message ListAuthzObjectsRequest {
     string zookie = 7;
     uint32 page_size = 8;
     string page_token = 9;
+    AuthzScope scope = 10;
 }
 
 message ListAuthzObjectsResponse {
@@ -1156,6 +1476,7 @@ message ListAuthzSubjectsRequest {
     string zookie = 6;
     uint32 page_size = 7;
     string page_token = 8;
+    AuthzScope scope = 9;
 }
 
 message AuthzSubject {
@@ -1193,6 +1514,44 @@ message AuthzNamespaceSchema {
     string applied_at = 14;
 }
 
+message PutAuthzSchemaRequest {
+    string anvil_storage_tenant_id = 1;
+    string schema_id = 2;
+    repeated AuthzNamespaceSchema namespaces = 3;
+    string reason = 4;
+}
+
+message PutAuthzSchemaResponse {
+    AuthzSchemaRef schema_ref = 1;
+    uint64 authz_revision = 2;
+    string zookie = 3;
+}
+
+message BindAuthzSchemaRequest {
+    AuthzScope scope = 1;
+    AuthzSchemaRef schema_ref = 2;
+    optional uint64 expected_binding_generation = 3;
+    string reason = 4;
+}
+
+message BindAuthzSchemaResponse {
+    AuthzScope scope = 1;
+    AuthzSchemaRef schema_ref = 2;
+    uint64 binding_generation = 3;
+    uint64 authz_revision = 4;
+    string zookie = 5;
+}
+
+message GetAuthzSchemaBindingRequest {
+    AuthzScope scope = 1;
+}
+
+message GetAuthzSchemaBindingResponse {
+    AuthzScope scope = 1;
+    AuthzSchemaRef schema_ref = 2;
+    uint64 binding_generation = 3;
+}
+
 message ApplyAuthzSchemaRequest {
     repeated AuthzNamespaceSchema namespaces = 1;
     string reason = 2;
@@ -1205,11 +1564,15 @@ message ApplyAuthzSchemaResponse {
 
 message GetAuthzSchemaRequest {
     string namespace = 1;
+    string anvil_storage_tenant_id = 2;
+    string schema_id = 3;
+    optional uint64 schema_revision = 4;
 }
 
 message GetAuthzSchemaResponse {
     repeated AuthzNamespaceSchema namespaces = 1;
     uint64 schema_version = 2;
+    AuthzSchemaRef schema_ref = 3;
 }
 
 message AcquireTaskLeaseRequest {
@@ -1295,6 +1658,7 @@ message ForceReleaseTaskLeaseResponse {
 message WatchAuthzTupleLogRequest {
     uint64 after_revision = 1;
     string namespace = 2;
+    AuthzScope scope = 3;
 }
 
 message WatchAuthzTupleLogResponse {

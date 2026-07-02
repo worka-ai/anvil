@@ -13,7 +13,7 @@ use crate::{
     config::Config,
     control_journal, directory_repair, hf_journal, index_builder, index_diagnostic_journal,
     index_journal, index_repair, manifest_journal, metadata_journal, model_journal,
-    multipart_journal,
+    multipart_journal, object_links,
     partition_fence::{
         PartitionOwnerStatus, PartitionRecoveryAcquire, PartitionWritePermit,
         acquire_partition_recovery, publish_partition_ready, read_partition_owner,
@@ -121,6 +121,8 @@ pub struct Object {
     pub tenant_id: i64,
     pub bucket_id: i64,
     pub key: String,
+    #[serde(default)]
+    pub kind: object_links::ObjectEntryKind,
     pub content_hash: String,
     pub size: i64,
     pub etag: String,
@@ -138,6 +140,8 @@ pub struct Object {
     pub shard_map: Option<JsonValue>,
     pub inline_payload: Option<Vec<u8>>,
     pub checksum: Option<Vec<u8>>,
+    #[serde(default)]
+    pub link: Option<object_links::ObjectLinkTarget>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -981,6 +985,92 @@ impl Persistence {
             .regions())
     }
 
+    pub async fn create_region_descriptor(
+        &self,
+        input: crate::mesh_lifecycle::CreateRegionDescriptor,
+    ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::RegionDescriptor> {
+        crate::mesh_lifecycle::create_region(&self.storage, input).await
+    }
+
+    pub async fn transition_region_descriptor(
+        &self,
+        region: &str,
+        expected_generation: u64,
+        target: crate::mesh_lifecycle::LifecycleState,
+    ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::RegionDescriptor> {
+        crate::mesh_lifecycle::transition_region(&self.storage, region, expected_generation, target)
+            .await
+    }
+
+    pub async fn list_region_descriptors(
+        &self,
+    ) -> crate::mesh_lifecycle::LifecycleResult<Vec<crate::mesh_lifecycle::RegionDescriptor>> {
+        crate::mesh_lifecycle::list_regions(&self.storage).await
+    }
+
+    pub async fn register_cell_descriptor(
+        &self,
+        input: crate::mesh_lifecycle::RegisterCellDescriptor,
+    ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::CellDescriptor> {
+        crate::mesh_lifecycle::register_cell(&self.storage, input).await
+    }
+
+    pub async fn transition_cell_descriptor(
+        &self,
+        region: &str,
+        cell_id: &str,
+        expected_generation: u64,
+        target: crate::mesh_lifecycle::LifecycleState,
+    ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::CellDescriptor> {
+        crate::mesh_lifecycle::transition_cell(
+            &self.storage,
+            region,
+            cell_id,
+            expected_generation,
+            target,
+        )
+        .await
+    }
+
+    pub async fn list_cell_descriptors(
+        &self,
+        region_filter: Option<&str>,
+    ) -> crate::mesh_lifecycle::LifecycleResult<Vec<crate::mesh_lifecycle::CellDescriptor>> {
+        crate::mesh_lifecycle::list_cells(&self.storage, region_filter).await
+    }
+
+    pub async fn register_node_descriptor(
+        &self,
+        input: crate::mesh_lifecycle::RegisterNodeDescriptor,
+    ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::NodeDescriptor> {
+        crate::mesh_lifecycle::register_node(&self.storage, input).await
+    }
+
+    pub async fn transition_node_descriptor(
+        &self,
+        node_id: &str,
+        expected_generation: u64,
+        target: crate::mesh_lifecycle::LifecycleState,
+        drain: Option<crate::mesh_lifecycle::NodeDrainDescriptor>,
+    ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::NodeDescriptor> {
+        crate::mesh_lifecycle::transition_node(
+            &self.storage,
+            node_id,
+            expected_generation,
+            target,
+            drain,
+        )
+        .await
+    }
+
+    pub async fn list_node_descriptors(
+        &self,
+        region_filter: Option<&str>,
+        cell_filter: Option<&str>,
+    ) -> crate::mesh_lifecycle::LifecycleResult<Vec<crate::mesh_lifecycle::NodeDescriptor>> {
+        crate::mesh_lifecycle::list_nodes(&self.storage, region_filter, cell_filter).await
+    }
+
     pub async fn get_tenant_by_name(&self, name: &str) -> Result<Option<Tenant>> {
         Ok(control_journal::read_control_state(&self.storage)
             .await?
@@ -1389,6 +1479,7 @@ impl Persistence {
             tenant_id,
             bucket_id,
             key: key.to_string(),
+            kind: object_links::ObjectEntryKind::Blob,
             content_hash: content_hash.to_string(),
             size,
             etag: etag.to_string(),
@@ -1406,6 +1497,7 @@ impl Persistence {
             shard_map,
             inline_payload,
             checksum: None,
+            link: None,
         };
         let permit = self
             .object_metadata_write_permit(bucket.tenant_id, bucket.id)
@@ -1425,6 +1517,201 @@ impl Persistence {
         Ok(object)
     }
 
+    pub async fn put_object_link(
+        &self,
+        request: object_links::PutObjectLinkRequest,
+    ) -> std::result::Result<object_links::ObjectLinkMutation, object_links::ObjectLinkError> {
+        if !crate::validation::is_valid_object_key(&request.link_key) {
+            return Err(object_links::ObjectLinkError::InvalidLinkKey);
+        }
+        if !crate::validation::is_valid_object_key(&request.target_key) {
+            return Err(object_links::ObjectLinkError::InvalidTargetKey);
+        }
+
+        let bucket = bucket_journal::read_current_bucket_by_id(&self.storage, request.bucket_id)
+            .await?
+            .ok_or(object_links::ObjectLinkError::BucketNotFound)?;
+        if bucket.tenant_id != request.tenant_id {
+            return Err(object_links::ObjectLinkError::BucketTenantMismatch);
+        }
+
+        let current = metadata_journal::read_current_object(
+            &self.storage,
+            &bucket,
+            &self.partition_owner_signing_key,
+            &request.link_key,
+        )
+        .await?;
+        if request.create_only && current.is_some() {
+            return Err(object_links::ObjectLinkError::AlreadyExists);
+        }
+        let existing_generation = match current.as_ref() {
+            Some(object) if object.kind != object_links::ObjectEntryKind::Link => {
+                return Err(object_links::ObjectLinkError::ExistingObjectIsNotLink);
+            }
+            Some(object) => object_links::link_generation(object).unwrap_or(0),
+            None => 0,
+        };
+
+        if !request.create_only {
+            let expected = request
+                .expected_generation
+                .ok_or(object_links::ObjectLinkError::MissingExpectedGeneration)?;
+            if expected != existing_generation {
+                return Err(object_links::ObjectLinkError::GenerationConflict {
+                    expected,
+                    actual: existing_generation,
+                });
+            }
+        } else if let Some(expected) = request.expected_generation
+            && expected != 0
+        {
+            return Err(object_links::ObjectLinkError::GenerationConflict {
+                expected,
+                actual: existing_generation,
+            });
+        }
+
+        if !request.allow_dangling {
+            let target = match request.target_version {
+                Some(version_id) => {
+                    metadata_journal::read_object_version(
+                        &self.storage,
+                        &bucket,
+                        &self.partition_owner_signing_key,
+                        &request.target_key,
+                        version_id,
+                    )
+                    .await?
+                }
+                None => {
+                    metadata_journal::read_current_object(
+                        &self.storage,
+                        &bucket,
+                        &self.partition_owner_signing_key,
+                        &request.target_key,
+                    )
+                    .await?
+                }
+            }
+            .ok_or(object_links::ObjectLinkError::DanglingObjectLink)?;
+            if target.deleted_at.is_some() {
+                return Err(object_links::ObjectLinkError::DanglingObjectLink);
+            }
+            if target.kind != object_links::ObjectEntryKind::Blob {
+                return Err(object_links::ObjectLinkError::TargetNotBlob);
+            }
+        }
+
+        let now = Utc::now();
+        let generation = existing_generation.checked_add(1).ok_or_else(|| {
+            object_links::ObjectLinkError::Internal("link generation overflow".to_string())
+        })?;
+        let link_created_at = current
+            .as_ref()
+            .and_then(|object| object.link.as_ref())
+            .map(|link| link.created_at)
+            .unwrap_or(now);
+        let descriptor = object_links::ObjectLinkDescriptor {
+            schema: "anvil.object_link.v1".to_string(),
+            tenant_id: request.tenant_id.to_string(),
+            bucket_name: bucket.name.clone(),
+            link_key: request.link_key.clone(),
+            target_key: request.target_key.clone(),
+            target_version: request.target_version.map(|version| version.to_string()),
+            resolution: request.resolution,
+            created_at: link_created_at,
+            updated_at: now,
+            created_by: request.created_by.clone(),
+            generation,
+        };
+        let content_hash = object_links::link_metadata_hash(&descriptor);
+        let etag = object_links::link_metadata_etag(&descriptor);
+        let version_id = uuid::Uuid::new_v4();
+        let mutation_id = uuid::Uuid::new_v4();
+        let index_policy_snapshot = self
+            .active_index_policy_snapshot_hash(request.tenant_id, bucket.id)
+            .await?;
+        let user_meta = Some(serde_json::json!({
+            "schema": "anvil.object_link.v1",
+            "idempotency_key": request.idempotency_key,
+        }));
+        let user_metadata_hash = user_metadata_hash(user_meta.as_ref());
+        let authz_revision = self.latest_authz_revision(request.tenant_id).await?;
+        let record_hash = object_version_record_hash(ObjectVersionRecordHashInput {
+            tenant_id: request.tenant_id,
+            bucket_id: bucket.id,
+            key: &request.link_key,
+            version_id,
+            mutation_id,
+            content_hash: &content_hash,
+            size: 0,
+            etag: &etag,
+            content_type: Some(object_links::LINK_METADATA_CONTENT_TYPE),
+            user_metadata_hash: &user_metadata_hash,
+            index_policy_snapshot: &index_policy_snapshot,
+            authz_revision,
+            delete_marker: false,
+        });
+        let link = object_links::ObjectLinkTarget {
+            target_key: request.target_key,
+            target_version: request.target_version,
+            resolution: request.resolution,
+            generation,
+            created_at: link_created_at,
+            created_by: request.created_by,
+        };
+        let object = Object {
+            id: metadata_journal::next_object_id(
+                &self.storage,
+                &bucket,
+                &self.partition_owner_signing_key,
+            )
+            .await?,
+            tenant_id: request.tenant_id,
+            bucket_id: bucket.id,
+            key: request.link_key,
+            kind: object_links::ObjectEntryKind::Link,
+            content_hash,
+            size: 0,
+            etag,
+            content_type: Some(object_links::LINK_METADATA_CONTENT_TYPE.to_string()),
+            version_id,
+            mutation_id,
+            index_policy_snapshot,
+            user_metadata_hash,
+            authz_revision,
+            record_hash,
+            created_at: now,
+            deleted_at: None,
+            storage_class: None,
+            user_meta,
+            shard_map: None,
+            inline_payload: None,
+            checksum: None,
+            link: Some(link),
+        };
+        let permit = self
+            .object_metadata_write_permit(bucket.tenant_id, bucket.id)
+            .await?;
+        metadata_journal::append_object_mutation_with_permit(
+            &self.storage,
+            &bucket,
+            &object,
+            metadata_journal::ObjectJournalMutation::Put,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await?;
+        self.enqueue_index_builds_for_bucket(&bucket).await?;
+        self.enqueue_object_metadata_compaction_if_due(&bucket)
+            .await?;
+        Ok(object_links::ObjectLinkMutation {
+            link: object,
+            descriptor,
+        })
+    }
+
     pub async fn get_object(&self, bucket_id: i64, key: &str) -> Result<Option<Object>> {
         let Some(bucket) =
             bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
@@ -1438,6 +1725,90 @@ impl Persistence {
             key,
         )
         .await
+    }
+
+    pub async fn get_object_link(
+        &self,
+        bucket_id: i64,
+        key: &str,
+    ) -> std::result::Result<
+        Option<object_links::ObjectLinkDescriptor>,
+        object_links::ObjectLinkError,
+    > {
+        let Some(bucket) =
+            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        else {
+            return Ok(None);
+        };
+        let Some(object) = metadata_journal::read_current_object(
+            &self.storage,
+            &bucket,
+            &self.partition_owner_signing_key,
+            key,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        if object.kind != object_links::ObjectEntryKind::Link {
+            return Ok(None);
+        }
+        Ok(object_links::link_descriptor(&bucket.name, &object))
+    }
+
+    pub async fn resolve_object_link_target(
+        &self,
+        bucket_id: i64,
+        link_key: &str,
+    ) -> std::result::Result<Object, object_links::ObjectLinkError> {
+        let Some(bucket) =
+            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        else {
+            return Err(object_links::ObjectLinkError::BucketNotFound);
+        };
+        let mut current_key = link_key.to_string();
+        let mut current_version = None;
+        let mut seen = HashSet::new();
+        for _ in 0..object_links::MAX_LINK_RESOLUTION_DEPTH {
+            let object = match current_version {
+                Some(version_id) => {
+                    metadata_journal::read_object_version(
+                        &self.storage,
+                        &bucket,
+                        &self.partition_owner_signing_key,
+                        &current_key,
+                        version_id,
+                    )
+                    .await?
+                }
+                None => {
+                    metadata_journal::read_current_object(
+                        &self.storage,
+                        &bucket,
+                        &self.partition_owner_signing_key,
+                        &current_key,
+                    )
+                    .await?
+                }
+            }
+            .ok_or(object_links::ObjectLinkError::DanglingObjectLink)?;
+            if object.deleted_at.is_some() {
+                return Err(object_links::ObjectLinkError::DanglingObjectLink);
+            }
+            if object.kind == object_links::ObjectEntryKind::Blob {
+                return Ok(object);
+            }
+            let Some(link) = object.link.as_ref() else {
+                return Err(object_links::ObjectLinkError::TargetNotBlob);
+            };
+            let seen_key = format!("{}:{}", object.key, object.version_id);
+            if !seen.insert(seen_key) {
+                return Err(object_links::ObjectLinkError::LinkLoop);
+            }
+            current_key = link.target_key.clone();
+            current_version = link.target_version;
+        }
+        Err(object_links::ObjectLinkError::LinkDepthExceeded)
     }
 
     pub async fn get_object_version(

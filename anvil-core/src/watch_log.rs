@@ -245,6 +245,7 @@ mod tests {
             tenant_id: 12,
             bucket_id: 77,
             key: key.to_string(),
+            kind: crate::object_links::ObjectEntryKind::Blob,
             content_hash: format!("hash-{id}"),
             size: 100 + id,
             etag: format!("etag-{id}"),
@@ -262,6 +263,7 @@ mod tests {
             shard_map: None,
             inline_payload: None,
             checksum: None,
+            link: None,
         }
     }
 
