@@ -12,7 +12,7 @@ use crate::routing::{
     self, HostAliasDescriptor as CoreHostAliasDescriptor, HostAliasState as CoreHostAliasState,
     RoutingConfig,
 };
-use crate::{AppState, auth};
+use crate::{AppState, auth, mesh_directory};
 use tonic::{Request, Response, Status};
 
 #[tonic::async_trait]
@@ -789,6 +789,72 @@ impl AdminService for AppState {
             nodes,
         }))
     }
+
+    async fn list_routing_records(
+        &self,
+        request: Request<ListRoutingRecordsRequest>,
+    ) -> Result<Response<ListRoutingRecordsResponse>, Status> {
+        require_admin(&request, self, AnvilAdminCapability::ManageRouting)?;
+        let req = request.into_inner();
+        let family = routing_record_family_from_proto(req.family)?;
+        let page = req.page.as_ref();
+        let cursor = page.map(|page| page.cursor.as_str()).unwrap_or_default();
+        let limit = page_limit(page);
+        let mut records = self
+            .persistence
+            .list_mesh_routing_records(family)
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?
+            .into_iter()
+            .filter(|record| cursor.is_empty() || record.descriptor_key.as_str() > cursor)
+            .take(limit + 1)
+            .map(routing_record_descriptor_to_proto)
+            .collect::<Vec<_>>();
+        let has_more = records.len() > limit;
+        if has_more {
+            records.truncate(limit);
+        }
+        let next_cursor = if has_more {
+            records
+                .last()
+                .map(|record| record.descriptor_key.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        Ok(Response::new(ListRoutingRecordsResponse {
+            page: Some(PageResponse {
+                next_cursor,
+                has_more,
+            }),
+            records,
+        }))
+    }
+
+    async fn repair_routing_record(
+        &self,
+        request: Request<RepairRoutingRecordRequest>,
+    ) -> Result<Response<AdminMutationResponse>, Status> {
+        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRouting)?;
+        let req = request.into_inner();
+        let context = require_mutation_context(req.context.as_ref(), false)?;
+        let family = routing_record_family_from_proto(req.family)?
+            .ok_or_else(|| Status::invalid_argument("routing record family is required"))?;
+        let record = self
+            .persistence
+            .repair_mesh_routing_record(family, &req.record_key)
+            .await
+            .map_err(|err| Status::failed_precondition(err.to_string()))?;
+
+        Ok(Response::new(AdminMutationResponse {
+            request_id: context.request_id.clone(),
+            resource_id: record.descriptor_key,
+            generation: record.generation,
+            audit_event_id: audit_event_id(&principal, context),
+            idempotent_replay: false,
+        }))
+    }
 }
 
 fn require_admin<T>(
@@ -1008,6 +1074,39 @@ fn lifecycle_state_to_proto(value: CoreLifecycleState) -> i32 {
         CoreLifecycleState::DrainedWithExceptions => 6,
         CoreLifecycleState::Offline => 7,
         CoreLifecycleState::Removed => 8,
+    }
+}
+
+fn routing_record_family_from_proto(
+    value: i32,
+) -> Result<Option<mesh_directory::RoutingRecordFamily>, Status> {
+    match value {
+        0 => Ok(None),
+        1 => Ok(Some(mesh_directory::RoutingRecordFamily::TenantName)),
+        2 => Ok(Some(mesh_directory::RoutingRecordFamily::TenantLocator)),
+        3 => Ok(Some(mesh_directory::RoutingRecordFamily::BucketLocator)),
+        _ => Err(Status::invalid_argument("Invalid routing record family")),
+    }
+}
+
+fn routing_record_family_to_proto(value: mesh_directory::RoutingRecordFamily) -> i32 {
+    match value {
+        mesh_directory::RoutingRecordFamily::TenantName => 1,
+        mesh_directory::RoutingRecordFamily::TenantLocator => 2,
+        mesh_directory::RoutingRecordFamily::BucketLocator => 3,
+    }
+}
+
+fn routing_record_descriptor_to_proto(
+    value: mesh_directory::RoutingRecordDescriptor,
+) -> RoutingRecordDescriptor {
+    RoutingRecordDescriptor {
+        family: routing_record_family_to_proto(value.family),
+        record_key: value.record_key,
+        partition: value.partition,
+        descriptor_key: value.descriptor_key,
+        generation: value.generation,
+        payload_json: value.payload_json,
     }
 }
 

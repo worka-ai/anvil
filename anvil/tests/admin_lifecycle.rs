@@ -475,6 +475,110 @@ async fn admin_lifecycle_rejects_invalid_region_cell_and_node_transitions() {
 }
 
 #[tokio::test]
+async fn admin_routing_records_list_and_repair_mesh_locators() {
+    let node = spawn_admin_node().await;
+    let token = admin_token(&node);
+    let mut client = AdminServiceClient::connect(node.admin_url.clone())
+        .await
+        .unwrap();
+
+    let tenant = node
+        .state
+        .persistence
+        .create_tenant("route-tenant", "unused")
+        .await
+        .unwrap();
+    node.state
+        .persistence
+        .create_bucket(tenant.id, "route-bucket", "eu-west-1")
+        .await
+        .unwrap();
+
+    let records = client
+        .list_routing_records(with_auth(
+            tonic::Request::new(ListRoutingRecordsRequest {
+                family: 0,
+                page: None,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .records;
+    assert!(records.iter().any(|record| record.family == 1
+        && record.record_key == "route-tenant"
+        && record.payload_json.contains("\"tenant_name\"")));
+    let bucket_record = records
+        .iter()
+        .find(|record| {
+            record.family == 3 && record.record_key == format!("{}/route-bucket", tenant.id)
+        })
+        .cloned()
+        .expect("bucket locator record should be listed");
+
+    let descriptor_relative = bucket_record
+        .descriptor_key
+        .strip_prefix("_anvil/control/v1/mesh/")
+        .unwrap();
+    let descriptor_path = std::path::Path::new(&node.state.config.storage_path)
+        .join("_anvil/control/v1/mesh")
+        .join(descriptor_relative);
+    tokio::fs::remove_file(&descriptor_path).await.unwrap();
+
+    let missing_after_delete = client
+        .list_routing_records(with_auth(
+            tonic::Request::new(ListRoutingRecordsRequest {
+                family: 3,
+                page: None,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .records;
+    assert!(
+        !missing_after_delete
+            .iter()
+            .any(|record| record.record_key == format!("{}/route-bucket", tenant.id))
+    );
+
+    let repaired = client
+        .repair_routing_record(with_auth(
+            tonic::Request::new(RepairRoutingRecordRequest {
+                context: Some(context("repair-bucket-routing-record", 1)),
+                family: 3,
+                record_key: format!("{}/route-bucket", tenant.id),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(repaired.generation, 1);
+    assert_eq!(repaired.resource_id, bucket_record.descriptor_key);
+
+    let listed_after_repair = client
+        .list_routing_records(with_auth(
+            tonic::Request::new(ListRoutingRecordsRequest {
+                family: 3,
+                page: None,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .records;
+    assert!(
+        listed_after_repair
+            .iter()
+            .any(|record| record.record_key == format!("{}/route-bucket", tenant.id))
+    );
+}
+
+#[tokio::test]
 async fn admin_host_aliases_are_generation_checked_and_lifecycle_managed() {
     let node = spawn_admin_node().await;
     let token = admin_token(&node);

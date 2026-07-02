@@ -35,6 +35,9 @@ service AdminService {
   rpc ForceOfflineNode(ForceOfflineNodeRequest) returns (NodeResponse);
   rpc RemoveNode(RemoveNodeRequest) returns (AdminMutationResponse);
   rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+
+  rpc ListRoutingRecords(ListRoutingRecordsRequest) returns (ListRoutingRecordsResponse);
+  rpc RepairRoutingRecord(RepairRoutingRecordRequest) returns (AdminMutationResponse);
 }
 
 message AdminRequestContext {
@@ -117,6 +120,13 @@ enum HostAliasState {
   HOST_ALIAS_STATE_ACTIVE = 2;
   HOST_ALIAS_STATE_SUSPENDED = 3;
   HOST_ALIAS_STATE_DELETED = 4;
+}
+
+enum RoutingRecordFamily {
+  ROUTING_RECORD_FAMILY_UNSPECIFIED = 0;
+  ROUTING_RECORD_FAMILY_TENANT_NAME = 1;
+  ROUTING_RECORD_FAMILY_TENANT_LOCATOR = 2;
+  ROUTING_RECORD_FAMILY_BUCKET_LOCATOR = 3;
 }
 
 message NodeDrainDescriptor {
@@ -445,6 +455,31 @@ message ListRegionsResponse {
 message ListCellsResponse {
   PageResponse page = 1;
   repeated CellDescriptor cells = 2;
+}
+
+message RoutingRecordDescriptor {
+  RoutingRecordFamily family = 1;
+  string record_key = 2;
+  string partition = 3;
+  string descriptor_key = 4;
+  uint64 generation = 5;
+  string payload_json = 6;
+}
+
+message ListRoutingRecordsRequest {
+  RoutingRecordFamily family = 1;
+  PageRequest page = 2;
+}
+
+message ListRoutingRecordsResponse {
+  PageResponse page = 1;
+  repeated RoutingRecordDescriptor records = 2;
+}
+
+message RepairRoutingRecordRequest {
+  AdminRequestContext context = 1;
+  RoutingRecordFamily family = 2;
+  string record_key = 3;
 }
 
 // Bucket Service

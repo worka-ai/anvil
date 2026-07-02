@@ -620,6 +620,56 @@ impl Persistence {
         Ok(mesh_directory::read_bucket_locator(&self.storage, &key).await?)
     }
 
+    pub async fn list_mesh_routing_records(
+        &self,
+        family_filter: Option<mesh_directory::RoutingRecordFamily>,
+    ) -> Result<Vec<mesh_directory::RoutingRecordDescriptor>> {
+        Ok(mesh_directory::list_routing_records(&self.storage, family_filter).await?)
+    }
+
+    pub async fn repair_mesh_routing_record(
+        &self,
+        family: mesh_directory::RoutingRecordFamily,
+        record_key: &str,
+    ) -> Result<mesh_directory::RoutingRecordDescriptor> {
+        match family {
+            mesh_directory::RoutingRecordFamily::TenantName => {
+                let tenant = self
+                    .get_tenant_by_name(record_key)
+                    .await?
+                    .ok_or_else(|| anyhow!("tenant not found"))?;
+                self.write_mesh_tenant_locators(&tenant).await?;
+            }
+            mesh_directory::RoutingRecordFamily::TenantLocator => {
+                let tenant_id = record_key.parse::<i64>()?;
+                let tenant = self
+                    .list_tenants()
+                    .await?
+                    .into_iter()
+                    .find(|tenant| tenant.id == tenant_id)
+                    .ok_or_else(|| anyhow!("tenant not found"))?;
+                self.write_mesh_tenant_locators(&tenant).await?;
+            }
+            mesh_directory::RoutingRecordFamily::BucketLocator => {
+                let (tenant_id, bucket_name) = record_key
+                    .split_once('/')
+                    .ok_or_else(|| anyhow!("bucket locator key must be tenant_id/bucket"))?;
+                let tenant_id = tenant_id.parse::<i64>()?;
+                let bucket = self
+                    .get_bucket_by_name(tenant_id, bucket_name)
+                    .await?
+                    .ok_or_else(|| anyhow!("bucket not found"))?;
+                self.write_mesh_bucket_locator(&bucket).await?;
+            }
+        }
+
+        self.list_mesh_routing_records(Some(family))
+            .await?
+            .into_iter()
+            .find(|record| record.record_key == record_key)
+            .ok_or_else(|| anyhow!("routing record was not repaired"))
+    }
+
     pub fn cache(&self) -> &MetadataCache {
         &self.cache
     }

@@ -17,6 +17,38 @@ const TENANT_NAME_PARTITION_DOMAIN: &str = "tenant-name";
 const TENANT_LOCATOR_PARTITION_DOMAIN: &str = "tenant-locator";
 const BUCKET_LOCATOR_PARTITION_DOMAIN: &str = "bucket-locator";
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingRecordFamily {
+    TenantName,
+    TenantLocator,
+    BucketLocator,
+}
+
+impl RoutingRecordFamily {
+    pub fn all() -> [Self; 3] {
+        [Self::TenantName, Self::TenantLocator, Self::BucketLocator]
+    }
+
+    pub fn directory_segment(self) -> &'static str {
+        match self {
+            Self::TenantName => "tenant-names",
+            Self::TenantLocator => "tenants",
+            Self::BucketLocator => "buckets",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutingRecordDescriptor {
+    pub family: RoutingRecordFamily,
+    pub record_key: String,
+    pub partition: String,
+    pub descriptor_key: String,
+    pub generation: u64,
+    pub payload_json: String,
+}
+
 #[derive(Debug, Error)]
 pub enum MeshDirectoryError {
     #[error("invalid tenant name: {0}")]
@@ -584,6 +616,58 @@ pub async fn read_bucket_locator(
     read_optional_descriptor(storage, &key.descriptor_key()).await
 }
 
+pub async fn list_routing_records(
+    storage: &Storage,
+    family_filter: Option<RoutingRecordFamily>,
+) -> MeshDirectoryResult<Vec<RoutingRecordDescriptor>> {
+    let mut records = Vec::new();
+    let families: Vec<_> = family_filter
+        .map(|family| vec![family])
+        .unwrap_or_else(|| RoutingRecordFamily::all().into_iter().collect());
+
+    for family in families {
+        let family_root = storage
+            .mesh_directory_root_path()
+            .join(family.directory_segment());
+        let mut files = json_files_under(&family_root).await?;
+        files.sort();
+        for path in files {
+            let payload_json = tokio::fs::read_to_string(&path).await?;
+            let payload: serde_json::Value = serde_json::from_str(&payload_json)?;
+            let relative = path
+                .strip_prefix(storage.mesh_directory_root_path())
+                .map_err(|_| MeshDirectoryError::InvalidIdentifier {
+                    field: "routing record path",
+                    value: path.display().to_string(),
+                })?;
+            let descriptor_key =
+                relative
+                    .iter()
+                    .fold(String::from(MESH_DIRECTORY_ROOT), |mut out, segment| {
+                        out.push('/');
+                        out.push_str(&segment.to_string_lossy());
+                        out
+                    });
+            records.push(RoutingRecordDescriptor {
+                family,
+                record_key: routing_record_key(family, relative)?,
+                partition: routing_record_partition(relative)?,
+                descriptor_key,
+                generation: payload
+                    .get("generation")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                payload_json,
+            });
+        }
+    }
+
+    records.sort_by(|left, right| {
+        (left.family, left.record_key.as_str()).cmp(&(right.family, right.record_key.as_str()))
+    });
+    Ok(records)
+}
+
 async fn write_descriptor<T: Serialize>(
     storage: &Storage,
     descriptor_key: &str,
@@ -637,6 +721,83 @@ fn descriptor_path(storage: &Storage, descriptor_key: &str) -> MeshDirectoryResu
         .fold(storage.mesh_directory_root_path(), |path, segment| {
             path.join(Path::new(segment))
         }))
+}
+
+async fn json_files_under(root: &Path) -> MeshDirectoryResult<Vec<PathBuf>> {
+    match tokio::fs::metadata(root).await {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(MeshDirectoryError::InvalidIdentifier {
+                field: "routing record directory",
+                value: root.display().to_string(),
+            });
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    }
+
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut entries = tokio::fs::read_dir(&dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let metadata = entry.metadata().await?;
+            if metadata.is_dir() {
+                stack.push(path);
+            } else if metadata.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+            {
+                out.push(path);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn routing_record_partition(relative: &Path) -> MeshDirectoryResult<String> {
+    relative
+        .components()
+        .nth(1)
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .filter(|partition| partition.len() == 4)
+        .ok_or_else(|| MeshDirectoryError::InvalidIdentifier {
+            field: "routing record partition",
+            value: relative.display().to_string(),
+        })
+}
+
+fn routing_record_key(family: RoutingRecordFamily, relative: &Path) -> MeshDirectoryResult<String> {
+    let segments = relative
+        .iter()
+        .map(|segment| segment.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    match family {
+        RoutingRecordFamily::TenantName | RoutingRecordFamily::TenantLocator => segments
+            .get(2)
+            .and_then(|file| file.strip_suffix(".json"))
+            .map(str::to_string)
+            .ok_or_else(|| MeshDirectoryError::InvalidIdentifier {
+                field: "routing record key",
+                value: relative.display().to_string(),
+            }),
+        RoutingRecordFamily::BucketLocator => {
+            let tenant_id = segments.get(2);
+            let bucket_file = segments.get(3);
+            match (
+                tenant_id,
+                bucket_file.and_then(|file| file.strip_suffix(".json")),
+            ) {
+                (Some(tenant_id), Some(bucket_name)) => Ok(format!("{tenant_id}/{bucket_name}")),
+                _ => Err(MeshDirectoryError::InvalidIdentifier {
+                    field: "routing record key",
+                    value: relative.display().to_string(),
+                }),
+            }
+        }
+    }
 }
 
 fn partition_key_bytes(domain: &str, components: &[&str]) -> Vec<u8> {

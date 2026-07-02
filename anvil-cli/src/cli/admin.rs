@@ -32,6 +32,11 @@ pub enum AdminCommands {
         #[clap(subcommand)]
         command: HostAliasCommands,
     },
+    /// Inspect and repair mesh routing records
+    Routing {
+        #[clap(subcommand)]
+        command: RoutingCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -335,6 +340,26 @@ pub enum HostAliasCommands {
     },
 }
 
+#[derive(Subcommand)]
+pub enum RoutingCommands {
+    /// List materialised mesh routing records
+    List {
+        #[clap(long, value_enum)]
+        family: Option<RoutingRecordFamilyArg>,
+        #[clap(flatten)]
+        page: PageOptions,
+    },
+    /// Repair one materialised mesh routing record from durable source state
+    Repair {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long, value_enum)]
+        family: RoutingRecordFamilyArg,
+        #[clap(long)]
+        record_key: String,
+    },
+}
+
 #[derive(Args, Debug, Clone)]
 pub struct MutationOptions {
     /// AdminRequestContext.request_id. Defaults to a generated UUID.
@@ -428,6 +453,23 @@ impl ObjectLinkResolutionArg {
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum RoutingRecordFamilyArg {
+    TenantName,
+    TenantLocator,
+    BucketLocator,
+}
+
+impl RoutingRecordFamilyArg {
+    fn to_proto(self) -> i32 {
+        match self {
+            Self::TenantName => 1,
+            Self::TenantLocator => 2,
+            Self::BucketLocator => 3,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum RegionDrainDispositionArg {
     BlockUntilEmpty,
     RemainProxyOnly,
@@ -513,6 +555,9 @@ pub async fn handle_admin_command(command: &AdminCommands, ctx: &Context) -> any
         }
         AdminCommands::HostAlias { command } => {
             handle_host_alias_command(command, &mut client, &token).await?
+        }
+        AdminCommands::Routing { command } => {
+            handle_routing_command(command, &mut client, &token).await?
         }
     }
 
@@ -1079,6 +1124,48 @@ async fn handle_host_alias_command(
     Ok(())
 }
 
+async fn handle_routing_command(
+    command: &RoutingCommands,
+    client: &mut AdminServiceClient<tonic::transport::Channel>,
+    token: &str,
+) -> anyhow::Result<()> {
+    match command {
+        RoutingCommands::List { family, page } => {
+            let response = client
+                .list_routing_records(with_auth(
+                    api::ListRoutingRecordsRequest {
+                        family: family.map(RoutingRecordFamilyArg::to_proto).unwrap_or(0),
+                        page: page.to_page_request(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        RoutingCommands::Repair {
+            context,
+            family,
+            record_key,
+        } => {
+            let response = client
+                .repair_routing_record(with_auth(
+                    api::RepairRoutingRecordRequest {
+                        context: Some(context.to_context()),
+                        family: family.to_proto(),
+                        record_key: record_key.clone(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn with_auth<T>(message: T, token: &str) -> anyhow::Result<tonic::Request<T>> {
     let mut request = tonic::Request::new(message);
     request.metadata_mut().insert(
@@ -1462,6 +1549,58 @@ mod tests {
         assert_eq!(context.audit_reason, "lost heartbeat");
         assert_eq!(context.expected_generation, 12);
         assert_eq!(node_id, "node-a");
+    }
+
+    #[test]
+    fn routing_commands_parse_family_and_mutation_context() {
+        let list_cli = TestAdminCli::try_parse_from([
+            "admin",
+            "routing",
+            "list",
+            "--family",
+            "bucket-locator",
+            "--limit",
+            "25",
+        ])
+        .unwrap();
+        let AdminCommands::Routing {
+            command: RoutingCommands::List { family, page },
+        } = list_cli.command
+        else {
+            panic!("expected routing list command");
+        };
+        assert_eq!(family.unwrap().to_proto(), 3);
+        assert_eq!(page.limit, Some(25));
+
+        let repair_cli = TestAdminCli::try_parse_from([
+            "admin",
+            "routing",
+            "repair",
+            "--audit-reason",
+            "rebuild missing locator",
+            "--expected-generation",
+            "1",
+            "--family",
+            "tenant-name",
+            "--record-key",
+            "acme",
+        ])
+        .unwrap();
+        let AdminCommands::Routing {
+            command:
+                RoutingCommands::Repair {
+                    context,
+                    family,
+                    record_key,
+                },
+        } = repair_cli.command
+        else {
+            panic!("expected routing repair command");
+        };
+        assert_eq!(context.audit_reason, "rebuild missing locator");
+        assert_eq!(context.expected_generation, 1);
+        assert_eq!(family.to_proto(), 1);
+        assert_eq!(record_key, "acme");
     }
 
     #[tokio::test]
