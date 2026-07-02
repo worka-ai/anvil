@@ -269,11 +269,13 @@ pub struct MeshLifecycleState {
 }
 
 pub async fn read_state(storage: &Storage) -> LifecycleResult<MeshLifecycleState> {
-    match tokio::fs::read(storage.mesh_lifecycle_state_path()).await {
-        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(MeshLifecycleState::default()),
-        Err(err) => Err(err.into()),
-    }
+    let mut state = match tokio::fs::read(storage.mesh_lifecycle_state_path()).await {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(err) if err.kind() == ErrorKind::NotFound => MeshLifecycleState::default(),
+        Err(err) => return Err(err.into()),
+    };
+    overlay_lifecycle_control_streams(storage, &mut state).await?;
+    Ok(state)
 }
 
 async fn write_state(storage: &Storage, state: &MeshLifecycleState) -> LifecycleResult<()> {
@@ -289,6 +291,155 @@ async fn write_state(storage: &Storage, state: &MeshLifecycleState) -> Lifecycle
     file.sync_all().await?;
     drop(file);
     tokio::fs::rename(tmp_path, path).await?;
+    Ok(())
+}
+
+async fn overlay_lifecycle_control_streams(
+    storage: &Storage,
+    state: &mut MeshLifecycleState,
+) -> LifecycleResult<()> {
+    for stream_family in lifecycle_control_stream_families() {
+        let family_path = storage
+            .mesh_control_stream_family_path(stream_family)
+            .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
+        let mut entries = match tokio::fs::read_dir(&family_path).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("anlog") {
+                continue;
+            }
+            let Some(partition) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let log = read_control_stream_log(&path).await.map_err(|err| {
+                LifecycleError::InvalidArgument(format!(
+                    "could not replay lifecycle control stream {stream_family}/{partition}: {err}"
+                ))
+            })?;
+            for record in log.records {
+                apply_lifecycle_control_frame(
+                    state,
+                    stream_family,
+                    partition,
+                    &record.frame.header_json,
+                    &record.frame.payload_json,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_lifecycle_control_frame(
+    state: &mut MeshLifecycleState,
+    expected_stream_family: &str,
+    expected_partition: &str,
+    header_json: &[u8],
+    payload_json: &[u8],
+) -> LifecycleResult<()> {
+    let header: serde_json::Value = serde_json::from_slice(header_json)?;
+    let stream_family = header
+        .get("stream_family")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            LifecycleError::InvalidArgument(
+                "lifecycle control frame missing stream_family".to_string(),
+            )
+        })?;
+    let partition = header
+        .get("partition")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            LifecycleError::InvalidArgument("lifecycle control frame missing partition".to_string())
+        })?;
+    if stream_family != expected_stream_family || partition != expected_partition {
+        return Err(LifecycleError::InvalidArgument(format!(
+            "lifecycle control frame scope {stream_family}/{partition} does not match path {expected_stream_family}/{expected_partition}"
+        )));
+    }
+    let operation = header
+        .get("operation")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let record_key = header
+        .get("record_key")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            LifecycleError::InvalidArgument(
+                "lifecycle control frame missing record_key".to_string(),
+            )
+        })?;
+    if matches!(operation, "delete" | "tombstone") {
+        remove_lifecycle_projection(state, stream_family, record_key)?;
+        return Ok(());
+    }
+    match stream_family {
+        REGION_DESCRIPTOR_STREAM_FAMILY => {
+            let descriptor: RegionDescriptor = serde_json::from_slice(payload_json)?;
+            if descriptor.region != record_key {
+                return Err(LifecycleError::InvalidArgument(format!(
+                    "region descriptor key mismatch: expected {record_key}, got {}",
+                    descriptor.region
+                )));
+            }
+            state.regions.insert(descriptor.region.clone(), descriptor);
+        }
+        CELL_DESCRIPTOR_STREAM_FAMILY => {
+            let descriptor: CellDescriptor = serde_json::from_slice(payload_json)?;
+            let key = cell_record_key(&descriptor.region, &descriptor.cell_id)?;
+            if key != record_key {
+                return Err(LifecycleError::InvalidArgument(format!(
+                    "cell descriptor key mismatch: expected {record_key}, got {key}"
+                )));
+            }
+            state.cells.insert(key, descriptor);
+        }
+        NODE_DESCRIPTOR_STREAM_FAMILY => {
+            let descriptor: NodeDescriptor = serde_json::from_slice(payload_json)?;
+            let key =
+                node_record_key(&descriptor.region, &descriptor.cell_id, &descriptor.node_id)?;
+            if key != record_key {
+                return Err(LifecycleError::InvalidArgument(format!(
+                    "node descriptor key mismatch: expected {record_key}, got {key}"
+                )));
+            }
+            state.nodes.insert(descriptor.node_id.clone(), descriptor);
+        }
+        _ => {
+            return Err(LifecycleError::InvalidArgument(format!(
+                "unknown lifecycle control stream family {stream_family}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn remove_lifecycle_projection(
+    state: &mut MeshLifecycleState,
+    stream_family: &str,
+    record_key: &str,
+) -> LifecycleResult<()> {
+    match stream_family {
+        REGION_DESCRIPTOR_STREAM_FAMILY => {
+            state.regions.remove(record_key);
+        }
+        CELL_DESCRIPTOR_STREAM_FAMILY => {
+            state.cells.remove(record_key);
+        }
+        NODE_DESCRIPTOR_STREAM_FAMILY => {
+            let (_, _, node_id) = parse_node_record_key(record_key)?;
+            state.nodes.remove(node_id);
+        }
+        _ => {
+            return Err(LifecycleError::InvalidArgument(format!(
+                "unknown lifecycle control stream family {stream_family}"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1585,6 +1736,19 @@ fn node_record_key(region: &str, cell_id: &str, node_id: &str) -> LifecycleResul
     Ok(format!("{region}/{cell_id}/{node_id}"))
 }
 
+fn parse_node_record_key(record_key: &str) -> LifecycleResult<(&str, &str, &str)> {
+    let mut parts = record_key.split('/');
+    let region = parts.next().unwrap_or_default();
+    let cell_id = parts.next().unwrap_or_default();
+    let node_id = parts.next().unwrap_or_default();
+    if parts.next().is_some() || region.is_empty() || cell_id.is_empty() || node_id.is_empty() {
+        return Err(LifecycleError::InvalidArgument(format!(
+            "invalid node record key {record_key}"
+        )));
+    }
+    Ok((region, cell_id, node_id))
+}
+
 fn require_control_record_key(value: &str) -> LifecycleResult<()> {
     require_nonempty(value, "control record key")?;
     if value.contains("//") || value.chars().any(|ch| ch == '\0' || ch.is_control()) {
@@ -1840,6 +2004,8 @@ fn timestamp_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Serialize;
+    use std::collections::BTreeMap;
     use tempfile::tempdir;
 
     #[test]
@@ -2209,6 +2375,129 @@ mod tests {
         assert_eq!(replayed.nodes["node-a"].state, LifecycleState::Draining);
     }
 
+    #[tokio::test]
+    async fn lifecycle_read_model_replays_control_streams_as_source_of_truth() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+
+        let stale_region = RegionDescriptor {
+            schema: REGION_DESCRIPTOR_SCHEMA.to_string(),
+            mesh_id: "mesh-a".to_string(),
+            region: "eu-west-1".to_string(),
+            state: LifecycleState::Joining,
+            public_base_url: "https://stale.example.test".to_string(),
+            virtual_host_suffix: "stale.example.test".to_string(),
+            placement_weight: 1,
+            default_cell: None,
+            created_at: "2026-07-02T00:00:00Z".to_string(),
+            updated_at: "2026-07-02T00:00:00Z".to_string(),
+            generation: 1,
+        };
+        write_state(
+            &storage,
+            &MeshLifecycleState {
+                regions: BTreeMap::from([("eu-west-1".to_string(), stale_region)]),
+                ..MeshLifecycleState::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let region = RegionDescriptor {
+            schema: REGION_DESCRIPTOR_SCHEMA.to_string(),
+            mesh_id: "mesh-a".to_string(),
+            region: "eu-west-1".to_string(),
+            state: LifecycleState::Active,
+            public_base_url: "https://eu-west-1.anvil-storage.test".to_string(),
+            virtual_host_suffix: "eu-west-1.anvil-storage.test".to_string(),
+            placement_weight: 100,
+            default_cell: Some("cell-a".to_string()),
+            created_at: "2026-07-02T00:00:00Z".to_string(),
+            updated_at: "2026-07-02T00:01:00Z".to_string(),
+            generation: 2,
+        };
+        append_lifecycle_descriptor(
+            &storage,
+            REGION_DESCRIPTOR_STREAM_FAMILY,
+            "eu-west-1",
+            1,
+            &region,
+        )
+        .await;
+
+        let cell = CellDescriptor {
+            schema: CELL_DESCRIPTOR_SCHEMA.to_string(),
+            mesh_id: "mesh-a".to_string(),
+            region: "eu-west-1".to_string(),
+            cell_id: "cell-a".to_string(),
+            state: LifecycleState::Active,
+            placement_weight: 100,
+            created_at: "2026-07-02T00:00:00Z".to_string(),
+            updated_at: "2026-07-02T00:01:00Z".to_string(),
+            generation: 2,
+        };
+        append_lifecycle_descriptor(
+            &storage,
+            CELL_DESCRIPTOR_STREAM_FAMILY,
+            "eu-west-1/cell-a",
+            1,
+            &cell,
+        )
+        .await;
+
+        let node = NodeDescriptor {
+            schema: NODE_DESCRIPTOR_SCHEMA.to_string(),
+            mesh_id: "mesh-a".to_string(),
+            node_id: "node-a".to_string(),
+            region: "eu-west-1".to_string(),
+            cell_id: "cell-a".to_string(),
+            libp2p_peer_id: "peer-a".to_string(),
+            public_api_addr: "http://127.0.0.1:50051".to_string(),
+            public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
+            capabilities: vec![NodeCapability::Object, NodeCapability::Admin],
+            state: LifecycleState::Active,
+            drain: None,
+            last_heartbeat_at: Some("2026-07-02T00:01:00Z".to_string()),
+            created_at: "2026-07-02T00:00:00Z".to_string(),
+            updated_at: "2026-07-02T00:01:00Z".to_string(),
+            generation: 2,
+        };
+        append_lifecycle_descriptor(
+            &storage,
+            NODE_DESCRIPTOR_STREAM_FAMILY,
+            "eu-west-1/cell-a/node-a",
+            1,
+            &node,
+        )
+        .await;
+
+        let replayed = read_state(&storage).await.unwrap();
+        assert_eq!(
+            replayed.regions["eu-west-1"].public_base_url,
+            "https://eu-west-1.anvil-storage.test"
+        );
+        assert_eq!(replayed.regions["eu-west-1"].state, LifecycleState::Active);
+        assert_eq!(
+            replayed.cells["eu-west-1/cell-a"].state,
+            LifecycleState::Active
+        );
+        assert_eq!(replayed.nodes["node-a"].state, LifecycleState::Active);
+
+        tokio::fs::remove_file(storage.mesh_lifecycle_state_path())
+            .await
+            .unwrap();
+        let replayed_without_projection = read_state(&storage).await.unwrap();
+        assert_eq!(
+            replayed_without_projection.regions["eu-west-1"].generation,
+            2
+        );
+        assert_eq!(
+            replayed_without_projection.cells["eu-west-1/cell-a"].generation,
+            2
+        );
+        assert_eq!(replayed_without_projection.nodes["node-a"].generation, 2);
+    }
+
     async fn create_test_region(storage: &Storage) -> RegionDescriptor {
         create_region(
             storage,
@@ -2410,6 +2699,45 @@ mod tests {
                 digest,
                 "2026-07-02T00:00:00Z",
             ),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn append_lifecycle_descriptor<T: Serialize>(
+        storage: &Storage,
+        stream_family: &str,
+        record_key: &str,
+        sequence: u64,
+        descriptor: &T,
+    ) {
+        let partition = lifecycle_control_partition(stream_family, record_key);
+        let path = storage
+            .mesh_control_stream_path(stream_family, &partition)
+            .unwrap();
+        let payload_json = serde_json::to_vec(descriptor).unwrap();
+        let digest = ControlRecordDigest::blake3(&payload_json);
+        let header_json = serde_json::json!({
+            "schema": "anvil.mesh.control_mutation.v1",
+            "mesh_id": "mesh-a",
+            "stream_family": stream_family,
+            "partition": partition,
+            "sequence": sequence,
+            "record_key": record_key,
+            "operation": "upsert",
+            "expected_generation": sequence.saturating_sub(1),
+            "new_generation": sequence,
+            "writer_node_id": "node-a",
+            "writer_fence": 1,
+            "idempotency_key": "idem-a",
+            "record_digest": digest.as_str(),
+            "created_at": "2026-07-02T00:00:00Z"
+        })
+        .to_string()
+        .into_bytes();
+        crate::mesh_control_stream::append_control_stream_frame(
+            path,
+            &crate::mesh_control_stream::ControlStreamFrame::new(header_json, payload_json),
         )
         .await
         .unwrap();
