@@ -64,6 +64,11 @@ enum Commands {
         #[clap(subcommand)]
         command: cli::hf::HfCommands,
     },
+    /// Manage mesh lifecycle administration
+    Admin {
+        #[clap(subcommand)]
+        command: cli::admin::AdminCommands,
+    },
 }
 
 #[tokio::main]
@@ -128,6 +133,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Hf { command } => {
             cli::hf::handle_hf_command(command, &ctx).await?;
+        }
+        Commands::Admin { command } => {
+            cli::admin::handle_admin_command(command, &ctx).await?;
         }
     }
 

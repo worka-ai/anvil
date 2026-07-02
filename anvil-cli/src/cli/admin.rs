@@ -1,0 +1,786 @@
+use crate::context::Context;
+use anvil::anvil_api as api;
+use anvil::anvil_api::admin_service_client::AdminServiceClient;
+use clap::{Args, Subcommand, ValueEnum};
+use serde::Serialize;
+use std::str::FromStr;
+
+#[derive(Subcommand)]
+pub enum AdminCommands {
+    /// Manage mesh regions
+    Region {
+        #[clap(subcommand)]
+        command: RegionCommands,
+    },
+    /// Manage cells within regions
+    Cell {
+        #[clap(subcommand)]
+        command: CellCommands,
+    },
+    /// Manage nodes within cells
+    Node {
+        #[clap(subcommand)]
+        command: NodeCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RegionCommands {
+    /// Create a region descriptor
+    Create {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        region: String,
+        #[clap(long)]
+        public_base_url: String,
+        #[clap(long)]
+        virtual_host_suffix: String,
+        #[clap(long, default_value_t = 100)]
+        placement_weight: u32,
+        #[clap(long)]
+        default_cell: Option<String>,
+    },
+    /// Activate a joining or drained region
+    Activate {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        region: String,
+    },
+    /// Drain an active region
+    Drain {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        region: String,
+        #[clap(long)]
+        default_disposition: RegionDrainDispositionArg,
+        #[clap(
+            long = "bucket-override",
+            value_name = "TENANT_ID:BUCKET_NAME:DISPOSITION:REASON"
+        )]
+        bucket_overrides: Vec<BucketDrainOverrideArg>,
+    },
+    /// Remove a drained region
+    Remove {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        region: String,
+    },
+    /// List region descriptors
+    List {
+        #[clap(flatten)]
+        page: PageOptions,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CellCommands {
+    /// Register a cell descriptor
+    Register {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        region: String,
+        #[clap(long)]
+        cell_id: String,
+        #[clap(long, default_value_t = 100)]
+        placement_weight: u32,
+    },
+    /// Activate a joining or drained cell
+    Activate {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        region: String,
+        #[clap(long)]
+        cell_id: String,
+    },
+    /// Drain an active cell
+    Drain {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        region: String,
+        #[clap(long)]
+        cell_id: String,
+    },
+    /// Remove a drained cell
+    Remove {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        region: String,
+        #[clap(long)]
+        cell_id: String,
+    },
+    /// List cell descriptors
+    List {
+        #[clap(long)]
+        region: Option<String>,
+        #[clap(flatten)]
+        page: PageOptions,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum NodeCommands {
+    /// Register a node descriptor
+    Register {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        node_id: String,
+        #[clap(long)]
+        region: String,
+        #[clap(long)]
+        cell_id: String,
+        #[clap(long)]
+        libp2p_peer_id: String,
+        #[clap(long)]
+        public_api_addr: String,
+        #[clap(long = "public-cluster-addr")]
+        public_cluster_addrs: Vec<String>,
+        #[clap(long = "capability", value_delimiter = ',', required = true)]
+        capabilities: Vec<NodeCapabilityArg>,
+    },
+    /// Activate a joining or drained node
+    Activate {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        node_id: String,
+    },
+    /// Drain an active node
+    Drain {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        node_id: String,
+        #[clap(long)]
+        graceful_timeout_ms: u64,
+        #[clap(long, action = clap::ArgAction::SetTrue)]
+        force_after_timeout: bool,
+    },
+    /// Remove a drained node
+    Remove {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        node_id: String,
+    },
+    /// List node descriptors
+    List {
+        #[clap(long)]
+        region: Option<String>,
+        #[clap(long)]
+        cell_id: Option<String>,
+        #[clap(flatten)]
+        page: PageOptions,
+    },
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct MutationOptions {
+    /// AdminRequestContext.request_id. Defaults to a generated UUID.
+    #[clap(long)]
+    request_id: Option<String>,
+    /// AdminRequestContext.idempotency_key. Defaults to a generated UUID.
+    #[clap(long)]
+    idempotency_key: Option<String>,
+    /// AdminRequestContext.audit_reason. Required for all mutations.
+    #[clap(long)]
+    audit_reason: String,
+    /// AdminRequestContext.expected_generation. Use 0 for create/register requests.
+    #[clap(long)]
+    expected_generation: u64,
+}
+
+impl MutationOptions {
+    fn to_context(&self) -> api::AdminRequestContext {
+        api::AdminRequestContext {
+            request_id: self
+                .request_id
+                .clone()
+                .unwrap_or_else(|| format!("cli-{}", uuid::Uuid::new_v4())),
+            idempotency_key: self
+                .idempotency_key
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            audit_reason: self.audit_reason.clone(),
+            expected_generation: self.expected_generation,
+        }
+    }
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct PageOptions {
+    #[clap(long)]
+    cursor: Option<String>,
+    #[clap(long)]
+    limit: Option<u32>,
+}
+
+impl PageOptions {
+    fn to_page_request(&self) -> Option<api::PageRequest> {
+        if self.cursor.is_none() && self.limit.is_none() {
+            return None;
+        }
+
+        Some(api::PageRequest {
+            cursor: self.cursor.clone().unwrap_or_default(),
+            limit: self.limit.unwrap_or_default(),
+        })
+    }
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum NodeCapabilityArg {
+    Object,
+    Index,
+    #[value(alias = "personal-db", alias = "personal_db")]
+    Personaldb,
+    Gateway,
+    Admin,
+}
+
+impl NodeCapabilityArg {
+    fn to_proto(self) -> i32 {
+        match self {
+            Self::Object => 1,
+            Self::Index => 2,
+            Self::Personaldb => 3,
+            Self::Gateway => 4,
+            Self::Admin => 5,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum RegionDrainDispositionArg {
+    BlockUntilEmpty,
+    RemainProxyOnly,
+    ReadOnlyUntilRemoved,
+    DeleteAfterRetention,
+}
+
+impl RegionDrainDispositionArg {
+    fn to_proto(self) -> i32 {
+        match self {
+            Self::BlockUntilEmpty => 1,
+            Self::RemainProxyOnly => 2,
+            Self::ReadOnlyUntilRemoved => 3,
+            Self::DeleteAfterRetention => 4,
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match normalize_enum_value(value).as_str() {
+            "blockuntilempty" => Ok(Self::BlockUntilEmpty),
+            "remainproxyonly" => Ok(Self::RemainProxyOnly),
+            "readonlyuntilremoved" => Ok(Self::ReadOnlyUntilRemoved),
+            "deleteafterretention" => Ok(Self::DeleteAfterRetention),
+            _ => Err(format!("invalid region drain disposition '{value}'")),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BucketDrainOverrideArg {
+    tenant_id: String,
+    bucket_name: String,
+    disposition: RegionDrainDispositionArg,
+    reason: String,
+}
+
+impl BucketDrainOverrideArg {
+    fn to_proto(&self) -> api::BucketDrainOverride {
+        api::BucketDrainOverride {
+            tenant_id: self.tenant_id.clone(),
+            bucket_name: self.bucket_name.clone(),
+            disposition: self.disposition.to_proto(),
+            reason: self.reason.clone(),
+        }
+    }
+}
+
+impl FromStr for BucketDrainOverrideArg {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let mut parts = value.splitn(4, ':');
+        let tenant_id = required_part(parts.next(), "tenant_id")?;
+        let bucket_name = required_part(parts.next(), "bucket_name")?;
+        let disposition = required_part(parts.next(), "disposition")?;
+        let reason = required_part(parts.next(), "reason")?;
+
+        Ok(Self {
+            tenant_id: tenant_id.to_string(),
+            bucket_name: bucket_name.to_string(),
+            disposition: RegionDrainDispositionArg::parse(disposition)?,
+            reason: reason.to_string(),
+        })
+    }
+}
+
+pub async fn handle_admin_command(command: &AdminCommands, ctx: &Context) -> anyhow::Result<()> {
+    let token = ctx.get_bearer_token().await?;
+    let mut client = AdminServiceClient::connect(ctx.profile.host.clone()).await?;
+
+    match command {
+        AdminCommands::Region { command } => {
+            handle_region_command(command, &mut client, &token).await?
+        }
+        AdminCommands::Cell { command } => {
+            handle_cell_command(command, &mut client, &token).await?
+        }
+        AdminCommands::Node { command } => {
+            handle_node_command(command, &mut client, &token).await?
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_region_command(
+    command: &RegionCommands,
+    client: &mut AdminServiceClient<tonic::transport::Channel>,
+    token: &str,
+) -> anyhow::Result<()> {
+    match command {
+        RegionCommands::Create {
+            context,
+            region,
+            public_base_url,
+            virtual_host_suffix,
+            placement_weight,
+            default_cell,
+        } => {
+            let response = client
+                .create_region(with_auth(
+                    api::CreateRegionRequest {
+                        context: Some(context.to_context()),
+                        region: region.clone(),
+                        public_base_url: public_base_url.clone(),
+                        virtual_host_suffix: virtual_host_suffix.clone(),
+                        placement_weight: *placement_weight,
+                        default_cell: default_cell.clone().unwrap_or_default(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        RegionCommands::Activate { context, region } => {
+            let response = client
+                .activate_region(with_auth(
+                    api::ActivateRegionRequest {
+                        context: Some(context.to_context()),
+                        region: region.clone(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        RegionCommands::Drain {
+            context,
+            region,
+            default_disposition,
+            bucket_overrides,
+        } => {
+            let response = client
+                .drain_region(with_auth(
+                    api::DrainRegionRequest {
+                        context: Some(context.to_context()),
+                        region: region.clone(),
+                        default_disposition: default_disposition.to_proto(),
+                        bucket_overrides: bucket_overrides
+                            .iter()
+                            .map(BucketDrainOverrideArg::to_proto)
+                            .collect(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        RegionCommands::Remove { context, region } => {
+            let response = client
+                .remove_region(with_auth(
+                    api::RemoveRegionRequest {
+                        context: Some(context.to_context()),
+                        region: region.clone(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        RegionCommands::List { page } => {
+            let response = client
+                .list_regions(with_auth(
+                    api::ListRegionsRequest {
+                        page: page.to_page_request(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_cell_command(
+    command: &CellCommands,
+    client: &mut AdminServiceClient<tonic::transport::Channel>,
+    token: &str,
+) -> anyhow::Result<()> {
+    match command {
+        CellCommands::Register {
+            context,
+            region,
+            cell_id,
+            placement_weight,
+        } => {
+            let response = client
+                .register_cell(with_auth(
+                    api::RegisterCellRequest {
+                        context: Some(context.to_context()),
+                        region: region.clone(),
+                        cell_id: cell_id.clone(),
+                        placement_weight: *placement_weight,
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        CellCommands::Activate {
+            context,
+            region,
+            cell_id,
+        } => {
+            let response = client
+                .activate_cell(with_auth(
+                    api::ActivateCellRequest {
+                        context: Some(context.to_context()),
+                        region: region.clone(),
+                        cell_id: cell_id.clone(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        CellCommands::Drain {
+            context,
+            region,
+            cell_id,
+        } => {
+            let response = client
+                .drain_cell(with_auth(
+                    api::DrainCellRequest {
+                        context: Some(context.to_context()),
+                        region: region.clone(),
+                        cell_id: cell_id.clone(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        CellCommands::Remove {
+            context,
+            region,
+            cell_id,
+        } => {
+            let response = client
+                .remove_cell(with_auth(
+                    api::RemoveCellRequest {
+                        context: Some(context.to_context()),
+                        region: region.clone(),
+                        cell_id: cell_id.clone(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        CellCommands::List { region, page } => {
+            let response = client
+                .list_cells(with_auth(
+                    api::ListCellsRequest {
+                        region: region.clone().unwrap_or_default(),
+                        page: page.to_page_request(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_node_command(
+    command: &NodeCommands,
+    client: &mut AdminServiceClient<tonic::transport::Channel>,
+    token: &str,
+) -> anyhow::Result<()> {
+    match command {
+        NodeCommands::Register {
+            context,
+            node_id,
+            region,
+            cell_id,
+            libp2p_peer_id,
+            public_api_addr,
+            public_cluster_addrs,
+            capabilities,
+        } => {
+            let response = client
+                .register_node(with_auth(
+                    api::RegisterNodeRequest {
+                        context: Some(context.to_context()),
+                        node_id: node_id.clone(),
+                        region: region.clone(),
+                        cell_id: cell_id.clone(),
+                        libp2p_peer_id: libp2p_peer_id.clone(),
+                        public_cluster_addrs: public_cluster_addrs.clone(),
+                        public_api_addr: public_api_addr.clone(),
+                        capabilities: capabilities
+                            .iter()
+                            .map(|capability| capability.to_proto())
+                            .collect(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        NodeCommands::Activate { context, node_id } => {
+            let response = client
+                .activate_node(with_auth(
+                    api::ActivateNodeRequest {
+                        context: Some(context.to_context()),
+                        node_id: node_id.clone(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        NodeCommands::Drain {
+            context,
+            node_id,
+            graceful_timeout_ms,
+            force_after_timeout,
+        } => {
+            let response = client
+                .drain_node(with_auth(
+                    api::DrainNodeRequest {
+                        context: Some(context.to_context()),
+                        node_id: node_id.clone(),
+                        graceful_timeout_ms: *graceful_timeout_ms,
+                        force_after_timeout: *force_after_timeout,
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        NodeCommands::Remove { context, node_id } => {
+            let response = client
+                .remove_node(with_auth(
+                    api::RemoveNodeRequest {
+                        context: Some(context.to_context()),
+                        node_id: node_id.clone(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        NodeCommands::List {
+            region,
+            cell_id,
+            page,
+        } => {
+            let response = client
+                .list_nodes(with_auth(
+                    api::ListNodesRequest {
+                        region: region.clone().unwrap_or_default(),
+                        cell_id: cell_id.clone().unwrap_or_default(),
+                        page: page.to_page_request(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn with_auth<T>(message: T, token: &str) -> anyhow::Result<tonic::Request<T>> {
+    let mut request = tonic::Request::new(message);
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {token}").parse().map_err(|err| {
+            anyhow::anyhow!("failed to build authorization metadata header: {err}")
+        })?,
+    );
+    Ok(request)
+}
+
+fn print_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
+    serde_json::to_writer_pretty(std::io::stdout().lock(), value)?;
+    println!();
+    Ok(())
+}
+
+fn required_part<'a>(part: Option<&'a str>, name: &str) -> Result<&'a str, String> {
+    part.filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("bucket override is missing {name}"))
+}
+
+fn normalize_enum_value(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| *ch != '-' && *ch != '_')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestAdminCli {
+        #[clap(subcommand)]
+        command: AdminCommands,
+    }
+
+    #[test]
+    fn mutation_options_generate_optional_ids() {
+        let context = MutationOptions {
+            request_id: None,
+            idempotency_key: None,
+            audit_reason: "planned maintenance".to_string(),
+            expected_generation: 42,
+        }
+        .to_context();
+
+        assert!(context.request_id.starts_with("cli-"));
+        assert!(!context.idempotency_key.is_empty());
+        assert_eq!(context.audit_reason, "planned maintenance");
+        assert_eq!(context.expected_generation, 42);
+    }
+
+    #[test]
+    fn mutation_parse_requires_explicit_audit_reason() {
+        let result = TestAdminCli::try_parse_from([
+            "admin",
+            "region",
+            "create",
+            "--expected-generation",
+            "0",
+            "--region",
+            "eu-west-1",
+            "--public-base-url",
+            "https://eu-west-1.example.test",
+            "--virtual-host-suffix",
+            "eu-west-1.example.test",
+        ]);
+        let Err(error) = result else {
+            panic!("expected audit_reason parse failure");
+        };
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn mutation_parse_allows_generated_request_ids() {
+        let cli = TestAdminCli::try_parse_from([
+            "admin",
+            "region",
+            "create",
+            "--audit-reason",
+            "bootstrap region",
+            "--expected-generation",
+            "0",
+            "--region",
+            "eu-west-1",
+            "--public-base-url",
+            "https://eu-west-1.example.test",
+            "--virtual-host-suffix",
+            "eu-west-1.example.test",
+        ])
+        .unwrap();
+
+        let AdminCommands::Region {
+            command: RegionCommands::Create {
+                context, region, ..
+            },
+        } = cli.command
+        else {
+            panic!("expected region create command");
+        };
+
+        assert!(context.request_id.is_none());
+        assert!(context.idempotency_key.is_none());
+        assert_eq!(context.audit_reason, "bootstrap region");
+        assert_eq!(context.expected_generation, 0);
+        assert_eq!(region, "eu-west-1");
+    }
+
+    #[test]
+    fn bucket_override_parses_reason_with_colons() {
+        let override_arg: BucketDrainOverrideArg =
+            "tenant-a:photos:read-only-until-removed:incident:123"
+                .parse()
+                .unwrap();
+
+        let proto = override_arg.to_proto();
+        assert_eq!(proto.tenant_id, "tenant-a");
+        assert_eq!(proto.bucket_name, "photos");
+        assert_eq!(proto.disposition, 3);
+        assert_eq!(proto.reason, "incident:123");
+    }
+
+    #[test]
+    fn node_capabilities_map_to_proto_values() {
+        assert_eq!(NodeCapabilityArg::Object.to_proto(), 1);
+        assert_eq!(NodeCapabilityArg::Index.to_proto(), 2);
+        assert_eq!(NodeCapabilityArg::Personaldb.to_proto(), 3);
+        assert_eq!(NodeCapabilityArg::Gateway.to_proto(), 4);
+        assert_eq!(NodeCapabilityArg::Admin.to_proto(), 5);
+    }
+}
