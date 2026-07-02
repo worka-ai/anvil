@@ -137,6 +137,67 @@ fn empty_activation_checkpoint_json(mesh_id: &str, region: &str) -> String {
     .to_string()
 }
 
+async fn activation_checkpoint_json_from_existing_streams(
+    node: &AdminNode,
+    region: &str,
+) -> String {
+    let mut required_streams = Vec::new();
+    for family in anvil::mesh_directory::RoutingRecordFamily::all() {
+        let stream_family = family.stream_family();
+        let family_path = node
+            .state
+            .storage
+            .mesh_control_stream_family_path(stream_family)
+            .unwrap();
+        let mut entries = match tokio::fs::read_dir(&family_path).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => panic!("read control stream directory {family_path:?}: {err}"),
+        };
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("anlog") {
+                continue;
+            }
+            let Some(partition) = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if node
+                .state
+                .storage
+                .mesh_control_stream_path(stream_family, &partition)
+                .is_err()
+            {
+                continue;
+            }
+            let log = anvil::mesh_control_stream::read_control_stream_log(&path)
+                .await
+                .unwrap();
+            let Some(record) = log.records.last() else {
+                continue;
+            };
+            required_streams.push(serde_json::json!({
+                "stream_family": stream_family,
+                "partition": partition,
+                "sequence": record.metadata.sequence.get(),
+                "digest": record.metadata.record_digest.as_str(),
+            }));
+        }
+    }
+    serde_json::json!({
+        "schema": anvil::mesh_lifecycle::ACTIVATION_CHECKPOINT_SCHEMA,
+        "mesh_id": "mesh-test",
+        "region": region,
+        "created_at": "2026-07-02T00:00:00Z",
+        "required_streams": required_streams,
+    })
+    .to_string()
+}
+
 fn missing_activation_checkpoint_json(mesh_id: &str, region: &str) -> String {
     serde_json::json!({
         "schema": anvil::mesh_lifecycle::ACTIVATION_CHECKPOINT_SCHEMA,
@@ -153,6 +214,80 @@ fn missing_activation_checkpoint_json(mesh_id: &str, region: &str) -> String {
         ]
     })
     .to_string()
+}
+
+async fn prepare_active_region_dependencies(
+    client: &mut AdminServiceClient<tonic::transport::Channel>,
+    token: &str,
+    label: &str,
+    region: &str,
+    cell_id: &str,
+    node_id: &str,
+) {
+    let cell = client
+        .register_cell(with_auth(
+            tonic::Request::new(RegisterCellRequest {
+                context: Some(context(&format!("{label}-register-cell"), 0)),
+                region: region.to_string(),
+                cell_id: cell_id.to_string(),
+                placement_weight: 100,
+            }),
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .cell
+        .unwrap();
+    let cell = client
+        .activate_cell(with_auth(
+            tonic::Request::new(ActivateCellRequest {
+                context: Some(context(&format!("{label}-activate-cell"), cell.generation)),
+                region: region.to_string(),
+                cell_id: cell_id.to_string(),
+            }),
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .cell
+        .unwrap();
+    assert_eq!(cell.state, 2);
+
+    let node = client
+        .register_node(with_auth(
+            tonic::Request::new(RegisterNodeRequest {
+                context: Some(context(&format!("{label}-register-node"), 0)),
+                node_id: node_id.to_string(),
+                region: region.to_string(),
+                cell_id: cell_id.to_string(),
+                libp2p_peer_id: format!("peer-{label}"),
+                public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
+                public_api_addr: "http://127.0.0.1:50051".to_string(),
+                capabilities: vec![1, 5],
+            }),
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .node
+        .unwrap();
+    let node = client
+        .activate_node(with_auth(
+            tonic::Request::new(ActivateNodeRequest {
+                context: Some(context(&format!("{label}-activate-node"), node.generation)),
+                node_id: node_id.to_string(),
+            }),
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .node
+        .unwrap();
+    assert_eq!(node.state, 2);
 }
 
 #[tokio::test]
@@ -288,6 +423,56 @@ async fn admin_lifecycle_rejects_invalid_region_cell_and_node_transitions() {
         .unwrap();
     assert_eq!(cell.state, 2);
 
+    let registered_node = client
+        .register_node(with_auth(
+            tonic::Request::new(RegisterNodeRequest {
+                context: Some(context("register-node", 0)),
+                node_id: "node-a".to_string(),
+                region: "eu-west-1".to_string(),
+                cell_id: "cell-a".to_string(),
+                libp2p_peer_id: "peer-a".to_string(),
+                public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
+                public_api_addr: "http://127.0.0.1:50051".to_string(),
+                capabilities: vec![1, 5],
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .node
+        .unwrap();
+    assert_eq!(registered_node.state, 1);
+
+    let drain_joining_node = client
+        .drain_node(with_auth(
+            tonic::Request::new(DrainNodeRequest {
+                context: Some(context("drain-joining-node", registered_node.generation)),
+                node_id: "node-a".to_string(),
+                graceful_timeout_ms: 1000,
+                force_after_timeout: false,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(drain_joining_node.code(), Code::FailedPrecondition);
+
+    let active_node = client
+        .activate_node(with_auth(
+            tonic::Request::new(ActivateNodeRequest {
+                context: Some(context("activate-node", registered_node.generation)),
+                node_id: "node-a".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .node
+        .unwrap();
+    assert_eq!(active_node.state, 2);
+
     let not_reached = client
         .activate_region(with_auth(
             tonic::Request::new(ActivateRegionRequest {
@@ -395,56 +580,6 @@ async fn admin_lifecycle_rejects_invalid_region_cell_and_node_transitions() {
         .await
         .unwrap_err();
     assert_eq!(remove_active_region.code(), Code::FailedPrecondition);
-
-    let registered_node = client
-        .register_node(with_auth(
-            tonic::Request::new(RegisterNodeRequest {
-                context: Some(context("register-node", 0)),
-                node_id: "node-a".to_string(),
-                region: "eu-west-1".to_string(),
-                cell_id: "cell-a".to_string(),
-                libp2p_peer_id: "peer-a".to_string(),
-                public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
-                public_api_addr: "http://127.0.0.1:50051".to_string(),
-                capabilities: vec![1, 5],
-            }),
-            &token,
-        ))
-        .await
-        .unwrap()
-        .into_inner()
-        .node
-        .unwrap();
-    assert_eq!(registered_node.state, 1);
-
-    let drain_joining_node = client
-        .drain_node(with_auth(
-            tonic::Request::new(DrainNodeRequest {
-                context: Some(context("drain-joining-node", registered_node.generation)),
-                node_id: "node-a".to_string(),
-                graceful_timeout_ms: 1000,
-                force_after_timeout: false,
-            }),
-            &token,
-        ))
-        .await
-        .unwrap_err();
-    assert_eq!(drain_joining_node.code(), Code::FailedPrecondition);
-
-    let active_node = client
-        .activate_node(with_auth(
-            tonic::Request::new(ActivateNodeRequest {
-                context: Some(context("activate-node", registered_node.generation)),
-                node_id: "node-a".to_string(),
-            }),
-            &token,
-        ))
-        .await
-        .unwrap()
-        .into_inner()
-        .node
-        .unwrap();
-    assert_eq!(active_node.state, 2);
 
     let remove_active_node = client
         .remove_node(with_auth(
@@ -709,6 +844,29 @@ async fn admin_routing_records_list_and_repair_mesh_locators() {
             .iter()
             .any(|record| record.record_key == format!("{}/route-bucket", tenant.id))
     );
+    let diagnostics_after_delete = client
+        .list_diagnostics(with_auth(
+            tonic::Request::new(ListDiagnosticsRequest {
+                request_id: "req-route-diagnostics-after-delete".to_string(),
+                source: "mesh_routing_projection".to_string(),
+                tenant_id: String::new(),
+                bucket_name: String::new(),
+                index_name: String::new(),
+                severity: String::new(),
+                page: None,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .diagnostics;
+    assert!(diagnostics_after_delete.iter().any(|diagnostic| {
+        diagnostic.code == "mesh_control_projection_missing_record"
+            && diagnostic
+                .details_json
+                .contains(&format!("{}/route-bucket", tenant.id))
+    }));
 
     let repaired = client
         .repair_routing_record(with_auth(
@@ -741,6 +899,60 @@ async fn admin_routing_records_list_and_repair_mesh_locators() {
         listed_after_repair
             .iter()
             .any(|record| record.record_key == format!("{}/route-bucket", tenant.id))
+    );
+    tokio::fs::remove_file(&descriptor_path).await.unwrap();
+    let projection_repair = client
+        .run_repair(with_auth(
+            tonic::Request::new(RunRepairRequest {
+                context: Some(context("repair-routing-projection", 0)),
+                repair_kind: 5,
+                tenant_id: String::new(),
+                bucket_name: String::new(),
+                index_name: String::new(),
+                derived_index_id: String::new(),
+                database_id: String::new(),
+                rebuild: false,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(projection_repair.status, "completed");
+    assert!(
+        projection_repair
+            .details_json
+            .contains("\"repair_kind\":\"mesh_routing_projection\"")
+    );
+    assert!(
+        projection_repair
+            .details_json
+            .contains("\"repaired_count\":1")
+    );
+    let diagnostics_after_repair = client
+        .list_diagnostics(with_auth(
+            tonic::Request::new(ListDiagnosticsRequest {
+                request_id: "req-route-diagnostics-after-repair".to_string(),
+                source: "mesh_routing_projection".to_string(),
+                tenant_id: String::new(),
+                bucket_name: String::new(),
+                index_name: String::new(),
+                severity: String::new(),
+                page: None,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .diagnostics;
+    assert!(
+        !diagnostics_after_repair.iter().any(|diagnostic| {
+            diagnostic
+                .details_json
+                .contains(&format!("{}/route-bucket", tenant.id))
+        }),
+        "routing projection diagnostics should clear after stream-backed repair"
     );
 }
 
@@ -798,6 +1010,15 @@ async fn admin_host_aliases_are_generation_checked_and_lifecycle_managed() {
         .into_inner()
         .region
         .unwrap();
+    prepare_active_region_dependencies(
+        &mut client,
+        &token,
+        "alias",
+        "eu-west-1",
+        "cell-a",
+        "node-a",
+    )
+    .await;
     let _region = client
         .activate_region(with_auth(
             tonic::Request::new(ActivateRegionRequest {
@@ -1261,4 +1482,264 @@ async fn admin_object_links_are_cas_checked_metadata_entries() {
             .inline_payload,
         target_v2.inline_payload
     );
+}
+
+#[tokio::test]
+async fn admin_mutations_are_returned_by_durable_audit_listing() {
+    let node = spawn_admin_node().await;
+    let token = admin_token(&node);
+    let mut client = AdminServiceClient::connect(node.admin_url.clone())
+        .await
+        .unwrap();
+
+    let tenant_response = client
+        .create_tenant(with_auth(
+            tonic::Request::new(CreateTenantRequest {
+                context: Some(context("audit-create-tenant", 0)),
+                name: "audit-tenant".to_string(),
+                home_region: "eu-west-1".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let tenant = tenant_response.tenant.clone().unwrap();
+    let tenant_id = tenant.tenant_id.parse::<i64>().unwrap();
+
+    let app_response = client
+        .create_application(with_auth(
+            tonic::Request::new(CreateApplicationRequest {
+                context: Some(context("audit-create-app", 0)),
+                tenant_id: tenant.tenant_id.clone(),
+                app_name: "publisher".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let bucket_response = client
+        .create_bucket_admin(with_auth(
+            tonic::Request::new(CreateBucketAdminRequest {
+                context: Some(context("audit-create-bucket", 0)),
+                tenant_id: tenant.tenant_id.clone(),
+                bucket_name: "release-assets".to_string(),
+                region: "eu-west-1".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let bucket = bucket_response.bucket.clone().unwrap();
+
+    let public_bucket_response = client
+        .set_bucket_public_access_admin(with_auth(
+            tonic::Request::new(SetBucketPublicAccessAdminRequest {
+                context: Some(context("audit-public-bucket", 1)),
+                tenant_id: tenant.tenant_id.clone(),
+                bucket_name: bucket.name.clone(),
+                allow_public_read: true,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    node.state
+        .persistence
+        .create_object(
+            tenant_id,
+            bucket.bucket_id,
+            "versions/app-v1.bin",
+            "hash-v1",
+            8,
+            "etag-v1",
+            Some("application/octet-stream"),
+            None,
+            None,
+            Some(b"v1-bytes".to_vec()),
+        )
+        .await
+        .unwrap();
+
+    let link_response = client
+        .create_object_link(with_auth(
+            tonic::Request::new(CreateObjectLinkRequest {
+                context: Some(context("audit-create-link", 0)),
+                tenant_id: tenant.tenant_id.clone(),
+                bucket_name: bucket.name.clone(),
+                link_key: "latest.bin".to_string(),
+                target_key: "versions/app-v1.bin".to_string(),
+                target_version: String::new(),
+                resolution: 1,
+                allow_dangling: false,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let region_response = client
+        .create_region(with_auth(
+            tonic::Request::new(CreateRegionRequest {
+                context: Some(context("audit-create-region", 0)),
+                region: "eu-west-1".to_string(),
+                public_base_url: "https://eu-west-1.anvil-storage.test".to_string(),
+                virtual_host_suffix: "eu-west-1.anvil-storage.test".to_string(),
+                placement_weight: 100,
+                default_cell: String::new(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let region = region_response.region.clone().unwrap();
+    prepare_active_region_dependencies(
+        &mut client,
+        &token,
+        "audit",
+        "eu-west-1",
+        "cell-a",
+        "node-a",
+    )
+    .await;
+    let active_region_response = client
+        .activate_region(with_auth(
+            tonic::Request::new(ActivateRegionRequest {
+                context: Some(context("audit-activate-region", region.generation)),
+                region: "eu-west-1".to_string(),
+                activation_checkpoint_json: activation_checkpoint_json_from_existing_streams(
+                    &node,
+                    "eu-west-1",
+                )
+                .await,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let host_alias_response = client
+        .create_host_alias(with_auth(
+            tonic::Request::new(CreateHostAliasRequest {
+                context: Some(context("audit-create-host-alias", 0)),
+                hostname: "Audit.Example.Com.".to_string(),
+                tenant_id: tenant.tenant_id.clone(),
+                bucket_name: bucket.name.clone(),
+                region: "eu-west-1".to_string(),
+                prefix: "public/".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let audit = client
+        .list_audit_events(with_auth(
+            tonic::Request::new(ListAuditEventsRequest {
+                request_id: "req-list-admin-audit".to_string(),
+                principal_id: "admin-principal".to_string(),
+                resource_id: String::new(),
+                action: String::new(),
+                page: Some(PageRequest {
+                    cursor: String::new(),
+                    limit: 100,
+                }),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let find_event = |action: &str| {
+        audit
+            .events
+            .iter()
+            .find(|event| event.action == action)
+            .unwrap_or_else(|| panic!("missing audit event for {action}"))
+    };
+    let details = |event: &AuditEventRecord| -> serde_json::Value {
+        serde_json::from_str(&event.details_json).unwrap()
+    };
+
+    let tenant_event = find_event("admin.tenant.create");
+    assert_eq!(tenant_event.audit_event_id, tenant_response.audit_event_id);
+    assert_eq!(tenant_event.resource_id, format!("tenant:{tenant_id}"));
+    assert_eq!(tenant_event.principal_id, "admin-principal");
+    let tenant_details = details(tenant_event);
+    assert_eq!(tenant_details["tenant_name"], "audit-tenant");
+    assert_eq!(
+        tenant_details["idempotency_key"],
+        "idem-audit-create-tenant"
+    );
+
+    let app_event = find_event("admin.app.create");
+    assert_eq!(app_event.audit_event_id, app_response.audit_event_id);
+    let app_details = details(app_event);
+    assert_eq!(app_details["tenant_id"], tenant_id);
+    assert_eq!(app_details["app_name"], "publisher");
+
+    let bucket_event = find_event("admin.bucket.create");
+    assert_eq!(bucket_event.audit_event_id, bucket_response.audit_event_id);
+    assert_eq!(
+        bucket_event.resource_id,
+        format!("tenant:{tenant_id}:bucket:release-assets")
+    );
+    let bucket_details = details(bucket_event);
+    assert_eq!(bucket_details["bucket_id"], bucket.bucket_id);
+    assert_eq!(bucket_details["region"], "eu-west-1");
+
+    let public_bucket_event = find_event("admin.bucket.public_access.set");
+    assert_eq!(
+        public_bucket_event.audit_event_id,
+        public_bucket_response.audit_event_id
+    );
+    let public_bucket_details = details(public_bucket_event);
+    assert_eq!(public_bucket_details["allow_public_read"], true);
+    assert_eq!(public_bucket_details["expected_generation"], 1);
+
+    let link_event = find_event("admin.object_link.create");
+    assert_eq!(link_event.audit_event_id, link_response.audit_event_id);
+    assert_eq!(
+        link_event.resource_id,
+        format!("tenant:{tenant_id}:bucket:release-assets:link:latest.bin")
+    );
+    let link_details = details(link_event);
+    assert_eq!(link_details["target_key"], "versions/app-v1.bin");
+    assert_eq!(link_details["resolution"], "follow");
+
+    let region_event = find_event("admin.region.create");
+    assert_eq!(region_event.audit_event_id, region_response.audit_event_id);
+    assert_eq!(region_event.resource_id, "region:eu-west-1");
+    let region_details = details(region_event);
+    assert_eq!(region_details["state"], "joining");
+    assert_eq!(region_details["placement_weight"], 100);
+
+    let active_region_event = find_event("admin.region.activate");
+    assert_eq!(
+        active_region_event.audit_event_id,
+        active_region_response.audit_event_id
+    );
+    let active_region_details = details(active_region_event);
+    assert_eq!(active_region_details["state"], "active");
+    assert!(active_region_details["activation_checkpoint"].is_object());
+
+    let host_alias_event = find_event("admin.host_alias.create");
+    assert_eq!(
+        host_alias_event.audit_event_id,
+        host_alias_response.audit_event_id
+    );
+    assert_eq!(host_alias_event.resource_id, "host_alias:audit.example.com");
+    let host_alias_details = details(host_alias_event);
+    assert_eq!(host_alias_details["hostname"], "audit.example.com");
+    assert_eq!(host_alias_details["prefix"], "public/");
 }

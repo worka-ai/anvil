@@ -1,5 +1,6 @@
 use anyhow::{Context, Result as AnyhowResult, anyhow};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::BTreeMap;
 use std::convert::TryInto;
 use std::fmt;
 use std::io::ErrorKind;
@@ -234,6 +235,366 @@ pub struct ControlStreamAppend {
     pub offset: u64,
     pub encoded_len: usize,
     pub position: ControlStreamPosition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlProjectionRecord {
+    pub record_key: String,
+    pub generation: u64,
+    pub payload_json: Vec<u8>,
+}
+
+impl ControlProjectionRecord {
+    pub fn new(
+        record_key: impl Into<String>,
+        generation: u64,
+        payload_json: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            record_key: record_key.into(),
+            generation,
+            payload_json: payload_json.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlProjectionDiagnostic {
+    pub stream_family: String,
+    pub partition: String,
+    pub record_key: String,
+    pub severity: &'static str,
+    pub code: &'static str,
+    pub message: String,
+    pub stream_sequence: Option<u64>,
+    pub stream_generation: Option<u64>,
+    pub stream_digest: Option<String>,
+    pub projection_generation: Option<u64>,
+    pub projection_digest: Option<String>,
+    pub repair_safe: bool,
+    pub proposed_action: &'static str,
+}
+
+pub async fn diagnose_control_stream_projection(
+    path: impl AsRef<Path>,
+    stream_family: &str,
+    partition: &str,
+    projected_records: &[ControlProjectionRecord],
+) -> AnyhowResult<Vec<ControlProjectionDiagnostic>> {
+    let log = read_control_stream_log(path).await?;
+    let mut diagnostics = Vec::new();
+    if let Some(partial) = &log.partial_final_frame {
+        diagnostics.push(ControlProjectionDiagnostic {
+            stream_family: stream_family.to_string(),
+            partition: partition.to_string(),
+            record_key: String::new(),
+            severity: "error",
+            code: "mesh_control_stream_partial_final_frame",
+            message: format!(
+                "control stream {stream_family}/{partition} has a partial final frame at offset {} ({} of {} bytes)",
+                partial.offset, partial.actual_len, partial.expected_len
+            ),
+            stream_sequence: None,
+            stream_generation: None,
+            stream_digest: None,
+            projection_generation: None,
+            projection_digest: None,
+            repair_safe: false,
+            proposed_action: "manual_review_rebuild_not_implemented",
+        });
+    }
+
+    let mut latest_by_key = BTreeMap::new();
+    let mut expected_sequence = 1_u64;
+    for record in &log.records {
+        let sequence = record.metadata.sequence.get();
+        if sequence != expected_sequence {
+            diagnostics.push(ControlProjectionDiagnostic {
+                stream_family: stream_family.to_string(),
+                partition: partition.to_string(),
+                record_key: String::new(),
+                severity: "error",
+                code: "mesh_control_stream_sequence_gap",
+                message: format!(
+                    "control stream {stream_family}/{partition} expected sequence {expected_sequence} but found {sequence}"
+                ),
+                stream_sequence: Some(sequence),
+                stream_generation: None,
+                stream_digest: Some(record.metadata.record_digest.to_string()),
+                projection_generation: None,
+                projection_digest: None,
+                repair_safe: false,
+                proposed_action: "manual_review_rebuild_not_implemented",
+            });
+        }
+        expected_sequence = sequence.saturating_add(1);
+
+        let header = match control_mutation_header(&record.frame.header_json) {
+            Ok(header) => header,
+            Err(err) => {
+                diagnostics.push(ControlProjectionDiagnostic {
+                    stream_family: stream_family.to_string(),
+                    partition: partition.to_string(),
+                    record_key: String::new(),
+                    severity: "error",
+                    code: "mesh_control_stream_header_invalid",
+                    message: format!(
+                        "control stream {stream_family}/{partition} sequence {sequence} has invalid mutation header: {err}"
+                    ),
+                    stream_sequence: Some(sequence),
+                    stream_generation: None,
+                    stream_digest: Some(record.metadata.record_digest.to_string()),
+                    projection_generation: None,
+                    projection_digest: None,
+                    repair_safe: false,
+                    proposed_action: "manual_review_rebuild_not_implemented",
+                });
+                continue;
+            }
+        };
+
+        if header.stream_family.as_deref() != Some(stream_family)
+            || header.partition.as_deref() != Some(partition)
+        {
+            diagnostics.push(ControlProjectionDiagnostic {
+                stream_family: stream_family.to_string(),
+                partition: partition.to_string(),
+                record_key: header.record_key.clone().unwrap_or_default(),
+                severity: "error",
+                code: "mesh_control_stream_header_scope_mismatch",
+                message: format!(
+                    "control stream header scope {:?}/{:?} does not match path {stream_family}/{partition}",
+                    header.stream_family, header.partition
+                ),
+                stream_sequence: Some(sequence),
+                stream_generation: header.new_generation,
+                stream_digest: Some(record.metadata.record_digest.to_string()),
+                projection_generation: None,
+                projection_digest: None,
+                repair_safe: false,
+                proposed_action: "manual_review_rebuild_not_implemented",
+            });
+        }
+
+        let Some(record_key) = header
+            .record_key
+            .clone()
+            .filter(|record_key| !record_key.trim().is_empty())
+        else {
+            diagnostics.push(ControlProjectionDiagnostic {
+                stream_family: stream_family.to_string(),
+                partition: partition.to_string(),
+                record_key: String::new(),
+                severity: "error",
+                code: "mesh_control_stream_record_key_missing",
+                message: format!(
+                    "control stream {stream_family}/{partition} sequence {sequence} is missing record_key"
+                ),
+                stream_sequence: Some(sequence),
+                stream_generation: header.new_generation,
+                stream_digest: Some(record.metadata.record_digest.to_string()),
+                projection_generation: None,
+                projection_digest: None,
+                repair_safe: false,
+                proposed_action: "manual_review_rebuild_not_implemented",
+            });
+            continue;
+        };
+
+        let payload_digest = ControlRecordDigest::blake3(&record.frame.payload_json);
+        if payload_digest.as_str() != record.metadata.record_digest.as_str() {
+            diagnostics.push(ControlProjectionDiagnostic {
+                stream_family: stream_family.to_string(),
+                partition: partition.to_string(),
+                record_key: record_key.clone(),
+                severity: "error",
+                code: "mesh_control_stream_digest_mismatch",
+                message: format!(
+                    "control stream {stream_family}/{partition} sequence {sequence} payload digest does not match header digest"
+                ),
+                stream_sequence: Some(sequence),
+                stream_generation: header.new_generation,
+                stream_digest: Some(record.metadata.record_digest.to_string()),
+                projection_generation: None,
+                projection_digest: Some(payload_digest.to_string()),
+                repair_safe: false,
+                proposed_action: "manual_review_rebuild_not_implemented",
+            });
+        }
+
+        latest_by_key.insert(
+            record_key,
+            StreamProjectionEntry {
+                sequence,
+                generation: header.new_generation,
+                digest: record.metadata.record_digest.to_string(),
+                operation: header.operation.unwrap_or_default(),
+                payload_json: record.frame.payload_json.clone(),
+            },
+        );
+    }
+
+    let mut projection_by_key = BTreeMap::new();
+    for projection in projected_records {
+        if projection_by_key
+            .insert(projection.record_key.clone(), projection)
+            .is_some()
+        {
+            diagnostics.push(ControlProjectionDiagnostic {
+                stream_family: stream_family.to_string(),
+                partition: partition.to_string(),
+                record_key: projection.record_key.clone(),
+                severity: "error",
+                code: "mesh_control_projection_duplicate_record",
+                message: format!(
+                    "projection for {stream_family}/{partition} contains duplicate record {}",
+                    projection.record_key
+                ),
+                stream_sequence: None,
+                stream_generation: None,
+                stream_digest: None,
+                projection_generation: Some(projection.generation),
+                projection_digest: projection_digest(&projection.payload_json).ok(),
+                repair_safe: false,
+                proposed_action: "manual_review_rebuild_not_implemented",
+            });
+        }
+    }
+
+    for projection in projected_records {
+        let projection_digest = projection_digest(&projection.payload_json)?;
+        let Some(stream_entry) = latest_by_key.get(&projection.record_key) else {
+            diagnostics.push(ControlProjectionDiagnostic {
+                stream_family: stream_family.to_string(),
+                partition: partition.to_string(),
+                record_key: projection.record_key.clone(),
+                severity: "error",
+                code: "mesh_control_projection_missing_stream_record",
+                message: format!(
+                    "projection record {} has no matching control stream mutation in {stream_family}/{partition}",
+                    projection.record_key
+                ),
+                stream_sequence: None,
+                stream_generation: None,
+                stream_digest: None,
+                projection_generation: Some(projection.generation),
+                projection_digest: Some(projection_digest),
+                repair_safe: false,
+                proposed_action: "manual_review_rebuild_not_implemented",
+            });
+            continue;
+        };
+
+        if stream_entry.generation != Some(projection.generation) {
+            diagnostics.push(ControlProjectionDiagnostic {
+                stream_family: stream_family.to_string(),
+                partition: partition.to_string(),
+                record_key: projection.record_key.clone(),
+                severity: "error",
+                code: "mesh_control_projection_generation_mismatch",
+                message: format!(
+                    "projection record {} generation {} does not match latest stream generation {:?}",
+                    projection.record_key, projection.generation, stream_entry.generation
+                ),
+                stream_sequence: Some(stream_entry.sequence),
+                stream_generation: stream_entry.generation,
+                stream_digest: Some(stream_entry.digest.clone()),
+                projection_generation: Some(projection.generation),
+                projection_digest: Some(projection_digest.clone()),
+                repair_safe: true,
+                proposed_action: "repair_routing_record_from_control_stream",
+            });
+        }
+
+        if semantic_json(&stream_entry.payload_json)? != semantic_json(&projection.payload_json)? {
+            diagnostics.push(ControlProjectionDiagnostic {
+                stream_family: stream_family.to_string(),
+                partition: partition.to_string(),
+                record_key: projection.record_key.clone(),
+                severity: "error",
+                code: "mesh_control_projection_payload_mismatch",
+                message: format!(
+                    "projection record {} payload does not match latest control stream payload",
+                    projection.record_key
+                ),
+                stream_sequence: Some(stream_entry.sequence),
+                stream_generation: stream_entry.generation,
+                stream_digest: Some(stream_entry.digest.clone()),
+                projection_generation: Some(projection.generation),
+                projection_digest: Some(projection_digest),
+                repair_safe: true,
+                proposed_action: "repair_routing_record_from_control_stream",
+            });
+        }
+    }
+
+    for (record_key, stream_entry) in latest_by_key {
+        if projection_by_key.contains_key(&record_key)
+            || is_delete_operation(&stream_entry.operation)
+        {
+            continue;
+        }
+        diagnostics.push(ControlProjectionDiagnostic {
+            stream_family: stream_family.to_string(),
+            partition: partition.to_string(),
+            record_key: record_key.clone(),
+            severity: "error",
+            code: "mesh_control_projection_missing_record",
+            message: format!(
+                "control stream latest mutation for {record_key} has no projected descriptor"
+            ),
+            stream_sequence: Some(stream_entry.sequence),
+            stream_generation: stream_entry.generation,
+            stream_digest: Some(stream_entry.digest),
+            projection_generation: None,
+            projection_digest: None,
+            repair_safe: true,
+            proposed_action: "repair_routing_record_from_control_stream",
+        });
+    }
+
+    Ok(diagnostics)
+}
+
+pub async fn latest_projected_record_from_control_stream(
+    path: impl AsRef<Path>,
+    stream_family: &str,
+    partition: &str,
+    record_key: &str,
+) -> AnyhowResult<Option<ControlProjectionRecord>> {
+    let log = read_control_stream_log(path).await?;
+    if log.partial_final_frame.is_some() {
+        return Err(anyhow!(
+            "control stream {stream_family}/{partition} has a partial final frame"
+        ));
+    }
+
+    let mut latest = None;
+    for record in &log.records {
+        let header = control_mutation_header(&record.frame.header_json)?;
+        if header.stream_family.as_deref() != Some(stream_family)
+            || header.partition.as_deref() != Some(partition)
+        {
+            return Err(anyhow!(
+                "control stream header scope {:?}/{:?} does not match path {stream_family}/{partition}",
+                header.stream_family,
+                header.partition
+            ));
+        }
+        if header.record_key.as_deref() != Some(record_key) {
+            continue;
+        }
+        if header.operation.as_deref().is_some_and(is_delete_operation) {
+            latest = None;
+            continue;
+        }
+        latest = Some(ControlProjectionRecord::new(
+            record_key,
+            header.new_generation.unwrap_or_default(),
+            record.frame.payload_json.clone(),
+        ));
+    }
+    Ok(latest)
 }
 
 pub fn encode_control_stream_frame(
@@ -504,6 +865,41 @@ struct RawControlFrameMetadata {
     record_digest: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RawControlMutationHeader {
+    stream_family: Option<String>,
+    partition: Option<String>,
+    record_key: Option<String>,
+    operation: Option<String>,
+    new_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct StreamProjectionEntry {
+    sequence: u64,
+    generation: Option<u64>,
+    digest: String,
+    operation: String,
+    payload_json: Vec<u8>,
+}
+
+fn control_mutation_header(header_json: &[u8]) -> AnyhowResult<RawControlMutationHeader> {
+    serde_json::from_slice(header_json).context("parse control mutation header")
+}
+
+fn semantic_json(payload_json: &[u8]) -> AnyhowResult<serde_json::Value> {
+    serde_json::from_slice(payload_json).context("parse projected control payload")
+}
+
+fn projection_digest(payload_json: &[u8]) -> AnyhowResult<String> {
+    let value = semantic_json(payload_json)?;
+    Ok(ControlRecordDigest::blake3(&serde_json::to_vec(&value)?).to_string())
+}
+
+fn is_delete_operation(operation: &str) -> bool {
+    matches!(operation, "delete" | "deleted")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,6 +928,27 @@ mod tests {
 
     fn sample_payload() -> Vec<u8> {
         br#"{"tenant_id":"tenant_acme","bucket":"releases"}"#.to_vec()
+    }
+
+    fn sample_header_for_payload(sequence: u64, payload: &[u8]) -> Vec<u8> {
+        serde_json::json!({
+            "schema": "anvil.mesh.control_mutation.v1",
+            "mesh_id": "mesh_01",
+            "stream_family": "bucket_locator",
+            "partition": "0a7f",
+            "sequence": sequence,
+            "record_key": "tenant_acme/releases",
+            "operation": "upsert",
+            "expected_generation": null,
+            "new_generation": 1,
+            "writer_node_id": "node_01J0",
+            "writer_fence": 44,
+            "idempotency_key": "req-123",
+            "record_digest": ControlRecordDigest::blake3(payload).as_str(),
+            "created_at": "2026-07-02T00:00:00Z"
+        })
+        .to_string()
+        .into_bytes()
     }
 
     #[test]
@@ -689,5 +1106,55 @@ mod tests {
             err.to_string()
                 .contains("control stream log has partial final frame")
         );
+    }
+
+    #[tokio::test]
+    async fn projection_diagnostic_detects_stream_projection_payload_mismatch() {
+        let dir = tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("_anvil/control/v1/streams/bucket_locator/0a7f.anlog");
+        let stream_payload =
+            br#"{"tenant_id":"tenant_acme","bucket_name":"releases","home_region":"eu-west-1"}"#;
+        let projection_payload =
+            br#"{"tenant_id":"tenant_acme","bucket_name":"releases","home_region":"us-east-1"}"#;
+        let frame = ControlStreamFrame::new(
+            sample_header_for_payload(1, stream_payload),
+            stream_payload.to_vec(),
+        );
+        append_control_stream_frame(&path, &frame).await.unwrap();
+
+        let clean = diagnose_control_stream_projection(
+            &path,
+            "bucket_locator",
+            "0a7f",
+            &[ControlProjectionRecord::new(
+                "tenant_acme/releases",
+                1,
+                stream_payload.to_vec(),
+            )],
+        )
+        .await
+        .unwrap();
+        assert!(clean.is_empty());
+
+        let diagnostics = diagnose_control_stream_projection(
+            &path,
+            "bucket_locator",
+            "0a7f",
+            &[ControlProjectionRecord::new(
+                "tenant_acme/releases",
+                1,
+                projection_payload.to_vec(),
+            )],
+        )
+        .await
+        .unwrap();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "mesh_control_projection_payload_mismatch"
+                && diagnostic.record_key == "tenant_acme/releases"
+                && diagnostic.repair_safe
+                && diagnostic.proposed_action == "repair_routing_record_from_control_stream"
+        }));
     }
 }

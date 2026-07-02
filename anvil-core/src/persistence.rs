@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use tokio::sync::mpsc::Sender;
 
 use crate::{
@@ -12,11 +12,13 @@ use crate::{
     cluster::MetadataEvent,
     config::Config,
     control_journal, directory_repair, hf_journal, index_builder, index_diagnostic_journal,
-    index_journal, index_repair, manifest_journal, mesh_directory, metadata_journal, model_journal,
-    multipart_journal, object_links,
+    index_journal, index_repair, manifest_journal, mesh_control_stream, mesh_directory,
+    metadata_journal, model_journal, multipart_journal, object_links,
     partition_fence::{
-        PartitionOwnerStatus, PartitionRecoveryAcquire, PartitionWritePermit,
-        acquire_partition_recovery, publish_partition_ready, read_partition_owner,
+        AcquireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal, OwnershipResource,
+        OwnershipResourceKind, PartitionOwnerStatus, PartitionRecoveryAcquire,
+        PartitionWritePermit, RenewOwnership, acquire_ownership, acquire_partition_recovery,
+        publish_partition_ready, read_ownership_fence, read_partition_owner, renew_ownership,
     },
     personaldb_repair, repair_finding,
     storage::Storage,
@@ -687,75 +689,103 @@ impl Persistence {
         Ok(mesh_directory::list_routing_records(&self.storage, family_filter).await?)
     }
 
+    pub async fn diagnose_mesh_routing_projection(
+        &self,
+        family_filter: Option<mesh_directory::RoutingRecordFamily>,
+    ) -> Result<Vec<mesh_control_stream::ControlProjectionDiagnostic>> {
+        let records = mesh_directory::list_routing_records(&self.storage, family_filter).await?;
+        let mut by_stream =
+            BTreeMap::<(mesh_directory::RoutingRecordFamily, String), Vec<_>>::new();
+        for record in records {
+            by_stream
+                .entry((record.family, record.partition.clone()))
+                .or_default()
+                .push(mesh_control_stream::ControlProjectionRecord::new(
+                    record.record_key,
+                    record.generation,
+                    record.payload_json.into_bytes(),
+                ));
+        }
+        for family in family_filter
+            .map(|family| vec![family])
+            .unwrap_or_else(|| mesh_directory::RoutingRecordFamily::all().to_vec())
+        {
+            let stream_family = family.stream_family();
+            let family_path = self
+                .storage
+                .mesh_control_stream_family_path(stream_family)?;
+            let mut entries = match tokio::fs::read_dir(&family_path).await {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err.into()),
+            };
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                if path.extension().and_then(|value| value.to_str()) != Some("anlog") {
+                    continue;
+                }
+                let Some(partition) = path.file_stem().and_then(|value| value.to_str()) else {
+                    continue;
+                };
+                if self
+                    .storage
+                    .mesh_control_stream_path(stream_family, partition)
+                    .is_ok()
+                {
+                    by_stream
+                        .entry((family, partition.to_string()))
+                        .or_default();
+                }
+            }
+        }
+
+        let mut diagnostics = Vec::new();
+        for ((family, partition), projected_records) in by_stream {
+            let stream_family = family.stream_family();
+            let path = self
+                .storage
+                .mesh_control_stream_path(stream_family, &partition)?;
+            diagnostics.extend(
+                mesh_control_stream::diagnose_control_stream_projection(
+                    path,
+                    stream_family,
+                    &partition,
+                    &projected_records,
+                )
+                .await?,
+            );
+        }
+        Ok(diagnostics)
+    }
+
     pub async fn repair_mesh_routing_record(
         &self,
         family: mesh_directory::RoutingRecordFamily,
         record_key: &str,
     ) -> Result<mesh_directory::RoutingRecordDescriptor> {
-        match family {
-            mesh_directory::RoutingRecordFamily::TenantName => {
-                let tenant = self
-                    .get_tenant_by_name(record_key)
-                    .await?
-                    .ok_or_else(|| anyhow!("tenant not found"))?;
-                self.write_mesh_tenant_locators(&tenant, "repair-tenant-name")
-                    .await?;
-            }
-            mesh_directory::RoutingRecordFamily::TenantLocator => {
-                let tenant_id = record_key.parse::<i64>()?;
-                let tenant = self
-                    .list_tenants()
-                    .await?
-                    .into_iter()
-                    .find(|tenant| tenant.id == tenant_id)
-                    .ok_or_else(|| anyhow!("tenant not found"))?;
-                self.write_mesh_tenant_locators(&tenant, "repair-tenant-locator")
-                    .await?;
-            }
-            mesh_directory::RoutingRecordFamily::BucketLocator => {
-                let (tenant_id, bucket_name) = record_key
-                    .split_once('/')
-                    .ok_or_else(|| anyhow!("bucket locator key must be tenant_id/bucket"))?;
-                let tenant_id = tenant_id.parse::<i64>()?;
-                let bucket = self
-                    .get_bucket_by_name(tenant_id, bucket_name)
-                    .await?
-                    .ok_or_else(|| anyhow!("bucket not found"))?;
-                self.write_mesh_bucket_locator(&bucket).await?;
-            }
-            mesh_directory::RoutingRecordFamily::HostAlias => {
-                let hostname = crate::routing::normalize_alias_hostname(record_key)
-                    .map_err(|err| anyhow!(err.to_string()))?;
-                let descriptor = crate::mesh_lifecycle::list_host_aliases(&self.storage, None)
-                    .await
-                    .map_err(|err| anyhow!(err.to_string()))?
-                    .into_iter()
-                    .find(|alias| alias.hostname == hostname)
-                    .ok_or_else(|| anyhow!("host alias not found"))?;
-                let partition = mesh_directory::host_alias_partition(&descriptor.hostname)?;
-                let permit = self
-                    .mesh_control_write_permit(
-                        mesh_directory::RoutingRecordFamily::HostAlias,
-                        &partition,
-                    )
-                    .await?;
-                mesh_directory::write_host_alias_descriptor(
-                    &self.storage,
-                    &descriptor,
-                    mesh_directory::MeshControlWriteAuthority {
-                        permit: &permit,
-                        signing_key: &self.partition_owner_signing_key,
-                    },
-                )
-                .await?;
-            }
-        }
-
-        self.list_mesh_routing_records(Some(family))
-            .await?
-            .into_iter()
-            .find(|record| record.record_key == record_key)
-            .ok_or_else(|| anyhow!("routing record was not repaired"))
+        let partition = mesh_directory::routing_record_partition_for_key(family, record_key)?;
+        let stream_family = family.stream_family();
+        let stream_path = self
+            .storage
+            .mesh_control_stream_path(stream_family, &partition)?;
+        let record = mesh_control_stream::latest_projected_record_from_control_stream(
+            stream_path,
+            stream_family,
+            &partition,
+            record_key,
+        )
+        .await?
+        .ok_or_else(|| {
+            anyhow!("no control stream mutation found for {stream_family}/{partition}/{record_key}")
+        })?;
+        mesh_directory::rebuild_routing_record_projection_from_payload(
+            &self.storage,
+            family,
+            record_key,
+            &record.payload_json,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     pub fn cache(&self) -> &MetadataCache {
@@ -829,11 +859,82 @@ impl Persistence {
         family: mesh_directory::RoutingRecordFamily,
         partition: &str,
     ) -> Result<PartitionWritePermit> {
+        self.ensure_mesh_control_ownership(family, partition)
+            .await?;
         self.global_write_permit(
             mesh_directory::CONTROL_PARTITION_FAMILY,
             mesh_directory::control_partition_id(family.stream_family(), partition),
         )
         .await
+    }
+
+    async fn ensure_mesh_control_ownership(
+        &self,
+        family: mesh_directory::RoutingRecordFamily,
+        partition: &str,
+    ) -> Result<()> {
+        let resource = OwnershipResource {
+            resource_kind: OwnershipResourceKind::ControlPartition,
+            resource_id: format!("{}/{}", family.stream_family(), partition),
+        };
+        let owner = self.ownership_principal();
+        let now_nanos = Utc::now()
+            .timestamp_nanos_opt()
+            .ok_or_else(|| anyhow!("ownership timestamp overflow"))?;
+        let ttl_nanos = i64::try_from(MAX_OWNERSHIP_LEASE_MS)?.saturating_mul(1_000_000);
+
+        if let Some(record) = read_ownership_fence(
+            &self.storage,
+            owner.tenant_id,
+            &resource,
+            &self.partition_owner_signing_key,
+        )
+        .await?
+        {
+            if record.owner == owner && record.is_active_unexpired(now_nanos) {
+                renew_ownership(
+                    &self.storage,
+                    RenewOwnership {
+                        request_id: format!("mesh-control-renew-{}", resource.resource_id),
+                        resource: resource.clone(),
+                        owner: owner.clone(),
+                        current_fence: record.fence,
+                        now_nanos,
+                        ttl_nanos,
+                    },
+                    &self.partition_owner_signing_key,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+
+        acquire_ownership(
+            &self.storage,
+            AcquireOwnership {
+                request_id: format!("mesh-control-acquire-{}", resource.resource_id),
+                idempotency_key: format!("mesh-control-owner-{}", resource.resource_id),
+                resource,
+                owner,
+                now_nanos,
+                ttl_nanos,
+            },
+            &self.partition_owner_signing_key,
+        )
+        .await?;
+        Ok(())
+    }
+
+    fn ownership_principal(&self) -> OwnershipPrincipal {
+        OwnershipPrincipal {
+            tenant_id: 0,
+            principal_kind: "node".to_string(),
+            principal_id: self.owner_node_id.clone(),
+            actor_instance_id: self.owner_node_id.clone(),
+            display_name: self.owner_node_id.clone(),
+            region: self.region.clone(),
+            cell: self.cell_id.clone(),
+        }
     }
 
     async fn task_queue_write_permit(&self) -> Result<PartitionWritePermit> {
@@ -1493,9 +1594,14 @@ impl Persistence {
         name: &str,
         region: &str,
     ) -> Result<Bucket, tonic::Status> {
-        crate::mesh_lifecycle::ensure_region_accepts_new_writes(&self.storage, region)
-            .await
-            .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?;
+        crate::mesh_lifecycle::ensure_new_writable_placement(
+            &self.storage,
+            region,
+            &self.cell_id,
+            &self.owner_node_id,
+        )
+        .await
+        .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?;
         if bucket_journal::read_current_bucket(&self.storage, tenant_id, name)
             .await
             .map_err(|e| tonic::Status::internal(e.to_string()))?
@@ -4338,6 +4444,246 @@ mod tests {
                 tenant.id
             )
         );
+
+        let tenant_name_fence = read_ownership_fence(
+            &persistence.storage,
+            0,
+            &OwnershipResource {
+                resource_kind: OwnershipResourceKind::ControlPartition,
+                resource_id: format!(
+                    "{}/{}",
+                    mesh_directory::RoutingRecordFamily::TenantName.stream_family(),
+                    tenant_name.partition()
+                ),
+            },
+            &persistence.partition_owner_signing_key,
+        )
+        .await
+        .unwrap()
+        .expect("tenant-name control partition ownership fence");
+        assert_eq!(tenant_name_fence.owner, persistence.ownership_principal());
+
+        let bucket_locator_fence = read_ownership_fence(
+            &persistence.storage,
+            0,
+            &OwnershipResource {
+                resource_kind: OwnershipResourceKind::ControlPartition,
+                resource_id: format!(
+                    "{}/{}",
+                    mesh_directory::RoutingRecordFamily::BucketLocator.stream_family(),
+                    bucket_locator.partition()
+                ),
+            },
+            &persistence.partition_owner_signing_key,
+        )
+        .await
+        .unwrap()
+        .expect("bucket-locator control partition ownership fence");
+        assert_eq!(
+            bucket_locator_fence.owner,
+            persistence.ownership_principal()
+        );
+    }
+
+    #[tokio::test]
+    async fn region_drain_blocks_bucket_creation_and_completion_with_active_locator() {
+        let temp = tempdir().unwrap();
+        let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+        let (region, _, _) = register_active_mesh_placement(&persistence).await;
+        let tenant = persistence
+            .create_tenant("tenant-a", "unused")
+            .await
+            .unwrap();
+        persistence
+            .create_bucket(tenant.id, "docs", "test-region")
+            .await
+            .unwrap();
+
+        let draining = persistence
+            .transition_region_descriptor(
+                "test-region",
+                region.generation,
+                crate::mesh_lifecycle::LifecycleState::Draining,
+            )
+            .await
+            .unwrap();
+        let placement_err = persistence
+            .create_bucket(tenant.id, "more-docs", "test-region")
+            .await
+            .unwrap_err();
+        assert_eq!(placement_err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            placement_err
+                .message()
+                .contains("cannot accept new writable placement")
+        );
+
+        let completion_err = persistence
+            .transition_region_descriptor(
+                "test-region",
+                draining.generation,
+                crate::mesh_lifecycle::LifecycleState::Drained,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            completion_err
+                .to_string()
+                .contains("still name the region as primary")
+        );
+    }
+
+    #[tokio::test]
+    async fn mesh_routing_projection_diagnostics_detect_bucket_locator_mismatch() {
+        let temp = tempdir().unwrap();
+        let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+        register_active_mesh_placement(&persistence).await;
+        let tenant = persistence
+            .create_tenant("tenant-a", "unused")
+            .await
+            .unwrap();
+        let bucket = persistence
+            .create_bucket(tenant.id, "docs", "test-region")
+            .await
+            .unwrap();
+
+        let clean = persistence
+            .diagnose_mesh_routing_projection(Some(
+                mesh_directory::RoutingRecordFamily::BucketLocator,
+            ))
+            .await
+            .unwrap();
+        assert!(clean.is_empty());
+
+        let bucket_locator = persistence
+            .get_mesh_bucket_locator(tenant.id, "docs")
+            .await
+            .unwrap()
+            .expect("bucket locator");
+        assert_eq!(bucket_locator.bucket_id.as_str(), bucket.id.to_string());
+        let path = mesh_descriptor_path(&persistence.storage, &bucket_locator.descriptor_key());
+        let mut projected: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        projected["home_region"] = json!("us-east-1");
+        tokio::fs::write(&path, serde_json::to_vec_pretty(&projected).unwrap())
+            .await
+            .unwrap();
+
+        let diagnostics = persistence
+            .diagnose_mesh_routing_projection(Some(
+                mesh_directory::RoutingRecordFamily::BucketLocator,
+            ))
+            .await
+            .unwrap();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "mesh_control_projection_payload_mismatch"
+                && diagnostic.record_key == format!("{}/docs", tenant.id)
+                && diagnostic.repair_safe
+                && diagnostic.proposed_action == "repair_routing_record_from_control_stream"
+        }));
+
+        let repaired = persistence
+            .repair_mesh_routing_record(
+                mesh_directory::RoutingRecordFamily::BucketLocator,
+                &format!("{}/docs", tenant.id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repaired.record_key, format!("{}/docs", tenant.id));
+        let repaired_payload: serde_json::Value =
+            serde_json::from_str(&repaired.payload_json).unwrap();
+        assert_eq!(repaired_payload["home_region"], "test-region");
+        let clean = persistence
+            .diagnose_mesh_routing_projection(Some(
+                mesh_directory::RoutingRecordFamily::BucketLocator,
+            ))
+            .await
+            .unwrap();
+        assert!(clean.is_empty(), "{clean:#?}");
+    }
+
+    async fn register_active_mesh_placement(
+        persistence: &Persistence,
+    ) -> (
+        crate::mesh_lifecycle::RegionDescriptor,
+        crate::mesh_lifecycle::CellDescriptor,
+        crate::mesh_lifecycle::NodeDescriptor,
+    ) {
+        let region = persistence
+            .create_region_descriptor(crate::mesh_lifecycle::CreateRegionDescriptor {
+                mesh_id: "default".to_string(),
+                region: "test-region".to_string(),
+                public_base_url: "https://test-region.anvil-storage.test".to_string(),
+                virtual_host_suffix: "test-region.anvil-storage.test".to_string(),
+                placement_weight: 100,
+                default_cell: Some("default".to_string()),
+            })
+            .await
+            .unwrap();
+        let cell = persistence
+            .register_cell_descriptor(crate::mesh_lifecycle::RegisterCellDescriptor {
+                mesh_id: "default".to_string(),
+                region: "test-region".to_string(),
+                cell_id: "default".to_string(),
+                placement_weight: 100,
+            })
+            .await
+            .unwrap();
+        let cell = persistence
+            .transition_cell_descriptor(
+                "test-region",
+                "default",
+                cell.generation,
+                crate::mesh_lifecycle::LifecycleState::Active,
+            )
+            .await
+            .unwrap();
+        let region = persistence
+            .transition_region_descriptor(
+                "test-region",
+                region.generation,
+                crate::mesh_lifecycle::LifecycleState::Active,
+            )
+            .await
+            .unwrap();
+        let node = persistence
+            .register_node_descriptor(crate::mesh_lifecycle::RegisterNodeDescriptor {
+                mesh_id: "default".to_string(),
+                node_id: "test-node".to_string(),
+                region: "test-region".to_string(),
+                cell_id: "default".to_string(),
+                libp2p_peer_id: "peer-test-node".to_string(),
+                public_api_addr: "test-node".to_string(),
+                public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
+                capabilities: vec![
+                    crate::mesh_lifecycle::NodeCapability::Object,
+                    crate::mesh_lifecycle::NodeCapability::Admin,
+                ],
+            })
+            .await
+            .unwrap();
+        let node = persistence
+            .transition_node_descriptor(
+                "test-node",
+                node.generation,
+                crate::mesh_lifecycle::LifecycleState::Active,
+                None,
+            )
+            .await
+            .unwrap();
+        (region, cell, node)
+    }
+
+    fn mesh_descriptor_path(storage: &Storage, descriptor_key: &str) -> std::path::PathBuf {
+        let relative = descriptor_key
+            .strip_prefix(mesh_directory::MESH_DIRECTORY_ROOT)
+            .and_then(|value| value.strip_prefix('/'))
+            .expect("mesh descriptor key prefix");
+        relative
+            .split('/')
+            .fold(storage.mesh_directory_root_path(), |path, segment| {
+                path.join(segment)
+            })
     }
 
     #[tokio::test]

@@ -642,6 +642,8 @@ pub enum RepairKindArg {
     AuthzDerivedIndex,
     #[value(alias = "personal-db-log-chain", alias = "personal_db_log_chain")]
     PersonaldbLogChain,
+    #[value(alias = "mesh-routing-projection", alias = "mesh_routing_projection")]
+    MeshRoutingProjection,
 }
 
 impl RepairKindArg {
@@ -651,6 +653,7 @@ impl RepairKindArg {
             Self::DirectoryIndex => 2,
             Self::AuthzDerivedIndex => 3,
             Self::PersonaldbLogChain => 4,
+            Self::MeshRoutingProjection => 5,
         }
     }
 }
@@ -2464,6 +2467,43 @@ mod tests {
         .await
         .unwrap();
 
+        handle_node_command(
+            &NodeCommands::Register {
+                context: mutation_options("cli-register-node", 0),
+                node_id: "node-a".to_string(),
+                region: "eu-west-1".to_string(),
+                cell_id: "cell-a".to_string(),
+                libp2p_peer_id: "peer-a".to_string(),
+                public_api_addr: "http://127.0.0.1:50051".to_string(),
+                public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
+                capabilities: vec![NodeCapabilityArg::Object, NodeCapabilityArg::Admin],
+            },
+            &mut client,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        let registered_node = node
+            .state
+            .persistence
+            .list_node_descriptors(Some("eu-west-1"), Some("cell-a"))
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        handle_node_command(
+            &NodeCommands::Activate {
+                context: mutation_options("cli-activate-node", registered_node.generation),
+                node_id: "node-a".to_string(),
+            },
+            &mut client,
+            &token,
+        )
+        .await
+        .unwrap();
+
         let region = node
             .state
             .persistence
@@ -2529,43 +2569,6 @@ mod tests {
                 ),
                 region: "eu-west-1".to_string(),
                 activation_checkpoint,
-            },
-            &mut client,
-            &token,
-        )
-        .await
-        .unwrap();
-
-        handle_node_command(
-            &NodeCommands::Register {
-                context: mutation_options("cli-register-node", 0),
-                node_id: "node-a".to_string(),
-                region: "eu-west-1".to_string(),
-                cell_id: "cell-a".to_string(),
-                libp2p_peer_id: "peer-a".to_string(),
-                public_api_addr: "http://127.0.0.1:50051".to_string(),
-                public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
-                capabilities: vec![NodeCapabilityArg::Object, NodeCapabilityArg::Admin],
-            },
-            &mut client,
-            &token,
-        )
-        .await
-        .unwrap();
-
-        let registered_node = node
-            .state
-            .persistence
-            .list_node_descriptors(Some("eu-west-1"), Some("cell-a"))
-            .await
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-        handle_node_command(
-            &NodeCommands::Activate {
-                context: mutation_options("cli-activate-node", registered_node.generation),
-                node_id: "node-a".to_string(),
             },
             &mut client,
             &token,

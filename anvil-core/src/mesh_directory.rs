@@ -53,6 +53,16 @@ impl RoutingRecordFamily {
         }
     }
 
+    pub fn from_stream_family(value: &str) -> Option<Self> {
+        match value {
+            "tenant_name" => Some(Self::TenantName),
+            "tenant_locator" => Some(Self::TenantLocator),
+            "bucket_locator" => Some(Self::BucketLocator),
+            "host_alias" => Some(Self::HostAlias),
+            _ => None,
+        }
+    }
+
     pub fn directory_segment(self) -> &'static str {
         match self {
             Self::TenantName => "tenant-names",
@@ -1308,6 +1318,95 @@ pub async fn list_routing_records(
     Ok(records)
 }
 
+pub fn routing_record_partition_for_key(
+    family: RoutingRecordFamily,
+    record_key: &str,
+) -> MeshDirectoryResult<String> {
+    match family {
+        RoutingRecordFamily::TenantName => Ok(TenantName::canonicalize(record_key)?.partition()),
+        RoutingRecordFamily::TenantLocator => Ok(TenantId::new(record_key)?.partition()),
+        RoutingRecordFamily::BucketLocator => {
+            let (tenant_id, bucket_name) = bucket_record_key(record_key)?;
+            Ok(BucketLocatorKey::new(tenant_id, bucket_name).partition())
+        }
+        RoutingRecordFamily::HostAlias => host_alias_partition(record_key),
+    }
+}
+
+pub fn routing_record_descriptor_key_for_key(
+    family: RoutingRecordFamily,
+    record_key: &str,
+) -> MeshDirectoryResult<String> {
+    match family {
+        RoutingRecordFamily::TenantName => {
+            Ok(TenantName::canonicalize(record_key)?.descriptor_key())
+        }
+        RoutingRecordFamily::TenantLocator => Ok(TenantId::new(record_key)?.descriptor_key()),
+        RoutingRecordFamily::BucketLocator => {
+            let (tenant_id, bucket_name) = bucket_record_key(record_key)?;
+            Ok(BucketLocatorKey::new(tenant_id, bucket_name).descriptor_key())
+        }
+        RoutingRecordFamily::HostAlias => host_alias_descriptor_key(record_key),
+    }
+}
+
+pub async fn read_routing_record_descriptor(
+    storage: &Storage,
+    family: RoutingRecordFamily,
+    record_key: &str,
+) -> MeshDirectoryResult<RoutingRecordDescriptor> {
+    let descriptor_key = routing_record_descriptor_key_for_key(family, record_key)?;
+    let path = descriptor_path(storage, &descriptor_key)?;
+    let payload_json = tokio::fs::read_to_string(&path).await?;
+    let payload: serde_json::Value = serde_json::from_str(&payload_json)?;
+    Ok(RoutingRecordDescriptor {
+        family,
+        record_key: record_key.to_string(),
+        partition: routing_record_partition_for_key(family, record_key)?,
+        descriptor_key,
+        generation: payload
+            .get("generation")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        payload_json,
+    })
+}
+
+pub async fn rebuild_routing_record_projection_from_payload(
+    storage: &Storage,
+    family: RoutingRecordFamily,
+    record_key: &str,
+    payload_json: &[u8],
+) -> MeshDirectoryResult<RoutingRecordDescriptor> {
+    let expected_descriptor_key = routing_record_descriptor_key_for_key(family, record_key)?;
+    match family {
+        RoutingRecordFamily::TenantName => {
+            let descriptor: TenantNameDescriptor = serde_json::from_slice(payload_json)?;
+            ensure_descriptor_key_matches(&descriptor.descriptor_key(), &expected_descriptor_key)?;
+            write_descriptor(storage, &expected_descriptor_key, &descriptor).await?;
+        }
+        RoutingRecordFamily::TenantLocator => {
+            let descriptor: TenantLocatorDescriptor = serde_json::from_slice(payload_json)?;
+            ensure_descriptor_key_matches(&descriptor.descriptor_key(), &expected_descriptor_key)?;
+            write_descriptor(storage, &expected_descriptor_key, &descriptor).await?;
+        }
+        RoutingRecordFamily::BucketLocator => {
+            let descriptor: BucketLocatorDescriptor = serde_json::from_slice(payload_json)?;
+            ensure_descriptor_key_matches(&descriptor.descriptor_key(), &expected_descriptor_key)?;
+            write_descriptor(storage, &expected_descriptor_key, &descriptor).await?;
+        }
+        RoutingRecordFamily::HostAlias => {
+            let descriptor: routing::HostAliasDescriptor = serde_json::from_slice(payload_json)?;
+            ensure_descriptor_key_matches(
+                &host_alias_descriptor_key(&descriptor.hostname)?,
+                &expected_descriptor_key,
+            )?;
+            write_descriptor(storage, &expected_descriptor_key, &descriptor).await?;
+        }
+    }
+    read_routing_record_descriptor(storage, family, record_key).await
+}
+
 async fn write_descriptor<T: Serialize>(
     storage: &Storage,
     descriptor_key: &str,
@@ -1325,6 +1424,31 @@ async fn write_descriptor<T: Serialize>(
     drop(file);
     tokio::fs::rename(tmp_path, path).await?;
     Ok(())
+}
+
+fn bucket_record_key(record_key: &str) -> MeshDirectoryResult<(TenantId, BucketName)> {
+    let (tenant_id, bucket_name) =
+        record_key
+            .split_once('/')
+            .ok_or_else(|| MeshDirectoryError::InvalidIdentifier {
+                field: "bucket routing record key",
+                value: record_key.to_string(),
+            })?;
+    Ok((
+        TenantId::new(tenant_id)?,
+        BucketName::canonicalize(bucket_name)?,
+    ))
+}
+
+fn ensure_descriptor_key_matches(actual: &str, expected: &str) -> MeshDirectoryResult<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(MeshDirectoryError::InvalidIdentifier {
+            field: "routing record payload descriptor key",
+            value: format!("expected {expected}, got {actual}"),
+        })
+    }
 }
 
 async fn create_descriptor<T: Serialize>(

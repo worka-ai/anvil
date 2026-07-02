@@ -116,6 +116,17 @@ impl Storage {
             .join(format!("{partition}.anlog")))
     }
 
+    pub fn mesh_control_stream_family_path(&self, stream_family: &str) -> Result<PathBuf> {
+        ensure_safe_internal_component(stream_family, "control stream family")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("control")
+            .join("v1")
+            .join("streams")
+            .join(stream_family))
+    }
+
     pub fn admin_audit_event_root(&self) -> PathBuf {
         self.storage_path
             .join("_anvil")

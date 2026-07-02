@@ -1,11 +1,12 @@
 use crate::mesh_control_stream::{
     ControlRecordDigest, ControlStreamSequence, read_control_stream_log,
 };
+use crate::mesh_directory::{self, BucketLocatorDescriptor, BucketLocatorStatus};
 use crate::routing::{self, HostAliasDescriptor, HostAliasState, RoutingConfig};
 use crate::storage::Storage;
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
@@ -279,6 +280,25 @@ pub async fn transition_region(
 ) -> LifecycleResult<RegionDescriptor> {
     require_identifier(region, "region")?;
     let mut state = read_state(storage).await?;
+    {
+        let descriptor = state
+            .regions
+            .get(region)
+            .ok_or_else(|| LifecycleError::NotFound {
+                resource_kind: "region",
+                resource_id: region.to_string(),
+            })?;
+        ensure_generation("region", region, descriptor.generation, expected_generation)?;
+        validate_region_transition(descriptor.state, target).map_err(|_| {
+            LifecycleError::LifecycleTransitionDenied {
+                resource_kind: "region",
+                resource_id: region.to_string(),
+                from: descriptor.state,
+                to: target,
+            }
+        })?;
+    }
+    ensure_region_drain_completion_is_supported(storage, region, target).await?;
     let descriptor = state
         .regions
         .get_mut(region)
@@ -286,15 +306,6 @@ pub async fn transition_region(
             resource_kind: "region",
             resource_id: region.to_string(),
         })?;
-    ensure_generation("region", region, descriptor.generation, expected_generation)?;
-    validate_region_transition(descriptor.state, target).map_err(|_| {
-        LifecycleError::LifecycleTransitionDenied {
-            resource_kind: "region",
-            resource_id: region.to_string(),
-            from: descriptor.state,
-            to: target,
-        }
-    })?;
     descriptor.state = target;
     descriptor.updated_at = timestamp_now();
     descriptor.generation = descriptor.generation.saturating_add(1);
@@ -337,6 +348,7 @@ pub async fn activate_region(
     })?;
     validate_activation_checkpoint_header(checkpoint, &current.mesh_id, region)?;
     validate_activation_checkpoint_streams(storage, checkpoint).await?;
+    ensure_region_activation_dependencies(&state, region)?;
 
     let descriptor = state
         .regions
@@ -363,16 +375,24 @@ pub async fn ensure_region_accepts_new_writes(
 ) -> LifecycleResult<()> {
     require_identifier(region, "region")?;
     let state = read_state(storage).await?;
-    let Some(descriptor) = state.regions.get(region) else {
-        return Ok(());
-    };
-    if descriptor.state == LifecycleState::Active {
-        return Ok(());
-    }
-    Err(LifecycleError::InvalidArgument(format!(
-        "region {region} is {:?} and cannot accept new writable placement",
-        descriptor.state
-    )))
+    ensure_region_accepts_new_writes_in_state(&state, region)
+}
+
+pub async fn ensure_new_writable_placement(
+    storage: &Storage,
+    region: &str,
+    cell_id: &str,
+    node_id: &str,
+) -> LifecycleResult<()> {
+    require_identifier(region, "region")?;
+    require_identifier(cell_id, "cell id")?;
+    require_identifier(node_id, "node id")?;
+
+    let state = read_state(storage).await?;
+    ensure_region_accepts_new_writes_in_state(&state, region)?;
+    ensure_cell_accepts_new_writes_in_state(&state, region, cell_id)?;
+    ensure_node_accepts_new_writes_in_state(&state, region, cell_id, node_id)?;
+    Ok(())
 }
 
 pub async fn register_cell(
@@ -816,12 +836,181 @@ fn ensure_node_placement_is_active(
             resource_id: descriptor.cell_id.clone(),
         });
     };
-    if region.state != LifecycleState::Active || cell.state != LifecycleState::Active {
+    if !matches!(
+        region.state,
+        LifecycleState::Joining | LifecycleState::Active
+    ) || cell.state != LifecycleState::Active
+    {
         return Err(LifecycleError::InvalidArgument(
-            "node activation requires active region and cell".to_string(),
+            "node activation requires a joining or active region and an active cell".to_string(),
         ));
     }
     Ok(())
+}
+
+fn ensure_region_activation_dependencies(
+    state: &MeshLifecycleState,
+    region: &str,
+) -> LifecycleResult<()> {
+    let active_cell_ids = state
+        .cells
+        .values()
+        .filter(|cell| cell.region == region && cell.state == LifecycleState::Active)
+        .map(|cell| cell.cell_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if active_cell_ids.is_empty() {
+        return Err(LifecycleError::InvalidArgument(format!(
+            "region {region} activation requires at least one active cell"
+        )));
+    }
+    let has_active_node = state.nodes.values().any(|node| {
+        node.region == region
+            && active_cell_ids.contains(node.cell_id.as_str())
+            && node.state == LifecycleState::Active
+    });
+    if !has_active_node {
+        return Err(LifecycleError::InvalidArgument(format!(
+            "region {region} activation requires at least one active node in an active cell"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_region_accepts_new_writes_in_state(
+    state: &MeshLifecycleState,
+    region: &str,
+) -> LifecycleResult<()> {
+    let Some(descriptor) = state.regions.get(region) else {
+        if state.regions.is_empty() {
+            return Ok(());
+        }
+        return Err(LifecycleError::NotFound {
+            resource_kind: "region",
+            resource_id: region.to_string(),
+        });
+    };
+    if descriptor.state == LifecycleState::Active {
+        return Ok(());
+    }
+    Err(LifecycleError::InvalidArgument(format!(
+        "region {region} is {:?} and cannot accept new writable placement",
+        descriptor.state
+    )))
+}
+
+fn ensure_cell_accepts_new_writes_in_state(
+    state: &MeshLifecycleState,
+    region: &str,
+    cell_id: &str,
+) -> LifecycleResult<()> {
+    let key = cell_key(region, cell_id)?;
+    let Some(descriptor) = state.cells.get(&key) else {
+        if state.cells.is_empty() {
+            return Ok(());
+        }
+        return Err(LifecycleError::NotFound {
+            resource_kind: "cell",
+            resource_id: format!("{region}/{cell_id}"),
+        });
+    };
+    if descriptor.state == LifecycleState::Active {
+        return Ok(());
+    }
+    Err(LifecycleError::InvalidArgument(format!(
+        "cell {region}/{cell_id} is {:?} and cannot accept new writable placement",
+        descriptor.state
+    )))
+}
+
+fn ensure_node_accepts_new_writes_in_state(
+    state: &MeshLifecycleState,
+    region: &str,
+    cell_id: &str,
+    node_id: &str,
+) -> LifecycleResult<()> {
+    let Some(descriptor) = state.nodes.get(node_id) else {
+        if state.nodes.is_empty() {
+            return Ok(());
+        }
+        return Err(LifecycleError::NotFound {
+            resource_kind: "node",
+            resource_id: node_id.to_string(),
+        });
+    };
+    if descriptor.region != region || descriptor.cell_id != cell_id {
+        return Err(LifecycleError::InvalidArgument(format!(
+            "node {node_id} belongs to {}/{} and cannot accept placement for {region}/{cell_id}",
+            descriptor.region, descriptor.cell_id
+        )));
+    }
+    if descriptor.state == LifecycleState::Active {
+        return Ok(());
+    }
+    Err(LifecycleError::InvalidArgument(format!(
+        "node {node_id} is {:?} and cannot accept new writable placement",
+        descriptor.state
+    )))
+}
+
+async fn ensure_region_drain_completion_is_supported(
+    storage: &Storage,
+    region: &str,
+    target: LifecycleState,
+) -> LifecycleResult<()> {
+    match target {
+        LifecycleState::Drained => {
+            let blockers = bucket_locators_blocking_region_drain(storage, region).await?;
+            if blockers.is_empty() {
+                Ok(())
+            } else {
+                Err(LifecycleError::InvalidArgument(format!(
+                    "region {region} drain cannot complete with block_until_empty: {} bucket locator(s) still name the region as primary: {}",
+                    blockers.len(),
+                    blockers.join(", ")
+                )))
+            }
+        }
+        LifecycleState::DrainedWithExceptions => Err(LifecycleError::InvalidArgument(format!(
+            "region {region} drain exceptions are not implemented; block_until_empty requires no bucket locator to name the region as primary"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+async fn bucket_locators_blocking_region_drain(
+    storage: &Storage,
+    region: &str,
+) -> LifecycleResult<Vec<String>> {
+    let records = mesh_directory::list_routing_records(
+        storage,
+        Some(mesh_directory::RoutingRecordFamily::BucketLocator),
+    )
+    .await
+    .map_err(|err| {
+        LifecycleError::InvalidArgument(format!(
+            "could not inspect bucket locators for region drain: {err}"
+        ))
+    })?;
+    let mut blockers = Vec::new();
+    for record in records {
+        let locator: BucketLocatorDescriptor =
+            serde_json::from_str(&record.payload_json).map_err(|err| {
+                LifecycleError::InvalidArgument(format!(
+                    "bucket locator {} is invalid: {err}",
+                    record.record_key
+                ))
+            })?;
+        if locator.home_region.as_str() == region
+            && bucket_locator_blocks_region_drain(locator.status)
+        {
+            blockers.push(format!("{}:{:?}", record.record_key, locator.status));
+        }
+    }
+    Ok(blockers)
+}
+
+fn bucket_locator_blocks_region_drain(status: BucketLocatorStatus) -> bool {
+    !matches!(status, BucketLocatorStatus::Deleted)
 }
 
 fn ensure_generation(
@@ -877,6 +1066,24 @@ async fn validate_activation_checkpoint_streams(
     storage: &Storage,
     checkpoint: &ActivationCheckpoint,
 ) -> LifecycleResult<()> {
+    let supplied_streams = checkpoint
+        .required_streams
+        .iter()
+        .map(|stream| (stream.stream_family.as_str(), stream.partition.as_str()))
+        .collect::<BTreeSet<_>>();
+    for (stream_family, partition) in existing_control_stream_partitions(storage).await? {
+        if !supplied_streams.contains(&(stream_family.as_str(), partition.as_str())) {
+            return Err(LifecycleError::ActivationCheckpointNotReached {
+                stream_family,
+                partition,
+                sequence: 1,
+                expected_digest: "checkpoint-required".to_string(),
+                reason: "activation checkpoint omits an existing control stream partition"
+                    .to_string(),
+            });
+        }
+    }
+
     for required in &checkpoint.required_streams {
         let path = storage
             .mesh_control_stream_path(&required.stream_family, &required.partition)
@@ -918,6 +1125,39 @@ async fn validate_activation_checkpoint_streams(
         }
     }
     Ok(())
+}
+
+async fn existing_control_stream_partitions(
+    storage: &Storage,
+) -> LifecycleResult<Vec<(String, String)>> {
+    let mut streams = Vec::new();
+    for family in mesh_directory::RoutingRecordFamily::all() {
+        let stream_family = family.stream_family();
+        let family_path = storage
+            .mesh_control_stream_family_path(stream_family)
+            .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
+        let mut entries = match tokio::fs::read_dir(&family_path).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("anlog") {
+                continue;
+            }
+            let Some(partition) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if storage
+                .mesh_control_stream_path(stream_family, partition)
+                .is_ok()
+            {
+                streams.push((stream_family.to_string(), partition.to_string()));
+            }
+        }
+    }
+    Ok(streams)
 }
 
 fn activation_checkpoint_not_reached(
@@ -1037,10 +1277,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn activate_region_rejects_checkpoint_that_omits_existing_control_stream() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let region = create_test_region(&storage).await;
+        append_control_record(&storage, "bucket_locator", "0a7f", 1, digest_for(b"record")).await;
+        let checkpoint = ActivationCheckpoint {
+            schema: ACTIVATION_CHECKPOINT_SCHEMA.to_string(),
+            mesh_id: "mesh-a".to_string(),
+            region: "eu-west-1".to_string(),
+            created_at: "2026-07-02T00:00:00Z".to_string(),
+            required_streams: vec![],
+        };
+
+        let err = activate_region(&storage, "eu-west-1", region.generation, &checkpoint)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            LifecycleError::ActivationCheckpointNotReached {
+                stream_family,
+                partition,
+                ..
+            } if stream_family == "bucket_locator" && partition == "0a7f"
+        ));
+    }
+
+    #[tokio::test]
     async fn activate_region_accepts_reached_activation_checkpoint() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let region = create_test_region(&storage).await;
+        let cell = register_test_cell(&storage).await;
+        let _cell = transition_cell(
+            &storage,
+            "eu-west-1",
+            "cell-a",
+            cell.generation,
+            LifecycleState::Active,
+        )
+        .await
+        .unwrap();
+        let node = register_test_node(&storage).await;
+        let _node = transition_node(
+            &storage,
+            "node-a",
+            node.generation,
+            LifecycleState::Active,
+            None,
+        )
+        .await
+        .unwrap();
         let digest = digest_for(b"record");
         append_control_record(&storage, "bucket_locator", "0a7f", 1, digest.clone()).await;
         let checkpoint = checkpoint_with_stream("bucket_locator", "0a7f", 1, digest);
@@ -1055,6 +1342,11 @@ mod tests {
     async fn writable_placement_rejects_non_active_region() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
+        assert!(
+            ensure_region_accepts_new_writes(&storage, "legacy-region")
+                .await
+                .is_ok()
+        );
         create_test_region(&storage).await;
 
         assert!(
@@ -1065,7 +1357,87 @@ mod tests {
         assert!(
             ensure_region_accepts_new_writes(&storage, "legacy-region")
                 .await
-                .is_ok()
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn writable_placement_rejects_stale_or_inactive_region_cell_and_node() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let (region, _cell, _node) = create_active_placement_model(&storage).await;
+
+        ensure_new_writable_placement(&storage, "eu-west-1", "cell-a", "node-a")
+            .await
+            .unwrap();
+        assert!(
+            ensure_new_writable_placement(&storage, "us-east-1", "cell-a", "node-a")
+                .await
+                .is_err()
+        );
+        assert!(
+            ensure_new_writable_placement(&storage, "eu-west-1", "cell-b", "node-a")
+                .await
+                .is_err()
+        );
+        assert!(
+            ensure_new_writable_placement(&storage, "eu-west-1", "cell-a", "node-b")
+                .await
+                .is_err()
+        );
+
+        transition_region(
+            &storage,
+            "eu-west-1",
+            region.generation,
+            LifecycleState::Draining,
+        )
+        .await
+        .unwrap();
+        assert!(
+            ensure_new_writable_placement(&storage, "eu-west-1", "cell-a", "node-a")
+                .await
+                .is_err()
+        );
+
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let (_region, cell, _node) = create_active_placement_model(&storage).await;
+        transition_cell(
+            &storage,
+            "eu-west-1",
+            "cell-a",
+            cell.generation,
+            LifecycleState::Draining,
+        )
+        .await
+        .unwrap();
+        assert!(
+            ensure_new_writable_placement(&storage, "eu-west-1", "cell-a", "node-a")
+                .await
+                .is_err()
+        );
+
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let (_region, _cell, node) = create_active_placement_model(&storage).await;
+        transition_node(
+            &storage,
+            "node-a",
+            node.generation,
+            LifecycleState::Draining,
+            Some(NodeDrainDescriptor {
+                started_at: timestamp_now(),
+                graceful_timeout_ms: 1000,
+                force_after_timeout: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            ensure_new_writable_placement(&storage, "eu-west-1", "cell-a", "node-a")
+                .await
+                .is_err()
         );
     }
 
@@ -1201,6 +1573,109 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    async fn register_test_cell(storage: &Storage) -> CellDescriptor {
+        register_cell(
+            storage,
+            RegisterCellDescriptor {
+                mesh_id: "mesh-a".to_string(),
+                region: "eu-west-1".to_string(),
+                cell_id: "cell-a".to_string(),
+                placement_weight: 100,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn register_test_node(storage: &Storage) -> NodeDescriptor {
+        register_node(
+            storage,
+            RegisterNodeDescriptor {
+                mesh_id: "mesh-a".to_string(),
+                node_id: "node-a".to_string(),
+                region: "eu-west-1".to_string(),
+                cell_id: "cell-a".to_string(),
+                libp2p_peer_id: "peer-a".to_string(),
+                public_api_addr: "http://127.0.0.1:50051".to_string(),
+                public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
+                capabilities: vec![NodeCapability::Object, NodeCapability::Admin],
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn create_active_placement_model(
+        storage: &Storage,
+    ) -> (RegionDescriptor, CellDescriptor, NodeDescriptor) {
+        let region = create_region(
+            storage,
+            CreateRegionDescriptor {
+                mesh_id: "mesh-a".to_string(),
+                region: "eu-west-1".to_string(),
+                public_base_url: "https://eu-west-1.anvil-storage.test".to_string(),
+                virtual_host_suffix: "eu-west-1.anvil-storage.test".to_string(),
+                placement_weight: 100,
+                default_cell: Some("cell-a".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        let cell = register_cell(
+            storage,
+            RegisterCellDescriptor {
+                mesh_id: "mesh-a".to_string(),
+                region: "eu-west-1".to_string(),
+                cell_id: "cell-a".to_string(),
+                placement_weight: 100,
+            },
+        )
+        .await
+        .unwrap();
+        let cell = transition_cell(
+            storage,
+            "eu-west-1",
+            "cell-a",
+            cell.generation,
+            LifecycleState::Active,
+        )
+        .await
+        .unwrap();
+        let region = transition_region(
+            storage,
+            "eu-west-1",
+            region.generation,
+            LifecycleState::Active,
+        )
+        .await
+        .unwrap();
+        let node = register_node(
+            storage,
+            RegisterNodeDescriptor {
+                mesh_id: "mesh-a".to_string(),
+                node_id: "node-a".to_string(),
+                region: "eu-west-1".to_string(),
+                cell_id: "cell-a".to_string(),
+                libp2p_peer_id: "peer-a".to_string(),
+                public_api_addr: "http://127.0.0.1:50051".to_string(),
+                public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
+                capabilities: vec![NodeCapability::Object, NodeCapability::Admin],
+            },
+        )
+        .await
+        .unwrap();
+        let node = transition_node(
+            storage,
+            "node-a",
+            node.generation,
+            LifecycleState::Active,
+            None,
+        )
+        .await
+        .unwrap();
+        (region, cell, node)
     }
 
     fn checkpoint_with_stream(

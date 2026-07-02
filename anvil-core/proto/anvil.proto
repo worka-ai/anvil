@@ -146,6 +146,7 @@ enum RepairKind {
   REPAIR_KIND_DIRECTORY_INDEX = 2;
   REPAIR_KIND_AUTHZ_DERIVED_INDEX = 3;
   REPAIR_KIND_PERSONALDB_LOG_CHAIN = 4;
+  REPAIR_KIND_MESH_ROUTING_PROJECTION = 5;
 }
 
 message NodeDrainDescriptor {
@@ -1563,6 +1564,11 @@ service CoordinationService {
   rpc CommitTaskLease(CommitTaskLeaseRequest) returns (CommitTaskLeaseResponse);
   rpc ReadTaskLease(ReadTaskLeaseRequest) returns (ReadTaskLeaseResponse);
   rpc ForceReleaseTaskLease(ForceReleaseTaskLeaseRequest) returns (ForceReleaseTaskLeaseResponse);
+  rpc AcquireOwnership(AcquireOwnershipRequest) returns (OwnershipFenceResponse);
+  rpc RenewOwnership(RenewOwnershipRequest) returns (OwnershipFenceResponse);
+  rpc TransferOwnership(TransferOwnershipRequest) returns (OwnershipFenceResponse);
+  rpc ReleaseOwnership(ReleaseOwnershipRequest) returns (OwnershipFenceResponse);
+  rpc ForceExpireOwnership(ForceExpireOwnershipRequest) returns (OwnershipFenceResponse);
 }
 
 service PersonalDbService {
@@ -1992,6 +1998,101 @@ message CommitTaskLeaseResponse {
 message ForceReleaseTaskLeaseResponse {
     bool released = 1;
     TaskLease previous_lease = 2;
+}
+
+message OwnershipResource {
+    OwnershipResourceKind resource_kind = 1;
+    string resource_id = 2;
+}
+
+message AcquireOwnershipRequest {
+    string request_id = 1;
+    string idempotency_key = 2;
+    // Non-authoritative diagnostic label. The stored security owner is derived
+    // from authenticated claims on the server.
+    string owner_label = 3;
+    OwnershipResource resource = 4;
+    uint64 requested_lease_ms = 5;
+}
+
+message RenewOwnershipRequest {
+    string request_id = 1;
+    // Non-authoritative diagnostic label. The authenticated owner still wins.
+    string owner_label = 2;
+    OwnershipResource resource = 3;
+    uint64 current_fence = 4;
+    uint64 requested_lease_ms = 5;
+}
+
+message TransferOwnershipRequest {
+    string request_id = 1;
+    string idempotency_key = 2;
+    // Non-authoritative diagnostic label for the caller.
+    string owner_label = 3;
+    OwnershipResource resource = 4;
+    uint64 current_fence = 5;
+    // Non-authoritative diagnostic label for the post-transfer owner record.
+    string new_owner_label = 6;
+    string new_owner_principal_kind = 7;
+    string new_owner_principal_id = 8;
+    string new_owner_actor_instance_id = 9;
+    string new_owner_region = 10;
+    string new_owner_cell = 11;
+}
+
+message ReleaseOwnershipRequest {
+    string request_id = 1;
+    string idempotency_key = 2;
+    // Non-authoritative diagnostic label. The stored security owner is derived
+    // from authenticated claims on the server.
+    string owner_label = 3;
+    OwnershipResource resource = 4;
+    uint64 current_fence = 5;
+    bool administrative_force = 6;
+}
+
+message ForceExpireOwnershipRequest {
+    string request_id = 1;
+    string idempotency_key = 2;
+    OwnershipResource resource = 3;
+    string reason = 4;
+}
+
+message OwnershipFenceResponse {
+    string request_id = 1;
+    OwnershipResource resource = 2;
+    string owner_node_id = 3;
+    string owner_region = 4;
+    string owner_cell = 5;
+    uint64 fence = 6;
+    OwnershipFenceState state = 7;
+    string lease_expires_at = 8;
+    uint64 generation = 9;
+    bool idempotent_replay = 10;
+    int64 owner_tenant_id = 11;
+    string owner_principal_kind = 12;
+    string owner_principal_id = 13;
+    string owner_actor_instance_id = 14;
+}
+
+enum OwnershipResourceKind {
+    OWNERSHIP_RESOURCE_KIND_UNSPECIFIED = 0;
+    OWNERSHIP_RESOURCE_KIND_CONTROL_PARTITION = 1;
+    OWNERSHIP_RESOURCE_KIND_BUCKET_PRIMARY = 2;
+    OWNERSHIP_RESOURCE_KIND_OBJECT_PARTITION = 3;
+    OWNERSHIP_RESOURCE_KIND_INDEX_PARTITION = 4;
+    OWNERSHIP_RESOURCE_KIND_PERSONALDB_GROUP = 5;
+    OWNERSHIP_RESOURCE_KIND_TASK_QUEUE = 6;
+    OWNERSHIP_RESOURCE_KIND_WATCH_PARTITION = 7;
+}
+
+enum OwnershipFenceState {
+    OWNERSHIP_FENCE_STATE_UNSPECIFIED = 0;
+    OWNERSHIP_FENCE_STATE_ACTIVE = 1;
+    OWNERSHIP_FENCE_STATE_TRANSFERRING = 2;
+    OWNERSHIP_FENCE_STATE_DRAINING = 3;
+    OWNERSHIP_FENCE_STATE_EXPIRED = 4;
+    OWNERSHIP_FENCE_STATE_RELEASED = 5;
 }
 
 message WatchAuthzTupleLogRequest {

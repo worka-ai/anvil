@@ -16,8 +16,8 @@ use crate::routing::{
     RoutingConfig,
 };
 use crate::{
-    AppState, auth, authz_repair, crypto, directory_repair, index_repair, mesh_directory,
-    persistence::Bucket, personaldb_repair,
+    AppState, auth, authz_repair, crypto, directory_repair, index_repair, mesh_control_stream,
+    mesh_directory, persistence::Bucket, personaldb_repair,
 };
 use chrono::Utc;
 use serde_json::json;
@@ -32,23 +32,38 @@ impl AdminService for AppState {
         let principal = require_admin(&request, self, AnvilAdminCapability::ManageTenants)?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), true)?;
+        let home_region = if req.home_region.trim().is_empty() {
+            self.config.region.clone()
+        } else {
+            req.home_region.clone()
+        };
         let tenant = self
             .persistence
             .create_tenant(&req.name, "admin-created")
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.tenant.create",
+            &format!("tenant:{}", tenant.id),
+            json!({
+                "resource_kind": "tenant",
+                "tenant_id": tenant.id,
+                "tenant_name": &tenant.name,
+                "home_region": &home_region,
+            }),
+        )
+        .await?;
         Ok(Response::new(TenantAdminResponse {
             request_id: context.request_id.clone(),
             tenant: Some(TenantAdminDescriptor {
                 tenant_id: tenant.id.to_string(),
                 name: tenant.name,
-                home_region: if req.home_region.trim().is_empty() {
-                    self.config.region.clone()
-                } else {
-                    req.home_region
-                },
+                home_region,
             }),
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
         }))
     }
 
@@ -68,13 +83,28 @@ impl AdminService for AppState {
             .create_app(tenant_id, &req.app_name, &client_id, &encrypted_secret)
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.app.create",
+            &format!("app:{}", app.client_id),
+            json!({
+                "resource_kind": "application",
+                "tenant_id": tenant_id,
+                "app_id": app.id,
+                "app_name": &app.name,
+                "client_id": &app.client_id,
+            }),
+        )
+        .await?;
         Ok(Response::new(ApplicationSecretResponse {
             request_id: context.request_id.clone(),
             tenant_id: tenant_id.to_string(),
             app_name: app.name,
             client_id: app.client_id,
             client_secret,
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
         }))
     }
 
@@ -100,13 +130,28 @@ impl AdminService for AppState {
             .update_app_secret(app.id, &encrypted_secret)
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.app.secret.rotate",
+            &format!("app:{}", app.client_id),
+            json!({
+                "resource_kind": "application",
+                "tenant_id": tenant_id,
+                "app_id": app.id,
+                "app_name": &app.name,
+                "client_id": &app.client_id,
+            }),
+        )
+        .await?;
         Ok(Response::new(ApplicationSecretResponse {
             request_id: context.request_id.clone(),
             tenant_id: tenant_id.to_string(),
             app_name: app.name,
             client_id: app.client_id,
             client_secret,
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
         }))
     }
 
@@ -122,10 +167,26 @@ impl AdminService for AppState {
             .persistence
             .create_bucket(tenant_id, &req.bucket_name, &req.region)
             .await?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.bucket.create",
+            &bucket_resource_id(tenant_id, &bucket.name),
+            json!({
+                "resource_kind": "bucket",
+                "tenant_id": tenant_id,
+                "bucket_id": bucket.id,
+                "bucket_name": &bucket.name,
+                "region": &bucket.region,
+                "is_public_read": bucket.is_public_read,
+            }),
+        )
+        .await?;
         Ok(Response::new(BucketAdminResponse {
             request_id: context.request_id.clone(),
             bucket: Some(bucket_to_proto(bucket)),
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
         }))
     }
 
@@ -147,10 +208,27 @@ impl AdminService for AppState {
             .await
             .map_err(|err| Status::internal(err.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.bucket.public_access.set",
+            &bucket_resource_id(tenant_id, &bucket.name),
+            json!({
+                "resource_kind": "bucket",
+                "tenant_id": tenant_id,
+                "bucket_id": bucket.id,
+                "bucket_name": &bucket.name,
+                "region": &bucket.region,
+                "allow_public_read": req.allow_public_read,
+                "is_public_read": bucket.is_public_read,
+            }),
+        )
+        .await?;
         Ok(Response::new(BucketAdminResponse {
             request_id: context.request_id.clone(),
             bucket: Some(bucket_to_proto(bucket)),
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
         }))
     }
 
@@ -163,7 +241,6 @@ impl AdminService for AppState {
         let context = require_mutation_context(req.context.as_ref(), true)?;
         let request_id = context.request_id.clone();
         let idempotency_key = context.idempotency_key.clone();
-        let audit_event_id = audit_event_id(&principal, context);
         let bucket = resolve_link_bucket(self, &req.tenant_id, &req.bucket_name).await?;
         let resolution = object_link_resolution_from_proto(req.resolution)?;
         let target_version = parse_optional_uuid("target_version", req.target_version)?;
@@ -184,6 +261,31 @@ impl AdminService for AppState {
             })
             .await
             .map_err(object_link_status)?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.object_link.create",
+            &object_link_resource_id(
+                bucket.tenant_id,
+                &bucket.name,
+                &mutation.descriptor.link_key,
+            ),
+            json!({
+                "resource_kind": "object_link",
+                "tenant_id": bucket.tenant_id,
+                "bucket_id": bucket.id,
+                "bucket_name": &bucket.name,
+                "link_key": &mutation.descriptor.link_key,
+                "target_key": &mutation.descriptor.target_key,
+                "target_version": &mutation.descriptor.target_version,
+                "resolution": mutation.descriptor.resolution,
+                "allow_dangling": req.allow_dangling,
+                "generation": mutation.descriptor.generation,
+                "created_by": &mutation.descriptor.created_by,
+            }),
+        )
+        .await?;
 
         Ok(Response::new(ObjectLinkResponse {
             request_id,
@@ -202,7 +304,6 @@ impl AdminService for AppState {
         let request_id = context.request_id.clone();
         let idempotency_key = context.idempotency_key.clone();
         let expected_generation = context.expected_generation;
-        let audit_event_id = audit_event_id(&principal, context);
         let bucket = resolve_link_bucket(self, &req.tenant_id, &req.bucket_name).await?;
         let resolution = object_link_resolution_from_proto(req.resolution)?;
         let target_version = parse_optional_uuid("target_version", req.target_version)?;
@@ -223,6 +324,32 @@ impl AdminService for AppState {
             })
             .await
             .map_err(object_link_status)?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.object_link.update",
+            &object_link_resource_id(
+                bucket.tenant_id,
+                &bucket.name,
+                &mutation.descriptor.link_key,
+            ),
+            json!({
+                "resource_kind": "object_link",
+                "tenant_id": bucket.tenant_id,
+                "bucket_id": bucket.id,
+                "bucket_name": &bucket.name,
+                "link_key": &mutation.descriptor.link_key,
+                "target_key": &mutation.descriptor.target_key,
+                "target_version": &mutation.descriptor.target_version,
+                "resolution": mutation.descriptor.resolution,
+                "allow_dangling": req.allow_dangling,
+                "previous_generation": expected_generation,
+                "generation": mutation.descriptor.generation,
+                "created_by": &mutation.descriptor.created_by,
+            }),
+        )
+        .await?;
 
         Ok(Response::new(ObjectLinkResponse {
             request_id,
@@ -241,7 +368,6 @@ impl AdminService for AppState {
         let request_id = context.request_id.clone();
         let idempotency_key = context.idempotency_key.clone();
         let expected_generation = context.expected_generation;
-        let audit_event_id = audit_event_id(&principal, context);
         let bucket = resolve_link_bucket(self, &req.tenant_id, &req.bucket_name).await?;
         let deleted = self
             .persistence
@@ -254,6 +380,23 @@ impl AdminService for AppState {
             })
             .await
             .map_err(object_link_status)?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.object_link.delete",
+            &object_link_resource_id(bucket.tenant_id, &bucket.name, &deleted.link_key),
+            json!({
+                "resource_kind": "object_link",
+                "tenant_id": bucket.tenant_id,
+                "bucket_id": bucket.id,
+                "bucket_name": &bucket.name,
+                "link_key": &deleted.link_key,
+                "previous_generation": expected_generation,
+                "generation": deleted.generation,
+            }),
+        )
+        .await?;
 
         Ok(Response::new(AdminMutationResponse {
             request_id,
@@ -365,7 +508,6 @@ impl AdminService for AppState {
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), true)?;
         let request_id = context.request_id.clone();
-        let audit_event_id = audit_event_id(&principal, context);
         let routing_config = routing_config_for_region(self, &req.region).await?;
         let host_alias = self
             .persistence
@@ -381,6 +523,15 @@ impl AdminService for AppState {
             )
             .await
             .map_err(lifecycle_status)?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.host_alias.create",
+            &format!("host_alias:{}", host_alias.hostname),
+            host_alias_audit_details(&host_alias),
+        )
+        .await?;
 
         Ok(Response::new(HostAliasResponse {
             request_id,
@@ -405,11 +556,20 @@ impl AdminService for AppState {
             )
             .await
             .map_err(lifecycle_status)?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.host_alias.activate",
+            &format!("host_alias:{}", host_alias.hostname),
+            host_alias_audit_details(&host_alias),
+        )
+        .await?;
 
         Ok(Response::new(HostAliasResponse {
             request_id: context.request_id.clone(),
             host_alias: Some(host_alias_descriptor_to_proto(host_alias)),
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
         }))
     }
 
@@ -429,11 +589,20 @@ impl AdminService for AppState {
             )
             .await
             .map_err(lifecycle_status)?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.host_alias.suspend",
+            &format!("host_alias:{}", host_alias.hostname),
+            host_alias_audit_details(&host_alias),
+        )
+        .await?;
 
         Ok(Response::new(HostAliasResponse {
             request_id: context.request_id.clone(),
             host_alias: Some(host_alias_descriptor_to_proto(host_alias)),
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
         }))
     }
 
@@ -453,12 +622,21 @@ impl AdminService for AppState {
             )
             .await
             .map_err(lifecycle_status)?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.host_alias.delete",
+            &format!("host_alias:{}", host_alias.hostname),
+            host_alias_audit_details(&host_alias),
+        )
+        .await?;
 
         Ok(Response::new(AdminMutationResponse {
             request_id: context.request_id.clone(),
             resource_id: host_alias.hostname,
             generation: host_alias.generation,
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
             idempotent_replay: false,
         }))
     }
@@ -568,10 +746,19 @@ impl AdminService for AppState {
             })
             .await
             .map_err(lifecycle_status)?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.region.create",
+            &format!("region:{}", region.region),
+            region_audit_details(&region),
+        )
+        .await?;
         Ok(Response::new(RegionResponse {
             request_id: context.request_id.clone(),
             region: Some(region_descriptor_to_proto(region)),
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
         }))
     }
 
@@ -593,10 +780,21 @@ impl AdminService for AppState {
         )
         .await
         .map_err(lifecycle_status)?;
+        let mut details = region_audit_details(&region);
+        add_audit_detail(&mut details, "activation_checkpoint", json!(&checkpoint));
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.region.activate",
+            &format!("region:{}", region.region),
+            details,
+        )
+        .await?;
         Ok(Response::new(RegionResponse {
             request_id: context.request_id.clone(),
             region: Some(region_descriptor_to_proto(region)),
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
         }))
     }
 
@@ -616,10 +814,19 @@ impl AdminService for AppState {
             )
             .await
             .map_err(lifecycle_status)?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.region.read_only.set",
+            &format!("region:{}", region.region),
+            region_audit_details(&region),
+        )
+        .await?;
         Ok(Response::new(RegionResponse {
             request_id: context.request_id.clone(),
             region: Some(region_descriptor_to_proto(region)),
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
         }))
     }
 
@@ -639,12 +846,37 @@ impl AdminService for AppState {
             )
             .await
             .map_err(lifecycle_status)?;
+        let mut details = region_audit_details(&region);
+        add_audit_detail(
+            &mut details,
+            "default_disposition",
+            json!(region_drain_disposition_name(req.default_disposition)),
+        );
+        add_audit_detail(
+            &mut details,
+            "default_disposition_code",
+            json!(req.default_disposition),
+        );
+        add_audit_detail(
+            &mut details,
+            "bucket_overrides",
+            json!(bucket_drain_overrides_details(&req.bucket_overrides)),
+        );
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.region.drain",
+            &format!("region:{}", region.region),
+            details,
+        )
+        .await?;
         Ok(Response::new(DrainOperationResponse {
             request_id: context.request_id.clone(),
             resource_id: region.region,
             state: lifecycle_state_to_proto(region.state),
             generation: region.generation,
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
         }))
     }
 
@@ -664,11 +896,20 @@ impl AdminService for AppState {
             )
             .await
             .map_err(lifecycle_status)?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.region.remove",
+            &format!("region:{}", region.region),
+            region_audit_details(&region),
+        )
+        .await?;
         Ok(Response::new(AdminMutationResponse {
             request_id: context.request_id.clone(),
             resource_id: region.region,
             generation: region.generation,
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
             idempotent_replay: false,
         }))
     }
@@ -677,19 +918,60 @@ impl AdminService for AppState {
         &self,
         request: Request<ListRegionsRequest>,
     ) -> Result<Response<ListRegionsResponse>, Status> {
-        require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
-        let regions = self
+        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let req = request.into_inner();
+        let page = req.page.as_ref();
+        let limit = page_limit(page);
+        let mut regions = self
             .persistence
             .list_region_descriptors()
             .await
-            .map_err(lifecycle_status)?
+            .map_err(lifecycle_status)?;
+        regions.sort_by(|left, right| left.region.cmp(&right.region));
+        let revision = admin_cursor::collection_revision(
+            regions
+                .iter()
+                .map(|region| (region.region.as_str(), region.generation)),
+        );
+        let binding = AdminCursorBinding {
+            scope: "admin.list_regions.v1",
+            filters: &[],
+            principal: &principal,
+            limit,
+            revision: &revision,
+            sort: "region.asc",
+        };
+        let cursor =
+            admin_cursor::decode_page_cursor(page, &binding, self.config.jwt_secret.as_bytes())?;
+        let mut regions = regions
             .into_iter()
+            .filter(|region| {
+                cursor
+                    .as_deref()
+                    .is_none_or(|cursor| region.region.as_str() > cursor)
+            })
+            .take(limit + 1)
             .map(region_descriptor_to_proto)
-            .collect();
+            .collect::<Vec<_>>();
+        let has_more = regions.len() > limit;
+        if has_more {
+            regions.truncate(limit);
+        }
+        let next_cursor = if has_more {
+            regions.last().map_or(Ok(String::new()), |region| {
+                admin_cursor::encode_next_cursor(
+                    &region.region,
+                    &binding,
+                    self.config.jwt_secret.as_bytes(),
+                )
+            })?
+        } else {
+            String::new()
+        };
         Ok(Response::new(ListRegionsResponse {
             page: Some(PageResponse {
-                next_cursor: String::new(),
-                has_more: false,
+                next_cursor,
+                has_more,
             }),
             regions,
         }))
@@ -712,10 +994,19 @@ impl AdminService for AppState {
             })
             .await
             .map_err(lifecycle_status)?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.cell.register",
+            &cell_resource_id(&cell.region, &cell.cell_id),
+            cell_audit_details(&cell),
+        )
+        .await?;
         Ok(Response::new(CellResponse {
             request_id: context.request_id.clone(),
             cell: Some(cell_descriptor_to_proto(cell)),
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
         }))
     }
 
@@ -736,10 +1027,19 @@ impl AdminService for AppState {
             )
             .await
             .map_err(lifecycle_status)?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.cell.activate",
+            &cell_resource_id(&cell.region, &cell.cell_id),
+            cell_audit_details(&cell),
+        )
+        .await?;
         Ok(Response::new(CellResponse {
             request_id: context.request_id.clone(),
             cell: Some(cell_descriptor_to_proto(cell)),
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
         }))
     }
 
@@ -760,12 +1060,21 @@ impl AdminService for AppState {
             )
             .await
             .map_err(lifecycle_status)?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.cell.drain",
+            &cell_resource_id(&cell.region, &cell.cell_id),
+            cell_audit_details(&cell),
+        )
+        .await?;
         Ok(Response::new(DrainOperationResponse {
             request_id: context.request_id.clone(),
             resource_id: cell.cell_id,
             state: lifecycle_state_to_proto(cell.state),
             generation: cell.generation,
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
         }))
     }
 
@@ -786,11 +1095,20 @@ impl AdminService for AppState {
             )
             .await
             .map_err(lifecycle_status)?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.cell.remove",
+            &cell_resource_id(&cell.region, &cell.cell_id),
+            cell_audit_details(&cell),
+        )
+        .await?;
         Ok(Response::new(AdminMutationResponse {
             request_id: context.request_id.clone(),
             resource_id: cell.cell_id,
             generation: cell.generation,
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
             idempotent_replay: false,
         }))
     }
@@ -799,21 +1117,70 @@ impl AdminService for AppState {
         &self,
         request: Request<ListCellsRequest>,
     ) -> Result<Response<ListCellsResponse>, Status> {
-        require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
         let req = request.into_inner();
         let region_filter = none_if_empty(&req.region);
-        let cells = self
+        let page = req.page.as_ref();
+        let limit = page_limit(page);
+        let mut cells = self
             .persistence
             .list_cell_descriptors(region_filter)
             .await
-            .map_err(lifecycle_status)?
+            .map_err(lifecycle_status)?;
+        cells.sort_by(|left, right| {
+            left.region
+                .cmp(&right.region)
+                .then(left.cell_id.cmp(&right.cell_id))
+        });
+        let revision_keys = cells
+            .iter()
+            .map(|cell| (format!("{}/{}", cell.region, cell.cell_id), cell.generation))
+            .collect::<Vec<_>>();
+        let revision = admin_cursor::collection_revision(
+            revision_keys
+                .iter()
+                .map(|(key, generation)| (key.as_str(), *generation)),
+        );
+        let filters = [("region", req.region.as_str())];
+        let binding = AdminCursorBinding {
+            scope: "admin.list_cells.v1",
+            filters: &filters,
+            principal: &principal,
+            limit,
+            revision: &revision,
+            sort: "region_cell.asc",
+        };
+        let cursor =
+            admin_cursor::decode_page_cursor(page, &binding, self.config.jwt_secret.as_bytes())?;
+        let mut cells = cells
             .into_iter()
+            .filter(|cell| {
+                cursor.as_deref().is_none_or(|cursor| {
+                    format!("{}/{}", cell.region, cell.cell_id).as_str() > cursor
+                })
+            })
+            .take(limit + 1)
             .map(cell_descriptor_to_proto)
-            .collect();
+            .collect::<Vec<_>>();
+        let has_more = cells.len() > limit;
+        if has_more {
+            cells.truncate(limit);
+        }
+        let next_cursor = if has_more {
+            cells.last().map_or(Ok(String::new()), |cell| {
+                admin_cursor::encode_next_cursor(
+                    &format!("{}/{}", cell.region, cell.cell_id),
+                    &binding,
+                    self.config.jwt_secret.as_bytes(),
+                )
+            })?
+        } else {
+            String::new()
+        };
         Ok(Response::new(ListCellsResponse {
             page: Some(PageResponse {
-                next_cursor: String::new(),
-                has_more: false,
+                next_cursor,
+                has_more,
             }),
             cells,
         }))
@@ -845,10 +1212,19 @@ impl AdminService for AppState {
             })
             .await
             .map_err(lifecycle_status)?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.node.register",
+            &format!("node:{}", node.node_id),
+            node_audit_details(&node),
+        )
+        .await?;
         Ok(Response::new(NodeResponse {
             request_id: context.request_id.clone(),
             node: Some(node_descriptor_to_proto(node)),
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
         }))
     }
 
@@ -869,10 +1245,19 @@ impl AdminService for AppState {
             )
             .await
             .map_err(lifecycle_status)?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.node.activate",
+            &format!("node:{}", node.node_id),
+            node_audit_details(&node),
+        )
+        .await?;
         Ok(Response::new(NodeResponse {
             request_id: context.request_id.clone(),
             node: Some(node_descriptor_to_proto(node)),
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
         }))
     }
 
@@ -898,12 +1283,21 @@ impl AdminService for AppState {
             )
             .await
             .map_err(lifecycle_status)?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.node.drain",
+            &format!("node:{}", node.node_id),
+            node_audit_details(&node),
+        )
+        .await?;
         Ok(Response::new(DrainOperationResponse {
             request_id: context.request_id.clone(),
             resource_id: node.node_id,
             state: lifecycle_state_to_proto(node.state),
             generation: node.generation,
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
         }))
     }
 
@@ -924,10 +1318,19 @@ impl AdminService for AppState {
             )
             .await
             .map_err(lifecycle_status)?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.node.force_offline",
+            &format!("node:{}", node.node_id),
+            node_audit_details(&node),
+        )
+        .await?;
         Ok(Response::new(NodeResponse {
             request_id: context.request_id.clone(),
             node: Some(node_descriptor_to_proto(node)),
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
         }))
     }
 
@@ -948,11 +1351,20 @@ impl AdminService for AppState {
             )
             .await
             .map_err(lifecycle_status)?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.node.remove",
+            &format!("node:{}", node.node_id),
+            node_audit_details(&node),
+        )
+        .await?;
         Ok(Response::new(AdminMutationResponse {
             request_id: context.request_id.clone(),
             resource_id: node.node_id,
             generation: node.generation,
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
             idempotent_replay: false,
         }))
     }
@@ -961,20 +1373,64 @@ impl AdminService for AppState {
         &self,
         request: Request<ListNodesRequest>,
     ) -> Result<Response<ListNodesResponse>, Status> {
-        require_admin(&request, self, AnvilAdminCapability::ManageNodes)?;
+        let principal = require_admin(&request, self, AnvilAdminCapability::ManageNodes)?;
         let req = request.into_inner();
-        let nodes = self
+        let page = req.page.as_ref();
+        let limit = page_limit(page);
+        let mut nodes = self
             .persistence
             .list_node_descriptors(none_if_empty(&req.region), none_if_empty(&req.cell_id))
             .await
-            .map_err(lifecycle_status)?
+            .map_err(lifecycle_status)?;
+        nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        let revision = admin_cursor::collection_revision(
+            nodes
+                .iter()
+                .map(|node| (node.node_id.as_str(), node.generation)),
+        );
+        let filters = [
+            ("region", req.region.as_str()),
+            ("cell_id", req.cell_id.as_str()),
+        ];
+        let binding = AdminCursorBinding {
+            scope: "admin.list_nodes.v1",
+            filters: &filters,
+            principal: &principal,
+            limit,
+            revision: &revision,
+            sort: "node_id.asc",
+        };
+        let cursor =
+            admin_cursor::decode_page_cursor(page, &binding, self.config.jwt_secret.as_bytes())?;
+        let mut nodes = nodes
             .into_iter()
+            .filter(|node| {
+                cursor
+                    .as_deref()
+                    .is_none_or(|cursor| node.node_id.as_str() > cursor)
+            })
+            .take(limit + 1)
             .map(node_descriptor_to_proto)
-            .collect();
+            .collect::<Vec<_>>();
+        let has_more = nodes.len() > limit;
+        if has_more {
+            nodes.truncate(limit);
+        }
+        let next_cursor = if has_more {
+            nodes.last().map_or(Ok(String::new()), |node| {
+                admin_cursor::encode_next_cursor(
+                    &node.node_id,
+                    &binding,
+                    self.config.jwt_secret.as_bytes(),
+                )
+            })?
+        } else {
+            String::new()
+        };
         Ok(Response::new(ListNodesResponse {
             page: Some(PageResponse {
-                next_cursor: String::new(),
-                has_more: false,
+                next_cursor,
+                has_more,
             }),
             nodes,
         }))
@@ -1061,12 +1517,29 @@ impl AdminService for AppState {
             .repair_mesh_routing_record(family, &req.record_key)
             .await
             .map_err(|err| Status::failed_precondition(err.to_string()))?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.routing_record.repair",
+            &format!("routing_record:{}", record.descriptor_key),
+            json!({
+                "resource_kind": "routing_record",
+                "family": record.family,
+                "record_key": &record.record_key,
+                "partition": &record.partition,
+                "descriptor_key": &record.descriptor_key,
+                "generation": record.generation,
+                "payload_json": &record.payload_json,
+            }),
+        )
+        .await?;
 
         Ok(Response::new(AdminMutationResponse {
             request_id: context.request_id.clone(),
             resource_id: record.descriptor_key,
             generation: record.generation,
-            audit_event_id: audit_event_id(&principal, context),
+            audit_event_id,
             idempotent_replay: false,
         }))
     }
@@ -1086,6 +1559,7 @@ impl AdminService for AppState {
             2 => run_directory_index_repair(self, &request_id, &audit_event_id, &req).await?,
             3 => run_authz_derived_index_repair(self, &request_id, &audit_event_id, &req).await?,
             4 => run_personaldb_log_chain_repair(self, &request_id, &audit_event_id, &req).await?,
+            5 => run_mesh_routing_projection_repair(self, &request_id, &audit_event_id).await?,
             _ => {
                 return Err(Status::invalid_argument(
                     "repair_kind must select a supported repair backend",
@@ -1100,9 +1574,10 @@ impl AdminService for AppState {
             &response.repair_task_id,
             json!({
                 "repair_kind": req.repair_kind,
-                "scope_kind": response.scope_kind,
-                "scope_id": response.scope_id,
-                "status": response.status,
+                "scope_kind": &response.scope_kind,
+                "scope_id": &response.scope_id,
+                "status": &response.status,
+                "repair_task_details_json": &response.details_json,
             }),
         )
         .await?;
@@ -1114,20 +1589,10 @@ impl AdminService for AppState {
         &self,
         request: Request<ListDiagnosticsRequest>,
     ) -> Result<Response<DiagnosticsResponse>, Status> {
-        require_admin(&request, self, AnvilAdminCapability::ViewDiagnostics)?;
+        let principal = require_admin(&request, self, AnvilAdminCapability::ViewDiagnostics)?;
         let req = request.into_inner();
         let request_id = require_request_id(&req.request_id)?.to_string();
         let page = req.page.as_ref();
-        let cursor = page
-            .map(|page| page.cursor.trim())
-            .filter(|cursor| !cursor.is_empty())
-            .map(|cursor| {
-                cursor
-                    .parse::<i64>()
-                    .map_err(|_| Status::invalid_argument("diagnostic cursor is invalid"))
-            })
-            .transpose()?
-            .unwrap_or_default();
         let limit = page_limit(page);
         let source = req.source.trim();
 
@@ -1135,8 +1600,16 @@ impl AdminService for AppState {
             validate_diagnostic_severity(&req.severity)?;
         }
 
+        let mut diagnostics = Vec::new();
+
         if source.is_empty() || source == "index" || source == "index_diagnostic_journal" {
-            if !req.tenant_id.trim().is_empty() && !req.bucket_name.trim().is_empty() {
+            if req.tenant_id.trim().is_empty() || req.bucket_name.trim().is_empty() {
+                if source == "index" || source == "index_diagnostic_journal" {
+                    return Err(Status::invalid_argument(
+                        "tenant_id and bucket_name are required for index diagnostics",
+                    ));
+                }
+            } else {
                 let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
                 let bucket = self
                     .persistence
@@ -1144,87 +1617,106 @@ impl AdminService for AppState {
                     .await
                     .map_err(|err| Status::internal(err.to_string()))?
                     .ok_or_else(|| Status::not_found("Bucket not found"))?;
-                let mut diagnostics = self
-                    .persistence
-                    .list_index_diagnostics(
-                        tenant_id,
-                        bucket.id,
-                        &req.index_name,
-                        &req.severity,
-                        cursor,
-                        i32::try_from(limit + 1)
-                            .map_err(|_| Status::invalid_argument("diagnostic limit is invalid"))?,
-                    )
-                    .await
-                    .map_err(|err| Status::internal(err.to_string()))?
-                    .into_iter()
-                    .map(index_diagnostic_to_admin_record)
-                    .collect::<Result<Vec<_>, _>>()?;
-                let has_more = diagnostics.len() > limit;
-                if has_more {
-                    diagnostics.truncate(limit);
-                }
-                let next_cursor = if has_more {
-                    diagnostics
-                        .last()
-                        .map(|diagnostic| diagnostic.cursor.to_string())
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                return Ok(Response::new(DiagnosticsResponse {
-                    request_id,
-                    page: Some(PageResponse {
-                        next_cursor,
-                        has_more,
-                    }),
-                    diagnostics,
-                    data_source: "index_diagnostic_journal".to_string(),
-                }));
+                diagnostics.extend(
+                    self.persistence
+                        .list_index_diagnostics(
+                            tenant_id,
+                            bucket.id,
+                            &req.index_name,
+                            &req.severity,
+                            0,
+                            i32::MAX,
+                        )
+                        .await
+                        .map_err(|err| Status::internal(err.to_string()))?
+                        .into_iter()
+                        .map(index_diagnostic_to_admin_record)
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
             }
         }
+
         if source.is_empty() || source == "mesh" || source == "mesh_lifecycle" {
-            let diagnostics = mesh_lifecycle_diagnostics(self)
-                .await?
-                .into_iter()
-                .filter(|diagnostic| {
-                    req.severity.trim().is_empty() || diagnostic.severity == req.severity
-                })
-                .filter(|diagnostic| diagnostic.cursor > cursor as u64)
-                .take(limit + 1)
-                .collect::<Vec<_>>();
-            let has_more = diagnostics.len() > limit;
-            let mut diagnostics = diagnostics;
-            if has_more {
-                diagnostics.truncate(limit);
-            }
-            let next_cursor = if has_more {
-                diagnostics
-                    .last()
-                    .map(|diagnostic| diagnostic.cursor.to_string())
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            return Ok(Response::new(DiagnosticsResponse {
-                request_id,
-                page: Some(PageResponse {
-                    next_cursor,
-                    has_more,
-                }),
-                diagnostics,
-                data_source: "mesh_lifecycle".to_string(),
-            }));
+            diagnostics.extend(mesh_lifecycle_diagnostics(self).await?);
         }
+
+        if source.is_empty() || source == "mesh" || source == "mesh_routing_projection" {
+            diagnostics.extend(mesh_routing_projection_diagnostics(self).await?);
+        }
+
+        if !req.severity.trim().is_empty() {
+            diagnostics.retain(|diagnostic| diagnostic.severity == req.severity);
+        }
+        diagnostics
+            .sort_by(|left, right| diagnostic_position(left).cmp(&diagnostic_position(right)));
+
+        let positions = diagnostics
+            .iter()
+            .map(|diagnostic| (diagnostic_position(diagnostic), diagnostic.cursor))
+            .collect::<Vec<_>>();
+        let revision = admin_cursor::collection_revision(
+            positions
+                .iter()
+                .map(|(position, cursor)| (position.as_str(), *cursor)),
+        );
+        let filters = [
+            ("source", source),
+            ("tenant_id", req.tenant_id.trim()),
+            ("bucket_name", req.bucket_name.trim()),
+            ("index_name", req.index_name.trim()),
+            ("severity", req.severity.trim()),
+        ];
+        let binding = AdminCursorBinding {
+            scope: "admin.list_diagnostics.v1",
+            filters: &filters,
+            principal: &principal,
+            limit,
+            revision: &revision,
+            sort: "source.cursor.id.asc",
+        };
+        let cursor =
+            admin_cursor::decode_page_cursor(page, &binding, self.config.jwt_secret.as_bytes())?;
+        let mut diagnostics = diagnostics
+            .into_iter()
+            .filter(|diagnostic| {
+                cursor
+                    .as_deref()
+                    .is_none_or(|cursor| diagnostic_position(diagnostic).as_str() > cursor)
+            })
+            .take(limit + 1)
+            .collect::<Vec<_>>();
+        let has_more = diagnostics.len() > limit;
+        if has_more {
+            diagnostics.truncate(limit);
+        }
+        let next_cursor = if has_more {
+            diagnostics.last().map_or(Ok(String::new()), |diagnostic| {
+                admin_cursor::encode_next_cursor(
+                    &diagnostic_position(diagnostic),
+                    &binding,
+                    self.config.jwt_secret.as_bytes(),
+                )
+            })?
+        } else {
+            String::new()
+        };
 
         Ok(Response::new(DiagnosticsResponse {
             request_id,
             page: Some(PageResponse {
-                next_cursor: String::new(),
-                has_more: false,
+                next_cursor,
+                has_more,
             }),
-            diagnostics: Vec::new(),
-            data_source: "no_matching_diagnostic_backend".to_string(),
+            diagnostics,
+            data_source: if source.is_empty() {
+                "combined".to_string()
+            } else if source == "index" {
+                "index_diagnostic_journal".to_string()
+            } else if source == "mesh" {
+                "mesh".to_string()
+            } else {
+                source.to_string()
+            },
         }))
     }
 
@@ -1582,6 +2074,94 @@ async fn run_personaldb_log_chain_repair(
     })
 }
 
+async fn run_mesh_routing_projection_repair(
+    state: &AppState,
+    request_id: &str,
+    audit_event_id: &str,
+) -> Result<RepairTaskResponse, Status> {
+    let diagnostics = state
+        .persistence
+        .diagnose_mesh_routing_projection(None)
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
+    let mut repaired_records = Vec::new();
+    let mut skipped_records = Vec::new();
+
+    for diagnostic in diagnostics {
+        if !diagnostic.repair_safe
+            || diagnostic.proposed_action != "repair_routing_record_from_control_stream"
+            || diagnostic.record_key.trim().is_empty()
+        {
+            skipped_records.push(json!({
+                "stream_family": diagnostic.stream_family,
+                "partition": diagnostic.partition,
+                "record_key": diagnostic.record_key,
+                "code": diagnostic.code,
+                "reason": "diagnostic is not safe for automatic routing projection repair",
+            }));
+            continue;
+        }
+        let Some(family) =
+            mesh_directory::RoutingRecordFamily::from_stream_family(&diagnostic.stream_family)
+        else {
+            skipped_records.push(json!({
+                "stream_family": diagnostic.stream_family,
+                "partition": diagnostic.partition,
+                "record_key": diagnostic.record_key,
+                "code": diagnostic.code,
+                "reason": "unknown routing record stream family",
+            }));
+            continue;
+        };
+        match state
+            .persistence
+            .repair_mesh_routing_record(family, &diagnostic.record_key)
+            .await
+        {
+            Ok(record) => repaired_records.push(json!({
+                "stream_family": diagnostic.stream_family,
+                "partition": diagnostic.partition,
+                "record_key": diagnostic.record_key,
+                "descriptor_key": record.descriptor_key,
+                "generation": record.generation,
+            })),
+            Err(err) => skipped_records.push(json!({
+                "stream_family": diagnostic.stream_family,
+                "partition": diagnostic.partition,
+                "record_key": diagnostic.record_key,
+                "code": diagnostic.code,
+                "reason": err.to_string(),
+            })),
+        }
+    }
+
+    let status = if skipped_records.is_empty() {
+        "completed"
+    } else if repaired_records.is_empty() {
+        "failed"
+    } else {
+        "completed_with_warnings"
+    };
+
+    Ok(RepairTaskResponse {
+        request_id: request_id.to_string(),
+        repair_task_id: format!("mesh-routing-projection-repair-{audit_event_id}"),
+        status: status.to_string(),
+        scope_kind: "mesh_routing_projection".to_string(),
+        scope_id: state.config.mesh_id.clone(),
+        findings: Vec::new(),
+        audit_event_id: audit_event_id.to_string(),
+        details_json: json!({
+            "repair_kind": "mesh_routing_projection",
+            "repaired_count": repaired_records.len(),
+            "skipped_count": skipped_records.len(),
+            "repaired_records": repaired_records,
+            "skipped_records": skipped_records,
+        })
+        .to_string(),
+    })
+}
+
 fn require_nonempty_admin_field(value: &str, field: &'static str) -> Result<(), Status> {
     if value.trim().is_empty() {
         return Err(Status::invalid_argument(format!("{field} is required")));
@@ -1634,6 +2214,69 @@ fn index_diagnostic_to_admin_record(
             .ok_or_else(|| Status::internal("Invalid diagnostic timestamp"))?,
         cursor,
     })
+}
+
+async fn mesh_routing_projection_diagnostics(
+    state: &AppState,
+) -> Result<Vec<DiagnosticRecord>, Status> {
+    state
+        .persistence
+        .diagnose_mesh_routing_projection(None)
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?
+        .into_iter()
+        .enumerate()
+        .map(|(index, diagnostic)| {
+            mesh_routing_projection_diagnostic_to_admin_record(
+                u64::try_from(index + 1)
+                    .map_err(|_| Status::internal("Too many mesh diagnostics"))?,
+                diagnostic,
+            )
+        })
+        .collect()
+}
+
+fn mesh_routing_projection_diagnostic_to_admin_record(
+    cursor: u64,
+    diagnostic: mesh_control_stream::ControlProjectionDiagnostic,
+) -> Result<DiagnosticRecord, Status> {
+    let scope_id = format!(
+        "{}/{}/{}",
+        diagnostic.stream_family, diagnostic.partition, diagnostic.record_key
+    );
+    Ok(DiagnosticRecord {
+        diagnostic_id: format!("mesh-routing-projection-{cursor}"),
+        scope_kind: "routing_record".to_string(),
+        scope_id,
+        source: "mesh_routing_projection".to_string(),
+        severity: diagnostic.severity.to_string(),
+        code: diagnostic.code.to_string(),
+        message: diagnostic.message,
+        object_key: String::new(),
+        version_id: String::new(),
+        details_json: json!({
+            "stream_family": diagnostic.stream_family,
+            "partition": diagnostic.partition,
+            "record_key": diagnostic.record_key,
+            "stream_sequence": diagnostic.stream_sequence,
+            "stream_generation": diagnostic.stream_generation,
+            "stream_digest": diagnostic.stream_digest,
+            "projection_generation": diagnostic.projection_generation,
+            "projection_digest": diagnostic.projection_digest,
+            "repair_safe": diagnostic.repair_safe,
+            "proposed_action": diagnostic.proposed_action,
+        })
+        .to_string(),
+        created_at_nanos: Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        cursor,
+    })
+}
+
+fn diagnostic_position(diagnostic: &DiagnosticRecord) -> String {
+    format!(
+        "{}:{:020}:{}",
+        diagnostic.source, diagnostic.cursor, diagnostic.diagnostic_id
+    )
 }
 
 async fn mesh_lifecycle_diagnostics(state: &AppState) -> Result<Vec<DiagnosticRecord>, Status> {
@@ -1834,13 +2477,138 @@ async fn record_admin_audit_event(
         action: action.to_string(),
         audit_reason: context.audit_reason.clone(),
         created_at: Utc::now().to_rfc3339(),
-        details_json: serde_json::to_string(&details)
-            .map_err(|_| Status::internal("Failed to encode admin audit details"))?,
+        details_json: admin_audit_details_json(context, details)?,
     };
     admin_audit::append_audit_event(&state.storage, &event)
         .await
         .map_err(|err| Status::internal(err.to_string()))?;
     Ok(audit_event_id)
+}
+
+fn admin_audit_details_json(
+    context: &AdminRequestContext,
+    details: serde_json::Value,
+) -> Result<String, Status> {
+    let mut details = match details {
+        serde_json::Value::Object(map) => map,
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("details".to_string(), other);
+            map
+        }
+    };
+    details.insert(
+        "idempotency_key".to_string(),
+        json!(context.idempotency_key.clone()),
+    );
+    details.insert(
+        "expected_generation".to_string(),
+        json!(context.expected_generation),
+    );
+    serde_json::to_string(&serde_json::Value::Object(details))
+        .map_err(|_| Status::internal("Failed to encode admin audit details"))
+}
+
+fn bucket_resource_id(tenant_id: i64, bucket_name: &str) -> String {
+    format!("tenant:{tenant_id}:bucket:{bucket_name}")
+}
+
+fn object_link_resource_id(tenant_id: i64, bucket_name: &str, link_key: &str) -> String {
+    format!(
+        "{}:link:{link_key}",
+        bucket_resource_id(tenant_id, bucket_name)
+    )
+}
+
+fn cell_resource_id(region: &str, cell_id: &str) -> String {
+    format!("region:{region}:cell:{cell_id}")
+}
+
+fn host_alias_audit_details(host_alias: &CoreHostAliasDescriptor) -> serde_json::Value {
+    json!({
+        "resource_kind": "host_alias",
+        "hostname": &host_alias.hostname,
+        "tenant_id": &host_alias.tenant_id,
+        "bucket_name": &host_alias.bucket_name,
+        "region": &host_alias.region,
+        "prefix": &host_alias.prefix,
+        "state": host_alias.state,
+        "generation": host_alias.generation,
+    })
+}
+
+fn region_audit_details(region: &mesh_lifecycle::RegionDescriptor) -> serde_json::Value {
+    json!({
+        "resource_kind": "region",
+        "mesh_id": &region.mesh_id,
+        "region": &region.region,
+        "state": region.state,
+        "public_base_url": &region.public_base_url,
+        "virtual_host_suffix": &region.virtual_host_suffix,
+        "placement_weight": region.placement_weight,
+        "default_cell": &region.default_cell,
+        "generation": region.generation,
+    })
+}
+
+fn cell_audit_details(cell: &mesh_lifecycle::CellDescriptor) -> serde_json::Value {
+    json!({
+        "resource_kind": "cell",
+        "mesh_id": &cell.mesh_id,
+        "region": &cell.region,
+        "cell_id": &cell.cell_id,
+        "state": cell.state,
+        "placement_weight": cell.placement_weight,
+        "generation": cell.generation,
+    })
+}
+
+fn node_audit_details(node: &mesh_lifecycle::NodeDescriptor) -> serde_json::Value {
+    json!({
+        "resource_kind": "node",
+        "mesh_id": &node.mesh_id,
+        "node_id": &node.node_id,
+        "region": &node.region,
+        "cell_id": &node.cell_id,
+        "libp2p_peer_id": &node.libp2p_peer_id,
+        "public_api_addr": &node.public_api_addr,
+        "public_cluster_addrs": &node.public_cluster_addrs,
+        "capabilities": &node.capabilities,
+        "state": node.state,
+        "drain": &node.drain,
+        "generation": node.generation,
+    })
+}
+
+fn add_audit_detail(details: &mut serde_json::Value, key: &str, value: serde_json::Value) {
+    if let serde_json::Value::Object(map) = details {
+        map.insert(key.to_string(), value);
+    }
+}
+
+fn bucket_drain_overrides_details(overrides: &[BucketDrainOverride]) -> Vec<serde_json::Value> {
+    overrides
+        .iter()
+        .map(|override_| {
+            json!({
+                "tenant_id": &override_.tenant_id,
+                "bucket_name": &override_.bucket_name,
+                "disposition": region_drain_disposition_name(override_.disposition),
+                "disposition_code": override_.disposition,
+                "reason": &override_.reason,
+            })
+        })
+        .collect()
+}
+
+fn region_drain_disposition_name(value: i32) -> &'static str {
+    match value {
+        1 => "block_until_empty",
+        2 => "remain_proxy_only",
+        3 => "read_only_until_removed",
+        4 => "delete_after_retention",
+        _ => "unspecified",
+    }
 }
 
 fn audit_cursor_position(event: &AdminAuditEvent) -> String {
