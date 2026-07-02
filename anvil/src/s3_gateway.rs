@@ -3,6 +3,7 @@ use crate::auth::Claims;
 use crate::s3_auth::{aws_chunked_decoder, sigv4_auth};
 use anvil_core::auth;
 use anvil_core::bucket_journal;
+use anvil_core::mesh_directory::TenantNameStatus;
 use anvil_core::object_links;
 use anvil_core::object_manager::{ObjectLinkReadMode, ObjectWriteOptions};
 use anvil_core::observability::RESERVED_NAMESPACE_REJECTION_COUNT;
@@ -15,8 +16,8 @@ use anvil_core::validation;
 use axum::{
     Router,
     body::Body,
-    extract::{Path, Query, Request, State},
-    http::{self, Uri},
+    extract::{ConnectInfo, Path, Query, Request, State},
+    http::{self, HeaderMap, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, put},
@@ -25,6 +26,7 @@ use futures_core::Stream;
 use futures_util::stream::StreamExt;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::pin::Pin;
 
 #[derive(Deserialize)]
@@ -146,8 +148,10 @@ async fn s3_host_routing(State(state): State<AppState>, mut req: Request, next: 
     let Some(config) = s3_routing_config(&state) else {
         return next.run(req).await;
     };
-    let Some(host) = request_host(&req).map(str::to_owned) else {
-        return next.run(req).await;
+    let host = match request_host(&req, state.config.as_ref()) {
+        Ok(Some(host)) => host,
+        Ok(None) => return next.run(req).await,
+        Err(err) => return s3_routing_error(err),
     };
 
     let request = RouteRequest {
@@ -216,11 +220,56 @@ fn s3_routing_config(state: &AppState) -> Option<RoutingConfig> {
     RoutingConfig::new(base_domain).ok()
 }
 
-fn request_host(req: &Request) -> Option<&str> {
+fn request_host(
+    req: &Request,
+    config: &anvil_core::config::Config,
+) -> Result<Option<String>, RoutingError> {
+    let Some(raw_authority) = raw_request_authority(req) else {
+        return Ok(None);
+    };
+    let Some(remote_peer) = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|connect_info| connect_info.0.ip())
+    else {
+        return routing::normalize_alias_hostname(raw_authority).map(Some);
+    };
+    let trusted_proxies = trusted_proxy_source_ranges(config);
+    let forwarded_headers = forwarded_headers(req.headers());
+    routing::effective_host(
+        raw_authority,
+        remote_peer,
+        &trusted_proxies,
+        &forwarded_headers,
+    )
+    .map(Some)
+}
+
+fn raw_request_authority(req: &Request) -> Option<&str> {
     req.headers()
         .get(http::header::HOST)
         .and_then(|value| value.to_str().ok())
         .or_else(|| req.uri().authority().map(|authority| authority.as_str()))
+}
+
+fn trusted_proxy_source_ranges(config: &anvil_core::config::Config) -> Vec<routing::TrustedProxy> {
+    routing::parse_trusted_proxies(&config.trusted_proxy_source_ranges).unwrap_or_default()
+}
+
+fn forwarded_headers(headers: &HeaderMap) -> routing::ForwardedHeaders {
+    routing::ForwardedHeaders {
+        forwarded: header_values(headers, "forwarded"),
+        x_forwarded_host: header_values(headers, "x-forwarded-host"),
+    }
+}
+
+fn header_values(headers: &HeaderMap, name: &'static str) -> Vec<String> {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_string)
+        .collect()
 }
 
 fn rewrite_s3_host_route_uri(req: &mut Request, route: &ObjectRoute) -> Result<(), RoutingError> {
@@ -353,6 +402,13 @@ async fn s3_checked_route(
                         axum::http::StatusCode::NOT_FOUND,
                     )
                 })?;
+            if descriptor.status != TenantNameStatus::Active {
+                return Err(s3_error(
+                    "NoSuchTenant",
+                    "The specified tenant does not exist",
+                    axum::http::StatusCode::NOT_FOUND,
+                ));
+            }
             descriptor.tenant_id.as_str().parse::<i64>().map_err(|_| {
                 s3_error(
                     "InvalidRequest",
@@ -1808,6 +1864,7 @@ mod list_bucket_pagination_tests {
             tenant_id: 0,
             bucket_id: 0,
             key: key.to_string(),
+            kind: object_links::ObjectEntryKind::Blob,
             content_hash: String::new(),
             size: 0,
             etag: String::new(),
@@ -1825,6 +1882,7 @@ mod list_bucket_pagination_tests {
             shard_map: None,
             inline_payload: None,
             checksum: None,
+            link: None,
         }
     }
 }
@@ -3277,6 +3335,26 @@ mod tests {
         Request::builder().uri(uri).body(Body::empty()).unwrap()
     }
 
+    fn host_request(host: &str, remote: &str, forwarded_host: Option<&str>) -> Request {
+        let mut builder = Request::builder().uri("/object.txt").header("host", host);
+        if let Some(forwarded_host) = forwarded_host {
+            builder = builder.header("x-forwarded-host", forwarded_host);
+        }
+        let mut req = builder.body(Body::empty()).unwrap();
+        req.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            remote.parse().unwrap(),
+            41_000,
+        )));
+        req
+    }
+
+    fn routing_config_with_trusted_ranges(ranges: &[&str]) -> anvil_core::config::Config {
+        anvil_core::config::Config {
+            trusted_proxy_source_ranges: ranges.iter().map(|range| range.to_string()).collect(),
+            ..anvil_core::config::Config::default()
+        }
+    }
+
     fn request_with_copy_source(uri: &str, copy_source: &str) -> Request {
         Request::builder()
             .uri(uri)
@@ -3313,6 +3391,51 @@ mod tests {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(name, httpdate::fmt_http_date(value).parse().unwrap());
         headers
+    }
+
+    #[test]
+    fn s3_host_routing_accepts_forwarded_host_only_from_trusted_ranges() {
+        let config = routing_config_with_trusted_ranges(&["127.0.0.1/32"]);
+        let req = host_request(
+            "internal.anvil-storage.test",
+            "127.0.0.1",
+            Some("Bucket.Default.Test-Region-1.Anvil-Storage.Test"),
+        );
+
+        let host = request_host(&req, &config).expect("effective host");
+
+        assert_eq!(
+            host.as_deref(),
+            Some("bucket.default.test-region-1.anvil-storage.test")
+        );
+    }
+
+    #[test]
+    fn s3_host_routing_ignores_untrusted_forwarded_host() {
+        let config = routing_config_with_trusted_ranges(&["10.0.0.0/8"]);
+        let req = host_request(
+            "internal.anvil-storage.test",
+            "127.0.0.1",
+            Some("bucket.default.test-region-1.anvil-storage.test"),
+        );
+
+        let host = request_host(&req, &config).expect("effective host");
+
+        assert_eq!(host.as_deref(), Some("internal.anvil-storage.test"));
+    }
+
+    #[test]
+    fn s3_host_routing_rejects_ambiguous_forwarded_host_chains() {
+        let config = routing_config_with_trusted_ranges(&["127.0.0.1/32"]);
+        let req = host_request(
+            "internal.anvil-storage.test",
+            "127.0.0.1",
+            Some("one.example.test, two.example.test"),
+        );
+
+        let err = request_host(&req, &config).unwrap_err();
+
+        assert_eq!(err, RoutingError::AmbiguousForwardedHost);
     }
 
     #[tokio::test]

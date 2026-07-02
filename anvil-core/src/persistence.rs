@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashSet;
@@ -552,27 +552,42 @@ impl Persistence {
         }
     }
 
-    async fn write_mesh_tenant_locators(&self, tenant: &Tenant) -> Result<()> {
+    async fn write_mesh_tenant_locators(
+        &self,
+        tenant: &Tenant,
+        idempotency_key: &str,
+    ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
+        let reservation_expires_at = (Utc::now() + Duration::minutes(5)).to_rfc3339();
         let mesh_id = mesh_directory::MeshId::new(self.mesh_id.clone())?;
         let tenant_id = mesh_directory::TenantId::new(tenant.id.to_string())?;
         let tenant_name = mesh_directory::TenantName::canonicalize(&tenant.name)?;
         let home_region = mesh_directory::RegionName::new(self.region.clone())?;
-        let name_descriptor = mesh_directory::TenantNameDescriptor::active(
+        let reserved_name = mesh_directory::TenantNameDescriptor::reserved(
             mesh_id.clone(),
             tenant_name.clone(),
             tenant_id.clone(),
+            idempotency_key,
+            reservation_expires_at,
             now.clone(),
         )?;
         let locator_descriptor = mesh_directory::TenantLocatorDescriptor::active(
             mesh_id,
-            tenant_id,
-            tenant_name,
+            tenant_id.clone(),
+            tenant_name.clone(),
             home_region,
-            now,
+            now.clone(),
         )?;
-        mesh_directory::write_tenant_records(&self.storage, &name_descriptor, &locator_descriptor)
-            .await?;
+        let reserved = mesh_directory::reserve_tenant_name(&self.storage, &reserved_name).await?;
+        mesh_directory::create_tenant_locator(&self.storage, &locator_descriptor).await?;
+        mesh_directory::activate_tenant_name(
+            &self.storage,
+            &tenant_name,
+            &tenant_id,
+            reserved.generation,
+            now,
+        )
+        .await?;
         Ok(())
     }
 
@@ -638,7 +653,8 @@ impl Persistence {
                     .get_tenant_by_name(record_key)
                     .await?
                     .ok_or_else(|| anyhow!("tenant not found"))?;
-                self.write_mesh_tenant_locators(&tenant).await?;
+                self.write_mesh_tenant_locators(&tenant, "repair-tenant-name")
+                    .await?;
             }
             mesh_directory::RoutingRecordFamily::TenantLocator => {
                 let tenant_id = record_key.parse::<i64>()?;
@@ -648,7 +664,8 @@ impl Persistence {
                     .into_iter()
                     .find(|tenant| tenant.id == tenant_id)
                     .ok_or_else(|| anyhow!("tenant not found"))?;
-                self.write_mesh_tenant_locators(&tenant).await?;
+                self.write_mesh_tenant_locators(&tenant, "repair-tenant-locator")
+                    .await?;
             }
             mesh_directory::RoutingRecordFamily::BucketLocator => {
                 let (tenant_id, bucket_name) = record_key
@@ -1278,7 +1295,7 @@ impl Persistence {
             .policies_for_app(app_id))
     }
 
-    pub async fn create_tenant(&self, name: &str, _api_key: &str) -> Result<Tenant> {
+    pub async fn create_tenant(&self, name: &str, idempotency_key: &str) -> Result<Tenant> {
         let permit = self.control_write_permit().await?;
         let tenant = control_journal::create_tenant_with_permit(
             &self.storage,
@@ -1287,7 +1304,8 @@ impl Persistence {
             &self.partition_owner_signing_key,
         )
         .await?;
-        self.write_mesh_tenant_locators(&tenant).await?;
+        self.write_mesh_tenant_locators(&tenant, idempotency_key)
+            .await?;
         Ok(tenant)
     }
 
@@ -4028,6 +4046,33 @@ fn mesh_directory_lifecycle_error(
             resource_kind: "bucket locator",
             resource_id: format!("{tenant_id}/{bucket_name}"),
         },
+        mesh_directory::MeshDirectoryError::TenantNameAlreadyExists { tenant_name } => {
+            crate::mesh_lifecycle::LifecycleError::AlreadyExists {
+                resource_kind: "tenant name",
+                resource_id: tenant_name,
+            }
+        }
+        mesh_directory::MeshDirectoryError::GenerationConflict {
+            descriptor_key,
+            expected,
+            actual,
+        } => crate::mesh_lifecycle::LifecycleError::GenerationConflict {
+            resource_kind: "mesh directory record",
+            resource_id: descriptor_key,
+            expected,
+            current: actual,
+        },
+        mesh_directory::MeshDirectoryError::InvalidState {
+            descriptor_key,
+            state,
+        } => crate::mesh_lifecycle::LifecycleError::InvalidArgument(format!(
+            "invalid mesh directory state for {descriptor_key}: {state}"
+        )),
+        mesh_directory::MeshDirectoryError::InvalidTimestamp { field, value } => {
+            crate::mesh_lifecycle::LifecycleError::InvalidArgument(format!(
+                "invalid RFC3339 timestamp in {field}: {value}"
+            ))
+        }
         mesh_directory::MeshDirectoryError::Io(err) => {
             crate::mesh_lifecycle::LifecycleError::Io(err)
         }
@@ -4145,6 +4190,9 @@ mod tests {
             .expect("tenant-name locator");
         assert_eq!(tenant_name.tenant_id.as_str(), tenant.id.to_string());
         assert_eq!(tenant_name.status, mesh_directory::TenantNameStatus::Active);
+        assert_eq!(tenant_name.idempotency_key.as_deref(), Some("unused"));
+        assert_eq!(tenant_name.reservation_expires_at, None);
+        assert_eq!(tenant_name.generation, 2);
 
         let bucket_locator = persistence
             .get_mesh_bucket_locator(tenant.id, "docs")

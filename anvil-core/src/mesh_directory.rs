@@ -1,5 +1,6 @@
 use crate::storage::Storage;
 use crate::{routing, validation};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::fmt;
@@ -70,6 +71,23 @@ pub enum MeshDirectoryError {
         tenant_id: String,
         bucket_name: String,
     },
+    #[error("tenant name already exists: {tenant_name}")]
+    TenantNameAlreadyExists { tenant_name: String },
+    #[error(
+        "mesh directory generation conflict for {descriptor_key}: expected {expected}, actual {actual}"
+    )]
+    GenerationConflict {
+        descriptor_key: String,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("invalid mesh directory state for {descriptor_key}: {state}")]
+    InvalidState {
+        descriptor_key: String,
+        state: String,
+    },
+    #[error("invalid RFC3339 timestamp in {field}: {value}")]
+    InvalidTimestamp { field: &'static str, value: String },
     #[error("mesh directory record not found: {0}")]
     NotFound(String),
     #[error(transparent)]
@@ -105,6 +123,46 @@ impl PartialEq for MeshDirectoryError {
                     bucket_name: bucket_b,
                 },
             ) => tenant_a == tenant_b && bucket_a == bucket_b,
+            (
+                Self::TenantNameAlreadyExists {
+                    tenant_name: name_a,
+                },
+                Self::TenantNameAlreadyExists {
+                    tenant_name: name_b,
+                },
+            ) => name_a == name_b,
+            (
+                Self::GenerationConflict {
+                    descriptor_key: key_a,
+                    expected: expected_a,
+                    actual: actual_a,
+                },
+                Self::GenerationConflict {
+                    descriptor_key: key_b,
+                    expected: expected_b,
+                    actual: actual_b,
+                },
+            ) => key_a == key_b && expected_a == expected_b && actual_a == actual_b,
+            (
+                Self::InvalidState {
+                    descriptor_key: key_a,
+                    state: state_a,
+                },
+                Self::InvalidState {
+                    descriptor_key: key_b,
+                    state: state_b,
+                },
+            ) => key_a == key_b && state_a == state_b,
+            (
+                Self::InvalidTimestamp {
+                    field: field_a,
+                    value: value_a,
+                },
+                Self::InvalidTimestamp {
+                    field: field_b,
+                    value: value_b,
+                },
+            ) => field_a == field_b && value_a == value_b,
             (Self::NotFound(a), Self::NotFound(b)) => a == b,
             _ => false,
         }
@@ -359,6 +417,34 @@ pub struct TenantNameDescriptor {
 }
 
 impl TenantNameDescriptor {
+    pub fn reserved(
+        mesh_id: MeshId,
+        tenant_name: TenantName,
+        tenant_id: TenantId,
+        idempotency_key: impl Into<String>,
+        reservation_expires_at: impl Into<String>,
+        now: impl Into<String>,
+    ) -> MeshDirectoryResult<Self> {
+        let idempotency_key = idempotency_key.into();
+        let reservation_expires_at = reservation_expires_at.into();
+        let now = now.into();
+        require_nonempty(&idempotency_key, "idempotency key")?;
+        require_nonempty(&reservation_expires_at, "reservation expiry")?;
+        require_nonempty(&now, "timestamp")?;
+        Ok(Self {
+            schema: TENANT_NAME_SCHEMA.to_string(),
+            mesh_id,
+            tenant_name,
+            tenant_id,
+            status: TenantNameStatus::Reserved,
+            idempotency_key: Some(idempotency_key),
+            reservation_expires_at: Some(reservation_expires_at),
+            created_at: now.clone(),
+            updated_at: now,
+            generation: 1,
+        })
+    }
+
     pub fn active(
         mesh_id: MeshId,
         tenant_name: TenantName,
@@ -379,6 +465,33 @@ impl TenantNameDescriptor {
             updated_at: now,
             generation: 1,
         })
+    }
+
+    pub fn activate(&self, now: impl Into<String>) -> MeshDirectoryResult<Self> {
+        let now = now.into();
+        require_nonempty(&now, "timestamp")?;
+        if self.status != TenantNameStatus::Reserved {
+            return Err(MeshDirectoryError::InvalidState {
+                descriptor_key: self.descriptor_key(),
+                state: format!("{:?}", self.status),
+            });
+        }
+        let mut active = self.clone();
+        active.status = TenantNameStatus::Active;
+        active.reservation_expires_at = None;
+        active.updated_at = now;
+        active.generation += 1;
+        Ok(active)
+    }
+
+    pub fn tombstone(&self, now: impl Into<String>) -> MeshDirectoryResult<Self> {
+        let now = now.into();
+        require_nonempty(&now, "timestamp")?;
+        let mut tombstone = self.clone();
+        tombstone.status = TenantNameStatus::Tombstoned;
+        tombstone.updated_at = now;
+        tombstone.generation += 1;
+        Ok(tombstone)
     }
 
     pub fn descriptor_key(&self) -> String {
@@ -649,6 +762,183 @@ pub async fn write_tenant_records(
     Ok(())
 }
 
+pub async fn reserve_tenant_name(
+    storage: &Storage,
+    descriptor: &TenantNameDescriptor,
+) -> MeshDirectoryResult<TenantNameDescriptor> {
+    if descriptor.status != TenantNameStatus::Reserved {
+        return Err(MeshDirectoryError::InvalidState {
+            descriptor_key: descriptor.descriptor_key(),
+            state: format!("{:?}", descriptor.status),
+        });
+    }
+    if descriptor
+        .idempotency_key
+        .as_deref()
+        .unwrap_or_default()
+        .is_empty()
+        || descriptor
+            .reservation_expires_at
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+    {
+        return Err(MeshDirectoryError::InvalidState {
+            descriptor_key: descriptor.descriptor_key(),
+            state: "reserved tenant-name requires idempotency_key and reservation_expires_at"
+                .to_string(),
+        });
+    }
+
+    match create_descriptor(storage, &descriptor.descriptor_key(), descriptor).await {
+        Ok(()) => Ok(descriptor.clone()),
+        Err(MeshDirectoryError::Io(err)) if err.kind() == ErrorKind::AlreadyExists => {
+            let existing = read_tenant_name_descriptor(storage, &descriptor.tenant_name)
+                .await?
+                .ok_or_else(|| MeshDirectoryError::NotFound(descriptor.descriptor_key()))?;
+            if existing.tenant_id == descriptor.tenant_id
+                && (existing.status == TenantNameStatus::Active
+                    || existing.idempotency_key == descriptor.idempotency_key)
+            {
+                return Ok(existing);
+            }
+            Err(MeshDirectoryError::TenantNameAlreadyExists {
+                tenant_name: descriptor.tenant_name.as_str().to_string(),
+            })
+        }
+        Err(err) => Err(err),
+    }
+}
+
+pub async fn create_tenant_locator(
+    storage: &Storage,
+    locator: &TenantLocatorDescriptor,
+) -> MeshDirectoryResult<TenantLocatorDescriptor> {
+    match create_descriptor(storage, &locator.descriptor_key(), locator).await {
+        Ok(()) => Ok(locator.clone()),
+        Err(MeshDirectoryError::Io(err)) if err.kind() == ErrorKind::AlreadyExists => {
+            let existing = read_tenant_locator_descriptor(storage, &locator.tenant_id)
+                .await?
+                .ok_or_else(|| MeshDirectoryError::NotFound(locator.descriptor_key()))?;
+            if existing.tenant_id == locator.tenant_id
+                && existing.tenant_name == locator.tenant_name
+                && existing.home_region == locator.home_region
+            {
+                return Ok(existing);
+            }
+            Err(MeshDirectoryError::GenerationConflict {
+                descriptor_key: locator.descriptor_key(),
+                expected: 0,
+                actual: existing.generation,
+            })
+        }
+        Err(err) => Err(err),
+    }
+}
+
+pub async fn activate_tenant_name(
+    storage: &Storage,
+    tenant_name: &TenantName,
+    tenant_id: &TenantId,
+    expected_generation: u64,
+    now: impl Into<String>,
+) -> MeshDirectoryResult<TenantNameDescriptor> {
+    let now = now.into();
+    let existing = read_tenant_name_descriptor(storage, tenant_name)
+        .await?
+        .ok_or_else(|| MeshDirectoryError::NotFound(tenant_name.descriptor_key()))?;
+    if existing.tenant_id != *tenant_id {
+        return Err(MeshDirectoryError::TenantNameAlreadyExists {
+            tenant_name: tenant_name.as_str().to_string(),
+        });
+    }
+    if existing.status == TenantNameStatus::Active {
+        return Ok(existing);
+    }
+    if existing.status != TenantNameStatus::Reserved {
+        return Err(MeshDirectoryError::InvalidState {
+            descriptor_key: existing.descriptor_key(),
+            state: format!("{:?}", existing.status),
+        });
+    }
+    if existing.generation != expected_generation {
+        return Err(MeshDirectoryError::GenerationConflict {
+            descriptor_key: existing.descriptor_key(),
+            expected: expected_generation,
+            actual: existing.generation,
+        });
+    }
+    let active = existing.activate(now)?;
+    write_descriptor(storage, &active.descriptor_key(), &active).await?;
+    Ok(active)
+}
+
+pub async fn tombstone_tenant_name(
+    storage: &Storage,
+    tenant_name: &TenantName,
+    expected_generation: u64,
+    now: impl Into<String>,
+) -> MeshDirectoryResult<TenantNameDescriptor> {
+    let existing = read_tenant_name_descriptor(storage, tenant_name)
+        .await?
+        .ok_or_else(|| MeshDirectoryError::NotFound(tenant_name.descriptor_key()))?;
+    if existing.generation != expected_generation {
+        return Err(MeshDirectoryError::GenerationConflict {
+            descriptor_key: existing.descriptor_key(),
+            expected: expected_generation,
+            actual: existing.generation,
+        });
+    }
+    let tombstone = existing.tombstone(now)?;
+    write_descriptor(storage, &tombstone.descriptor_key(), &tombstone).await?;
+    Ok(tombstone)
+}
+
+pub async fn recover_tenant_name_reservation(
+    storage: &Storage,
+    tenant_name: &TenantName,
+    now: impl Into<String>,
+) -> MeshDirectoryResult<Option<TenantNameDescriptor>> {
+    let now = now.into();
+    let Some(existing) = read_tenant_name_descriptor(storage, tenant_name).await? else {
+        return Ok(None);
+    };
+    if existing.status != TenantNameStatus::Reserved {
+        return Ok(Some(existing));
+    }
+
+    if let Some(locator) = read_tenant_locator_descriptor(storage, &existing.tenant_id).await?
+        && locator.tenant_id == existing.tenant_id
+        && locator.tenant_name == existing.tenant_name
+    {
+        return activate_tenant_name(
+            storage,
+            tenant_name,
+            &existing.tenant_id,
+            existing.generation,
+            now,
+        )
+        .await
+        .map(Some);
+    }
+
+    let expires_at = existing.reservation_expires_at.as_deref().ok_or_else(|| {
+        MeshDirectoryError::InvalidState {
+            descriptor_key: existing.descriptor_key(),
+            state: "reserved tenant-name missing reservation_expires_at".to_string(),
+        }
+    })?;
+    let expires_at = parse_rfc3339(expires_at, "reservation_expires_at")?;
+    let now_dt = parse_rfc3339(&now, "now")?;
+    if expires_at <= now_dt {
+        return tombstone_tenant_name(storage, tenant_name, existing.generation, now)
+            .await
+            .map(Some);
+    }
+
+    Ok(Some(existing))
+}
+
 pub async fn write_bucket_locator(
     storage: &Storage,
     locator: &BucketLocatorDescriptor,
@@ -745,6 +1035,26 @@ async fn write_descriptor<T: Serialize>(
     file.sync_all().await?;
     drop(file);
     tokio::fs::rename(tmp_path, path).await?;
+    Ok(())
+}
+
+async fn create_descriptor<T: Serialize>(
+    storage: &Storage,
+    descriptor_key: &str,
+    descriptor: &T,
+) -> MeshDirectoryResult<()> {
+    let path = descriptor_path(storage, descriptor_key)?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await?;
+    let bytes = serde_json::to_vec_pretty(descriptor)?;
+    file.write_all(&bytes).await?;
+    file.sync_all().await?;
     Ok(())
 }
 
@@ -942,9 +1252,20 @@ fn require_nonempty(value: &str, field: &'static str) -> MeshDirectoryResult<()>
     Ok(())
 }
 
+fn parse_rfc3339(value: &str, field: &'static str) -> MeshDirectoryResult<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|_| MeshDirectoryError::InvalidTimestamp {
+            field,
+            value: value.to_string(),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::Storage;
+    use tempfile::tempdir;
 
     const NOW: &str = "2026-07-02T00:00:00Z";
 
@@ -1036,6 +1357,151 @@ mod tests {
             TenantName::canonicalize("prod.acme."),
             Err(MeshDirectoryError::InvalidTenantName(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn tenant_name_reservation_is_create_once_and_promoted_by_generation() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let tenant_name = TenantName::canonicalize("Acme").unwrap();
+        let tenant_id = TenantId::new("tenant_01").unwrap();
+        let reserved = TenantNameDescriptor::reserved(
+            MeshId::new("mesh_01").unwrap(),
+            tenant_name.clone(),
+            tenant_id.clone(),
+            "req-1",
+            "2026-07-02T00:05:00Z",
+            NOW,
+        )
+        .unwrap();
+
+        let written = reserve_tenant_name(&storage, &reserved).await.unwrap();
+        assert_eq!(written.status, TenantNameStatus::Reserved);
+        assert_eq!(written.generation, 1);
+
+        let retry = reserve_tenant_name(&storage, &reserved).await.unwrap();
+        assert_eq!(retry, written);
+
+        let active = activate_tenant_name(&storage, &tenant_name, &tenant_id, 1, NOW)
+            .await
+            .unwrap();
+        assert_eq!(active.status, TenantNameStatus::Active);
+        assert_eq!(active.generation, 2);
+        assert_eq!(active.idempotency_key.as_deref(), Some("req-1"));
+        assert_eq!(active.reservation_expires_at, None);
+
+        let active_retry = reserve_tenant_name(&storage, &reserved).await.unwrap();
+        assert_eq!(active_retry.status, TenantNameStatus::Active);
+        assert_eq!(active_retry.generation, 2);
+    }
+
+    #[tokio::test]
+    async fn tenant_name_reservation_rejects_competing_tenant_ids_and_stale_generations() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let tenant_name = TenantName::canonicalize("Acme").unwrap();
+        let tenant_id = TenantId::new("tenant_01").unwrap();
+        let reserved = TenantNameDescriptor::reserved(
+            MeshId::new("mesh_01").unwrap(),
+            tenant_name.clone(),
+            tenant_id.clone(),
+            "req-1",
+            "2026-07-02T00:05:00Z",
+            NOW,
+        )
+        .unwrap();
+        reserve_tenant_name(&storage, &reserved).await.unwrap();
+
+        let competing = TenantNameDescriptor::reserved(
+            MeshId::new("mesh_01").unwrap(),
+            tenant_name.clone(),
+            TenantId::new("tenant_02").unwrap(),
+            "req-2",
+            "2026-07-02T00:05:00Z",
+            NOW,
+        )
+        .unwrap();
+        assert!(matches!(
+            reserve_tenant_name(&storage, &competing).await,
+            Err(MeshDirectoryError::TenantNameAlreadyExists { tenant_name })
+                if tenant_name == "acme"
+        ));
+
+        assert!(matches!(
+            activate_tenant_name(&storage, &tenant_name, &tenant_id, 99, NOW).await,
+            Err(MeshDirectoryError::GenerationConflict {
+                expected: 99,
+                actual: 1,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn tenant_name_recovery_completes_reserved_name_when_locator_exists() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let mesh_id = MeshId::new("mesh_01").unwrap();
+        let tenant_name = TenantName::canonicalize("Acme").unwrap();
+        let tenant_id = TenantId::new("tenant_01").unwrap();
+        let reserved = TenantNameDescriptor::reserved(
+            mesh_id.clone(),
+            tenant_name.clone(),
+            tenant_id.clone(),
+            "req-1",
+            "2026-07-02T00:05:00Z",
+            NOW,
+        )
+        .unwrap();
+        reserve_tenant_name(&storage, &reserved).await.unwrap();
+        create_tenant_locator(
+            &storage,
+            &TenantLocatorDescriptor::active(
+                mesh_id,
+                tenant_id,
+                tenant_name.clone(),
+                RegionName::new("eu-west-1").unwrap(),
+                NOW,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let recovered =
+            recover_tenant_name_reservation(&storage, &tenant_name, "2026-07-02T00:01:00Z")
+                .await
+                .unwrap()
+                .expect("recovered tenant-name");
+
+        assert_eq!(recovered.status, TenantNameStatus::Active);
+        assert_eq!(recovered.generation, 2);
+    }
+
+    #[tokio::test]
+    async fn tenant_name_recovery_tombstones_expired_reserved_name_without_locator() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let tenant_name = TenantName::canonicalize("Acme").unwrap();
+        let reserved = TenantNameDescriptor::reserved(
+            MeshId::new("mesh_01").unwrap(),
+            tenant_name.clone(),
+            TenantId::new("tenant_01").unwrap(),
+            "req-1",
+            "2026-07-02T00:05:00Z",
+            NOW,
+        )
+        .unwrap();
+        reserve_tenant_name(&storage, &reserved).await.unwrap();
+
+        let recovered =
+            recover_tenant_name_reservation(&storage, &tenant_name, "2026-07-02T00:06:00Z")
+                .await
+                .unwrap()
+                .expect("recovered tenant-name");
+
+        assert_eq!(recovered.status, TenantNameStatus::Tombstoned);
+        assert_eq!(recovered.generation, 2);
     }
 
     fn locator(tenant_id: &str, bucket_id: &str) -> BucketLocatorDescriptor {
