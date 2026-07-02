@@ -4,6 +4,7 @@ use crate::{
     AppState, access_control,
     anvil_personaldb_sqlite_changeset::iterate_changeset,
     auth, authz_journal,
+    authz_scope::{DEFAULT_AUTHZ_REALM_ID, encode_realm_namespace},
     error_codes::AnvilErrorCode,
     formats::{Hash32, hash32, personaldb::PersonalDbLogRecord as CorePersonalDbLogRecord},
     partition_fence::{
@@ -1427,10 +1428,11 @@ impl AppState {
             .map_err(|_| Status::internal("Invalid projection authorization revision"))?;
         let mut allowed = Vec::new();
         for check in checks {
+            let scoped_namespace = encode_realm_namespace(DEFAULT_AUTHZ_REALM_ID, &check.namespace);
             let is_allowed = authz_journal::resolve_permission_at_revision(
                 &self.storage,
                 tenant_id,
-                &check.namespace,
+                &scoped_namespace,
                 &check.object_id,
                 &check.relation,
                 access_control::APP_SUBJECT_KIND,
