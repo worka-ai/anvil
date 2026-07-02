@@ -1,5 +1,5 @@
 use crate::storage::Storage;
-use crate::validation;
+use crate::{routing, validation};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::fmt;
@@ -16,6 +16,7 @@ pub const BUCKET_LOCATOR_SCHEMA: &str = "anvil.mesh.bucket_locator.v1";
 const TENANT_NAME_PARTITION_DOMAIN: &str = "tenant-name";
 const TENANT_LOCATOR_PARTITION_DOMAIN: &str = "tenant-locator";
 const BUCKET_LOCATOR_PARTITION_DOMAIN: &str = "bucket-locator";
+const HOST_ALIAS_PARTITION_DOMAIN: &str = "host-alias";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -23,11 +24,17 @@ pub enum RoutingRecordFamily {
     TenantName,
     TenantLocator,
     BucketLocator,
+    HostAlias,
 }
 
 impl RoutingRecordFamily {
-    pub fn all() -> [Self; 3] {
-        [Self::TenantName, Self::TenantLocator, Self::BucketLocator]
+    pub fn all() -> [Self; 4] {
+        [
+            Self::TenantName,
+            Self::TenantLocator,
+            Self::BucketLocator,
+            Self::HostAlias,
+        ]
     }
 
     pub fn directory_segment(self) -> &'static str {
@@ -35,6 +42,7 @@ impl RoutingRecordFamily {
             Self::TenantName => "tenant-names",
             Self::TenantLocator => "tenants",
             Self::BucketLocator => "buckets",
+            Self::HostAlias => "host-aliases",
         }
     }
 }
@@ -543,6 +551,59 @@ impl BucketLocatorDescriptor {
     }
 }
 
+pub fn host_alias_partition_key(hostname: &str) -> MeshDirectoryResult<Vec<u8>> {
+    let hostname = routing::normalize_alias_hostname(hostname).map_err(|_| {
+        MeshDirectoryError::InvalidIdentifier {
+            field: "hostname",
+            value: hostname.to_string(),
+        }
+    })?;
+    Ok(partition_key_bytes(
+        HOST_ALIAS_PARTITION_DOMAIN,
+        &[&hostname],
+    ))
+}
+
+pub fn host_alias_partition(hostname: &str) -> MeshDirectoryResult<String> {
+    Ok(stable_partition_prefix(&host_alias_partition_key(
+        hostname,
+    )?))
+}
+
+pub fn host_alias_descriptor_key(hostname: &str) -> MeshDirectoryResult<String> {
+    let hostname = routing::normalize_alias_hostname(hostname).map_err(|_| {
+        MeshDirectoryError::InvalidIdentifier {
+            field: "hostname",
+            value: hostname.to_string(),
+        }
+    })?;
+    let partition = host_alias_partition(&hostname)?;
+    Ok(join_mesh_key(&[
+        "host-aliases",
+        &partition,
+        &format!("{hostname}.json"),
+    ]))
+}
+
+pub async fn write_host_alias_descriptor(
+    storage: &Storage,
+    descriptor: &routing::HostAliasDescriptor,
+) -> MeshDirectoryResult<()> {
+    write_descriptor(
+        storage,
+        &host_alias_descriptor_key(&descriptor.hostname)?,
+        descriptor,
+    )
+    .await
+}
+
+pub async fn read_host_alias_descriptor(
+    storage: &Storage,
+    hostname: &str,
+) -> MeshDirectoryResult<Option<routing::HostAliasDescriptor>> {
+    read_optional_descriptor(storage, &host_alias_descriptor_key(hostname)?).await
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BucketLocatorDirectory {
     locators: BTreeMap<BucketLocatorKey, BucketLocatorDescriptor>,
@@ -775,7 +836,9 @@ fn routing_record_key(family: RoutingRecordFamily, relative: &Path) -> MeshDirec
         .map(|segment| segment.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     match family {
-        RoutingRecordFamily::TenantName | RoutingRecordFamily::TenantLocator => segments
+        RoutingRecordFamily::TenantName
+        | RoutingRecordFamily::TenantLocator
+        | RoutingRecordFamily::HostAlias => segments
             .get(2)
             .and_then(|file| file.strip_suffix(".json"))
             .map(str::to_string)

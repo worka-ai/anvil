@@ -150,18 +150,11 @@ async fn s3_host_routing(State(state): State<AppState>, mut req: Request, next: 
         return next.run(req).await;
     };
 
-    let aliases = match active_s3_host_aliases(&state).await {
-        Ok(aliases) => aliases,
-        Err(response) => return response,
+    let request = RouteRequest {
+        host: &host,
+        path: req.uri().path(),
     };
-    match routing::parse_object_route(
-        RouteRequest {
-            host: &host,
-            path: req.uri().path(),
-        },
-        &config,
-        &aliases,
-    ) {
+    match routing::parse_object_route(request.clone(), &config, &[]) {
         Ok(route) => {
             if let Err(err) = rewrite_s3_host_route_uri(&mut req, &route) {
                 return s3_routing_error(err);
@@ -169,20 +162,42 @@ async fn s3_host_routing(State(state): State<AppState>, mut req: Request, next: 
             req.extensions_mut().insert(S3HostRoute(route));
             next.run(req).await
         }
-        Err(RoutingError::UnknownHost) => next.run(req).await,
+        Err(RoutingError::UnknownHost) => {
+            let alias = match active_s3_host_alias(&state, &host).await {
+                Ok(Some(alias)) => alias,
+                Ok(None) => return next.run(req).await,
+                Err(response) => return response,
+            };
+            match routing::parse_object_route(request, &config, &[alias]) {
+                Ok(route) => {
+                    if let Err(err) = rewrite_s3_host_route_uri(&mut req, &route) {
+                        return s3_routing_error(err);
+                    }
+                    req.extensions_mut().insert(S3HostRoute(route));
+                    next.run(req).await
+                }
+                Err(RoutingError::UnknownHost) => next.run(req).await,
+                Err(err) => s3_routing_error(err),
+            }
+        }
         Err(err) => s3_routing_error(err),
     }
 }
 
-async fn active_s3_host_aliases(state: &AppState) -> Result<Vec<HostAliasDescriptor>, Response> {
-    match state.persistence.list_host_alias_descriptors(None).await {
-        Ok(aliases) => Ok(aliases
-            .into_iter()
-            .filter(|alias| alias.state == routing::HostAliasState::Active)
-            .collect()),
+async fn active_s3_host_alias(
+    state: &AppState,
+    host: &str,
+) -> Result<Option<HostAliasDescriptor>, Response> {
+    let host = match routing::normalize_alias_hostname(host) {
+        Ok(host) => host,
+        Err(_) => return Ok(None),
+    };
+    match state.persistence.get_host_alias_descriptor(&host).await {
+        Ok(Some(alias)) if alias.state == routing::HostAliasState::Active => Ok(Some(alias)),
+        Ok(_) => Ok(None),
         Err(error) => Err(s3_error(
             "InternalError",
-            &format!("Failed to load host aliases: {error}"),
+            &format!("Failed to load host alias: {error}"),
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
         )),
     }

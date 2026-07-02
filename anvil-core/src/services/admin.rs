@@ -1085,6 +1085,7 @@ fn routing_record_family_from_proto(
         1 => Ok(Some(mesh_directory::RoutingRecordFamily::TenantName)),
         2 => Ok(Some(mesh_directory::RoutingRecordFamily::TenantLocator)),
         3 => Ok(Some(mesh_directory::RoutingRecordFamily::BucketLocator)),
+        4 => Ok(Some(mesh_directory::RoutingRecordFamily::HostAlias)),
         _ => Err(Status::invalid_argument("Invalid routing record family")),
     }
 }
@@ -1094,6 +1095,7 @@ fn routing_record_family_to_proto(value: mesh_directory::RoutingRecordFamily) ->
         mesh_directory::RoutingRecordFamily::TenantName => 1,
         mesh_directory::RoutingRecordFamily::TenantLocator => 2,
         mesh_directory::RoutingRecordFamily::BucketLocator => 3,
+        mesh_directory::RoutingRecordFamily::HostAlias => 4,
     }
 }
 

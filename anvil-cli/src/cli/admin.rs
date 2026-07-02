@@ -457,6 +457,7 @@ pub enum RoutingRecordFamilyArg {
     TenantName,
     TenantLocator,
     BucketLocator,
+    HostAlias,
 }
 
 impl RoutingRecordFamilyArg {
@@ -465,6 +466,7 @@ impl RoutingRecordFamilyArg {
             Self::TenantName => 1,
             Self::TenantLocator => 2,
             Self::BucketLocator => 3,
+            Self::HostAlias => 4,
         }
     }
 }

@@ -740,6 +740,30 @@ async fn admin_host_aliases_are_generation_checked_and_lifecycle_managed() {
     assert_eq!(read.state, 2);
     assert_eq!(read.generation, active.generation);
 
+    let routing_records = client
+        .list_routing_records(with_auth(
+            tonic::Request::new(ListRoutingRecordsRequest {
+                family: 4,
+                page: None,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .records;
+    let host_alias_record = routing_records
+        .iter()
+        .find(|record| record.record_key == "cdn.example.com")
+        .expect("host alias routing record should be materialised");
+    assert_eq!(host_alias_record.family, 4);
+    assert_eq!(host_alias_record.generation, active.generation);
+    assert!(
+        host_alias_record
+            .payload_json
+            .contains("\"cdn.example.com\"")
+    );
+
     let listed = client
         .list_host_aliases(with_auth(
             tonic::Request::new(ListHostAliasesRequest {

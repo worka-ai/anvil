@@ -661,6 +661,17 @@ impl Persistence {
                     .ok_or_else(|| anyhow!("bucket not found"))?;
                 self.write_mesh_bucket_locator(&bucket).await?;
             }
+            mesh_directory::RoutingRecordFamily::HostAlias => {
+                let hostname = crate::routing::normalize_alias_hostname(record_key)
+                    .map_err(|err| anyhow!(err.to_string()))?;
+                let descriptor = crate::mesh_lifecycle::list_host_aliases(&self.storage, None)
+                    .await
+                    .map_err(|err| anyhow!(err.to_string()))?
+                    .into_iter()
+                    .find(|alias| alias.hostname == hostname)
+                    .ok_or_else(|| anyhow!("host alias not found"))?;
+                mesh_directory::write_host_alias_descriptor(&self.storage, &descriptor).await?;
+            }
         }
 
         self.list_mesh_routing_records(Some(family))
@@ -1200,7 +1211,12 @@ impl Persistence {
         routing_config: &crate::routing::RoutingConfig,
         input: crate::mesh_lifecycle::CreateHostAliasDescriptor,
     ) -> crate::mesh_lifecycle::LifecycleResult<crate::routing::HostAliasDescriptor> {
-        crate::mesh_lifecycle::create_host_alias(&self.storage, routing_config, input).await
+        let descriptor =
+            crate::mesh_lifecycle::create_host_alias(&self.storage, routing_config, input).await?;
+        mesh_directory::write_host_alias_descriptor(&self.storage, &descriptor)
+            .await
+            .map_err(mesh_directory_lifecycle_error)?;
+        Ok(descriptor)
     }
 
     pub async fn transition_host_alias_descriptor(
@@ -1209,24 +1225,26 @@ impl Persistence {
         expected_generation: u64,
         target: crate::routing::HostAliasState,
     ) -> crate::mesh_lifecycle::LifecycleResult<crate::routing::HostAliasDescriptor> {
-        crate::mesh_lifecycle::transition_host_alias(
+        let descriptor = crate::mesh_lifecycle::transition_host_alias(
             &self.storage,
             hostname,
             expected_generation,
             target,
         )
-        .await
+        .await?;
+        mesh_directory::write_host_alias_descriptor(&self.storage, &descriptor)
+            .await
+            .map_err(mesh_directory_lifecycle_error)?;
+        Ok(descriptor)
     }
 
     pub async fn get_host_alias_descriptor(
         &self,
         hostname: &str,
     ) -> crate::mesh_lifecycle::LifecycleResult<Option<crate::routing::HostAliasDescriptor>> {
-        let hostname = crate::routing::normalize_alias_hostname(hostname).map_err(|err| {
-            crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
-        })?;
-        let state = crate::mesh_lifecycle::read_state(&self.storage).await?;
-        Ok(state.host_aliases.get(&hostname).cloned())
+        mesh_directory::read_host_alias_descriptor(&self.storage, hostname)
+            .await
+            .map_err(mesh_directory_lifecycle_error)
     }
 
     pub async fn list_host_alias_descriptors(
@@ -3986,6 +4004,36 @@ fn nonempty_or(value: &str, fallback: &str) -> String {
         fallback.to_string()
     } else {
         value.to_string()
+    }
+}
+
+fn mesh_directory_lifecycle_error(
+    err: mesh_directory::MeshDirectoryError,
+) -> crate::mesh_lifecycle::LifecycleError {
+    match err {
+        mesh_directory::MeshDirectoryError::InvalidTenantName(message)
+        | mesh_directory::MeshDirectoryError::InvalidBucketName(message)
+        | mesh_directory::MeshDirectoryError::NotFound(message) => {
+            crate::mesh_lifecycle::LifecycleError::InvalidArgument(message)
+        }
+        mesh_directory::MeshDirectoryError::InvalidIdentifier { field, value } => {
+            crate::mesh_lifecycle::LifecycleError::InvalidArgument(format!(
+                "invalid {field}: {value}"
+            ))
+        }
+        mesh_directory::MeshDirectoryError::DuplicateBucketLocator {
+            tenant_id,
+            bucket_name,
+        } => crate::mesh_lifecycle::LifecycleError::AlreadyExists {
+            resource_kind: "bucket locator",
+            resource_id: format!("{tenant_id}/{bucket_name}"),
+        },
+        mesh_directory::MeshDirectoryError::Io(err) => {
+            crate::mesh_lifecycle::LifecycleError::Io(err)
+        }
+        mesh_directory::MeshDirectoryError::Json(err) => {
+            crate::mesh_lifecycle::LifecycleError::Json(err)
+        }
     }
 }
 
