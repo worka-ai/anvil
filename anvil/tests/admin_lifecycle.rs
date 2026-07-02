@@ -1,4 +1,5 @@
 use anvil::anvil_api::admin_service_client::AdminServiceClient;
+use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::*;
 use anvil_test_utils::wait_for_port;
 use std::time::Duration;
@@ -472,6 +473,110 @@ async fn admin_lifecycle_rejects_invalid_region_cell_and_node_transitions() {
         .into_inner();
     assert_eq!(listed.nodes.len(), 1);
     assert_eq!(listed.nodes[0].state, 4);
+}
+
+#[tokio::test]
+async fn admin_tenant_app_and_bucket_workflow_issues_usable_credentials() {
+    let node = spawn_admin_node().await;
+    let token = admin_token(&node);
+    let mut admin_client = AdminServiceClient::connect(node.admin_url.clone())
+        .await
+        .unwrap();
+
+    let tenant = admin_client
+        .create_tenant(with_auth(
+            tonic::Request::new(CreateTenantRequest {
+                context: Some(context("admin-create-tenant", 0)),
+                name: "operator-tenant".to_string(),
+                home_region: "eu-west-1".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .tenant
+        .unwrap();
+    assert_eq!(tenant.name, "operator-tenant");
+
+    let app_secret = admin_client
+        .create_application(with_auth(
+            tonic::Request::new(CreateApplicationRequest {
+                context: Some(context("admin-create-app", 0)),
+                tenant_id: tenant.tenant_id.clone(),
+                app_name: "publisher".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(app_secret.tenant_id, tenant.tenant_id);
+    assert_eq!(app_secret.app_name, "publisher");
+    assert!(app_secret.client_id.starts_with("app_"));
+    assert!(app_secret.client_secret.starts_with("secret_"));
+
+    let app_details = node
+        .state
+        .persistence
+        .get_app_by_client_id(&app_secret.client_id)
+        .await
+        .unwrap()
+        .unwrap();
+    node.state
+        .persistence
+        .grant_policy(app_details.id, "*", "*")
+        .await
+        .unwrap();
+
+    let mut auth_client = AuthServiceClient::connect(node.public_url.clone())
+        .await
+        .unwrap();
+    let token_response = auth_client
+        .get_access_token(tonic::Request::new(GetAccessTokenRequest {
+            client_id: app_secret.client_id.clone(),
+            client_secret: app_secret.client_secret.clone(),
+            scopes: vec!["*".to_string()],
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!token_response.access_token.is_empty());
+
+    let bucket = admin_client
+        .create_bucket_admin(with_auth(
+            tonic::Request::new(CreateBucketAdminRequest {
+                context: Some(context("admin-create-bucket", 0)),
+                tenant_id: tenant.tenant_id.clone(),
+                bucket_name: "release-assets".to_string(),
+                region: "eu-west-1".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket
+        .unwrap();
+    assert_eq!(bucket.name, "release-assets");
+    assert!(!bucket.is_public_read);
+
+    let public_bucket = admin_client
+        .set_bucket_public_access_admin(with_auth(
+            tonic::Request::new(SetBucketPublicAccessAdminRequest {
+                context: Some(context("admin-public-bucket", 1)),
+                tenant_id: tenant.tenant_id,
+                bucket_name: "release-assets".to_string(),
+                allow_public_read: true,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket
+        .unwrap();
+    assert!(public_bucket.is_public_read);
 }
 
 #[tokio::test]

@@ -2,6 +2,9 @@ use crate::auth::Claims;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnvilAdminCapability {
+    ManageTenants,
+    ManageApps,
+    ManageBuckets,
     ManageNodes,
     ManageRegions,
     ManageRouting,
@@ -13,6 +16,9 @@ pub enum AnvilAdminCapability {
 impl AnvilAdminCapability {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::ManageTenants => "manage_tenants",
+            Self::ManageApps => "manage_apps",
+            Self::ManageBuckets => "manage_buckets",
             Self::ManageNodes => "manage_nodes",
             Self::ManageRegions => "manage_regions",
             Self::ManageRouting => "manage_routing",

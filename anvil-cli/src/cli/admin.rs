@@ -7,6 +7,21 @@ use std::str::FromStr;
 
 #[derive(Subcommand)]
 pub enum AdminCommands {
+    /// Manage tenants
+    Tenant {
+        #[clap(subcommand)]
+        command: TenantCommands,
+    },
+    /// Manage applications
+    App {
+        #[clap(subcommand)]
+        command: AppCommands,
+    },
+    /// Manage buckets through the administrative plane
+    Bucket {
+        #[clap(subcommand)]
+        command: BucketCommands,
+    },
     /// Manage mesh regions
     Region {
         #[clap(subcommand)]
@@ -36,6 +51,76 @@ pub enum AdminCommands {
     Routing {
         #[clap(subcommand)]
         command: RoutingCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TenantCommands {
+    /// Create a tenant
+    Create {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        name: String,
+        #[clap(long, default_value = "")]
+        home_region: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AppCommands {
+    /// Create an application credential
+    Create {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        tenant_id: String,
+        #[clap(long)]
+        app_name: String,
+    },
+    /// Rotate an application secret
+    RotateSecret {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        tenant_id: String,
+        #[clap(long)]
+        app_name: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum BucketCommands {
+    /// Create a bucket for a tenant
+    Create {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        tenant_id: String,
+        #[clap(long)]
+        bucket_name: String,
+        #[clap(long)]
+        region: String,
+    },
+    /// Manage public access
+    PublicAccess {
+        #[clap(subcommand)]
+        command: BucketPublicAccessCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum BucketPublicAccessCommands {
+    /// Set public read access on a bucket
+    Set {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        tenant_id: String,
+        #[clap(long)]
+        bucket_name: String,
+        #[clap(long, action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
+        allow: bool,
     },
 }
 
@@ -543,6 +628,13 @@ pub async fn handle_admin_command(command: &AdminCommands, ctx: &Context) -> any
     let mut client = AdminServiceClient::connect(ctx.profile.host.clone()).await?;
 
     match command {
+        AdminCommands::Tenant { command } => {
+            handle_tenant_command(command, &mut client, &token).await?
+        }
+        AdminCommands::App { command } => handle_app_command(command, &mut client, &token).await?,
+        AdminCommands::Bucket { command } => {
+            handle_bucket_command(command, &mut client, &token).await?
+        }
         AdminCommands::Region { command } => {
             handle_region_command(command, &mut client, &token).await?
         }
@@ -563,6 +655,133 @@ pub async fn handle_admin_command(command: &AdminCommands, ctx: &Context) -> any
         }
     }
 
+    Ok(())
+}
+
+async fn handle_tenant_command(
+    command: &TenantCommands,
+    client: &mut AdminServiceClient<tonic::transport::Channel>,
+    token: &str,
+) -> anyhow::Result<()> {
+    match command {
+        TenantCommands::Create {
+            context,
+            name,
+            home_region,
+        } => {
+            let response = client
+                .create_tenant(with_auth(
+                    api::CreateTenantRequest {
+                        context: Some(context.to_context()),
+                        name: name.clone(),
+                        home_region: home_region.clone(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_app_command(
+    command: &AppCommands,
+    client: &mut AdminServiceClient<tonic::transport::Channel>,
+    token: &str,
+) -> anyhow::Result<()> {
+    match command {
+        AppCommands::Create {
+            context,
+            tenant_id,
+            app_name,
+        } => {
+            let response = client
+                .create_application(with_auth(
+                    api::CreateApplicationRequest {
+                        context: Some(context.to_context()),
+                        tenant_id: tenant_id.clone(),
+                        app_name: app_name.clone(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        AppCommands::RotateSecret {
+            context,
+            tenant_id,
+            app_name,
+        } => {
+            let response = client
+                .rotate_application_secret(with_auth(
+                    api::RotateApplicationSecretRequest {
+                        context: Some(context.to_context()),
+                        tenant_id: tenant_id.clone(),
+                        app_name: app_name.clone(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_bucket_command(
+    command: &BucketCommands,
+    client: &mut AdminServiceClient<tonic::transport::Channel>,
+    token: &str,
+) -> anyhow::Result<()> {
+    match command {
+        BucketCommands::Create {
+            context,
+            tenant_id,
+            bucket_name,
+            region,
+        } => {
+            let response = client
+                .create_bucket_admin(with_auth(
+                    api::CreateBucketAdminRequest {
+                        context: Some(context.to_context()),
+                        tenant_id: tenant_id.clone(),
+                        bucket_name: bucket_name.clone(),
+                        region: region.clone(),
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+        BucketCommands::PublicAccess {
+            command:
+                BucketPublicAccessCommands::Set {
+                    context,
+                    tenant_id,
+                    bucket_name,
+                    allow,
+                },
+        } => {
+            let response = client
+                .set_bucket_public_access_admin(with_auth(
+                    api::SetBucketPublicAccessAdminRequest {
+                        context: Some(context.to_context()),
+                        tenant_id: tenant_id.clone(),
+                        bucket_name: bucket_name.clone(),
+                        allow_public_read: *allow,
+                    },
+                    token,
+                )?)
+                .await?
+                .into_inner();
+            print_json(&response)?;
+        }
+    }
     Ok(())
 }
 
@@ -1603,6 +1822,104 @@ mod tests {
         assert_eq!(context.expected_generation, 1);
         assert_eq!(family.to_proto(), 1);
         assert_eq!(record_key, "acme");
+    }
+
+    #[test]
+    fn tenant_app_and_bucket_admin_commands_parse() {
+        let tenant_cli = TestAdminCli::try_parse_from([
+            "admin",
+            "tenant",
+            "create",
+            "--audit-reason",
+            "create tenant",
+            "--expected-generation",
+            "0",
+            "--name",
+            "acme",
+            "--home-region",
+            "eu-west-1",
+        ])
+        .unwrap();
+        let AdminCommands::Tenant {
+            command:
+                TenantCommands::Create {
+                    context,
+                    name,
+                    home_region,
+                },
+        } = tenant_cli.command
+        else {
+            panic!("expected tenant create command");
+        };
+        assert_eq!(context.audit_reason, "create tenant");
+        assert_eq!(name, "acme");
+        assert_eq!(home_region, "eu-west-1");
+
+        let app_cli = TestAdminCli::try_parse_from([
+            "admin",
+            "app",
+            "rotate-secret",
+            "--audit-reason",
+            "rotate app",
+            "--expected-generation",
+            "1",
+            "--tenant-id",
+            "acme",
+            "--app-name",
+            "publisher",
+        ])
+        .unwrap();
+        let AdminCommands::App {
+            command:
+                AppCommands::RotateSecret {
+                    context,
+                    tenant_id,
+                    app_name,
+                },
+        } = app_cli.command
+        else {
+            panic!("expected app rotate-secret command");
+        };
+        assert_eq!(context.expected_generation, 1);
+        assert_eq!(tenant_id, "acme");
+        assert_eq!(app_name, "publisher");
+
+        let bucket_cli = TestAdminCli::try_parse_from([
+            "admin",
+            "bucket",
+            "public-access",
+            "set",
+            "--audit-reason",
+            "publish bucket",
+            "--expected-generation",
+            "1",
+            "--tenant-id",
+            "acme",
+            "--bucket-name",
+            "releases",
+            "--allow",
+            "true",
+        ])
+        .unwrap();
+        let AdminCommands::Bucket {
+            command:
+                BucketCommands::PublicAccess {
+                    command:
+                        BucketPublicAccessCommands::Set {
+                            context,
+                            tenant_id,
+                            bucket_name,
+                            allow,
+                        },
+                },
+        } = bucket_cli.command
+        else {
+            panic!("expected bucket public-access set command");
+        };
+        assert_eq!(context.audit_reason, "publish bucket");
+        assert_eq!(tenant_id, "acme");
+        assert_eq!(bucket_name, "releases");
+        assert!(allow);
     }
 
     #[tokio::test]

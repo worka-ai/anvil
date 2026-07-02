@@ -12,11 +12,140 @@ use crate::routing::{
     self, HostAliasDescriptor as CoreHostAliasDescriptor, HostAliasState as CoreHostAliasState,
     RoutingConfig,
 };
-use crate::{AppState, auth, mesh_directory};
+use crate::{AppState, auth, crypto, mesh_directory, persistence::Bucket};
 use tonic::{Request, Response, Status};
 
 #[tonic::async_trait]
 impl AdminService for AppState {
+    async fn create_tenant(
+        &self,
+        request: Request<CreateTenantRequest>,
+    ) -> Result<Response<TenantAdminResponse>, Status> {
+        let principal = require_admin(&request, self, AnvilAdminCapability::ManageTenants)?;
+        let req = request.into_inner();
+        let context = require_mutation_context(req.context.as_ref(), true)?;
+        let tenant = self
+            .persistence
+            .create_tenant(&req.name, "admin-created")
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?;
+        Ok(Response::new(TenantAdminResponse {
+            request_id: context.request_id.clone(),
+            tenant: Some(TenantAdminDescriptor {
+                tenant_id: tenant.id.to_string(),
+                name: tenant.name,
+                home_region: if req.home_region.trim().is_empty() {
+                    self.config.region.clone()
+                } else {
+                    req.home_region
+                },
+            }),
+            audit_event_id: audit_event_id(&principal, context),
+        }))
+    }
+
+    async fn create_application(
+        &self,
+        request: Request<CreateApplicationRequest>,
+    ) -> Result<Response<ApplicationSecretResponse>, Status> {
+        let principal = require_admin(&request, self, AnvilAdminCapability::ManageApps)?;
+        let req = request.into_inner();
+        let context = require_mutation_context(req.context.as_ref(), true)?;
+        let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
+        let client_id = generated_client_id();
+        let client_secret = generated_client_secret();
+        let encrypted_secret = encrypt_admin_client_secret(self, &client_secret)?;
+        let app = self
+            .persistence
+            .create_app(tenant_id, &req.app_name, &client_id, &encrypted_secret)
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?;
+        Ok(Response::new(ApplicationSecretResponse {
+            request_id: context.request_id.clone(),
+            tenant_id: tenant_id.to_string(),
+            app_name: app.name,
+            client_id: app.client_id,
+            client_secret,
+            audit_event_id: audit_event_id(&principal, context),
+        }))
+    }
+
+    async fn rotate_application_secret(
+        &self,
+        request: Request<RotateApplicationSecretRequest>,
+    ) -> Result<Response<ApplicationSecretResponse>, Status> {
+        let principal = require_admin(&request, self, AnvilAdminCapability::ManageApps)?;
+        let req = request.into_inner();
+        let context = require_mutation_context(req.context.as_ref(), false)?;
+        let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
+        let app = self
+            .persistence
+            .list_apps_for_tenant(tenant_id)
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?
+            .into_iter()
+            .find(|app| app.name == req.app_name)
+            .ok_or_else(|| Status::not_found("Application not found"))?;
+        let client_secret = generated_client_secret();
+        let encrypted_secret = encrypt_admin_client_secret(self, &client_secret)?;
+        self.persistence
+            .update_app_secret(app.id, &encrypted_secret)
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?;
+        Ok(Response::new(ApplicationSecretResponse {
+            request_id: context.request_id.clone(),
+            tenant_id: tenant_id.to_string(),
+            app_name: app.name,
+            client_id: app.client_id,
+            client_secret,
+            audit_event_id: audit_event_id(&principal, context),
+        }))
+    }
+
+    async fn create_bucket_admin(
+        &self,
+        request: Request<CreateBucketAdminRequest>,
+    ) -> Result<Response<BucketAdminResponse>, Status> {
+        let principal = require_admin(&request, self, AnvilAdminCapability::ManageBuckets)?;
+        let req = request.into_inner();
+        let context = require_mutation_context(req.context.as_ref(), true)?;
+        let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
+        let bucket = self
+            .persistence
+            .create_bucket(tenant_id, &req.bucket_name, &req.region)
+            .await?;
+        Ok(Response::new(BucketAdminResponse {
+            request_id: context.request_id.clone(),
+            bucket: Some(bucket_to_proto(bucket)),
+            audit_event_id: audit_event_id(&principal, context),
+        }))
+    }
+
+    async fn set_bucket_public_access_admin(
+        &self,
+        request: Request<SetBucketPublicAccessAdminRequest>,
+    ) -> Result<Response<BucketAdminResponse>, Status> {
+        let principal = require_admin(&request, self, AnvilAdminCapability::ManageBuckets)?;
+        let req = request.into_inner();
+        let context = require_mutation_context(req.context.as_ref(), false)?;
+        let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
+        self.persistence
+            .set_bucket_public_access(tenant_id, &req.bucket_name, req.allow_public_read)
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?;
+        let bucket = self
+            .persistence
+            .get_bucket_by_name(tenant_id, &req.bucket_name)
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?
+            .ok_or_else(|| Status::not_found("Bucket not found"))?;
+        Ok(Response::new(BucketAdminResponse {
+            request_id: context.request_id.clone(),
+            bucket: Some(bucket_to_proto(bucket)),
+            audit_event_id: audit_event_id(&principal, context),
+        }))
+    }
+
     async fn create_object_link(
         &self,
         request: Request<CreateObjectLinkRequest>,
@@ -910,6 +1039,34 @@ fn audit_event_id(principal: &AdminPrincipal, context: &AdminRequestContext) -> 
 
 fn principal_label(principal: &AdminPrincipal) -> String {
     format!("principal:{}", principal.principal_id)
+}
+
+fn generated_client_id() -> String {
+    format!("app_{}", uuid::Uuid::new_v4().simple())
+}
+
+fn generated_client_secret() -> String {
+    format!("secret_{}", uuid::Uuid::new_v4().simple())
+}
+
+fn encrypt_admin_client_secret(state: &AppState, client_secret: &str) -> Result<Vec<u8>, Status> {
+    let encryption_key = hex::decode(&state.config.anvil_secret_encryption_key)
+        .map_err(|_| Status::internal("Invalid encryption key format"))?;
+    crypto::encrypt(client_secret.as_bytes(), &encryption_key)
+        .map_err(|err| Status::internal(err.to_string()))
+}
+
+fn bucket_to_proto(bucket: Bucket) -> crate::anvil_api::Bucket {
+    crate::anvil_api::Bucket {
+        name: bucket.name,
+        creation_date: bucket
+            .created_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        region: bucket.region,
+        is_public_read: bucket.is_public_read,
+        deleted: false,
+        bucket_id: bucket.id,
+    }
 }
 
 async fn resolve_link_bucket(

@@ -3,6 +3,12 @@ syntax = "proto3";
 package anvil;
 
 service AdminService {
+  rpc CreateTenant(CreateTenantRequest) returns (TenantAdminResponse);
+  rpc CreateApplication(CreateApplicationRequest) returns (ApplicationSecretResponse);
+  rpc RotateApplicationSecret(RotateApplicationSecretRequest) returns (ApplicationSecretResponse);
+  rpc CreateBucketAdmin(CreateBucketAdminRequest) returns (BucketAdminResponse);
+  rpc SetBucketPublicAccessAdmin(SetBucketPublicAccessAdminRequest) returns (BucketAdminResponse);
+
   rpc CreateObjectLink(CreateObjectLinkRequest) returns (ObjectLinkResponse);
   rpc UpdateObjectLink(UpdateObjectLinkRequest) returns (ObjectLinkResponse);
   rpc DeleteObjectLink(DeleteObjectLinkRequest) returns (AdminMutationResponse);
@@ -205,6 +211,65 @@ message HostAliasDescriptor {
   string created_at = 8;
   string updated_at = 9;
   uint64 generation = 10;
+}
+
+message TenantAdminDescriptor {
+  string tenant_id = 1;
+  string name = 2;
+  string home_region = 3;
+}
+
+message CreateTenantRequest {
+  AdminRequestContext context = 1;
+  string name = 2;
+  string home_region = 3;
+}
+
+message TenantAdminResponse {
+  string request_id = 1;
+  TenantAdminDescriptor tenant = 2;
+  string audit_event_id = 3;
+}
+
+message CreateApplicationRequest {
+  AdminRequestContext context = 1;
+  string tenant_id = 2;
+  string app_name = 3;
+}
+
+message RotateApplicationSecretRequest {
+  AdminRequestContext context = 1;
+  string tenant_id = 2;
+  string app_name = 3;
+}
+
+message ApplicationSecretResponse {
+  string request_id = 1;
+  string tenant_id = 2;
+  string app_name = 3;
+  string client_id = 4;
+  string client_secret = 5;
+  string audit_event_id = 6;
+}
+
+message CreateBucketAdminRequest {
+  AdminRequestContext context = 1;
+  string tenant_id = 2;
+  string bucket_name = 3;
+  string region = 4;
+}
+
+message SetBucketPublicAccessAdminRequest {
+  AdminRequestContext context = 1;
+  string tenant_id = 2;
+  string bucket_name = 3;
+  bool allow_public_read = 4;
+}
+
+message BucketAdminResponse {
+  string request_id = 1;
+  Bucket bucket = 2;
+  string audit_event_id = 3;
 }
 
 message CreateObjectLinkRequest {
