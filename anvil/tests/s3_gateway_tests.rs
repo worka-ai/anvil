@@ -5,6 +5,7 @@ use anvil::anvil_api::{
     SetPublicAccessRequest, WriteAuthzTupleRequest,
 };
 use anvil::mesh_lifecycle::{CreateHostAliasDescriptor, CreateRegionDescriptor, LifecycleState};
+use anvil::object_links::{ObjectLinkResolution, PutObjectLinkRequest};
 use anvil::routing::{HostAliasState, RoutingConfig};
 use anvil::storage::{DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES, ExternalChunkManifest};
 use aws_sdk_s3::Client;
@@ -363,8 +364,12 @@ async fn test_s3_regional_routes_public_reads_to_tenant_scoped_duplicate_bucket(
     let s3 = s3_client(http_base, "test-app", "test-secret");
     let bucket = format!("tenant-scoped-{}", uuid::Uuid::new_v4());
     let key = "same/key.txt";
+    let default_only_key = "default-only.txt";
+    let routed_only_key = "routed-only.txt";
+    let link_key = "latest.txt";
     let default_body = b"default tenant object";
     let routed_body = b"routed tenant object";
+    let routed_only_body = b"routed tenant only";
 
     s3.create_bucket()
         .bucket(&bucket)
@@ -378,6 +383,13 @@ async fn test_s3_regional_routes_public_reads_to_tenant_scoped_duplicate_bucket(
         .send()
         .await
         .expect("default tenant PutObject should succeed");
+    s3.put_object()
+        .bucket(&bucket)
+        .key(default_only_key)
+        .body(ByteStream::from_static(b"default tenant only"))
+        .send()
+        .await
+        .expect("default tenant-only PutObject should succeed");
 
     let persistence = &cluster.states[0].persistence;
     let routed_tenant = persistence
@@ -404,6 +416,37 @@ async fn test_s3_regional_routes_public_reads_to_tenant_scoped_duplicate_bucket(
         .await
         .expect("routed tenant object should be written");
     persistence
+        .create_object(
+            routed_tenant.id,
+            routed_bucket.id,
+            routed_only_key,
+            "routed-only-object-hash",
+            routed_only_body.len() as i64,
+            "routed-only-object-etag",
+            Some("text/plain"),
+            None,
+            None,
+            Some(routed_only_body.to_vec()),
+        )
+        .await
+        .expect("routed tenant-only object should be written");
+    persistence
+        .put_object_link(PutObjectLinkRequest {
+            tenant_id: routed_tenant.id,
+            bucket_id: routed_bucket.id,
+            link_key: link_key.to_string(),
+            target_key: key.to_string(),
+            target_version: None,
+            resolution: ObjectLinkResolution::Follow,
+            expected_generation: None,
+            create_only: true,
+            allow_dangling: false,
+            idempotency_key: "test-routed-link".to_string(),
+            created_by: "test".to_string(),
+        })
+        .await
+        .expect("routed tenant object link should be written");
+    persistence
         .set_bucket_public_access(routed_tenant.id, &bucket, true)
         .await
         .expect("routed tenant bucket should be public");
@@ -417,6 +460,33 @@ async fn test_s3_regional_routes_public_reads_to_tenant_scoped_duplicate_bucket(
 
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(response.bytes().await.unwrap().as_ref(), routed_body);
+
+    let versions = reqwest::Client::new()
+        .get(format!("{http_base}/tenant-b/{bucket}?versions"))
+        .header(reqwest::header::HOST, "test-region-1.anvil-storage.test")
+        .send()
+        .await
+        .expect("tenant-routed public version listing should send");
+    assert_eq!(versions.status(), reqwest::StatusCode::OK);
+    let versions_xml = versions.text().await.expect("version listing body");
+    assert!(versions_xml.contains(routed_only_key));
+    assert!(!versions_xml.contains(default_only_key));
+
+    let link_metadata = reqwest::Client::new()
+        .get(format!("{http_base}/tenant-b/{bucket}/{link_key}"))
+        .header(reqwest::header::HOST, "test-region-1.anvil-storage.test")
+        .header("x-anvil-link-mode", "metadata")
+        .send()
+        .await
+        .expect("tenant-routed link metadata GET should send");
+    assert_eq!(link_metadata.status(), reqwest::StatusCode::OK);
+    let link_metadata = link_metadata
+        .json::<serde_json::Value>()
+        .await
+        .expect("link metadata JSON");
+    assert_eq!(link_metadata["tenant_id"], routed_tenant.id.to_string());
+    assert_eq!(link_metadata["link_key"], link_key);
+    assert_eq!(link_metadata["target_key"], key);
 }
 
 #[tokio::test]
