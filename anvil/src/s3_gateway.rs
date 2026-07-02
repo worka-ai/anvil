@@ -293,16 +293,22 @@ fn s3_routed_bucket_without_key(req: &Request) -> Option<String> {
         .map(|route| route.bucket)
 }
 
-async fn s3_route_checked_claims(
+#[derive(Debug, Clone)]
+struct CheckedS3Route {
+    claims: Option<Claims>,
+    tenant_id: Option<i64>,
+}
+
+async fn s3_checked_route(
     state: &AppState,
     route: Option<ObjectRoute>,
     claims: Option<Claims>,
-) -> Result<Option<Claims>, Response> {
+) -> Result<CheckedS3Route, Response> {
     let Some(route) = route else {
-        return Ok(claims);
-    };
-    let Some(claims) = claims else {
-        return Ok(None);
+        return Ok(CheckedS3Route {
+            claims,
+            tenant_id: None,
+        });
     };
 
     let route_tenant_id = match route.source {
@@ -342,14 +348,19 @@ async fn s3_route_checked_claims(
         }
     };
 
-    if route_tenant_id != claims.tenant_id {
+    if let Some(claims) = claims.as_ref()
+        && route_tenant_id != claims.tenant_id
+    {
         return Err(s3_error(
             "AccessDenied",
             "Credentials are not valid for routed tenant",
             axum::http::StatusCode::FORBIDDEN,
         ));
     }
-    Ok(Some(claims))
+    Ok(CheckedS3Route {
+        claims,
+        tenant_id: Some(route_tenant_id),
+    })
 }
 
 fn s3_query_map(uri: &Uri) -> HashMap<String, String> {
@@ -557,11 +568,13 @@ async fn create_bucket(
             );
         }
     };
-    let claims = match s3_route_checked_claims(&state, s3_host_route(&req), Some(claims)).await {
-        Ok(Some(claims)) => claims,
-        Ok(None) => unreachable!("authenticated create bucket path supplied claims"),
+    let checked_route = match s3_checked_route(&state, s3_host_route(&req), Some(claims)).await {
+        Ok(checked_route) => checked_route,
         Err(response) => return response,
     };
+    let claims = checked_route
+        .claims
+        .expect("authenticated create bucket path supplied claims");
 
     if q.contains_key("versioning") {
         return put_bucket_versioning_response(state, claims, &bucket, req).await;
@@ -812,11 +825,13 @@ async fn head_bucket(
             );
         }
     };
-    let claims = match s3_route_checked_claims(&state, s3_host_route(&req), Some(claims)).await {
-        Ok(Some(claims)) => claims,
-        Ok(None) => unreachable!("authenticated head bucket path supplied claims"),
+    let checked_route = match s3_checked_route(&state, s3_host_route(&req), Some(claims)).await {
+        Ok(checked_route) => checked_route,
         Err(response) => return response,
     };
+    let claims = checked_route
+        .claims
+        .expect("authenticated head bucket path supplied claims");
 
     match bucket_journal::read_current_bucket(&state.storage, claims.tenant_id, &bucket_name).await
     {
@@ -850,16 +865,17 @@ async fn list_objects(
     }
     let Path(bucket) = bucket;
     let bucket = s3_routed_bucket(&req, bucket);
-    let claims = match s3_route_checked_claims(
+    let checked_route = match s3_checked_route(
         &state,
         s3_host_route(&req),
         req.extensions().get::<Claims>().cloned(),
     )
     .await
     {
-        Ok(claims) => claims,
+        Ok(checked_route) => checked_route,
         Err(response) => return response,
     };
+    let claims = checked_route.claims.clone();
 
     if q.contains_key("versions") {
         let request_is_authenticated = req.extensions().get::<Claims>().is_some();
@@ -938,8 +954,9 @@ async fn list_objects(
 
     match state
         .object_manager
-        .list_objects(
+        .list_objects_for_tenant(
             claims,
+            checked_route.tenant_id,
             &bucket,
             &prefix,
             &start_after,
@@ -1800,16 +1817,17 @@ async fn get_object(
     }
     (bucket, key) = s3_routed_bucket_key(&req, bucket, key);
 
-    let claims = match s3_route_checked_claims(
+    let checked_route = match s3_checked_route(
         &state,
         s3_host_route(&req),
         req.extensions().get::<Claims>().cloned(),
     )
     .await
     {
-        Ok(claims) => claims,
+        Ok(checked_route) => checked_route,
         Err(response) => return response,
     };
+    let claims = checked_route.claims.clone();
     if let Some(upload_id) = q.get("uploadId") {
         let claims = match claims {
             Some(claims) => claims,
@@ -1848,7 +1866,14 @@ async fn get_object(
 
     match state
         .object_manager
-        .get_object_with_link_mode(claims, bucket, key, version_id, ObjectLinkReadMode::Follow)
+        .get_object_with_link_mode_for_tenant(
+            claims,
+            checked_route.tenant_id,
+            bucket,
+            key,
+            version_id,
+            ObjectLinkReadMode::Follow,
+        )
         .await
     {
         Ok(result) => {
@@ -2764,16 +2789,17 @@ async fn head_object(
     }
     (bucket, key) = s3_routed_bucket_key(&req, bucket, key);
 
-    let claims = match s3_route_checked_claims(
+    let checked_route = match s3_checked_route(
         &state,
         s3_host_route(&req),
         req.extensions().get::<Claims>().cloned(),
     )
     .await
     {
-        Ok(claims) => claims,
+        Ok(checked_route) => checked_route,
         Err(response) => return response,
     };
+    let claims = checked_route.claims.clone();
     let version_id = match parse_s3_version_id(&q) {
         Ok(version_id) => version_id,
         Err(response) => return response,
@@ -2784,8 +2810,9 @@ async fn head_object(
 
     match state
         .object_manager
-        .head_object_with_link_mode(
+        .head_object_with_link_mode_for_tenant(
             claims,
+            checked_route.tenant_id,
             &bucket,
             &key,
             version_id,

@@ -910,6 +910,26 @@ impl ObjectManager {
         version_id: Option<uuid::Uuid>,
         link_mode: ObjectLinkReadMode,
     ) -> Result<ObjectReadResult, Status> {
+        self.get_object_with_link_mode_for_tenant(
+            claims,
+            None,
+            bucket_name,
+            object_key,
+            version_id,
+            link_mode,
+        )
+        .await
+    }
+
+    pub async fn get_object_with_link_mode_for_tenant(
+        &self,
+        claims: Option<auth::Claims>,
+        route_tenant_id: Option<i64>,
+        bucket_name: String,
+        object_key: String,
+        version_id: Option<uuid::Uuid>,
+        link_mode: ObjectLinkReadMode,
+    ) -> Result<ObjectReadResult, Status> {
         let _latency = self
             .observability
             .latency_guard(OBJECT_READ_LATENCY, &[("api", "native")]);
@@ -925,7 +945,7 @@ impl ObjectManager {
         }
 
         let bucket = self
-            .get_authorized_bucket(claims.as_ref(), &bucket_name)
+            .get_authorized_bucket(claims.as_ref(), route_tenant_id, &bucket_name)
             .await?;
 
         if !bucket.is_public_read {
@@ -1350,6 +1370,26 @@ impl ObjectManager {
         version_id: Option<uuid::Uuid>,
         link_mode: ObjectLinkReadMode,
     ) -> Result<ObjectHeadResult, Status> {
+        self.head_object_with_link_mode_for_tenant(
+            claims,
+            None,
+            bucket_name,
+            object_key,
+            version_id,
+            link_mode,
+        )
+        .await
+    }
+
+    pub async fn head_object_with_link_mode_for_tenant(
+        &self,
+        claims: Option<auth::Claims>,
+        route_tenant_id: Option<i64>,
+        bucket_name: &str,
+        object_key: &str,
+        version_id: Option<uuid::Uuid>,
+        link_mode: ObjectLinkReadMode,
+    ) -> Result<ObjectHeadResult, Status> {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
@@ -1361,7 +1401,7 @@ impl ObjectManager {
         }
 
         let bucket = self
-            .get_authorized_bucket(claims.as_ref(), bucket_name)
+            .get_authorized_bucket(claims.as_ref(), route_tenant_id, bucket_name)
             .await?;
 
         if !bucket.is_public_read {
@@ -1438,7 +1478,7 @@ impl ObjectManager {
         }
 
         let bucket = self
-            .get_authorized_bucket(claims.as_ref(), bucket_name)
+            .get_authorized_bucket(claims.as_ref(), None, bucket_name)
             .await?;
         if !bucket.is_public_read {
             let claims = claims
@@ -1489,6 +1529,28 @@ impl ObjectManager {
         limit: i32,
         delimiter: &str,
     ) -> Result<(Vec<Object>, Vec<String>), Status> {
+        self.list_objects_for_tenant(
+            claims,
+            None,
+            bucket_name,
+            prefix,
+            start_after,
+            limit,
+            delimiter,
+        )
+        .await
+    }
+
+    pub async fn list_objects_for_tenant(
+        &self,
+        claims: Option<auth::Claims>,
+        route_tenant_id: Option<i64>,
+        bucket_name: &str,
+        prefix: &str,
+        start_after: &str,
+        limit: i32,
+        delimiter: &str,
+    ) -> Result<(Vec<Object>, Vec<String>), Status> {
         let _latency = self
             .observability
             .latency_guard(PREFIX_LIST_LATENCY, &[("api", "native")]);
@@ -1505,7 +1567,7 @@ impl ObjectManager {
 
         // Allow public buckets to bypass auth; otherwise require appropriate scope
         let bucket = self
-            .get_authorized_bucket(claims.as_ref(), bucket_name)
+            .get_authorized_bucket(claims.as_ref(), route_tenant_id, bucket_name)
             .await?;
         if !bucket.is_public_read {
             let claims = claims
@@ -1579,7 +1641,7 @@ impl ObjectManager {
         };
 
         let bucket = self
-            .get_authorized_bucket(claims.as_ref(), bucket_name)
+            .get_authorized_bucket(claims.as_ref(), None, bucket_name)
             .await?;
         if !bucket.is_public_read {
             let claims = claims
@@ -1789,13 +1851,25 @@ impl ObjectManager {
     async fn get_authorized_bucket(
         &self,
         claims: Option<&auth::Claims>,
+        route_tenant_id: Option<i64>,
         bucket_name: &str,
     ) -> Result<Bucket, Status> {
-        let bucket = match claims {
-            Some(c) => bucket_journal::read_current_bucket(&self.storage, c.tenant_id, bucket_name)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-                .ok_or_else(|| Status::not_found("Bucket not found for this tenant")),
+        if let (Some(claims), Some(route_tenant_id)) = (claims, route_tenant_id)
+            && claims.tenant_id != route_tenant_id
+        {
+            return Err(Status::permission_denied(
+                "Credentials are not valid for routed tenant",
+            ));
+        }
+
+        let tenant_id = route_tenant_id.or_else(|| claims.map(|claims| claims.tenant_id));
+        let bucket = match tenant_id {
+            Some(tenant_id) => {
+                bucket_journal::read_current_bucket(&self.storage, tenant_id, bucket_name)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .ok_or_else(|| Status::not_found("Bucket not found for this tenant"))
+            }
             None => bucket_journal::read_public_bucket_by_name(&self.storage, bucket_name)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?

@@ -351,6 +351,75 @@ async fn test_s3_regional_host_routing_reads_same_object_and_rejects_dotted_host
 }
 
 #[tokio::test]
+async fn test_s3_regional_routes_public_reads_to_tenant_scoped_duplicate_bucket() {
+    let mut cluster = TestCluster::new_with_config(&["test-region-1"], |config| {
+        config.public_region_base_domain = "test-region-1.anvil-storage.test".to_string();
+        config.mesh_id = "mesh-test".to_string();
+    })
+    .await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
+    let s3 = s3_client(http_base, "test-app", "test-secret");
+    let bucket = format!("tenant-scoped-{}", uuid::Uuid::new_v4());
+    let key = "same/key.txt";
+    let default_body = b"default tenant object";
+    let routed_body = b"routed tenant object";
+
+    s3.create_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("default tenant CreateBucket should succeed");
+    s3.put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(default_body))
+        .send()
+        .await
+        .expect("default tenant PutObject should succeed");
+
+    let persistence = &cluster.states[0].persistence;
+    let routed_tenant = persistence
+        .create_tenant("tenant-b", "unused")
+        .await
+        .expect("routed tenant should be created");
+    let routed_bucket = persistence
+        .create_bucket(routed_tenant.id, &bucket, "test-region-1")
+        .await
+        .expect("same bucket name should be allowed in another tenant");
+    persistence
+        .create_object(
+            routed_tenant.id,
+            routed_bucket.id,
+            key,
+            "routed-object-hash",
+            routed_body.len() as i64,
+            "routed-object-etag",
+            Some("text/plain"),
+            None,
+            None,
+            Some(routed_body.to_vec()),
+        )
+        .await
+        .expect("routed tenant object should be written");
+    persistence
+        .set_bucket_public_access(routed_tenant.id, &bucket, true)
+        .await
+        .expect("routed tenant bucket should be public");
+
+    let response = reqwest::Client::new()
+        .get(format!("{http_base}/tenant-b/{bucket}/{key}"))
+        .header(reqwest::header::HOST, "test-region-1.anvil-storage.test")
+        .send()
+        .await
+        .expect("tenant-routed public GET should send");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.bytes().await.unwrap().as_ref(), routed_body);
+}
+
+#[tokio::test]
 async fn test_s3_custom_host_alias_routes_to_bucket_prefix() {
     let mut cluster = TestCluster::new_with_config(&["test-region-1"], |config| {
         config.public_region_base_domain = "test-region-1.anvil-storage.test".to_string();
