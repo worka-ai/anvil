@@ -1,9 +1,87 @@
 use crate::validation;
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::{
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    str::FromStr,
+};
 
 pub const HOST_ALIAS_DESCRIPTOR_SCHEMA: &str = "anvil.mesh.host_alias.v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrossRegionRoutingPolicy {
+    RedirectPreferred,
+    ProxyPreferred,
+    ProxyRequired,
+    LocalOnly,
+}
+
+impl CrossRegionRoutingPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RedirectPreferred => "redirect_preferred",
+            Self::ProxyPreferred => "proxy_preferred",
+            Self::ProxyRequired => "proxy_required",
+            Self::LocalOnly => "local_only",
+        }
+    }
+}
+
+impl Default for CrossRegionRoutingPolicy {
+    fn default() -> Self {
+        Self::RedirectPreferred
+    }
+}
+
+impl fmt::Display for CrossRegionRoutingPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for CrossRegionRoutingPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "redirect_preferred" => Ok(Self::RedirectPreferred),
+            "proxy_preferred" => Ok(Self::ProxyPreferred),
+            "proxy_required" => Ok(Self::ProxyRequired),
+            "local_only" => Ok(Self::LocalOnly),
+            other => Err(format!(
+                "invalid cross-region routing policy {other:?}; expected redirect_preferred, proxy_preferred, proxy_required, or local_only"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteBucketRoutingAction {
+    Redirect,
+    Proxy,
+    RejectLocalOnly,
+    ProxyUnavailable,
+}
+
+pub fn remote_bucket_routing_action(
+    policy: CrossRegionRoutingPolicy,
+    proxy_available: bool,
+) -> RemoteBucketRoutingAction {
+    match policy {
+        CrossRegionRoutingPolicy::RedirectPreferred => RemoteBucketRoutingAction::Redirect,
+        CrossRegionRoutingPolicy::ProxyPreferred if proxy_available => {
+            RemoteBucketRoutingAction::Proxy
+        }
+        CrossRegionRoutingPolicy::ProxyPreferred => RemoteBucketRoutingAction::Redirect,
+        CrossRegionRoutingPolicy::ProxyRequired if proxy_available => {
+            RemoteBucketRoutingAction::Proxy
+        }
+        CrossRegionRoutingPolicy::ProxyRequired => RemoteBucketRoutingAction::ProxyUnavailable,
+        CrossRegionRoutingPolicy::LocalOnly => RemoteBucketRoutingAction::RejectLocalOnly,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingConfig {
@@ -489,6 +567,57 @@ mod tests {
 
     fn config() -> RoutingConfig {
         RoutingConfig::new("anvil-storage.com").unwrap()
+    }
+
+    #[test]
+    fn parses_cross_region_routing_policies_deterministically() {
+        assert_eq!(
+            "redirect_preferred"
+                .parse::<CrossRegionRoutingPolicy>()
+                .unwrap(),
+            CrossRegionRoutingPolicy::RedirectPreferred
+        );
+        assert_eq!(
+            "proxy_preferred"
+                .parse::<CrossRegionRoutingPolicy>()
+                .unwrap(),
+            CrossRegionRoutingPolicy::ProxyPreferred
+        );
+        assert_eq!(
+            "proxy_required"
+                .parse::<CrossRegionRoutingPolicy>()
+                .unwrap(),
+            CrossRegionRoutingPolicy::ProxyRequired
+        );
+        assert_eq!(
+            "local_only".parse::<CrossRegionRoutingPolicy>().unwrap(),
+            CrossRegionRoutingPolicy::LocalOnly
+        );
+        assert!("redirect-only".parse::<CrossRegionRoutingPolicy>().is_err());
+    }
+
+    #[test]
+    fn chooses_remote_bucket_action_from_policy_and_proxy_availability() {
+        assert_eq!(
+            remote_bucket_routing_action(CrossRegionRoutingPolicy::LocalOnly, false),
+            RemoteBucketRoutingAction::RejectLocalOnly
+        );
+        assert_eq!(
+            remote_bucket_routing_action(CrossRegionRoutingPolicy::RedirectPreferred, false),
+            RemoteBucketRoutingAction::Redirect
+        );
+        assert_eq!(
+            remote_bucket_routing_action(CrossRegionRoutingPolicy::ProxyPreferred, false),
+            RemoteBucketRoutingAction::Redirect
+        );
+        assert_eq!(
+            remote_bucket_routing_action(CrossRegionRoutingPolicy::ProxyPreferred, true),
+            RemoteBucketRoutingAction::Proxy
+        );
+        assert_eq!(
+            remote_bucket_routing_action(CrossRegionRoutingPolicy::ProxyRequired, false),
+            RemoteBucketRoutingAction::ProxyUnavailable
+        );
     }
 
     #[test]

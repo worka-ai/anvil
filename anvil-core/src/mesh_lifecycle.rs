@@ -1,3 +1,6 @@
+use crate::mesh_control_stream::{
+    ControlRecordDigest, ControlStreamSequence, read_control_stream_log,
+};
 use crate::routing::{self, HostAliasDescriptor, HostAliasState, RoutingConfig};
 use crate::storage::Storage;
 use chrono::{SecondsFormat, Utc};
@@ -10,6 +13,7 @@ use tokio::io::AsyncWriteExt;
 pub const REGION_DESCRIPTOR_SCHEMA: &str = "anvil.mesh.region.v1";
 pub const CELL_DESCRIPTOR_SCHEMA: &str = "anvil.mesh.cell.v1";
 pub const NODE_DESCRIPTOR_SCHEMA: &str = "anvil.mesh.node.v1";
+pub const ACTIVATION_CHECKPOINT_SCHEMA: &str = "anvil.mesh.activation_checkpoint.v1";
 
 #[derive(Debug, Error)]
 pub enum LifecycleError {
@@ -40,6 +44,16 @@ pub enum LifecycleError {
         resource_id: String,
         from: LifecycleState,
         to: LifecycleState,
+    },
+    #[error(
+        "ActivationCheckpointNotReached: control stream {stream_family}/{partition} has not reached sequence {sequence} with digest {expected_digest}: {reason}"
+    )]
+    ActivationCheckpointNotReached {
+        stream_family: String,
+        partition: String,
+        sequence: u64,
+        expected_digest: String,
+        reason: String,
     },
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -165,6 +179,24 @@ pub struct CreateHostAliasDescriptor {
     pub prefix: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActivationCheckpoint {
+    pub schema: String,
+    pub mesh_id: String,
+    pub region: String,
+    pub created_at: String,
+    #[serde(default)]
+    pub required_streams: Vec<ActivationCheckpointStream>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActivationCheckpointStream {
+    pub stream_family: String,
+    pub partition: String,
+    pub sequence: ControlStreamSequence,
+    pub digest: ControlRecordDigest,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MeshLifecycleState {
     pub regions: BTreeMap<String, RegionDescriptor>,
@@ -264,6 +296,56 @@ pub async fn transition_region(
         }
     })?;
     descriptor.state = target;
+    descriptor.updated_at = timestamp_now();
+    descriptor.generation = descriptor.generation.saturating_add(1);
+    let out = descriptor.clone();
+    write_state(storage, &state).await?;
+    Ok(out)
+}
+
+pub fn parse_activation_checkpoint_json(input: &str) -> LifecycleResult<ActivationCheckpoint> {
+    require_nonempty(input, "activation checkpoint")?;
+    serde_json::from_str(input).map_err(|err| {
+        LifecycleError::InvalidArgument(format!("activation checkpoint JSON is invalid: {err}"))
+    })
+}
+
+pub async fn activate_region(
+    storage: &Storage,
+    region: &str,
+    expected_generation: u64,
+    checkpoint: &ActivationCheckpoint,
+) -> LifecycleResult<RegionDescriptor> {
+    require_identifier(region, "region")?;
+
+    let mut state = read_state(storage).await?;
+    let current = state
+        .regions
+        .get(region)
+        .ok_or_else(|| LifecycleError::NotFound {
+            resource_kind: "region",
+            resource_id: region.to_string(),
+        })?;
+    ensure_generation("region", region, current.generation, expected_generation)?;
+    validate_region_transition(current.state, LifecycleState::Active).map_err(|_| {
+        LifecycleError::LifecycleTransitionDenied {
+            resource_kind: "region",
+            resource_id: region.to_string(),
+            from: current.state,
+            to: LifecycleState::Active,
+        }
+    })?;
+    validate_activation_checkpoint_header(checkpoint, &current.mesh_id, region)?;
+    validate_activation_checkpoint_streams(storage, checkpoint).await?;
+
+    let descriptor = state
+        .regions
+        .get_mut(region)
+        .ok_or_else(|| LifecycleError::NotFound {
+            resource_kind: "region",
+            resource_id: region.to_string(),
+        })?;
+    descriptor.state = LifecycleState::Active;
     descriptor.updated_at = timestamp_now();
     descriptor.generation = descriptor.generation.saturating_add(1);
     let out = descriptor.clone();
@@ -741,6 +823,98 @@ fn ensure_generation(
     })
 }
 
+fn validate_activation_checkpoint_header(
+    checkpoint: &ActivationCheckpoint,
+    mesh_id: &str,
+    region: &str,
+) -> LifecycleResult<()> {
+    if checkpoint.schema != ACTIVATION_CHECKPOINT_SCHEMA {
+        return Err(LifecycleError::InvalidArgument(format!(
+            "activation checkpoint schema must be {ACTIVATION_CHECKPOINT_SCHEMA}"
+        )));
+    }
+    require_identifier(&checkpoint.mesh_id, "activation checkpoint mesh id")?;
+    require_identifier(&checkpoint.region, "activation checkpoint region")?;
+    require_nonempty(&checkpoint.created_at, "activation checkpoint created_at")?;
+    if checkpoint.mesh_id != mesh_id {
+        return Err(LifecycleError::InvalidArgument(format!(
+            "activation checkpoint mesh_id {} does not match region mesh_id {mesh_id}",
+            checkpoint.mesh_id
+        )));
+    }
+    if checkpoint.region != region {
+        return Err(LifecycleError::InvalidArgument(format!(
+            "activation checkpoint region {} does not match requested region {region}",
+            checkpoint.region
+        )));
+    }
+    for stream in &checkpoint.required_streams {
+        require_identifier(&stream.stream_family, "activation checkpoint stream family")?;
+        require_identifier(&stream.partition, "activation checkpoint partition")?;
+    }
+    Ok(())
+}
+
+async fn validate_activation_checkpoint_streams(
+    storage: &Storage,
+    checkpoint: &ActivationCheckpoint,
+) -> LifecycleResult<()> {
+    for required in &checkpoint.required_streams {
+        let path = storage
+            .mesh_control_stream_path(&required.stream_family, &required.partition)
+            .map_err(|err| {
+                LifecycleError::InvalidArgument(format!(
+                    "activation checkpoint stream {}/{} is invalid: {err}",
+                    required.stream_family, required.partition
+                ))
+            })?;
+        let log = read_control_stream_log(&path).await.map_err(|err| {
+            LifecycleError::InvalidArgument(format!(
+                "activation checkpoint could not read control stream {}/{}: {err}",
+                required.stream_family, required.partition
+            ))
+        })?;
+        let mut latest_sequence = 0;
+        let mut found_sequence = false;
+        for record in log.records {
+            latest_sequence = latest_sequence.max(record.metadata.sequence.get());
+            if record.metadata.sequence == required.sequence {
+                found_sequence = true;
+                if record.metadata.record_digest.as_str() != required.digest.as_str() {
+                    return Err(activation_checkpoint_not_reached(
+                        required,
+                        format!("digest mismatch at sequence {}", required.sequence.get()),
+                    ));
+                }
+            }
+        }
+        if !found_sequence {
+            let reason = if latest_sequence == 0 {
+                "stream is absent".to_string()
+            } else if latest_sequence < required.sequence.get() {
+                format!("latest sequence is {latest_sequence}")
+            } else {
+                "required sequence is absent".to_string()
+            };
+            return Err(activation_checkpoint_not_reached(required, reason));
+        }
+    }
+    Ok(())
+}
+
+fn activation_checkpoint_not_reached(
+    required: &ActivationCheckpointStream,
+    reason: String,
+) -> LifecycleError {
+    LifecycleError::ActivationCheckpointNotReached {
+        stream_family: required.stream_family.clone(),
+        partition: required.partition.clone(),
+        sequence: required.sequence.get(),
+        expected_digest: required.digest.to_string(),
+        reason,
+    }
+}
+
 fn cell_key(region: &str, cell_id: &str) -> LifecycleResult<String> {
     require_identifier(region, "region")?;
     require_identifier(cell_id, "cell id")?;
@@ -798,6 +972,65 @@ mod tests {
         assert!(
             validate_region_transition(LifecycleState::Active, LifecycleState::Removed).is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn activate_region_rejects_missing_activation_checkpoint_stream() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let region = create_test_region(&storage).await;
+        let checkpoint = checkpoint_with_stream("bucket_locator", "0a7f", 1, digest_for(b"record"));
+
+        let err = activate_region(&storage, "eu-west-1", region.generation, &checkpoint)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            LifecycleError::ActivationCheckpointNotReached { .. }
+        ));
+        assert_eq!(
+            read_state(&storage)
+                .await
+                .unwrap()
+                .regions
+                .get("eu-west-1")
+                .unwrap()
+                .state,
+            LifecycleState::Joining
+        );
+    }
+
+    #[tokio::test]
+    async fn activate_region_rejects_mismatched_activation_checkpoint_digest() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let region = create_test_region(&storage).await;
+        append_control_record(&storage, "bucket_locator", "0a7f", 1, digest_for(b"actual")).await;
+        let checkpoint =
+            checkpoint_with_stream("bucket_locator", "0a7f", 1, digest_for(b"expected"));
+
+        let err = activate_region(&storage, "eu-west-1", region.generation, &checkpoint)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            LifecycleError::ActivationCheckpointNotReached { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn activate_region_accepts_reached_activation_checkpoint() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let region = create_test_region(&storage).await;
+        let digest = digest_for(b"record");
+        append_control_record(&storage, "bucket_locator", "0a7f", 1, digest.clone()).await;
+        let checkpoint = checkpoint_with_stream("bucket_locator", "0a7f", 1, digest);
+
+        let active = activate_region(&storage, "eu-west-1", region.generation, &checkpoint)
+            .await
+            .unwrap();
+        assert_eq!(active.state, LifecycleState::Active);
     }
 
     #[tokio::test]
@@ -916,6 +1149,85 @@ mod tests {
 
         let replayed = read_state(&storage).await.unwrap();
         assert_eq!(replayed.nodes["node-a"].state, LifecycleState::Draining);
+    }
+
+    async fn create_test_region(storage: &Storage) -> RegionDescriptor {
+        create_region(
+            storage,
+            CreateRegionDescriptor {
+                mesh_id: "mesh-a".to_string(),
+                region: "eu-west-1".to_string(),
+                public_base_url: "https://eu-west-1.anvil-storage.test".to_string(),
+                virtual_host_suffix: "eu-west-1.anvil-storage.test".to_string(),
+                placement_weight: 100,
+                default_cell: None,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    fn checkpoint_with_stream(
+        stream_family: &str,
+        partition: &str,
+        sequence: u64,
+        digest: ControlRecordDigest,
+    ) -> ActivationCheckpoint {
+        ActivationCheckpoint {
+            schema: ACTIVATION_CHECKPOINT_SCHEMA.to_string(),
+            mesh_id: "mesh-a".to_string(),
+            region: "eu-west-1".to_string(),
+            created_at: "2026-07-02T00:00:00Z".to_string(),
+            required_streams: vec![ActivationCheckpointStream {
+                stream_family: stream_family.to_string(),
+                partition: partition.to_string(),
+                sequence: ControlStreamSequence::new(sequence).unwrap(),
+                digest,
+            }],
+        }
+    }
+
+    fn digest_for(bytes: &[u8]) -> ControlRecordDigest {
+        ControlRecordDigest::blake3(bytes)
+    }
+
+    async fn append_control_record(
+        storage: &Storage,
+        stream_family: &str,
+        partition: &str,
+        sequence: u64,
+        digest: ControlRecordDigest,
+    ) {
+        let path = storage
+            .mesh_control_stream_path(stream_family, partition)
+            .unwrap();
+        let header_json = serde_json::json!({
+            "schema": "anvil.mesh.control_mutation.v1",
+            "mesh_id": "mesh-a",
+            "stream_family": stream_family,
+            "partition": partition,
+            "sequence": sequence,
+            "record_key": "tenant_acme/releases",
+            "operation": "upsert",
+            "expected_generation": 1,
+            "new_generation": 2,
+            "writer_node_id": "node-a",
+            "writer_fence": 1,
+            "idempotency_key": "idem-a",
+            "record_digest": digest.as_str(),
+            "created_at": "2026-07-02T00:00:00Z"
+        })
+        .to_string()
+        .into_bytes();
+        crate::mesh_control_stream::append_control_stream_frame(
+            path,
+            &crate::mesh_control_stream::ControlStreamFrame::new(
+                header_json,
+                br#"{"ok":true}"#.to_vec(),
+            ),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

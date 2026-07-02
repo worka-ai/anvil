@@ -410,6 +410,7 @@ message CreateRegionRequest {
 message ActivateRegionRequest {
   AdminRequestContext context = 1;
   string region = 2;
+  string activation_checkpoint_json = 3;
 }
 
 message SetRegionReadOnlyRequest {

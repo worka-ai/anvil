@@ -3,6 +3,7 @@ use anvil::anvil_api as api;
 use anvil::anvil_api::admin_service_client::AdminServiceClient;
 use clap::{Args, Subcommand, ValueEnum};
 use serde::Serialize;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 #[derive(Subcommand)]
@@ -162,6 +163,8 @@ pub enum RegionCommands {
         context: MutationOptions,
         #[clap(long)]
         region: String,
+        #[clap(long)]
+        activation_checkpoint: PathBuf,
     },
     /// Set an active region read-only
     SetReadOnly {
@@ -920,12 +923,25 @@ async fn handle_region_command(
                 .into_inner();
             print_json(&response)?;
         }
-        RegionCommands::Activate { context, region } => {
+        RegionCommands::Activate {
+            context,
+            region,
+            activation_checkpoint,
+        } => {
+            let activation_checkpoint_json = tokio::fs::read_to_string(activation_checkpoint)
+                .await
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "failed to read activation checkpoint {}: {err}",
+                        activation_checkpoint.display()
+                    )
+                })?;
             let response = client
                 .activate_region(with_auth(
                     api::ActivateRegionRequest {
                         context: Some(context.to_context()),
                         region: region.clone(),
+                        activation_checkpoint_json,
                     },
                     token,
                 )?)
@@ -1765,6 +1781,23 @@ mod tests {
             .unwrap()
     }
 
+    fn write_empty_activation_checkpoint(temp: &TempDir, file_name: &str) -> PathBuf {
+        let path = temp.path().join(file_name);
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "schema": anvil::mesh_lifecycle::ACTIVATION_CHECKPOINT_SCHEMA,
+                "mesh_id": "mesh-cli-test",
+                "region": "eu-west-1",
+                "created_at": "2026-07-02T00:00:00Z",
+                "required_streams": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+        path
+    }
+
     #[test]
     fn mutation_options_generate_optional_ids() {
         let context = MutationOptions {
@@ -2438,10 +2471,13 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
+        let activation_checkpoint =
+            write_empty_activation_checkpoint(&node._temp, "activate-region.json");
         handle_region_command(
             &RegionCommands::Activate {
                 context: mutation_options("cli-activate-region", region.generation),
                 region: "eu-west-1".to_string(),
+                activation_checkpoint: activation_checkpoint.clone(),
             },
             &mut client,
             &token,
@@ -2490,6 +2526,7 @@ mod tests {
                     read_only_region.generation,
                 ),
                 region: "eu-west-1".to_string(),
+                activation_checkpoint,
             },
             &mut client,
             &token,

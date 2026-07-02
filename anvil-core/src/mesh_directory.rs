@@ -1,3 +1,7 @@
+use crate::mesh_control_stream::{
+    self, ControlRecordDigest, ControlStreamFrame, ControlStreamSequence,
+};
+use crate::partition_fence::{self, PartitionWritePermit};
 use crate::storage::Storage;
 use crate::{routing, validation};
 use chrono::{DateTime, Utc};
@@ -13,6 +17,8 @@ pub const MESH_DIRECTORY_ROOT: &str = "_anvil/control/v1/mesh";
 pub const TENANT_NAME_SCHEMA: &str = "anvil.mesh.tenant_name.v1";
 pub const TENANT_LOCATOR_SCHEMA: &str = "anvil.mesh.tenant_locator.v1";
 pub const BUCKET_LOCATOR_SCHEMA: &str = "anvil.mesh.bucket_locator.v1";
+pub const CONTROL_MUTATION_SCHEMA: &str = "anvil.mesh.control_mutation.v1";
+pub const CONTROL_PARTITION_FAMILY: &str = "control_partition";
 
 const TENANT_NAME_PARTITION_DOMAIN: &str = "tenant-name";
 const TENANT_LOCATOR_PARTITION_DOMAIN: &str = "tenant-locator";
@@ -38,6 +44,15 @@ impl RoutingRecordFamily {
         ]
     }
 
+    pub fn stream_family(self) -> &'static str {
+        match self {
+            Self::TenantName => "tenant_name",
+            Self::TenantLocator => "tenant_locator",
+            Self::BucketLocator => "bucket_locator",
+            Self::HostAlias => "host_alias",
+        }
+    }
+
     pub fn directory_segment(self) -> &'static str {
         match self {
             Self::TenantName => "tenant-names",
@@ -56,6 +71,20 @@ pub struct RoutingRecordDescriptor {
     pub descriptor_key: String,
     pub generation: u64,
     pub payload_json: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MeshControlWriteAuthority<'a> {
+    pub permit: &'a PartitionWritePermit,
+    pub signing_key: &'a [u8],
+}
+
+pub fn control_partition_id(stream_family: &str, partition: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(stream_family.as_bytes());
+    hasher.update(b"/");
+    hasher.update(partition.as_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 #[derive(Debug, Error)]
@@ -90,6 +119,25 @@ pub enum MeshDirectoryError {
     InvalidTimestamp { field: &'static str, value: String },
     #[error("mesh directory record not found: {0}")]
     NotFound(String),
+    #[error("invalid mesh control write permit for {stream_family}/{partition}: {reason}")]
+    InvalidControlWritePermit {
+        stream_family: String,
+        partition: String,
+        reason: String,
+    },
+    #[error("mesh control write fence rejected for {stream_family}/{partition}: {code}: {reason}")]
+    ControlFenceRejected {
+        stream_family: String,
+        partition: String,
+        code: &'static str,
+        reason: &'static str,
+    },
+    #[error("mesh control stream write failed for {stream_family}/{partition}: {message}")]
+    ControlStreamWrite {
+        stream_family: String,
+        partition: String,
+        message: String,
+    },
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -164,6 +212,49 @@ impl PartialEq for MeshDirectoryError {
                 },
             ) => field_a == field_b && value_a == value_b,
             (Self::NotFound(a), Self::NotFound(b)) => a == b,
+            (
+                Self::InvalidControlWritePermit {
+                    stream_family: family_a,
+                    partition: partition_a,
+                    reason: reason_a,
+                },
+                Self::InvalidControlWritePermit {
+                    stream_family: family_b,
+                    partition: partition_b,
+                    reason: reason_b,
+                },
+            ) => family_a == family_b && partition_a == partition_b && reason_a == reason_b,
+            (
+                Self::ControlFenceRejected {
+                    stream_family: family_a,
+                    partition: partition_a,
+                    code: code_a,
+                    reason: reason_a,
+                },
+                Self::ControlFenceRejected {
+                    stream_family: family_b,
+                    partition: partition_b,
+                    code: code_b,
+                    reason: reason_b,
+                },
+            ) => {
+                family_a == family_b
+                    && partition_a == partition_b
+                    && code_a == code_b
+                    && reason_a == reason_b
+            }
+            (
+                Self::ControlStreamWrite {
+                    stream_family: family_a,
+                    partition: partition_a,
+                    message: source_a,
+                },
+                Self::ControlStreamWrite {
+                    stream_family: family_b,
+                    partition: partition_b,
+                    message: source_b,
+                },
+            ) => family_a == family_b && partition_a == partition_b && source_a == source_b,
             _ => false,
         }
     }
@@ -701,13 +792,37 @@ pub fn host_alias_descriptor_key(hostname: &str) -> MeshDirectoryResult<String> 
 pub async fn write_host_alias_descriptor(
     storage: &Storage,
     descriptor: &routing::HostAliasDescriptor,
+    authority: MeshControlWriteAuthority<'_>,
 ) -> MeshDirectoryResult<()> {
-    write_descriptor(
+    let hostname = routing::normalize_alias_hostname(&descriptor.hostname).map_err(|_| {
+        MeshDirectoryError::InvalidIdentifier {
+            field: "hostname",
+            value: descriptor.hostname.clone(),
+        }
+    })?;
+    let partition = host_alias_partition(&hostname)?;
+    if let Some(existing) = read_host_alias_descriptor(storage, &hostname).await?
+        && existing == *descriptor
+    {
+        return Ok(());
+    }
+    append_control_mutation(
         storage,
-        &host_alias_descriptor_key(&descriptor.hostname)?,
+        RoutingRecordFamily::HostAlias,
+        &partition,
+        &hostname,
+        "upsert",
+        descriptor
+            .generation
+            .checked_sub(1)
+            .filter(|generation| *generation > 0),
+        descriptor.generation,
+        None,
         descriptor,
+        authority,
     )
-    .await
+    .await?;
+    write_descriptor(storage, &host_alias_descriptor_key(&hostname)?, descriptor).await
 }
 
 pub async fn read_host_alias_descriptor(
@@ -752,19 +867,112 @@ pub fn stable_partition_prefix(canonical_key: &[u8]) -> String {
     format!("{:02x}{:02x}", bytes[0], bytes[1])
 }
 
-pub async fn write_tenant_records(
+fn mesh_id_from_payload_json(payload_json: &[u8]) -> MeshDirectoryResult<String> {
+    let value: serde_json::Value = serde_json::from_slice(payload_json)?;
+    Ok(value
+        .get("mesh_id")
+        .and_then(|mesh_id| mesh_id.as_str())
+        .unwrap_or("default")
+        .to_string())
+}
+
+async fn append_control_mutation<T: Serialize>(
     storage: &Storage,
-    tenant_name: &TenantNameDescriptor,
-    tenant_locator: &TenantLocatorDescriptor,
+    family: RoutingRecordFamily,
+    partition: &str,
+    record_key: &str,
+    operation: &str,
+    expected_generation: Option<u64>,
+    new_generation: u64,
+    idempotency_key: Option<&str>,
+    payload: &T,
+    authority: MeshControlWriteAuthority<'_>,
 ) -> MeshDirectoryResult<()> {
-    write_descriptor(storage, &tenant_name.descriptor_key(), tenant_name).await?;
-    write_descriptor(storage, &tenant_locator.descriptor_key(), tenant_locator).await?;
+    let stream_family = family.stream_family();
+    let expected_partition_id = control_partition_id(stream_family, partition);
+    if authority.permit.partition_family != CONTROL_PARTITION_FAMILY {
+        return Err(MeshDirectoryError::InvalidControlWritePermit {
+            stream_family: stream_family.to_string(),
+            partition: partition.to_string(),
+            reason: format!(
+                "expected partition family {CONTROL_PARTITION_FAMILY}, got {}",
+                authority.permit.partition_family
+            ),
+        });
+    }
+    if authority.permit.partition_id != expected_partition_id {
+        return Err(MeshDirectoryError::InvalidControlWritePermit {
+            stream_family: stream_family.to_string(),
+            partition: partition.to_string(),
+            reason: "permit partition id does not match control stream partition".to_string(),
+        });
+    }
+    partition_fence::validate_partition_write(storage, authority.permit, authority.signing_key)
+        .await
+        .map_err(|rejection| MeshDirectoryError::ControlFenceRejected {
+            stream_family: stream_family.to_string(),
+            partition: partition.to_string(),
+            code: rejection.code.as_str(),
+            reason: rejection.reason,
+        })?;
+
+    let stream_path = storage
+        .mesh_control_stream_path(stream_family, partition)
+        .map_err(|err| MeshDirectoryError::ControlStreamWrite {
+            stream_family: stream_family.to_string(),
+            partition: partition.to_string(),
+            message: err.to_string(),
+        })?;
+    let existing_log = mesh_control_stream::read_control_stream_log(&stream_path)
+        .await
+        .map_err(|err| MeshDirectoryError::ControlStreamWrite {
+            stream_family: stream_family.to_string(),
+            partition: partition.to_string(),
+            message: err.to_string(),
+        })?;
+    let sequence = existing_log
+        .records
+        .last()
+        .map(|record| record.metadata.sequence.get().saturating_add(1))
+        .unwrap_or(1);
+    let payload_json = serde_json::to_vec(payload).map_err(MeshDirectoryError::Json)?;
+    let digest = ControlRecordDigest::blake3(&payload_json);
+    let header_json = serde_json::to_vec(&serde_json::json!({
+        "schema": CONTROL_MUTATION_SCHEMA,
+        "mesh_id": mesh_id_from_payload_json(&payload_json)?,
+        "stream_family": stream_family,
+        "partition": partition,
+        "sequence": ControlStreamSequence::new(sequence)
+            .map_err(|err| MeshDirectoryError::ControlStreamWrite {
+                stream_family: stream_family.to_string(),
+                partition: partition.to_string(),
+                message: err.to_string(),
+            })?,
+        "record_key": record_key,
+        "operation": operation,
+        "expected_generation": expected_generation,
+        "new_generation": new_generation,
+        "writer_node_id": authority.permit.owner_node_id.as_str(),
+        "writer_fence": authority.permit.fence_token,
+        "idempotency_key": idempotency_key,
+        "record_digest": digest.as_str(),
+        "created_at": Utc::now().to_rfc3339(),
+    }))?;
+    let frame = ControlStreamFrame::new(header_json, payload_json);
+    mesh_control_stream::append_control_stream_frame(stream_path, &frame)
+        .await
+        .map_err(|err| MeshDirectoryError::ControlStreamWrite {
+            stream_family: stream_family.to_string(),
+            partition: partition.to_string(),
+            message: err.to_string(),
+        })?;
     Ok(())
 }
 
 pub async fn reserve_tenant_name(
     storage: &Storage,
     descriptor: &TenantNameDescriptor,
+    authority: MeshControlWriteAuthority<'_>,
 ) -> MeshDirectoryResult<TenantNameDescriptor> {
     if descriptor.status != TenantNameStatus::Reserved {
         return Err(MeshDirectoryError::InvalidState {
@@ -790,50 +998,69 @@ pub async fn reserve_tenant_name(
         });
     }
 
-    match create_descriptor(storage, &descriptor.descriptor_key(), descriptor).await {
-        Ok(()) => Ok(descriptor.clone()),
-        Err(MeshDirectoryError::Io(err)) if err.kind() == ErrorKind::AlreadyExists => {
-            let existing = read_tenant_name_descriptor(storage, &descriptor.tenant_name)
-                .await?
-                .ok_or_else(|| MeshDirectoryError::NotFound(descriptor.descriptor_key()))?;
-            if existing.tenant_id == descriptor.tenant_id
-                && (existing.status == TenantNameStatus::Active
-                    || existing.idempotency_key == descriptor.idempotency_key)
-            {
-                return Ok(existing);
-            }
-            Err(MeshDirectoryError::TenantNameAlreadyExists {
-                tenant_name: descriptor.tenant_name.as_str().to_string(),
-            })
+    if let Some(existing) = read_tenant_name_descriptor(storage, &descriptor.tenant_name).await? {
+        if existing.tenant_id == descriptor.tenant_id
+            && (existing.status == TenantNameStatus::Active
+                || existing.idempotency_key == descriptor.idempotency_key)
+        {
+            return Ok(existing);
         }
-        Err(err) => Err(err),
+        return Err(MeshDirectoryError::TenantNameAlreadyExists {
+            tenant_name: descriptor.tenant_name.as_str().to_string(),
+        });
     }
+
+    append_control_mutation(
+        storage,
+        RoutingRecordFamily::TenantName,
+        &descriptor.partition(),
+        descriptor.tenant_name.as_str(),
+        "create",
+        None,
+        descriptor.generation,
+        descriptor.idempotency_key.as_deref(),
+        descriptor,
+        authority,
+    )
+    .await?;
+    create_descriptor(storage, &descriptor.descriptor_key(), descriptor).await?;
+    Ok(descriptor.clone())
 }
 
 pub async fn create_tenant_locator(
     storage: &Storage,
     locator: &TenantLocatorDescriptor,
+    authority: MeshControlWriteAuthority<'_>,
 ) -> MeshDirectoryResult<TenantLocatorDescriptor> {
-    match create_descriptor(storage, &locator.descriptor_key(), locator).await {
-        Ok(()) => Ok(locator.clone()),
-        Err(MeshDirectoryError::Io(err)) if err.kind() == ErrorKind::AlreadyExists => {
-            let existing = read_tenant_locator_descriptor(storage, &locator.tenant_id)
-                .await?
-                .ok_or_else(|| MeshDirectoryError::NotFound(locator.descriptor_key()))?;
-            if existing.tenant_id == locator.tenant_id
-                && existing.tenant_name == locator.tenant_name
-                && existing.home_region == locator.home_region
-            {
-                return Ok(existing);
-            }
-            Err(MeshDirectoryError::GenerationConflict {
-                descriptor_key: locator.descriptor_key(),
-                expected: 0,
-                actual: existing.generation,
-            })
+    if let Some(existing) = read_tenant_locator_descriptor(storage, &locator.tenant_id).await? {
+        if existing.tenant_id == locator.tenant_id
+            && existing.tenant_name == locator.tenant_name
+            && existing.home_region == locator.home_region
+        {
+            return Ok(existing);
         }
-        Err(err) => Err(err),
+        return Err(MeshDirectoryError::GenerationConflict {
+            descriptor_key: locator.descriptor_key(),
+            expected: 0,
+            actual: existing.generation,
+        });
     }
+
+    append_control_mutation(
+        storage,
+        RoutingRecordFamily::TenantLocator,
+        &locator.partition(),
+        locator.tenant_id.as_str(),
+        "create",
+        None,
+        locator.generation,
+        None,
+        locator,
+        authority,
+    )
+    .await?;
+    create_descriptor(storage, &locator.descriptor_key(), locator).await?;
+    Ok(locator.clone())
 }
 
 pub async fn activate_tenant_name(
@@ -842,6 +1069,7 @@ pub async fn activate_tenant_name(
     tenant_id: &TenantId,
     expected_generation: u64,
     now: impl Into<String>,
+    authority: MeshControlWriteAuthority<'_>,
 ) -> MeshDirectoryResult<TenantNameDescriptor> {
     let now = now.into();
     let existing = read_tenant_name_descriptor(storage, tenant_name)
@@ -869,6 +1097,19 @@ pub async fn activate_tenant_name(
         });
     }
     let active = existing.activate(now)?;
+    append_control_mutation(
+        storage,
+        RoutingRecordFamily::TenantName,
+        &active.partition(),
+        active.tenant_name.as_str(),
+        "upsert",
+        Some(expected_generation),
+        active.generation,
+        active.idempotency_key.as_deref(),
+        &active,
+        authority,
+    )
+    .await?;
     write_descriptor(storage, &active.descriptor_key(), &active).await?;
     Ok(active)
 }
@@ -878,6 +1119,7 @@ pub async fn tombstone_tenant_name(
     tenant_name: &TenantName,
     expected_generation: u64,
     now: impl Into<String>,
+    authority: MeshControlWriteAuthority<'_>,
 ) -> MeshDirectoryResult<TenantNameDescriptor> {
     let existing = read_tenant_name_descriptor(storage, tenant_name)
         .await?
@@ -890,6 +1132,19 @@ pub async fn tombstone_tenant_name(
         });
     }
     let tombstone = existing.tombstone(now)?;
+    append_control_mutation(
+        storage,
+        RoutingRecordFamily::TenantName,
+        &tombstone.partition(),
+        tombstone.tenant_name.as_str(),
+        "tombstone",
+        Some(expected_generation),
+        tombstone.generation,
+        tombstone.idempotency_key.as_deref(),
+        &tombstone,
+        authority,
+    )
+    .await?;
     write_descriptor(storage, &tombstone.descriptor_key(), &tombstone).await?;
     Ok(tombstone)
 }
@@ -898,6 +1153,7 @@ pub async fn recover_tenant_name_reservation(
     storage: &Storage,
     tenant_name: &TenantName,
     now: impl Into<String>,
+    authority: MeshControlWriteAuthority<'_>,
 ) -> MeshDirectoryResult<Option<TenantNameDescriptor>> {
     let now = now.into();
     let Some(existing) = read_tenant_name_descriptor(storage, tenant_name).await? else {
@@ -917,6 +1173,7 @@ pub async fn recover_tenant_name_reservation(
             &existing.tenant_id,
             existing.generation,
             now,
+            authority,
         )
         .await
         .map(Some);
@@ -931,7 +1188,7 @@ pub async fn recover_tenant_name_reservation(
     let expires_at = parse_rfc3339(expires_at, "reservation_expires_at")?;
     let now_dt = parse_rfc3339(&now, "now")?;
     if expires_at <= now_dt {
-        return tombstone_tenant_name(storage, tenant_name, existing.generation, now)
+        return tombstone_tenant_name(storage, tenant_name, existing.generation, now, authority)
             .await
             .map(Some);
     }
@@ -942,7 +1199,39 @@ pub async fn recover_tenant_name_reservation(
 pub async fn write_bucket_locator(
     storage: &Storage,
     locator: &BucketLocatorDescriptor,
+    authority: MeshControlWriteAuthority<'_>,
 ) -> MeshDirectoryResult<()> {
+    if let Some(existing) = read_bucket_locator(storage, &locator.key()).await? {
+        if existing == *locator {
+            return Ok(());
+        }
+        if existing.bucket_id != locator.bucket_id {
+            return Err(MeshDirectoryError::DuplicateBucketLocator {
+                tenant_id: locator.tenant_id.to_string(),
+                bucket_name: locator.bucket_name.to_string(),
+            });
+        }
+    }
+    append_control_mutation(
+        storage,
+        RoutingRecordFamily::BucketLocator,
+        &locator.partition(),
+        &format!(
+            "{}/{}",
+            locator.tenant_id.as_str(),
+            locator.bucket_name.as_str()
+        ),
+        "upsert",
+        locator
+            .generation
+            .checked_sub(1)
+            .filter(|generation| *generation > 0),
+        locator.generation,
+        None,
+        locator,
+        authority,
+    )
+    .await?;
     write_descriptor(storage, &locator.descriptor_key(), locator).await
 }
 
@@ -1264,10 +1553,57 @@ fn parse_rfc3339(value: &str, field: &'static str) -> MeshDirectoryResult<DateTi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::partition_fence::{
+        PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
+    };
     use crate::storage::Storage;
     use tempfile::tempdir;
 
     const NOW: &str = "2026-07-02T00:00:00Z";
+    const TEST_SIGNING_KEY: &[u8] = b"mesh-directory-control-stream-test-key";
+
+    async fn mesh_permit(
+        storage: &Storage,
+        family: RoutingRecordFamily,
+        partition: &str,
+    ) -> PartitionWritePermit {
+        let partition_id = control_partition_id(family.stream_family(), partition);
+        let recovering = acquire_partition_recovery(
+            storage,
+            PartitionRecoveryAcquire {
+                partition_family: CONTROL_PARTITION_FAMILY.to_string(),
+                partition_id: partition_id.clone(),
+                owner_node_id: "node-test".to_string(),
+                recovered_through_sequence: 0,
+                recovered_manifest_hash: hex::encode([0; 32]),
+                now_nanos: Utc::now().timestamp_nanos_opt().unwrap(),
+            },
+            TEST_SIGNING_KEY,
+        )
+        .await
+        .unwrap();
+        let ready = publish_partition_ready(
+            storage,
+            CONTROL_PARTITION_FAMILY,
+            &partition_id,
+            "node-test",
+            recovering.fence_token,
+            0,
+            &hex::encode([0; 32]),
+            Utc::now().timestamp_nanos_opt().unwrap(),
+            TEST_SIGNING_KEY,
+        )
+        .await
+        .unwrap();
+        ready.write_permit().unwrap()
+    }
+
+    fn authority(permit: &PartitionWritePermit) -> MeshControlWriteAuthority<'_> {
+        MeshControlWriteAuthority {
+            permit,
+            signing_key: TEST_SIGNING_KEY,
+        }
+    }
 
     #[test]
     fn tenant_name_partition_path_is_stable() {
@@ -1375,24 +1711,60 @@ mod tests {
         )
         .unwrap();
 
-        let written = reserve_tenant_name(&storage, &reserved).await.unwrap();
+        let name_permit = mesh_permit(
+            &storage,
+            RoutingRecordFamily::TenantName,
+            &reserved.partition(),
+        )
+        .await;
+        let name_authority = authority(&name_permit);
+
+        let written = reserve_tenant_name(&storage, &reserved, name_authority)
+            .await
+            .unwrap();
         assert_eq!(written.status, TenantNameStatus::Reserved);
         assert_eq!(written.generation, 1);
 
-        let retry = reserve_tenant_name(&storage, &reserved).await.unwrap();
-        assert_eq!(retry, written);
-
-        let active = activate_tenant_name(&storage, &tenant_name, &tenant_id, 1, NOW)
+        let retry = reserve_tenant_name(&storage, &reserved, name_authority)
             .await
             .unwrap();
+        assert_eq!(retry, written);
+
+        let active =
+            activate_tenant_name(&storage, &tenant_name, &tenant_id, 1, NOW, name_authority)
+                .await
+                .unwrap();
         assert_eq!(active.status, TenantNameStatus::Active);
         assert_eq!(active.generation, 2);
         assert_eq!(active.idempotency_key.as_deref(), Some("req-1"));
         assert_eq!(active.reservation_expires_at, None);
 
-        let active_retry = reserve_tenant_name(&storage, &reserved).await.unwrap();
+        let active_retry = reserve_tenant_name(&storage, &reserved, name_authority)
+            .await
+            .unwrap();
         assert_eq!(active_retry.status, TenantNameStatus::Active);
         assert_eq!(active_retry.generation, 2);
+
+        let stream_path = storage
+            .mesh_control_stream_path(
+                RoutingRecordFamily::TenantName.stream_family(),
+                &reserved.partition(),
+            )
+            .unwrap();
+        let stream = mesh_control_stream::read_control_stream_log(stream_path)
+            .await
+            .unwrap();
+        assert_eq!(stream.records.len(), 2);
+        let first_header: serde_json::Value =
+            serde_json::from_slice(&stream.records[0].frame.header_json).unwrap();
+        let second_header: serde_json::Value =
+            serde_json::from_slice(&stream.records[1].frame.header_json).unwrap();
+        assert_eq!(first_header["operation"], "create");
+        assert_eq!(first_header["sequence"], 1);
+        assert_eq!(first_header["writer_node_id"], "node-test");
+        assert_eq!(first_header["writer_fence"], name_permit.fence_token);
+        assert_eq!(second_header["operation"], "upsert");
+        assert_eq!(second_header["sequence"], 2);
     }
 
     #[tokio::test]
@@ -1410,7 +1782,16 @@ mod tests {
             NOW,
         )
         .unwrap();
-        reserve_tenant_name(&storage, &reserved).await.unwrap();
+        let name_permit = mesh_permit(
+            &storage,
+            RoutingRecordFamily::TenantName,
+            &reserved.partition(),
+        )
+        .await;
+        let name_authority = authority(&name_permit);
+        reserve_tenant_name(&storage, &reserved, name_authority)
+            .await
+            .unwrap();
 
         let competing = TenantNameDescriptor::reserved(
             MeshId::new("mesh_01").unwrap(),
@@ -1422,13 +1803,13 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            reserve_tenant_name(&storage, &competing).await,
+            reserve_tenant_name(&storage, &competing, name_authority).await,
             Err(MeshDirectoryError::TenantNameAlreadyExists { tenant_name })
                 if tenant_name == "acme"
         ));
 
         assert!(matches!(
-            activate_tenant_name(&storage, &tenant_name, &tenant_id, 99, NOW).await,
+            activate_tenant_name(&storage, &tenant_name, &tenant_id, 99, NOW, name_authority).await,
             Err(MeshDirectoryError::GenerationConflict {
                 expected: 99,
                 actual: 1,
@@ -1453,26 +1834,43 @@ mod tests {
             NOW,
         )
         .unwrap();
-        reserve_tenant_name(&storage, &reserved).await.unwrap();
-        create_tenant_locator(
+        let name_permit = mesh_permit(
             &storage,
-            &TenantLocatorDescriptor::active(
-                mesh_id,
-                tenant_id,
-                tenant_name.clone(),
-                RegionName::new("eu-west-1").unwrap(),
-                NOW,
-            )
-            .unwrap(),
+            RoutingRecordFamily::TenantName,
+            &reserved.partition(),
+        )
+        .await;
+        let name_authority = authority(&name_permit);
+        reserve_tenant_name(&storage, &reserved, name_authority)
+            .await
+            .unwrap();
+        let locator_descriptor = TenantLocatorDescriptor::active(
+            mesh_id,
+            tenant_id,
+            tenant_name.clone(),
+            RegionName::new("eu-west-1").unwrap(),
+            NOW,
+        )
+        .unwrap();
+        let locator_permit = mesh_permit(
+            &storage,
+            RoutingRecordFamily::TenantLocator,
+            &locator_descriptor.partition(),
+        )
+        .await;
+        create_tenant_locator(&storage, &locator_descriptor, authority(&locator_permit))
+            .await
+            .unwrap();
+
+        let recovered = recover_tenant_name_reservation(
+            &storage,
+            &tenant_name,
+            "2026-07-02T00:01:00Z",
+            name_authority,
         )
         .await
-        .unwrap();
-
-        let recovered =
-            recover_tenant_name_reservation(&storage, &tenant_name, "2026-07-02T00:01:00Z")
-                .await
-                .unwrap()
-                .expect("recovered tenant-name");
+        .unwrap()
+        .expect("recovered tenant-name");
 
         assert_eq!(recovered.status, TenantNameStatus::Active);
         assert_eq!(recovered.generation, 2);
@@ -1492,13 +1890,26 @@ mod tests {
             NOW,
         )
         .unwrap();
-        reserve_tenant_name(&storage, &reserved).await.unwrap();
+        let name_permit = mesh_permit(
+            &storage,
+            RoutingRecordFamily::TenantName,
+            &reserved.partition(),
+        )
+        .await;
+        let name_authority = authority(&name_permit);
+        reserve_tenant_name(&storage, &reserved, name_authority)
+            .await
+            .unwrap();
 
-        let recovered =
-            recover_tenant_name_reservation(&storage, &tenant_name, "2026-07-02T00:06:00Z")
-                .await
-                .unwrap()
-                .expect("recovered tenant-name");
+        let recovered = recover_tenant_name_reservation(
+            &storage,
+            &tenant_name,
+            "2026-07-02T00:06:00Z",
+            name_authority,
+        )
+        .await
+        .unwrap()
+        .expect("recovered tenant-name");
 
         assert_eq!(recovered.status, TenantNameStatus::Tombstoned);
         assert_eq!(recovered.generation, 2);

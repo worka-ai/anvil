@@ -1,4 +1,5 @@
 pub mod admin;
+pub(crate) mod admin_cursor;
 pub mod auth;
 pub mod bucket;
 pub mod coordination;

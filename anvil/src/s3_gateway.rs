@@ -3,14 +3,15 @@ use crate::auth::Claims;
 use crate::s3_auth::{aws_chunked_decoder, sigv4_auth};
 use anvil_core::auth;
 use anvil_core::bucket_journal;
-use anvil_core::mesh_directory::TenantNameStatus;
+use anvil_core::mesh_directory::{BucketLocatorStatus, TenantNameStatus};
 use anvil_core::object_links;
 use anvil_core::object_manager::{ObjectLinkReadMode, ObjectWriteOptions};
 use anvil_core::observability::RESERVED_NAMESPACE_REJECTION_COUNT;
 use anvil_core::permissions::AnvilAction;
 use anvil_core::persistence::Object;
 use anvil_core::routing::{
-    self, HostAliasDescriptor, ObjectRoute, RouteRequest, RouteSource, RoutingConfig, RoutingError,
+    self, CrossRegionRoutingPolicy, HostAliasDescriptor, ObjectRoute, RouteRequest, RouteSource,
+    RoutingConfig, RoutingError,
 };
 use anvil_core::validation;
 use axum::{
@@ -375,7 +376,7 @@ async fn s3_checked_route(
         });
     };
 
-    let route_tenant_id = match route.source {
+    let route_tenant_id = match &route.source {
         RouteSource::HostAlias { .. } => route.tenant.parse::<i64>().map_err(|_| {
             s3_error(
                 "InvalidRequest",
@@ -428,6 +429,27 @@ async fn s3_checked_route(
             axum::http::StatusCode::FORBIDDEN,
         ));
     }
+
+    if let Some(locator) = state
+        .persistence
+        .get_mesh_bucket_locator(route_tenant_id, &route.bucket)
+        .await
+        .map_err(|error| {
+            s3_error(
+                "InvalidRequest",
+                &format!("Failed to resolve bucket route: {error}"),
+                axum::http::StatusCode::BAD_REQUEST,
+            )
+        })?
+        && locator.status != BucketLocatorStatus::Deleted
+        && locator.home_region.as_str() != state.region.as_str()
+    {
+        return Err(s3_remote_bucket_response(
+            state.config.cross_region_routing_policy,
+            locator.home_region.as_str(),
+        ));
+    }
+
     Ok(CheckedS3Route {
         claims,
         tenant_id: Some(route_tenant_id),
@@ -876,6 +898,47 @@ fn s3_redirect(region: &str) -> Response {
         .unwrap()
 }
 
+fn s3_remote_bucket_response(policy: CrossRegionRoutingPolicy, region: &str) -> Response {
+    match routing::remote_bucket_routing_action(policy, false) {
+        routing::RemoteBucketRoutingAction::Redirect => s3_redirect(region),
+        routing::RemoteBucketRoutingAction::Proxy => add_bucket_region_header(
+            s3_error(
+                "InternalError",
+                "Cross-region proxying was selected but is not available",
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            region,
+        ),
+        routing::RemoteBucketRoutingAction::RejectLocalOnly => add_bucket_region_header(
+            s3_error(
+                "InvalidRequest",
+                &format!(
+                    "Bucket is in region {region}; cross-region routing is disabled by local_only policy"
+                ),
+                axum::http::StatusCode::BAD_REQUEST,
+            ),
+            region,
+        ),
+        routing::RemoteBucketRoutingAction::ProxyUnavailable => add_bucket_region_header(
+            s3_error(
+                "ServiceUnavailable",
+                &format!(
+                    "Bucket is in region {region}; cross-region proxying is required by policy but is not implemented"
+                ),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            region,
+        ),
+    }
+}
+
+fn add_bucket_region_header(mut response: Response, region: &str) -> Response {
+    if let Ok(value) = http::HeaderValue::from_str(region) {
+        response.headers_mut().insert("x-amz-bucket-region", value);
+    }
+    response
+}
+
 async fn head_bucket(
     State(state): State<AppState>,
     Path(mut bucket_name): Path<String>,
@@ -915,7 +978,10 @@ async fn head_bucket(
     {
         Ok(Some(bucket)) => {
             if bucket.region != state.region {
-                return s3_redirect(&bucket.region);
+                return s3_remote_bucket_response(
+                    state.config.cross_region_routing_policy,
+                    &bucket.region,
+                );
             }
             (axum::http::StatusCode::OK, "").into_response()
         }
@@ -1115,7 +1181,10 @@ async fn list_objects(
             tonic::Code::FailedPrecondition => {
                 if status.message().starts_with("Bucket is in region ") {
                     let region = status.message().trim_start_matches("Bucket is in region ");
-                    return s3_redirect(region);
+                    return s3_remote_bucket_response(
+                        state.config.cross_region_routing_policy,
+                        region,
+                    );
                 }
                 s3_error(
                     "PreconditionFailed",
@@ -1298,7 +1367,10 @@ async fn delete_objects(
             Err(status) if status.code() == tonic::Code::FailedPrecondition => {
                 if status.message().starts_with("Bucket is in region ") {
                     let region = status.message().trim_start_matches("Bucket is in region ");
-                    return s3_redirect(region);
+                    return s3_remote_bucket_response(
+                        state.config.cross_region_routing_policy,
+                        region,
+                    );
                 }
                 errors.push(DeleteObjectError::from_status(
                     key,
@@ -1538,7 +1610,12 @@ async fn list_multipart_uploads_response(
                 .body(Body::from(xml))
                 .unwrap()
         }
-        Err(status) => s3_status_to_response_for_auth(status, true, "NoSuchBucket"),
+        Err(status) => s3_status_to_response_for_auth(
+            status,
+            true,
+            "NoSuchBucket",
+            state.config.cross_region_routing_policy,
+        ),
     }
 }
 
@@ -1646,9 +1723,12 @@ async fn list_object_versions_response(
                 .body(Body::from(xml))
                 .unwrap()
         }
-        Err(status) => {
-            s3_status_to_response_for_auth(status, request_is_authenticated, "NoSuchBucket")
-        }
+        Err(status) => s3_status_to_response_for_auth(
+            status,
+            request_is_authenticated,
+            "NoSuchBucket",
+            state.config.cross_region_routing_policy,
+        ),
     }
 }
 
@@ -1656,12 +1736,13 @@ fn s3_status_to_response_for_auth(
     status: tonic::Status,
     request_is_authenticated: bool,
     not_found_code: &str,
+    cross_region_policy: CrossRegionRoutingPolicy,
 ) -> Response {
     match status.code() {
         tonic::Code::FailedPrecondition => {
             if status.message().starts_with("Bucket is in region ") {
                 let region = status.message().trim_start_matches("Bucket is in region ");
-                return s3_redirect(region);
+                return s3_remote_bucket_response(cross_region_policy, region);
             }
             s3_error(
                 "PreconditionFailed",
@@ -2031,7 +2112,10 @@ async fn get_object(
             tonic::Code::FailedPrecondition => {
                 if status.message().starts_with("Bucket is in region ") {
                     let region = status.message().trim_start_matches("Bucket is in region ");
-                    return s3_redirect(region);
+                    return s3_remote_bucket_response(
+                        state.config.cross_region_routing_policy,
+                        region,
+                    );
                 }
                 s3_error(
                     "PreconditionFailed",
@@ -2276,7 +2360,12 @@ async fn list_multipart_parts_response(
                 .body(Body::from(xml))
                 .unwrap()
         }
-        Err(status) => s3_status_to_response_for_auth(status, true, "NoSuchUpload"),
+        Err(status) => s3_status_to_response_for_auth(
+            status,
+            true,
+            "NoSuchUpload",
+            state.config.cross_region_routing_policy,
+        ),
     }
 }
 
@@ -2373,7 +2462,14 @@ async fn put_object(
             .await
         {
             Ok(current) => current,
-            Err(status) => return s3_status_to_response_for_auth(status, true, "NoSuchBucket"),
+            Err(status) => {
+                return s3_status_to_response_for_auth(
+                    status,
+                    true,
+                    "NoSuchBucket",
+                    state.config.cross_region_routing_policy,
+                );
+            }
         };
         if let Some(response) = evaluate_write_etag_preconditions(
             req.headers(),
@@ -2418,7 +2514,10 @@ async fn put_object(
             tonic::Code::FailedPrecondition => {
                 if status.message().starts_with("Bucket is in region ") {
                     let region = status.message().trim_start_matches("Bucket is in region ");
-                    return s3_redirect(region);
+                    return s3_remote_bucket_response(
+                        state.config.cross_region_routing_policy,
+                        region,
+                    );
                 }
                 s3_error(
                     "PreconditionFailed",
@@ -2526,7 +2625,12 @@ async fn initiate_multipart_upload(
                 .body(Body::from(xml))
                 .unwrap()
         }
-        Err(status) => s3_status_to_response_for_auth(status, true, "NoSuchBucket"),
+        Err(status) => s3_status_to_response_for_auth(
+            status,
+            true,
+            "NoSuchBucket",
+            state.config.cross_region_routing_policy,
+        ),
     }
 }
 
@@ -2557,7 +2661,12 @@ async fn upload_part(
             .header("ETag", format!("\"{}\"", result.etag))
             .body(Body::empty())
             .unwrap(),
-        Err(status) => s3_status_to_response_for_auth(status, true, "NoSuchUpload"),
+        Err(status) => s3_status_to_response_for_auth(
+            status,
+            true,
+            "NoSuchUpload",
+            state.config.cross_region_routing_policy,
+        ),
     }
 }
 
@@ -2617,7 +2726,12 @@ async fn complete_multipart_upload(
                 .body(Body::from(xml))
                 .unwrap()
         }
-        Err(status) => s3_status_to_response_for_auth(status, true, "NoSuchUpload"),
+        Err(status) => s3_status_to_response_for_auth(
+            status,
+            true,
+            "NoSuchUpload",
+            state.config.cross_region_routing_policy,
+        ),
     }
 }
 
@@ -2645,7 +2759,13 @@ async fn copy_object(
         .await
     {
         Ok(source) => source,
-        Err(status) => return copy_status_to_response(status, "NoSuchKey"),
+        Err(status) => {
+            return copy_status_to_response(
+                status,
+                "NoSuchKey",
+                state.config.cross_region_routing_policy,
+            );
+        }
     };
 
     if let Some(response) =
@@ -2683,7 +2803,11 @@ async fn copy_object(
                 .body(Body::from(xml))
                 .unwrap()
         }
-        Err(status) => copy_status_to_response(status, "NoSuchBucket"),
+        Err(status) => copy_status_to_response(
+            status,
+            "NoSuchBucket",
+            state.config.cross_region_routing_policy,
+        ),
     }
 }
 
@@ -2732,12 +2856,16 @@ fn percent_decode_path_component(value: &str) -> String {
     percent_decode(value.as_bytes())
 }
 
-fn copy_status_to_response(status: tonic::Status, not_found_code: &str) -> Response {
+fn copy_status_to_response(
+    status: tonic::Status,
+    not_found_code: &str,
+    cross_region_policy: CrossRegionRoutingPolicy,
+) -> Response {
     match status.code() {
         tonic::Code::FailedPrecondition => {
             if status.message().starts_with("Bucket is in region ") {
                 let region = status.message().trim_start_matches("Bucket is in region ");
-                return s3_redirect(region);
+                return s3_remote_bucket_response(cross_region_policy, region);
             }
             s3_error(
                 "PreconditionFailed",
@@ -2831,7 +2959,9 @@ async fn delete_object(
                 }
                 builder.body(Body::empty()).unwrap()
             }
-            Err(status) => s3_delete_status_to_response(status),
+            Err(status) => {
+                s3_delete_status_to_response(status, state.config.cross_region_routing_policy)
+            }
         };
     }
 
@@ -2846,16 +2976,21 @@ async fn delete_object(
             .header("x-amz-version-id", delete_marker.version_id.to_string())
             .body(Body::empty())
             .unwrap(),
-        Err(status) => s3_delete_status_to_response(status),
+        Err(status) => {
+            s3_delete_status_to_response(status, state.config.cross_region_routing_policy)
+        }
     }
 }
 
-fn s3_delete_status_to_response(status: tonic::Status) -> Response {
+fn s3_delete_status_to_response(
+    status: tonic::Status,
+    cross_region_policy: CrossRegionRoutingPolicy,
+) -> Response {
     match status.code() {
         tonic::Code::FailedPrecondition => {
             if status.message().starts_with("Bucket is in region ") {
                 let region = status.message().trim_start_matches("Bucket is in region ");
-                return s3_redirect(region);
+                return s3_remote_bucket_response(cross_region_policy, region);
             }
             s3_error(
                 "PreconditionFailed",
@@ -2901,7 +3036,12 @@ async fn abort_multipart_upload(
             .status(axum::http::StatusCode::NO_CONTENT)
             .body(Body::empty())
             .unwrap(),
-        Err(status) => s3_status_to_response_for_auth(status, true, "NoSuchUpload"),
+        Err(status) => s3_status_to_response_for_auth(
+            status,
+            true,
+            "NoSuchUpload",
+            state.config.cross_region_routing_policy,
+        ),
     }
 }
 
@@ -2984,7 +3124,10 @@ async fn head_object(
             tonic::Code::FailedPrecondition => {
                 if status.message().starts_with("Bucket is in region ") {
                     let region = status.message().trim_start_matches("Bucket is in region ");
-                    return s3_redirect(region);
+                    return s3_remote_bucket_response(
+                        state.config.cross_region_routing_policy,
+                        region,
+                    );
                 }
                 s3_error(
                     "PreconditionFailed",
@@ -3330,6 +3473,7 @@ fn parse_s3_version_id(q: &HashMap<String, String>) -> Result<Option<uuid::Uuid>
 mod tests {
     use super::*;
     use futures_util::TryStreamExt;
+    use tempfile::tempdir;
 
     fn request(uri: &str) -> Request {
         Request::builder().uri(uri).body(Body::empty()).unwrap()
@@ -3353,6 +3497,65 @@ mod tests {
             trusted_proxy_source_ranges: ranges.iter().map(|range| range.to_string()).collect(),
             ..anvil_core::config::Config::default()
         }
+    }
+
+    fn routing_config_with_policy(
+        storage_path: &std::path::Path,
+        policy: CrossRegionRoutingPolicy,
+    ) -> anvil_core::config::Config {
+        anvil_core::config::Config {
+            jwt_secret: "test-secret".to_string(),
+            anvil_secret_encryption_key:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            public_api_addr: "test-node".to_string(),
+            api_listen_addr: "127.0.0.1:0".to_string(),
+            region: "us-east-1".to_string(),
+            storage_path: storage_path.to_string_lossy().to_string(),
+            cross_region_routing_policy: policy,
+            ..anvil_core::config::Config::default()
+        }
+    }
+
+    async fn seeded_remote_bucket_route(
+        policy: CrossRegionRoutingPolicy,
+    ) -> (tempfile::TempDir, AppState, Claims, ObjectRoute) {
+        let temp = tempdir().unwrap();
+        let storage_path = temp.path().join("storage");
+        let state = AppState::new(routing_config_with_policy(&storage_path, policy), None)
+            .await
+            .unwrap();
+        let tenant = state
+            .persistence
+            .create_tenant("acme", "remote-bucket-test")
+            .await
+            .unwrap();
+        state
+            .persistence
+            .create_bucket(tenant.id, "releases", "eu-west-1")
+            .await
+            .unwrap();
+        let claims = Claims {
+            sub: "test-app".to_string(),
+            exp: usize::MAX,
+            scopes: Vec::new(),
+            tenant_id: tenant.id,
+            jti: None,
+        };
+        let route = ObjectRoute {
+            tenant: "acme".to_string(),
+            bucket: "releases".to_string(),
+            region: "us-east-1".to_string(),
+            key: "object.txt".to_string(),
+            source: RouteSource::PathStyle,
+        };
+        (temp, state, claims, route)
+    }
+
+    async fn response_xml(response: Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        std::str::from_utf8(&body).unwrap().to_string()
     }
 
     fn request_with_copy_source(uri: &str, copy_source: &str) -> Request {
@@ -3471,6 +3674,7 @@ mod tests {
             tonic::Status::not_found("missing protected object"),
             false,
             "NoSuchKey",
+            CrossRegionRoutingPolicy::RedirectPreferred,
         );
         assert_eq!(unauthenticated.status(), axum::http::StatusCode::FORBIDDEN);
         assert!(unauthenticated.headers().contains_key("x-amz-request-id"));
@@ -3485,6 +3689,7 @@ mod tests {
             tonic::Status::not_found("missing visible object"),
             true,
             "NoSuchKey",
+            CrossRegionRoutingPolicy::RedirectPreferred,
         );
         assert_eq!(authenticated.status(), axum::http::StatusCode::NOT_FOUND);
         let body = axum::body::to_bytes(authenticated.into_body(), 1024)
@@ -3492,6 +3697,66 @@ mod tests {
             .unwrap();
         let xml = std::str::from_utf8(&body).unwrap();
         assert!(xml.contains("<Code>NoSuchKey</Code>"));
+    }
+
+    #[tokio::test]
+    async fn remote_bucket_locator_local_only_rejects_cross_region_route() {
+        let (_temp, state, claims, route) =
+            seeded_remote_bucket_route(CrossRegionRoutingPolicy::LocalOnly).await;
+
+        let response = s3_checked_route(&state, Some(route), Some(claims))
+            .await
+            .unwrap_err();
+
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers().get("x-amz-bucket-region").unwrap(),
+            "eu-west-1"
+        );
+        let xml = response_xml(response).await;
+        assert!(xml.contains("<Code>InvalidRequest</Code>"));
+        assert!(xml.contains("local_only"));
+    }
+
+    #[tokio::test]
+    async fn remote_bucket_locator_redirect_preferred_returns_s3_wrong_region_response() {
+        let (_temp, state, claims, route) =
+            seeded_remote_bucket_route(CrossRegionRoutingPolicy::RedirectPreferred).await;
+
+        let response = s3_checked_route(&state, Some(route), Some(claims))
+            .await
+            .unwrap_err();
+
+        assert_eq!(response.status(), axum::http::StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            response.headers().get("x-amz-bucket-region").unwrap(),
+            "eu-west-1"
+        );
+        let xml = response_xml(response).await;
+        assert!(xml.contains("<Code>PermanentRedirect</Code>"));
+        assert!(xml.contains("<BucketRegion>eu-west-1</BucketRegion>"));
+    }
+
+    #[tokio::test]
+    async fn remote_bucket_locator_proxy_required_reports_unavailable_without_proxy() {
+        let (_temp, state, claims, route) =
+            seeded_remote_bucket_route(CrossRegionRoutingPolicy::ProxyRequired).await;
+
+        let response = s3_checked_route(&state, Some(route), Some(claims))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            response.headers().get("x-amz-bucket-region").unwrap(),
+            "eu-west-1"
+        );
+        let xml = response_xml(response).await;
+        assert!(xml.contains("<Code>ServiceUnavailable</Code>"));
+        assert!(xml.contains("not implemented"));
     }
 
     #[test]

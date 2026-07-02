@@ -578,14 +578,45 @@ impl Persistence {
             home_region,
             now.clone(),
         )?;
-        let reserved = mesh_directory::reserve_tenant_name(&self.storage, &reserved_name).await?;
-        mesh_directory::create_tenant_locator(&self.storage, &locator_descriptor).await?;
+        let tenant_name_permit = self
+            .mesh_control_write_permit(
+                mesh_directory::RoutingRecordFamily::TenantName,
+                &reserved_name.partition(),
+            )
+            .await?;
+        let tenant_locator_permit = self
+            .mesh_control_write_permit(
+                mesh_directory::RoutingRecordFamily::TenantLocator,
+                &locator_descriptor.partition(),
+            )
+            .await?;
+        let tenant_name_authority = mesh_directory::MeshControlWriteAuthority {
+            permit: &tenant_name_permit,
+            signing_key: &self.partition_owner_signing_key,
+        };
+        let tenant_locator_authority = mesh_directory::MeshControlWriteAuthority {
+            permit: &tenant_locator_permit,
+            signing_key: &self.partition_owner_signing_key,
+        };
+        let reserved = mesh_directory::reserve_tenant_name(
+            &self.storage,
+            &reserved_name,
+            tenant_name_authority,
+        )
+        .await?;
+        mesh_directory::create_tenant_locator(
+            &self.storage,
+            &locator_descriptor,
+            tenant_locator_authority,
+        )
+        .await?;
         mesh_directory::activate_tenant_name(
             &self.storage,
             &tenant_name,
             &tenant_id,
             reserved.generation,
             now,
+            tenant_name_authority,
         )
         .await?;
         Ok(())
@@ -611,7 +642,21 @@ impl Persistence {
             object_prefix,
             now,
         )?;
-        mesh_directory::write_bucket_locator(&self.storage, &locator).await?;
+        let permit = self
+            .mesh_control_write_permit(
+                mesh_directory::RoutingRecordFamily::BucketLocator,
+                &locator.partition(),
+            )
+            .await?;
+        mesh_directory::write_bucket_locator(
+            &self.storage,
+            &locator,
+            mesh_directory::MeshControlWriteAuthority {
+                permit: &permit,
+                signing_key: &self.partition_owner_signing_key,
+            },
+        )
+        .await?;
         Ok(())
     }
 
@@ -687,7 +732,22 @@ impl Persistence {
                     .into_iter()
                     .find(|alias| alias.hostname == hostname)
                     .ok_or_else(|| anyhow!("host alias not found"))?;
-                mesh_directory::write_host_alias_descriptor(&self.storage, &descriptor).await?;
+                let partition = mesh_directory::host_alias_partition(&descriptor.hostname)?;
+                let permit = self
+                    .mesh_control_write_permit(
+                        mesh_directory::RoutingRecordFamily::HostAlias,
+                        &partition,
+                    )
+                    .await?;
+                mesh_directory::write_host_alias_descriptor(
+                    &self.storage,
+                    &descriptor,
+                    mesh_directory::MeshControlWriteAuthority {
+                        permit: &permit,
+                        signing_key: &self.partition_owner_signing_key,
+                    },
+                )
+                .await?;
             }
         }
 
@@ -760,6 +820,18 @@ impl Persistence {
         self.global_write_permit(
             "control_plane",
             hex::encode(control_journal::control_partition_id()),
+        )
+        .await
+    }
+
+    async fn mesh_control_write_permit(
+        &self,
+        family: mesh_directory::RoutingRecordFamily,
+        partition: &str,
+    ) -> Result<PartitionWritePermit> {
+        self.global_write_permit(
+            mesh_directory::CONTROL_PARTITION_FAMILY,
+            mesh_directory::control_partition_id(family.stream_family(), partition),
         )
         .await
     }
@@ -1230,9 +1302,24 @@ impl Persistence {
     ) -> crate::mesh_lifecycle::LifecycleResult<crate::routing::HostAliasDescriptor> {
         let descriptor =
             crate::mesh_lifecycle::create_host_alias(&self.storage, routing_config, input).await?;
-        mesh_directory::write_host_alias_descriptor(&self.storage, &descriptor)
-            .await
+        let partition = mesh_directory::host_alias_partition(&descriptor.hostname)
             .map_err(mesh_directory_lifecycle_error)?;
+        let permit = self
+            .mesh_control_write_permit(mesh_directory::RoutingRecordFamily::HostAlias, &partition)
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        mesh_directory::write_host_alias_descriptor(
+            &self.storage,
+            &descriptor,
+            mesh_directory::MeshControlWriteAuthority {
+                permit: &permit,
+                signing_key: &self.partition_owner_signing_key,
+            },
+        )
+        .await
+        .map_err(mesh_directory_lifecycle_error)?;
         Ok(descriptor)
     }
 
@@ -1249,9 +1336,24 @@ impl Persistence {
             target,
         )
         .await?;
-        mesh_directory::write_host_alias_descriptor(&self.storage, &descriptor)
-            .await
+        let partition = mesh_directory::host_alias_partition(&descriptor.hostname)
             .map_err(mesh_directory_lifecycle_error)?;
+        let permit = self
+            .mesh_control_write_permit(mesh_directory::RoutingRecordFamily::HostAlias, &partition)
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        mesh_directory::write_host_alias_descriptor(
+            &self.storage,
+            &descriptor,
+            mesh_directory::MeshControlWriteAuthority {
+                permit: &permit,
+                signing_key: &self.partition_owner_signing_key,
+            },
+        )
+        .await
+        .map_err(mesh_directory_lifecycle_error)?;
         Ok(descriptor)
     }
 
@@ -4073,6 +4175,28 @@ fn mesh_directory_lifecycle_error(
                 "invalid RFC3339 timestamp in {field}: {value}"
             ))
         }
+        mesh_directory::MeshDirectoryError::InvalidControlWritePermit {
+            stream_family,
+            partition,
+            reason,
+        } => crate::mesh_lifecycle::LifecycleError::InvalidArgument(format!(
+            "invalid mesh control write permit for {stream_family}/{partition}: {reason}"
+        )),
+        mesh_directory::MeshDirectoryError::ControlFenceRejected {
+            stream_family,
+            partition,
+            code,
+            reason,
+        } => crate::mesh_lifecycle::LifecycleError::InvalidArgument(format!(
+            "mesh control write fence rejected for {stream_family}/{partition}: {code}: {reason}"
+        )),
+        mesh_directory::MeshDirectoryError::ControlStreamWrite {
+            stream_family,
+            partition,
+            message,
+        } => crate::mesh_lifecycle::LifecycleError::InvalidArgument(format!(
+            "mesh control stream write failed for {stream_family}/{partition}: {message}"
+        )),
         mesh_directory::MeshDirectoryError::Io(err) => {
             crate::mesh_lifecycle::LifecycleError::Io(err)
         }

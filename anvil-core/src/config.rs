@@ -1,6 +1,7 @@
 use clap::Parser;
 use std::path::{Path, PathBuf};
 
+use crate::routing::CrossRegionRoutingPolicy;
 use anyhow::Result;
 
 /// A distributed storage and compute system.
@@ -54,6 +55,10 @@ pub struct Config {
     /// Trusted proxy source IPs or CIDR ranges allowed to supply forwarded request metadata.
     #[arg(long, env, use_value_delimiter = true, value_delimiter = ',')]
     pub trusted_proxy_source_ranges: Vec<String>,
+
+    /// Policy for requests whose bucket locator is owned by another region.
+    #[arg(long, env, default_value_t = CrossRegionRoutingPolicy::RedirectPreferred)]
+    pub cross_region_routing_policy: CrossRegionRoutingPolicy,
 
     /// Path used by operators to persist this node's stable lifecycle identity.
     /// Defaults to `<storage_path>/node-id` when left empty.
@@ -162,6 +167,42 @@ fn resolve_identity_path(configured_path: &str, storage_path: &str, default_file
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn required_args() -> [&'static str; 9] {
+        [
+            "anvil",
+            "--jwt-secret",
+            "test-secret",
+            "--anvil-secret-encryption-key",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--public-api-addr",
+            "test-node",
+            "--region",
+            "us-east-1",
+        ]
+    }
+
+    #[test]
+    fn cross_region_routing_policy_defaults_to_redirect_preferred() {
+        let config = Config::try_parse_from(required_args()).unwrap();
+
+        assert_eq!(
+            config.cross_region_routing_policy,
+            CrossRegionRoutingPolicy::RedirectPreferred
+        );
+    }
+
+    #[test]
+    fn cross_region_routing_policy_parses_configured_value() {
+        let mut args = required_args().to_vec();
+        args.extend(["--cross-region-routing-policy", "local_only"]);
+        let config = Config::try_parse_from(args).unwrap();
+
+        assert_eq!(
+            config.cross_region_routing_policy,
+            CrossRegionRoutingPolicy::LocalOnly
+        );
+    }
 
     #[test]
     fn persisted_identity_uses_storage_defaults_and_reloads() {

@@ -126,6 +126,35 @@ fn context(label: &str, expected_generation: u64) -> AdminRequestContext {
     }
 }
 
+fn empty_activation_checkpoint_json(mesh_id: &str, region: &str) -> String {
+    serde_json::json!({
+        "schema": anvil::mesh_lifecycle::ACTIVATION_CHECKPOINT_SCHEMA,
+        "mesh_id": mesh_id,
+        "region": region,
+        "created_at": "2026-07-02T00:00:00Z",
+        "required_streams": []
+    })
+    .to_string()
+}
+
+fn missing_activation_checkpoint_json(mesh_id: &str, region: &str) -> String {
+    serde_json::json!({
+        "schema": anvil::mesh_lifecycle::ACTIVATION_CHECKPOINT_SCHEMA,
+        "mesh_id": mesh_id,
+        "region": region,
+        "created_at": "2026-07-02T00:00:00Z",
+        "required_streams": [
+            {
+                "stream_family": "bucket_locator",
+                "partition": "0a7f",
+                "sequence": 1,
+                "digest": "blake3:0000000000000000000000000000000000000000000000000000000000000000"
+            }
+        ]
+    })
+    .to_string()
+}
+
 #[tokio::test]
 async fn admin_service_is_absent_public_present_admin_and_requires_auth() {
     let node = spawn_admin_node().await;
@@ -259,11 +288,39 @@ async fn admin_lifecycle_rejects_invalid_region_cell_and_node_transitions() {
         .unwrap();
     assert_eq!(cell.state, 2);
 
+    let not_reached = client
+        .activate_region(with_auth(
+            tonic::Request::new(ActivateRegionRequest {
+                context: Some(context(
+                    "activate-region-missing-checkpoint",
+                    region.generation,
+                )),
+                region: "eu-west-1".to_string(),
+                activation_checkpoint_json: missing_activation_checkpoint_json(
+                    "mesh-test",
+                    "eu-west-1",
+                ),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(not_reached.code(), Code::FailedPrecondition);
+    assert!(
+        not_reached
+            .message()
+            .contains("ActivationCheckpointNotReached")
+    );
+
     let region = client
         .activate_region(with_auth(
             tonic::Request::new(ActivateRegionRequest {
                 context: Some(context("activate-region", region.generation)),
                 region: "eu-west-1".to_string(),
+                activation_checkpoint_json: empty_activation_checkpoint_json(
+                    "mesh-test",
+                    "eu-west-1",
+                ),
             }),
             &token,
         ))
@@ -313,6 +370,10 @@ async fn admin_lifecycle_rejects_invalid_region_cell_and_node_transitions() {
                     read_only_region.generation,
                 )),
                 region: "eu-west-1".to_string(),
+                activation_checkpoint_json: empty_activation_checkpoint_json(
+                    "mesh-test",
+                    "eu-west-1",
+                ),
             }),
             &token,
         ))
@@ -742,6 +803,10 @@ async fn admin_host_aliases_are_generation_checked_and_lifecycle_managed() {
             tonic::Request::new(ActivateRegionRequest {
                 context: Some(context("alias-activate-region", region.generation)),
                 region: "eu-west-1".to_string(),
+                activation_checkpoint_json: empty_activation_checkpoint_json(
+                    "mesh-test",
+                    "eu-west-1",
+                ),
             }),
             &token,
         ))

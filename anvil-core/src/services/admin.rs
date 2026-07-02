@@ -1,3 +1,4 @@
+use super::admin_cursor::{self, AdminCursorBinding};
 use crate::admin_auth::{self, AdminPrincipal, AnvilAdminCapability};
 use crate::anvil_api::admin_service_server::AdminService;
 use crate::anvil_api::*;
@@ -286,19 +287,44 @@ impl AdminService for AppState {
         &self,
         request: Request<ListObjectLinksRequest>,
     ) -> Result<Response<ListObjectLinksResponse>, Status> {
-        require_admin(&request, self, AnvilAdminCapability::ManageLinks)?;
+        let principal = require_admin(&request, self, AnvilAdminCapability::ManageLinks)?;
         let req = request.into_inner();
         let bucket = resolve_link_bucket(self, &req.tenant_id, &req.bucket_name).await?;
         let page = req.page.as_ref();
-        let cursor = page.map(|page| page.cursor.as_str()).unwrap_or_default();
         let limit = page_limit(page);
-        let mut links = self
+        let links = self
             .persistence
             .list_object_links(bucket.id, none_if_empty(&req.prefix))
             .await
-            .map_err(object_link_status)?
+            .map_err(object_link_status)?;
+        let revision = admin_cursor::collection_revision(
+            links
+                .iter()
+                .map(|link| (link.link_key.as_str(), link.generation)),
+        );
+        let tenant_id_filter = bucket.tenant_id.to_string();
+        let filters = [
+            ("tenant_id", tenant_id_filter.as_str()),
+            ("bucket_name", bucket.name.as_str()),
+            ("prefix", req.prefix.as_str()),
+        ];
+        let binding = AdminCursorBinding {
+            scope: "admin.list_object_links.v1",
+            filters: &filters,
+            principal: &principal,
+            limit,
+            revision: &revision,
+            sort: "link_key.asc",
+        };
+        let cursor =
+            admin_cursor::decode_page_cursor(page, &binding, self.config.jwt_secret.as_bytes())?;
+        let mut links = links
             .into_iter()
-            .filter(|link| cursor.is_empty() || link.link_key.as_str() > cursor)
+            .filter(|link| {
+                cursor
+                    .as_deref()
+                    .is_none_or(|cursor| link.link_key.as_str() > cursor)
+            })
             .take(limit + 1)
             .collect::<Vec<_>>();
         let has_more = links.len() > limit;
@@ -306,10 +332,13 @@ impl AdminService for AppState {
             links.truncate(limit);
         }
         let next_cursor = if has_more {
-            links
-                .last()
-                .map(|link| link.link_key.clone())
-                .unwrap_or_default()
+            links.last().map_or(Ok(String::new()), |link| {
+                admin_cursor::encode_next_cursor(
+                    &link.link_key,
+                    &binding,
+                    self.config.jwt_secret.as_bytes(),
+                )
+            })?
         } else {
             String::new()
         };
@@ -456,18 +485,38 @@ impl AdminService for AppState {
         &self,
         request: Request<ListHostAliasesRequest>,
     ) -> Result<Response<ListHostAliasesResponse>, Status> {
-        require_admin(&request, self, AnvilAdminCapability::ManageHostAliases)?;
+        let principal = require_admin(&request, self, AnvilAdminCapability::ManageHostAliases)?;
         let req = request.into_inner();
         let page = req.page.as_ref();
-        let cursor = page.map(|page| page.cursor.as_str()).unwrap_or_default();
         let limit = page_limit(page);
-        let mut host_aliases = self
+        let host_aliases = self
             .persistence
             .list_host_alias_descriptors(none_if_empty(&req.region))
             .await
-            .map_err(lifecycle_status)?
+            .map_err(lifecycle_status)?;
+        let revision = admin_cursor::collection_revision(
+            host_aliases
+                .iter()
+                .map(|alias| (alias.hostname.as_str(), alias.generation)),
+        );
+        let filters = [("region", req.region.as_str())];
+        let binding = AdminCursorBinding {
+            scope: "admin.list_host_aliases.v1",
+            filters: &filters,
+            principal: &principal,
+            limit,
+            revision: &revision,
+            sort: "hostname.asc",
+        };
+        let cursor =
+            admin_cursor::decode_page_cursor(page, &binding, self.config.jwt_secret.as_bytes())?;
+        let mut host_aliases = host_aliases
             .into_iter()
-            .filter(|alias| cursor.is_empty() || alias.hostname.as_str() > cursor)
+            .filter(|alias| {
+                cursor
+                    .as_deref()
+                    .is_none_or(|cursor| alias.hostname.as_str() > cursor)
+            })
             .take(limit + 1)
             .collect::<Vec<_>>();
         let has_more = host_aliases.len() > limit;
@@ -475,10 +524,13 @@ impl AdminService for AppState {
             host_aliases.truncate(limit);
         }
         let next_cursor = if has_more {
-            host_aliases
-                .last()
-                .map(|alias| alias.hostname.clone())
-                .unwrap_or_default()
+            host_aliases.last().map_or(Ok(String::new()), |alias| {
+                admin_cursor::encode_next_cursor(
+                    &alias.hostname,
+                    &binding,
+                    self.config.jwt_secret.as_bytes(),
+                )
+            })?
         } else {
             String::new()
         };
@@ -528,15 +580,17 @@ impl AdminService for AppState {
         let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
-        let region = self
-            .persistence
-            .transition_region_descriptor(
-                &req.region,
-                context.expected_generation,
-                CoreLifecycleState::Active,
-            )
-            .await
-            .map_err(lifecycle_status)?;
+        let checkpoint =
+            mesh_lifecycle::parse_activation_checkpoint_json(&req.activation_checkpoint_json)
+                .map_err(lifecycle_status)?;
+        let region = mesh_lifecycle::activate_region(
+            &self.storage,
+            &req.region,
+            context.expected_generation,
+            &checkpoint,
+        )
+        .await
+        .map_err(lifecycle_status)?;
         Ok(Response::new(RegionResponse {
             request_id: context.request_id.clone(),
             region: Some(region_descriptor_to_proto(region)),
@@ -928,19 +982,41 @@ impl AdminService for AppState {
         &self,
         request: Request<ListRoutingRecordsRequest>,
     ) -> Result<Response<ListRoutingRecordsResponse>, Status> {
-        require_admin(&request, self, AnvilAdminCapability::ManageRouting)?;
+        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRouting)?;
         let req = request.into_inner();
         let family = routing_record_family_from_proto(req.family)?;
         let page = req.page.as_ref();
-        let cursor = page.map(|page| page.cursor.as_str()).unwrap_or_default();
         let limit = page_limit(page);
         let mut records = self
             .persistence
             .list_mesh_routing_records(family)
             .await
-            .map_err(|err| Status::internal(err.to_string()))?
+            .map_err(|err| Status::internal(err.to_string()))?;
+        records.sort_by(|left, right| left.descriptor_key.cmp(&right.descriptor_key));
+        let revision = admin_cursor::collection_revision(
+            records
+                .iter()
+                .map(|record| (record.descriptor_key.as_str(), record.generation)),
+        );
+        let family_filter = req.family.to_string();
+        let filters = [("family", family_filter.as_str())];
+        let binding = AdminCursorBinding {
+            scope: "admin.list_routing_records.v1",
+            filters: &filters,
+            principal: &principal,
+            limit,
+            revision: &revision,
+            sort: "descriptor_key.asc",
+        };
+        let cursor =
+            admin_cursor::decode_page_cursor(page, &binding, self.config.jwt_secret.as_bytes())?;
+        let mut records = records
             .into_iter()
-            .filter(|record| cursor.is_empty() || record.descriptor_key.as_str() > cursor)
+            .filter(|record| {
+                cursor
+                    .as_deref()
+                    .is_none_or(|cursor| record.descriptor_key.as_str() > cursor)
+            })
             .take(limit + 1)
             .map(routing_record_descriptor_to_proto)
             .collect::<Vec<_>>();
@@ -949,10 +1025,13 @@ impl AdminService for AppState {
             records.truncate(limit);
         }
         let next_cursor = if has_more {
-            records
-                .last()
-                .map(|record| record.descriptor_key.clone())
-                .unwrap_or_default()
+            records.last().map_or(Ok(String::new()), |record| {
+                admin_cursor::encode_next_cursor(
+                    &record.descriptor_key,
+                    &binding,
+                    self.config.jwt_secret.as_bytes(),
+                )
+            })?
         } else {
             String::new()
         };
@@ -1657,7 +1736,8 @@ fn lifecycle_status(err: LifecycleError) -> Status {
         LifecycleError::AlreadyExists { .. } => Status::already_exists(err.to_string()),
         LifecycleError::NotFound { .. } => Status::not_found(err.to_string()),
         LifecycleError::GenerationConflict { .. } => Status::aborted(err.to_string()),
-        LifecycleError::LifecycleTransitionDenied { .. } => {
+        LifecycleError::LifecycleTransitionDenied { .. }
+        | LifecycleError::ActivationCheckpointNotReached { .. } => {
             Status::failed_precondition(err.to_string())
         }
         LifecycleError::Io(_) | LifecycleError::Json(_) => Status::internal(err.to_string()),
