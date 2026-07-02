@@ -886,8 +886,15 @@ async fn list_objects(
 
     if q.contains_key("versions") {
         let request_is_authenticated = req.extensions().get::<Claims>().is_some();
-        return list_object_versions_response(state, claims, &bucket, &q, request_is_authenticated)
-            .await;
+        return list_object_versions_response(
+            state,
+            claims,
+            checked_route.tenant_id,
+            &bucket,
+            &q,
+            request_is_authenticated,
+        )
+        .await;
     }
 
     if q.contains_key("uploads") {
@@ -1467,6 +1474,7 @@ async fn list_multipart_uploads_response(
 async fn list_object_versions_response(
     state: AppState,
     claims: Option<Claims>,
+    route_tenant_id: Option<i64>,
     bucket: &str,
     q: &HashMap<String, String>,
     request_is_authenticated: bool,
@@ -1489,8 +1497,9 @@ async fn list_object_versions_response(
 
     match state
         .object_manager
-        .list_object_versions(
+        .list_object_versions_for_tenant(
             claims,
+            route_tenant_id,
             bucket,
             &prefix,
             &key_marker,
@@ -1871,7 +1880,15 @@ async fn get_object(
         Err(response) => return response,
     };
     if is_link_metadata_request(req.headers()) {
-        return get_object_link_metadata_response(state, claims, &bucket, &key, version_id).await;
+        return get_object_link_metadata_response(
+            state,
+            claims,
+            checked_route.tenant_id,
+            &bucket,
+            &key,
+            version_id,
+        )
+        .await;
     }
     let requested_range = match parse_http_range(req.headers(), None) {
         Ok(range) => range,
@@ -1981,13 +1998,14 @@ async fn get_object(
 async fn get_object_link_metadata_response(
     state: AppState,
     claims: Option<Claims>,
+    route_tenant_id: Option<i64>,
     bucket: &str,
     key: &str,
     version_id: Option<uuid::Uuid>,
 ) -> Response {
     match state
         .object_manager
-        .read_object_link(claims.clone(), bucket, key, version_id)
+        .read_object_link_for_tenant(claims.clone(), route_tenant_id, bucket, key, version_id)
         .await
     {
         Ok(descriptor) => {
@@ -2017,13 +2035,14 @@ async fn get_object_link_metadata_response(
 async fn head_object_link_metadata_response(
     state: AppState,
     claims: Option<Claims>,
+    route_tenant_id: Option<i64>,
     bucket: &str,
     key: &str,
     version_id: Option<uuid::Uuid>,
 ) -> Response {
     match state
         .object_manager
-        .read_object_link(claims.clone(), bucket, key, version_id)
+        .read_object_link_for_tenant(claims.clone(), route_tenant_id, bucket, key, version_id)
         .await
     {
         Ok(descriptor) => {
@@ -2840,7 +2859,15 @@ async fn head_object(
         Err(response) => return response,
     };
     if is_link_metadata_request(req.headers()) {
-        return head_object_link_metadata_response(state, claims, &bucket, &key, version_id).await;
+        return head_object_link_metadata_response(
+            state,
+            claims,
+            checked_route.tenant_id,
+            &bucket,
+            &key,
+            version_id,
+        )
+        .await;
     }
 
     match state

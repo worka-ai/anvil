@@ -1467,6 +1467,18 @@ impl ObjectManager {
         object_key: &str,
         version_id: Option<uuid::Uuid>,
     ) -> Result<object_links::ObjectLinkDescriptor, Status> {
+        self.read_object_link_for_tenant(claims, None, bucket_name, object_key, version_id)
+            .await
+    }
+
+    pub async fn read_object_link_for_tenant(
+        &self,
+        claims: Option<auth::Claims>,
+        route_tenant_id: Option<i64>,
+        bucket_name: &str,
+        object_key: &str,
+        version_id: Option<uuid::Uuid>,
+    ) -> Result<object_links::ObjectLinkDescriptor, Status> {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
@@ -1478,7 +1490,7 @@ impl ObjectManager {
         }
 
         let bucket = self
-            .get_authorized_bucket(claims.as_ref(), None, bucket_name)
+            .get_authorized_bucket(claims.as_ref(), route_tenant_id, bucket_name)
             .await?;
         if !bucket.is_public_read {
             let claims = claims
@@ -1615,6 +1627,28 @@ impl ObjectManager {
         version_id_marker: &str,
         limit: i32,
     ) -> Result<crate::persistence::ObjectVersionsPage, Status> {
+        self.list_object_versions_for_tenant(
+            claims,
+            None,
+            bucket_name,
+            prefix,
+            key_marker,
+            version_id_marker,
+            limit,
+        )
+        .await
+    }
+
+    pub async fn list_object_versions_for_tenant(
+        &self,
+        claims: Option<auth::Claims>,
+        route_tenant_id: Option<i64>,
+        bucket_name: &str,
+        prefix: &str,
+        key_marker: &str,
+        version_id_marker: &str,
+        limit: i32,
+    ) -> Result<crate::persistence::ObjectVersionsPage, Status> {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
@@ -1641,7 +1675,7 @@ impl ObjectManager {
         };
 
         let bucket = self
-            .get_authorized_bucket(claims.as_ref(), None, bucket_name)
+            .get_authorized_bucket(claims.as_ref(), route_tenant_id, bucket_name)
             .await?;
         if !bucket.is_public_read {
             let claims = claims
