@@ -227,7 +227,7 @@ fn authz_record_from_segment_record(record: SegmentRecord) -> Result<AuthzTupleR
         namespace: String::from_utf8(key.namespace)?,
         object_id: String::from_utf8(key.object_id)?,
         relation: String::from_utf8(key.relation)?,
-        subject_kind: subject_kind_from_code(key.subject_kind)?.to_string(),
+        subject_kind: String::from_utf8(key.subject_kind)?,
         subject_id: String::from_utf8(key.subject_id)?,
         caveat_hash: caveat_hash_to_string(key.caveat_hash),
         operation: operation_to_string(value.operation).to_string(),
@@ -244,7 +244,7 @@ fn segment_key(record: &AuthzTupleRecord) -> Result<Vec<u8>> {
         namespace: record.namespace.as_bytes().to_vec(),
         object_id: record.object_id.as_bytes().to_vec(),
         relation: record.relation.as_bytes().to_vec(),
-        subject_kind: subject_kind_code(&record.subject_kind)?,
+        subject_kind: record.subject_kind.as_bytes().to_vec(),
         subject_id: record.subject_id.as_bytes().to_vec(),
         caveat_hash: caveat_hash_from_string(&record.caveat_hash)?,
     };
@@ -280,32 +280,6 @@ fn operation_to_string(operation: TupleOperation) -> &'static str {
     match operation {
         TupleOperation::Add => "add",
         TupleOperation::Remove => "remove",
-    }
-}
-
-fn subject_kind_code(subject_kind: &str) -> Result<u8> {
-    match subject_kind {
-        "user" => Ok(1),
-        "group" => Ok(2),
-        "service" => Ok(3),
-        "public" => Ok(4),
-        "anonymous" => Ok(5),
-        "app" => Ok(6),
-        "userset" => Ok(7),
-        other => Err(anyhow!("unsupported authz subject kind {other}")),
-    }
-}
-
-fn subject_kind_from_code(code: u8) -> Result<&'static str> {
-    match code {
-        1 => Ok("user"),
-        2 => Ok("group"),
-        3 => Ok("service"),
-        4 => Ok("public"),
-        5 => Ok("anonymous"),
-        6 => Ok("app"),
-        7 => Ok("userset"),
-        other => Err(anyhow!("unsupported authz subject kind code {other}")),
     }
 }
 

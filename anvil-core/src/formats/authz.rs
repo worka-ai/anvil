@@ -6,7 +6,7 @@ pub struct TupleKey {
     pub namespace: Vec<u8>,
     pub object_id: Vec<u8>,
     pub relation: Vec<u8>,
-    pub subject_kind: u8,
+    pub subject_kind: Vec<u8>,
     pub subject_id: Vec<u8>,
     pub caveat_hash: Hash32,
 }
@@ -16,42 +16,44 @@ impl TupleKey {
         let mut out = Vec::with_capacity(
             2 + 2
                 + 2
-                + 1
+                + 2
                 + 2
                 + 32
                 + self.namespace.len()
                 + self.object_id.len()
                 + self.relation.len()
+                + self.subject_kind.len()
                 + self.subject_id.len(),
         );
         out.extend_from_slice(&(self.namespace.len() as u16).to_le_bytes());
         out.extend_from_slice(&(self.object_id.len() as u16).to_le_bytes());
         out.extend_from_slice(&(self.relation.len() as u16).to_le_bytes());
-        out.push(self.subject_kind);
+        out.extend_from_slice(&(self.subject_kind.len() as u16).to_le_bytes());
         out.extend_from_slice(&(self.subject_id.len() as u16).to_le_bytes());
         out.extend_from_slice(&self.caveat_hash);
         out.extend_from_slice(&self.namespace);
         out.extend_from_slice(&self.object_id);
         out.extend_from_slice(&self.relation);
+        out.extend_from_slice(&self.subject_kind);
         out.extend_from_slice(&self.subject_id);
         out
     }
 
     pub fn decode(input: &[u8]) -> Result<(Self, usize), FormatError> {
-        if input.len() < 41 {
+        if input.len() < 42 {
             return Err(FormatError::TooShort {
                 context: "authz tuple key",
-                needed: 41,
+                needed: 42,
                 actual: input.len(),
             });
         }
         let namespace_len = u16::from_le_bytes(input[0..2].try_into().unwrap()) as usize;
         let object_id_len = u16::from_le_bytes(input[2..4].try_into().unwrap()) as usize;
         let relation_len = u16::from_le_bytes(input[4..6].try_into().unwrap()) as usize;
-        let subject_kind = input[6];
-        let subject_id_len = u16::from_le_bytes(input[7..9].try_into().unwrap()) as usize;
-        let caveat_hash = input[9..41].try_into().unwrap();
-        let namespace_start: usize = 41;
+        let subject_kind_len = u16::from_le_bytes(input[6..8].try_into().unwrap()) as usize;
+        let subject_id_len = u16::from_le_bytes(input[8..10].try_into().unwrap()) as usize;
+        let caveat_hash = input[10..42].try_into().unwrap();
+        let namespace_start: usize = 42;
         let object_id_start = namespace_start.checked_add(namespace_len).ok_or(
             FormatError::InvalidDeclaredLength {
                 context: "authz tuple namespace",
@@ -68,6 +70,12 @@ impl TupleKey {
                 .ok_or(FormatError::InvalidDeclaredLength {
                     context: "authz tuple relation",
                 })?;
+        let subject_kind_start = subject_id_start;
+        let subject_id_start = subject_kind_start.checked_add(subject_kind_len).ok_or(
+            FormatError::InvalidDeclaredLength {
+                context: "authz tuple subject kind",
+            },
+        )?;
         let record_end = subject_id_start.checked_add(subject_id_len).ok_or(
             FormatError::InvalidDeclaredLength {
                 context: "authz tuple subject id",
@@ -84,8 +92,8 @@ impl TupleKey {
             Self {
                 namespace: input[namespace_start..object_id_start].to_vec(),
                 object_id: input[object_id_start..relation_start].to_vec(),
-                relation: input[relation_start..subject_id_start].to_vec(),
-                subject_kind,
+                relation: input[relation_start..subject_kind_start].to_vec(),
+                subject_kind: input[subject_kind_start..subject_id_start].to_vec(),
                 subject_id: input[subject_id_start..record_end].to_vec(),
                 caveat_hash,
             },
@@ -257,7 +265,7 @@ mod tests {
             namespace: b"document".to_vec(),
             object_id: b"doc-1".to_vec(),
             relation: b"viewer".to_vec(),
-            subject_kind: 1,
+            subject_kind: b"folder".to_vec(),
             subject_id: b"user:alice".to_vec(),
             caveat_hash: [7; 32],
         };

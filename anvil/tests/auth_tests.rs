@@ -913,6 +913,28 @@ async fn test_authz_tuple_batch_failure_is_atomic() {
         "failed authz batches must not advance the tenant revision"
     );
 
+    let mut unsafe_component_batch = Request::new(WriteAuthzTuplesRequest {
+        mutations: vec![
+            authz_mutation("document", "alpha", "viewer", "user", "alice", "add"),
+            authz_mutation("bad/slash", "beta", "viewer", "user", "alice", "add"),
+        ],
+    });
+    add_bearer(&mut unsafe_component_batch, &token);
+    let err = auth_client
+        .write_authz_tuples(unsafe_component_batch)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert_eq!(
+        cluster.states[0]
+            .persistence
+            .latest_authz_revision(1)
+            .await
+            .unwrap(),
+        0,
+        "failed authz batches with unsafe components must not advance the tenant revision"
+    );
+
     let mut valid_batch = Request::new(WriteAuthzTuplesRequest {
         mutations: vec![
             authz_mutation("document", "alpha", "viewer", "user", "alice", "add"),
@@ -927,6 +949,62 @@ async fn test_authz_tuple_batch_failure_is_atomic() {
         .into_inner();
     assert_eq!(valid.revision, 1);
     assert!(valid.results.iter().all(|result| result.revision == 1));
+}
+
+#[tokio::test]
+async fn test_authz_accepts_arbitrary_safe_subject_kind() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    let mut write = Request::new(WriteAuthzTuplesRequest {
+        mutations: vec![authz_mutation(
+            "document", "doc-1", "viewer", "folder", "folder-1", "add",
+        )],
+    });
+    add_bearer(&mut write, &token);
+    let written = auth_client
+        .write_authz_tuples(write)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(written.revision, 1);
+
+    let mut check = Request::new(check_permission_request(
+        "document", "doc-1", "viewer", "folder", "folder-1", "latest", "",
+    ));
+    add_bearer(&mut check, &token);
+    let check = auth_client
+        .check_permission(check)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(check.allowed);
+
+    let mut read = Request::new(ReadAuthzTuplesRequest {
+        namespace: "document".to_string(),
+        object_id: "doc-1".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "folder".to_string(),
+        subject_id: "folder-1".to_string(),
+        caveat_hash: String::new(),
+        consistency: "latest".to_string(),
+        zookie: String::new(),
+        page_size: 10,
+        page_token: String::new(),
+    });
+    add_bearer(&mut read, &token);
+    let read = auth_client
+        .read_authz_tuples(read)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(read.tuples.len(), 1);
+    assert_eq!(read.tuples[0].subject_kind, "folder");
 }
 
 #[tokio::test]

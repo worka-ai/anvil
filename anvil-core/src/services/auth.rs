@@ -287,10 +287,10 @@ impl AuthService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
-        validate_optional_tuple_field("namespace", &req.namespace)?;
+        validate_optional_tuple_component("namespace", &req.namespace)?;
         validate_optional_tuple_field("object_id", &req.object_id)?;
-        validate_optional_tuple_field("relation", &req.relation)?;
-        validate_optional_tuple_field("subject_kind", &req.subject_kind)?;
+        validate_optional_tuple_component("relation", &req.relation)?;
+        validate_optional_tuple_component("subject_kind", &req.subject_kind)?;
         validate_optional_tuple_field("subject_id", &req.subject_id)?;
         validate_caveat_hash(&req.caveat_hash)?;
 
@@ -420,9 +420,9 @@ impl AuthService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
-        validate_tuple_field("namespace", &req.namespace)?;
-        validate_tuple_field("relation", &req.relation)?;
-        validate_tuple_field("subject_kind", &req.subject_kind)?;
+        validate_tuple_component("namespace", &req.namespace)?;
+        validate_tuple_component("relation", &req.relation)?;
+        validate_tuple_component("subject_kind", &req.subject_kind)?;
         validate_tuple_field("subject_id", &req.subject_id)?;
         validate_caveat_hash(&req.caveat_hash)?;
         let resource = authz_filter_resource(&req.namespace, "", &req.relation);
@@ -493,10 +493,10 @@ impl AuthService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
-        validate_tuple_field("namespace", &req.namespace)?;
+        validate_tuple_component("namespace", &req.namespace)?;
         validate_tuple_field("object_id", &req.object_id)?;
-        validate_tuple_field("relation", &req.relation)?;
-        validate_optional_tuple_field("subject_kind", &req.subject_kind)?;
+        validate_tuple_component("relation", &req.relation)?;
+        validate_optional_tuple_component("subject_kind", &req.subject_kind)?;
         let resource = authz_resource(&req.namespace, &req.object_id, &req.relation);
         if !auth::is_authorized(AnvilAction::AuthzTupleRead, &resource, &claims.scopes) {
             return Err(Status::permission_denied("Permission denied"));
@@ -588,7 +588,7 @@ impl AuthService for AppState {
             .and_then(revision_to_u64)?
             .max(1);
         for namespace in req.namespaces {
-            validate_tuple_field("namespace", &namespace.namespace)?;
+            validate_tuple_component("namespace", &namespace.namespace)?;
             if !auth::is_authorized(
                 AnvilAction::AuthzSchemaWrite,
                 &namespace.namespace,
@@ -646,7 +646,7 @@ impl AuthService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
         if !req.namespace.is_empty() {
-            validate_tuple_field("namespace", &req.namespace)?;
+            validate_tuple_component("namespace", &req.namespace)?;
         }
         let resource = if req.namespace.is_empty() {
             "*".to_string()
@@ -960,6 +960,23 @@ fn validate_optional_tuple_field(name: &str, value: &str) -> Result<(), Status> 
     validate_tuple_field(name, value)
 }
 
+fn validate_tuple_component(name: &str, value: &str) -> Result<(), Status> {
+    validate_tuple_field(name, value)?;
+    if value == "." || value == ".." || value.contains('/') {
+        return Err(Status::invalid_argument(format!(
+            "{name} must be a safe authz component"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_optional_tuple_component(name: &str, value: &str) -> Result<(), Status> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    validate_tuple_component(name, value)
+}
+
 fn validate_caveat_hash(value: &str) -> Result<(), Status> {
     authz_journal::validate_optional_caveat_hash(value)
         .map_err(|err| Status::invalid_argument(err.to_string()))
@@ -1005,10 +1022,10 @@ fn validate_authz_tuple_mutation<'a>(
     claims: &auth::Claims,
     req: &'a AuthzTupleMutation,
 ) -> Result<&'a str, Status> {
-    validate_tuple_field("namespace", &req.namespace)?;
+    validate_tuple_component("namespace", &req.namespace)?;
     validate_tuple_field("object_id", &req.object_id)?;
-    validate_tuple_field("relation", &req.relation)?;
-    validate_tuple_field("subject_kind", &req.subject_kind)?;
+    validate_tuple_component("relation", &req.relation)?;
+    validate_tuple_component("subject_kind", &req.subject_kind)?;
     validate_tuple_field("subject_id", &req.subject_id)?;
     validate_caveat_hash(&req.caveat_hash)?;
     let operation = match req.operation.as_str() {
@@ -1079,10 +1096,10 @@ async fn check_permission_response(
     claims: &auth::Claims,
     req: CheckPermissionRequest,
 ) -> Result<CheckPermissionResponse, Status> {
-    validate_tuple_field("namespace", &req.namespace)?;
+    validate_tuple_component("namespace", &req.namespace)?;
     validate_tuple_field("object_id", &req.object_id)?;
-    validate_tuple_field("relation", &req.relation)?;
-    validate_tuple_field("subject_kind", &req.subject_kind)?;
+    validate_tuple_component("relation", &req.relation)?;
+    validate_tuple_component("subject_kind", &req.subject_kind)?;
     validate_tuple_field("subject_id", &req.subject_id)?;
     validate_caveat_hash(&req.caveat_hash)?;
     let resource = authz_resource(&req.namespace, &req.object_id, &req.relation);
