@@ -3983,7 +3983,7 @@ mod tests {
             .acquire_task_execution_lease(&task)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("owned by another active node"));
+        assert!(err.to_string().contains(task_lease::LEASE_HELD));
 
         let checkpointed = persistence
             .checkpoint_task_execution_lease(&lease, lease.source_cursor)
