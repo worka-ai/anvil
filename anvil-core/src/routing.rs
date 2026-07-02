@@ -344,9 +344,18 @@ pub enum TrustedProxy {
 
 impl TrustedProxy {
     pub fn parse(value: &str) -> Result<Self, RoutingError> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(RoutingError::InvalidHost);
+        }
         if let Some((addr, prefix)) = value.split_once('/') {
             let network = addr.parse().map_err(|_| RoutingError::InvalidHost)?;
-            let prefix = prefix.parse().map_err(|_| RoutingError::InvalidHost)?;
+            let prefix: u8 = prefix.parse().map_err(|_| RoutingError::InvalidHost)?;
+            match network {
+                IpAddr::V4(_) if prefix > 32 => return Err(RoutingError::InvalidHost),
+                IpAddr::V6(_) if prefix > 128 => return Err(RoutingError::InvalidHost),
+                _ => {}
+            }
             return Ok(Self::Cidr { network, prefix });
         }
         Ok(Self::Exact(
@@ -360,6 +369,14 @@ impl TrustedProxy {
             Self::Cidr { network, prefix } => cidr_contains(*network, *prefix, peer),
         }
     }
+}
+
+pub fn parse_trusted_proxies(values: &[String]) -> Result<Vec<TrustedProxy>, RoutingError> {
+    values
+        .iter()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| TrustedProxy::parse(value))
+        .collect()
 }
 
 pub fn effective_host(
@@ -380,6 +397,30 @@ pub fn effective_host(
     match candidates.as_slice() {
         [] => Ok(raw),
         [host] => normalize_host(host),
+        _ => Err(RoutingError::AmbiguousForwardedHost),
+    }
+}
+
+pub fn effective_host_authority(
+    raw_authority: &str,
+    remote_peer: IpAddr,
+    trusted_proxies: &[TrustedProxy],
+    headers: &ForwardedHeaders,
+) -> Result<String, RoutingError> {
+    if !trusted_proxies
+        .iter()
+        .any(|proxy| proxy.contains(remote_peer))
+    {
+        return Ok(raw_authority.to_string());
+    }
+
+    let candidates = forwarded_host_candidates(headers)?;
+    match candidates.as_slice() {
+        [] => Ok(raw_authority.to_string()),
+        [host] => {
+            normalize_host(host)?;
+            Ok(host.clone())
+        }
         _ => Err(RoutingError::AmbiguousForwardedHost),
     }
 }
@@ -411,7 +452,7 @@ fn forwarded_host_candidates(headers: &ForwardedHeaders) -> Result<Vec<String>, 
             .into_iter()
             .all(|candidate| candidate == first);
         if all_same {
-            return Ok(vec![first]);
+            return Ok(vec![candidates[0].clone()]);
         }
     }
     Ok(candidates)
@@ -616,6 +657,53 @@ mod tests {
     }
 
     #[test]
+    fn trusted_forwarded_header_host_is_supported() {
+        let trusted = [TrustedProxy::parse("10.0.0.0/24").unwrap()];
+        let headers = ForwardedHeaders {
+            forwarded: vec![
+                r#"for=198.51.100.10;proto=https;host="CDN.Customer-Domain.Com:443""#.to_string(),
+            ],
+            x_forwarded_host: Vec::new(),
+        };
+
+        let trusted_host = effective_host(
+            "internal.anvil-storage.com",
+            "10.0.0.9".parse().unwrap(),
+            &trusted,
+            &headers,
+        )
+        .unwrap();
+        assert_eq!(trusted_host, "cdn.customer-domain.com");
+    }
+
+    #[test]
+    fn effective_host_authority_preserves_selected_authority_for_signature_checks() {
+        let trusted = [TrustedProxy::parse("10.0.0.0/24").unwrap()];
+        let headers = ForwardedHeaders {
+            forwarded: Vec::new(),
+            x_forwarded_host: vec!["cdn.customer-domain.com:443".to_string()],
+        };
+
+        let trusted_host = effective_host_authority(
+            "internal.anvil-storage.com:50051",
+            "10.0.0.9".parse().unwrap(),
+            &trusted,
+            &headers,
+        )
+        .unwrap();
+        assert_eq!(trusted_host, "cdn.customer-domain.com:443");
+
+        let untrusted_host = effective_host_authority(
+            "raw.example.com:50051",
+            "203.0.113.10".parse().unwrap(),
+            &trusted,
+            &headers,
+        )
+        .unwrap();
+        assert_eq!(untrusted_host, "raw.example.com:50051");
+    }
+
+    #[test]
     fn ambiguous_forwarded_hosts_are_rejected() {
         let trusted = [TrustedProxy::parse("10.0.0.0/24").unwrap()];
         let headers = ForwardedHeaders {
@@ -631,5 +719,53 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, RoutingError::AmbiguousForwardedHost);
+    }
+
+    #[test]
+    fn ambiguous_forwarded_header_chain_is_rejected() {
+        let trusted = [TrustedProxy::parse("10.0.0.0/24").unwrap()];
+        let headers = ForwardedHeaders {
+            forwarded: vec![
+                "for=198.51.100.10;host=one.example.com, for=10.0.0.9;host=two.example.com"
+                    .to_string(),
+            ],
+            x_forwarded_host: Vec::new(),
+        };
+
+        let err = effective_host(
+            "raw.example.com",
+            "10.0.0.9".parse().unwrap(),
+            &trusted,
+            &headers,
+        )
+        .unwrap_err();
+        assert_eq!(err, RoutingError::AmbiguousForwardedHost);
+    }
+
+    #[test]
+    fn trusted_proxy_ranges_parse_exact_and_cidr_values() {
+        let proxies = parse_trusted_proxies(&[
+            "127.0.0.1".to_string(),
+            " 10.0.0.0/24 ".to_string(),
+            String::new(),
+        ])
+        .unwrap();
+
+        assert_eq!(proxies.len(), 2);
+        assert!(
+            proxies
+                .iter()
+                .any(|proxy| proxy.contains("127.0.0.1".parse().unwrap()))
+        );
+        assert!(
+            proxies
+                .iter()
+                .any(|proxy| proxy.contains("10.0.0.7".parse().unwrap()))
+        );
+        assert!(
+            !proxies
+                .iter()
+                .any(|proxy| proxy.contains("10.0.1.7".parse().unwrap()))
+        );
     }
 }

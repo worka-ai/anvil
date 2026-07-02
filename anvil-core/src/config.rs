@@ -51,6 +51,10 @@ pub struct Config {
     #[arg(long, env, default_value = "")]
     pub public_region_base_domain: String,
 
+    /// Trusted proxy source IPs or CIDR ranges allowed to supply forwarded request metadata.
+    #[arg(long, env, use_value_delimiter = true, value_delimiter = ',')]
+    pub trusted_proxy_source_ranges: Vec<String>,
+
     /// Path used by operators to persist this node's stable lifecycle identity.
     /// Defaults to `<storage_path>/node-id` when left empty.
     #[arg(long, env, default_value = "")]

@@ -127,8 +127,13 @@ pub async fn start_node_with_admin_listener(
         state.persistence.cache().clone(),
         outbound_events_rx,
     ));
-    let server_task =
-        tokio::spawn(async move { axum::serve(listener, app.into_make_service()).await });
+    let server_task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
     let admin_server_task = admin_listener
         .zip(admin_axum)
         .map(|(admin_listener, admin_app)| {
