@@ -1071,6 +1071,47 @@ impl Persistence {
         crate::mesh_lifecycle::list_nodes(&self.storage, region_filter, cell_filter).await
     }
 
+    pub async fn create_host_alias_descriptor(
+        &self,
+        routing_config: &crate::routing::RoutingConfig,
+        input: crate::mesh_lifecycle::CreateHostAliasDescriptor,
+    ) -> crate::mesh_lifecycle::LifecycleResult<crate::routing::HostAliasDescriptor> {
+        crate::mesh_lifecycle::create_host_alias(&self.storage, routing_config, input).await
+    }
+
+    pub async fn transition_host_alias_descriptor(
+        &self,
+        hostname: &str,
+        expected_generation: u64,
+        target: crate::routing::HostAliasState,
+    ) -> crate::mesh_lifecycle::LifecycleResult<crate::routing::HostAliasDescriptor> {
+        crate::mesh_lifecycle::transition_host_alias(
+            &self.storage,
+            hostname,
+            expected_generation,
+            target,
+        )
+        .await
+    }
+
+    pub async fn get_host_alias_descriptor(
+        &self,
+        hostname: &str,
+    ) -> crate::mesh_lifecycle::LifecycleResult<Option<crate::routing::HostAliasDescriptor>> {
+        let hostname = crate::routing::normalize_alias_hostname(hostname).map_err(|err| {
+            crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+        })?;
+        let state = crate::mesh_lifecycle::read_state(&self.storage).await?;
+        Ok(state.host_aliases.get(&hostname).cloned())
+    }
+
+    pub async fn list_host_alias_descriptors(
+        &self,
+        region_filter: Option<&str>,
+    ) -> crate::mesh_lifecycle::LifecycleResult<Vec<crate::routing::HostAliasDescriptor>> {
+        crate::mesh_lifecycle::list_host_aliases(&self.storage, region_filter).await
+    }
+
     pub async fn get_tenant_by_name(&self, name: &str) -> Result<Option<Tenant>> {
         Ok(control_journal::read_control_state(&self.storage)
             .await?

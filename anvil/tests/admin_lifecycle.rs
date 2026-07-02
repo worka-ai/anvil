@@ -379,6 +379,216 @@ async fn admin_lifecycle_rejects_invalid_region_cell_and_node_transitions() {
 }
 
 #[tokio::test]
+async fn admin_host_aliases_are_generation_checked_and_lifecycle_managed() {
+    let node = spawn_admin_node().await;
+    let token = admin_token(&node);
+    let denied_token = non_admin_token(&node);
+
+    let mut public_client = AdminServiceClient::connect(node.public_url.clone())
+        .await
+        .unwrap();
+    let public_err = public_client
+        .list_host_aliases(with_auth(
+            tonic::Request::new(ListHostAliasesRequest {
+                region: String::new(),
+                page: None,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(public_err.code(), Code::Unimplemented);
+
+    let mut client = AdminServiceClient::connect(node.admin_url.clone())
+        .await
+        .unwrap();
+
+    let denied = client
+        .list_host_aliases(with_auth(
+            tonic::Request::new(ListHostAliasesRequest {
+                region: String::new(),
+                page: None,
+            }),
+            &denied_token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), Code::PermissionDenied);
+
+    let region = client
+        .create_region(with_auth(
+            tonic::Request::new(CreateRegionRequest {
+                context: Some(context("alias-create-region", 0)),
+                region: "eu-west-1".to_string(),
+                public_base_url: "https://eu-west-1.anvil-storage.test".to_string(),
+                virtual_host_suffix: "eu-west-1.anvil-storage.test".to_string(),
+                placement_weight: 100,
+                default_cell: String::new(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .region
+        .unwrap();
+    let _region = client
+        .activate_region(with_auth(
+            tonic::Request::new(ActivateRegionRequest {
+                context: Some(context("alias-activate-region", region.generation)),
+                region: "eu-west-1".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .region
+        .unwrap();
+
+    let native_hostname = client
+        .create_host_alias(with_auth(
+            tonic::Request::new(CreateHostAliasRequest {
+                context: Some(context("alias-native-hostname", 0)),
+                hostname: "releases.tenant-alias.eu-west-1.anvil-storage.test".to_string(),
+                tenant_id: "tenant-alias".to_string(),
+                bucket_name: "releases".to_string(),
+                region: "eu-west-1".to_string(),
+                prefix: "public/".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(native_hostname.code(), Code::InvalidArgument);
+
+    let created = client
+        .create_host_alias(with_auth(
+            tonic::Request::new(CreateHostAliasRequest {
+                context: Some(context("alias-create", 0)),
+                hostname: "CDN.Example.Com.".to_string(),
+                tenant_id: "tenant-alias".to_string(),
+                bucket_name: "releases".to_string(),
+                region: "eu-west-1".to_string(),
+                prefix: "public/".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .host_alias
+        .unwrap();
+    assert_eq!(created.hostname, "cdn.example.com");
+    assert_eq!(created.state, 1);
+    assert_eq!(created.generation, 1);
+
+    let stale = client
+        .activate_host_alias(with_auth(
+            tonic::Request::new(ActivateHostAliasRequest {
+                context: Some(context("alias-activate-stale", created.generation + 1)),
+                hostname: "cdn.example.com".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), Code::Aborted);
+
+    let missing_generation = client
+        .activate_host_alias(with_auth(
+            tonic::Request::new(ActivateHostAliasRequest {
+                context: Some(context("alias-activate-missing-generation", 0)),
+                hostname: "cdn.example.com".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(missing_generation.code(), Code::InvalidArgument);
+
+    let active = client
+        .activate_host_alias(with_auth(
+            tonic::Request::new(ActivateHostAliasRequest {
+                context: Some(context("alias-activate", created.generation)),
+                hostname: "cdn.example.com".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .host_alias
+        .unwrap();
+    assert_eq!(active.state, 2);
+    assert_eq!(active.generation, created.generation + 1);
+
+    let read = client
+        .read_host_alias(with_auth(
+            tonic::Request::new(ReadHostAliasRequest {
+                request_id: "req-alias-read".to_string(),
+                hostname: "CDN.EXAMPLE.COM.".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .host_alias
+        .unwrap();
+    assert_eq!(read.hostname, "cdn.example.com");
+    assert_eq!(read.state, 2);
+    assert_eq!(read.generation, active.generation);
+
+    let listed = client
+        .list_host_aliases(with_auth(
+            tonic::Request::new(ListHostAliasesRequest {
+                region: "eu-west-1".to_string(),
+                page: Some(PageRequest {
+                    cursor: String::new(),
+                    limit: 10,
+                }),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.host_aliases.len(), 1);
+    assert_eq!(listed.host_aliases[0].hostname, "cdn.example.com");
+    assert_eq!(listed.host_aliases[0].state, 2);
+
+    let suspended = client
+        .suspend_host_alias(with_auth(
+            tonic::Request::new(SuspendHostAliasRequest {
+                context: Some(context("alias-suspend", active.generation)),
+                hostname: "cdn.example.com".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .host_alias
+        .unwrap();
+    assert_eq!(suspended.state, 3);
+
+    let deleted = client
+        .delete_host_alias(with_auth(
+            tonic::Request::new(DeleteHostAliasRequest {
+                context: Some(context("alias-delete", suspended.generation)),
+                hostname: "cdn.example.com".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(deleted.resource_id, "cdn.example.com");
+    assert_eq!(deleted.generation, suspended.generation + 1);
+}
+
+#[tokio::test]
 async fn admin_object_links_are_cas_checked_metadata_entries() {
     let node = spawn_admin_node().await;
     let token = admin_token(&node);

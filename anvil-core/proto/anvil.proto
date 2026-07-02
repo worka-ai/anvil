@@ -9,6 +9,13 @@ service AdminService {
   rpc ReadObjectLink(ReadObjectLinkRequest) returns (ObjectLinkResponse);
   rpc ListObjectLinks(ListObjectLinksRequest) returns (ListObjectLinksResponse);
 
+  rpc CreateHostAlias(CreateHostAliasRequest) returns (HostAliasResponse);
+  rpc ActivateHostAlias(ActivateHostAliasRequest) returns (HostAliasResponse);
+  rpc SuspendHostAlias(SuspendHostAliasRequest) returns (HostAliasResponse);
+  rpc DeleteHostAlias(DeleteHostAliasRequest) returns (AdminMutationResponse);
+  rpc ReadHostAlias(ReadHostAliasRequest) returns (HostAliasResponse);
+  rpc ListHostAliases(ListHostAliasesRequest) returns (ListHostAliasesResponse);
+
   rpc CreateRegion(CreateRegionRequest) returns (RegionResponse);
   rpc ActivateRegion(ActivateRegionRequest) returns (RegionResponse);
   rpc DrainRegion(DrainRegionRequest) returns (DrainOperationResponse);
@@ -102,6 +109,14 @@ enum LifecycleState {
   LIFECYCLE_STATE_REMOVED = 8;
 }
 
+enum HostAliasState {
+  HOST_ALIAS_STATE_UNSPECIFIED = 0;
+  HOST_ALIAS_STATE_PENDING_VERIFICATION = 1;
+  HOST_ALIAS_STATE_ACTIVE = 2;
+  HOST_ALIAS_STATE_SUSPENDED = 3;
+  HOST_ALIAS_STATE_DELETED = 4;
+}
+
 message NodeDrainDescriptor {
   string started_at = 1;
   uint64 graceful_timeout_ms = 2;
@@ -166,6 +181,19 @@ message ObjectLinkDescriptor {
   uint64 generation = 11;
 }
 
+message HostAliasDescriptor {
+  string schema = 1;
+  string hostname = 2;
+  string tenant_id = 3;
+  string bucket_name = 4;
+  string region = 5;
+  string prefix = 6;
+  HostAliasState state = 7;
+  string created_at = 8;
+  string updated_at = 9;
+  uint64 generation = 10;
+}
+
 message CreateObjectLinkRequest {
   AdminRequestContext context = 1;
   string tenant_id = 2;
@@ -209,6 +237,40 @@ message ListObjectLinksRequest {
   PageRequest page = 4;
 }
 
+message CreateHostAliasRequest {
+  AdminRequestContext context = 1;
+  string hostname = 2;
+  string tenant_id = 3;
+  string bucket_name = 4;
+  string region = 5;
+  string prefix = 6;
+}
+
+message ActivateHostAliasRequest {
+  AdminRequestContext context = 1;
+  string hostname = 2;
+}
+
+message SuspendHostAliasRequest {
+  AdminRequestContext context = 1;
+  string hostname = 2;
+}
+
+message DeleteHostAliasRequest {
+  AdminRequestContext context = 1;
+  string hostname = 2;
+}
+
+message ReadHostAliasRequest {
+  string request_id = 1;
+  string hostname = 2;
+}
+
+message ListHostAliasesRequest {
+  string region = 1;
+  PageRequest page = 2;
+}
+
 message ObjectLinkResponse {
   string request_id = 1;
   ObjectLinkDescriptor link = 2;
@@ -218,6 +280,17 @@ message ObjectLinkResponse {
 message ListObjectLinksResponse {
   PageResponse page = 1;
   repeated ObjectLinkDescriptor links = 2;
+}
+
+message HostAliasResponse {
+  string request_id = 1;
+  HostAliasDescriptor host_alias = 2;
+  string audit_event_id = 3;
+}
+
+message ListHostAliasesResponse {
+  PageResponse page = 1;
+  repeated HostAliasDescriptor host_aliases = 2;
 }
 
 message BucketDrainOverride {

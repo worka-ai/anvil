@@ -2,12 +2,16 @@ use crate::admin_auth::{self, AdminPrincipal, AnvilAdminCapability};
 use crate::anvil_api::admin_service_server::AdminService;
 use crate::anvil_api::*;
 use crate::mesh_lifecycle::{
-    self, CreateRegionDescriptor, LifecycleError, LifecycleState as CoreLifecycleState,
-    NodeCapability as CoreNodeCapability, NodeDrainDescriptor, RegisterCellDescriptor,
-    RegisterNodeDescriptor,
+    self, CreateHostAliasDescriptor, CreateRegionDescriptor, LifecycleError,
+    LifecycleState as CoreLifecycleState, NodeCapability as CoreNodeCapability,
+    NodeDrainDescriptor, RegisterCellDescriptor, RegisterNodeDescriptor,
 };
 use crate::object_links;
 use crate::persistence;
+use crate::routing::{
+    self, HostAliasDescriptor as CoreHostAliasDescriptor, HostAliasState as CoreHostAliasState,
+    RoutingConfig,
+};
 use crate::{AppState, auth};
 use tonic::{Request, Response, Status};
 
@@ -184,6 +188,175 @@ impl AdminService for AppState {
             links: links
                 .into_iter()
                 .map(object_link_descriptor_to_proto)
+                .collect(),
+        }))
+    }
+
+    async fn create_host_alias(
+        &self,
+        request: Request<CreateHostAliasRequest>,
+    ) -> Result<Response<HostAliasResponse>, Status> {
+        let principal = require_admin(&request, self, AnvilAdminCapability::ManageHostAliases)?;
+        let req = request.into_inner();
+        let context = require_mutation_context(req.context.as_ref(), true)?;
+        let request_id = context.request_id.clone();
+        let audit_event_id = audit_event_id(&principal, context);
+        let routing_config = routing_config_for_region(self, &req.region).await?;
+        let host_alias = self
+            .persistence
+            .create_host_alias_descriptor(
+                &routing_config,
+                CreateHostAliasDescriptor {
+                    hostname: req.hostname,
+                    tenant_id: req.tenant_id,
+                    bucket_name: req.bucket_name,
+                    region: req.region,
+                    prefix: req.prefix,
+                },
+            )
+            .await
+            .map_err(lifecycle_status)?;
+
+        Ok(Response::new(HostAliasResponse {
+            request_id,
+            host_alias: Some(host_alias_descriptor_to_proto(host_alias)),
+            audit_event_id,
+        }))
+    }
+
+    async fn activate_host_alias(
+        &self,
+        request: Request<ActivateHostAliasRequest>,
+    ) -> Result<Response<HostAliasResponse>, Status> {
+        let principal = require_admin(&request, self, AnvilAdminCapability::ManageHostAliases)?;
+        let req = request.into_inner();
+        let context = require_mutation_context(req.context.as_ref(), false)?;
+        let host_alias = self
+            .persistence
+            .transition_host_alias_descriptor(
+                &req.hostname,
+                context.expected_generation,
+                CoreHostAliasState::Active,
+            )
+            .await
+            .map_err(lifecycle_status)?;
+
+        Ok(Response::new(HostAliasResponse {
+            request_id: context.request_id.clone(),
+            host_alias: Some(host_alias_descriptor_to_proto(host_alias)),
+            audit_event_id: audit_event_id(&principal, context),
+        }))
+    }
+
+    async fn suspend_host_alias(
+        &self,
+        request: Request<SuspendHostAliasRequest>,
+    ) -> Result<Response<HostAliasResponse>, Status> {
+        let principal = require_admin(&request, self, AnvilAdminCapability::ManageHostAliases)?;
+        let req = request.into_inner();
+        let context = require_mutation_context(req.context.as_ref(), false)?;
+        let host_alias = self
+            .persistence
+            .transition_host_alias_descriptor(
+                &req.hostname,
+                context.expected_generation,
+                CoreHostAliasState::Suspended,
+            )
+            .await
+            .map_err(lifecycle_status)?;
+
+        Ok(Response::new(HostAliasResponse {
+            request_id: context.request_id.clone(),
+            host_alias: Some(host_alias_descriptor_to_proto(host_alias)),
+            audit_event_id: audit_event_id(&principal, context),
+        }))
+    }
+
+    async fn delete_host_alias(
+        &self,
+        request: Request<DeleteHostAliasRequest>,
+    ) -> Result<Response<AdminMutationResponse>, Status> {
+        let principal = require_admin(&request, self, AnvilAdminCapability::ManageHostAliases)?;
+        let req = request.into_inner();
+        let context = require_mutation_context(req.context.as_ref(), false)?;
+        let host_alias = self
+            .persistence
+            .transition_host_alias_descriptor(
+                &req.hostname,
+                context.expected_generation,
+                CoreHostAliasState::Deleted,
+            )
+            .await
+            .map_err(lifecycle_status)?;
+
+        Ok(Response::new(AdminMutationResponse {
+            request_id: context.request_id.clone(),
+            resource_id: host_alias.hostname,
+            generation: host_alias.generation,
+            audit_event_id: audit_event_id(&principal, context),
+            idempotent_replay: false,
+        }))
+    }
+
+    async fn read_host_alias(
+        &self,
+        request: Request<ReadHostAliasRequest>,
+    ) -> Result<Response<HostAliasResponse>, Status> {
+        require_admin(&request, self, AnvilAdminCapability::ManageHostAliases)?;
+        let req = request.into_inner();
+        let host_alias = self
+            .persistence
+            .get_host_alias_descriptor(&req.hostname)
+            .await
+            .map_err(lifecycle_status)?
+            .ok_or_else(|| Status::not_found("Host alias not found"))?;
+
+        Ok(Response::new(HostAliasResponse {
+            request_id: req.request_id,
+            host_alias: Some(host_alias_descriptor_to_proto(host_alias)),
+            audit_event_id: String::new(),
+        }))
+    }
+
+    async fn list_host_aliases(
+        &self,
+        request: Request<ListHostAliasesRequest>,
+    ) -> Result<Response<ListHostAliasesResponse>, Status> {
+        require_admin(&request, self, AnvilAdminCapability::ManageHostAliases)?;
+        let req = request.into_inner();
+        let page = req.page.as_ref();
+        let cursor = page.map(|page| page.cursor.as_str()).unwrap_or_default();
+        let limit = page_limit(page);
+        let mut host_aliases = self
+            .persistence
+            .list_host_alias_descriptors(none_if_empty(&req.region))
+            .await
+            .map_err(lifecycle_status)?
+            .into_iter()
+            .filter(|alias| cursor.is_empty() || alias.hostname.as_str() > cursor)
+            .take(limit + 1)
+            .collect::<Vec<_>>();
+        let has_more = host_aliases.len() > limit;
+        if has_more {
+            host_aliases.truncate(limit);
+        }
+        let next_cursor = if has_more {
+            host_aliases
+                .last()
+                .map(|alias| alias.hostname.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        Ok(Response::new(ListHostAliasesResponse {
+            page: Some(PageResponse {
+                next_cursor,
+                has_more,
+            }),
+            host_aliases: host_aliases
+                .into_iter()
+                .map(host_alias_descriptor_to_proto)
                 .collect(),
         }))
     }
@@ -657,6 +830,42 @@ async fn resolve_tenant_id(state: &AppState, tenant_ref: &str) -> Result<i64, St
         .ok_or_else(|| Status::not_found("Tenant not found"))
 }
 
+async fn routing_config_for_region(
+    state: &AppState,
+    region_name: &str,
+) -> Result<RoutingConfig, Status> {
+    let region_name = region_name.trim();
+    if region_name.is_empty() {
+        return Err(Status::invalid_argument("region is required"));
+    }
+    let region = state
+        .persistence
+        .list_region_descriptors()
+        .await
+        .map_err(lifecycle_status)?
+        .into_iter()
+        .find(|region| region.region == region_name)
+        .ok_or_else(|| Status::not_found("Region not found"))?;
+    let base_domain = base_domain_from_region_suffix(&region.region, &region.virtual_host_suffix)?;
+    RoutingConfig::new(base_domain).map_err(|err| Status::invalid_argument(err.to_string()))
+}
+
+fn base_domain_from_region_suffix(
+    region: &str,
+    virtual_host_suffix: &str,
+) -> Result<String, Status> {
+    let suffix = routing::normalize_alias_hostname(virtual_host_suffix)
+        .map_err(|err| Status::invalid_argument(err.to_string()))?;
+    let region_prefix = format!(
+        "{}.",
+        region.trim().trim_end_matches('.').to_ascii_lowercase()
+    );
+    Ok(suffix
+        .strip_prefix(&region_prefix)
+        .unwrap_or(&suffix)
+        .to_string())
+}
+
 fn parse_optional_uuid(
     field_name: &'static str,
     value: String,
@@ -755,6 +964,15 @@ fn lifecycle_state_to_proto(value: CoreLifecycleState) -> i32 {
     }
 }
 
+fn host_alias_state_to_proto(value: CoreHostAliasState) -> i32 {
+    match value {
+        CoreHostAliasState::PendingVerification => 1,
+        CoreHostAliasState::Active => 2,
+        CoreHostAliasState::Suspended => 3,
+        CoreHostAliasState::Deleted => 4,
+    }
+}
+
 fn object_link_resolution_from_proto(
     value: i32,
 ) -> Result<object_links::ObjectLinkResolution, Status> {
@@ -790,6 +1008,23 @@ fn object_link_descriptor_to_proto(
             .updated_at
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         created_by: value.created_by,
+        generation: value.generation,
+    }
+}
+
+fn host_alias_descriptor_to_proto(
+    value: CoreHostAliasDescriptor,
+) -> crate::anvil_api::HostAliasDescriptor {
+    crate::anvil_api::HostAliasDescriptor {
+        schema: value.schema,
+        hostname: value.hostname,
+        tenant_id: value.tenant_id,
+        bucket_name: value.bucket_name,
+        region: value.region,
+        prefix: value.prefix,
+        state: host_alias_state_to_proto(value.state),
+        created_at: value.created_at,
+        updated_at: value.updated_at,
         generation: value.generation,
     }
 }
