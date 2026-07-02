@@ -357,6 +357,24 @@ pub async fn list_regions(storage: &Storage) -> LifecycleResult<Vec<RegionDescri
     Ok(read_state(storage).await?.regions.into_values().collect())
 }
 
+pub async fn ensure_region_accepts_new_writes(
+    storage: &Storage,
+    region: &str,
+) -> LifecycleResult<()> {
+    require_identifier(region, "region")?;
+    let state = read_state(storage).await?;
+    let Some(descriptor) = state.regions.get(region) else {
+        return Ok(());
+    };
+    if descriptor.state == LifecycleState::Active {
+        return Ok(());
+    }
+    Err(LifecycleError::InvalidArgument(format!(
+        "region {region} is {:?} and cannot accept new writable placement",
+        descriptor.state
+    )))
+}
+
 pub async fn register_cell(
     storage: &Storage,
     input: RegisterCellDescriptor,
@@ -1031,6 +1049,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(active.state, LifecycleState::Active);
+    }
+
+    #[tokio::test]
+    async fn writable_placement_rejects_non_active_region() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        create_test_region(&storage).await;
+
+        assert!(
+            ensure_region_accepts_new_writes(&storage, "eu-west-1")
+                .await
+                .is_err()
+        );
+        assert!(
+            ensure_region_accepts_new_writes(&storage, "legacy-region")
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

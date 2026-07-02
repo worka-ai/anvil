@@ -1493,6 +1493,9 @@ impl Persistence {
         name: &str,
         region: &str,
     ) -> Result<Bucket, tonic::Status> {
+        crate::mesh_lifecycle::ensure_region_accepts_new_writes(&self.storage, region)
+            .await
+            .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?;
         if bucket_journal::read_current_bucket(&self.storage, tenant_id, name)
             .await
             .map_err(|e| tonic::Status::internal(e.to_string()))?
