@@ -743,6 +743,136 @@ async fn test_authz_batch_read_and_list_operations() {
 }
 
 #[tokio::test]
+async fn test_authz_batch_watch_and_pagination_are_revision_bound() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut first_batch = Request::new(WriteAuthzTuplesRequest {
+        mutations: vec![
+            authz_mutation("document", "alpha", "viewer", "user", "alice", "add"),
+            authz_mutation("document", "beta", "viewer", "user", "bob", "add"),
+            authz_mutation("document", "gamma", "viewer", "user", "charlie", "add"),
+        ],
+    });
+    add_bearer(&mut first_batch, &token);
+    let first_batch = auth_client
+        .write_authz_tuples(first_batch)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first_batch.revision, 1);
+    assert_eq!(first_batch.results.len(), 3);
+
+    let mut watch_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut watch_req = Request::new(WatchAuthzTupleLogRequest {
+        after_revision: 0,
+        namespace: "document".to_string(),
+    });
+    add_bearer(&mut watch_req, &token);
+    let mut stream = watch_client
+        .watch_authz_tuple_log(watch_req)
+        .await
+        .unwrap()
+        .into_inner();
+
+    let mut watched = Vec::new();
+    for _ in 0..first_batch.results.len() {
+        watched.push(
+            tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    assert_eq!(watched.len(), 3);
+    assert!(
+        watched.iter().all(|event| event.revision == 1),
+        "batch watch events must become visible only as one committed revision"
+    );
+    assert_eq!(
+        watched
+            .iter()
+            .map(|event| event.object_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "beta", "gamma"]
+    );
+
+    let mut first_page = Request::new(ReadAuthzTuplesRequest {
+        namespace: "document".to_string(),
+        page_size: 1,
+        ..Default::default()
+    });
+    add_bearer(&mut first_page, &token);
+    let first_page = auth_client
+        .read_authz_tuples(first_page)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first_page.revision, 1);
+    assert!(!first_page.next_page_token.is_empty());
+
+    let mut second_batch = Request::new(WriteAuthzTuplesRequest {
+        mutations: vec![authz_mutation(
+            "document", "delta", "viewer", "user", "dana", "add",
+        )],
+    });
+    add_bearer(&mut second_batch, &token);
+    let second_batch = auth_client
+        .write_authz_tuples(second_batch)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second_batch.revision, 2);
+
+    let mut revision_bound_page = Request::new(ReadAuthzTuplesRequest {
+        namespace: "document".to_string(),
+        page_size: 100,
+        page_token: first_page.next_page_token,
+        ..Default::default()
+    });
+    add_bearer(&mut revision_bound_page, &token);
+    let revision_bound_page = auth_client
+        .read_authz_tuples(revision_bound_page)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(revision_bound_page.revision, 1);
+    assert!(
+        revision_bound_page
+            .tuples
+            .iter()
+            .all(|tuple| tuple.object_id != "delta"),
+        "a follow-up page must keep reading the original revision"
+    );
+
+    let mut latest_page = Request::new(ReadAuthzTuplesRequest {
+        namespace: "document".to_string(),
+        page_size: 100,
+        ..Default::default()
+    });
+    add_bearer(&mut latest_page, &token);
+    let latest_page = auth_client
+        .read_authz_tuples(latest_page)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(latest_page.revision, 2);
+    assert!(
+        latest_page
+            .tuples
+            .iter()
+            .any(|tuple| tuple.object_id == "delta")
+    );
+}
+
+#[tokio::test]
 async fn test_authz_tuple_batch_failure_is_atomic() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
