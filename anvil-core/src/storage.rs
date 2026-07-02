@@ -127,6 +127,39 @@ impl Storage {
             .join(stream_family))
     }
 
+    pub fn mesh_control_checkpoint_path(
+        &self,
+        region: &str,
+        stream_family: &str,
+        partition: &str,
+    ) -> Result<PathBuf> {
+        ensure_safe_internal_component(region, "control checkpoint region")?;
+        ensure_safe_internal_component(stream_family, "control checkpoint stream family")?;
+        ensure_control_stream_partition(partition)?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("control")
+            .join("v1")
+            .join("checkpoints")
+            .join("regions")
+            .join(region)
+            .join(stream_family)
+            .join(format!("{partition}.json")))
+    }
+
+    pub fn mesh_control_checkpoint_region_path(&self, region: &str) -> Result<PathBuf> {
+        ensure_safe_internal_component(region, "control checkpoint region")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("control")
+            .join("v1")
+            .join("checkpoints")
+            .join("regions")
+            .join(region))
+    }
+
     pub fn admin_audit_event_root(&self) -> PathBuf {
         self.storage_path
             .join("_anvil")
