@@ -1756,6 +1756,164 @@ impl Persistence {
         Ok(object_links::link_descriptor(&bucket.name, &object))
     }
 
+    pub async fn list_object_links(
+        &self,
+        bucket_id: i64,
+        prefix: Option<&str>,
+    ) -> std::result::Result<Vec<object_links::ObjectLinkDescriptor>, object_links::ObjectLinkError>
+    {
+        let Some(bucket) =
+            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        else {
+            return Err(object_links::ObjectLinkError::BucketNotFound);
+        };
+        let mut links = metadata_journal::read_current_directory_objects(
+            &self.storage,
+            &bucket,
+            &self.partition_owner_signing_key,
+        )
+        .await?
+        .into_iter()
+        .filter(|object| object.kind == object_links::ObjectEntryKind::Link)
+        .filter_map(|object| object_links::link_descriptor(&bucket.name, &object))
+        .filter(|descriptor| {
+            prefix
+                .map(|prefix| descriptor.link_key.starts_with(prefix))
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+        links.sort_by(|left, right| left.link_key.cmp(&right.link_key));
+        Ok(links)
+    }
+
+    pub async fn delete_object_link(
+        &self,
+        request: object_links::DeleteObjectLinkRequest,
+    ) -> std::result::Result<object_links::DeleteObjectLinkResult, object_links::ObjectLinkError>
+    {
+        if !crate::validation::is_valid_object_key(&request.link_key) {
+            return Err(object_links::ObjectLinkError::InvalidLinkKey);
+        }
+
+        let bucket = bucket_journal::read_current_bucket_by_id(&self.storage, request.bucket_id)
+            .await?
+            .ok_or(object_links::ObjectLinkError::BucketNotFound)?;
+        if bucket.tenant_id != request.tenant_id {
+            return Err(object_links::ObjectLinkError::BucketTenantMismatch);
+        }
+
+        let current = metadata_journal::read_current_object(
+            &self.storage,
+            &bucket,
+            &self.partition_owner_signing_key,
+            &request.link_key,
+        )
+        .await?
+        .ok_or(object_links::ObjectLinkError::NotFound)?;
+        if current.kind != object_links::ObjectEntryKind::Link {
+            return Err(object_links::ObjectLinkError::ExistingObjectIsNotLink);
+        }
+        let current_link = current
+            .link
+            .as_ref()
+            .ok_or_else(|| object_links::ObjectLinkError::Internal("link target missing".into()))?;
+        if current_link.generation != request.expected_generation {
+            return Err(object_links::ObjectLinkError::GenerationConflict {
+                expected: request.expected_generation,
+                actual: current_link.generation,
+            });
+        }
+
+        let new_generation = current_link.generation.checked_add(1).ok_or_else(|| {
+            object_links::ObjectLinkError::Internal("link generation overflow".to_string())
+        })?;
+        let now = Utc::now();
+        let version_id = uuid::Uuid::new_v4();
+        let mutation_id = uuid::Uuid::new_v4();
+        let content_hash = String::new();
+        let etag = String::new();
+        let index_policy_snapshot = self
+            .active_index_policy_snapshot_hash(request.tenant_id, bucket.id)
+            .await?;
+        let user_meta = Some(serde_json::json!({
+            "schema": "anvil.object_link_delete.v1",
+            "idempotency_key": request.idempotency_key,
+        }));
+        let user_metadata_hash = user_metadata_hash(user_meta.as_ref());
+        let authz_revision = self.latest_authz_revision(request.tenant_id).await?;
+        let record_hash = object_version_record_hash(ObjectVersionRecordHashInput {
+            tenant_id: request.tenant_id,
+            bucket_id: bucket.id,
+            key: &request.link_key,
+            version_id,
+            mutation_id,
+            content_hash: &content_hash,
+            size: 0,
+            etag: &etag,
+            content_type: Some(object_links::LINK_METADATA_CONTENT_TYPE),
+            user_metadata_hash: &user_metadata_hash,
+            index_policy_snapshot: &index_policy_snapshot,
+            authz_revision,
+            delete_marker: true,
+        });
+        let object = Object {
+            id: metadata_journal::next_object_id(
+                &self.storage,
+                &bucket,
+                &self.partition_owner_signing_key,
+            )
+            .await?,
+            tenant_id: request.tenant_id,
+            bucket_id: bucket.id,
+            key: request.link_key.clone(),
+            kind: object_links::ObjectEntryKind::Link,
+            content_hash,
+            size: 0,
+            etag,
+            content_type: Some(object_links::LINK_METADATA_CONTENT_TYPE.to_string()),
+            version_id,
+            mutation_id,
+            index_policy_snapshot,
+            user_metadata_hash,
+            authz_revision,
+            record_hash,
+            created_at: now,
+            deleted_at: Some(now),
+            storage_class: None,
+            user_meta,
+            shard_map: None,
+            inline_payload: None,
+            checksum: None,
+            link: Some(object_links::ObjectLinkTarget {
+                target_key: current_link.target_key.clone(),
+                target_version: current_link.target_version,
+                resolution: current_link.resolution,
+                generation: new_generation,
+                created_at: current_link.created_at,
+                created_by: current_link.created_by.clone(),
+            }),
+        };
+        let permit = self
+            .object_metadata_write_permit(bucket.tenant_id, bucket.id)
+            .await?;
+        metadata_journal::append_object_mutation_with_permit(
+            &self.storage,
+            &bucket,
+            &object,
+            metadata_journal::ObjectJournalMutation::DeleteMarker,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await?;
+        self.enqueue_index_builds_for_bucket(&bucket).await?;
+        self.enqueue_object_metadata_compaction_if_due(&bucket)
+            .await?;
+        Ok(object_links::DeleteObjectLinkResult {
+            link_key: request.link_key,
+            generation: new_generation,
+        })
+    }
+
     pub async fn resolve_object_link_target(
         &self,
         bucket_id: i64,

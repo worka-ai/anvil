@@ -61,6 +61,21 @@ pub struct PutObjectLinkRequest {
     pub created_by: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteObjectLinkRequest {
+    pub tenant_id: i64,
+    pub bucket_id: i64,
+    pub link_key: String,
+    pub expected_generation: u64,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteObjectLinkResult {
+    pub link_key: String,
+    pub generation: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectLinkMutation {
     pub link: Object,
@@ -86,6 +101,8 @@ pub enum ObjectLinkError {
     InvalidTargetKey,
     #[error("object link already exists")]
     AlreadyExists,
+    #[error("object link not found")]
+    NotFound,
     #[error("existing object is not an object link")]
     ExistingObjectIsNotLink,
     #[error("expected link generation is required")]

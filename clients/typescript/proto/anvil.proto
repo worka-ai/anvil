@@ -3,6 +3,12 @@ syntax = "proto3";
 package anvil;
 
 service AdminService {
+  rpc CreateObjectLink(CreateObjectLinkRequest) returns (ObjectLinkResponse);
+  rpc UpdateObjectLink(UpdateObjectLinkRequest) returns (ObjectLinkResponse);
+  rpc DeleteObjectLink(DeleteObjectLinkRequest) returns (AdminMutationResponse);
+  rpc ReadObjectLink(ReadObjectLinkRequest) returns (ObjectLinkResponse);
+  rpc ListObjectLinks(ListObjectLinksRequest) returns (ListObjectLinksResponse);
+
   rpc CreateRegion(CreateRegionRequest) returns (RegionResponse);
   rpc ActivateRegion(ActivateRegionRequest) returns (RegionResponse);
   rpc DrainRegion(DrainRegionRequest) returns (DrainOperationResponse);
@@ -154,10 +160,64 @@ message ObjectLinkDescriptor {
   string target_key = 5;
   string target_version = 6;
   ObjectLinkResolution resolution = 7;
-  bool allow_dangling = 8;
-  string created_at = 9;
-  string updated_at = 10;
+  string created_at = 8;
+  string updated_at = 9;
+  string created_by = 10;
   uint64 generation = 11;
+}
+
+message CreateObjectLinkRequest {
+  AdminRequestContext context = 1;
+  string tenant_id = 2;
+  string bucket_name = 3;
+  string link_key = 4;
+  string target_key = 5;
+  string target_version = 6;
+  ObjectLinkResolution resolution = 7;
+  bool allow_dangling = 8;
+}
+
+message UpdateObjectLinkRequest {
+  AdminRequestContext context = 1;
+  string tenant_id = 2;
+  string bucket_name = 3;
+  string link_key = 4;
+  string target_key = 5;
+  string target_version = 6;
+  ObjectLinkResolution resolution = 7;
+  bool allow_dangling = 8;
+}
+
+message DeleteObjectLinkRequest {
+  AdminRequestContext context = 1;
+  string tenant_id = 2;
+  string bucket_name = 3;
+  string link_key = 4;
+}
+
+message ReadObjectLinkRequest {
+  string request_id = 1;
+  string tenant_id = 2;
+  string bucket_name = 3;
+  string link_key = 4;
+}
+
+message ListObjectLinksRequest {
+  string tenant_id = 1;
+  string bucket_name = 2;
+  string prefix = 3;
+  PageRequest page = 4;
+}
+
+message ObjectLinkResponse {
+  string request_id = 1;
+  ObjectLinkDescriptor link = 2;
+  string audit_event_id = 3;
+}
+
+message ListObjectLinksResponse {
+  PageResponse page = 1;
+  repeated ObjectLinkDescriptor links = 2;
 }
 
 message BucketDrainOverride {

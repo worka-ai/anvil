@@ -377,3 +377,284 @@ async fn admin_lifecycle_rejects_invalid_region_cell_and_node_transitions() {
     assert_eq!(listed.nodes.len(), 1);
     assert_eq!(listed.nodes[0].state, 4);
 }
+
+#[tokio::test]
+async fn admin_object_links_are_cas_checked_metadata_entries() {
+    let node = spawn_admin_node().await;
+    let token = admin_token(&node);
+    let denied_token = non_admin_token(&node);
+    let tenant = node
+        .state
+        .persistence
+        .create_tenant("tenant-links", "unused")
+        .await
+        .unwrap();
+    let bucket = node
+        .state
+        .persistence
+        .create_bucket(tenant.id, "releases", "eu-west-1")
+        .await
+        .unwrap();
+    let target_v1 = node
+        .state
+        .persistence
+        .create_object(
+            tenant.id,
+            bucket.id,
+            "versions/app-v1.bin",
+            "hash-v1",
+            8,
+            "etag-v1",
+            Some("application/octet-stream"),
+            None,
+            None,
+            Some(b"v1-bytes".to_vec()),
+        )
+        .await
+        .unwrap();
+    let target_v2 = node
+        .state
+        .persistence
+        .create_object(
+            tenant.id,
+            bucket.id,
+            "versions/app-v2.bin",
+            "hash-v2",
+            8,
+            "etag-v2",
+            Some("application/octet-stream"),
+            None,
+            None,
+            Some(b"v2-bytes".to_vec()),
+        )
+        .await
+        .unwrap();
+
+    let mut client = AdminServiceClient::connect(node.admin_url.clone())
+        .await
+        .unwrap();
+
+    let created = client
+        .create_object_link(with_auth(
+            tonic::Request::new(CreateObjectLinkRequest {
+                context: Some(context("create-link", 0)),
+                tenant_id: "tenant-links".to_string(),
+                bucket_name: "releases".to_string(),
+                link_key: "latest.bin".to_string(),
+                target_key: "versions/app-v1.bin".to_string(),
+                target_version: String::new(),
+                resolution: 1,
+                allow_dangling: false,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .link
+        .unwrap();
+    assert_eq!(created.generation, 1);
+    assert_eq!(created.target_key, "versions/app-v1.bin");
+    assert_eq!(created.created_by, "principal:admin-principal");
+
+    let duplicate_create = client
+        .create_object_link(with_auth(
+            tonic::Request::new(CreateObjectLinkRequest {
+                context: Some(context("create-link-stale", 0)),
+                tenant_id: "tenant-links".to_string(),
+                bucket_name: "releases".to_string(),
+                link_key: "latest.bin".to_string(),
+                target_key: "versions/app-v1.bin".to_string(),
+                target_version: String::new(),
+                resolution: 1,
+                allow_dangling: false,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(duplicate_create.code(), Code::AlreadyExists);
+
+    let denied_read = client
+        .read_object_link(with_auth(
+            tonic::Request::new(ReadObjectLinkRequest {
+                request_id: "req-denied-read-link".to_string(),
+                tenant_id: "tenant-links".to_string(),
+                bucket_name: "releases".to_string(),
+                link_key: "latest.bin".to_string(),
+            }),
+            &denied_token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied_read.code(), Code::PermissionDenied);
+
+    let read = client
+        .read_object_link(with_auth(
+            tonic::Request::new(ReadObjectLinkRequest {
+                request_id: "req-read-link".to_string(),
+                tenant_id: "tenant-links".to_string(),
+                bucket_name: "releases".to_string(),
+                link_key: "latest.bin".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .link
+        .unwrap();
+    assert_eq!(read.generation, created.generation);
+    assert_eq!(read.target_key, "versions/app-v1.bin");
+
+    let listed = client
+        .list_object_links(with_auth(
+            tonic::Request::new(ListObjectLinksRequest {
+                tenant_id: "tenant-links".to_string(),
+                bucket_name: "releases".to_string(),
+                prefix: "latest".to_string(),
+                page: Some(PageRequest {
+                    cursor: String::new(),
+                    limit: 10,
+                }),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.links.len(), 1);
+    assert_eq!(listed.links[0].link_key, "latest.bin");
+
+    let link_entry = node
+        .state
+        .persistence
+        .get_object(bucket.id, "latest.bin")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(link_entry.size, 0);
+    assert!(link_entry.inline_payload.is_none());
+
+    let stale_update = client
+        .update_object_link(with_auth(
+            tonic::Request::new(UpdateObjectLinkRequest {
+                context: Some(context("update-link-stale", created.generation + 1)),
+                tenant_id: "tenant-links".to_string(),
+                bucket_name: "releases".to_string(),
+                link_key: "latest.bin".to_string(),
+                target_key: "versions/app-v2.bin".to_string(),
+                target_version: String::new(),
+                resolution: 1,
+                allow_dangling: false,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(stale_update.code(), Code::Aborted);
+
+    let updated = client
+        .update_object_link(with_auth(
+            tonic::Request::new(UpdateObjectLinkRequest {
+                context: Some(context("update-link", created.generation)),
+                tenant_id: "tenant-links".to_string(),
+                bucket_name: "releases".to_string(),
+                link_key: "latest.bin".to_string(),
+                target_key: "versions/app-v2.bin".to_string(),
+                target_version: String::new(),
+                resolution: 1,
+                allow_dangling: false,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .link
+        .unwrap();
+    assert_eq!(updated.generation, created.generation + 1);
+    assert_eq!(updated.target_key, "versions/app-v2.bin");
+
+    let updated_entry = node
+        .state
+        .persistence
+        .get_object(bucket.id, "latest.bin")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated_entry.size, 0);
+    assert!(updated_entry.inline_payload.is_none());
+
+    let stale_delete = client
+        .delete_object_link(with_auth(
+            tonic::Request::new(DeleteObjectLinkRequest {
+                context: Some(context("delete-link-stale", created.generation)),
+                tenant_id: "tenant-links".to_string(),
+                bucket_name: "releases".to_string(),
+                link_key: "latest.bin".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(stale_delete.code(), Code::Aborted);
+
+    let deleted = client
+        .delete_object_link(with_auth(
+            tonic::Request::new(DeleteObjectLinkRequest {
+                context: Some(context("delete-link", updated.generation)),
+                tenant_id: "tenant-links".to_string(),
+                bucket_name: "releases".to_string(),
+                link_key: "latest.bin".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(deleted.generation, updated.generation + 1);
+
+    let deleted_read = client
+        .read_object_link(with_auth(
+            tonic::Request::new(ReadObjectLinkRequest {
+                request_id: "req-read-deleted-link".to_string(),
+                tenant_id: "tenant-links".to_string(),
+                bucket_name: "releases".to_string(),
+                link_key: "latest.bin".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(deleted_read.code(), Code::NotFound);
+
+    assert!(
+        node.state
+            .persistence
+            .get_object(bucket.id, "latest.bin")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        node.state
+            .persistence
+            .get_object(bucket.id, "versions/app-v1.bin")
+            .await
+            .unwrap()
+            .unwrap()
+            .inline_payload,
+        target_v1.inline_payload
+    );
+    assert_eq!(
+        node.state
+            .persistence
+            .get_object(bucket.id, "versions/app-v2.bin")
+            .await
+            .unwrap()
+            .unwrap()
+            .inline_payload,
+        target_v2.inline_payload
+    );
+}
