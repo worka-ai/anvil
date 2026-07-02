@@ -156,6 +156,22 @@ async fn native_object_routes_use_mesh_locator_before_local_bucket_metadata() {
             .unwrap(),
         "proxy_unavailable"
     );
+
+    let write_err = state
+        .object_manager
+        .initiate_multipart_upload(1, bucket_name.as_str(), "upload.bin", &["*|*".to_string()])
+        .await
+        .unwrap_err();
+    assert_eq!(write_err.code(), Code::Unavailable);
+    assert_eq!(
+        write_err
+            .metadata()
+            .get("x-anvil-bucket-region")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "eu-west-1"
+    );
 }
 
 fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {

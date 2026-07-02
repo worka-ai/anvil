@@ -247,6 +247,7 @@ impl ObjectManager {
         if !authorized {
             return Err(Status::permission_denied("Permission denied"));
         }
+        let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
         let nodes = self
             .placer
             .calculate_placement(object_key, &self.cluster, self.sharder.total_shards())
@@ -362,7 +363,6 @@ impl ObjectManager {
                 .map_err(|e| Status::internal(e.to_string()))?;
         }
 
-        let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
         let shard_map_json = if nodes.len() > 1 {
             let peer_ids: Vec<String> = nodes.iter().map(|p| p.to_base58()).collect();
             Some(serde_json::json!(peer_ids))
@@ -2229,16 +2229,24 @@ impl ObjectManager {
     }
 
     async fn get_tenant_bucket(&self, tenant_id: i64, bucket_name: &str) -> Result<Bucket, Status> {
+        if let Some(locator) = self
+            .persistence
+            .get_mesh_bucket_locator(tenant_id, bucket_name)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            && locator.status != crate::mesh_directory::BucketLocatorStatus::Deleted
+            && locator.home_region.as_str() != self.region.as_str()
+        {
+            return Err(self.remote_bucket_status(locator.home_region.as_str()));
+        }
+
         let bucket = bucket_journal::read_current_bucket(&self.storage, tenant_id, bucket_name)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
 
         if bucket.region != self.region {
-            return Err(Status::failed_precondition(format!(
-                "Bucket is in region {}",
-                bucket.region
-            )));
+            return Err(self.remote_bucket_status(&bucket.region));
         }
 
         Ok(bucket)
