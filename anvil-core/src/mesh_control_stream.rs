@@ -1,3 +1,4 @@
+use crate::storage::Storage;
 use anyhow::{Context, Result as AnyhowResult, anyhow};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
@@ -10,6 +11,7 @@ use tokio::io::AsyncWriteExt;
 pub const CONTROL_STREAM_MAGIC: &[u8; 8] = b"ANVCTL1\0";
 pub const CONTROL_STREAM_VERSION: u16 = 1;
 pub const CONTROL_STREAM_FIXED_HEADER_LEN: usize = 8 + 2 + 4 + 8 + 4 + 4;
+pub const CONTROL_CHECKPOINT_SCHEMA: &str = "anvil.mesh.control_checkpoint.v1";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ControlStreamFrameError {
@@ -235,6 +237,41 @@ pub struct ControlStreamAppend {
     pub offset: u64,
     pub encoded_len: usize,
     pub position: ControlStreamPosition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlCheckpointRecord {
+    pub schema: String,
+    pub mesh_id: String,
+    pub region: String,
+    pub stream_family: String,
+    pub partition: String,
+    pub last_sequence: ControlStreamSequence,
+    pub last_digest: ControlRecordDigest,
+    pub updated_at: String,
+}
+
+impl ControlCheckpointRecord {
+    pub fn new(
+        mesh_id: impl Into<String>,
+        region: impl Into<String>,
+        stream_family: impl Into<String>,
+        partition: impl Into<String>,
+        last_sequence: ControlStreamSequence,
+        last_digest: ControlRecordDigest,
+        updated_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema: CONTROL_CHECKPOINT_SCHEMA.to_string(),
+            mesh_id: mesh_id.into(),
+            region: region.into(),
+            stream_family: stream_family.into(),
+            partition: partition.into(),
+            last_sequence,
+            last_digest,
+            updated_at: updated_at.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -595,6 +632,83 @@ pub async fn latest_projected_record_from_control_stream(
         ));
     }
     Ok(latest)
+}
+
+pub async fn write_control_checkpoint(
+    storage: &Storage,
+    checkpoint: &ControlCheckpointRecord,
+) -> AnyhowResult<()> {
+    validate_control_checkpoint(checkpoint)?;
+    let path = storage.mesh_control_checkpoint_path(
+        &checkpoint.region,
+        &checkpoint.stream_family,
+        &checkpoint.partition,
+    )?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp_path = path.with_extension(format!("json.tmp-{}", uuid::Uuid::new_v4()));
+    let mut file = tokio::fs::File::create(&tmp_path).await?;
+    let bytes = serde_json::to_vec_pretty(checkpoint)?;
+    file.write_all(&bytes).await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(tmp_path, path).await?;
+    Ok(())
+}
+
+pub async fn read_control_checkpoint(
+    storage: &Storage,
+    region: &str,
+    stream_family: &str,
+    partition: &str,
+) -> AnyhowResult<Option<ControlCheckpointRecord>> {
+    let path = storage.mesh_control_checkpoint_path(region, stream_family, partition)?;
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let checkpoint: ControlCheckpointRecord = serde_json::from_slice(&bytes)?;
+    validate_control_checkpoint(&checkpoint)?;
+    if checkpoint.region != region
+        || checkpoint.stream_family != stream_family
+        || checkpoint.partition != partition
+    {
+        return Err(anyhow!(
+            "control checkpoint path does not match checkpoint body: expected {region}/{stream_family}/{partition}, got {}/{}/{}",
+            checkpoint.region,
+            checkpoint.stream_family,
+            checkpoint.partition
+        ));
+    }
+    Ok(Some(checkpoint))
+}
+
+fn validate_control_checkpoint(checkpoint: &ControlCheckpointRecord) -> AnyhowResult<()> {
+    if checkpoint.schema != CONTROL_CHECKPOINT_SCHEMA {
+        return Err(anyhow!(
+            "control checkpoint schema must be {CONTROL_CHECKPOINT_SCHEMA}"
+        ));
+    }
+    if checkpoint.mesh_id.trim().is_empty() {
+        return Err(anyhow!("control checkpoint mesh_id must not be empty"));
+    }
+    if checkpoint.region.trim().is_empty() {
+        return Err(anyhow!("control checkpoint region must not be empty"));
+    }
+    if checkpoint.stream_family.trim().is_empty() {
+        return Err(anyhow!(
+            "control checkpoint stream_family must not be empty"
+        ));
+    }
+    if checkpoint.partition.trim().is_empty() {
+        return Err(anyhow!("control checkpoint partition must not be empty"));
+    }
+    if checkpoint.updated_at.trim().is_empty() {
+        return Err(anyhow!("control checkpoint updated_at must not be empty"));
+    }
+    Ok(())
 }
 
 pub fn encode_control_stream_frame(

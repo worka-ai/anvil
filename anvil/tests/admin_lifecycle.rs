@@ -180,6 +180,20 @@ async fn activation_checkpoint_json_from_existing_streams(
             let Some(record) = log.records.last() else {
                 continue;
             };
+            anvil::mesh_control_stream::write_control_checkpoint(
+                &node.state.storage,
+                &anvil::mesh_control_stream::ControlCheckpointRecord::new(
+                    "mesh-test",
+                    region,
+                    stream_family,
+                    &partition,
+                    record.metadata.sequence,
+                    record.metadata.record_digest.clone(),
+                    "2026-07-02T00:00:00Z",
+                ),
+            )
+            .await
+            .unwrap();
             required_streams.push(serde_json::json!({
                 "stream_family": stream_family,
                 "partition": partition,

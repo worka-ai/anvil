@@ -1,5 +1,5 @@
 use crate::mesh_control_stream::{
-    ControlRecordDigest, ControlStreamSequence, read_control_stream_log,
+    ControlRecordDigest, ControlStreamSequence, read_control_checkpoint, read_control_stream_log,
 };
 use crate::mesh_directory::{self, BucketLocatorDescriptor, BucketLocatorStatus};
 use crate::routing::{self, HostAliasDescriptor, HostAliasState, RoutingConfig};
@@ -1274,16 +1274,64 @@ async fn validate_activation_checkpoint_streams(
                     required.stream_family, required.partition
                 ))
             })?;
+        let Some(region_checkpoint) = read_control_checkpoint(
+            storage,
+            &checkpoint.region,
+            &required.stream_family,
+            &required.partition,
+        )
+        .await
+        .map_err(|err| {
+            LifecycleError::InvalidArgument(format!(
+                "activation checkpoint could not read regional checkpoint {}/{} for {}: {err}",
+                required.stream_family, required.partition, checkpoint.region
+            ))
+        })?
+        else {
+            return Err(activation_checkpoint_not_reached(
+                required,
+                "regional control checkpoint is absent".to_string(),
+            ));
+        };
+        if region_checkpoint.mesh_id != checkpoint.mesh_id {
+            return Err(activation_checkpoint_not_reached(
+                required,
+                format!(
+                    "regional checkpoint mesh_id {} does not match activation checkpoint mesh_id {}",
+                    region_checkpoint.mesh_id, checkpoint.mesh_id
+                ),
+            ));
+        }
+        if region_checkpoint.last_sequence < required.sequence {
+            return Err(activation_checkpoint_not_reached(
+                required,
+                format!(
+                    "regional checkpoint latest sequence is {}",
+                    region_checkpoint.last_sequence.get()
+                ),
+            ));
+        }
+        if region_checkpoint.last_sequence == required.sequence {
+            if region_checkpoint.last_digest.as_str() != required.digest.as_str() {
+                return Err(activation_checkpoint_not_reached(
+                    required,
+                    format!(
+                        "regional checkpoint digest mismatch at sequence {}",
+                        required.sequence.get()
+                    ),
+                ));
+            }
+            continue;
+        }
+
         let log = read_control_stream_log(&path).await.map_err(|err| {
             LifecycleError::InvalidArgument(format!(
                 "activation checkpoint could not read control stream {}/{}: {err}",
                 required.stream_family, required.partition
             ))
         })?;
-        let mut latest_sequence = 0;
         let mut found_sequence = false;
         for record in log.records {
-            latest_sequence = latest_sequence.max(record.metadata.sequence.get());
             if record.metadata.sequence == required.sequence {
                 found_sequence = true;
                 if record.metadata.record_digest.as_str() != required.digest.as_str() {
@@ -1295,14 +1343,13 @@ async fn validate_activation_checkpoint_streams(
             }
         }
         if !found_sequence {
-            let reason = if latest_sequence == 0 {
-                "stream is absent".to_string()
-            } else if latest_sequence < required.sequence.get() {
-                format!("latest sequence is {latest_sequence}")
-            } else {
-                "required sequence is absent".to_string()
-            };
-            return Err(activation_checkpoint_not_reached(required, reason));
+            return Err(activation_checkpoint_not_reached(
+                required,
+                format!(
+                    "regional checkpoint is beyond sequence {}, but the required stream position is not available for digest validation",
+                    region_checkpoint.last_sequence.get()
+                ),
+            ));
         }
     }
     Ok(())
@@ -1445,6 +1492,15 @@ mod tests {
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let region = create_test_region(&storage).await;
         append_control_record(&storage, "bucket_locator", "0a7f", 1, digest_for(b"actual")).await;
+        write_control_checkpoint_record(
+            &storage,
+            "eu-west-1",
+            "bucket_locator",
+            "0a7f",
+            1,
+            digest_for(b"actual"),
+        )
+        .await;
         let checkpoint =
             checkpoint_with_stream("bucket_locator", "0a7f", 1, digest_for(b"expected"));
 
@@ -1511,6 +1567,15 @@ mod tests {
         .unwrap();
         let digest = digest_for(b"record");
         append_control_record(&storage, "bucket_locator", "0a7f", 1, digest.clone()).await;
+        write_control_checkpoint_record(
+            &storage,
+            "eu-west-1",
+            "bucket_locator",
+            "0a7f",
+            1,
+            digest.clone(),
+        )
+        .await;
         let checkpoint = checkpoint_with_stream("bucket_locator", "0a7f", 1, digest);
 
         let active = activate_region(&storage, "eu-west-1", region.generation, &checkpoint)
@@ -1916,6 +1981,30 @@ mod tests {
             &crate::mesh_control_stream::ControlStreamFrame::new(
                 header_json,
                 br#"{"ok":true}"#.to_vec(),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn write_control_checkpoint_record(
+        storage: &Storage,
+        region: &str,
+        stream_family: &str,
+        partition: &str,
+        sequence: u64,
+        digest: ControlRecordDigest,
+    ) {
+        crate::mesh_control_stream::write_control_checkpoint(
+            storage,
+            &crate::mesh_control_stream::ControlCheckpointRecord::new(
+                "mesh-a",
+                region,
+                stream_family,
+                partition,
+                ControlStreamSequence::new(sequence).unwrap(),
+                digest,
+                "2026-07-02T00:00:00Z",
             ),
         )
         .await
