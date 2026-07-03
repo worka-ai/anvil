@@ -12,9 +12,21 @@ pub struct Config {
     #[arg(long, env)]
     pub jwt_secret: String,
 
-    /// The secret key used for encrypting data at rest.
+    /// Optional fixed bearer token accepted for first administrative bootstrap.
+    #[arg(long, env)]
+    pub anvil_bootstrap_admin_token: Option<String>,
+
+    /// Active hex-encoded 32-byte key used for server-side secret encryption.
     #[arg(long, env)]
     pub anvil_secret_encryption_key: String,
+
+    /// Identifier written into new encrypted secret envelopes.
+    #[arg(long, env, default_value = "primary")]
+    pub anvil_secret_encryption_key_id: String,
+
+    /// Comma-delimited previous secret encryption keys as `key_id:hex`.
+    #[arg(long, env, default_value = "")]
+    pub anvil_secret_encryption_previous_keys: String,
 
     /// The address to bind the QUIC peer-to-peer endpoint to.
     #[arg(long, env, default_value = "/ip4/0.0.0.0/udp/7443/quic-v1")]
@@ -139,6 +151,19 @@ impl Config {
             &self.cluster_keypair_path,
             &self.storage_path,
             crate::cluster_identity::DEFAULT_CLUSTER_KEYPAIR_FILE,
+        )
+    }
+
+    pub fn secret_keyring(&self) -> Result<crate::crypto::EncryptionKeyring> {
+        let active_key_id = if self.anvil_secret_encryption_key_id.trim().is_empty() {
+            "primary"
+        } else {
+            &self.anvil_secret_encryption_key_id
+        };
+        crate::crypto::EncryptionKeyring::from_hex_config(
+            active_key_id,
+            &self.anvil_secret_encryption_key,
+            &self.anvil_secret_encryption_previous_keys,
         )
     }
 

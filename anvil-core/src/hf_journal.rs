@@ -161,6 +161,44 @@ pub async fn get_key_encrypted_by_id(storage: &Storage, id: i64) -> Result<Optio
         .map(|key| key.token_encrypted))
 }
 
+pub(crate) async fn list_encrypted_keys(storage: &Storage) -> Result<Vec<HfKey>> {
+    let mut keys = read_state(storage)
+        .await?
+        .keys
+        .into_values()
+        .collect::<Vec<_>>();
+    keys.sort_by_key(|key| key.id);
+    Ok(keys)
+}
+
+pub(crate) async fn update_key_encrypted_with_permit(
+    storage: &Storage,
+    id: i64,
+    token_encrypted: &[u8],
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<()> {
+    let fence_token = validate_hf_write(storage, permit, partition_owner_signing_key).await?;
+    let state = read_state(storage).await?;
+    let mut key = state
+        .keys
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| anyhow!("hugging face key not found"))?;
+    key.token_encrypted = token_encrypted.to_vec();
+    key.updated_at = Utc::now();
+    append_body(
+        storage,
+        HfMutationKind::KeyUpsert,
+        Some(key),
+        None,
+        None,
+        None,
+        fence_token,
+    )
+    .await
+}
+
 pub async fn list_keys(
     storage: &Storage,
 ) -> Result<Vec<(String, Option<String>, DateTime<Utc>, DateTime<Utc>)>> {

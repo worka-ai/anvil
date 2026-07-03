@@ -6,6 +6,7 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use anvil::anvil_api::GetAccessTokenRequest;
+use anvil::anvil_api::admin_service_client::AdminServiceClient;
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil_core::AppState;
 use aws_config::BehaviorVersion;
@@ -16,15 +17,6 @@ use tokio::task::JoinHandle;
 use tracing_subscriber::{self, EnvFilter};
 
 static INIT_LOGGER: Once = Once::new();
-
-#[allow(dead_code)]
-pub fn extract_credential(output: &str, key: &str) -> String {
-    output
-        .lines()
-        .find(|line| line.contains(key))
-        .map(|line| line.split(':').nth(1).unwrap().trim().to_string())
-        .unwrap()
-}
 
 #[allow(dead_code)]
 pub async fn get_auth_token(_admin_state_path: &str, grpc_addr: &str) -> String {
@@ -52,6 +44,7 @@ pub struct TestCluster {
     pub nodes: Vec<JoinHandle<()>>,
     pub states: Vec<AppState>,
     pub grpc_addrs: Vec<String>,
+    pub admin_addrs: Vec<String>,
     pub token: String,
     pub admin_state_path: String,
     pub config: Arc<anvil_core::config::Config>,
@@ -153,7 +146,6 @@ impl TestCluster {
                     .await
                     .unwrap()
             };
-            let encryption_key = hex::decode(&state.config.anvil_secret_encryption_key).unwrap();
             if state
                 .persistence
                 .get_app_by_client_id("test-app")
@@ -161,8 +153,7 @@ impl TestCluster {
                 .unwrap()
                 .is_none()
             {
-                let encrypted_secret =
-                    anvil::crypto::encrypt(b"test-secret", &encryption_key).unwrap();
+                let encrypted_secret = state.secret_keyring.encrypt(b"test-secret").unwrap();
                 let app = state
                     .persistence
                     .create_app(tenant.id, "test-app", "test-app", &encrypted_secret)
@@ -186,6 +177,7 @@ impl TestCluster {
             nodes: Vec::new(),
             states,
             grpc_addrs: Vec::new(),
+            admin_addrs: Vec::new(),
             token: String::new(),
             admin_state_path: admin_state_path.to_string_lossy().into_owned(),
             config,
@@ -237,8 +229,11 @@ impl TestCluster {
             let mut state = self.states[i].clone();
             let swarm = swarms.remove(0);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
+            let admin_addr = admin_listener.local_addr().unwrap();
             self.grpc_addrs.push(format!("http://{}", addr));
+            self.admin_addrs.push(format!("http://{}", admin_addr));
 
             let cfg = &state.config.deref();
             let mut cfg = anvil_core::config::Config::from_ref(cfg);
@@ -247,7 +242,15 @@ impl TestCluster {
 
             let handle = tokio::spawn(async move {
                 let (_tx, rx) = tokio::sync::mpsc::channel(1);
-                anvil::start_node(listener, state, swarm, rx).await.unwrap();
+                anvil::start_node_with_admin_listener(
+                    listener,
+                    Some(admin_listener),
+                    state,
+                    swarm,
+                    rx,
+                )
+                .await
+                .unwrap();
             });
             self.nodes.push(handle);
         }
@@ -275,6 +278,12 @@ impl TestCluster {
                     let addr: SocketAddr = addr_str.replace("http://", "").parse().unwrap();
                     if !wait_for_port(addr, Duration::from_secs(5)).await {
                         panic!("gRPC port {} did not open in time", addr);
+                    }
+                }
+                for addr_str in &self.admin_addrs {
+                    let addr: SocketAddr = addr_str.replace("http://", "").parse().unwrap();
+                    if !wait_for_port(addr, Duration::from_secs(5)).await {
+                        panic!("admin gRPC port {} did not open in time", addr);
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(3)).await;
@@ -308,7 +317,127 @@ impl TestCluster {
             node.abort();
         }
         self.grpc_addrs.clear();
+        self.admin_addrs.clear();
         self.start_and_converge(timeout).await;
+    }
+
+    pub fn admin_token(&self) -> String {
+        self.states[0]
+            .jwt_manager
+            .mint_token(
+                "admin-principal".to_string(),
+                vec![format!(
+                    "anvil_admin:*|anvil_admin:cluster:{}",
+                    self.states[0].config.mesh_id
+                )],
+                0,
+            )
+            .unwrap()
+    }
+
+    pub async fn create_application(&self, tenant_id: &str, app_name: &str) -> (String, String) {
+        let (_app_id, client_id, client_secret) =
+            self.create_application_with_id(tenant_id, app_name).await;
+        (client_id, client_secret)
+    }
+
+    pub async fn create_application_with_id(
+        &self,
+        tenant_id: &str,
+        app_name: &str,
+    ) -> (String, String, String) {
+        let mut client = AdminServiceClient::connect(self.admin_addrs[0].clone())
+            .await
+            .unwrap();
+        let mut request = tonic::Request::new(anvil::anvil_api::CreateApplicationRequest {
+            context: Some(test_admin_context(&format!("create-app-{app_name}"), 0)),
+            tenant_id: tenant_id.to_string(),
+            app_name: app_name.to_string(),
+        });
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", self.admin_token()).parse().unwrap(),
+        );
+        let response = client
+            .create_application(request)
+            .await
+            .unwrap()
+            .into_inner();
+        (response.app_id, response.client_id, response.client_secret)
+    }
+
+    pub async fn grant_application_policy(
+        &self,
+        tenant_id: &str,
+        app_name: &str,
+        action: &str,
+        resource: &str,
+    ) {
+        let mut client = AdminServiceClient::connect(self.admin_addrs[0].clone())
+            .await
+            .unwrap();
+        let mut request = tonic::Request::new(anvil::anvil_api::GrantApplicationPolicyRequest {
+            context: Some(test_admin_context(&format!("grant-{app_name}"), 0)),
+            tenant_id: tenant_id.to_string(),
+            app_name: app_name.to_string(),
+            action: action.to_string(),
+            resource: resource.to_string(),
+        });
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", self.admin_token()).parse().unwrap(),
+        );
+        client.grant_application_policy(request).await.unwrap();
+    }
+
+    pub async fn rotate_application_secret(
+        &self,
+        tenant_id: &str,
+        app_name: &str,
+    ) -> (String, String) {
+        let mut client = AdminServiceClient::connect(self.admin_addrs[0].clone())
+            .await
+            .unwrap();
+        let mut request = tonic::Request::new(anvil::anvil_api::RotateApplicationSecretRequest {
+            context: Some(test_admin_context(&format!("rotate-app-{app_name}"), 1)),
+            tenant_id: tenant_id.to_string(),
+            app_name: app_name.to_string(),
+        });
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", self.admin_token()).parse().unwrap(),
+        );
+        let response = client
+            .rotate_application_secret(request)
+            .await
+            .unwrap()
+            .into_inner();
+        (response.client_id, response.client_secret)
+    }
+
+    pub async fn create_application_with_policy(
+        &self,
+        tenant_id: &str,
+        app_name: &str,
+        action: &str,
+        resource: &str,
+    ) -> (String, String) {
+        let credentials = self.create_application(tenant_id, app_name).await;
+        self.grant_application_policy(tenant_id, app_name, action, resource)
+            .await;
+        credentials
+    }
+}
+
+fn test_admin_context(
+    label: &str,
+    expected_generation: u64,
+) -> anvil::anvil_api::AdminRequestContext {
+    anvil::anvil_api::AdminRequestContext {
+        request_id: format!("test-{label}-{}", uuid::Uuid::new_v4().simple()),
+        idempotency_key: uuid::Uuid::new_v4().to_string(),
+        audit_reason: format!("test {label}"),
+        expected_generation,
     }
 }
 

@@ -54,7 +54,7 @@ pub async fn start_node_with_admin_listener(
             worker_state.cluster.clone(),
             worker_state.jwt_manager.clone(),
             worker_state.object_manager.clone(),
-            worker_state.config.anvil_secret_encryption_key.clone(),
+            worker_state.secret_keyring.clone(),
         )
         .await
         {

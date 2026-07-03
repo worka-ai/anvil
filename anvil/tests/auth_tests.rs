@@ -54,66 +54,22 @@ async fn grpc_error_responses_include_server_request_id() {
     assert!(request_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
 }
 
-// Helper function to create an app, since it's used in auth tests.
-fn create_app(admin_state_path: &str, app_name: &str) -> (String, String) {
-    let (_, client_id, client_secret) = create_app_with_id(admin_state_path, app_name);
+// Helper function to create an app through the network admin API.
+async fn create_app(cluster: &TestCluster, app_name: &str) -> (String, String) {
+    let (_, client_id, client_secret) = create_app_with_id(cluster, app_name).await;
     (client_id, client_secret)
 }
 
-fn create_app_with_id(admin_state_path: &str, app_name: &str) -> (String, String, String) {
-    let admin_args = &["run", "--bin", "admin", "--"];
-    let app_output = std::process::Command::new("cargo")
-        .args(admin_args.iter().chain(&[
-            "--anvil-secret-encryption-key",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--storage-path",
-            admin_state_path,
-            "app",
-            "create",
-            "--tenant-name",
-            "default",
-            "--app-name",
-            app_name,
-        ]))
-        .output()
-        .unwrap();
-    assert!(app_output.status.success());
-    let creds = String::from_utf8(app_output.stdout).unwrap();
-    let app_id = creds
-        .lines()
-        .find_map(|line| line.split_once("(ID: "))
-        .and_then(|(_, rest)| rest.strip_suffix(')'))
-        .expect("app id in admin output")
-        .to_string();
-    let client_id = extract_credential(&creds, "Client ID");
-    let client_secret = extract_credential(&creds, "Client Secret");
-    (app_id, client_id, client_secret)
+async fn create_app_with_id(cluster: &TestCluster, app_name: &str) -> (String, String, String) {
+    cluster
+        .create_application_with_id("default", app_name)
+        .await
 }
 
-fn grant_policy(admin_state_path: &str, app_name: &str, action: &str, resource: &str) {
-    let admin_args = &["run", "--bin", "admin", "--"];
-    let output = std::process::Command::new("cargo")
-        .args(admin_args.iter().chain(&[
-            "--anvil-secret-encryption-key",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--storage-path",
-            admin_state_path,
-            "policy",
-            "grant",
-            "--app-name",
-            app_name,
-            "--action",
-            action,
-            "--resource",
-            resource,
-        ]))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "policy grant failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+async fn grant_policy(cluster: &TestCluster, app_name: &str, action: &str, resource: &str) {
+    cluster
+        .grant_application_policy("default", app_name, action, resource)
+        .await;
 }
 
 // Helper to get a token for specific scopes.
@@ -273,62 +229,11 @@ async fn test_grant_and_revoke_access() {
         .await
         .unwrap();
 
-    let (granter_client_id, granter_client_secret) =
-        create_app(&cluster.admin_state_path, "granter-app");
+    let (granter_client_id, granter_client_secret) = create_app(&cluster, "granter-app").await;
 
-    // Grant the granter app the ability to grant policies
-    let admin_args = &["run", "--bin", "admin", "--"];
-    let policy_args = &[
-        "policy",
-        "grant",
-        "--app-name",
-        "granter-app",
-        "--action",
-        "policy:grant",
-        "--resource",
-        "*",
-    ];
-    let output = std::process::Command::new("cargo")
-        .args(
-            admin_args
-                .iter()
-                .chain(&[
-                    "--anvil-secret-encryption-key",
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "--storage-path",
-                    &cluster.admin_state_path,
-                ])
-                .chain(policy_args.iter()),
-        )
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-
-    let revoke_policy_args = &[
-        "policy",
-        "grant",
-        "--app-name",
-        "granter-app",
-        "--action",
-        "policy:revoke",
-        "--resource",
-        "*",
-    ];
-    let revoke_output = std::process::Command::new("cargo")
-        .args(
-            admin_args
-                .iter()
-                .chain(&[
-                    "--anvil-secret-encryption-key",
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "--storage-path",
-                    &cluster.admin_state_path,
-                ])
-                .chain(revoke_policy_args.iter()),
-        )
-        .output()
-        .unwrap();
-    assert!(revoke_output.status.success());
+    // Grant the granter app the ability to grant and revoke policies.
+    grant_policy(&cluster, "granter-app", "policy:grant", "*").await;
+    grant_policy(&cluster, "granter-app", "policy:revoke", "*").await;
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -340,8 +245,7 @@ async fn test_grant_and_revoke_access() {
     )
     .await;
 
-    let (grantee_client_id, grantee_client_secret) =
-        create_app(&cluster.admin_state_path, "grantee-app");
+    let (grantee_client_id, grantee_client_secret) = create_app(&cluster, "grantee-app").await;
 
     let bucket_name = "grant-test-bucket".to_string();
     let resource = format!("bucket:{}", bucket_name);
@@ -1633,13 +1537,14 @@ async fn test_object_read_uses_relationship_authorization_before_streaming_bytes
     object_client.put_object(put_request).await.unwrap();
 
     let (reader_app_id, reader_client_id, reader_client_secret) =
-        create_app_with_id(&cluster.admin_state_path, "relationship-reader-app");
+        create_app_with_id(&cluster, "relationship-reader-app").await;
     grant_policy(
-        &cluster.admin_state_path,
+        &cluster,
         "relationship-reader-app",
         "bucket:read",
         "unrelated-bucket",
-    );
+    )
+    .await;
     let reader_token = get_token_for_scopes(
         &cluster.grpc_addrs[0],
         &reader_client_id,
@@ -1772,13 +1677,14 @@ async fn test_object_list_and_versions_filter_entries_by_read_relationship() {
     .await;
 
     let (reader_app_id, reader_client_id, reader_client_secret) =
-        create_app_with_id(&cluster.admin_state_path, "relationship-list-reader-app");
+        create_app_with_id(&cluster, "relationship-list-reader-app").await;
     grant_policy(
-        &cluster.admin_state_path,
+        &cluster,
         "relationship-list-reader-app",
         "object:list",
         &bucket_name,
-    );
+    )
+    .await;
     let reader_token = get_token_for_scopes(
         &cluster.grpc_addrs[0],
         &reader_client_id,
@@ -2483,54 +2389,11 @@ async fn test_reset_app_secret() {
     let app_name = "app-to-reset";
 
     // 1. Create an app and get original credentials
-    let (client_id, original_secret) = create_app(&cluster.admin_state_path, app_name);
+    let (client_id, original_secret) = create_app(&cluster, app_name).await;
 
-    // Grant it permissions
-    let admin_args = &["run", "--bin", "admin", "--"];
-    let policy_args = &[
-        "policy",
-        "grant",
-        "--app-name",
-        app_name,
-        "--action",
-        "*",
-        "--resource",
-        "*",
-    ];
-    let grant_status = std::process::Command::new("cargo")
-        .args(
-            admin_args
-                .iter()
-                .chain(&[
-                    "--anvil-secret-encryption-key",
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "--storage-path",
-                    &cluster.admin_state_path,
-                ])
-                .chain(policy_args.iter()),
-        )
-        .status()
-        .unwrap();
-    assert!(grant_status.success());
-
-    // 2. Reset the secret using the new admin command
-    let reset_output = std::process::Command::new("cargo")
-        .args(admin_args.iter().chain(&[
-            "--anvil-secret-encryption-key",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--storage-path",
-            &cluster.admin_state_path,
-            "app",
-            "reset-secret",
-            "--app-name",
-            app_name,
-        ]))
-        .output()
-        .unwrap();
-
-    assert!(reset_output.status.success());
-    let reset_creds = String::from_utf8(reset_output.stdout).unwrap();
-    let new_secret = extract_credential(&reset_creds, "Client Secret");
+    // Grant it permissions and rotate the secret through the network admin API.
+    grant_policy(&cluster, app_name, "*", "*").await;
+    let (_client_id, new_secret) = cluster.rotate_application_secret("default", app_name).await;
 
     // 3. Verify the secret has changed
     assert_ne!(original_secret, new_secret);

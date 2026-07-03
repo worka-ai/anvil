@@ -23,10 +23,6 @@ path = "src/lib.rs"
 name = "anvil"
 path = "src/main.rs"
 
-[[bin]]
-name = "admin"
-path = "src/bin/admin.rs"
-
 [features]
 enterprise = []
 gcp = ["dep:prost-types", "tonic/tls-ring"]

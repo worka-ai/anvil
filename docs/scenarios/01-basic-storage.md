@@ -19,18 +19,15 @@ First, the system administrator creates a new region, a tenant for the client (e
 
 ```bash
 # 1. Create the region where data will live
-anvil-admin region create --name us-east-1
+admin tenant create --name acme-corp --home-region us-east-1 --audit-reason "create customer tenant"
 
-# 2. Create the tenant
-anvil-admin tenant create --name acme-corp
-
-# 3. Create the app and securely save the outputted credentials
-anvil-admin app create --tenant-name acme-corp --app-name data-science-app
+# 2. Create the app and securely save the outputted credentials
+admin app create --tenant-id acme-corp --app-name data-science-app --audit-reason "create customer app"
 ```
 **Expected Output:**
 ```
-Client ID: app_abc123...
-Client Secret: xyz789...
+"client_id": "app_abc123..."
+"client_secret": "xyz789..."
 ```
 
 ### 2. Admin: Grant Initial Permissions
@@ -39,10 +36,12 @@ By default, the new app has no permissions. The administrator must grant it the 
 
 ```bash
 # Grant the app permission to create buckets
-anvil-admin policy grant \
+admin policy grant \
+  --tenant-id acme-corp \
   --app-name data-science-app \
   --action bucket:create \
-  --resource "*"
+  --resource "*" \
+  --audit-reason "allow bucket creation"
 ```
 
 ### 3. Client: Configure CLI
@@ -74,10 +73,10 @@ Now that the `project-x-data` bucket exists, the administrator grants the app fi
 ```bash
 # Grant write, read, list, and delete permissions on objects in the new bucket.
 # The '/*' suffix is a prefix match for all objects within the bucket.
-anvil policy grant --app-name data-science-app --action object:write --resource "project-x-data/*"
-anvil policy grant --app-name data-science-app --action object:read --resource "project-x-data/*"
-anvil policy grant --app-name data-science-app --action object:list --resource "project-x-data"
-anvil policy grant --app-name data-science-app --action object:delete --resource "project-x-data/*"
+admin policy grant --tenant-id acme-corp --app-name data-science-app --action object:write --resource "project-x-data/*" --audit-reason "allow object writes"
+admin policy grant --tenant-id acme-corp --app-name data-science-app --action object:read --resource "project-x-data/*" --audit-reason "allow object reads"
+admin policy grant --tenant-id acme-corp --app-name data-science-app --action object:list --resource "project-x-data" --audit-reason "allow object listing"
+admin policy grant --tenant-id acme-corp --app-name data-science-app --action object:delete --resource "project-x-data/*" --audit-reason "allow object deletes"
 ```
 
 ### 6. Client: Manage Objects

@@ -6,6 +6,9 @@ service AdminService {
   rpc CreateTenant(CreateTenantRequest) returns (TenantAdminResponse);
   rpc CreateApplication(CreateApplicationRequest) returns (ApplicationSecretResponse);
   rpc RotateApplicationSecret(RotateApplicationSecretRequest) returns (ApplicationSecretResponse);
+  rpc GrantApplicationPolicy(GrantApplicationPolicyRequest) returns (ApplicationPolicyResponse);
+  rpc RevokeApplicationPolicy(RevokeApplicationPolicyRequest) returns (ApplicationPolicyResponse);
+  rpc RotateSecretEncryptionKey(RotateSecretEncryptionKeyRequest) returns (SecretEncryptionKeyRotationResponse);
   rpc CreateBucketAdmin(CreateBucketAdminRequest) returns (BucketAdminResponse);
   rpc SetBucketPublicAccessAdmin(SetBucketPublicAccessAdminRequest) returns (BucketAdminResponse);
 
@@ -263,6 +266,51 @@ message ApplicationSecretResponse {
   string client_id = 4;
   string client_secret = 5;
   string audit_event_id = 6;
+  string app_id = 7;
+}
+
+message GrantApplicationPolicyRequest {
+  AdminRequestContext context = 1;
+  string tenant_id = 2;
+  string app_name = 3;
+  string action = 4;
+  string resource = 5;
+}
+
+message RevokeApplicationPolicyRequest {
+  AdminRequestContext context = 1;
+  string tenant_id = 2;
+  string app_name = 3;
+  string action = 4;
+  string resource = 5;
+}
+
+message ApplicationPolicyResponse {
+  string request_id = 1;
+  string tenant_id = 2;
+  string app_name = 3;
+  string action = 4;
+  string resource = 5;
+  string audit_event_id = 6;
+}
+
+message RotateSecretEncryptionKeyRequest {
+  AdminRequestContext context = 1;
+  bool dry_run = 2;
+}
+
+message SecretEncryptionKeyRotationResponse {
+  string request_id = 1;
+  string active_key_id = 2;
+  bool dry_run = 3;
+  uint64 app_secrets_examined = 4;
+  uint64 app_secrets_rotated = 5;
+  uint64 hf_keys_examined = 6;
+  uint64 hf_keys_rotated = 7;
+  uint64 shard_files_examined = 8;
+  uint64 shard_files_rotated = 9;
+  uint64 already_active = 10;
+  string audit_event_id = 11;
 }
 
 message CreateBucketAdminRequest {

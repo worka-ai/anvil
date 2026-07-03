@@ -344,6 +344,113 @@ async fn admin_service_is_absent_public_present_admin_and_requires_auth() {
 }
 
 #[tokio::test]
+async fn admin_policy_and_secret_key_rotation_use_admin_api() {
+    let node = spawn_admin_node().await;
+    let admin_token = admin_token(&node);
+    let mut client = AdminServiceClient::connect(node.admin_url.clone())
+        .await
+        .unwrap();
+
+    let tenant = client
+        .create_tenant(with_auth(
+            tonic::Request::new(CreateTenantRequest {
+                context: Some(context("policy-tenant", 0)),
+                name: "policy-tenant".to_string(),
+                home_region: "eu-west-1".to_string(),
+            }),
+            &admin_token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .tenant
+        .unwrap();
+
+    let app = client
+        .create_application(with_auth(
+            tonic::Request::new(CreateApplicationRequest {
+                context: Some(context("policy-app", 0)),
+                tenant_id: tenant.tenant_id.clone(),
+                app_name: "policy-app".to_string(),
+            }),
+            &admin_token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!app.client_id.is_empty());
+    assert!(!app.client_secret.is_empty());
+
+    client
+        .grant_application_policy(with_auth(
+            tonic::Request::new(GrantApplicationPolicyRequest {
+                context: Some(context("policy-grant", 0)),
+                tenant_id: tenant.tenant_id.clone(),
+                app_name: "policy-app".to_string(),
+                action: "object:read".to_string(),
+                resource: "assets/*".to_string(),
+            }),
+            &admin_token,
+        ))
+        .await
+        .unwrap();
+    let app_record = node
+        .state
+        .persistence
+        .list_apps_for_tenant(tenant.tenant_id.parse().unwrap())
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|app| app.name == "policy-app")
+        .unwrap();
+    assert_eq!(
+        node.state
+            .persistence
+            .get_policies_for_app(app_record.id)
+            .await
+            .unwrap(),
+        vec!["object:read|assets/*".to_string()]
+    );
+
+    client
+        .revoke_application_policy(with_auth(
+            tonic::Request::new(RevokeApplicationPolicyRequest {
+                context: Some(context("policy-revoke", 0)),
+                tenant_id: tenant.tenant_id.clone(),
+                app_name: "policy-app".to_string(),
+                action: "object:read".to_string(),
+                resource: "assets/*".to_string(),
+            }),
+            &admin_token,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        node.state
+            .persistence
+            .get_policies_for_app(app_record.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let rotation = client
+        .rotate_secret_encryption_key(with_auth(
+            tonic::Request::new(RotateSecretEncryptionKeyRequest {
+                context: Some(context("secret-rotation-dry-run", 0)),
+                dry_run: true,
+            }),
+            &admin_token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(rotation.dry_run);
+    assert_eq!(rotation.active_key_id, "primary");
+    assert!(rotation.app_secrets_examined >= 1);
+}
+
+#[tokio::test]
 async fn admin_lifecycle_rejects_invalid_region_cell_and_node_transitions() {
     let node = spawn_admin_node().await;
     let token = admin_token(&node);

@@ -2,6 +2,7 @@ use crate::anvil_api::DeleteShardRequest;
 use crate::anvil_api::internal_anvil_service_client::InternalAnvilServiceClient;
 use crate::auth::JwtManager;
 use crate::cluster::ClusterState;
+use crate::crypto::EncryptionKeyring;
 use crate::object_manager::ObjectManager;
 use crate::persistence::Object;
 use crate::persistence::Persistence;
@@ -52,9 +53,8 @@ pub async fn run(
     cluster_state: ClusterState,
     jwt_manager: Arc<JwtManager>,
     object_manager: ObjectManager,
-    anvil_secret_encryption_key: String,
+    keyring: Arc<EncryptionKeyring>,
 ) -> Result<()> {
-    let encryption_key = Arc::new(hex::decode(anvil_secret_encryption_key)?);
     loop {
         let tasks = match persistence.claim_pending_tasks(10).await {
             Ok(tasks) => tasks,
@@ -75,10 +75,9 @@ pub async fn run(
             let cs = cluster_state.clone();
             let jm = jwt_manager.clone();
             let om = object_manager.clone();
-            let encryption_key = encryption_key.clone();
+            let keyring = keyring.clone();
             tokio::spawn(async move {
-                let result =
-                    execute_task_with_lease(&p, &cs, &jm, &om, &task, &encryption_key).await;
+                let result = execute_task_with_lease(&p, &cs, &jm, &om, &task, &keyring).await;
 
                 if let Err(e) = result {
                     error!("Task {} failed: {:?}", task.id, e);
@@ -106,7 +105,7 @@ async fn execute_task_with_lease(
     jwt_manager: &Arc<JwtManager>,
     object_manager: &ObjectManager,
     task: &Task,
-    encryption_key: &Arc<Vec<u8>>,
+    keyring: &Arc<EncryptionKeyring>,
 ) -> anyhow::Result<()> {
     let lease = persistence.acquire_task_execution_lease(task).await?;
     match task.task_type {
@@ -119,7 +118,7 @@ async fn execute_task_with_lease(
         }
         TaskType::IndexBuild => handle_index_build(persistence, task).await?,
         TaskType::HFIngestion => {
-            handle_hf_ingestion(persistence, object_manager, task, encryption_key).await?
+            handle_hf_ingestion(persistence, object_manager, task, keyring).await?
         }
         _ => {
             warn!("Unhandled task type: {:?}", task.task_type);
@@ -197,7 +196,7 @@ async fn handle_hf_ingestion(
     persistence: &Persistence,
     object_manager: &ObjectManager,
     task: &Task,
-    encryption_key: &[u8],
+    keyring: &EncryptionKeyring,
 ) -> anyhow::Result<()> {
     use globset::{Glob, GlobSetBuilder};
     use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
@@ -240,7 +239,7 @@ async fn handle_hf_ingestion(
             .hf_get_key_encrypted_by_id(key_id)
             .await?
             .ok_or_else(|| anyhow!("hugging face key not found"))?;
-        let token_bytes = crate::crypto::decrypt(&token_encrypted, encryption_key)?;
+        let token_bytes = keyring.decrypt(&token_encrypted)?;
         let token = String::from_utf8(token_bytes)?;
         debug!("Decrypted token.");
 
@@ -700,18 +699,19 @@ mod tests {
             config.region.clone(),
             config.cross_region_routing_policy,
             jwt_manager.clone(),
-            config.anvil_secret_encryption_key.clone(),
+            hex::decode(&config.anvil_secret_encryption_key).unwrap(),
+            Arc::new(config.secret_keyring().unwrap()),
             watch_tx,
             crate::observability::Observability::default(),
         );
-        let encryption_key = Arc::new(hex::decode(&config.anvil_secret_encryption_key).unwrap());
+        let keyring = Arc::new(config.secret_keyring().unwrap());
         execute_task_with_lease(
             &persistence,
             &cluster_state,
             &jwt_manager,
             &object_manager,
             &task,
-            &encryption_key,
+            &keyring,
         )
         .await
         .unwrap();

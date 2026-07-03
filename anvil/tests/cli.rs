@@ -69,70 +69,11 @@ async fn run_cli(args: &[&str], config_dir: &std::path::Path) -> std::process::O
 }
 
 async fn setup_test_profile(cluster: &TestCluster, config_dir: &std::path::Path) {
-    let admin_args = &["run", "--bin", "admin", "--"];
-    let admin_state_path = cluster.admin_state_path.clone();
     let app_name = "cli-test-app";
+    let (client_id, client_secret) = cluster
+        .create_application_with_policy("default", app_name, "*", "*")
+        .await;
 
-    // Create the app
-    let create_args: Vec<String> = admin_args
-        .iter()
-        .map(|s| s.to_string())
-        .chain([
-            "--anvil-secret-encryption-key".to_string(),
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            "--storage-path".to_string(),
-            admin_state_path.clone(),
-            "app".to_string(),
-            "create".to_string(),
-            "--tenant-name".to_string(),
-            "default".to_string(),
-            "--app-name".to_string(),
-            app_name.to_string(),
-        ])
-        .collect();
-
-    let app_output = tokio::task::spawn_blocking(move || {
-        println!("Running `cargo {}`", create_args.join(" "));
-        Command::new("cargo").args(&create_args).output().unwrap()
-    })
-    .await
-    .unwrap();
-
-    println!("configure output: {:?}", app_output);
-    assert!(app_output.status.success());
-    let creds = String::from_utf8(app_output.stdout).unwrap();
-    let client_id = extract_credential(&creds, "Client ID");
-    let client_secret = extract_credential(&creds, "Client Secret");
-
-    // Grant policies to the app
-    let grant_args: Vec<String> = admin_args
-        .iter()
-        .map(|s| s.to_string())
-        .chain([
-            "--anvil-secret-encryption-key".to_string(),
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            "--storage-path".to_string(),
-            admin_state_path,
-            "policy".to_string(),
-            "grant".to_string(),
-            "--app-name".to_string(),
-            app_name.to_string(),
-            "--action".to_string(),
-            "*".to_string(),
-            "--resource".to_string(),
-            "*".to_string(),
-        ])
-        .collect();
-
-    let grant_output = tokio::task::spawn_blocking(move || {
-        println!("Running `cargo {}`", grant_args.join(" "));
-        Command::new("cargo").args(&grant_args).output().unwrap()
-    })
-    .await
-    .unwrap();
-    assert!(grant_output.status.success());
-
-    // Configure the CLI profile
     let output = run_cli(
         &[
             "static-config",

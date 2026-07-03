@@ -4,6 +4,8 @@ use crate::auth::Claims;
 pub enum AnvilAdminCapability {
     ManageTenants,
     ManageApps,
+    ManagePolicies,
+    ManageSecretEncryptionKeys,
     ManageBuckets,
     ManageNodes,
     ManageRegions,
@@ -20,6 +22,8 @@ impl AnvilAdminCapability {
         match self {
             Self::ManageTenants => "manage_tenants",
             Self::ManageApps => "manage_apps",
+            Self::ManagePolicies => "manage_policies",
+            Self::ManageSecretEncryptionKeys => "manage_secret_encryption_keys",
             Self::ManageBuckets => "manage_buckets",
             Self::ManageNodes => "manage_nodes",
             Self::ManageRegions => "manage_regions",

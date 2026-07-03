@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-server"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-storage"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "prost",
  "tokio",
@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-storage-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anvil-server",
  "anyhow",
@@ -310,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-storage-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-storage-test-utils"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anvil-server",
  "anvil-storage-core",

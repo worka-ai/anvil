@@ -59,6 +59,10 @@ href = "/operators/deployment/"
 title = "Reference"
 href = "/reference/configuration/"
 
+[[site.nav]]
+title = "Blog"
+href = "/blog/admin-api-key-rotation/"
+
 [[site.routes]]
 kind = "content"
 path = "/learn"
@@ -93,3 +97,10 @@ path = "/reference"
 source = "content/reference"
 template = "fission::site::documentation"
 sidebar = "site/reference-sidebar.toml"
+
+[[site.routes]]
+kind = "content"
+path = "/blog"
+source = "content/blog"
+template = "fission::site::documentation"
+sidebar = "site/blog-sidebar.toml"

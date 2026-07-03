@@ -20,10 +20,6 @@ fn docker_admin(compose_file: &std::path::Path, args: &[&str]) {
         "-T",
         "anvil1",
         "admin",
-        "--storage-path",
-        "/var/lib/anvil",
-        "--anvil-secret-encryption-key",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     ];
     command_args.extend_from_slice(args);
     run("docker", &command_args);
@@ -38,10 +34,6 @@ fn docker_admin_output(compose_file: &std::path::Path, args: &[&str]) -> std::pr
         "-T",
         "anvil1",
         "admin",
-        "--storage-path",
-        "/var/lib/anvil",
-        "--anvil-secret-encryption-key",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     ];
     command_args.extend_from_slice(args);
     Command::new("docker")
@@ -150,21 +142,32 @@ async fn docker_cluster_end_to_end() {
     )
     .await;
 
-    // Initialise the Docker node's own control plane. These commands must run
-    // inside the container because the server reads /var/lib/anvil, not the
-    // runner's local development storage.
-    docker_admin(&compose_file_path, &["region", "create", "docker-test"]);
-    docker_admin(&compose_file_path, &["tenant", "create", "default"]);
+    // Initialise the Docker node through its internal admin API.
+    docker_admin(
+        &compose_file_path,
+        &[
+            "tenant",
+            "create",
+            "--name",
+            "default",
+            "--home-region",
+            "docker-test",
+            "--audit-reason",
+            "docker e2e tenant",
+        ],
+    );
 
     let app_out = docker_admin_output(
         &compose_file_path,
         &[
             "app",
             "create",
-            "--tenant-name",
+            "--tenant-id",
             "default",
             "--app-name",
             "docker-e2e-app",
+            "--audit-reason",
+            "docker e2e app",
         ],
     );
     if !app_out.status.success() {
@@ -178,37 +181,28 @@ async fn docker_cluster_end_to_end() {
         );
         panic!("admin create failed");
     }
-    let creds = String::from_utf8(app_out.stdout).unwrap();
-
-    fn extract_credential(output: &str, label: &str) -> String {
-        output
-            .lines()
-            .find_map(|line| {
-                line.split_once(": ").and_then(|(k, v)| {
-                    if k.trim() == label {
-                        Some(v.trim().to_string())
-                    } else {
-                        None
-                    }
-                })
-            })
-            .expect("credential not found")
-    }
-
-    let client_id = extract_credential(&creds, "Client ID");
-    let client_secret = extract_credential(&creds, "Client Secret");
+    let creds: serde_json::Value = serde_json::from_slice(&app_out.stdout).unwrap();
+    let client_id = creds["resource"]["client_id"].as_str().unwrap().to_string();
+    let client_secret = creds["resource"]["client_secret"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     docker_admin(
         &compose_file_path,
         &[
             "policy",
             "grant",
+            "--tenant-id",
+            "default",
             "--app-name",
             "docker-e2e-app",
             "--action",
             "*",
             "--resource",
             "*",
+            "--audit-reason",
+            "docker e2e wildcard policy",
         ],
     );
 

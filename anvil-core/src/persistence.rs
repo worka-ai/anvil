@@ -436,21 +436,6 @@ pub struct AppDetails {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AdminUser {
-    pub id: i64,
-    pub username: String,
-    pub email: String,
-    pub password_hash: String,
-    pub is_active: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AdminRole {
-    pub id: i32,
-    pub name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
     pub id: i64,
     pub task_type: crate::tasks::TaskType,
@@ -1486,131 +1471,6 @@ impl Persistence {
             format!("tenant/{tenant_id}/bucket/{bucket_id}/index_diagnostic/{partition_id}"),
             "index_diagnostic",
             partition_id,
-        )
-        .await
-    }
-
-    pub async fn get_admin_user_by_username(&self, username: &str) -> Result<Option<AdminUser>> {
-        Ok(control_journal::read_control_state(&self.storage)
-            .await?
-            .admin_user_by_username(username))
-    }
-
-    pub async fn get_admin_user_by_id(&self, id: i64) -> Result<Option<AdminUser>> {
-        Ok(control_journal::read_control_state(&self.storage)
-            .await?
-            .admin_user_by_id(id))
-    }
-
-    pub async fn get_roles_for_admin_user(&self, user_id: i64) -> Result<Vec<String>> {
-        Ok(control_journal::read_control_state(&self.storage)
-            .await?
-            .roles_for_admin_user(user_id))
-    }
-
-    pub async fn create_admin_user(
-        &self,
-        username: &str,
-        email: &str,
-        password_hash: &str,
-        role_names: &[String],
-    ) -> Result<AdminUser> {
-        let permit = self.control_write_permit().await?;
-        control_journal::create_admin_user_with_permit(
-            &self.storage,
-            username,
-            email,
-            password_hash,
-            role_names,
-            &permit,
-            &self.partition_owner_signing_key,
-        )
-        .await
-    }
-
-    pub async fn update_admin_user(
-        &self,
-        user_id: i64,
-        username: &str,
-        email: &str,
-        password_hash: Option<&str>,
-        is_active: bool,
-        role_names: &[String],
-    ) -> Result<()> {
-        let permit = self.control_write_permit().await?;
-        control_journal::update_admin_user_with_permit(
-            &self.storage,
-            user_id,
-            username,
-            email,
-            password_hash,
-            is_active,
-            role_names,
-            &permit,
-            &self.partition_owner_signing_key,
-        )
-        .await
-    }
-
-    pub async fn delete_admin_user(&self, user_id: i64) -> Result<()> {
-        let permit = self.control_write_permit().await?;
-        control_journal::delete_admin_user_with_permit(
-            &self.storage,
-            user_id,
-            &permit,
-            &self.partition_owner_signing_key,
-        )
-        .await
-    }
-
-    pub async fn list_admin_users(&self) -> Result<Vec<AdminUser>> {
-        Ok(control_journal::read_control_state(&self.storage)
-            .await?
-            .admin_users())
-    }
-
-    pub async fn create_admin_role(&self, name: &str) -> Result<()> {
-        let permit = self.control_write_permit().await?;
-        control_journal::create_admin_role_with_permit(
-            &self.storage,
-            name,
-            &permit,
-            &self.partition_owner_signing_key,
-        )
-        .await
-    }
-
-    pub async fn list_admin_roles(&self) -> Result<Vec<String>> {
-        Ok(control_journal::read_control_state(&self.storage)
-            .await?
-            .admin_roles())
-    }
-
-    pub async fn get_admin_role_by_id(&self, id: i32) -> Result<Option<AdminRole>> {
-        Ok(control_journal::read_control_state(&self.storage)
-            .await?
-            .admin_role_by_id(id))
-    }
-
-    pub async fn update_admin_role(&self, id: i32, name: &str) -> Result<()> {
-        let permit = self.control_write_permit().await?;
-        control_journal::update_admin_role_with_permit(
-            &self.storage,
-            id,
-            name,
-            &permit,
-            &self.partition_owner_signing_key,
-        )
-        .await
-    }
-
-    pub async fn delete_admin_role(&self, id: i32) -> Result<()> {
-        let permit = self.control_write_permit().await?;
-        control_journal::delete_admin_role_with_permit(
-            &self.storage,
-            id,
-            &permit,
-            &self.partition_owner_signing_key,
         )
         .await
     }
@@ -4836,6 +4696,22 @@ impl Persistence {
 
     pub async fn hf_get_key_encrypted_by_id(&self, id: i64) -> Result<Option<Vec<u8>>> {
         hf_journal::get_key_encrypted_by_id(&self.storage, id).await
+    }
+
+    pub(crate) async fn hf_list_encrypted_keys(&self) -> Result<Vec<HfKey>> {
+        hf_journal::list_encrypted_keys(&self.storage).await
+    }
+
+    pub async fn hf_update_key_encrypted(&self, id: i64, token_encrypted: &[u8]) -> Result<()> {
+        let permit = self.hf_write_permit().await?;
+        hf_journal::update_key_encrypted_with_permit(
+            &self.storage,
+            id,
+            token_encrypted,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn hf_list_keys(

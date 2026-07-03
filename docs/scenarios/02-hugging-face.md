@@ -17,10 +17,10 @@ First, an administrator must grant the client's app the necessary permissions to
 
 ```bash
 # Grant permission to manage HF keys and start ingestions
-admin policy grant --app-name data-science-app --action hf_key:create --resource "*"
-admin policy grant --app-name data-science-app --action hf_key:delete --resource "*"
-admin policy grant --app-name data-science-app --action hf_key:read --resource "*"
-admin policy grant --app-name data-science-app --action hf_ingestion:create --resource "*"
+admin policy grant --tenant-id acme-corp --app-name data-science-app --action hf_key:create --resource "*" --audit-reason "allow hf key create"
+admin policy grant --tenant-id acme-corp --app-name data-science-app --action hf_key:delete --resource "*" --audit-reason "allow hf key delete"
+admin policy grant --tenant-id acme-corp --app-name data-science-app --action hf_key:read --resource "*" --audit-reason "allow hf key read"
+admin policy grant --tenant-id acme-corp --app-name data-science-app --action hf_ingestion:create --resource "*" --audit-reason "allow hf ingestion"
 ```
 
 ### 2. Client: Manage Hugging Face API Keys
@@ -44,7 +44,7 @@ anvil hf key rm --name my-hf-key
 Before starting the ingestion, the client must ensure a destination bucket exists and that the administrator has granted `object:write` permissions for it.
 
 ```bash
-# admin policy grant --app-name data-science-app --action object:write --resource "models/*"
+# admin policy grant --tenant-id acme-corp --app-name data-science-app --action object:write --resource "models/*" --audit-reason "allow model writes"
 ```
 
 The `ingest start` command will return a unique ID for the ingestion job.

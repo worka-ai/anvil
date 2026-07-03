@@ -1,4 +1,7 @@
-use crate::{AppState, auth::AuthenticatedBearerToken};
+use crate::{
+    AppState,
+    auth::{AuthenticatedBearerToken, Claims},
+};
 use axum::{http::HeaderMap, http::HeaderValue, response::Response};
 use http::Uri;
 use tonic::{Request, Status};
@@ -38,6 +41,27 @@ pub fn auth_interceptor<T>(mut req: Request<T>, state: &AppState) -> Result<Requ
                 .ok_or_else(|| Status::unauthenticated("Invalid token format"))?;
 
             let bearer_token = token.to_string();
+            if state
+                .config
+                .anvil_bootstrap_admin_token
+                .as_deref()
+                .is_some_and(|bootstrap| !bootstrap.is_empty() && bootstrap == bearer_token)
+            {
+                req.extensions_mut().insert(Claims {
+                    sub: "bootstrap-admin".to_string(),
+                    exp: usize::MAX,
+                    scopes: vec![format!(
+                        "anvil_admin:*|anvil_admin:cluster:{}",
+                        state.config.mesh_id
+                    )],
+                    tenant_id: 0,
+                    jti: None,
+                });
+                req.extensions_mut()
+                    .insert(AuthenticatedBearerToken(bearer_token));
+                return Ok(req);
+            }
+
             let claims = state
                 .jwt_manager
                 .verify_token(&bearer_token)
