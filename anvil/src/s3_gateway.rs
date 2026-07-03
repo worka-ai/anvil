@@ -3480,12 +3480,12 @@ async fn copy_object(
         Err(response) => return response,
     };
 
-    let (source_object, source_stream) = match state
+    let source_object = match state
         .object_manager
-        .get_object(
+        .head_object(
             Some(claims.clone()),
-            source_bucket,
-            source_key,
+            &source_bucket,
+            &source_key,
             source_version_id,
         )
         .await
@@ -3508,16 +3508,13 @@ async fn copy_object(
 
     match state
         .object_manager
-        .put_object(
-            claims.tenant_id,
+        .copy_object(
+            claims,
+            &source_bucket,
+            &source_key,
+            source_version_id,
             &destination_bucket,
             &destination_key,
-            &claims.scopes,
-            source_stream,
-            ObjectWriteOptions {
-                content_type: source_object.content_type,
-                user_metadata: source_object.user_meta,
-            },
         )
         .await
     {
