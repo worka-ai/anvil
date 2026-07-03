@@ -1537,6 +1537,52 @@ service InternalAnvilService {
   rpc DeleteShard(DeleteShardRequest) returns (DeleteShardResponse);
 }
 
+service InternalProxyService {
+  rpc ProxyObject(stream ProxyRequestChunk) returns (stream ProxyResponseChunk);
+}
+
+message ProxyHeader {
+  string name = 1;
+  bytes value = 2;
+}
+
+message ProxyRequestHeader {
+  string request_id = 1;
+  string idempotency_key = 2;
+  string principal_id = 3;
+  string tenant_id = 4;
+  string bucket_name = 5;
+  string object_key = 6;
+  string method = 7;
+  string canonical_host = 8;
+  string canonical_path = 9;
+  uint64 bucket_locator_generation = 10;
+  repeated ProxyHeader headers = 11;
+  bytes authz_context = 12;
+}
+
+message ProxyRequestChunk {
+  oneof part {
+    ProxyRequestHeader header = 1;
+    bytes body = 2;
+  }
+}
+
+message ProxyResponseHeader {
+  string request_id = 1;
+  uint32 status = 2;
+  repeated ProxyHeader headers = 3;
+  repeated ProxyHeader trailers = 4;
+  bool committed = 5;
+}
+
+message ProxyResponseChunk {
+  oneof part {
+    ProxyResponseHeader header = 1;
+    bytes body = 2;
+  }
+}
+
 service AuthService {
   rpc GetAccessToken(GetAccessTokenRequest) returns (GetAccessTokenResponse);
   rpc GrantAccess(GrantAccessRequest) returns (GrantAccessResponse);

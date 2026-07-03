@@ -7,6 +7,7 @@ pub mod git_source;
 pub mod huggingface;
 pub mod index;
 pub mod internal;
+pub mod internal_proxy;
 pub mod object;
 pub mod personaldb;
 pub mod repair;
@@ -21,6 +22,7 @@ use crate::anvil_api::{
     hugging_face_key_service_server::HuggingFaceKeyServiceServer,
     index_service_server::IndexServiceServer,
     internal_anvil_service_server::InternalAnvilServiceServer,
+    internal_proxy_service_server::InternalProxyServiceServer,
     object_service_server::ObjectServiceServer,
     personal_db_service_server::PersonalDbServiceServer,
     repair_service_server::RepairServiceServer,
@@ -88,6 +90,10 @@ pub fn create_grpc_router(state: AppState, auth_interceptor: AuthInterceptorFn) 
         auth_closure.clone(),
     ))
     .add_service(InternalAnvilServiceServer::with_interceptor(
+        state.clone(),
+        auth_closure.clone(),
+    ))
+    .add_service(InternalProxyServiceServer::with_interceptor(
         state.clone(),
         auth_closure.clone(),
     ))

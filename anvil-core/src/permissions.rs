@@ -94,6 +94,7 @@ pub enum AnvilAction {
     InternalGetShard,
     InternalCommitShard,
     InternalDeleteShard,
+    InternalProxyObject,
 }
 
 impl fmt::Display for AnvilAction {
@@ -186,6 +187,7 @@ impl fmt::Display for AnvilAction {
             AnvilAction::InternalGetShard => "internal:get_shard",
             AnvilAction::InternalCommitShard => "internal:commit_shard",
             AnvilAction::InternalDeleteShard => "internal:delete_shard",
+            AnvilAction::InternalProxyObject => "internal:proxy_object",
         };
         write!(f, "{}", s)
     }
@@ -283,6 +285,7 @@ impl FromStr for AnvilAction {
             "internal:get_shard" => Ok(AnvilAction::InternalGetShard),
             "internal:commit_shard" => Ok(AnvilAction::InternalCommitShard),
             "internal:delete_shard" => Ok(AnvilAction::InternalDeleteShard),
+            "internal:proxy_object" => Ok(AnvilAction::InternalProxyObject),
 
             _ => Err(anyhow::anyhow!("Unknown action: {}", s)),
         }
