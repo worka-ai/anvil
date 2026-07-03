@@ -13,7 +13,7 @@ services:
     pull_policy: never
     environment:
       - RUST_LOG=info
-      - REGION=DOCKER_TEST
+      - REGION=docker-test
       - JWT_SECRET=docker-test-secret
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - ANVIL_CLUSTER_SECRET=docker-cluster-secret
@@ -43,7 +43,7 @@ services:
         condition: service_started
     environment:
       - RUST_LOG=info
-      - REGION=DOCKER_TEST
+      - REGION=docker-test
       - JWT_SECRET=docker-test-secret
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - ANVIL_CLUSTER_SECRET=docker-cluster-secret
@@ -68,7 +68,7 @@ services:
         condition: service_started
     environment:
       - RUST_LOG=info
-      - REGION=DOCKER_TEST
+      - REGION=docker-test
       - JWT_SECRET=docker-test-secret
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - ANVIL_CLUSTER_SECRET=docker-cluster-secret

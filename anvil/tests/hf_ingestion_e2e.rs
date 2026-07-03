@@ -159,7 +159,7 @@ async fn hf_ingestion_config_json() {
     .await;
 
     // Prepare region/tenant/app inside the Docker node's own storage.
-    docker_admin(&compose_file_path, &["region", "create", "DOCKER_TEST"]);
+    docker_admin(&compose_file_path, &["region", "create", "docker-test"]);
     docker_admin(&compose_file_path, &["tenant", "create", "default"]);
 
     let app_out = docker_admin_output(
@@ -233,7 +233,7 @@ async fn hf_ingestion_config_json() {
             .unwrap();
     let mut req = tonic::Request::new(anvil::anvil_api::CreateBucketRequest {
         bucket_name: "models".into(),
-        region: "DOCKER_TEST".into(),
+        region: "docker-test".into(),
     });
     req.metadata_mut().insert(
         "authorization",
@@ -289,7 +289,7 @@ async fn hf_ingestion_config_json() {
         target_prefix: "gpt-oss-20b".into(),
         include_globs: vec!["config.json".into()],
         exclude_globs: vec![],
-        target_region: "DOCKER_TEST".into(),
+        target_region: "docker-test".into(),
     });
     sreq.metadata_mut().insert(
         "authorization",
@@ -377,7 +377,7 @@ async fn hf_ingestion_config_json() {
         target_prefix: "gpt-oss-20b".into(),
         include_globs: vec!["README.md".into()],
         exclude_globs: vec![],
-        target_region: "DOCKER_TEST".into(),
+        target_region: "docker-test".into(),
     });
     sreq2.metadata_mut().insert(
         "authorization",
