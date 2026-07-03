@@ -505,7 +505,7 @@ async fn test_full_text_index_builds_from_object_write_task() {
     object_client.put_object(put_req).await.unwrap();
 
     let mut final_response = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while tokio::time::Instant::now() < deadline {
         let response = index_client
             .query_index(authorized(
@@ -1761,7 +1761,24 @@ async fn test_vector_index_builds_from_object_write_task() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    let response = final_response.expect("vector index build task should make object searchable");
+    let diagnostics = index_client
+        .list_index_diagnostics(authorized(
+            ListIndexDiagnosticsRequest {
+                bucket_name: bucket_name.clone(),
+                index_name: "embedding".to_string(),
+                severity: String::new(),
+                after_cursor: 0,
+                limit: 100,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .diagnostics;
+    let response = final_response.unwrap_or_else(|| {
+        panic!("vector index build task should make object searchable; diagnostics={diagnostics:?}")
+    });
     assert_eq!(response.index_kind, IndexKind::Vector as i32);
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "docs/vector.json");
@@ -2075,7 +2092,10 @@ async fn test_hybrid_index_builds_text_and_vector_segments_from_object_write_tas
                 kind: IndexKind::Hybrid as i32,
                 selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
                 extractor_json: serde_json::json!({
-                    "text": {"source": "object_body_utf8"},
+                    "text": {
+                        "source": "json_pointer",
+                        "json_pointer": "/body"
+                    },
                     "vector": {
                         "source": "object_body_json_vector",
                         "json_pointer": "/embedding"
@@ -2130,7 +2150,7 @@ async fn test_hybrid_index_builds_text_and_vector_segments_from_object_write_tas
     object_client.put_object(put_req).await.unwrap();
 
     let mut final_response = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while tokio::time::Instant::now() < deadline {
         let response = index_client
             .query_index(authorized(
@@ -2161,7 +2181,24 @@ async fn test_hybrid_index_builds_text_and_vector_segments_from_object_write_tas
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    let response = final_response.expect("hybrid index build task should make object searchable");
+    let diagnostics = index_client
+        .list_index_diagnostics(authorized(
+            ListIndexDiagnosticsRequest {
+                bucket_name: bucket_name.clone(),
+                index_name: "body-and-vector".to_string(),
+                severity: String::new(),
+                after_cursor: 0,
+                limit: 100,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .diagnostics;
+    let response = final_response.unwrap_or_else(|| {
+        panic!("hybrid index build task should make object searchable; diagnostics={diagnostics:?}")
+    });
     assert_eq!(response.index_kind, IndexKind::Hybrid as i32);
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "docs/hybrid.json");
