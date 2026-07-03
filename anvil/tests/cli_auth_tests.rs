@@ -1,48 +1,22 @@
 use anvil_test_utils::TestCluster;
-use serde_json::Value;
 use std::env;
 use std::process::Command;
-use std::sync::OnceLock;
 use std::time::Duration;
 use tempfile::tempdir;
 use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
 
-static ADMIN_PATH: OnceLock<String> = OnceLock::new();
-
 fn cargo_path() -> String {
-    if let Ok(p) = env::var("CARGO") {
-        return p;
+    if let Ok(path) = env::var("CARGO") {
+        return path;
     }
-    // Fallback to `which cargo`
     let output = Command::new("which")
         .arg("cargo")
         .output()
-        .expect("Failed to locate cargo in PATH");
+        .expect("locate cargo in PATH");
     assert!(output.status.success(), "cargo not found in PATH");
     String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
-
-fn get_admin_path() -> &'static str {
-    ADMIN_PATH.get_or_init(|| {
-        let status = Command::new(cargo_path())
-            .args(&["build", "--package", "anvil-server", "--bin", "admin"])
-            .status()
-            .expect("Failed to build admin");
-        assert!(status.success());
-
-        let metadata_output = Command::new(cargo_path())
-            .arg("metadata")
-            .arg("--format-version=1")
-            .output()
-            .expect("Failed to get cargo metadata");
-        let metadata: Value = serde_json::from_slice(&metadata_output.stdout).unwrap();
-        let target_dir = metadata["target_directory"].as_str().unwrap();
-        format!("{}/debug/admin", target_dir)
-    })
-}
-
-// We will call cargo directly via absolute path
 
 // This verifies that anvil-cli can obtain an access token using a configured
 // profile and then use that token for an authenticated CLI operation. Subprocess
@@ -58,63 +32,10 @@ async fn test_cli_auth_and_hf_key_add() {
     let config_path = config_dir.path().join("config.toml");
     let app_name = format!("test-app-{}", Uuid::new_v4());
 
-    // 1. Create app
-    let admin_bin = get_admin_path();
-    let mut admin_cmd = TokioCommand::new(admin_bin);
-    admin_cmd.args(&[
-        "--anvil-secret-encryption-key",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "--storage-path",
-        &cluster.admin_state_path,
-        "app",
-        "create",
-        "--tenant-name",
-        "default",
-        "--app-name",
-        &app_name,
-    ]);
-    let admin_output = admin_cmd.output().await.unwrap();
-    assert!(
-        admin_output.status.success(),
-        "admin apps create failed: {}",
-        String::from_utf8_lossy(&admin_output.stderr)
-    );
-    let output_str = String::from_utf8(admin_output.stdout).unwrap();
-
-    let client_id = output_str
-        .lines()
-        .find(|line| line.starts_with("Client ID:"))
-        .map(|line| line.split_whitespace().last().unwrap())
-        .unwrap();
-    let client_secret = output_str
-        .lines()
-        .find(|line| line.starts_with("Client Secret:"))
-        .map(|line| line.split_whitespace().last().unwrap())
-        .unwrap();
-
-    let grant_output = TokioCommand::new(admin_bin)
-        .args([
-            "--anvil-secret-encryption-key",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--storage-path",
-            &cluster.admin_state_path,
-            "policy",
-            "grant",
-            "--app-name",
-            &app_name,
-            "--action",
-            "*",
-            "--resource",
-            "*",
-        ])
-        .output()
-        .await
-        .unwrap();
-    assert!(
-        grant_output.status.success(),
-        "admin policy grant failed: {}",
-        String::from_utf8_lossy(&grant_output.stderr)
-    );
+    // 1. Create an application through the network admin API.
+    let (client_id, client_secret) = cluster
+        .create_application_with_policy("default", &app_name, "*", "*")
+        .await;
 
     // 2. Configure the CLI
     // 2. Configure the CLI using `cargo run` with absolute cargo path
@@ -123,6 +44,8 @@ async fn test_cli_auth_and_hf_key_add() {
         "run",
         "-p",
         "anvil-storage-cli",
+        "--bin",
+        "anvil-cli",
         "--",
         "--config",
         config_path.to_str().unwrap(),
@@ -132,9 +55,9 @@ async fn test_cli_auth_and_hf_key_add() {
         "--host",
         &grpc_addr,
         "--client-id",
-        client_id,
+        &client_id,
         "--client-secret",
-        client_secret,
+        &client_secret,
         "--default",
     ]);
     let cli_output = cli_cmd.output().await.unwrap();
@@ -153,6 +76,8 @@ async fn test_cli_auth_and_hf_key_add() {
         "run",
         "-p",
         "anvil-storage-cli",
+        "--bin",
+        "anvil-cli",
         "--",
         "--config",
         config_path.to_str().unwrap(),
@@ -182,6 +107,8 @@ async fn test_cli_auth_and_hf_key_add() {
         "run",
         "-p",
         "anvil-storage-cli",
+        "--bin",
+        "anvil-cli",
         "--",
         "--config",
         config_path.to_str().unwrap(),

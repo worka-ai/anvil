@@ -1,0 +1,10 @@
+[[items]]
+title = "Blog"
+href = "/blog/admin-api-key-rotation/"
+level = 0
+group = true
+
+[[items]]
+title = "Admin key rotation"
+href = "/blog/admin-api-key-rotation/"
+level = 1

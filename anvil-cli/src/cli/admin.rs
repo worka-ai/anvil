@@ -21,6 +21,16 @@ pub enum AdminCommands {
         #[clap(subcommand)]
         command: AppCommands,
     },
+    /// Manage application policies
+    Policy {
+        #[clap(subcommand)]
+        command: PolicyCommands,
+    },
+    /// Rotate server-side secret encryption envelopes
+    SecretEncryptionKey {
+        #[clap(subcommand)]
+        command: SecretEncryptionKeyCommands,
+    },
     /// Manage buckets through the administrative plane
     Bucket {
         #[clap(subcommand)]
@@ -105,6 +115,47 @@ pub enum AppCommands {
         tenant_id: String,
         #[clap(long)]
         app_name: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PolicyCommands {
+    /// Grant an application permission scope
+    Grant {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        tenant_id: String,
+        #[clap(long)]
+        app_name: String,
+        #[clap(long)]
+        action: String,
+        #[clap(long)]
+        resource: String,
+    },
+    /// Revoke an application permission scope
+    Revoke {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long)]
+        tenant_id: String,
+        #[clap(long)]
+        app_name: String,
+        #[clap(long)]
+        action: String,
+        #[clap(long)]
+        resource: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SecretEncryptionKeyCommands {
+    /// Re-encrypt existing server-side secret envelopes with the active configured key
+    Rotate {
+        #[clap(flatten)]
+        context: MutationOptions,
+        #[clap(long, action = clap::ArgAction::SetTrue)]
+        dry_run: bool,
     },
 }
 
@@ -762,6 +813,12 @@ pub async fn handle_admin_command(command: &AdminCommands, ctx: &Context) -> any
             handle_tenant_command(command, &mut client, &token).await?
         }
         AdminCommands::App { command } => handle_app_command(command, &mut client, &token).await?,
+        AdminCommands::Policy { command } => {
+            handle_policy_command(command, &mut client, &token).await?
+        }
+        AdminCommands::SecretEncryptionKey { command } => {
+            handle_secret_encryption_key_command(command, &mut client, &token).await?
+        }
         AdminCommands::Bucket { command } => {
             handle_bucket_command(command, &mut client, &token).await?
         }
@@ -870,6 +927,92 @@ async fn handle_app_command(
                         context: Some(admin_context.clone()),
                         tenant_id: tenant_id.clone(),
                         app_name: app_name.clone(),
+                    },
+                    token,
+                )?),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_policy_command(
+    command: &PolicyCommands,
+    client: &mut AdminServiceClient<tonic::transport::Channel>,
+    token: &str,
+) -> anyhow::Result<()> {
+    match command {
+        PolicyCommands::Grant {
+            context,
+            tenant_id,
+            app_name,
+            action,
+            resource,
+        } => {
+            let admin_context = context.to_action_context();
+            print_rpc_response(
+                "application_policy",
+                Some(&admin_context),
+                None,
+                client.grant_application_policy(with_auth(
+                    api::GrantApplicationPolicyRequest {
+                        context: Some(admin_context.clone()),
+                        tenant_id: tenant_id.clone(),
+                        app_name: app_name.clone(),
+                        action: action.clone(),
+                        resource: resource.clone(),
+                    },
+                    token,
+                )?),
+            )
+            .await?;
+        }
+        PolicyCommands::Revoke {
+            context,
+            tenant_id,
+            app_name,
+            action,
+            resource,
+        } => {
+            let admin_context = context.to_action_context();
+            print_rpc_response(
+                "application_policy",
+                Some(&admin_context),
+                None,
+                client.revoke_application_policy(with_auth(
+                    api::RevokeApplicationPolicyRequest {
+                        context: Some(admin_context.clone()),
+                        tenant_id: tenant_id.clone(),
+                        app_name: app_name.clone(),
+                        action: action.clone(),
+                        resource: resource.clone(),
+                    },
+                    token,
+                )?),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_secret_encryption_key_command(
+    command: &SecretEncryptionKeyCommands,
+    client: &mut AdminServiceClient<tonic::transport::Channel>,
+    token: &str,
+) -> anyhow::Result<()> {
+    match command {
+        SecretEncryptionKeyCommands::Rotate { context, dry_run } => {
+            let admin_context = context.to_action_context();
+            print_rpc_response(
+                "secret_encryption_key_rotation",
+                Some(&admin_context),
+                None,
+                client.rotate_secret_encryption_key(with_auth(
+                    api::RotateSecretEncryptionKeyRequest {
+                        context: Some(admin_context.clone()),
+                        dry_run: *dry_run,
                     },
                     token,
                 )?),

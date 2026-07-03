@@ -16,7 +16,7 @@ use crate::routing::{
     RoutingConfig,
 };
 use crate::{
-    AppState, auth, authz_repair, crypto, directory_repair, index_repair, mesh_control_stream,
+    AppState, auth, authz_repair, directory_repair, index_repair, mesh_control_stream,
     mesh_directory, persistence::Bucket, personaldb_repair,
 };
 use chrono::Utc;
@@ -105,6 +105,7 @@ impl AdminService for AppState {
             client_id: app.client_id,
             client_secret,
             audit_event_id,
+            app_id: app.id.to_string(),
         }))
     }
 
@@ -151,6 +152,142 @@ impl AdminService for AppState {
             app_name: app.name,
             client_id: app.client_id,
             client_secret,
+            audit_event_id,
+            app_id: app.id.to_string(),
+        }))
+    }
+
+    async fn grant_application_policy(
+        &self,
+        request: Request<GrantApplicationPolicyRequest>,
+    ) -> Result<Response<ApplicationPolicyResponse>, Status> {
+        let principal = require_admin(&request, self, AnvilAdminCapability::ManagePolicies)?;
+        let req = request.into_inner();
+        let context = require_admin_action_context(req.context.as_ref())?;
+        let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
+        let app = resolve_tenant_app(self, tenant_id, &req.app_name).await?;
+        validate_policy_parts(&req.action, &req.resource)?;
+        self.persistence
+            .grant_policy(app.id, &req.resource, &req.action)
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.app.policy.grant",
+            &app_resource_id(tenant_id, &app.name),
+            json!({
+                "resource_kind": "application_policy",
+                "tenant_id": tenant_id,
+                "app_id": app.id,
+                "app_name": &app.name,
+                "client_id": &app.client_id,
+                "action": &req.action,
+                "resource": &req.resource,
+            }),
+        )
+        .await?;
+        Ok(Response::new(ApplicationPolicyResponse {
+            request_id: context.request_id.clone(),
+            tenant_id: tenant_id.to_string(),
+            app_name: app.name,
+            action: req.action,
+            resource: req.resource,
+            audit_event_id,
+        }))
+    }
+
+    async fn revoke_application_policy(
+        &self,
+        request: Request<RevokeApplicationPolicyRequest>,
+    ) -> Result<Response<ApplicationPolicyResponse>, Status> {
+        let principal = require_admin(&request, self, AnvilAdminCapability::ManagePolicies)?;
+        let req = request.into_inner();
+        let context = require_admin_action_context(req.context.as_ref())?;
+        let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
+        let app = resolve_tenant_app(self, tenant_id, &req.app_name).await?;
+        validate_policy_parts(&req.action, &req.resource)?;
+        self.persistence
+            .revoke_policy(app.id, &req.resource, &req.action)
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.app.policy.revoke",
+            &app_resource_id(tenant_id, &app.name),
+            json!({
+                "resource_kind": "application_policy",
+                "tenant_id": tenant_id,
+                "app_id": app.id,
+                "app_name": &app.name,
+                "client_id": &app.client_id,
+                "action": &req.action,
+                "resource": &req.resource,
+            }),
+        )
+        .await?;
+        Ok(Response::new(ApplicationPolicyResponse {
+            request_id: context.request_id.clone(),
+            tenant_id: tenant_id.to_string(),
+            app_name: app.name,
+            action: req.action,
+            resource: req.resource,
+            audit_event_id,
+        }))
+    }
+
+    async fn rotate_secret_encryption_key(
+        &self,
+        request: Request<RotateSecretEncryptionKeyRequest>,
+    ) -> Result<Response<SecretEncryptionKeyRotationResponse>, Status> {
+        let principal = require_admin(
+            &request,
+            self,
+            AnvilAdminCapability::ManageSecretEncryptionKeys,
+        )?;
+        let req = request.into_inner();
+        let context = require_admin_action_context(req.context.as_ref())?;
+        let mut stats = SecretEncryptionRotationStats::default();
+
+        rotate_application_secret_envelopes(self, req.dry_run, &mut stats).await?;
+        rotate_hf_secret_envelopes(self, req.dry_run, &mut stats).await?;
+        rotate_local_shard_envelopes(self, req.dry_run, &mut stats).await?;
+
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.secret_encryption_key.rotate",
+            "secret_encryption_key",
+            json!({
+                "resource_kind": "secret_encryption_key",
+                "active_key_id": self.secret_keyring.active_key_id(),
+                "dry_run": req.dry_run,
+                "app_secrets_examined": stats.app_secrets_examined,
+                "app_secrets_rotated": stats.app_secrets_rotated,
+                "hf_keys_examined": stats.hf_keys_examined,
+                "hf_keys_rotated": stats.hf_keys_rotated,
+                "shard_files_examined": stats.shard_files_examined,
+                "shard_files_rotated": stats.shard_files_rotated,
+                "already_active": stats.already_active,
+            }),
+        )
+        .await?;
+
+        Ok(Response::new(SecretEncryptionKeyRotationResponse {
+            request_id: context.request_id.clone(),
+            active_key_id: self.secret_keyring.active_key_id().to_string(),
+            dry_run: req.dry_run,
+            app_secrets_examined: stats.app_secrets_examined,
+            app_secrets_rotated: stats.app_secrets_rotated,
+            hf_keys_examined: stats.hf_keys_examined,
+            hf_keys_rotated: stats.hf_keys_rotated,
+            shard_files_examined: stats.shard_files_examined,
+            shard_files_rotated: stats.shard_files_rotated,
+            already_active: stats.already_active,
             audit_event_id,
         }))
     }
@@ -2746,6 +2883,148 @@ fn bucket_resource_id(tenant_id: i64, bucket_name: &str) -> String {
     format!("tenant:{tenant_id}:bucket:{bucket_name}")
 }
 
+fn app_resource_id(tenant_id: i64, app_name: &str) -> String {
+    format!("tenant:{tenant_id}:app:{app_name}")
+}
+
+fn validate_policy_parts(action: &str, resource: &str) -> Result<(), Status> {
+    if action.trim().is_empty() {
+        return Err(Status::invalid_argument("policy action is required"));
+    }
+    if resource.trim().is_empty() {
+        return Err(Status::invalid_argument("policy resource is required"));
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct SecretEncryptionRotationStats {
+    app_secrets_examined: u64,
+    app_secrets_rotated: u64,
+    hf_keys_examined: u64,
+    hf_keys_rotated: u64,
+    shard_files_examined: u64,
+    shard_files_rotated: u64,
+    already_active: u64,
+}
+
+async fn rotate_application_secret_envelopes(
+    state: &AppState,
+    dry_run: bool,
+    stats: &mut SecretEncryptionRotationStats,
+) -> Result<(), Status> {
+    let tenants = state
+        .persistence
+        .list_tenants()
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
+    for tenant in tenants {
+        let apps = state
+            .persistence
+            .list_apps_for_tenant(tenant.id)
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?;
+        for app in apps {
+            let Some(details) = state
+                .persistence
+                .get_app_by_client_id(&app.client_id)
+                .await
+                .map_err(|err| Status::internal(err.to_string()))?
+            else {
+                continue;
+            };
+            stats.app_secrets_examined += 1;
+            match state
+                .secret_keyring
+                .reencrypt_if_needed(&details.client_secret_encrypted)
+                .map_err(|err| Status::internal(err.to_string()))?
+            {
+                Some(rotated) => {
+                    stats.app_secrets_rotated += 1;
+                    if !dry_run {
+                        state
+                            .persistence
+                            .update_app_secret(details.id, &rotated)
+                            .await
+                            .map_err(|err| Status::internal(err.to_string()))?;
+                    }
+                }
+                None => stats.already_active += 1,
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn rotate_hf_secret_envelopes(
+    state: &AppState,
+    dry_run: bool,
+    stats: &mut SecretEncryptionRotationStats,
+) -> Result<(), Status> {
+    let keys = state
+        .persistence
+        .hf_list_encrypted_keys()
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
+    for key in keys {
+        stats.hf_keys_examined += 1;
+        match state
+            .secret_keyring
+            .reencrypt_if_needed(&key.token_encrypted)
+            .map_err(|err| Status::internal(err.to_string()))?
+        {
+            Some(rotated) => {
+                stats.hf_keys_rotated += 1;
+                if !dry_run {
+                    state
+                        .persistence
+                        .hf_update_key_encrypted(key.id, &rotated)
+                        .await
+                        .map_err(|err| Status::internal(err.to_string()))?;
+                }
+            }
+            None => stats.already_active += 1,
+        }
+    }
+    Ok(())
+}
+
+async fn rotate_local_shard_envelopes(
+    state: &AppState,
+    dry_run: bool,
+    stats: &mut SecretEncryptionRotationStats,
+) -> Result<(), Status> {
+    let shard_files = state
+        .storage
+        .list_committed_shard_files()
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
+    for path in shard_files {
+        stats.shard_files_examined += 1;
+        let data = tokio::fs::read(&path)
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?;
+        match state
+            .secret_keyring
+            .reencrypt_if_needed(&data)
+            .map_err(|err| Status::internal(err.to_string()))?
+        {
+            Some(rotated) => {
+                stats.shard_files_rotated += 1;
+                if !dry_run {
+                    state
+                        .storage
+                        .rewrite_storage_file(&path, &rotated)
+                        .await
+                        .map_err(|err| Status::internal(err.to_string()))?;
+                }
+            }
+            None => stats.already_active += 1,
+        }
+    }
+    Ok(())
+}
+
 fn object_link_resource_id(tenant_id: i64, bucket_name: &str, link_key: &str) -> String {
     format!(
         "{}:link:{link_key}",
@@ -2942,9 +3221,9 @@ fn generated_client_secret() -> String {
 }
 
 fn encrypt_admin_client_secret(state: &AppState, client_secret: &str) -> Result<Vec<u8>, Status> {
-    let encryption_key = hex::decode(&state.config.anvil_secret_encryption_key)
-        .map_err(|_| Status::internal("Invalid encryption key format"))?;
-    crypto::encrypt(client_secret.as_bytes(), &encryption_key)
+    state
+        .secret_keyring
+        .encrypt(client_secret.as_bytes())
         .map_err(|err| Status::internal(err.to_string()))
 }
 
@@ -2990,6 +3269,25 @@ async fn resolve_tenant_id(state: &AppState, tenant_ref: &str) -> Result<i64, St
         .map_err(|err| Status::internal(err.to_string()))?
         .map(|tenant| tenant.id)
         .ok_or_else(|| Status::not_found("Tenant not found"))
+}
+
+async fn resolve_tenant_app(
+    state: &AppState,
+    tenant_id: i64,
+    app_name: &str,
+) -> Result<persistence::App, Status> {
+    let app_name = app_name.trim();
+    if app_name.is_empty() {
+        return Err(Status::invalid_argument("app_name is required"));
+    }
+    state
+        .persistence
+        .list_apps_for_tenant(tenant_id)
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?
+        .into_iter()
+        .find(|app| app.name == app_name)
+        .ok_or_else(|| Status::not_found("Application not found"))
 }
 
 async fn routing_config_for_region(

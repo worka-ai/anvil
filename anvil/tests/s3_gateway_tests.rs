@@ -17,19 +17,14 @@ use aws_sdk_s3::types::{
 use rand::random;
 use std::env::temp_dir;
 use std::future::Future;
-use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::process::{Command, Output};
-use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tonic::Request;
 
 use anvil_test_utils::*;
-
-static ADMIN_BINARY: OnceLock<PathBuf> = OnceLock::new();
 
 fn assert_reserved_namespace_error(error: impl std::fmt::Debug) {
     let rendered = format!("{error:?}");
@@ -62,121 +57,25 @@ fn run_large_s3_gateway_test(future: Pin<Box<dyn Future<Output = ()> + Send>>) {
     });
 }
 
-// Helper function to create an app, since it's used in auth tests.
-fn create_app(admin_state_path: &str, app_name: &str) -> (String, String) {
-    let (_, client_id, client_secret) = create_app_with_id(admin_state_path, app_name);
+async fn create_app(cluster: &TestCluster, app_name: &str) -> (String, String) {
+    let (_, client_id, client_secret) = create_app_with_id(cluster, app_name).await;
     (client_id, client_secret)
 }
 
-fn create_app_with_id(admin_state_path: &str, app_name: &str) -> (String, String, String) {
-    let app_output = run_admin(
-        admin_state_path,
-        &[
-            "app",
-            "create",
-            "--tenant-name",
-            "default",
-            "--app-name",
-            app_name,
-        ],
-    );
-    let creds = String::from_utf8(app_output.stdout).unwrap();
-    let app_id = creds
-        .lines()
-        .find_map(|line| line.split_once("(ID: "))
-        .and_then(|(_, rest)| rest.strip_suffix(')'))
-        .expect("app id in admin output")
-        .to_string();
-    let client_id = extract_credential(&creds, "Client ID");
-    let client_secret = extract_credential(&creds, "Client Secret");
-    (app_id, client_id, client_secret)
+async fn create_app_with_id(cluster: &TestCluster, app_name: &str) -> (String, String, String) {
+    cluster
+        .create_application_with_id("default", app_name)
+        .await
 }
 
-fn grant_wildcard_policy(admin_state_path: &str, app_name: &str) {
-    grant_policy(admin_state_path, app_name, "*", "*");
+async fn grant_wildcard_policy(cluster: &TestCluster, app_name: &str) {
+    grant_policy(cluster, app_name, "*", "*").await;
 }
 
-fn grant_policy(admin_state_path: &str, app_name: &str, action: &str, resource: &str) {
-    run_admin(
-        admin_state_path,
-        &[
-            "policy",
-            "grant",
-            "--app-name",
-            app_name,
-            "--action",
-            action,
-            "--resource",
-            resource,
-        ],
-    );
-}
-
-fn run_admin(admin_state_path: &str, args: &[&str]) -> Output {
-    let mut command = admin_command(admin_state_path);
-    let output = command.args(args).output().expect("run admin binary");
-    assert!(
-        output.status.success(),
-        "admin command failed: status={:?}, args={:?}, stdout={}, stderr={}",
-        output.status.code(),
-        args,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
-}
-
-fn admin_command(admin_state_path: &str) -> Command {
-    let mut command = Command::new(admin_binary_path());
-    command.args([
-        "--anvil-secret-encryption-key",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "--storage-path",
-        admin_state_path,
-    ]);
-    command
-}
-
-fn admin_binary_path() -> PathBuf {
-    if let Some(admin_binary) = option_env!("CARGO_BIN_EXE_admin") {
-        let path = PathBuf::from(admin_binary);
-        if path.exists() {
-            return path;
-        }
-    }
-    ADMIN_BINARY.get_or_init(build_admin_binary).clone()
-}
-
-fn build_admin_binary() -> PathBuf {
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let status = Command::new(&cargo)
-        .args(["build", "--package", "anvil-server", "--bin", "admin"])
-        .status()
-        .expect("build admin binary");
-    assert!(status.success(), "cargo build --bin admin failed");
-
-    let metadata_output = Command::new(&cargo)
-        .args(["metadata", "--format-version=1"])
-        .output()
-        .expect("read cargo metadata");
-    assert!(
-        metadata_output.status.success(),
-        "cargo metadata failed: {}",
-        String::from_utf8_lossy(&metadata_output.stderr)
-    );
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&metadata_output.stdout).expect("parse cargo metadata");
-    let target_dir = metadata["target_directory"]
-        .as_str()
-        .expect("cargo metadata target_directory");
-    let binary_name = if cfg!(windows) { "admin.exe" } else { "admin" };
-    let path = Path::new(target_dir).join("debug").join(binary_name);
-    assert!(
-        path.exists(),
-        "expected admin binary after cargo build at {}",
-        path.display()
-    );
-    path
+async fn grant_policy(cluster: &TestCluster, app_name: &str, action: &str, resource: &str) {
+    cluster
+        .grant_application_policy("default", app_name, action, resource)
+        .await;
 }
 
 async fn wait_for_completed_index_build(cluster: &TestCluster, timeout: Duration) {
@@ -586,8 +485,8 @@ async fn test_s3_put_write_etag_preconditions() {
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let app_name = format!("s3-write-preconditions-{}", uuid::Uuid::new_v4());
-    let (client_id, client_secret) = create_app(&cluster.admin_state_path, &app_name);
-    grant_wildcard_policy(&cluster.admin_state_path, &app_name);
+    let (client_id, client_secret) = create_app(&cluster, &app_name).await;
+    grant_wildcard_policy(&cluster, &app_name).await;
 
     let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
     let client = s3_client(http_base, &client_id, &client_secret);
@@ -704,20 +603,15 @@ async fn test_s3_list_versions_and_get_filter_by_relationship_authorization() {
 
     let writer_app = format!("s3-relationship-writer-{}", uuid::Uuid::new_v4());
     let (_, writer_client_id, writer_client_secret) =
-        create_app_with_id(&cluster.admin_state_path, &writer_app);
-    grant_wildcard_policy(&cluster.admin_state_path, &writer_app);
+        create_app_with_id(&cluster, &writer_app).await;
+    grant_wildcard_policy(&cluster, &writer_app).await;
 
     let reader_app = format!("s3-relationship-reader-{}", uuid::Uuid::new_v4());
     let (reader_app_id, reader_client_id, reader_client_secret) =
-        create_app_with_id(&cluster.admin_state_path, &reader_app);
+        create_app_with_id(&cluster, &reader_app).await;
 
     let bucket = format!("s3-relationship-filter-{}", uuid::Uuid::new_v4());
-    grant_policy(
-        &cluster.admin_state_path,
-        &reader_app,
-        "object:list",
-        &bucket,
-    );
+    grant_policy(&cluster, &reader_app, "object:list", &bucket).await;
 
     let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
     let writer = s3_client(http_base, &writer_client_id, &writer_client_secret);
@@ -899,8 +793,8 @@ async fn test_s3_reads_and_lists_survive_object_metadata_compaction() {
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let app_name = format!("s3-compact-{}", uuid::Uuid::new_v4());
-    let (client_id, client_secret) = create_app(&cluster.admin_state_path, &app_name);
-    grant_wildcard_policy(&cluster.admin_state_path, &app_name);
+    let (client_id, client_secret) = create_app(&cluster, &app_name).await;
+    grant_wildcard_policy(&cluster, &app_name).await;
 
     let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
     let client = s3_client(http_base, &client_id, &client_secret);
@@ -1065,8 +959,8 @@ async fn test_s3_active_get_survives_object_metadata_compaction() {
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let app_name = format!("s3-active-compact-{}", uuid::Uuid::new_v4());
-    let (client_id, client_secret) = create_app(&cluster.admin_state_path, &app_name);
-    grant_wildcard_policy(&cluster.admin_state_path, &app_name);
+    let (client_id, client_secret) = create_app(&cluster, &app_name).await;
+    grant_wildcard_policy(&cluster, &app_name).await;
 
     let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
     let client = s3_client(http_base, &client_id, &client_secret);
@@ -1154,8 +1048,8 @@ async fn test_s3_writes_trigger_worker_metadata_compaction() {
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let app_name = format!("s3-auto-compact-{}", uuid::Uuid::new_v4());
-    let (client_id, client_secret) = create_app(&cluster.admin_state_path, &app_name);
-    grant_wildcard_policy(&cluster.admin_state_path, &app_name);
+    let (client_id, client_secret) = create_app(&cluster, &app_name).await;
+    grant_wildcard_policy(&cluster, &app_name).await;
 
     let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
     let client = s3_client(http_base, &client_id, &client_secret);
@@ -1249,8 +1143,8 @@ async fn test_s3_put_triggers_full_text_index_build() {
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let app_name = format!("s3-index-{}", uuid::Uuid::new_v4());
-    let (client_id, client_secret) = create_app(&cluster.admin_state_path, &app_name);
-    grant_wildcard_policy(&cluster.admin_state_path, &app_name);
+    let (client_id, client_secret) = create_app(&cluster, &app_name).await;
+    grant_wildcard_policy(&cluster, &app_name).await;
 
     let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
     let client = s3_client(http_base, &client_id, &client_secret);
@@ -1336,8 +1230,8 @@ async fn test_s3_put_metadata_field_triggers_full_text_index_build() {
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let app_name = format!("s3-metadata-index-{}", uuid::Uuid::new_v4());
-    let (client_id, client_secret) = create_app(&cluster.admin_state_path, &app_name);
-    grant_wildcard_policy(&cluster.admin_state_path, &app_name);
+    let (client_id, client_secret) = create_app(&cluster, &app_name).await;
+    grant_wildcard_policy(&cluster, &app_name).await;
 
     let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
     let client = s3_client(http_base, &client_id, &client_secret);
@@ -1429,8 +1323,8 @@ async fn test_s3_put_personaldb_table_column_triggers_full_text_index_build() {
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let app_name = format!("s3-personaldb-column-index-{}", uuid::Uuid::new_v4());
-    let (client_id, client_secret) = create_app(&cluster.admin_state_path, &app_name);
-    grant_wildcard_policy(&cluster.admin_state_path, &app_name);
+    let (client_id, client_secret) = create_app(&cluster, &app_name).await;
+    grant_wildcard_policy(&cluster, &app_name).await;
 
     let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
     let client = s3_client(http_base, &client_id, &client_secret);
@@ -1523,8 +1417,8 @@ async fn test_s3_put_media_transcript_triggers_full_text_index_build() {
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let app_name = format!("s3-media-index-{}", uuid::Uuid::new_v4());
-    let (client_id, client_secret) = create_app(&cluster.admin_state_path, &app_name);
-    grant_wildcard_policy(&cluster.admin_state_path, &app_name);
+    let (client_id, client_secret) = create_app(&cluster, &app_name).await;
+    grant_wildcard_policy(&cluster, &app_name).await;
 
     let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
     let client = s3_client(http_base, &client_id, &client_secret);
@@ -1612,8 +1506,8 @@ async fn test_s3_put_triggers_vector_index_build() {
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let app_name = format!("s3-vector-index-{}", uuid::Uuid::new_v4());
-    let (client_id, client_secret) = create_app(&cluster.admin_state_path, &app_name);
-    grant_wildcard_policy(&cluster.admin_state_path, &app_name);
+    let (client_id, client_secret) = create_app(&cluster, &app_name).await;
+    grant_wildcard_policy(&cluster, &app_name).await;
 
     let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
     let client = s3_client(http_base, &client_id, &client_secret);
@@ -1715,8 +1609,8 @@ fn test_s3_large_object_uses_external_chunks_and_ranges_across_chunk_boundary() 
         cluster.start_and_converge(Duration::from_secs(5)).await;
 
         let app_name = format!("s3-large-chunks-{}", uuid::Uuid::new_v4());
-        let (client_id, client_secret) = create_app(&cluster.admin_state_path, &app_name);
-        grant_wildcard_policy(&cluster.admin_state_path, &app_name);
+        let (client_id, client_secret) = create_app(&cluster, &app_name).await;
+        grant_wildcard_policy(&cluster, &app_name).await;
 
         let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
         let client = s3_client(http_base, &client_id, &client_secret);
@@ -1819,10 +1713,10 @@ async fn run_s3_public_and_private_access() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
-    let (client_id, client_secret) = create_app(&cluster.admin_state_path, "s3-test-app");
+    let (client_id, client_secret) = create_app(&cluster, "s3-test-app").await;
 
     // Grant wildcard policy to the app before getting a token
-    grant_wildcard_policy(&cluster.admin_state_path, "s3-test-app");
+    grant_wildcard_policy(&cluster, "s3-test-app").await;
 
     // Allow a moment for the policy change to propagate or be read by the server.
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -2974,22 +2868,10 @@ async fn test_streaming_upload_decoding() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
-    let (client_id, client_secret) = create_app(&cluster.admin_state_path, "streaming-decode-app");
+    let (client_id, client_secret) = create_app(&cluster, "streaming-decode-app").await;
 
-    // Grant wildcard policy to the app
-    run_admin(
-        &cluster.admin_state_path,
-        &[
-            "policy",
-            "grant",
-            "--app-name",
-            "streaming-decode-app",
-            "--action",
-            "*",
-            "--resource",
-            "*",
-        ],
-    );
+    // Grant wildcard policy to the app.
+    grant_wildcard_policy(&cluster, "streaming-decode-app").await;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Configure S3 client

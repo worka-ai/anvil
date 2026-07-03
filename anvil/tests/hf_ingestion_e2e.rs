@@ -16,10 +16,6 @@ fn docker_admin(compose_file: &std::path::Path, args: &[&str]) {
         "-T",
         "anvil1",
         "admin",
-        "--storage-path",
-        "/var/lib/anvil",
-        "--anvil-secret-encryption-key",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     ];
     command_args.extend_from_slice(args);
     run("docker", &command_args);
@@ -34,10 +30,6 @@ fn docker_admin_output(compose_file: &std::path::Path, args: &[&str]) -> std::pr
         "-T",
         "anvil1",
         "admin",
-        "--storage-path",
-        "/var/lib/anvil",
-        "--anvil-secret-encryption-key",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     ];
     command_args.extend_from_slice(args);
     Command::new("docker")
@@ -158,19 +150,32 @@ async fn hf_ingestion_config_json() {
     )
     .await;
 
-    // Prepare region/tenant/app inside the Docker node's own storage.
-    docker_admin(&compose_file_path, &["region", "create", "docker-test"]);
-    docker_admin(&compose_file_path, &["tenant", "create", "default"]);
+    // Prepare tenant/app through the network admin API exposed inside the container.
+    docker_admin(
+        &compose_file_path,
+        &[
+            "tenant",
+            "create",
+            "--name",
+            "default",
+            "--home-region",
+            "docker-test",
+            "--audit-reason",
+            "docker hf e2e tenant",
+        ],
+    );
 
     let app_out = docker_admin_output(
         &compose_file_path,
         &[
             "app",
             "create",
-            "--tenant-name",
+            "--tenant-id",
             "default",
             "--app-name",
             "hf-e2e-app",
+            "--audit-reason",
+            "docker hf e2e app",
         ],
     );
     assert!(
@@ -178,22 +183,12 @@ async fn hf_ingestion_config_json() {
         "admin apps create failed: {}",
         String::from_utf8_lossy(&app_out.stderr)
     );
-    let out = String::from_utf8(app_out.stdout).unwrap();
-    fn extract(s: &str, label: &str) -> String {
-        s.lines()
-            .find_map(|l| {
-                l.split_once(": ").and_then(|(k, v)| {
-                    if k.trim() == label {
-                        Some(v.trim().to_string())
-                    } else {
-                        None
-                    }
-                })
-            })
-            .unwrap()
-    }
-    let client_id = extract(&out, "Client ID");
-    let client_secret = extract(&out, "Client Secret");
+    let out: serde_json::Value = serde_json::from_slice(&app_out.stdout).unwrap();
+    let client_id = out["resource"]["client_id"].as_str().unwrap().to_string();
+    let client_secret = out["resource"]["client_secret"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // Wildcard policy for simplicity in e2e.
     docker_admin(
@@ -201,12 +196,16 @@ async fn hf_ingestion_config_json() {
         &[
             "policy",
             "grant",
+            "--tenant-id",
+            "default",
             "--app-name",
             "hf-e2e-app",
             "--action",
             "*",
             "--resource",
             "*",
+            "--audit-reason",
+            "docker hf e2e wildcard policy",
         ],
     );
 

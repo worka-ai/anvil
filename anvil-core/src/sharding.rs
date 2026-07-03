@@ -1,4 +1,4 @@
-use crate::crypto;
+use crate::crypto::EncryptionKeyring;
 use anyhow::Result;
 use reed_solomon_erasure::galois_8::Field;
 use reed_solomon_erasure::{Error, ReedSolomon};
@@ -26,10 +26,12 @@ impl ShardManager {
     }
 
     /// Encrypts and encodes a single data stripe into data + parity shards.
-    pub fn encode(&self, stripe: &mut [Vec<u8>], key: &[u8]) -> Result<(), Error> {
+    pub fn encode(&self, stripe: &mut [Vec<u8>], keyring: &EncryptionKeyring) -> Result<(), Error> {
         // Encrypt the data shards before encoding
         for data_shard in stripe.iter_mut().take(self.data_shards()) {
-            *data_shard = crypto::encrypt(data_shard, key).map_err(|_| Error::TooFewShards)?;
+            *data_shard = keyring
+                .encrypt(data_shard)
+                .map_err(|_| Error::TooFewShards)?;
         }
 
         // After encryption, data shards are longer. Resize parity shards to match.
@@ -44,13 +46,18 @@ impl ShardManager {
     }
 
     /// Reconstructs and decrypts a data stripe from a set of shards.
-    pub fn reconstruct(&self, shards: &mut [Option<Vec<u8>>], key: &[u8]) -> Result<(), Error> {
+    pub fn reconstruct(
+        &self,
+        shards: &mut [Option<Vec<u8>>],
+        keyring: &EncryptionKeyring,
+    ) -> Result<(), Error> {
         self.codec.reconstruct(shards)?;
         // Decrypt the reconstructed data shards
         for data_shard_opt in shards.iter_mut().take(self.data_shards()) {
             if let Some(data_shard) = data_shard_opt {
-                *data_shard =
-                    crypto::decrypt(data_shard, key).map_err(|_| Error::IncorrectShardSize)?;
+                *data_shard = keyring
+                    .decrypt(data_shard)
+                    .map_err(|_| Error::IncorrectShardSize)?;
             }
         }
         Ok(())
@@ -80,7 +87,12 @@ mod tests {
         let manager = ShardManager::new();
         let stripe_size = 1024;
         let mut data = vec![vec![0; stripe_size]; manager.total_shards()];
-        let key = [0u8; 32]; // Dummy key for testing
+        let keyring = crate::crypto::EncryptionKeyring::from_hex_config(
+            "test",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "",
+        )
+        .unwrap();
 
         // Fill the data shards with some data
         for i in 0..manager.data_shards() {
@@ -93,7 +105,7 @@ mod tests {
         let original_data = data[..manager.data_shards()].to_vec();
 
         // Encode the data to generate parity shards
-        manager.encode(&mut data, &key).unwrap();
+        manager.encode(&mut data, &keyring).unwrap();
 
         // "Lose" two shards (one data, one parity)
         let mut shards: Vec<Option<Vec<u8>>> = data.into_iter().map(Some).collect();
@@ -101,7 +113,7 @@ mod tests {
         shards[5] = None; // Lose the second parity shard
 
         // Reconstruct the data
-        manager.reconstruct(&mut shards, &key).unwrap();
+        manager.reconstruct(&mut shards, &keyring).unwrap();
 
         // Verify that the lost data shard was reconstructed and decrypted correctly
         let reconstructed_shard = shards[0].as_ref().unwrap();

@@ -1,64 +1,63 @@
 ---
 slug: /scenarios/admin-tasks
 title: 'Scenario: Administrative Tasks'
-description: A guide covering miscellaneous administrative commands like creating admin users and resetting app secrets.
-tags: [scenario, cli, admin, users]
+description: A guide covering common administrative commands for credentials, policies, and secret rotation.
+tags: [scenario, cli, admin, credentials]
 ---
 
 # Scenario: Common Administrative Tasks
 
-This guide covers several standalone administrative commands for managing users and application credentials.
+Anvil administration is performed through the network `admin` CLI. The CLI connects to the admin API and never writes the storage directory directly.
 
-### 1. Admin: Create a New Administrator User
+## 1. Rotate an App's Client Secret
 
-To give another person administrative access to Anvil, you can create a new admin user for them. This is distinct from tenants and apps; it is for managing the Anvil system itself.
-
-```bash
-# Create a new administrator with a password
-anvil-admin user create \
-  --username new-admin \
-  --email admin@acme.com \
-  --password "a-very-strong-password" \
-  --role administrator
-```
-
-### 2. Admin: Reset an App's Client Secret
-
-If an application's client secret is compromised, you can immediately invalidate it and generate a new one. This is a critical security feature.
+If an application's client secret is compromised, invalidate it and generate a new one:
 
 ```bash
-# Immediately invalidate an app's secret and generate a new one
-anvil-admin app reset-secret --app-name data-science-app
+admin app rotate-secret \
+  --tenant-id acme-corp \
+  --app-name data-science-app \
+  --expected-generation 1 \
+  --audit-reason "rotate compromised app secret"
 ```
-The command will output a new `Client Secret`. The old secret will no longer work.
 
-### 3. Client: Interactive CLI Configuration
+The command returns a new `client_secret`. The old secret stops working once the mutation is committed.
 
-While non-interactive configuration is recommended for scripts, users can use the `configure` command for a wizard-style setup experience.
+## 2. Rotate the Server Secret Encryption Key
+
+Generate a replacement key:
 
 ```bash
-anvil configure
-```
-This will prompt the user for the profile name, host, Client ID, and Client Secret.
-
-**Example Interaction:**
-```
-? Profile Name: acme
-? Anvil Host: https://anvil.acme.com
-? Client ID: app_abc123...
-? Client Secret: [hidden]
-Configuration saved.
+admin key generate-secret-encryption-key
 ```
 
-### 4. Client: Getting a Raw Bearer Token
-
-For developers who need to interact with the gRPC API directly using tools like `grpcurl`, the `anvil auth get-token` command is a convenient way to get a valid JSON Web Token (JWT).
+Restart the server with the new key as `ANVIL_SECRET_ENCRYPTION_KEY`, a new `ANVIL_SECRET_ENCRYPTION_KEY_ID`, and the old key in `ANVIL_SECRET_ENCRYPTION_PREVIOUS_KEYS`. Then run:
 
 ```bash
-# This command uses the credentials from the currently active profile
-anvil auth get-token
-```
-This will print a long token string to standard output, which can then be used in the `authorization` metadata header of a gRPC request (e.g., `authorization: Bearer <token>`).
+admin secret-encryption-key rotate \
+  --dry-run \
+  --audit-reason "dry-run secret key rotation"
 
+admin secret-encryption-key rotate \
+  --audit-reason "rotate secret key"
 ```
+
+After verification, remove the old key from `ANVIL_SECRET_ENCRYPTION_PREVIOUS_KEYS` and restart the server.
+
+## 3. Interactive Client CLI Configuration
+
+While non-interactive configuration is recommended for scripts, users can use the client CLI `configure` command for a wizard-style setup experience:
+
+```bash
+anvil-cli configure
 ```
+
+## 4. Getting a Raw Bearer Token
+
+For developers who need to interact with the gRPC API directly using tools like `grpcurl`, the client CLI can mint a bearer token for the configured profile:
+
+```bash
+anvil-cli auth get-token
+```
+
+Use the returned token in the `authorization` metadata header, for example `authorization: Bearer <token>`.

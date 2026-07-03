@@ -1054,6 +1054,44 @@ impl Storage {
         Ok(data)
     }
 
+    pub async fn list_committed_shard_files(&self) -> Result<Vec<PathBuf>> {
+        let mut entries = fs::read_dir(&self.storage_path).await?;
+        let mut paths = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name.len() == 67
+                && name.as_bytes()[64] == b'-'
+                && name.as_bytes()[..64]
+                    .iter()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                && name.as_bytes()[65..].iter().all(u8::is_ascii_digit)
+            {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        Ok(paths)
+    }
+
+    pub async fn rewrite_storage_file(&self, path: &Path, data: &[u8]) -> Result<()> {
+        let relative = self.relative_storage_path(path)?;
+        let safe_path = self.resolve_relative_storage_path(&relative)?;
+        let tmp_path = self
+            .temp_path
+            .join(format!("rewrite-{}", uuid::Uuid::new_v4()));
+        let mut file = fs::File::create(&tmp_path).await?;
+        file.write_all(data).await?;
+        file.flush().await?;
+        fs::rename(tmp_path, safe_path).await?;
+        Ok(())
+    }
+
     pub async fn retrieve_whole_object(&self, object_hash: &str) -> Result<Vec<u8>> {
         let file_path = self.get_whole_object_path(object_hash);
         let data = fs::read(file_path).await?;

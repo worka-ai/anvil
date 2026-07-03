@@ -1,7 +1,4 @@
 # Stage 1: Build the binaries with the release toolchain used by CI.
-# The server dependency graph uses crates whose build scripts require the
-# current stable toolchain; the published Rust client remains the crates.io
-# compatibility surface.
 FROM rust:1.96-bookworm AS builder
 
 # Install build dependencies
@@ -20,8 +17,8 @@ WORKDIR /usr/src/anvil
 COPY . .
 
 # Build the anvil server and the admin CLI in release mode
-RUN cargo build --release --bin anvil --bin admin
-RUN cargo build --release -p anvil-storage-cli
+RUN cargo build --release --bin anvil
+RUN cargo build --release -p anvil-storage-cli --bin admin
 
 # Stage 2: Create the final runtime image. Rust tooling is deliberately not
 # present in the shipped server image.
@@ -37,7 +34,6 @@ RUN useradd --uid 10001 --create-home --home-dir /var/lib/anvil --shell /usr/sbi
 # Copy the compiled binaries from the builder stage
 COPY --from=builder /usr/src/anvil/target/release/anvil /usr/local/bin/anvil
 COPY --from=builder /usr/src/anvil/target/release/admin /usr/local/bin/admin
-COPY --from=builder /usr/src/anvil/target/release/anvil-cli /usr/local/bin/anvil-cli
 
 RUN chown -R anvil:anvil /var/lib/anvil
 
@@ -47,6 +43,7 @@ WORKDIR /var/lib/anvil
 
 # Expose the default gRPC/S3 port and a potential swarm port
 EXPOSE 50051
+EXPOSE 50052
 EXPOSE 7443
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=5 CMD curl -fsS http://127.0.0.1:50051/ready || exit 1

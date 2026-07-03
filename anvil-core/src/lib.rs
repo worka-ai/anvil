@@ -117,6 +117,7 @@ pub struct AppState {
     pub bucket_manager: bucket_manager::BucketManager,
     pub object_manager: object_manager::ObjectManager,
     pub config: Arc<Config>,
+    pub secret_keyring: Arc<crypto::EncryptionKeyring>,
     pub bucket_watch_tx: broadcast::Sender<persistence::BucketMetadataEvent>,
     pub authz_watch_tx: broadcast::Sender<persistence::AuthzTupleRecord>,
     pub index_watch_tx: broadcast::Sender<persistence::IndexDefinitionEvent>,
@@ -134,6 +135,8 @@ impl AppState {
         event_publisher: Option<tokio::sync::mpsc::Sender<cluster::MetadataEvent>>,
     ) -> Result<Self> {
         let config = config.with_persisted_identity()?;
+        let secret_keyring = Arc::new(config.secret_keyring()?);
+        let partition_signing_key = hex::decode(&config.anvil_secret_encryption_key)?;
         let arc_config = Arc::new(config);
         let jwt_manager = Arc::new(JwtManager::new(arc_config.jwt_secret.clone()));
         let storage = storage::Storage::new_at(&arc_config.storage_path).await?;
@@ -166,7 +169,8 @@ impl AppState {
             arc_config.region.clone(),
             arc_config.cross_region_routing_policy,
             jwt_manager.clone(),
-            arc_config.anvil_secret_encryption_key.clone(),
+            partition_signing_key,
+            secret_keyring.clone(),
             object_watch_tx,
             observability.clone(),
         );
@@ -182,6 +186,7 @@ impl AppState {
             bucket_manager,
             object_manager,
             config: arc_config,
+            secret_keyring,
             bucket_watch_tx,
             authz_watch_tx,
             index_watch_tx,

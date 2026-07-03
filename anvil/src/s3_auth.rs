@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::{AppState, auth::Claims, crypto};
+use crate::{AppState, auth::Claims};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
     PercentEncodingMode, SignableBody, SignableRequest, SignatureLocation, SigningParams,
@@ -165,9 +165,9 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         }
     };
 
-    let encryption_key = hex::decode(&state.config.anvil_secret_encryption_key)
-        .expect("ANVIL_SECRET_ENCRYPTION_KEY must be a valid hex string");
-    let secret_bytes = match crypto::decrypt(&app_details.client_secret_encrypted, &encryption_key)
+    let secret_bytes = match state
+        .secret_keyring
+        .decrypt(&app_details.client_secret_encrypted)
     {
         Ok(s) => s,
         Err(_) => {

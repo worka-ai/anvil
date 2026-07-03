@@ -1,7 +1,6 @@
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::{CreateBucketRequest, GetAccessTokenRequest};
-use std::process::Command;
 use std::time::Duration;
 
 use anvil_test_utils::*;
@@ -12,55 +11,9 @@ async fn test_auth_flow_with_wildcard_scopes() {
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
-    let admin_state_path = cluster.admin_state_path.clone();
-
-    // Use the admin CLI to create app and grant policy
-    let admin_args = &["run", "--bin", "admin", "--"];
-    let app_output = Command::new("cargo")
-        .args(admin_args.iter().chain(&[
-            "--anvil-secret-encryption-key",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--storage-path",
-            &admin_state_path,
-            "app",
-            "create",
-            "--tenant-name",
-            "default",
-            "--app-name",
-            "auth-app",
-        ]))
-        .output()
-        .unwrap();
-    assert!(app_output.status.success());
-    let creds = String::from_utf8(app_output.stdout).unwrap();
-    let client_id = extract_credential(&creds, "Client ID");
-    let client_secret = extract_credential(&creds, "Client Secret");
-
-    let policy_args = &[
-        "policy",
-        "grant",
-        "--app-name",
-        "auth-app",
-        "--action",
-        "bucket:create",
-        "--resource",
-        "auth-test-*",
-    ];
-    let status = Command::new("cargo")
-        .args(
-            admin_args
-                .iter()
-                .chain(&[
-                    "--anvil-secret-encryption-key",
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "--storage-path",
-                    &admin_state_path,
-                ])
-                .chain(policy_args.iter()),
-        )
-        .status()
-        .unwrap();
-    assert!(status.success());
+    let (client_id, client_secret) = cluster
+        .create_application_with_policy("default", "auth-app", "bucket:create", "auth-test-*")
+        .await;
 
     // Get a token (requesting no specific scopes, should get all allowed)
     let mut auth_client = AuthServiceClient::connect(grpc_addr.clone()).await.unwrap();

@@ -5,6 +5,7 @@ use crate::{
     },
     auth, bucket_journal,
     cluster::ClusterState,
+    crypto::EncryptionKeyring,
     metadata_journal, object_links,
     observability::{
         OBJECT_READ_LATENCY, OBJECT_WRITE_LATENCY, Observability, PREFIX_LIST_LATENCY,
@@ -49,7 +50,8 @@ pub struct ObjectManager {
     region: String,
     cross_region_routing_policy: CrossRegionRoutingPolicy,
     jwt_manager: Arc<auth::JwtManager>,
-    encryption_key: Vec<u8>,
+    signing_key: Vec<u8>,
+    secret_keyring: Arc<EncryptionKeyring>,
     watch_tx: broadcast::Sender<ObjectWatchEvent>,
     observability: Observability,
 }
@@ -179,12 +181,11 @@ impl ObjectManager {
         region: String,
         cross_region_routing_policy: CrossRegionRoutingPolicy,
         jwt_manager: Arc<auth::JwtManager>,
-        anvil_secret_encryption_key: String,
+        signing_key: Vec<u8>,
+        secret_keyring: Arc<EncryptionKeyring>,
         watch_tx: broadcast::Sender<ObjectWatchEvent>,
         observability: Observability,
     ) -> Self {
-        let encryption_key = hex::decode(anvil_secret_encryption_key)
-            .expect("ANVIL_SECRET_ENCRYPTION_KEY must be a valid hex string");
         Self {
             persistence,
             placer,
@@ -194,7 +195,8 @@ impl ObjectManager {
             region,
             cross_region_routing_policy,
             jwt_manager,
-            encryption_key,
+            signing_key,
+            secret_keyring,
             watch_tx,
             observability,
         }
@@ -363,7 +365,7 @@ impl ObjectManager {
                 .map_err(|e| Status::internal(e.to_string()))?;
         }
 
-        let shard_map_json = if nodes.len() > 1 {
+        let shard_map_json = if nodes.len() >= self.sharder.total_shards() {
             let peer_ids: Vec<String> = nodes.iter().map(|p| p.to_base58()).collect();
             Some(serde_json::json!(peer_ids))
         } else {
@@ -847,7 +849,7 @@ impl ObjectManager {
             .collect();
         shards.resize(self.sharder.total_shards(), vec![0; stripe_size]);
         self.sharder
-            .encode(&mut shards, &self.encryption_key)
+            .encode(&mut shards, &self.secret_keyring)
             .map_err(|e| Status::internal(e.to_string()))?;
 
         let mut futures = Vec::new();
@@ -970,7 +972,7 @@ impl ObjectManager {
                 let object = metadata_journal::read_object_version(
                     &self.storage,
                     &bucket,
-                    &self.encryption_key,
+                    &self.signing_key,
                     &object_key,
                     version_id,
                 )
@@ -985,7 +987,7 @@ impl ObjectManager {
             None => metadata_journal::read_current_object(
                 &self.storage,
                 &bucket,
-                &self.encryption_key,
+                &self.signing_key,
                 &object_key,
             )
             .await
@@ -1217,7 +1219,7 @@ impl ObjectManager {
 
             if app_state
                 .sharder
-                .reconstruct(&mut shards, &app_state.encryption_key)
+                .reconstruct(&mut shards, &app_state.secret_keyring)
                 .is_err()
             {
                 let _ = tx
@@ -1426,7 +1428,7 @@ impl ObjectManager {
                 let object = metadata_journal::read_object_version(
                     &self.storage,
                     &bucket,
-                    &self.encryption_key,
+                    &self.signing_key,
                     object_key,
                     version_id,
                 )
@@ -1441,7 +1443,7 @@ impl ObjectManager {
             None => metadata_journal::read_current_object(
                 &self.storage,
                 &bucket,
-                &self.encryption_key,
+                &self.signing_key,
                 object_key,
             )
             .await
@@ -1513,7 +1515,7 @@ impl ObjectManager {
             Some(version_id) => metadata_journal::read_object_version(
                 &self.storage,
                 &bucket,
-                &self.encryption_key,
+                &self.signing_key,
                 object_key,
                 version_id,
             )
@@ -1523,7 +1525,7 @@ impl ObjectManager {
             None => metadata_journal::read_current_object(
                 &self.storage,
                 &bucket,
-                &self.encryption_key,
+                &self.signing_key,
                 object_key,
             )
             .await
@@ -1598,7 +1600,7 @@ impl ObjectManager {
         let mut objects = metadata_journal::read_current_directory_objects(
             &self.storage,
             &bucket,
-            &self.encryption_key,
+            &self.signing_key,
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -1695,7 +1697,7 @@ impl ObjectManager {
             return metadata_journal::read_object_versions(
                 &self.storage,
                 &bucket,
-                &self.encryption_key,
+                &self.signing_key,
                 prefix,
                 key_marker,
                 version_id_marker,
@@ -1729,14 +1731,9 @@ impl ObjectManager {
     ) -> Result<Option<Object>, Status> {
         self.validate_write_request(bucket_name, object_key, scopes)?;
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
-        metadata_journal::read_current_object(
-            &self.storage,
-            &bucket,
-            &self.encryption_key,
-            object_key,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))
+        metadata_journal::read_current_object(&self.storage, &bucket, &self.signing_key, object_key)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))
     }
 
     pub async fn current_object_for_mutation_precondition(
@@ -1749,14 +1746,9 @@ impl ObjectManager {
     ) -> Result<Option<Object>, Status> {
         self.validate_object_request(bucket_name, object_key, scopes, action)?;
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
-        metadata_journal::read_current_object(
-            &self.storage,
-            &bucket,
-            &self.encryption_key,
-            object_key,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))
+        metadata_journal::read_current_object(&self.storage, &bucket, &self.signing_key, object_key)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))
     }
 
     pub async fn copy_object(
@@ -2008,7 +2000,7 @@ impl ObjectManager {
                     metadata_journal::read_object_version(
                         &self.storage,
                         bucket,
-                        &self.encryption_key,
+                        &self.signing_key,
                         &link.target_key,
                         version_id,
                     )
@@ -2018,7 +2010,7 @@ impl ObjectManager {
                     metadata_journal::read_current_object(
                         &self.storage,
                         bucket,
-                        &self.encryption_key,
+                        &self.signing_key,
                         &link.target_key,
                     )
                     .await
@@ -2112,7 +2104,7 @@ impl ObjectManager {
             let page = metadata_journal::read_object_versions(
                 &self.storage,
                 bucket,
-                &self.encryption_key,
+                &self.signing_key,
                 prefix,
                 &current_key_marker,
                 current_version_marker,

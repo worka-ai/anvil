@@ -37,6 +37,22 @@ impl Context {
         Ok(Self { profile })
     }
 
+    #[allow(dead_code)]
+    pub fn from_host(host: String) -> Self {
+        let mut host = host;
+        if !(host.starts_with("http://") || host.starts_with("https://")) {
+            host = format!("http://{}", host);
+        }
+        Self {
+            profile: Profile {
+                name: "inline".to_string(),
+                host,
+                client_id: String::new(),
+                client_secret: String::new(),
+            },
+        }
+    }
+
     pub async fn get_bearer_token(&self) -> anyhow::Result<String> {
         if let Ok(token) = std::env::var("ANVIL_AUTH_TOKEN") {
             return Ok(token);

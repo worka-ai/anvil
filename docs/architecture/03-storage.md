@@ -7,9 +7,9 @@ tags: [architecture, deep-dive, storage, erasure-coding, encryption, sharding, p
 
 # Deep Dive: Distributed Storage
 
-> **TL;DR:** Objects are encrypted, erasure-coded into shards, and distributed across peers using Rendezvous Hashing.
+> **TL;DR:** Distributed objects are encrypted into key envelopes, erasure-coded into shards, and distributed across peers using Rendezvous Hashing.
 
-Anvil's storage engine is designed for durability, efficiency, and scalability. It achieves this by combining four core concepts: at-rest encryption, content-addressable storage, Reed-Solomon erasure coding, and Rendezvous Hashing for placement.
+Anvil's storage engine is designed for durability, efficiency, and scalability. It achieves this by combining content-addressable storage, encrypted distributed shards, Reed-Solomon erasure coding, and Rendezvous Hashing for placement.
 
 ### Content-Addressable Storage
 
@@ -26,7 +26,7 @@ To provide durability and security, Anvil uses **Reed-Solomon erasure coding** c
 
 #### Encryption
 
-A critical, verified detail from the implementation is that Anvil performs **encryption at rest**. Before an object is processed for sharding, its raw data is first encrypted using the `ANVIL_SECRET_ENCRYPTION_KEY`. This means the data shards stored on disk are always encrypted, and are decrypted on-the-fly during a read request. This provides a powerful layer of security for all stored data.
+When an object is processed through distributed sharding, each data shard is encrypted with the active server key envelope before Reed-Solomon parity shards are calculated. The envelope records the configured `ANVIL_SECRET_ENCRYPTION_KEY_ID`, letting Anvil rotate encrypted shard records by decrypting them with a previous key and re-encrypting them with the active key. The raw `ANVIL_SECRET_ENCRYPTION_KEY` remains server-side only; administrative tools use the network admin API and do not receive the key.
 
 #### Erasure Coding
 

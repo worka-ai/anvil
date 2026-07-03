@@ -21,12 +21,14 @@ anvil bucket create public-assets us-east-1
 
 # 2. Grant your app ('data-science-app') permission to upload to this bucket
 admin policy grant \
+  --tenant-id acme-corp \
   --app-name data-science-app \
   --action object:write \
-  --resource "public-assets/*"
+  --resource "public-assets/*" \
+  --audit-reason "allow public asset uploads"
 
 # 3. Use the admin tool to set the bucket's public flag to true
-admin bucket set-public-access --bucket public-assets --allow
+admin bucket public-access set --tenant-id acme-corp --bucket-name public-assets --allow true --audit-reason "publish assets bucket"
 ```
 
 > **Note on Public Access:** The `--allow` flag is a switch. Including it enables public access (sets it to `true`). Omitting the flag entirely disables public access (sets it to `false`), making the bucket private.
@@ -52,13 +54,15 @@ First, an admin creates a second app (`reporting-app`). Then, they grant the pri
 
 ```bash
 # Create the second app
-admin app create --tenant-name acme-corp --app-name reporting-app
+admin app create --tenant-id acme-corp --app-name reporting-app --audit-reason "create reporting app"
 
 # Grant the 'data-science-app' the ability to delegate its permissions
 admin policy grant \
+  --tenant-id acme-corp \
   --app-name data-science-app \
   --action policy:grant \
-  --resource "*"
+  --resource "*" \
+  --audit-reason "allow delegation"
 ```
 
 **2. Client: Delegate and Revoke Permissions**

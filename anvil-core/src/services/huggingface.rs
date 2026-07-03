@@ -1,4 +1,4 @@
-use crate::{AppState, auth, crypto, permissions::AnvilAction, tasks::TaskType};
+use crate::{AppState, auth, permissions::AnvilAction, tasks::TaskType};
 use tonic::{Request, Response, Status};
 
 use crate::anvil_api as api;
@@ -20,10 +20,9 @@ impl api::hugging_face_key_service_server::HuggingFaceKeyService for AppState {
             return Err(Status::invalid_argument("name is required"));
         }
 
-        let enc_key = hex::decode(&self.config.anvil_secret_encryption_key)
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        let enc = crypto::encrypt(req.token.as_bytes(), &enc_key)
+        let enc = self
+            .secret_keyring
+            .encrypt(req.token.as_bytes())
             .map_err(|e| Status::internal(e.to_string()))?;
 
         let note_opt = if req.note.is_empty() {
