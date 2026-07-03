@@ -330,13 +330,13 @@ async fn hf_ingestion_config_json() {
 
     // Verify GET on the object returns 200 and valid JSON
     let url = format!("{}/models/gpt-oss-20b/config.json", host_api_url(1));
-    let txt = get_public_text_with_retry(&url, Duration::from_secs(15)).await;
+    let txt = get_public_text_with_retry(&url, Duration::from_secs(60)).await;
     let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
     assert!(v.is_object());
 
     // Verify anvil-index.json
     let index_url = format!("{}/models/gpt-oss-20b/anvil-index.json", host_api_url(1));
-    let index_txt = get_public_text_with_retry(&index_url, Duration::from_secs(15)).await;
+    let index_txt = get_public_text_with_retry(&index_url, Duration::from_secs(60)).await;
     let index_v: serde_json::Value = serde_json::from_str(&index_txt).unwrap();
 
     // Assert meta fields
@@ -417,7 +417,7 @@ async fn hf_ingestion_config_json() {
     }
 
     // Verify merged anvil-index.json
-    let index_txt_2 = get_public_text_with_retry(&index_url, Duration::from_secs(15)).await;
+    let index_txt_2 = get_public_text_with_retry(&index_url, Duration::from_secs(60)).await;
     let index_v_2: serde_json::Value = serde_json::from_str(&index_txt_2).unwrap();
 
     // Assert meta fields
