@@ -2073,7 +2073,8 @@ mod tests {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let bucket = sample_bucket();
-        let first = sample_object(1, "docs/a.txt", false);
+        let mut first = sample_object(1, "docs/a.txt", false);
+        first.inline_payload = Some(b"alpha payload".to_vec());
         let second = sample_object(2, "docs/b.txt", true);
 
         let path = append_object_mutation(&storage, &bucket, &first, ObjectJournalMutation::Put)
@@ -2108,6 +2109,20 @@ mod tests {
             .unwrap();
         assert_eq!(current.len(), 1);
         assert_eq!(current[0].key, first.key);
+        assert_eq!(
+            current[0].inline_payload.as_deref(),
+            Some(&b"alpha payload"[..])
+        );
+
+        let current_through_directory_frame =
+            read_current_objects_through_sequence(&storage, &bucket, b"unused without manifest", 2)
+                .await
+                .unwrap();
+        assert_eq!(current_through_directory_frame.len(), 1);
+        assert_eq!(
+            current_through_directory_frame[0].inline_payload.as_deref(),
+            Some(&b"alpha payload"[..])
+        );
     }
 
     #[tokio::test]
