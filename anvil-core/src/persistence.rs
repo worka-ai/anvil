@@ -665,7 +665,7 @@ impl Persistence {
         let home_region = mesh_directory::RegionName::new(bucket.region.clone())?;
         let home_cell = mesh_directory::CellId::new(self.cell_id.clone())?;
         let object_prefix = format!("objects/{tenant_id}/{bucket_name}/");
-        let locator = mesh_directory::BucketLocatorDescriptor::active(
+        let mut locator = mesh_directory::BucketLocatorDescriptor::active(
             mesh_id,
             tenant_id,
             bucket_name,
@@ -676,6 +676,12 @@ impl Persistence {
             object_prefix,
             now,
         )?;
+        if let Some(existing) =
+            mesh_directory::read_bucket_locator(&self.storage, &locator.key()).await?
+            && existing.status == mesh_directory::BucketLocatorStatus::Deleted
+        {
+            locator.generation = existing.generation.saturating_add(1);
+        }
         let permit = self
             .mesh_control_write_permit(
                 mesh_directory::RoutingRecordFamily::BucketLocator,
@@ -692,6 +698,24 @@ impl Persistence {
         )
         .await?;
         Ok(())
+    }
+
+    async fn mark_mesh_bucket_locator_deleted(&self, bucket: &Bucket) -> Result<()> {
+        let tenant_id = mesh_directory::TenantId::new(bucket.tenant_id.to_string())?;
+        let bucket_name = mesh_directory::BucketName::canonicalize(&bucket.name)?;
+        let key = mesh_directory::BucketLocatorKey::new(tenant_id, bucket_name);
+        let Some(existing) = mesh_directory::read_bucket_locator(&self.storage, &key).await? else {
+            return Ok(());
+        };
+        if existing.status == mesh_directory::BucketLocatorStatus::Deleted {
+            return Ok(());
+        }
+
+        let mut deleted = existing;
+        deleted.status = mesh_directory::BucketLocatorStatus::Deleted;
+        deleted.updated_at = Utc::now().to_rfc3339();
+        deleted.generation = deleted.generation.saturating_add(1);
+        self.write_mesh_bucket_locator_descriptor(&deleted).await
     }
 
     pub async fn get_mesh_tenant_name_locator(
@@ -2491,6 +2515,7 @@ impl Persistence {
                 &self.partition_owner_signing_key,
             )
             .await?;
+            self.mark_mesh_bucket_locator_deleted(bucket).await?;
         }
         self.cache.invalidate_bucket(tenant_id, name).await;
         Ok(deleted)

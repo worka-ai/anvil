@@ -1221,7 +1221,9 @@ pub async fn write_bucket_locator(
         if existing == *locator {
             return Ok(());
         }
-        if existing.bucket_id != locator.bucket_id {
+        if existing.bucket_id != locator.bucket_id
+            && existing.status != BucketLocatorStatus::Deleted
+        {
             return Err(MeshDirectoryError::DuplicateBucketLocator {
                 tenant_id: locator.tenant_id.to_string(),
                 bucket_name: locator.bucket_name.to_string(),
