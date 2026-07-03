@@ -153,7 +153,7 @@ async fn docker_cluster_end_to_end() {
     // Initialise the Docker node's own control plane. These commands must run
     // inside the container because the server reads /var/lib/anvil, not the
     // runner's local development storage.
-    docker_admin(&compose_file_path, &["region", "create", "DOCKER_TEST"]);
+    docker_admin(&compose_file_path, &["region", "create", "docker-test"]);
     docker_admin(&compose_file_path, &["tenant", "create", "default"]);
 
     let app_out = docker_admin_output(
@@ -242,7 +242,7 @@ async fn docker_cluster_end_to_end() {
 
     let mut req = tonic::Request::new(anvil::anvil_api::CreateBucketRequest {
         bucket_name: private_bucket.clone(),
-        region: "DOCKER_TEST".into(),
+        region: "docker-test".into(),
     });
     req.metadata_mut().insert(
         "authorization",
@@ -254,7 +254,7 @@ async fn docker_cluster_end_to_end() {
 
     let mut req = tonic::Request::new(anvil::anvil_api::CreateBucketRequest {
         bucket_name: public_bucket.clone(),
-        region: "DOCKER_TEST".into(),
+        region: "docker-test".into(),
     });
     req.metadata_mut().insert(
         "authorization",
