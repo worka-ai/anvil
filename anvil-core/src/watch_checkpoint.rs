@@ -1,4 +1,11 @@
-use crate::{formats::hash32, storage::Storage};
+use crate::{
+    formats::hash32,
+    partition_fence::{
+        OWNERSHIP_EXPIRED, OWNERSHIP_NOT_FOUND, OWNERSHIP_OWNER_MISMATCH, OWNERSHIP_STALE_FENCE,
+        OwnershipResource, OwnershipResourceKind, read_ownership_fence,
+    },
+    storage::Storage,
+};
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use hmac::{Hmac, Mac};
@@ -36,6 +43,13 @@ pub struct WatchCheckpointUpdate {
     pub generation: u64,
     pub updated_by_node: String,
     pub updated_at_nanos: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchCheckpointWriteAuthority {
+    pub owner_node_id: String,
+    pub fence: u64,
+    pub resource_id: String,
 }
 
 impl WatchCheckpoint {
@@ -90,9 +104,11 @@ pub fn hash_watch_checkpoint(checkpoint: &WatchCheckpoint) -> Result<String> {
 pub async fn checkpoint_watch_consumer(
     storage: &Storage,
     update: WatchCheckpointUpdate,
+    authority: WatchCheckpointWriteAuthority,
     signing_key: &[u8],
 ) -> Result<WatchCheckpoint> {
     validate_update(&update)?;
+    validate_write_authority(storage, &update, &authority, signing_key).await?;
     let existing = read_watch_checkpoint(
         storage,
         &update.watch_stream_id,
@@ -111,6 +127,13 @@ pub async fn checkpoint_watch_consumer(
             || existing.partition_id != update.partition_id
         {
             return Err(anyhow!("watch checkpoint stream partition cannot change"));
+        }
+        if existing.cursor == update.cursor
+            && existing.source_manifest_hash != update.source_manifest_hash
+        {
+            return Err(anyhow!(
+                "ControlStreamDivergence: watch checkpoint digest differs for already applied cursor"
+            ));
         }
     }
 
@@ -133,6 +156,14 @@ pub async fn checkpoint_watch_consumer(
     Ok(checkpoint)
 }
 
+pub fn watch_checkpoint_resource_id(
+    watch_stream_id: &str,
+    partition_id: &str,
+    consumer_id: &str,
+) -> String {
+    format!("watch/{watch_stream_id}/partition/{partition_id}/consumer/{consumer_id}")
+}
+
 pub async fn read_watch_checkpoint(
     storage: &Storage,
     watch_stream_id: &str,
@@ -148,6 +179,62 @@ pub async fn read_watch_checkpoint(
         return Err(anyhow!("watch checkpoint path scope mismatch"));
     }
     Ok(Some(checkpoint))
+}
+
+async fn validate_write_authority(
+    storage: &Storage,
+    update: &WatchCheckpointUpdate,
+    authority: &WatchCheckpointWriteAuthority,
+    signing_key: &[u8],
+) -> Result<()> {
+    if authority.fence == 0 {
+        return Err(anyhow!("watch checkpoint write fence must be nonzero"));
+    }
+    if authority.owner_node_id != update.updated_by_node {
+        return Err(anyhow!(
+            "{OWNERSHIP_OWNER_MISMATCH}: watch checkpoint writer node mismatch"
+        ));
+    }
+    let expected_resource_id = watch_checkpoint_resource_id(
+        &update.watch_stream_id,
+        &update.partition_id,
+        &update.consumer_id,
+    );
+    if authority.resource_id != expected_resource_id {
+        return Err(anyhow!(
+            "{OWNERSHIP_OWNER_MISMATCH}: watch checkpoint authority resource mismatch"
+        ));
+    }
+    let resource = OwnershipResource {
+        resource_kind: OwnershipResourceKind::WatchPartition,
+        resource_id: authority.resource_id.clone(),
+    };
+    let Some(record) = read_ownership_fence(storage, 0, &resource, signing_key).await? else {
+        return Err(anyhow!(
+            "{OWNERSHIP_NOT_FOUND}: watch checkpoint ownership fence is absent"
+        ));
+    };
+    let now_nanos = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .ok_or_else(|| anyhow!("watch checkpoint timestamp overflow"))?;
+    if !record.is_active_unexpired(now_nanos) {
+        return Err(anyhow!(
+            "{OWNERSHIP_EXPIRED}: watch checkpoint ownership fence is not active"
+        ));
+    }
+    if record.owner.principal_id != authority.owner_node_id
+        || record.owner.actor_instance_id != authority.owner_node_id
+    {
+        return Err(anyhow!(
+            "{OWNERSHIP_OWNER_MISMATCH}: watch checkpoint ownership fence owner mismatch"
+        ));
+    }
+    if record.fence != authority.fence {
+        return Err(anyhow!(
+            "{OWNERSHIP_STALE_FENCE}: watch checkpoint ownership fence token mismatch"
+        ));
+    }
+    Ok(())
 }
 
 async fn write_watch_checkpoint(storage: &Storage, checkpoint: &WatchCheckpoint) -> Result<()> {
@@ -248,6 +335,10 @@ fn require_nonempty(value: &str, field: &'static str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::partition_fence::{
+        AcquireOwnership, ForceExpireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal,
+        OwnershipResource, OwnershipResourceKind, acquire_ownership, force_expire_ownership,
+    };
     use tempfile::tempdir;
 
     const KEY: &[u8] = b"watch checkpoint signing key";
@@ -256,7 +347,9 @@ mod tests {
     async fn watch_checkpoint_writes_reads_and_advances_cursor() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let first = checkpoint_watch_consumer(&storage, update(40, 1), KEY)
+        let first_update = update(40, 1);
+        let first_authority = authority(&storage, &first_update).await;
+        let first = checkpoint_watch_consumer(&storage, first_update, first_authority, KEY)
             .await
             .unwrap();
         assert_eq!(first.cursor, 40);
@@ -267,7 +360,9 @@ mod tests {
             .unwrap();
         assert!(path.ends_with("_anvil/watch/checkpoints/object-prefix/full-text-builder.json"));
 
-        let second = checkpoint_watch_consumer(&storage, update(75, 2), KEY)
+        let second_update = update(75, 2);
+        let second_authority = authority(&storage, &second_update).await;
+        let second = checkpoint_watch_consumer(&storage, second_update, second_authority, KEY)
             .await
             .unwrap();
         assert_eq!(second.cursor, 75);
@@ -285,25 +380,42 @@ mod tests {
     async fn watch_checkpoint_rejects_backwards_progress_and_partition_changes() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        checkpoint_watch_consumer(&storage, update(40, 3), KEY)
+        let first = update(40, 3);
+        let first_authority = authority(&storage, &first).await;
+        checkpoint_watch_consumer(&storage, first, first_authority, KEY)
             .await
             .unwrap();
+        let backwards_cursor = update(39, 4);
+        let backwards_cursor_authority = authority(&storage, &backwards_cursor).await;
         assert!(
-            checkpoint_watch_consumer(&storage, update(39, 4), KEY)
+            checkpoint_watch_consumer(&storage, backwards_cursor, backwards_cursor_authority, KEY)
                 .await
                 .is_err()
         );
+        let backwards_generation = update(41, 2);
+        let backwards_generation_authority = authority(&storage, &backwards_generation).await;
         assert!(
-            checkpoint_watch_consumer(&storage, update(41, 2), KEY)
-                .await
-                .is_err()
+            checkpoint_watch_consumer(
+                &storage,
+                backwards_generation,
+                backwards_generation_authority,
+                KEY
+            )
+            .await
+            .is_err()
         );
         let mut changed_partition = update(41, 4);
         changed_partition.partition_id = hex::encode([2; 32]);
+        let changed_partition_authority = authority(&storage, &changed_partition).await;
         assert!(
-            checkpoint_watch_consumer(&storage, changed_partition, KEY)
-                .await
-                .is_err()
+            checkpoint_watch_consumer(
+                &storage,
+                changed_partition,
+                changed_partition_authority,
+                KEY
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -311,7 +423,9 @@ mod tests {
     async fn watch_checkpoint_rejects_tamper_invalid_inputs_and_unsafe_paths() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        checkpoint_watch_consumer(&storage, update(40, 1), KEY)
+        let first = update(40, 1);
+        let first_authority = authority(&storage, &first).await;
+        checkpoint_watch_consumer(&storage, first, first_authority, KEY)
             .await
             .unwrap();
         let path = storage
@@ -340,11 +454,54 @@ mod tests {
         );
         let mut invalid = update(1, 1);
         invalid.source_manifest_hash = "not-hex".to_string();
+        let invalid_authority = WatchCheckpointWriteAuthority {
+            owner_node_id: "node-a".to_string(),
+            fence: 1,
+            resource_id: watch_checkpoint_resource_id(
+                &invalid.watch_stream_id,
+                &invalid.partition_id,
+                &invalid.consumer_id,
+            ),
+        };
         assert!(
-            checkpoint_watch_consumer(&storage, invalid, KEY)
+            checkpoint_watch_consumer(&storage, invalid, invalid_authority, KEY)
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn watch_checkpoint_rejects_stale_or_mismatched_fence() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let first_update = update(40, 1);
+        let valid = authority(&storage, &first_update).await;
+
+        let stale = WatchCheckpointWriteAuthority {
+            fence: valid.fence.saturating_add(1),
+            ..valid.clone()
+        };
+        let err = checkpoint_watch_consumer(&storage, first_update.clone(), stale, KEY)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("StaleFence"));
+
+        let wrong_owner = WatchCheckpointWriteAuthority {
+            owner_node_id: "node-b".to_string(),
+            ..valid
+        };
+        let err = checkpoint_watch_consumer(&storage, first_update, wrong_owner, KEY)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("OwnershipOwnerMismatch"));
+
+        let next_update = update(41, 2);
+        let stale_after_failover = authority(&storage, &next_update).await;
+        replace_watch_checkpoint_owner(&storage, &stale_after_failover).await;
+        let err = checkpoint_watch_consumer(&storage, next_update, stale_after_failover, KEY)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("OwnershipOwnerMismatch"));
     }
 
     fn update(cursor: u128, generation: u64) -> WatchCheckpointUpdate {
@@ -359,5 +516,101 @@ mod tests {
             updated_by_node: "node-a".to_string(),
             updated_at_nanos: 1000 + i64::try_from(cursor).unwrap(),
         }
+    }
+
+    async fn authority(
+        storage: &Storage,
+        update: &WatchCheckpointUpdate,
+    ) -> WatchCheckpointWriteAuthority {
+        let resource_id = watch_checkpoint_resource_id(
+            &update.watch_stream_id,
+            &update.partition_id,
+            &update.consumer_id,
+        );
+        let outcome = acquire_ownership(
+            storage,
+            AcquireOwnership {
+                request_id: format!("test-watch-checkpoint-{resource_id}"),
+                idempotency_key: format!("test-watch-checkpoint-{resource_id}"),
+                resource: OwnershipResource {
+                    resource_kind: OwnershipResourceKind::WatchPartition,
+                    resource_id: resource_id.clone(),
+                },
+                owner: OwnershipPrincipal {
+                    tenant_id: 0,
+                    principal_kind: "node".to_string(),
+                    principal_id: update.updated_by_node.clone(),
+                    actor_instance_id: update.updated_by_node.clone(),
+                    display_name: update.updated_by_node.clone(),
+                    region: "test-region".to_string(),
+                    cell: "default".to_string(),
+                },
+                now_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap(),
+                ttl_nanos: i64::try_from(MAX_OWNERSHIP_LEASE_MS)
+                    .unwrap()
+                    .saturating_mul(1_000_000),
+            },
+            KEY,
+        )
+        .await
+        .unwrap();
+        WatchCheckpointWriteAuthority {
+            owner_node_id: update.updated_by_node.clone(),
+            fence: outcome.record.fence,
+            resource_id,
+        }
+    }
+
+    async fn replace_watch_checkpoint_owner(
+        storage: &Storage,
+        stale_authority: &WatchCheckpointWriteAuthority,
+    ) {
+        let resource = OwnershipResource {
+            resource_kind: OwnershipResourceKind::WatchPartition,
+            resource_id: stale_authority.resource_id.clone(),
+        };
+        let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+        force_expire_ownership(
+            storage,
+            ForceExpireOwnership {
+                request_id: format!(
+                    "test-watch-checkpoint-expire-{}",
+                    stale_authority.resource_id
+                ),
+                idempotency_key: format!(
+                    "test-watch-checkpoint-expire-{}",
+                    stale_authority.resource_id
+                ),
+                resource: resource.clone(),
+                admin: OwnershipPrincipal::node("admin-node"),
+                reason: "test ownership failover".to_string(),
+                now_nanos,
+            },
+            KEY,
+        )
+        .await
+        .unwrap();
+        acquire_ownership(
+            storage,
+            AcquireOwnership {
+                request_id: format!(
+                    "test-watch-checkpoint-replacement-{}",
+                    stale_authority.resource_id
+                ),
+                idempotency_key: format!(
+                    "test-watch-checkpoint-replacement-{}",
+                    stale_authority.resource_id
+                ),
+                resource,
+                owner: OwnershipPrincipal::node("node-b"),
+                now_nanos: now_nanos.saturating_add(1),
+                ttl_nanos: i64::try_from(MAX_OWNERSHIP_LEASE_MS)
+                    .unwrap()
+                    .saturating_mul(1_000_000),
+            },
+            KEY,
+        )
+        .await
+        .unwrap();
     }
 }

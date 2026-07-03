@@ -132,6 +132,10 @@ impl PersonalDbService for AppState {
         {
             return Err(Status::already_exists("PersonalDB group already exists"));
         }
+        self.persistence
+            .ensure_personaldb_group_ownership_fence(claims.tenant_id, &req.database_id)
+            .await
+            .map_err(personaldb_ownership_status)?;
 
         let now = now_rfc3339();
         let manifest = PersonalDbGroupManifest {
@@ -622,6 +626,10 @@ impl AppState {
         recovered_manifest_hash: &str,
     ) -> Result<PartitionWritePermit, Status> {
         validate_hex32(recovered_manifest_hash, "recovered_manifest_hash")?;
+        self.persistence
+            .ensure_personaldb_group_ownership_fence(tenant_id, database_id)
+            .await
+            .map_err(personaldb_ownership_status)?;
         let partition_family = personaldb_group_partition_family().to_string();
         let partition_id = personaldb_group_partition_id(tenant_id, database_id);
         let owner_node_id = self.personaldb_node_id();
@@ -1925,6 +1933,12 @@ fn now_rfc3339() -> String {
 
 fn internal_status(err: impl std::fmt::Display) -> Status {
     Status::internal(err.to_string())
+}
+
+fn personaldb_ownership_status(err: impl std::fmt::Display) -> Status {
+    Status::failed_precondition(format!(
+        "PersonalDB group ownership fence is not current: {err}"
+    ))
 }
 
 fn projection_writeback_rejected(reason: &'static str) -> Status {

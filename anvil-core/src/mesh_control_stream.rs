@@ -644,6 +644,39 @@ pub async fn write_control_checkpoint(
         &checkpoint.stream_family,
         &checkpoint.partition,
     )?;
+    if let Some(existing) = read_control_checkpoint(
+        storage,
+        &checkpoint.region,
+        &checkpoint.stream_family,
+        &checkpoint.partition,
+    )
+    .await?
+    {
+        if checkpoint.last_sequence < existing.last_sequence {
+            return Err(anyhow!(
+                "control checkpoint cannot move backwards for {}/{}/{}: existing sequence {}, new sequence {}",
+                checkpoint.region,
+                checkpoint.stream_family,
+                checkpoint.partition,
+                existing.last_sequence.get(),
+                checkpoint.last_sequence.get()
+            ));
+        }
+        if checkpoint.last_sequence == existing.last_sequence {
+            if checkpoint.last_digest.as_str() != existing.last_digest.as_str() {
+                return Err(anyhow!(
+                    "ControlStreamDivergence: control checkpoint {}/{}/{} sequence {} has digest {}, existing digest {}",
+                    checkpoint.region,
+                    checkpoint.stream_family,
+                    checkpoint.partition,
+                    checkpoint.last_sequence.get(),
+                    checkpoint.last_digest,
+                    existing.last_digest
+                ));
+            }
+            return Ok(());
+        }
+    }
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -1219,6 +1252,163 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("control stream log has partial final frame")
+        );
+    }
+
+    #[tokio::test]
+    async fn control_checkpoint_round_trips_and_rejects_path_body_scope_mismatch() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::new_at(dir.path()).await.unwrap();
+        let digest = ControlRecordDigest::blake3(b"checkpointed-record");
+        let checkpoint = ControlCheckpointRecord::new(
+            "mesh-a",
+            "eu-west-1",
+            "bucket_locator",
+            "0a7f",
+            ControlStreamSequence::new(7).unwrap(),
+            digest.clone(),
+            "2026-07-02T00:00:00Z",
+        );
+
+        write_control_checkpoint(&storage, &checkpoint)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_control_checkpoint(&storage, "eu-west-1", "bucket_locator", "0a7f")
+                .await
+                .unwrap(),
+            Some(checkpoint)
+        );
+
+        let scoped_path = storage
+            .mesh_control_checkpoint_path("eu-west-1", "bucket_locator", "0a7f")
+            .unwrap();
+        let mismatched_body = ControlCheckpointRecord::new(
+            "mesh-a",
+            "us-east-1",
+            "tenant_name",
+            "ffff",
+            ControlStreamSequence::new(7).unwrap(),
+            digest,
+            "2026-07-02T00:00:00Z",
+        );
+        tokio::fs::write(
+            scoped_path,
+            serde_json::to_vec_pretty(&mismatched_body).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let err = read_control_checkpoint(&storage, "eu-west-1", "bucket_locator", "0a7f")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("control checkpoint path does not match checkpoint body"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_checkpoint_rejects_unsafe_path_scopes() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::new_at(dir.path()).await.unwrap();
+        let checkpoint = ControlCheckpointRecord::new(
+            "mesh-a",
+            "../escape",
+            "bucket_locator",
+            "0a7f",
+            ControlStreamSequence::new(1).unwrap(),
+            ControlRecordDigest::blake3(b"checkpointed-record"),
+            "2026-07-02T00:00:00Z",
+        );
+
+        let err = write_control_checkpoint(&storage, &checkpoint)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("control checkpoint region is not a safe path component"),
+            "unexpected error: {err}"
+        );
+
+        let err = read_control_checkpoint(&storage, "eu-west-1", "bucket_locator", "0A7F")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("control stream partition must be four lowercase hex characters"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_checkpoint_is_monotonic_idempotent_and_digest_scoped() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::new_at(dir.path()).await.unwrap();
+        let first_digest = ControlRecordDigest::blake3(b"first");
+        let first = ControlCheckpointRecord::new(
+            "mesh-a",
+            "eu-west-1",
+            "bucket_locator",
+            "0a7f",
+            ControlStreamSequence::new(4).unwrap(),
+            first_digest.clone(),
+            "2026-07-02T00:00:00Z",
+        );
+        write_control_checkpoint(&storage, &first).await.unwrap();
+        write_control_checkpoint(&storage, &first).await.unwrap();
+
+        let same_sequence_different_digest = ControlCheckpointRecord::new(
+            "mesh-a",
+            "eu-west-1",
+            "bucket_locator",
+            "0a7f",
+            ControlStreamSequence::new(4).unwrap(),
+            ControlRecordDigest::blake3(b"diverged"),
+            "2026-07-02T00:01:00Z",
+        );
+        let err = write_control_checkpoint(&storage, &same_sequence_different_digest)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("ControlStreamDivergence"),
+            "unexpected error: {err}"
+        );
+
+        let backwards = ControlCheckpointRecord::new(
+            "mesh-a",
+            "eu-west-1",
+            "bucket_locator",
+            "0a7f",
+            ControlStreamSequence::new(3).unwrap(),
+            first_digest,
+            "2026-07-02T00:02:00Z",
+        );
+        let err = write_control_checkpoint(&storage, &backwards)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("control checkpoint cannot move backwards"),
+            "unexpected error: {err}"
+        );
+
+        let advanced = ControlCheckpointRecord::new(
+            "mesh-a",
+            "eu-west-1",
+            "bucket_locator",
+            "0a7f",
+            ControlStreamSequence::new(5).unwrap(),
+            ControlRecordDigest::blake3(b"advanced"),
+            "2026-07-02T00:03:00Z",
+        );
+        write_control_checkpoint(&storage, &advanced).await.unwrap();
+        assert_eq!(
+            read_control_checkpoint(&storage, "eu-west-1", "bucket_locator", "0a7f")
+                .await
+                .unwrap(),
+            Some(advanced)
         );
     }
 

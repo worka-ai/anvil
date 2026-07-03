@@ -994,6 +994,8 @@ impl Persistence {
         if self.partition_owner_signing_key.is_empty() {
             return Err(anyhow!("partition owner signing key must not be empty"));
         }
+        self.ensure_owner_node_can_acquire_new_partition(partition_family)
+            .await?;
         if let Some(owner) = read_partition_owner(
             &self.storage,
             partition_family,
@@ -1008,8 +1010,6 @@ impl Persistence {
                 return owner.write_permit().map_err(Into::into);
             }
         }
-        self.ensure_owner_node_can_acquire_new_partition(partition_family)
-            .await?;
 
         let now_nanos = Utc::now()
             .timestamp_nanos_opt()
@@ -1073,6 +1073,113 @@ impl Persistence {
             node.state,
             partition_family
         ))
+    }
+
+    async fn owned_write_permit(
+        &self,
+        resource_kind: OwnershipResourceKind,
+        resource_id: String,
+        partition_family: &str,
+        partition_id: String,
+    ) -> Result<PartitionWritePermit> {
+        self.ensure_ownership_fence(resource_kind, resource_id)
+            .await?;
+        self.global_write_permit(partition_family, partition_id)
+            .await
+    }
+
+    pub(crate) async fn ensure_ownership_fence(
+        &self,
+        resource_kind: OwnershipResourceKind,
+        resource_id: String,
+    ) -> Result<()> {
+        let resource = OwnershipResource {
+            resource_kind,
+            resource_id,
+        };
+        let owner = self.ownership_principal();
+        let now_nanos = Utc::now()
+            .timestamp_nanos_opt()
+            .ok_or_else(|| anyhow!("ownership timestamp overflow"))?;
+        let ttl_nanos = i64::try_from(MAX_OWNERSHIP_LEASE_MS)?.saturating_mul(1_000_000);
+
+        if let Some(record) = read_ownership_fence(
+            &self.storage,
+            owner.tenant_id,
+            &resource,
+            &self.partition_owner_signing_key,
+        )
+        .await?
+        {
+            if record.owner == owner && record.is_active_unexpired(now_nanos) {
+                renew_ownership(
+                    &self.storage,
+                    RenewOwnership {
+                        request_id: format!(
+                            "owned-write-renew-{}-{}",
+                            resource.resource_kind.as_str(),
+                            resource.resource_id
+                        ),
+                        resource: resource.clone(),
+                        owner: owner.clone(),
+                        current_fence: record.fence,
+                        now_nanos,
+                        ttl_nanos,
+                    },
+                    &self.partition_owner_signing_key,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+
+        acquire_ownership(
+            &self.storage,
+            AcquireOwnership {
+                request_id: format!(
+                    "owned-write-acquire-{}-{}",
+                    resource.resource_kind.as_str(),
+                    resource.resource_id
+                ),
+                idempotency_key: format!(
+                    "owned-write-owner-{}-{}",
+                    resource.resource_kind.as_str(),
+                    resource.resource_id
+                ),
+                resource,
+                owner,
+                now_nanos,
+                ttl_nanos,
+            },
+            &self.partition_owner_signing_key,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn ensure_personaldb_group_ownership_fence(
+        &self,
+        tenant_id: i64,
+        database_id: &str,
+    ) -> Result<()> {
+        self.ensure_ownership_fence(
+            OwnershipResourceKind::PersonalDbGroup,
+            format!("tenant/{tenant_id}/personaldb/{database_id}"),
+        )
+        .await
+    }
+
+    pub(crate) async fn ensure_index_build_ownership_fence(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        index_storage_id: &str,
+    ) -> Result<()> {
+        self.ensure_ownership_fence(
+            OwnershipResourceKind::IndexPartition,
+            format!("tenant/{tenant_id}/bucket/{bucket_id}/index_build/{index_storage_id}"),
+        )
+        .await
     }
 
     async fn control_write_permit(&self) -> Result<PartitionWritePermit> {
@@ -1190,9 +1297,12 @@ impl Persistence {
     }
 
     async fn task_queue_write_permit(&self) -> Result<PartitionWritePermit> {
-        self.global_write_permit(
+        let partition_id = hex::encode(task_journal::task_queue_partition_id());
+        self.owned_write_permit(
+            OwnershipResourceKind::TaskQueue,
+            format!("task_queue/{partition_id}"),
             "task_queue",
-            hex::encode(task_journal::task_queue_partition_id()),
+            partition_id,
         )
         .await
     }
@@ -1211,17 +1321,23 @@ impl Persistence {
     }
 
     async fn bucket_tenant_write_permit(&self, tenant_id: i64) -> Result<PartitionWritePermit> {
-        self.global_write_permit(
+        let partition_id = hex::encode(bucket_journal::tenant_bucket_partition_id(tenant_id));
+        self.owned_write_permit(
+            OwnershipResourceKind::BucketPrimary,
+            format!("tenant/{tenant_id}/bucket_metadata/{partition_id}"),
             "bucket_metadata",
-            hex::encode(bucket_journal::tenant_bucket_partition_id(tenant_id)),
+            partition_id,
         )
         .await
     }
 
     async fn bucket_global_write_permit(&self) -> Result<PartitionWritePermit> {
-        self.global_write_permit(
+        let partition_id = hex::encode(bucket_journal::global_bucket_partition_id());
+        self.owned_write_permit(
+            OwnershipResourceKind::BucketPrimary,
+            format!("global/bucket_metadata/{partition_id}"),
             "bucket_metadata",
-            hex::encode(bucket_journal::global_bucket_partition_id()),
+            partition_id,
         )
         .await
     }
@@ -1231,11 +1347,14 @@ impl Persistence {
         tenant_id: i64,
         bucket_id: i64,
     ) -> Result<PartitionWritePermit> {
-        self.global_write_permit(
+        let partition_id = hex::encode(metadata_journal::object_metadata_partition_id(
+            tenant_id, bucket_id,
+        ));
+        self.owned_write_permit(
+            OwnershipResourceKind::ObjectPartition,
+            format!("tenant/{tenant_id}/bucket/{bucket_id}/object_metadata/{partition_id}"),
             "object_metadata",
-            hex::encode(metadata_journal::object_metadata_partition_id(
-                tenant_id, bucket_id,
-            )),
+            partition_id,
         )
         .await
     }
@@ -1245,11 +1364,14 @@ impl Persistence {
         tenant_id: i64,
         bucket_id: i64,
     ) -> Result<PartitionWritePermit> {
-        self.global_write_permit(
+        let partition_id = hex::encode(multipart_journal::multipart_metadata_partition_id(
+            tenant_id, bucket_id,
+        ));
+        self.owned_write_permit(
+            OwnershipResourceKind::ObjectPartition,
+            format!("tenant/{tenant_id}/bucket/{bucket_id}/multipart_metadata/{partition_id}"),
             "multipart_metadata",
-            hex::encode(multipart_journal::multipart_metadata_partition_id(
-                tenant_id, bucket_id,
-            )),
+            partition_id,
         )
         .await
     }
@@ -1259,11 +1381,14 @@ impl Persistence {
         tenant_id: i64,
         bucket_id: i64,
     ) -> Result<PartitionWritePermit> {
-        self.global_write_permit(
+        let partition_id = hex::encode(append_journal::append_metadata_partition_id(
+            tenant_id, bucket_id,
+        ));
+        self.owned_write_permit(
+            OwnershipResourceKind::ObjectPartition,
+            format!("tenant/{tenant_id}/bucket/{bucket_id}/append_metadata/{partition_id}"),
             "append_metadata",
-            hex::encode(append_journal::append_metadata_partition_id(
-                tenant_id, bucket_id,
-            )),
+            partition_id,
         )
         .await
     }
@@ -1273,11 +1398,14 @@ impl Persistence {
         tenant_id: i64,
         bucket_id: i64,
     ) -> Result<PartitionWritePermit> {
-        self.global_write_permit(
+        let partition_id = hex::encode(manifest_journal::manifest_cas_partition_id(
+            tenant_id, bucket_id,
+        ));
+        self.owned_write_permit(
+            OwnershipResourceKind::ObjectPartition,
+            format!("tenant/{tenant_id}/bucket/{bucket_id}/manifest_cas/{partition_id}"),
             "manifest_cas",
-            hex::encode(manifest_journal::manifest_cas_partition_id(
-                tenant_id, bucket_id,
-            )),
+            partition_id,
         )
         .await
     }
@@ -1309,11 +1437,14 @@ impl Persistence {
         tenant_id: i64,
         bucket_id: i64,
     ) -> Result<PartitionWritePermit> {
-        self.global_write_permit(
+        let partition_id = hex::encode(index_journal::index_definition_partition_id(
+            tenant_id, bucket_id,
+        ));
+        self.owned_write_permit(
+            OwnershipResourceKind::IndexPartition,
+            format!("tenant/{tenant_id}/bucket/{bucket_id}/index_definition/{partition_id}"),
             "index_definition",
-            hex::encode(index_journal::index_definition_partition_id(
-                tenant_id, bucket_id,
-            )),
+            partition_id,
         )
         .await
     }
@@ -1323,11 +1454,14 @@ impl Persistence {
         tenant_id: i64,
         bucket_id: i64,
     ) -> Result<PartitionWritePermit> {
-        self.global_write_permit(
+        let partition_id = hex::encode(index_diagnostic_journal::index_diagnostic_partition_id(
+            tenant_id, bucket_id,
+        ));
+        self.owned_write_permit(
+            OwnershipResourceKind::IndexPartition,
+            format!("tenant/{tenant_id}/bucket/{bucket_id}/index_diagnostic/{partition_id}"),
             "index_diagnostic",
-            hex::encode(index_diagnostic_journal::index_diagnostic_partition_id(
-                tenant_id, bucket_id,
-            )),
+            partition_id,
         )
         .await
     }
@@ -4058,6 +4192,9 @@ impl Persistence {
         if !index.enabled || index.version != index_version {
             return Ok(None);
         }
+        let index_storage_id = index_journal::index_storage_id(tenant_id, bucket_id, index.id);
+        self.ensure_index_build_ownership_fence(tenant_id, bucket_id, &index_storage_id)
+            .await?;
         let outcome = match index.kind.as_str() {
             "full_text" => {
                 index_builder::build_full_text_index(
@@ -6143,6 +6280,76 @@ mod tests {
                 .versions
                 .len(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn object_metadata_writes_require_rfc_ownership_fence() {
+        let temp = tempdir().unwrap();
+        let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+        register_active_mesh_placement(&persistence).await;
+        let tenant = persistence
+            .create_tenant("tenant-a", "unused")
+            .await
+            .unwrap();
+        let bucket = persistence
+            .create_bucket(tenant.id, "docs", "test-region")
+            .await
+            .unwrap();
+        let partition_id = hex::encode(metadata_journal::object_metadata_partition_id(
+            tenant.id, bucket.id,
+        ));
+        let resource = OwnershipResource {
+            resource_kind: OwnershipResourceKind::ObjectPartition,
+            resource_id: format!(
+                "tenant/{}/bucket/{}/object_metadata/{partition_id}",
+                tenant.id, bucket.id
+            ),
+        };
+        let now_nanos = Utc::now().timestamp_nanos_opt().unwrap();
+        acquire_ownership(
+            &persistence.storage,
+            AcquireOwnership {
+                request_id: "other-node-object-owner".to_string(),
+                idempotency_key: "other-node-object-owner".to_string(),
+                resource,
+                owner: OwnershipPrincipal {
+                    tenant_id: 0,
+                    principal_kind: "node".to_string(),
+                    principal_id: "other-node".to_string(),
+                    actor_instance_id: "other-node".to_string(),
+                    display_name: "other-node".to_string(),
+                    region: "test-region".to_string(),
+                    cell: "default".to_string(),
+                },
+                now_nanos,
+                ttl_nanos: i64::try_from(MAX_OWNERSHIP_LEASE_MS)
+                    .unwrap()
+                    .saturating_mul(1_000_000),
+            },
+            &persistence.partition_owner_signing_key,
+        )
+        .await
+        .unwrap();
+
+        let err = persistence
+            .create_object(
+                tenant.id,
+                bucket.id,
+                "blocked.txt",
+                "payload-hash",
+                1,
+                "etag",
+                Some("text/plain"),
+                None,
+                None,
+                Some(b"x".to_vec()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("OwnershipHeld"),
+            "unexpected error: {err}"
         );
     }
 

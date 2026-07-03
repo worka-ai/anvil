@@ -12,12 +12,17 @@ use crate::media_extraction::{
     execute_media_extraction,
 };
 use crate::metadata_journal;
+use crate::partition_fence::{
+    AcquireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal, OwnershipResource,
+    OwnershipResourceKind, RenewOwnership, acquire_ownership, read_ownership_fence,
+    renew_ownership,
+};
 use crate::persistence::{Bucket, IndexDefinition, Object};
 use crate::storage::{ExternalChunkManifest, Storage};
 use crate::vector_segment::{self, VectorSegmentEntry, VectorSegmentWrite};
 use crate::{
     derived_index_proof::{self, DerivedIndexProofWrite},
-    watch_checkpoint::{self, WatchCheckpointUpdate},
+    watch_checkpoint::{self, WatchCheckpointUpdate, WatchCheckpointWriteAuthority},
 };
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -118,6 +123,15 @@ pub async fn build_full_text_index(
             .await?
             .map(|segment| segment.header.generation)
             .unwrap_or(0);
+    ensure_index_build_authority(
+        storage,
+        index.tenant_id,
+        index.bucket_id,
+        &index_storage_id,
+        builder_node_id,
+        partition_owner_signing_key,
+    )
+    .await?;
     let generation = latest_generation
         .saturating_add(1)
         .max(u64::try_from(source_cursor).unwrap_or(u64::MAX))
@@ -255,6 +269,30 @@ pub async fn build_full_text_index(
         source_cursor.max(u128::from(generation)),
     )
     .await?;
+    let watch_payload = IndexPartitionWatchPayload {
+        index_id: index_storage_id.clone(),
+        index_kind: index.kind.clone(),
+        event_type: "segment_built".to_string(),
+        generation,
+        source_cursor,
+        source_manifest_hash,
+        proof_hash: proof
+            .proof_hash
+            .clone()
+            .ok_or_else(|| anyhow!("derived index proof was not sealed"))?,
+        segment_hashes: vec![segment_hash.clone()],
+        emitted_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let watch_authority = acquire_index_partition_watch_authority(
+        storage,
+        index.tenant_id,
+        index.bucket_id,
+        &partition_id,
+        &watch_payload,
+        builder_node_id,
+        partition_owner_signing_key,
+    )
+    .await?;
     index_partition_watch::append_index_partition_watch_record(
         storage,
         index.tenant_id,
@@ -263,20 +301,9 @@ pub async fn build_full_text_index(
         watch_cursor,
         *uuid::Uuid::new_v4().as_bytes(),
         latest_authz_revision_for_documents(&owned_documents),
-        IndexPartitionWatchPayload {
-            index_id: index_storage_id.clone(),
-            index_kind: index.kind.clone(),
-            event_type: "segment_built".to_string(),
-            generation,
-            source_cursor,
-            source_manifest_hash,
-            proof_hash: proof
-                .proof_hash
-                .clone()
-                .ok_or_else(|| anyhow!("derived index proof was not sealed"))?,
-            segment_hashes: vec![segment_hash.clone()],
-            emitted_at: chrono::Utc::now().to_rfc3339(),
-        },
+        watch_payload,
+        watch_authority,
+        partition_owner_signing_key,
     )
     .await?;
 
@@ -408,6 +435,15 @@ async fn build_vector_index_with_policy(
         .await?
         .map(|segment| segment.header.generation)
         .unwrap_or(0);
+    ensure_index_build_authority(
+        storage,
+        index.tenant_id,
+        index.bucket_id,
+        &index_storage_id,
+        builder_node_id,
+        partition_owner_signing_key,
+    )
+    .await?;
     let generation = latest_generation
         .saturating_add(1)
         .max(u64::try_from(source_cursor).unwrap_or(u64::MAX))
@@ -548,6 +584,30 @@ async fn build_vector_index_with_policy(
         source_cursor.max(u128::from(generation)),
     )
     .await?;
+    let watch_payload = IndexPartitionWatchPayload {
+        index_id: index_storage_id.clone(),
+        index_kind: outcome_kind.to_string(),
+        event_type: "segment_built".to_string(),
+        generation,
+        source_cursor,
+        source_manifest_hash,
+        proof_hash: proof
+            .proof_hash
+            .clone()
+            .ok_or_else(|| anyhow!("derived index proof was not sealed"))?,
+        segment_hashes: vec![segment_hash.clone()],
+        emitted_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let watch_authority = acquire_index_partition_watch_authority(
+        storage,
+        index.tenant_id,
+        index.bucket_id,
+        &partition_id,
+        &watch_payload,
+        builder_node_id,
+        partition_owner_signing_key,
+    )
+    .await?;
     index_partition_watch::append_index_partition_watch_record(
         storage,
         index.tenant_id,
@@ -556,20 +616,9 @@ async fn build_vector_index_with_policy(
         watch_cursor,
         *uuid::Uuid::new_v4().as_bytes(),
         latest_authz_revision_for_vectors(&vector_documents),
-        IndexPartitionWatchPayload {
-            index_id: index_storage_id.clone(),
-            index_kind: outcome_kind.to_string(),
-            event_type: "segment_built".to_string(),
-            generation,
-            source_cursor,
-            source_manifest_hash,
-            proof_hash: proof
-                .proof_hash
-                .clone()
-                .ok_or_else(|| anyhow!("derived index proof was not sealed"))?,
-            segment_hashes: vec![segment_hash.clone()],
-            emitted_at: chrono::Utc::now().to_rfc3339(),
-        },
+        watch_payload,
+        watch_authority,
+        partition_owner_signing_key,
     )
     .await?;
 
@@ -619,26 +668,177 @@ async fn publish_index_build_proof_and_checkpoint(
         signing_key,
     )
     .await?;
+    let checkpoint_update = WatchCheckpointUpdate {
+        watch_stream_id: "object_metadata".to_string(),
+        partition_family: "object_metadata".to_string(),
+        partition_id: hex::encode(metadata_journal::object_metadata_partition_id(
+            bucket.tenant_id,
+            bucket.id,
+        )),
+        consumer_id: index_storage_id.to_string(),
+        cursor: source_cursor,
+        source_manifest_hash: source_manifest_hash.to_string(),
+        generation,
+        updated_by_node: builder_node_id.to_string(),
+        updated_at_nanos: built_at_nanos,
+    };
+    let checkpoint_authority = acquire_watch_checkpoint_authority(
+        storage,
+        &checkpoint_update,
+        builder_node_id,
+        signing_key,
+    )
+    .await?;
     watch_checkpoint::checkpoint_watch_consumer(
         storage,
-        WatchCheckpointUpdate {
-            watch_stream_id: "object_metadata".to_string(),
-            partition_family: "object_metadata".to_string(),
-            partition_id: hex::encode(metadata_journal::object_metadata_partition_id(
-                bucket.tenant_id,
-                bucket.id,
-            )),
-            consumer_id: index_storage_id.to_string(),
-            cursor: source_cursor,
-            source_manifest_hash: source_manifest_hash.to_string(),
-            generation,
-            updated_by_node: builder_node_id.to_string(),
-            updated_at_nanos: built_at_nanos,
-        },
+        checkpoint_update,
+        checkpoint_authority,
         signing_key,
     )
     .await?;
     Ok(proof)
+}
+
+async fn ensure_index_build_authority(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+    index_storage_id: &str,
+    builder_node_id: &str,
+    signing_key: &[u8],
+) -> Result<()> {
+    let resource = OwnershipResource {
+        resource_kind: OwnershipResourceKind::IndexPartition,
+        resource_id: format!(
+            "tenant/{tenant_id}/bucket/{bucket_id}/index_build/{index_storage_id}"
+        ),
+    };
+    let owner = OwnershipPrincipal::node(builder_node_id);
+    let now_nanos = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .ok_or_else(|| anyhow!("timestamp cannot be represented in nanoseconds"))?;
+    let ttl_nanos = i64::try_from(MAX_OWNERSHIP_LEASE_MS)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1_000_000);
+
+    if let Some(record) =
+        read_ownership_fence(storage, owner.tenant_id, &resource, signing_key).await?
+        && record.owner.same_security_owner(&owner)
+        && record.is_active_unexpired(now_nanos)
+    {
+        renew_ownership(
+            storage,
+            RenewOwnership {
+                request_id: format!("index-build-renew-{}", resource.resource_id),
+                resource,
+                owner,
+                current_fence: record.fence,
+                now_nanos,
+                ttl_nanos,
+            },
+            signing_key,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    acquire_ownership(
+        storage,
+        AcquireOwnership {
+            request_id: format!("index-build-acquire-{}", resource.resource_id),
+            idempotency_key: format!("index-build-owner-{}", resource.resource_id),
+            resource,
+            owner,
+            now_nanos,
+            ttl_nanos,
+        },
+        signing_key,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn acquire_watch_checkpoint_authority(
+    storage: &Storage,
+    update: &WatchCheckpointUpdate,
+    builder_node_id: &str,
+    signing_key: &[u8],
+) -> Result<WatchCheckpointWriteAuthority> {
+    let resource_id = watch_checkpoint::watch_checkpoint_resource_id(
+        &update.watch_stream_id,
+        &update.partition_id,
+        &update.consumer_id,
+    );
+    let now_nanos = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .ok_or_else(|| anyhow!("timestamp cannot be represented in nanoseconds"))?;
+    let outcome = acquire_ownership(
+        storage,
+        AcquireOwnership {
+            request_id: format!("watch-checkpoint-{resource_id}-{builder_node_id}"),
+            idempotency_key: format!("watch-checkpoint-{resource_id}-{builder_node_id}"),
+            resource: OwnershipResource {
+                resource_kind: OwnershipResourceKind::WatchPartition,
+                resource_id: resource_id.clone(),
+            },
+            owner: OwnershipPrincipal::node(builder_node_id),
+            now_nanos,
+            ttl_nanos: i64::try_from(MAX_OWNERSHIP_LEASE_MS)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1_000_000),
+        },
+        signing_key,
+    )
+    .await?;
+    Ok(WatchCheckpointWriteAuthority {
+        owner_node_id: builder_node_id.to_string(),
+        fence: outcome.record.fence,
+        resource_id,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn acquire_index_partition_watch_authority(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+    partition_id: &str,
+    payload: &IndexPartitionWatchPayload,
+    builder_node_id: &str,
+    signing_key: &[u8],
+) -> Result<index_partition_watch::IndexPartitionWatchWriteAuthority> {
+    let resource_id = index_partition_watch::index_partition_watch_resource_id(
+        tenant_id,
+        bucket_id,
+        &payload.index_id,
+        partition_id,
+    );
+    let now_nanos = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .ok_or_else(|| anyhow!("timestamp cannot be represented in nanoseconds"))?;
+    let outcome = acquire_ownership(
+        storage,
+        AcquireOwnership {
+            request_id: format!("index-watch-{resource_id}-{builder_node_id}"),
+            idempotency_key: format!("index-watch-{resource_id}-{builder_node_id}"),
+            resource: OwnershipResource {
+                resource_kind: OwnershipResourceKind::WatchPartition,
+                resource_id: resource_id.clone(),
+            },
+            owner: OwnershipPrincipal::node(builder_node_id),
+            now_nanos,
+            ttl_nanos: i64::try_from(MAX_OWNERSHIP_LEASE_MS)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1_000_000),
+        },
+        signing_key,
+    )
+    .await?;
+    Ok(index_partition_watch::IndexPartitionWatchWriteAuthority {
+        owner_node_id: builder_node_id.to_string(),
+        fence: outcome.record.fence,
+        resource_id,
+    })
 }
 
 async fn next_index_watch_cursor(
