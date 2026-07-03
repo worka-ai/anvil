@@ -271,13 +271,15 @@ redirect_preferred | proxy_preferred | proxy_required | local_only
 
 `local_only` rejects remote-region requests and is intended for deployments without inter-region proxying.
 
+Implementations MUST expose this choice as deterministic configuration. The default policy is `redirect_preferred`. If the internal proxy service is not implemented or not enabled, the implementation MUST evaluate proxy availability as false: `proxy_required` MUST return an explicit unavailable error, `proxy_preferred` MUST use its configured redirect fallback, and `local_only` MUST reject rather than silently redirecting or serving local metadata.
+
 Default proxyable methods:
 
 ```text
 GET | HEAD | OPTIONS | PUT | POST | DELETE | PATCH
 ```
 
-A deployment MAY disable proxying for large uploads and return a redirect instead. For ordinary HTTP redirects Anvil MUST use `307` or `308` for methods with request bodies so the method and body are preserved. For S3-compatible wrong-region responses, Anvil MUST use the protocol-compatible status and `x-amz-bucket-region` header.
+A deployment MAY disable proxying for large uploads and return a redirect instead. For ordinary HTTP redirects Anvil MUST use `307` or `308` for methods with request bodies so the method and body are preserved. For S3-compatible wrong-region responses, Anvil MUST use the protocol-compatible status and `x-amz-bucket-region` header. When a remote bucket locator is found before object execution, the same policy decision MUST be applied before falling back to local bucket metadata so stale or incomplete local metadata cannot convert a remote bucket into a local `NoSuchBucket`.
 
 ## 6. Mesh Directory Records
 
@@ -1091,7 +1093,16 @@ message PageResponse {
 }
 ```
 
-A cursor MUST bind the filter fields, sort order, caller principal, and authorisation revision used to create it. Reusing a cursor with different filters MUST fail with `InvalidArgument`.
+A cursor is an opaque server-issued value. It MUST be authenticated with a server-side signing key and MUST bind:
+
+1. the list API scope, for example `admin.list_nodes.v1` or `admin.list_object_links.v1`;
+2. the canonical filter fields after name resolution, such as tenant id, bucket name, region, cell id, prefix, or routing-record family;
+3. the sort order and exclusive resume position;
+4. the effective page limit after server-side clamping;
+5. the caller principal used for the first page;
+6. the authorisation revision used to authorise the first page.
+
+If an admin list implementation cannot read a durable authorisation revision for the endpoint, it MUST bind an equivalent route-specific snapshot revision for the listed collection and reject the cursor if that revision changes before the next page. Reusing a cursor with different filters, a different principal, a different limit, a different sort order, or a different revision MUST fail with `InvalidArgument`. Clients MUST NOT construct cursor values locally and MUST pass back `next_cursor` unchanged.
 
 Resource responses MUST include full descriptor payloads and current generation. Minimum response shapes:
 

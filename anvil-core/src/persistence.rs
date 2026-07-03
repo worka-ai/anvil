@@ -1,8 +1,8 @@
 use anyhow::{Result, anyhow};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tokio::sync::mpsc::Sender;
 
 use crate::{
@@ -12,11 +12,15 @@ use crate::{
     cluster::MetadataEvent,
     config::Config,
     control_journal, directory_repair, hf_journal, index_builder, index_diagnostic_journal,
-    index_journal, index_repair, manifest_journal, metadata_journal, model_journal,
-    multipart_journal,
+    index_journal, index_repair, manifest_journal, mesh_control_stream, mesh_directory,
+    metadata_journal, model_journal, multipart_journal, object_links,
     partition_fence::{
-        PartitionOwnerStatus, PartitionRecoveryAcquire, PartitionWritePermit,
-        acquire_partition_recovery, publish_partition_ready, read_partition_owner,
+        AcquireOwnership, ForceExpireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal,
+        OwnershipResource, OwnershipResourceKind, PartitionOwnerStatus, PartitionRecoveryAcquire,
+        PartitionWritePermit, RenewOwnership, acquire_ownership, acquire_partition_recovery,
+        force_expire_ownership, force_expire_partition_owner_for_node,
+        list_active_ownership_fences_for_node, list_partition_owners_for_node,
+        publish_partition_ready, read_ownership_fence, read_partition_owner, renew_ownership,
     },
     personaldb_repair, repair_finding,
     storage::Storage,
@@ -28,12 +32,45 @@ pub struct Persistence {
     storage: Storage,
     cache: MetadataCache,
     event_publisher: Option<Sender<MetadataEvent>>,
+    mesh_id: String,
+    region: String,
+    cell_id: String,
     owner_node_id: String,
     partition_owner_signing_key: Vec<u8>,
     personaldb_signing_key: Vec<u8>,
     object_metadata_compaction_frame_threshold: u64,
     object_metadata_compaction_bytes_threshold: u64,
     task_lease_ttl_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionDrainBucketOverride {
+    pub tenant_id: String,
+    pub bucket_name: String,
+    pub disposition: crate::mesh_lifecycle::BucketDrainDisposition,
+    pub reason: String,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionDrainBucketDecision {
+    pub tenant_id: String,
+    pub bucket_name: String,
+    pub bucket_locator_generation_before: u64,
+    pub bucket_locator_generation_after: u64,
+    pub status_before: mesh_directory::BucketLocatorStatus,
+    pub status_after: mesh_directory::BucketLocatorStatus,
+    pub disposition: crate::mesh_lifecycle::BucketDrainDisposition,
+    pub reason: String,
+    pub expires_at: Option<String>,
+    pub exception_written: bool,
+    pub locator_updated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionDrainPlanReport {
+    pub region: String,
+    pub decisions: Vec<RegionDrainBucketDecision>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +158,8 @@ pub struct Object {
     pub tenant_id: i64,
     pub bucket_id: i64,
     pub key: String,
+    #[serde(default)]
+    pub kind: object_links::ObjectEntryKind,
     pub content_hash: String,
     pub size: i64,
     pub etag: String,
@@ -138,6 +177,8 @@ pub struct Object {
     pub shard_map: Option<JsonValue>,
     pub inline_payload: Option<Vec<u8>>,
     pub checksum: Option<Vec<u8>>,
+    #[serde(default)]
+    pub link: Option<object_links::ObjectLinkTarget>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -521,6 +562,9 @@ impl Persistence {
             storage: Storage::new_at_sync(&config.storage_path)?,
             cache: MetadataCache::new(config),
             event_publisher,
+            mesh_id: nonempty_or(&config.mesh_id, "default"),
+            region: nonempty_or(&config.region, "default"),
+            cell_id: nonempty_or(&config.cell_id, "default"),
             owner_node_id: persistence_owner_node_id(config),
             partition_owner_signing_key: hex::decode(&config.anvil_secret_encryption_key)?,
             personaldb_signing_key: config.anvil_secret_encryption_key.as_bytes().to_vec(),
@@ -542,8 +586,428 @@ impl Persistence {
         }
     }
 
+    async fn write_mesh_tenant_locators(
+        &self,
+        tenant: &Tenant,
+        idempotency_key: &str,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let reservation_expires_at = (Utc::now() + Duration::minutes(5)).to_rfc3339();
+        let mesh_id = mesh_directory::MeshId::new(self.mesh_id.clone())?;
+        let tenant_id = mesh_directory::TenantId::new(tenant.id.to_string())?;
+        let tenant_name = mesh_directory::TenantName::canonicalize(&tenant.name)?;
+        let home_region = mesh_directory::RegionName::new(self.region.clone())?;
+        let reserved_name = mesh_directory::TenantNameDescriptor::reserved(
+            mesh_id.clone(),
+            tenant_name.clone(),
+            tenant_id.clone(),
+            idempotency_key,
+            reservation_expires_at,
+            now.clone(),
+        )?;
+        let locator_descriptor = mesh_directory::TenantLocatorDescriptor::active(
+            mesh_id,
+            tenant_id.clone(),
+            tenant_name.clone(),
+            home_region,
+            now.clone(),
+        )?;
+        let tenant_name_permit = self
+            .mesh_control_write_permit(
+                mesh_directory::RoutingRecordFamily::TenantName,
+                &reserved_name.partition(),
+            )
+            .await?;
+        let tenant_locator_permit = self
+            .mesh_control_write_permit(
+                mesh_directory::RoutingRecordFamily::TenantLocator,
+                &locator_descriptor.partition(),
+            )
+            .await?;
+        let tenant_name_authority = mesh_directory::MeshControlWriteAuthority {
+            permit: &tenant_name_permit,
+            signing_key: &self.partition_owner_signing_key,
+        };
+        let tenant_locator_authority = mesh_directory::MeshControlWriteAuthority {
+            permit: &tenant_locator_permit,
+            signing_key: &self.partition_owner_signing_key,
+        };
+        let reserved = mesh_directory::reserve_tenant_name(
+            &self.storage,
+            &reserved_name,
+            tenant_name_authority,
+        )
+        .await?;
+        mesh_directory::create_tenant_locator(
+            &self.storage,
+            &locator_descriptor,
+            tenant_locator_authority,
+        )
+        .await?;
+        mesh_directory::activate_tenant_name(
+            &self.storage,
+            &tenant_name,
+            &tenant_id,
+            reserved.generation,
+            now,
+            tenant_name_authority,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn write_mesh_bucket_locator(&self, bucket: &Bucket) -> Result<()> {
+        let now = bucket.created_at.to_rfc3339();
+        let mesh_id = mesh_directory::MeshId::new(self.mesh_id.clone())?;
+        let tenant_id = mesh_directory::TenantId::new(bucket.tenant_id.to_string())?;
+        let bucket_name = mesh_directory::BucketName::canonicalize(&bucket.name)?;
+        let bucket_id = mesh_directory::BucketId::new(bucket.id.to_string())?;
+        let home_region = mesh_directory::RegionName::new(bucket.region.clone())?;
+        let home_cell = mesh_directory::CellId::new(self.cell_id.clone())?;
+        let object_prefix = format!("objects/{tenant_id}/{bucket_name}/");
+        let mut locator = mesh_directory::BucketLocatorDescriptor::active(
+            mesh_id,
+            tenant_id,
+            bucket_name,
+            bucket_id,
+            home_region,
+            home_cell,
+            "regional-primary",
+            object_prefix,
+            now,
+        )?;
+        if let Some(existing) =
+            mesh_directory::read_bucket_locator(&self.storage, &locator.key()).await?
+            && existing.status == mesh_directory::BucketLocatorStatus::Deleted
+        {
+            locator.generation = existing.generation.saturating_add(1);
+        }
+        let permit = self
+            .mesh_control_write_permit(
+                mesh_directory::RoutingRecordFamily::BucketLocator,
+                &locator.partition(),
+            )
+            .await?;
+        mesh_directory::write_bucket_locator(
+            &self.storage,
+            &locator,
+            mesh_directory::MeshControlWriteAuthority {
+                permit: &permit,
+                signing_key: &self.partition_owner_signing_key,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn mark_mesh_bucket_locator_deleted(&self, bucket: &Bucket) -> Result<()> {
+        let tenant_id = mesh_directory::TenantId::new(bucket.tenant_id.to_string())?;
+        let bucket_name = mesh_directory::BucketName::canonicalize(&bucket.name)?;
+        let key = mesh_directory::BucketLocatorKey::new(tenant_id, bucket_name);
+        let Some(existing) = mesh_directory::read_bucket_locator(&self.storage, &key).await? else {
+            return Ok(());
+        };
+        if existing.status == mesh_directory::BucketLocatorStatus::Deleted {
+            return Ok(());
+        }
+
+        let mut deleted = existing;
+        deleted.status = mesh_directory::BucketLocatorStatus::Deleted;
+        deleted.updated_at = Utc::now().to_rfc3339();
+        deleted.generation = deleted.generation.saturating_add(1);
+        self.write_mesh_bucket_locator_descriptor(&deleted).await
+    }
+
+    pub async fn get_mesh_tenant_name_locator(
+        &self,
+        tenant_name: &str,
+    ) -> Result<Option<mesh_directory::TenantNameDescriptor>> {
+        let tenant_name = mesh_directory::TenantName::canonicalize(tenant_name)?;
+        Ok(mesh_directory::read_tenant_name_descriptor(&self.storage, &tenant_name).await?)
+    }
+
+    pub async fn get_mesh_bucket_locator(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+    ) -> Result<Option<mesh_directory::BucketLocatorDescriptor>> {
+        let key = mesh_directory::BucketLocatorKey::new(
+            mesh_directory::TenantId::new(tenant_id.to_string())?,
+            mesh_directory::BucketName::canonicalize(bucket_name)?,
+        );
+        Ok(mesh_directory::read_bucket_locator(&self.storage, &key).await?)
+    }
+
+    pub async fn list_mesh_routing_records(
+        &self,
+        family_filter: Option<mesh_directory::RoutingRecordFamily>,
+    ) -> Result<Vec<mesh_directory::RoutingRecordDescriptor>> {
+        Ok(mesh_directory::list_routing_records(&self.storage, family_filter).await?)
+    }
+
+    pub async fn diagnose_mesh_routing_projection(
+        &self,
+        family_filter: Option<mesh_directory::RoutingRecordFamily>,
+    ) -> Result<Vec<mesh_control_stream::ControlProjectionDiagnostic>> {
+        let mut by_stream =
+            BTreeMap::<(mesh_directory::RoutingRecordFamily, String), Vec<_>>::new();
+        for family in family_filter
+            .map(|family| vec![family])
+            .unwrap_or_else(|| mesh_directory::RoutingRecordFamily::all().to_vec())
+        {
+            for record in
+                mesh_directory::list_projected_routing_records(&self.storage, family).await?
+            {
+                by_stream
+                    .entry((record.family, record.partition.clone()))
+                    .or_default()
+                    .push(mesh_control_stream::ControlProjectionRecord::new(
+                        record.record_key,
+                        record.generation,
+                        record.payload_json.into_bytes(),
+                    ));
+            }
+            let stream_family = family.stream_family();
+            let family_path = self
+                .storage
+                .mesh_control_stream_family_path(stream_family)?;
+            let mut entries = match tokio::fs::read_dir(&family_path).await {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err.into()),
+            };
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                if path.extension().and_then(|value| value.to_str()) != Some("anlog") {
+                    continue;
+                }
+                let Some(partition) = path.file_stem().and_then(|value| value.to_str()) else {
+                    continue;
+                };
+                if self
+                    .storage
+                    .mesh_control_stream_path(stream_family, partition)
+                    .is_ok()
+                {
+                    by_stream
+                        .entry((family, partition.to_string()))
+                        .or_default();
+                }
+            }
+        }
+
+        let mut diagnostics = Vec::new();
+        for ((family, partition), projected_records) in by_stream {
+            let stream_family = family.stream_family();
+            let path = self
+                .storage
+                .mesh_control_stream_path(stream_family, &partition)?;
+            diagnostics.extend(
+                mesh_control_stream::diagnose_control_stream_projection(
+                    path,
+                    stream_family,
+                    &partition,
+                    &projected_records,
+                )
+                .await?,
+            );
+        }
+        Ok(diagnostics)
+    }
+
+    pub async fn repair_mesh_routing_record(
+        &self,
+        family: mesh_directory::RoutingRecordFamily,
+        record_key: &str,
+    ) -> Result<mesh_directory::RoutingRecordDescriptor> {
+        let partition = mesh_directory::routing_record_partition_for_key(family, record_key)?;
+        let stream_family = family.stream_family();
+        let stream_path = self
+            .storage
+            .mesh_control_stream_path(stream_family, &partition)?;
+        let record = mesh_control_stream::latest_projected_record_from_control_stream(
+            stream_path,
+            stream_family,
+            &partition,
+            record_key,
+        )
+        .await?
+        .ok_or_else(|| {
+            anyhow!("no control stream mutation found for {stream_family}/{partition}/{record_key}")
+        })?;
+        mesh_directory::rebuild_routing_record_projection_from_payload(
+            &self.storage,
+            family,
+            record_key,
+            &record.payload_json,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn apply_region_drain_plan(
+        &self,
+        region: &str,
+        default_disposition: crate::mesh_lifecycle::BucketDrainDisposition,
+        overrides: Vec<RegionDrainBucketOverride>,
+    ) -> Result<RegionDrainPlanReport> {
+        let mut overrides_by_bucket = HashMap::new();
+        for override_ in overrides {
+            let key = (override_.tenant_id.clone(), override_.bucket_name.clone());
+            if overrides_by_bucket.insert(key.clone(), override_).is_some() {
+                return Err(anyhow!(
+                    "duplicate bucket drain override for tenant {} bucket {}",
+                    key.0,
+                    key.1
+                ));
+            }
+        }
+
+        let mut locators = self.bucket_locators_in_region(region).await?;
+        locators.sort_by(|left, right| {
+            left.tenant_id
+                .as_str()
+                .cmp(right.tenant_id.as_str())
+                .then(left.bucket_name.as_str().cmp(right.bucket_name.as_str()))
+        });
+        let drainable_locator_keys = locators
+            .iter()
+            .filter(|locator| locator.status != mesh_directory::BucketLocatorStatus::Deleted)
+            .map(|locator| {
+                (
+                    locator.tenant_id.as_str().to_string(),
+                    locator.bucket_name.as_str().to_string(),
+                )
+            })
+            .collect::<HashSet<_>>();
+        for (tenant_id, bucket_name) in overrides_by_bucket.keys() {
+            if !drainable_locator_keys.contains(&(tenant_id.clone(), bucket_name.clone())) {
+                return Err(anyhow!(
+                    "bucket drain override for tenant {tenant_id} bucket {bucket_name} does not match an active bucket locator in region {region}"
+                ));
+            }
+        }
+
+        let mut decisions = Vec::new();
+        for locator in locators {
+            if locator.status == mesh_directory::BucketLocatorStatus::Deleted {
+                continue;
+            }
+            let tenant_id = locator.tenant_id.as_str().to_string();
+            let bucket_name = locator.bucket_name.as_str().to_string();
+            let override_ = overrides_by_bucket.get(&(tenant_id.clone(), bucket_name.clone()));
+            let disposition = override_
+                .map(|override_| override_.disposition)
+                .unwrap_or(default_disposition);
+            let reason = override_
+                .map(|override_| override_.reason.clone())
+                .unwrap_or_else(|| "region drain default disposition".to_string());
+            let expires_at = override_.and_then(|override_| override_.expires_at.clone());
+
+            let status_before = locator.status;
+            let mut status_after = status_before;
+            let mut exception_written = false;
+            match disposition {
+                crate::mesh_lifecycle::BucketDrainDisposition::BlockUntilEmpty => {}
+                crate::mesh_lifecycle::BucketDrainDisposition::RemainProxyOnly
+                | crate::mesh_lifecycle::BucketDrainDisposition::ReadOnlyUntilRemoved => {
+                    status_after = mesh_directory::BucketLocatorStatus::ReadOnly;
+                    crate::mesh_lifecycle::upsert_bucket_drain_exception(
+                        &self.storage,
+                        crate::mesh_lifecycle::BucketDrainExceptionInput {
+                            tenant_id: tenant_id.clone(),
+                            bucket_name: bucket_name.clone(),
+                            region: region.to_string(),
+                            disposition,
+                            reason: reason.clone(),
+                            expires_at: expires_at.clone(),
+                        },
+                    )
+                    .await?;
+                    exception_written = true;
+                }
+                crate::mesh_lifecycle::BucketDrainDisposition::DeleteAfterRetention => {
+                    status_after = mesh_directory::BucketLocatorStatus::Draining;
+                }
+            }
+
+            let mut generation_after = locator.generation;
+            let mut locator_updated = false;
+            if status_after != status_before {
+                let mut updated = locator.clone();
+                updated.status = status_after;
+                updated.updated_at = Utc::now().to_rfc3339();
+                updated.generation = updated.generation.saturating_add(1);
+                self.write_mesh_bucket_locator_descriptor(&updated).await?;
+                generation_after = updated.generation;
+                locator_updated = true;
+            }
+
+            decisions.push(RegionDrainBucketDecision {
+                tenant_id,
+                bucket_name,
+                bucket_locator_generation_before: locator.generation,
+                bucket_locator_generation_after: generation_after,
+                status_before,
+                status_after,
+                disposition,
+                reason,
+                expires_at,
+                exception_written,
+                locator_updated,
+            });
+        }
+
+        Ok(RegionDrainPlanReport {
+            region: region.to_string(),
+            decisions,
+        })
+    }
+
     pub fn cache(&self) -> &MetadataCache {
         &self.cache
+    }
+
+    async fn bucket_locators_in_region(
+        &self,
+        region: &str,
+    ) -> Result<Vec<mesh_directory::BucketLocatorDescriptor>> {
+        let records = mesh_directory::list_routing_records(
+            &self.storage,
+            Some(mesh_directory::RoutingRecordFamily::BucketLocator),
+        )
+        .await?;
+        let mut locators = Vec::new();
+        for record in records {
+            let locator: mesh_directory::BucketLocatorDescriptor =
+                serde_json::from_str(&record.payload_json)?;
+            if locator.home_region.as_str() == region {
+                locators.push(locator);
+            }
+        }
+        Ok(locators)
+    }
+
+    async fn write_mesh_bucket_locator_descriptor(
+        &self,
+        locator: &mesh_directory::BucketLocatorDescriptor,
+    ) -> Result<()> {
+        let permit = self
+            .mesh_control_write_permit(
+                mesh_directory::RoutingRecordFamily::BucketLocator,
+                &locator.partition(),
+            )
+            .await?;
+        mesh_directory::write_bucket_locator(
+            &self.storage,
+            locator,
+            mesh_directory::MeshControlWriteAuthority {
+                permit: &permit,
+                signing_key: &self.partition_owner_signing_key,
+            },
+        )
+        .await?;
+        Ok(())
     }
 
     async fn global_write_permit(
@@ -554,6 +1018,8 @@ impl Persistence {
         if self.partition_owner_signing_key.is_empty() {
             return Err(anyhow!("partition owner signing key must not be empty"));
         }
+        self.ensure_owner_node_can_acquire_new_partition(partition_family)
+            .await?;
         if let Some(owner) = read_partition_owner(
             &self.storage,
             partition_family,
@@ -600,6 +1066,146 @@ impl Persistence {
         ready.write_permit().map_err(Into::into)
     }
 
+    async fn ensure_owner_node_can_acquire_new_partition(
+        &self,
+        partition_family: &str,
+    ) -> Result<()> {
+        if matches!(
+            partition_family,
+            "control_plane" | mesh_directory::CONTROL_PARTITION_FAMILY
+        ) {
+            return Ok(());
+        }
+        let nodes = crate::mesh_lifecycle::list_nodes(&self.storage, None, None)
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        let Some(node) = nodes
+            .into_iter()
+            .find(|node| node.node_id == self.owner_node_id)
+        else {
+            return Ok(());
+        };
+        if node.state == crate::mesh_lifecycle::LifecycleState::Active {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "node {} is {:?} and cannot acquire new partition ownership for {}",
+            self.owner_node_id,
+            node.state,
+            partition_family
+        ))
+    }
+
+    async fn owned_write_permit(
+        &self,
+        resource_kind: OwnershipResourceKind,
+        resource_id: String,
+        partition_family: &str,
+        partition_id: String,
+    ) -> Result<PartitionWritePermit> {
+        self.ensure_ownership_fence(resource_kind, resource_id)
+            .await?;
+        self.global_write_permit(partition_family, partition_id)
+            .await
+    }
+
+    pub(crate) async fn ensure_ownership_fence(
+        &self,
+        resource_kind: OwnershipResourceKind,
+        resource_id: String,
+    ) -> Result<()> {
+        let resource = OwnershipResource {
+            resource_kind,
+            resource_id,
+        };
+        let owner = self.ownership_principal();
+        let now_nanos = Utc::now()
+            .timestamp_nanos_opt()
+            .ok_or_else(|| anyhow!("ownership timestamp overflow"))?;
+        let ttl_nanos = i64::try_from(MAX_OWNERSHIP_LEASE_MS)?.saturating_mul(1_000_000);
+
+        if let Some(record) = read_ownership_fence(
+            &self.storage,
+            owner.tenant_id,
+            &resource,
+            &self.partition_owner_signing_key,
+        )
+        .await?
+        {
+            if record.owner == owner && record.is_active_unexpired(now_nanos) {
+                renew_ownership(
+                    &self.storage,
+                    RenewOwnership {
+                        request_id: format!(
+                            "owned-write-renew-{}-{}",
+                            resource.resource_kind.as_str(),
+                            resource.resource_id
+                        ),
+                        resource: resource.clone(),
+                        owner: owner.clone(),
+                        current_fence: record.fence,
+                        now_nanos,
+                        ttl_nanos,
+                    },
+                    &self.partition_owner_signing_key,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+
+        acquire_ownership(
+            &self.storage,
+            AcquireOwnership {
+                request_id: format!(
+                    "owned-write-acquire-{}-{}",
+                    resource.resource_kind.as_str(),
+                    resource.resource_id
+                ),
+                idempotency_key: format!(
+                    "owned-write-owner-{}-{}",
+                    resource.resource_kind.as_str(),
+                    resource.resource_id
+                ),
+                resource,
+                owner,
+                now_nanos,
+                ttl_nanos,
+            },
+            &self.partition_owner_signing_key,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn ensure_personaldb_group_ownership_fence(
+        &self,
+        tenant_id: i64,
+        database_id: &str,
+    ) -> Result<()> {
+        self.ensure_ownership_fence(
+            OwnershipResourceKind::PersonalDbGroup,
+            format!("tenant/{tenant_id}/personaldb/{database_id}"),
+        )
+        .await
+    }
+
+    pub(crate) async fn ensure_index_build_ownership_fence(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        index_storage_id: &str,
+    ) -> Result<()> {
+        self.ensure_ownership_fence(
+            OwnershipResourceKind::IndexPartition,
+            format!("tenant/{tenant_id}/bucket/{bucket_id}/index_build/{index_storage_id}"),
+        )
+        .await
+    }
+
     async fn control_write_permit(&self) -> Result<PartitionWritePermit> {
         self.global_write_permit(
             "control_plane",
@@ -608,10 +1214,119 @@ impl Persistence {
         .await
     }
 
-    async fn task_queue_write_permit(&self) -> Result<PartitionWritePermit> {
+    async fn mesh_control_write_permit(
+        &self,
+        family: mesh_directory::RoutingRecordFamily,
+        partition: &str,
+    ) -> Result<PartitionWritePermit> {
+        self.ensure_mesh_control_ownership(family, partition)
+            .await?;
         self.global_write_permit(
+            mesh_directory::CONTROL_PARTITION_FAMILY,
+            mesh_directory::control_partition_id(family.stream_family(), partition),
+        )
+        .await
+    }
+
+    async fn mesh_control_write_permit_for_stream(
+        &self,
+        stream_family: &str,
+        partition: &str,
+    ) -> Result<PartitionWritePermit> {
+        self.ensure_mesh_control_stream_ownership(stream_family, partition)
+            .await?;
+        self.global_write_permit(
+            mesh_directory::CONTROL_PARTITION_FAMILY,
+            mesh_directory::control_partition_id(stream_family, partition),
+        )
+        .await
+    }
+
+    async fn ensure_mesh_control_ownership(
+        &self,
+        family: mesh_directory::RoutingRecordFamily,
+        partition: &str,
+    ) -> Result<()> {
+        self.ensure_mesh_control_stream_ownership(family.stream_family(), partition)
+            .await
+    }
+
+    async fn ensure_mesh_control_stream_ownership(
+        &self,
+        stream_family: &str,
+        partition: &str,
+    ) -> Result<()> {
+        let resource = OwnershipResource {
+            resource_kind: OwnershipResourceKind::ControlPartition,
+            resource_id: format!("{stream_family}/{partition}"),
+        };
+        let owner = self.ownership_principal();
+        let now_nanos = Utc::now()
+            .timestamp_nanos_opt()
+            .ok_or_else(|| anyhow!("ownership timestamp overflow"))?;
+        let ttl_nanos = i64::try_from(MAX_OWNERSHIP_LEASE_MS)?.saturating_mul(1_000_000);
+
+        if let Some(record) = read_ownership_fence(
+            &self.storage,
+            owner.tenant_id,
+            &resource,
+            &self.partition_owner_signing_key,
+        )
+        .await?
+        {
+            if record.owner == owner && record.is_active_unexpired(now_nanos) {
+                renew_ownership(
+                    &self.storage,
+                    RenewOwnership {
+                        request_id: format!("mesh-control-renew-{}", resource.resource_id),
+                        resource: resource.clone(),
+                        owner: owner.clone(),
+                        current_fence: record.fence,
+                        now_nanos,
+                        ttl_nanos,
+                    },
+                    &self.partition_owner_signing_key,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+
+        acquire_ownership(
+            &self.storage,
+            AcquireOwnership {
+                request_id: format!("mesh-control-acquire-{}", resource.resource_id),
+                idempotency_key: format!("mesh-control-owner-{}", resource.resource_id),
+                resource,
+                owner,
+                now_nanos,
+                ttl_nanos,
+            },
+            &self.partition_owner_signing_key,
+        )
+        .await?;
+        Ok(())
+    }
+
+    fn ownership_principal(&self) -> OwnershipPrincipal {
+        OwnershipPrincipal {
+            tenant_id: 0,
+            principal_kind: "node".to_string(),
+            principal_id: self.owner_node_id.clone(),
+            actor_instance_id: self.owner_node_id.clone(),
+            display_name: self.owner_node_id.clone(),
+            region: self.region.clone(),
+            cell: self.cell_id.clone(),
+        }
+    }
+
+    async fn task_queue_write_permit(&self) -> Result<PartitionWritePermit> {
+        let partition_id = hex::encode(task_journal::task_queue_partition_id());
+        self.owned_write_permit(
+            OwnershipResourceKind::TaskQueue,
+            format!("task_queue/{partition_id}"),
             "task_queue",
-            hex::encode(task_journal::task_queue_partition_id()),
+            partition_id,
         )
         .await
     }
@@ -630,17 +1345,23 @@ impl Persistence {
     }
 
     async fn bucket_tenant_write_permit(&self, tenant_id: i64) -> Result<PartitionWritePermit> {
-        self.global_write_permit(
+        let partition_id = hex::encode(bucket_journal::tenant_bucket_partition_id(tenant_id));
+        self.owned_write_permit(
+            OwnershipResourceKind::BucketPrimary,
+            format!("tenant/{tenant_id}/bucket_metadata/{partition_id}"),
             "bucket_metadata",
-            hex::encode(bucket_journal::tenant_bucket_partition_id(tenant_id)),
+            partition_id,
         )
         .await
     }
 
     async fn bucket_global_write_permit(&self) -> Result<PartitionWritePermit> {
-        self.global_write_permit(
+        let partition_id = hex::encode(bucket_journal::global_bucket_partition_id());
+        self.owned_write_permit(
+            OwnershipResourceKind::BucketPrimary,
+            format!("global/bucket_metadata/{partition_id}"),
             "bucket_metadata",
-            hex::encode(bucket_journal::global_bucket_partition_id()),
+            partition_id,
         )
         .await
     }
@@ -650,11 +1371,14 @@ impl Persistence {
         tenant_id: i64,
         bucket_id: i64,
     ) -> Result<PartitionWritePermit> {
-        self.global_write_permit(
+        let partition_id = hex::encode(metadata_journal::object_metadata_partition_id(
+            tenant_id, bucket_id,
+        ));
+        self.owned_write_permit(
+            OwnershipResourceKind::ObjectPartition,
+            format!("tenant/{tenant_id}/bucket/{bucket_id}/object_metadata/{partition_id}"),
             "object_metadata",
-            hex::encode(metadata_journal::object_metadata_partition_id(
-                tenant_id, bucket_id,
-            )),
+            partition_id,
         )
         .await
     }
@@ -664,11 +1388,14 @@ impl Persistence {
         tenant_id: i64,
         bucket_id: i64,
     ) -> Result<PartitionWritePermit> {
-        self.global_write_permit(
+        let partition_id = hex::encode(multipart_journal::multipart_metadata_partition_id(
+            tenant_id, bucket_id,
+        ));
+        self.owned_write_permit(
+            OwnershipResourceKind::ObjectPartition,
+            format!("tenant/{tenant_id}/bucket/{bucket_id}/multipart_metadata/{partition_id}"),
             "multipart_metadata",
-            hex::encode(multipart_journal::multipart_metadata_partition_id(
-                tenant_id, bucket_id,
-            )),
+            partition_id,
         )
         .await
     }
@@ -678,11 +1405,14 @@ impl Persistence {
         tenant_id: i64,
         bucket_id: i64,
     ) -> Result<PartitionWritePermit> {
-        self.global_write_permit(
+        let partition_id = hex::encode(append_journal::append_metadata_partition_id(
+            tenant_id, bucket_id,
+        ));
+        self.owned_write_permit(
+            OwnershipResourceKind::ObjectPartition,
+            format!("tenant/{tenant_id}/bucket/{bucket_id}/append_metadata/{partition_id}"),
             "append_metadata",
-            hex::encode(append_journal::append_metadata_partition_id(
-                tenant_id, bucket_id,
-            )),
+            partition_id,
         )
         .await
     }
@@ -692,11 +1422,14 @@ impl Persistence {
         tenant_id: i64,
         bucket_id: i64,
     ) -> Result<PartitionWritePermit> {
-        self.global_write_permit(
+        let partition_id = hex::encode(manifest_journal::manifest_cas_partition_id(
+            tenant_id, bucket_id,
+        ));
+        self.owned_write_permit(
+            OwnershipResourceKind::ObjectPartition,
+            format!("tenant/{tenant_id}/bucket/{bucket_id}/manifest_cas/{partition_id}"),
             "manifest_cas",
-            hex::encode(manifest_journal::manifest_cas_partition_id(
-                tenant_id, bucket_id,
-            )),
+            partition_id,
         )
         .await
     }
@@ -728,11 +1461,14 @@ impl Persistence {
         tenant_id: i64,
         bucket_id: i64,
     ) -> Result<PartitionWritePermit> {
-        self.global_write_permit(
+        let partition_id = hex::encode(index_journal::index_definition_partition_id(
+            tenant_id, bucket_id,
+        ));
+        self.owned_write_permit(
+            OwnershipResourceKind::IndexPartition,
+            format!("tenant/{tenant_id}/bucket/{bucket_id}/index_definition/{partition_id}"),
             "index_definition",
-            hex::encode(index_journal::index_definition_partition_id(
-                tenant_id, bucket_id,
-            )),
+            partition_id,
         )
         .await
     }
@@ -742,11 +1478,14 @@ impl Persistence {
         tenant_id: i64,
         bucket_id: i64,
     ) -> Result<PartitionWritePermit> {
-        self.global_write_permit(
+        let partition_id = hex::encode(index_diagnostic_journal::index_diagnostic_partition_id(
+            tenant_id, bucket_id,
+        ));
+        self.owned_write_permit(
+            OwnershipResourceKind::IndexPartition,
+            format!("tenant/{tenant_id}/bucket/{bucket_id}/index_diagnostic/{partition_id}"),
             "index_diagnostic",
-            hex::encode(index_diagnostic_journal::index_diagnostic_partition_id(
-                tenant_id, bucket_id,
-            )),
+            partition_id,
         )
         .await
     }
@@ -981,6 +1720,540 @@ impl Persistence {
             .regions())
     }
 
+    pub async fn create_region_descriptor(
+        &self,
+        input: crate::mesh_lifecycle::CreateRegionDescriptor,
+    ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::RegionDescriptor> {
+        let partition = crate::mesh_lifecycle::lifecycle_control_partition(
+            crate::mesh_lifecycle::REGION_DESCRIPTOR_STREAM_FAMILY,
+            &input.region,
+        );
+        let permit = self
+            .mesh_control_write_permit_for_stream(
+                crate::mesh_lifecycle::REGION_DESCRIPTOR_STREAM_FAMILY,
+                &partition,
+            )
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        crate::mesh_lifecycle::create_region_with_control(
+            &self.storage,
+            input,
+            crate::mesh_lifecycle::LifecycleControlWriteAuthority {
+                permit: &permit,
+                signing_key: &self.partition_owner_signing_key,
+            },
+        )
+        .await
+    }
+
+    pub async fn transition_region_descriptor(
+        &self,
+        region: &str,
+        expected_generation: u64,
+        target: crate::mesh_lifecycle::LifecycleState,
+    ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::RegionDescriptor> {
+        let partition = crate::mesh_lifecycle::lifecycle_control_partition(
+            crate::mesh_lifecycle::REGION_DESCRIPTOR_STREAM_FAMILY,
+            region,
+        );
+        let permit = self
+            .mesh_control_write_permit_for_stream(
+                crate::mesh_lifecycle::REGION_DESCRIPTOR_STREAM_FAMILY,
+                &partition,
+            )
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        crate::mesh_lifecycle::transition_region_with_control(
+            &self.storage,
+            region,
+            expected_generation,
+            target,
+            crate::mesh_lifecycle::LifecycleControlWriteAuthority {
+                permit: &permit,
+                signing_key: &self.partition_owner_signing_key,
+            },
+        )
+        .await
+    }
+
+    pub async fn activate_region_descriptor(
+        &self,
+        region: &str,
+        expected_generation: u64,
+        checkpoint: &crate::mesh_lifecycle::ActivationCheckpoint,
+    ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::RegionDescriptor> {
+        let partition = crate::mesh_lifecycle::lifecycle_control_partition(
+            crate::mesh_lifecycle::REGION_DESCRIPTOR_STREAM_FAMILY,
+            region,
+        );
+        let permit = self
+            .mesh_control_write_permit_for_stream(
+                crate::mesh_lifecycle::REGION_DESCRIPTOR_STREAM_FAMILY,
+                &partition,
+            )
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        crate::mesh_lifecycle::activate_region_with_control(
+            &self.storage,
+            region,
+            expected_generation,
+            checkpoint,
+            crate::mesh_lifecycle::LifecycleControlWriteAuthority {
+                permit: &permit,
+                signing_key: &self.partition_owner_signing_key,
+            },
+        )
+        .await
+    }
+
+    pub async fn list_region_descriptors(
+        &self,
+    ) -> crate::mesh_lifecycle::LifecycleResult<Vec<crate::mesh_lifecycle::RegionDescriptor>> {
+        crate::mesh_lifecycle::list_regions(&self.storage).await
+    }
+
+    pub async fn register_cell_descriptor(
+        &self,
+        input: crate::mesh_lifecycle::RegisterCellDescriptor,
+    ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::CellDescriptor> {
+        let record_key = format!("{}/{}", input.region, input.cell_id);
+        let partition = crate::mesh_lifecycle::lifecycle_control_partition(
+            crate::mesh_lifecycle::CELL_DESCRIPTOR_STREAM_FAMILY,
+            &record_key,
+        );
+        let permit = self
+            .mesh_control_write_permit_for_stream(
+                crate::mesh_lifecycle::CELL_DESCRIPTOR_STREAM_FAMILY,
+                &partition,
+            )
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        crate::mesh_lifecycle::register_cell_with_control(
+            &self.storage,
+            input,
+            crate::mesh_lifecycle::LifecycleControlWriteAuthority {
+                permit: &permit,
+                signing_key: &self.partition_owner_signing_key,
+            },
+        )
+        .await
+    }
+
+    pub async fn transition_cell_descriptor(
+        &self,
+        region: &str,
+        cell_id: &str,
+        expected_generation: u64,
+        target: crate::mesh_lifecycle::LifecycleState,
+    ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::CellDescriptor> {
+        let record_key = format!("{region}/{cell_id}");
+        let partition = crate::mesh_lifecycle::lifecycle_control_partition(
+            crate::mesh_lifecycle::CELL_DESCRIPTOR_STREAM_FAMILY,
+            &record_key,
+        );
+        let permit = self
+            .mesh_control_write_permit_for_stream(
+                crate::mesh_lifecycle::CELL_DESCRIPTOR_STREAM_FAMILY,
+                &partition,
+            )
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        crate::mesh_lifecycle::transition_cell_with_control(
+            &self.storage,
+            region,
+            cell_id,
+            expected_generation,
+            target,
+            crate::mesh_lifecycle::LifecycleControlWriteAuthority {
+                permit: &permit,
+                signing_key: &self.partition_owner_signing_key,
+            },
+        )
+        .await
+    }
+
+    pub async fn list_cell_descriptors(
+        &self,
+        region_filter: Option<&str>,
+    ) -> crate::mesh_lifecycle::LifecycleResult<Vec<crate::mesh_lifecycle::CellDescriptor>> {
+        crate::mesh_lifecycle::list_cells(&self.storage, region_filter).await
+    }
+
+    pub async fn register_node_descriptor(
+        &self,
+        input: crate::mesh_lifecycle::RegisterNodeDescriptor,
+    ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::NodeDescriptor> {
+        let record_key = format!("{}/{}/{}", input.region, input.cell_id, input.node_id);
+        let partition = crate::mesh_lifecycle::lifecycle_control_partition(
+            crate::mesh_lifecycle::NODE_DESCRIPTOR_STREAM_FAMILY,
+            &record_key,
+        );
+        let permit = self
+            .mesh_control_write_permit_for_stream(
+                crate::mesh_lifecycle::NODE_DESCRIPTOR_STREAM_FAMILY,
+                &partition,
+            )
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        crate::mesh_lifecycle::register_node_with_control(
+            &self.storage,
+            input,
+            crate::mesh_lifecycle::LifecycleControlWriteAuthority {
+                permit: &permit,
+                signing_key: &self.partition_owner_signing_key,
+            },
+        )
+        .await
+    }
+
+    pub async fn transition_node_descriptor(
+        &self,
+        node_id: &str,
+        expected_generation: u64,
+        target: crate::mesh_lifecycle::LifecycleState,
+        drain: Option<crate::mesh_lifecycle::NodeDrainDescriptor>,
+    ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::NodeDescriptor> {
+        let node = crate::mesh_lifecycle::list_nodes(&self.storage, None, None)
+            .await?
+            .into_iter()
+            .find(|node| node.node_id == node_id)
+            .ok_or_else(|| crate::mesh_lifecycle::LifecycleError::NotFound {
+                resource_kind: "node",
+                resource_id: node_id.to_string(),
+            })?;
+        if node.generation != expected_generation {
+            return Err(crate::mesh_lifecycle::LifecycleError::GenerationConflict {
+                resource_kind: "node",
+                resource_id: node_id.to_string(),
+                expected: expected_generation,
+                current: node.generation,
+            });
+        }
+        crate::mesh_lifecycle::validate_node_transition(node.state, target).map_err(|_| {
+            crate::mesh_lifecycle::LifecycleError::LifecycleTransitionDenied {
+                resource_kind: "node",
+                resource_id: node_id.to_string(),
+                from: node.state,
+                to: target,
+            }
+        })?;
+        match target {
+            crate::mesh_lifecycle::LifecycleState::Drained => {
+                self.ensure_node_has_no_runtime_ownership(node_id).await?;
+            }
+            crate::mesh_lifecycle::LifecycleState::Offline
+            | crate::mesh_lifecycle::LifecycleState::Removed => {
+                self.force_expire_node_runtime_ownership(node_id).await?;
+            }
+            _ => {}
+        }
+        let record_key = format!("{}/{}/{}", node.region, node.cell_id, node.node_id);
+        let partition = crate::mesh_lifecycle::lifecycle_control_partition(
+            crate::mesh_lifecycle::NODE_DESCRIPTOR_STREAM_FAMILY,
+            &record_key,
+        );
+        let permit = self
+            .mesh_control_write_permit_for_stream(
+                crate::mesh_lifecycle::NODE_DESCRIPTOR_STREAM_FAMILY,
+                &partition,
+            )
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        crate::mesh_lifecycle::transition_node_with_control(
+            &self.storage,
+            node_id,
+            expected_generation,
+            target,
+            drain,
+            crate::mesh_lifecycle::LifecycleControlWriteAuthority {
+                permit: &permit,
+                signing_key: &self.partition_owner_signing_key,
+            },
+        )
+        .await
+    }
+
+    pub async fn node_runtime_ownership_blockers(
+        &self,
+        node_id: &str,
+    ) -> crate::mesh_lifecycle::LifecycleResult<Vec<String>> {
+        let now_nanos = current_time_nanos().map_err(|err| {
+            crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+        })?;
+        self.node_runtime_ownership_blockers_at(node_id, now_nanos)
+            .await
+    }
+
+    async fn ensure_node_has_no_runtime_ownership(
+        &self,
+        node_id: &str,
+    ) -> crate::mesh_lifecycle::LifecycleResult<()> {
+        let blockers = self.node_runtime_ownership_blockers(node_id).await?;
+        if blockers.is_empty() {
+            return Ok(());
+        }
+        Err(crate::mesh_lifecycle::LifecycleError::InvalidArgument(
+            format!(
+                "node {node_id} drain cannot complete: {} runtime ownership record(s) still exist: {}",
+                blockers.len(),
+                blockers.join(", ")
+            ),
+        ))
+    }
+
+    async fn node_runtime_ownership_blockers_at(
+        &self,
+        node_id: &str,
+        now_nanos: i64,
+    ) -> crate::mesh_lifecycle::LifecycleResult<Vec<String>> {
+        let mut blockers = Vec::new();
+        let partition_owners = list_partition_owners_for_node(
+            &self.storage,
+            node_id,
+            &self.partition_owner_signing_key,
+        )
+        .await
+        .map_err(|err| crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string()))?;
+        blockers.extend(partition_owners.into_iter().map(|owner| {
+            format!(
+                "partition_owner:{}/{}:{:?}:fence={}",
+                owner.partition_family, owner.partition_id, owner.status, owner.fence_token
+            )
+        }));
+
+        let ownership_fences = list_active_ownership_fences_for_node(
+            &self.storage,
+            node_id,
+            now_nanos,
+            &self.partition_owner_signing_key,
+        )
+        .await
+        .map_err(|err| crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string()))?;
+        blockers.extend(ownership_fences.into_iter().map(|record| {
+            format!(
+                "ownership_fence:{}/{}:{:?}:fence={}",
+                record.resource.resource_kind.as_str(),
+                record.resource.resource_id,
+                record.state,
+                record.fence
+            )
+        }));
+
+        let task_leases = task_lease::list_active_task_leases_for_node(
+            &self.storage,
+            node_id,
+            now_nanos,
+            &self.partition_owner_signing_key,
+        )
+        .await
+        .map_err(|err| crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string()))?;
+        blockers.extend(task_leases.into_iter().map(|lease| {
+            format!(
+                "task_lease:{}:{}:fence={}",
+                lease.task_kind, lease.task_id, lease.fence_token
+            )
+        }));
+        blockers.sort();
+        Ok(blockers)
+    }
+
+    async fn force_expire_node_runtime_ownership(
+        &self,
+        node_id: &str,
+    ) -> crate::mesh_lifecycle::LifecycleResult<()> {
+        let now_nanos = current_time_nanos().map_err(|err| {
+            crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+        })?;
+        let partition_owners = list_partition_owners_for_node(
+            &self.storage,
+            node_id,
+            &self.partition_owner_signing_key,
+        )
+        .await
+        .map_err(|err| crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string()))?;
+        for owner in partition_owners {
+            force_expire_partition_owner_for_node(
+                &self.storage,
+                &owner.partition_family,
+                &owner.partition_id,
+                node_id,
+                now_nanos,
+                &self.partition_owner_signing_key,
+            )
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        }
+
+        let ownership_fences = list_active_ownership_fences_for_node(
+            &self.storage,
+            node_id,
+            now_nanos,
+            &self.partition_owner_signing_key,
+        )
+        .await
+        .map_err(|err| crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string()))?;
+        let admin = OwnershipPrincipal {
+            tenant_id: 0,
+            principal_kind: "node_admin".to_string(),
+            principal_id: self.owner_node_id.clone(),
+            actor_instance_id: self.owner_node_id.clone(),
+            display_name: self.owner_node_id.clone(),
+            region: self.region.clone(),
+            cell: self.cell_id.clone(),
+        };
+        for record in ownership_fences {
+            let mut admin = admin.clone();
+            admin.tenant_id = record.owner.tenant_id;
+            force_expire_ownership(
+                &self.storage,
+                ForceExpireOwnership {
+                    request_id: format!(
+                        "node-force-expire-{}-{}",
+                        node_id,
+                        record.resource.resource_id.replace('/', "-")
+                    ),
+                    idempotency_key: format!(
+                        "node-force-expire-{}-{}-{}",
+                        node_id, record.resource.resource_id, record.fence
+                    ),
+                    resource: record.resource,
+                    admin: admin.clone(),
+                    reason: format!("node {node_id} transitioned to non-owning lifecycle state"),
+                    now_nanos,
+                },
+                &self.partition_owner_signing_key,
+            )
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        }
+
+        let task_leases = task_lease::list_active_task_leases_for_node(
+            &self.storage,
+            node_id,
+            now_nanos,
+            &self.partition_owner_signing_key,
+        )
+        .await
+        .map_err(|err| crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string()))?;
+        for lease in task_leases {
+            task_lease::force_release_task_lease(
+                &self.storage,
+                lease.owner.tenant_id,
+                &lease.task_id,
+                &self.partition_owner_signing_key,
+            )
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        }
+        Ok(())
+    }
+
+    pub async fn list_node_descriptors(
+        &self,
+        region_filter: Option<&str>,
+        cell_filter: Option<&str>,
+    ) -> crate::mesh_lifecycle::LifecycleResult<Vec<crate::mesh_lifecycle::NodeDescriptor>> {
+        crate::mesh_lifecycle::list_nodes(&self.storage, region_filter, cell_filter).await
+    }
+
+    pub async fn create_host_alias_descriptor(
+        &self,
+        routing_config: &crate::routing::RoutingConfig,
+        input: crate::mesh_lifecycle::CreateHostAliasDescriptor,
+    ) -> crate::mesh_lifecycle::LifecycleResult<crate::routing::HostAliasDescriptor> {
+        let descriptor =
+            crate::mesh_lifecycle::create_host_alias(&self.storage, routing_config, input).await?;
+        let partition = mesh_directory::host_alias_partition(&descriptor.hostname)
+            .map_err(mesh_directory_lifecycle_error)?;
+        let permit = self
+            .mesh_control_write_permit(mesh_directory::RoutingRecordFamily::HostAlias, &partition)
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        mesh_directory::write_host_alias_descriptor(
+            &self.storage,
+            &descriptor,
+            mesh_directory::MeshControlWriteAuthority {
+                permit: &permit,
+                signing_key: &self.partition_owner_signing_key,
+            },
+        )
+        .await
+        .map_err(mesh_directory_lifecycle_error)?;
+        Ok(descriptor)
+    }
+
+    pub async fn transition_host_alias_descriptor(
+        &self,
+        hostname: &str,
+        expected_generation: u64,
+        target: crate::routing::HostAliasState,
+    ) -> crate::mesh_lifecycle::LifecycleResult<crate::routing::HostAliasDescriptor> {
+        let descriptor = crate::mesh_lifecycle::transition_host_alias(
+            &self.storage,
+            hostname,
+            expected_generation,
+            target,
+        )
+        .await?;
+        let partition = mesh_directory::host_alias_partition(&descriptor.hostname)
+            .map_err(mesh_directory_lifecycle_error)?;
+        let permit = self
+            .mesh_control_write_permit(mesh_directory::RoutingRecordFamily::HostAlias, &partition)
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+        mesh_directory::write_host_alias_descriptor(
+            &self.storage,
+            &descriptor,
+            mesh_directory::MeshControlWriteAuthority {
+                permit: &permit,
+                signing_key: &self.partition_owner_signing_key,
+            },
+        )
+        .await
+        .map_err(mesh_directory_lifecycle_error)?;
+        Ok(descriptor)
+    }
+
+    pub async fn get_host_alias_descriptor(
+        &self,
+        hostname: &str,
+    ) -> crate::mesh_lifecycle::LifecycleResult<Option<crate::routing::HostAliasDescriptor>> {
+        mesh_directory::read_host_alias_descriptor(&self.storage, hostname)
+            .await
+            .map_err(mesh_directory_lifecycle_error)
+    }
+
+    pub async fn list_host_alias_descriptors(
+        &self,
+        region_filter: Option<&str>,
+    ) -> crate::mesh_lifecycle::LifecycleResult<Vec<crate::routing::HostAliasDescriptor>> {
+        crate::mesh_lifecycle::list_host_aliases(&self.storage, region_filter).await
+    }
+
     pub async fn get_tenant_by_name(&self, name: &str) -> Result<Option<Tenant>> {
         Ok(control_journal::read_control_state(&self.storage)
             .await?
@@ -1005,15 +2278,18 @@ impl Persistence {
             .policies_for_app(app_id))
     }
 
-    pub async fn create_tenant(&self, name: &str, _api_key: &str) -> Result<Tenant> {
+    pub async fn create_tenant(&self, name: &str, idempotency_key: &str) -> Result<Tenant> {
         let permit = self.control_write_permit().await?;
-        control_journal::create_tenant_with_permit(
+        let tenant = control_journal::create_tenant_with_permit(
             &self.storage,
             name,
             &permit,
             &self.partition_owner_signing_key,
         )
-        .await
+        .await?;
+        self.write_mesh_tenant_locators(&tenant, idempotency_key)
+            .await?;
+        Ok(tenant)
     }
 
     pub async fn create_app(
@@ -1098,6 +2374,14 @@ impl Persistence {
         name: &str,
         region: &str,
     ) -> Result<Bucket, tonic::Status> {
+        crate::mesh_lifecycle::ensure_new_writable_placement(
+            &self.storage,
+            region,
+            &self.cell_id,
+            &self.owner_node_id,
+        )
+        .await
+        .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?;
         if bucket_journal::read_current_bucket(&self.storage, tenant_id, name)
             .await
             .map_err(|e| tonic::Status::internal(e.to_string()))?
@@ -1135,6 +2419,9 @@ impl Persistence {
         )
         .await
         .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        self.write_mesh_bucket_locator(&bucket)
+            .await
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
         self.cache
             .insert_bucket(tenant_id, name.to_string(), bucket.clone())
             .await;
@@ -1228,6 +2515,7 @@ impl Persistence {
                 &self.partition_owner_signing_key,
             )
             .await?;
+            self.mark_mesh_bucket_locator_deleted(bucket).await?;
         }
         self.cache.invalidate_bucket(tenant_id, name).await;
         Ok(deleted)
@@ -1389,6 +2677,7 @@ impl Persistence {
             tenant_id,
             bucket_id,
             key: key.to_string(),
+            kind: object_links::ObjectEntryKind::Blob,
             content_hash: content_hash.to_string(),
             size,
             etag: etag.to_string(),
@@ -1406,6 +2695,7 @@ impl Persistence {
             shard_map,
             inline_payload,
             checksum: None,
+            link: None,
         };
         let permit = self
             .object_metadata_write_permit(bucket.tenant_id, bucket.id)
@@ -1425,6 +2715,201 @@ impl Persistence {
         Ok(object)
     }
 
+    pub async fn put_object_link(
+        &self,
+        request: object_links::PutObjectLinkRequest,
+    ) -> std::result::Result<object_links::ObjectLinkMutation, object_links::ObjectLinkError> {
+        if !crate::validation::is_valid_object_key(&request.link_key) {
+            return Err(object_links::ObjectLinkError::InvalidLinkKey);
+        }
+        if !crate::validation::is_valid_object_key(&request.target_key) {
+            return Err(object_links::ObjectLinkError::InvalidTargetKey);
+        }
+
+        let bucket = bucket_journal::read_current_bucket_by_id(&self.storage, request.bucket_id)
+            .await?
+            .ok_or(object_links::ObjectLinkError::BucketNotFound)?;
+        if bucket.tenant_id != request.tenant_id {
+            return Err(object_links::ObjectLinkError::BucketTenantMismatch);
+        }
+
+        let current = metadata_journal::read_current_object(
+            &self.storage,
+            &bucket,
+            &self.partition_owner_signing_key,
+            &request.link_key,
+        )
+        .await?;
+        if request.create_only && current.is_some() {
+            return Err(object_links::ObjectLinkError::AlreadyExists);
+        }
+        let existing_generation = match current.as_ref() {
+            Some(object) if object.kind != object_links::ObjectEntryKind::Link => {
+                return Err(object_links::ObjectLinkError::ExistingObjectIsNotLink);
+            }
+            Some(object) => object_links::link_generation(object).unwrap_or(0),
+            None => 0,
+        };
+
+        if !request.create_only {
+            let expected = request
+                .expected_generation
+                .ok_or(object_links::ObjectLinkError::MissingExpectedGeneration)?;
+            if expected != existing_generation {
+                return Err(object_links::ObjectLinkError::GenerationConflict {
+                    expected,
+                    actual: existing_generation,
+                });
+            }
+        } else if let Some(expected) = request.expected_generation
+            && expected != 0
+        {
+            return Err(object_links::ObjectLinkError::GenerationConflict {
+                expected,
+                actual: existing_generation,
+            });
+        }
+
+        if !request.allow_dangling {
+            let target = match request.target_version {
+                Some(version_id) => {
+                    metadata_journal::read_object_version(
+                        &self.storage,
+                        &bucket,
+                        &self.partition_owner_signing_key,
+                        &request.target_key,
+                        version_id,
+                    )
+                    .await?
+                }
+                None => {
+                    metadata_journal::read_current_object(
+                        &self.storage,
+                        &bucket,
+                        &self.partition_owner_signing_key,
+                        &request.target_key,
+                    )
+                    .await?
+                }
+            }
+            .ok_or(object_links::ObjectLinkError::DanglingObjectLink)?;
+            if target.deleted_at.is_some() {
+                return Err(object_links::ObjectLinkError::DanglingObjectLink);
+            }
+            if target.kind != object_links::ObjectEntryKind::Blob {
+                return Err(object_links::ObjectLinkError::TargetNotBlob);
+            }
+        }
+
+        let now = Utc::now();
+        let generation = existing_generation.checked_add(1).ok_or_else(|| {
+            object_links::ObjectLinkError::Internal("link generation overflow".to_string())
+        })?;
+        let link_created_at = current
+            .as_ref()
+            .and_then(|object| object.link.as_ref())
+            .map(|link| link.created_at)
+            .unwrap_or(now);
+        let descriptor = object_links::ObjectLinkDescriptor {
+            schema: "anvil.object_link.v1".to_string(),
+            tenant_id: request.tenant_id.to_string(),
+            bucket_name: bucket.name.clone(),
+            link_key: request.link_key.clone(),
+            target_key: request.target_key.clone(),
+            target_version: request.target_version.map(|version| version.to_string()),
+            resolution: request.resolution,
+            created_at: link_created_at,
+            updated_at: now,
+            created_by: request.created_by.clone(),
+            generation,
+        };
+        let content_hash = object_links::link_metadata_hash(&descriptor);
+        let etag = object_links::link_metadata_etag(&descriptor);
+        let version_id = uuid::Uuid::new_v4();
+        let mutation_id = uuid::Uuid::new_v4();
+        let index_policy_snapshot = self
+            .active_index_policy_snapshot_hash(request.tenant_id, bucket.id)
+            .await?;
+        let user_meta = Some(serde_json::json!({
+            "schema": "anvil.object_link.v1",
+            "idempotency_key": request.idempotency_key,
+        }));
+        let user_metadata_hash = user_metadata_hash(user_meta.as_ref());
+        let authz_revision = self.latest_authz_revision(request.tenant_id).await?;
+        let record_hash = object_version_record_hash(ObjectVersionRecordHashInput {
+            tenant_id: request.tenant_id,
+            bucket_id: bucket.id,
+            key: &request.link_key,
+            version_id,
+            mutation_id,
+            content_hash: &content_hash,
+            size: 0,
+            etag: &etag,
+            content_type: Some(object_links::LINK_METADATA_CONTENT_TYPE),
+            user_metadata_hash: &user_metadata_hash,
+            index_policy_snapshot: &index_policy_snapshot,
+            authz_revision,
+            delete_marker: false,
+        });
+        let link = object_links::ObjectLinkTarget {
+            target_key: request.target_key,
+            target_version: request.target_version,
+            resolution: request.resolution,
+            generation,
+            created_at: link_created_at,
+            created_by: request.created_by,
+        };
+        let object = Object {
+            id: metadata_journal::next_object_id(
+                &self.storage,
+                &bucket,
+                &self.partition_owner_signing_key,
+            )
+            .await?,
+            tenant_id: request.tenant_id,
+            bucket_id: bucket.id,
+            key: request.link_key,
+            kind: object_links::ObjectEntryKind::Link,
+            content_hash,
+            size: 0,
+            etag,
+            content_type: Some(object_links::LINK_METADATA_CONTENT_TYPE.to_string()),
+            version_id,
+            mutation_id,
+            index_policy_snapshot,
+            user_metadata_hash,
+            authz_revision,
+            record_hash,
+            created_at: now,
+            deleted_at: None,
+            storage_class: None,
+            user_meta,
+            shard_map: None,
+            inline_payload: None,
+            checksum: None,
+            link: Some(link),
+        };
+        let permit = self
+            .object_metadata_write_permit(bucket.tenant_id, bucket.id)
+            .await?;
+        metadata_journal::append_object_mutation_with_permit(
+            &self.storage,
+            &bucket,
+            &object,
+            metadata_journal::ObjectJournalMutation::Put,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await?;
+        self.enqueue_index_builds_for_bucket(&bucket).await?;
+        self.enqueue_object_metadata_compaction_if_due(&bucket)
+            .await?;
+        Ok(object_links::ObjectLinkMutation {
+            link: object,
+            descriptor,
+        })
+    }
+
     pub async fn get_object(&self, bucket_id: i64, key: &str) -> Result<Option<Object>> {
         let Some(bucket) =
             bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
@@ -1438,6 +2923,248 @@ impl Persistence {
             key,
         )
         .await
+    }
+
+    pub async fn get_object_link(
+        &self,
+        bucket_id: i64,
+        key: &str,
+    ) -> std::result::Result<
+        Option<object_links::ObjectLinkDescriptor>,
+        object_links::ObjectLinkError,
+    > {
+        let Some(bucket) =
+            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        else {
+            return Ok(None);
+        };
+        let Some(object) = metadata_journal::read_current_object(
+            &self.storage,
+            &bucket,
+            &self.partition_owner_signing_key,
+            key,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        if object.kind != object_links::ObjectEntryKind::Link {
+            return Ok(None);
+        }
+        Ok(object_links::link_descriptor(&bucket.name, &object))
+    }
+
+    pub async fn list_object_links(
+        &self,
+        bucket_id: i64,
+        prefix: Option<&str>,
+    ) -> std::result::Result<Vec<object_links::ObjectLinkDescriptor>, object_links::ObjectLinkError>
+    {
+        let Some(bucket) =
+            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        else {
+            return Err(object_links::ObjectLinkError::BucketNotFound);
+        };
+        let mut links = metadata_journal::read_current_directory_objects(
+            &self.storage,
+            &bucket,
+            &self.partition_owner_signing_key,
+        )
+        .await?
+        .into_iter()
+        .filter(|object| object.kind == object_links::ObjectEntryKind::Link)
+        .filter_map(|object| object_links::link_descriptor(&bucket.name, &object))
+        .filter(|descriptor| {
+            prefix
+                .map(|prefix| descriptor.link_key.starts_with(prefix))
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+        links.sort_by(|left, right| left.link_key.cmp(&right.link_key));
+        Ok(links)
+    }
+
+    pub async fn delete_object_link(
+        &self,
+        request: object_links::DeleteObjectLinkRequest,
+    ) -> std::result::Result<object_links::DeleteObjectLinkResult, object_links::ObjectLinkError>
+    {
+        if !crate::validation::is_valid_object_key(&request.link_key) {
+            return Err(object_links::ObjectLinkError::InvalidLinkKey);
+        }
+
+        let bucket = bucket_journal::read_current_bucket_by_id(&self.storage, request.bucket_id)
+            .await?
+            .ok_or(object_links::ObjectLinkError::BucketNotFound)?;
+        if bucket.tenant_id != request.tenant_id {
+            return Err(object_links::ObjectLinkError::BucketTenantMismatch);
+        }
+
+        let current = metadata_journal::read_current_object(
+            &self.storage,
+            &bucket,
+            &self.partition_owner_signing_key,
+            &request.link_key,
+        )
+        .await?
+        .ok_or(object_links::ObjectLinkError::NotFound)?;
+        if current.kind != object_links::ObjectEntryKind::Link {
+            return Err(object_links::ObjectLinkError::ExistingObjectIsNotLink);
+        }
+        let current_link = current
+            .link
+            .as_ref()
+            .ok_or_else(|| object_links::ObjectLinkError::Internal("link target missing".into()))?;
+        if current_link.generation != request.expected_generation {
+            return Err(object_links::ObjectLinkError::GenerationConflict {
+                expected: request.expected_generation,
+                actual: current_link.generation,
+            });
+        }
+
+        let new_generation = current_link.generation.checked_add(1).ok_or_else(|| {
+            object_links::ObjectLinkError::Internal("link generation overflow".to_string())
+        })?;
+        let now = Utc::now();
+        let version_id = uuid::Uuid::new_v4();
+        let mutation_id = uuid::Uuid::new_v4();
+        let content_hash = String::new();
+        let etag = String::new();
+        let index_policy_snapshot = self
+            .active_index_policy_snapshot_hash(request.tenant_id, bucket.id)
+            .await?;
+        let user_meta = Some(serde_json::json!({
+            "schema": "anvil.object_link_delete.v1",
+            "idempotency_key": request.idempotency_key,
+        }));
+        let user_metadata_hash = user_metadata_hash(user_meta.as_ref());
+        let authz_revision = self.latest_authz_revision(request.tenant_id).await?;
+        let record_hash = object_version_record_hash(ObjectVersionRecordHashInput {
+            tenant_id: request.tenant_id,
+            bucket_id: bucket.id,
+            key: &request.link_key,
+            version_id,
+            mutation_id,
+            content_hash: &content_hash,
+            size: 0,
+            etag: &etag,
+            content_type: Some(object_links::LINK_METADATA_CONTENT_TYPE),
+            user_metadata_hash: &user_metadata_hash,
+            index_policy_snapshot: &index_policy_snapshot,
+            authz_revision,
+            delete_marker: true,
+        });
+        let object = Object {
+            id: metadata_journal::next_object_id(
+                &self.storage,
+                &bucket,
+                &self.partition_owner_signing_key,
+            )
+            .await?,
+            tenant_id: request.tenant_id,
+            bucket_id: bucket.id,
+            key: request.link_key.clone(),
+            kind: object_links::ObjectEntryKind::Link,
+            content_hash,
+            size: 0,
+            etag,
+            content_type: Some(object_links::LINK_METADATA_CONTENT_TYPE.to_string()),
+            version_id,
+            mutation_id,
+            index_policy_snapshot,
+            user_metadata_hash,
+            authz_revision,
+            record_hash,
+            created_at: now,
+            deleted_at: Some(now),
+            storage_class: None,
+            user_meta,
+            shard_map: None,
+            inline_payload: None,
+            checksum: None,
+            link: Some(object_links::ObjectLinkTarget {
+                target_key: current_link.target_key.clone(),
+                target_version: current_link.target_version,
+                resolution: current_link.resolution,
+                generation: new_generation,
+                created_at: current_link.created_at,
+                created_by: current_link.created_by.clone(),
+            }),
+        };
+        let permit = self
+            .object_metadata_write_permit(bucket.tenant_id, bucket.id)
+            .await?;
+        metadata_journal::append_object_mutation_with_permit(
+            &self.storage,
+            &bucket,
+            &object,
+            metadata_journal::ObjectJournalMutation::DeleteMarker,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await?;
+        self.enqueue_index_builds_for_bucket(&bucket).await?;
+        self.enqueue_object_metadata_compaction_if_due(&bucket)
+            .await?;
+        Ok(object_links::DeleteObjectLinkResult {
+            link_key: request.link_key,
+            generation: new_generation,
+        })
+    }
+
+    pub async fn resolve_object_link_target(
+        &self,
+        bucket_id: i64,
+        link_key: &str,
+    ) -> std::result::Result<Object, object_links::ObjectLinkError> {
+        let Some(bucket) =
+            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        else {
+            return Err(object_links::ObjectLinkError::BucketNotFound);
+        };
+        let mut current_key = link_key.to_string();
+        let mut current_version = None;
+        let mut seen = HashSet::new();
+        for _ in 0..object_links::MAX_LINK_RESOLUTION_DEPTH {
+            let object = match current_version {
+                Some(version_id) => {
+                    metadata_journal::read_object_version(
+                        &self.storage,
+                        &bucket,
+                        &self.partition_owner_signing_key,
+                        &current_key,
+                        version_id,
+                    )
+                    .await?
+                }
+                None => {
+                    metadata_journal::read_current_object(
+                        &self.storage,
+                        &bucket,
+                        &self.partition_owner_signing_key,
+                        &current_key,
+                    )
+                    .await?
+                }
+            }
+            .ok_or(object_links::ObjectLinkError::DanglingObjectLink)?;
+            if object.deleted_at.is_some() {
+                return Err(object_links::ObjectLinkError::DanglingObjectLink);
+            }
+            if object.kind == object_links::ObjectEntryKind::Blob {
+                return Ok(object);
+            }
+            let Some(link) = object.link.as_ref() else {
+                return Err(object_links::ObjectLinkError::TargetNotBlob);
+            };
+            let seen_key = format!("{}:{}", object.key, object.version_id);
+            if !seen.insert(seen_key) {
+                return Err(object_links::ObjectLinkError::LinkLoop);
+            }
+            current_key = link.target_key.clone();
+            current_version = link.target_version;
+        }
+        Err(object_links::ObjectLinkError::LinkDepthExceeded)
     }
 
     pub async fn get_object_version(
@@ -2490,6 +4217,9 @@ impl Persistence {
         if !index.enabled || index.version != index_version {
             return Ok(None);
         }
+        let index_storage_id = index_journal::index_storage_id(tenant_id, bucket_id, index.id);
+        self.ensure_index_build_ownership_fence(tenant_id, bucket_id, &index_storage_id)
+            .await?;
         let outcome = match index.kind.as_str() {
             "full_text" => {
                 index_builder::build_full_text_index(
@@ -3266,6 +4996,9 @@ impl Persistence {
 }
 
 fn persistence_owner_node_id(config: &Config) -> String {
+    if !config.node_id.is_empty() {
+        return config.node_id.clone();
+    }
     if !config.public_api_addr.is_empty() {
         return config.public_api_addr.clone();
     }
@@ -3276,6 +5009,94 @@ fn persistence_owner_node_id(config: &Config) -> String {
         return config.region.clone();
     }
     "local-anvil-node".to_string()
+}
+
+fn nonempty_or(value: &str, fallback: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        fallback.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn mesh_directory_lifecycle_error(
+    err: mesh_directory::MeshDirectoryError,
+) -> crate::mesh_lifecycle::LifecycleError {
+    match err {
+        mesh_directory::MeshDirectoryError::InvalidTenantName(message)
+        | mesh_directory::MeshDirectoryError::InvalidBucketName(message)
+        | mesh_directory::MeshDirectoryError::NotFound(message) => {
+            crate::mesh_lifecycle::LifecycleError::InvalidArgument(message)
+        }
+        mesh_directory::MeshDirectoryError::InvalidIdentifier { field, value } => {
+            crate::mesh_lifecycle::LifecycleError::InvalidArgument(format!(
+                "invalid {field}: {value}"
+            ))
+        }
+        mesh_directory::MeshDirectoryError::DuplicateBucketLocator {
+            tenant_id,
+            bucket_name,
+        } => crate::mesh_lifecycle::LifecycleError::AlreadyExists {
+            resource_kind: "bucket locator",
+            resource_id: format!("{tenant_id}/{bucket_name}"),
+        },
+        mesh_directory::MeshDirectoryError::TenantNameAlreadyExists { tenant_name } => {
+            crate::mesh_lifecycle::LifecycleError::AlreadyExists {
+                resource_kind: "tenant name",
+                resource_id: tenant_name,
+            }
+        }
+        mesh_directory::MeshDirectoryError::GenerationConflict {
+            descriptor_key,
+            expected,
+            actual,
+        } => crate::mesh_lifecycle::LifecycleError::GenerationConflict {
+            resource_kind: "mesh directory record",
+            resource_id: descriptor_key,
+            expected,
+            current: actual,
+        },
+        mesh_directory::MeshDirectoryError::InvalidState {
+            descriptor_key,
+            state,
+        } => crate::mesh_lifecycle::LifecycleError::InvalidArgument(format!(
+            "invalid mesh directory state for {descriptor_key}: {state}"
+        )),
+        mesh_directory::MeshDirectoryError::InvalidTimestamp { field, value } => {
+            crate::mesh_lifecycle::LifecycleError::InvalidArgument(format!(
+                "invalid RFC3339 timestamp in {field}: {value}"
+            ))
+        }
+        mesh_directory::MeshDirectoryError::InvalidControlWritePermit {
+            stream_family,
+            partition,
+            reason,
+        } => crate::mesh_lifecycle::LifecycleError::InvalidArgument(format!(
+            "invalid mesh control write permit for {stream_family}/{partition}: {reason}"
+        )),
+        mesh_directory::MeshDirectoryError::ControlFenceRejected {
+            stream_family,
+            partition,
+            code,
+            reason,
+        } => crate::mesh_lifecycle::LifecycleError::InvalidArgument(format!(
+            "mesh control write fence rejected for {stream_family}/{partition}: {code}: {reason}"
+        )),
+        mesh_directory::MeshDirectoryError::ControlStreamWrite {
+            stream_family,
+            partition,
+            message,
+        } => crate::mesh_lifecycle::LifecycleError::InvalidArgument(format!(
+            "mesh control stream write failed for {stream_family}/{partition}: {message}"
+        )),
+        mesh_directory::MeshDirectoryError::Io(err) => {
+            crate::mesh_lifecycle::LifecycleError::Io(err)
+        }
+        mesh_directory::MeshDirectoryError::Json(err) => {
+            crate::mesh_lifecycle::LifecycleError::Json(err)
+        }
+    }
 }
 
 fn current_time_nanos() -> Result<i64> {
@@ -3363,6 +5184,674 @@ mod tests {
         }
         assert!(!frames.is_empty());
         assert!(frames.iter().all(|frame| frame.fence_token == header_fence));
+    }
+
+    #[tokio::test]
+    async fn tenant_and_bucket_creation_materialise_mesh_directory_locators() {
+        let temp = tempdir().unwrap();
+        let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+
+        let tenant = persistence
+            .create_tenant("tenant-a", "unused")
+            .await
+            .unwrap();
+        let bucket = persistence
+            .create_bucket(tenant.id, "docs", "eu-west-1")
+            .await
+            .unwrap();
+
+        let tenant_name = persistence
+            .get_mesh_tenant_name_locator("tenant-a")
+            .await
+            .unwrap()
+            .expect("tenant-name locator");
+        assert_eq!(tenant_name.tenant_id.as_str(), tenant.id.to_string());
+        assert_eq!(tenant_name.status, mesh_directory::TenantNameStatus::Active);
+        assert_eq!(tenant_name.idempotency_key.as_deref(), Some("unused"));
+        assert_eq!(tenant_name.reservation_expires_at, None);
+        assert_eq!(tenant_name.generation, 2);
+
+        let bucket_locator = persistence
+            .get_mesh_bucket_locator(tenant.id, "docs")
+            .await
+            .unwrap()
+            .expect("bucket locator");
+        assert_eq!(bucket_locator.tenant_id.as_str(), tenant.id.to_string());
+        assert_eq!(bucket_locator.bucket_name.as_str(), "docs");
+        assert_eq!(bucket_locator.bucket_id.as_str(), bucket.id.to_string());
+        assert_eq!(bucket_locator.home_region.as_str(), "eu-west-1");
+        assert_eq!(
+            bucket_locator.descriptor_key(),
+            format!(
+                "_anvil/control/v1/mesh/buckets/{}/{}/docs.json",
+                bucket_locator.partition(),
+                tenant.id
+            )
+        );
+
+        let tenant_name_fence = read_ownership_fence(
+            &persistence.storage,
+            0,
+            &OwnershipResource {
+                resource_kind: OwnershipResourceKind::ControlPartition,
+                resource_id: format!(
+                    "{}/{}",
+                    mesh_directory::RoutingRecordFamily::TenantName.stream_family(),
+                    tenant_name.partition()
+                ),
+            },
+            &persistence.partition_owner_signing_key,
+        )
+        .await
+        .unwrap()
+        .expect("tenant-name control partition ownership fence");
+        assert_eq!(tenant_name_fence.owner, persistence.ownership_principal());
+
+        let bucket_locator_fence = read_ownership_fence(
+            &persistence.storage,
+            0,
+            &OwnershipResource {
+                resource_kind: OwnershipResourceKind::ControlPartition,
+                resource_id: format!(
+                    "{}/{}",
+                    mesh_directory::RoutingRecordFamily::BucketLocator.stream_family(),
+                    bucket_locator.partition()
+                ),
+            },
+            &persistence.partition_owner_signing_key,
+        )
+        .await
+        .unwrap()
+        .expect("bucket-locator control partition ownership fence");
+        assert_eq!(
+            bucket_locator_fence.owner,
+            persistence.ownership_principal()
+        );
+    }
+
+    #[tokio::test]
+    async fn region_drain_blocks_bucket_creation_and_completion_with_active_locator() {
+        let temp = tempdir().unwrap();
+        let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+        let (region, _, _) = register_active_mesh_placement(&persistence).await;
+        let tenant = persistence
+            .create_tenant("tenant-a", "unused")
+            .await
+            .unwrap();
+        persistence
+            .create_bucket(tenant.id, "docs", "test-region")
+            .await
+            .unwrap();
+
+        let draining = persistence
+            .transition_region_descriptor(
+                "test-region",
+                region.generation,
+                crate::mesh_lifecycle::LifecycleState::Draining,
+            )
+            .await
+            .unwrap();
+        let placement_err = persistence
+            .create_bucket(tenant.id, "more-docs", "test-region")
+            .await
+            .unwrap_err();
+        assert_eq!(placement_err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            placement_err
+                .message()
+                .contains("cannot accept new writable placement")
+        );
+
+        let completion_err = persistence
+            .transition_region_descriptor(
+                "test-region",
+                draining.generation,
+                crate::mesh_lifecycle::LifecycleState::Drained,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            completion_err
+                .to_string()
+                .contains("still name the region as primary")
+        );
+    }
+
+    #[tokio::test]
+    async fn region_drain_applies_read_only_exceptions_to_bucket_locators() {
+        let temp = tempdir().unwrap();
+        let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+        let (region, _, _) = register_active_mesh_placement(&persistence).await;
+        let tenant = persistence
+            .create_tenant("tenant-a", "unused")
+            .await
+            .unwrap();
+        persistence
+            .create_bucket(tenant.id, "docs", "test-region")
+            .await
+            .unwrap();
+
+        let draining = persistence
+            .transition_region_descriptor(
+                "test-region",
+                region.generation,
+                crate::mesh_lifecycle::LifecycleState::Draining,
+            )
+            .await
+            .unwrap();
+        let report = persistence
+            .apply_region_drain_plan(
+                "test-region",
+                crate::mesh_lifecycle::BucketDrainDisposition::BlockUntilEmpty,
+                vec![RegionDrainBucketOverride {
+                    tenant_id: tenant.id.to_string(),
+                    bucket_name: "docs".to_string(),
+                    disposition: crate::mesh_lifecycle::BucketDrainDisposition::RemainProxyOnly,
+                    reason: "customer-approved delayed migration".to_string(),
+                    expires_at: Some("2026-08-02T00:00:00Z".to_string()),
+                }],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.decisions.len(), 1);
+        let decision = &report.decisions[0];
+        assert_eq!(
+            decision.status_before,
+            mesh_directory::BucketLocatorStatus::Active
+        );
+        assert_eq!(
+            decision.status_after,
+            mesh_directory::BucketLocatorStatus::ReadOnly
+        );
+        assert!(decision.exception_written);
+        assert!(decision.locator_updated);
+
+        let locator = persistence
+            .get_mesh_bucket_locator(tenant.id, "docs")
+            .await
+            .unwrap()
+            .expect("bucket locator");
+        assert_eq!(
+            locator.status,
+            mesh_directory::BucketLocatorStatus::ReadOnly
+        );
+        assert_eq!(locator.generation, 2);
+
+        let exceptions = crate::mesh_lifecycle::list_bucket_drain_exceptions(
+            &persistence.storage,
+            Some("test-region"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(exceptions.len(), 1);
+        assert_eq!(
+            exceptions[0].disposition,
+            crate::mesh_lifecycle::BucketDrainDisposition::RemainProxyOnly
+        );
+
+        let full_drain_err = persistence
+            .transition_region_descriptor(
+                "test-region",
+                draining.generation,
+                crate::mesh_lifecycle::LifecycleState::Drained,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            full_drain_err
+                .to_string()
+                .contains("still name the region as primary")
+        );
+
+        let drained_with_exceptions = persistence
+            .transition_region_descriptor(
+                "test-region",
+                draining.generation,
+                crate::mesh_lifecycle::LifecycleState::DrainedWithExceptions,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            drained_with_exceptions.state,
+            crate::mesh_lifecycle::LifecycleState::DrainedWithExceptions
+        );
+    }
+
+    #[tokio::test]
+    async fn region_drain_delete_after_retention_keeps_region_from_exception_completion() {
+        let temp = tempdir().unwrap();
+        let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+        let (region, _, _) = register_active_mesh_placement(&persistence).await;
+        let tenant = persistence
+            .create_tenant("tenant-a", "unused")
+            .await
+            .unwrap();
+        persistence
+            .create_bucket(tenant.id, "docs", "test-region")
+            .await
+            .unwrap();
+
+        let draining = persistence
+            .transition_region_descriptor(
+                "test-region",
+                region.generation,
+                crate::mesh_lifecycle::LifecycleState::Draining,
+            )
+            .await
+            .unwrap();
+        let report = persistence
+            .apply_region_drain_plan(
+                "test-region",
+                crate::mesh_lifecycle::BucketDrainDisposition::DeleteAfterRetention,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report.decisions[0].status_after,
+            mesh_directory::BucketLocatorStatus::Draining
+        );
+
+        let completion_err = persistence
+            .transition_region_descriptor(
+                "test-region",
+                draining.generation,
+                crate::mesh_lifecycle::LifecycleState::DrainedWithExceptions,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            completion_err
+                .to_string()
+                .contains("do not have a valid read-only drain exception")
+        );
+    }
+
+    #[tokio::test]
+    async fn node_drain_completion_requires_no_runtime_ownership_and_force_offline_expires_it() {
+        let temp = tempdir().unwrap();
+        let mut config = test_config(temp.path());
+        config.public_api_addr = "admin-node".to_string();
+        let persistence = Persistence::new(&config, None).unwrap();
+        let now_nanos = current_time_nanos().unwrap();
+        let ttl_nanos = i64::try_from(MAX_OWNERSHIP_LEASE_MS)
+            .unwrap()
+            .saturating_mul(1_000_000);
+
+        let region = persistence
+            .create_region_descriptor(crate::mesh_lifecycle::CreateRegionDescriptor {
+                mesh_id: "default".to_string(),
+                region: "test-region".to_string(),
+                public_base_url: "https://test-region.anvil-storage.test".to_string(),
+                virtual_host_suffix: "test-region.anvil-storage.test".to_string(),
+                placement_weight: 100,
+                default_cell: Some("default".to_string()),
+            })
+            .await
+            .unwrap();
+        let cell = persistence
+            .register_cell_descriptor(crate::mesh_lifecycle::RegisterCellDescriptor {
+                mesh_id: "default".to_string(),
+                region: "test-region".to_string(),
+                cell_id: "default".to_string(),
+                placement_weight: 100,
+            })
+            .await
+            .unwrap();
+        persistence
+            .transition_cell_descriptor(
+                "test-region",
+                "default",
+                cell.generation,
+                crate::mesh_lifecycle::LifecycleState::Active,
+            )
+            .await
+            .unwrap();
+        persistence
+            .transition_region_descriptor(
+                "test-region",
+                region.generation,
+                crate::mesh_lifecycle::LifecycleState::Active,
+            )
+            .await
+            .unwrap();
+        let worker = persistence
+            .register_node_descriptor(crate::mesh_lifecycle::RegisterNodeDescriptor {
+                mesh_id: "default".to_string(),
+                node_id: "worker-node".to_string(),
+                region: "test-region".to_string(),
+                cell_id: "default".to_string(),
+                libp2p_peer_id: "peer-worker-node".to_string(),
+                public_api_addr: "worker-node".to_string(),
+                public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7444/quic-v1".to_string()],
+                capabilities: vec![crate::mesh_lifecycle::NodeCapability::Object],
+            })
+            .await
+            .unwrap();
+        let worker = persistence
+            .transition_node_descriptor(
+                "worker-node",
+                worker.generation,
+                crate::mesh_lifecycle::LifecycleState::Active,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let partition_owner = crate::partition_fence::acquire_partition_recovery(
+            &persistence.storage,
+            crate::partition_fence::PartitionRecoveryAcquire {
+                partition_family: "object_metadata".to_string(),
+                partition_id: hex::encode([8; 32]),
+                owner_node_id: "worker-node".to_string(),
+                recovered_through_sequence: 0,
+                recovered_manifest_hash: hex::encode([0; 32]),
+                now_nanos,
+            },
+            &persistence.partition_owner_signing_key,
+        )
+        .await
+        .unwrap();
+        let partition_owner = crate::partition_fence::publish_partition_ready(
+            &persistence.storage,
+            &partition_owner.partition_family,
+            &partition_owner.partition_id,
+            "worker-node",
+            partition_owner.fence_token,
+            1,
+            &hex::encode([1; 32]),
+            now_nanos.saturating_add(1),
+            &persistence.partition_owner_signing_key,
+        )
+        .await
+        .unwrap();
+        let stale_partition_permit = partition_owner.write_permit().unwrap();
+
+        crate::partition_fence::acquire_ownership(
+            &persistence.storage,
+            crate::partition_fence::AcquireOwnership {
+                request_id: "worker-control-acquire".to_string(),
+                idempotency_key: "worker-control-acquire".to_string(),
+                resource: crate::partition_fence::OwnershipResource {
+                    resource_kind: crate::partition_fence::OwnershipResourceKind::WatchPartition,
+                    resource_id: "watch/alpha".to_string(),
+                },
+                owner: crate::partition_fence::OwnershipPrincipal {
+                    tenant_id: 0,
+                    principal_kind: "node".to_string(),
+                    principal_id: "worker-node".to_string(),
+                    actor_instance_id: "worker-node".to_string(),
+                    display_name: "worker-node".to_string(),
+                    region: "test-region".to_string(),
+                    cell: "default".to_string(),
+                },
+                now_nanos,
+                ttl_nanos,
+            },
+            &persistence.partition_owner_signing_key,
+        )
+        .await
+        .unwrap();
+
+        let task_lease = crate::task_lease::acquire_task_lease(
+            &persistence.storage,
+            crate::task_lease::TaskLeaseAcquire {
+                task_id: "worker-task".to_string(),
+                task_kind: "index-build".to_string(),
+                partition_family: "index_partition".to_string(),
+                partition_id: hex::encode([9; 32]),
+                owner: crate::task_lease::TaskLeaseOwner::node("worker-node"),
+                source_cursor: 1,
+                now_nanos,
+                ttl_nanos,
+            },
+            &persistence.partition_owner_signing_key,
+        )
+        .await
+        .unwrap();
+
+        let draining = persistence
+            .transition_node_descriptor(
+                "worker-node",
+                worker.generation,
+                crate::mesh_lifecycle::LifecycleState::Draining,
+                Some(crate::mesh_lifecycle::NodeDrainDescriptor {
+                    started_at: "2026-07-02T00:00:00Z".to_string(),
+                    graceful_timeout_ms: 1000,
+                    force_after_timeout: false,
+                }),
+            )
+            .await
+            .unwrap();
+        let blockers = persistence
+            .node_runtime_ownership_blockers("worker-node")
+            .await
+            .unwrap();
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker.starts_with("partition_owner:object_metadata/"))
+        );
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker.starts_with("ownership_fence:watch_partition/watch/alpha"))
+        );
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker == "task_lease:index-build:worker-task:fence=1")
+        );
+
+        let drained = persistence
+            .transition_node_descriptor(
+                "worker-node",
+                draining.generation,
+                crate::mesh_lifecycle::LifecycleState::Drained,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(drained.to_string().contains("drain cannot complete"));
+
+        let offline = persistence
+            .transition_node_descriptor(
+                "worker-node",
+                draining.generation,
+                crate::mesh_lifecycle::LifecycleState::Offline,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            offline.state,
+            crate::mesh_lifecycle::LifecycleState::Offline
+        );
+        assert!(
+            persistence
+                .node_runtime_ownership_blockers("worker-node")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let stale_rejection = crate::partition_fence::validate_partition_write(
+            &persistence.storage,
+            &stale_partition_permit,
+            &persistence.partition_owner_signing_key,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            stale_rejection.code,
+            crate::error_codes::AnvilErrorCode::PartitionNotOwned
+        );
+        assert!(
+            crate::task_lease::checkpoint_task_lease(
+                &persistence.storage,
+                &task_lease.task_id,
+                &task_lease.owner,
+                task_lease.fence_token,
+                task_lease.source_cursor,
+                now_nanos.saturating_add(2),
+                &persistence.partition_owner_signing_key,
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn mesh_routing_projection_diagnostics_detect_bucket_locator_mismatch() {
+        let temp = tempdir().unwrap();
+        let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+        register_active_mesh_placement(&persistence).await;
+        let tenant = persistence
+            .create_tenant("tenant-a", "unused")
+            .await
+            .unwrap();
+        let bucket = persistence
+            .create_bucket(tenant.id, "docs", "test-region")
+            .await
+            .unwrap();
+
+        let clean = persistence
+            .diagnose_mesh_routing_projection(Some(
+                mesh_directory::RoutingRecordFamily::BucketLocator,
+            ))
+            .await
+            .unwrap();
+        assert!(clean.is_empty());
+
+        let bucket_locator = persistence
+            .get_mesh_bucket_locator(tenant.id, "docs")
+            .await
+            .unwrap()
+            .expect("bucket locator");
+        assert_eq!(bucket_locator.bucket_id.as_str(), bucket.id.to_string());
+        let path = mesh_descriptor_path(&persistence.storage, &bucket_locator.descriptor_key());
+        let mut projected: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        projected["home_region"] = json!("us-east-1");
+        tokio::fs::write(&path, serde_json::to_vec_pretty(&projected).unwrap())
+            .await
+            .unwrap();
+
+        let diagnostics = persistence
+            .diagnose_mesh_routing_projection(Some(
+                mesh_directory::RoutingRecordFamily::BucketLocator,
+            ))
+            .await
+            .unwrap();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "mesh_control_projection_payload_mismatch"
+                && diagnostic.record_key == format!("{}/docs", tenant.id)
+                && diagnostic.repair_safe
+                && diagnostic.proposed_action == "repair_routing_record_from_control_stream"
+        }));
+
+        let repaired = persistence
+            .repair_mesh_routing_record(
+                mesh_directory::RoutingRecordFamily::BucketLocator,
+                &format!("{}/docs", tenant.id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repaired.record_key, format!("{}/docs", tenant.id));
+        let repaired_payload: serde_json::Value =
+            serde_json::from_str(&repaired.payload_json).unwrap();
+        assert_eq!(repaired_payload["home_region"], "test-region");
+        let clean = persistence
+            .diagnose_mesh_routing_projection(Some(
+                mesh_directory::RoutingRecordFamily::BucketLocator,
+            ))
+            .await
+            .unwrap();
+        assert!(clean.is_empty(), "{clean:#?}");
+    }
+
+    async fn register_active_mesh_placement(
+        persistence: &Persistence,
+    ) -> (
+        crate::mesh_lifecycle::RegionDescriptor,
+        crate::mesh_lifecycle::CellDescriptor,
+        crate::mesh_lifecycle::NodeDescriptor,
+    ) {
+        let region = persistence
+            .create_region_descriptor(crate::mesh_lifecycle::CreateRegionDescriptor {
+                mesh_id: "default".to_string(),
+                region: "test-region".to_string(),
+                public_base_url: "https://test-region.anvil-storage.test".to_string(),
+                virtual_host_suffix: "test-region.anvil-storage.test".to_string(),
+                placement_weight: 100,
+                default_cell: Some("default".to_string()),
+            })
+            .await
+            .unwrap();
+        let cell = persistence
+            .register_cell_descriptor(crate::mesh_lifecycle::RegisterCellDescriptor {
+                mesh_id: "default".to_string(),
+                region: "test-region".to_string(),
+                cell_id: "default".to_string(),
+                placement_weight: 100,
+            })
+            .await
+            .unwrap();
+        let cell = persistence
+            .transition_cell_descriptor(
+                "test-region",
+                "default",
+                cell.generation,
+                crate::mesh_lifecycle::LifecycleState::Active,
+            )
+            .await
+            .unwrap();
+        let region = persistence
+            .transition_region_descriptor(
+                "test-region",
+                region.generation,
+                crate::mesh_lifecycle::LifecycleState::Active,
+            )
+            .await
+            .unwrap();
+        let node = persistence
+            .register_node_descriptor(crate::mesh_lifecycle::RegisterNodeDescriptor {
+                mesh_id: "default".to_string(),
+                node_id: "test-node".to_string(),
+                region: "test-region".to_string(),
+                cell_id: "default".to_string(),
+                libp2p_peer_id: "peer-test-node".to_string(),
+                public_api_addr: "test-node".to_string(),
+                public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
+                capabilities: vec![
+                    crate::mesh_lifecycle::NodeCapability::Object,
+                    crate::mesh_lifecycle::NodeCapability::Admin,
+                ],
+            })
+            .await
+            .unwrap();
+        let node = persistence
+            .transition_node_descriptor(
+                "test-node",
+                node.generation,
+                crate::mesh_lifecycle::LifecycleState::Active,
+                None,
+            )
+            .await
+            .unwrap();
+        (region, cell, node)
+    }
+
+    fn mesh_descriptor_path(storage: &Storage, descriptor_key: &str) -> std::path::PathBuf {
+        let relative = descriptor_key
+            .strip_prefix(mesh_directory::MESH_DIRECTORY_ROOT)
+            .and_then(|value| value.strip_prefix('/'))
+            .expect("mesh descriptor key prefix");
+        relative
+            .split('/')
+            .fold(storage.mesh_directory_root_path(), |path, segment| {
+                path.join(segment)
+            })
     }
 
     #[tokio::test]
@@ -3522,11 +6011,7 @@ mod tests {
 
         drop(persistence);
 
-        let restarted_config = Config {
-            public_api_addr: "test-node-after-restart".to_string(),
-            ..first_config
-        };
-        let replayed = Persistence::new(&restarted_config, None).unwrap();
+        let replayed = Persistence::new(&first_config, None).unwrap();
 
         assert!(
             replayed
@@ -3750,11 +6235,7 @@ mod tests {
         assert_eq!(sealed.directory_record_count, 2);
 
         drop(persistence);
-        let restarted_config = Config {
-            public_api_addr: "test-node-after-compaction".to_string(),
-            ..first_config
-        };
-        let restarted = Persistence::new(&restarted_config, None).unwrap();
+        let restarted = Persistence::new(&first_config, None).unwrap();
 
         let replayed = restarted
             .get_object(bucket.id, "docs/a.txt")
@@ -3816,6 +6297,76 @@ mod tests {
                 .versions
                 .len(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn object_metadata_writes_require_rfc_ownership_fence() {
+        let temp = tempdir().unwrap();
+        let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+        register_active_mesh_placement(&persistence).await;
+        let tenant = persistence
+            .create_tenant("tenant-a", "unused")
+            .await
+            .unwrap();
+        let bucket = persistence
+            .create_bucket(tenant.id, "docs", "test-region")
+            .await
+            .unwrap();
+        let partition_id = hex::encode(metadata_journal::object_metadata_partition_id(
+            tenant.id, bucket.id,
+        ));
+        let resource = OwnershipResource {
+            resource_kind: OwnershipResourceKind::ObjectPartition,
+            resource_id: format!(
+                "tenant/{}/bucket/{}/object_metadata/{partition_id}",
+                tenant.id, bucket.id
+            ),
+        };
+        let now_nanos = Utc::now().timestamp_nanos_opt().unwrap();
+        acquire_ownership(
+            &persistence.storage,
+            AcquireOwnership {
+                request_id: "other-node-object-owner".to_string(),
+                idempotency_key: "other-node-object-owner".to_string(),
+                resource,
+                owner: OwnershipPrincipal {
+                    tenant_id: 0,
+                    principal_kind: "node".to_string(),
+                    principal_id: "other-node".to_string(),
+                    actor_instance_id: "other-node".to_string(),
+                    display_name: "other-node".to_string(),
+                    region: "test-region".to_string(),
+                    cell: "default".to_string(),
+                },
+                now_nanos,
+                ttl_nanos: i64::try_from(MAX_OWNERSHIP_LEASE_MS)
+                    .unwrap()
+                    .saturating_mul(1_000_000),
+            },
+            &persistence.partition_owner_signing_key,
+        )
+        .await
+        .unwrap();
+
+        let err = persistence
+            .create_object(
+                tenant.id,
+                bucket.id,
+                "blocked.txt",
+                "payload-hash",
+                1,
+                "etag",
+                Some("text/plain"),
+                None,
+                None,
+                Some(b"x".to_vec()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("OwnershipHeld"),
+            "unexpected error: {err}"
         );
     }
 

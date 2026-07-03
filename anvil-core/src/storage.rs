@@ -84,6 +84,103 @@ impl Storage {
             .join("control.anjournal")
     }
 
+    pub fn mesh_lifecycle_state_path(&self) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("control")
+            .join("mesh-lifecycle.json")
+    }
+
+    pub fn mesh_directory_root_path(&self) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("control")
+            .join("v1")
+            .join("mesh")
+    }
+
+    pub fn mesh_control_stream_path(
+        &self,
+        stream_family: &str,
+        partition: &str,
+    ) -> Result<PathBuf> {
+        ensure_safe_internal_component(stream_family, "control stream family")?;
+        ensure_control_stream_partition(partition)?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("control")
+            .join("v1")
+            .join("streams")
+            .join(stream_family)
+            .join(format!("{partition}.anlog")))
+    }
+
+    pub fn mesh_control_stream_family_path(&self, stream_family: &str) -> Result<PathBuf> {
+        ensure_safe_internal_component(stream_family, "control stream family")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("control")
+            .join("v1")
+            .join("streams")
+            .join(stream_family))
+    }
+
+    pub fn mesh_control_checkpoint_path(
+        &self,
+        region: &str,
+        stream_family: &str,
+        partition: &str,
+    ) -> Result<PathBuf> {
+        ensure_safe_internal_component(region, "control checkpoint region")?;
+        ensure_safe_internal_component(stream_family, "control checkpoint stream family")?;
+        ensure_control_stream_partition(partition)?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("control")
+            .join("v1")
+            .join("checkpoints")
+            .join("regions")
+            .join(region)
+            .join(stream_family)
+            .join(format!("{partition}.json")))
+    }
+
+    pub fn mesh_control_checkpoint_region_path(&self, region: &str) -> Result<PathBuf> {
+        ensure_safe_internal_component(region, "control checkpoint region")?;
+        Ok(self
+            .storage_path
+            .join("_anvil")
+            .join("control")
+            .join("v1")
+            .join("checkpoints")
+            .join("regions")
+            .join(region))
+    }
+
+    pub fn admin_audit_event_root(&self) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("control")
+            .join("admin-audit")
+    }
+
+    pub fn admin_audit_event_path(
+        &self,
+        created_at: &str,
+        audit_event_id: &str,
+    ) -> Result<PathBuf> {
+        let day = created_at.get(0..10).unwrap_or("unknown-day");
+        ensure_safe_internal_component(day, "admin audit day")?;
+        let digest = blake3::hash(audit_event_id.as_bytes()).to_hex().to_string();
+        Ok(self
+            .admin_audit_event_root()
+            .join(day)
+            .join(format!("{digest}.json")))
+    }
+
     pub fn metadata_journal_path(&self, tenant_id: i64, bucket_id: i64) -> PathBuf {
         self.storage_path
             .join("_anvil")
@@ -213,6 +310,20 @@ impl Storage {
             .join("partition-owners")
             .join(partition_family)
             .join(format!("{partition_id}.json")))
+    }
+
+    pub fn partition_owners_root_path(&self) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("control")
+            .join("partition-owners")
+    }
+
+    pub fn task_lease_root_path(&self) -> PathBuf {
+        self.storage_path
+            .join("_anvil")
+            .join("tasks")
+            .join("leases")
     }
 
     pub fn model_metadata_journal_path(&self) -> PathBuf {
@@ -1091,6 +1202,18 @@ fn ensure_safe_internal_component(value: &str, context: &str) -> Result<()> {
 fn ensure_hash_hex(value: &str, context: &str) -> Result<()> {
     if value.len() != 64 || !value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
         anyhow::bail!("{context} must be 32 bytes encoded as hex");
+    }
+    Ok(())
+}
+
+fn ensure_control_stream_partition(value: &str) -> Result<()> {
+    if value.len() != 4
+        || !value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        anyhow::bail!("control stream partition must be four lowercase hex characters");
     }
     Ok(())
 }

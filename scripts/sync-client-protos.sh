@@ -16,6 +16,11 @@ for name in [
     'GetShardResponse',
     'DeleteShardRequest',
     'DeleteShardResponse',
+    'ProxyHeader',
+    'ProxyRequestHeader',
+    'ProxyRequestChunk',
+    'ProxyResponseHeader',
+    'ProxyResponseChunk',
 ]:
     src = re.sub(r'\nmessage ' + name + r' \{\}\n', '\n', src)
     src = re.sub(
@@ -26,6 +31,10 @@ for name in [
     )
 src = src.replace(
     '''\n// Internal Service for node-to-node communication\nservice InternalAnvilService {\n  rpc PutShard(stream PutShardRequest) returns (PutShardResponse);\n  rpc GetShard(GetShardRequest) returns (stream GetShardResponse);\n  rpc CommitShard(CommitShardRequest) returns (CommitShardResponse);\n  rpc DeleteShard(DeleteShardRequest) returns (DeleteShardResponse);\n}\n''',
+    '\n',
+)
+src = src.replace(
+    '''\nservice InternalProxyService {\n  rpc ProxyObject(stream ProxyRequestChunk) returns (stream ProxyResponseChunk);\n}\n''',
     '\n',
 )
 Path('clients/rust/proto/anvil.proto').write_text(src)

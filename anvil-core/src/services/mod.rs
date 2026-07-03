@@ -1,3 +1,5 @@
+pub mod admin;
+pub(crate) mod admin_cursor;
 pub mod auth;
 pub mod bucket;
 pub mod coordination;
@@ -5,19 +7,22 @@ pub mod git_source;
 pub mod huggingface;
 pub mod index;
 pub mod internal;
+pub mod internal_proxy;
 pub mod object;
 pub mod personaldb;
 pub mod repair;
 pub(crate) mod watch_envelope;
 
 use crate::anvil_api::{
-    auth_service_server::AuthServiceServer, bucket_service_server::BucketServiceServer,
+    admin_service_server::AdminServiceServer, auth_service_server::AuthServiceServer,
+    bucket_service_server::BucketServiceServer,
     coordination_service_server::CoordinationServiceServer,
     git_source_service_server::GitSourceServiceServer,
     hf_ingestion_service_server::HfIngestionServiceServer,
     hugging_face_key_service_server::HuggingFaceKeyServiceServer,
     index_service_server::IndexServiceServer,
     internal_anvil_service_server::InternalAnvilServiceServer,
+    internal_proxy_service_server::InternalProxyServiceServer,
     object_service_server::ObjectServiceServer,
     personal_db_service_server::PersonalDbServiceServer,
     repair_service_server::RepairServiceServer,
@@ -88,6 +93,10 @@ pub fn create_grpc_router(state: AppState, auth_interceptor: AuthInterceptorFn) 
         state.clone(),
         auth_closure.clone(),
     ))
+    .add_service(InternalProxyServiceServer::with_interceptor(
+        state.clone(),
+        auth_closure.clone(),
+    ))
     .add_service(HuggingFaceKeyServiceServer::with_interceptor(
         state.clone(),
         auth_closure.clone(),
@@ -96,6 +105,14 @@ pub fn create_grpc_router(state: AppState, auth_interceptor: AuthInterceptorFn) 
         state.clone(),
         auth_closure,
     ))
+}
+
+pub fn create_admin_grpc_router(state: AppState, auth_interceptor: AuthInterceptorFn) -> Routes {
+    let auth_closure = {
+        let f = auth_interceptor.clone();
+        move |req| f.call(req)
+    };
+    tonic::service::Routes::new(AdminServiceServer::with_interceptor(state, auth_closure))
 }
 
 pub fn create_axum_router(grpc_router: Routes) -> axum::Router {

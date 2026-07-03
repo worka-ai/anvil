@@ -112,6 +112,7 @@ sha2 = "0.10.9"
 sha1 = "0.10.6"
 hex = "0.4.3"
 hmac = "0.12.1"
+idna = "1.1.0"
 axum-extra = { version = "0.10.2", features = ["typed-header"] }
 regex = "1.11.3"
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled", "session"] }

@@ -5,7 +5,7 @@ use crate::{
     },
     auth, bucket_journal,
     cluster::ClusterState,
-    metadata_journal,
+    metadata_journal, object_links,
     observability::{
         OBJECT_READ_LATENCY, OBJECT_WRITE_LATENCY, Observability, PREFIX_LIST_LATENCY,
         RESERVED_NAMESPACE_REJECTION_COUNT,
@@ -16,6 +16,7 @@ use crate::{
         ObjectWatchEvent, Persistence,
     },
     placement::PlacementManager,
+    routing::{self, CrossRegionRoutingPolicy},
     sharding::ShardManager,
     storage::{ExternalChunkManifest, Storage},
     validation, watch_log,
@@ -27,6 +28,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
+use tonic::metadata::MetadataValue;
 use tracing::info;
 
 const INLINE_PAYLOAD_MAX_BYTES: i64 = 64 * 1024;
@@ -45,6 +47,7 @@ pub struct ObjectManager {
     sharder: ShardManager,
     storage: Storage,
     region: String,
+    cross_region_routing_policy: CrossRegionRoutingPolicy,
     jwt_manager: Arc<auth::JwtManager>,
     encryption_key: Vec<u8>,
     watch_tx: broadcast::Sender<ObjectWatchEvent>,
@@ -87,6 +90,24 @@ pub struct AbortMultipartUploadResult {
 pub struct ObjectWriteOptions {
     pub content_type: Option<String>,
     pub user_metadata: Option<JsonValue>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectLinkReadMode {
+    Follow,
+    Metadata,
+}
+
+pub struct ObjectReadResult {
+    pub object: Object,
+    pub stream: Pin<Box<dyn Stream<Item = Result<Vec<u8>, Status>> + Send + 'static>>,
+    pub followed_link: Option<object_links::FollowedObjectLink>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectHeadResult {
+    pub object: Object,
+    pub followed_link: Option<object_links::FollowedObjectLink>,
 }
 
 async fn commit_temp_payload(
@@ -156,6 +177,7 @@ impl ObjectManager {
         sharder: ShardManager,
         storage: Storage,
         region: String,
+        cross_region_routing_policy: CrossRegionRoutingPolicy,
         jwt_manager: Arc<auth::JwtManager>,
         anvil_secret_encryption_key: String,
         watch_tx: broadcast::Sender<ObjectWatchEvent>,
@@ -170,6 +192,7 @@ impl ObjectManager {
             sharder,
             storage,
             region,
+            cross_region_routing_policy,
             jwt_manager,
             encryption_key,
             watch_tx,
@@ -224,6 +247,7 @@ impl ObjectManager {
         if !authorized {
             return Err(Status::permission_denied("Permission denied"));
         }
+        let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
         let nodes = self
             .placer
             .calculate_placement(object_key, &self.cluster, self.sharder.total_shards())
@@ -339,7 +363,6 @@ impl ObjectManager {
                 .map_err(|e| Status::internal(e.to_string()))?;
         }
 
-        let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
         let shard_map_json = if nodes.len() > 1 {
             let peer_ids: Vec<String> = nodes.iter().map(|p| p.to_base58()).collect();
             Some(serde_json::json!(peer_ids))
@@ -872,6 +895,46 @@ impl ObjectManager {
         ),
         Status,
     > {
+        let result = self
+            .get_object_with_link_mode(
+                claims,
+                bucket_name,
+                object_key,
+                version_id,
+                ObjectLinkReadMode::Follow,
+            )
+            .await?;
+        Ok((result.object, result.stream))
+    }
+
+    pub async fn get_object_with_link_mode(
+        &self,
+        claims: Option<auth::Claims>,
+        bucket_name: String,
+        object_key: String,
+        version_id: Option<uuid::Uuid>,
+        link_mode: ObjectLinkReadMode,
+    ) -> Result<ObjectReadResult, Status> {
+        self.get_object_with_link_mode_for_tenant(
+            claims,
+            None,
+            bucket_name,
+            object_key,
+            version_id,
+            link_mode,
+        )
+        .await
+    }
+
+    pub async fn get_object_with_link_mode_for_tenant(
+        &self,
+        claims: Option<auth::Claims>,
+        route_tenant_id: Option<i64>,
+        bucket_name: String,
+        object_key: String,
+        version_id: Option<uuid::Uuid>,
+        link_mode: ObjectLinkReadMode,
+    ) -> Result<ObjectReadResult, Status> {
         let _latency = self
             .observability
             .latency_guard(OBJECT_READ_LATENCY, &[("api", "native")]);
@@ -887,20 +950,22 @@ impl ObjectManager {
         }
 
         let bucket = self
-            .get_authorized_bucket(claims.as_ref(), &bucket_name)
+            .get_authorized_bucket(claims.as_ref(), route_tenant_id, &bucket_name)
             .await?;
 
         if !bucket.is_public_read {
-            let claims = claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
+            let claims = claims
+                .as_ref()
+                .ok_or_else(|| Status::permission_denied("Permission denied"))?;
             if !self
-                .object_read_allowed(&claims, &bucket_name, &object_key, None)
+                .object_read_allowed(claims, &bucket_name, &object_key, None)
                 .await?
             {
                 return Err(Status::permission_denied("Permission denied"));
             }
         }
 
-        let object = match version_id {
+        let mut object = match version_id {
             Some(version_id) => {
                 let object = metadata_journal::read_object_version(
                     &self.storage,
@@ -927,13 +992,28 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Object not found"))?,
         };
+        let mut followed_link = None;
+        if version_id.is_none() && object.kind == object_links::ObjectEntryKind::Link {
+            if link_mode == ObjectLinkReadMode::Metadata {
+                return Err(Status::failed_precondition("ObjectLinkMetadataRead"));
+            }
+            let (target, link) = self
+                .resolve_followed_link(&bucket, object, claims.as_ref())
+                .await?;
+            object = target;
+            followed_link = Some(link);
+        }
 
         if let Some(inline_payload) = object.inline_payload.clone() {
             let chunks = inline_payload
                 .chunks(1024 * 64)
                 .map(|chunk| Ok(chunk.to_vec()))
                 .collect::<Vec<Result<Vec<u8>, Status>>>();
-            return Ok((object, Box::pin(futures_util::stream::iter(chunks))));
+            return Ok(ObjectReadResult {
+                object,
+                stream: Box::pin(futures_util::stream::iter(chunks)),
+                followed_link,
+            });
         }
 
         let (tx, rx) = mpsc::channel(4);
@@ -1167,7 +1247,11 @@ impl ObjectManager {
             }
         });
 
-        Ok((object, Box::pin(ReceiverStream::new(rx))))
+        Ok(ObjectReadResult {
+            object,
+            stream: Box::pin(ReceiverStream::new(rx)),
+            followed_link,
+        })
     }
 
     pub async fn delete_object(
@@ -1271,6 +1355,46 @@ impl ObjectManager {
         object_key: &str,
         version_id: Option<uuid::Uuid>,
     ) -> Result<Object, Status> {
+        Ok(self
+            .head_object_with_link_mode(
+                claims,
+                bucket_name,
+                object_key,
+                version_id,
+                ObjectLinkReadMode::Follow,
+            )
+            .await?
+            .object)
+    }
+
+    pub async fn head_object_with_link_mode(
+        &self,
+        claims: Option<auth::Claims>,
+        bucket_name: &str,
+        object_key: &str,
+        version_id: Option<uuid::Uuid>,
+        link_mode: ObjectLinkReadMode,
+    ) -> Result<ObjectHeadResult, Status> {
+        self.head_object_with_link_mode_for_tenant(
+            claims,
+            None,
+            bucket_name,
+            object_key,
+            version_id,
+            link_mode,
+        )
+        .await
+    }
+
+    pub async fn head_object_with_link_mode_for_tenant(
+        &self,
+        claims: Option<auth::Claims>,
+        route_tenant_id: Option<i64>,
+        bucket_name: &str,
+        object_key: &str,
+        version_id: Option<uuid::Uuid>,
+        link_mode: ObjectLinkReadMode,
+    ) -> Result<ObjectHeadResult, Status> {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
@@ -1282,20 +1406,22 @@ impl ObjectManager {
         }
 
         let bucket = self
-            .get_authorized_bucket(claims.as_ref(), bucket_name)
+            .get_authorized_bucket(claims.as_ref(), route_tenant_id, bucket_name)
             .await?;
 
         if !bucket.is_public_read {
-            let claims = claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
+            let claims = claims
+                .as_ref()
+                .ok_or_else(|| Status::permission_denied("Permission denied"))?;
             if !self
-                .object_read_allowed(&claims, bucket_name, object_key, None)
+                .object_read_allowed(claims, bucket_name, object_key, None)
                 .await?
             {
                 return Err(Status::permission_denied("Permission denied"));
             }
         }
 
-        let object = match version_id {
+        let mut object = match version_id {
             Some(version_id) => {
                 let object = metadata_journal::read_object_version(
                     &self.storage,
@@ -1322,12 +1448,120 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Object not found"))?,
         };
-        Ok(object)
+        let mut followed_link = None;
+        if version_id.is_none() && object.kind == object_links::ObjectEntryKind::Link {
+            if link_mode == ObjectLinkReadMode::Metadata {
+                return Err(Status::failed_precondition("ObjectLinkMetadataRead"));
+            }
+            let (target, link) = self
+                .resolve_followed_link(&bucket, object, claims.as_ref())
+                .await?;
+            object = target;
+            followed_link = Some(link);
+        }
+        Ok(ObjectHeadResult {
+            object,
+            followed_link,
+        })
+    }
+
+    pub async fn read_object_link(
+        &self,
+        claims: Option<auth::Claims>,
+        bucket_name: &str,
+        object_key: &str,
+        version_id: Option<uuid::Uuid>,
+    ) -> Result<object_links::ObjectLinkDescriptor, Status> {
+        self.read_object_link_for_tenant(claims, None, bucket_name, object_key, version_id)
+            .await
+    }
+
+    pub async fn read_object_link_for_tenant(
+        &self,
+        claims: Option<auth::Claims>,
+        route_tenant_id: Option<i64>,
+        bucket_name: &str,
+        object_key: &str,
+        version_id: Option<uuid::Uuid>,
+    ) -> Result<object_links::ObjectLinkDescriptor, Status> {
+        if !validation::is_valid_bucket_name(bucket_name) {
+            return Err(Status::invalid_argument("Invalid bucket name"));
+        }
+        if validation::is_reserved_internal_key(object_key) {
+            return Err(Status::permission_denied("UnauthorizedReservedNamespace"));
+        }
+        if !validation::is_valid_object_key(object_key) {
+            return Err(Status::invalid_argument("Invalid object key"));
+        }
+
+        let bucket = self
+            .get_authorized_bucket(claims.as_ref(), route_tenant_id, bucket_name)
+            .await?;
+        if !bucket.is_public_read {
+            let claims = claims
+                .as_ref()
+                .ok_or_else(|| Status::permission_denied("Permission denied"))?;
+            if !self
+                .object_read_allowed(claims, bucket_name, object_key, None)
+                .await?
+            {
+                return Err(Status::permission_denied("Permission denied"));
+            }
+        }
+
+        let object = match version_id {
+            Some(version_id) => metadata_journal::read_object_version(
+                &self.storage,
+                &bucket,
+                &self.encryption_key,
+                object_key,
+                version_id,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Object link not found"))?,
+            None => metadata_journal::read_current_object(
+                &self.storage,
+                &bucket,
+                &self.encryption_key,
+                object_key,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Object link not found"))?,
+        };
+        if object.deleted_at.is_some() || object.kind != object_links::ObjectEntryKind::Link {
+            return Err(Status::not_found("Object link not found"));
+        }
+        object_links::link_descriptor(&bucket.name, &object)
+            .ok_or_else(|| Status::internal("Object link descriptor missing"))
     }
 
     pub async fn list_objects(
         &self,
         claims: Option<auth::Claims>,
+        bucket_name: &str,
+        prefix: &str,
+        start_after: &str,
+        limit: i32,
+        delimiter: &str,
+    ) -> Result<(Vec<Object>, Vec<String>), Status> {
+        self.list_objects_for_tenant(
+            claims,
+            None,
+            bucket_name,
+            prefix,
+            start_after,
+            limit,
+            delimiter,
+        )
+        .await
+    }
+
+    pub async fn list_objects_for_tenant(
+        &self,
+        claims: Option<auth::Claims>,
+        route_tenant_id: Option<i64>,
         bucket_name: &str,
         prefix: &str,
         start_after: &str,
@@ -1350,7 +1584,7 @@ impl ObjectManager {
 
         // Allow public buckets to bypass auth; otherwise require appropriate scope
         let bucket = self
-            .get_authorized_bucket(claims.as_ref(), bucket_name)
+            .get_authorized_bucket(claims.as_ref(), route_tenant_id, bucket_name)
             .await?;
         if !bucket.is_public_read {
             let claims = claims
@@ -1398,6 +1632,28 @@ impl ObjectManager {
         version_id_marker: &str,
         limit: i32,
     ) -> Result<crate::persistence::ObjectVersionsPage, Status> {
+        self.list_object_versions_for_tenant(
+            claims,
+            None,
+            bucket_name,
+            prefix,
+            key_marker,
+            version_id_marker,
+            limit,
+        )
+        .await
+    }
+
+    pub async fn list_object_versions_for_tenant(
+        &self,
+        claims: Option<auth::Claims>,
+        route_tenant_id: Option<i64>,
+        bucket_name: &str,
+        prefix: &str,
+        key_marker: &str,
+        version_id_marker: &str,
+        limit: i32,
+    ) -> Result<crate::persistence::ObjectVersionsPage, Status> {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
@@ -1424,7 +1680,7 @@ impl ObjectManager {
         };
 
         let bucket = self
-            .get_authorized_bucket(claims.as_ref(), bucket_name)
+            .get_authorized_bucket(claims.as_ref(), route_tenant_id, bucket_name)
             .await?;
         if !bucket.is_public_read {
             let claims = claims
@@ -1634,13 +1890,37 @@ impl ObjectManager {
     async fn get_authorized_bucket(
         &self,
         claims: Option<&auth::Claims>,
+        route_tenant_id: Option<i64>,
         bucket_name: &str,
     ) -> Result<Bucket, Status> {
-        let bucket = match claims {
-            Some(c) => bucket_journal::read_current_bucket(&self.storage, c.tenant_id, bucket_name)
+        if let (Some(claims), Some(route_tenant_id)) = (claims, route_tenant_id)
+            && claims.tenant_id != route_tenant_id
+        {
+            return Err(Status::permission_denied(
+                "Credentials are not valid for routed tenant",
+            ));
+        }
+
+        let tenant_id = route_tenant_id.or_else(|| claims.map(|claims| claims.tenant_id));
+        if let Some(tenant_id) = tenant_id
+            && let Some(locator) = self
+                .persistence
+                .get_mesh_bucket_locator(tenant_id, bucket_name)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?
-                .ok_or_else(|| Status::not_found("Bucket not found for this tenant")),
+            && locator.status != crate::mesh_directory::BucketLocatorStatus::Deleted
+            && locator.home_region.as_str() != self.region.as_str()
+        {
+            return Err(self.remote_bucket_status(locator.home_region.as_str()));
+        }
+
+        let bucket = match tenant_id {
+            Some(tenant_id) => {
+                bucket_journal::read_current_bucket(&self.storage, tenant_id, bucket_name)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .ok_or_else(|| Status::not_found("Bucket not found for this tenant"))
+            }
             None => bucket_journal::read_public_bucket_by_name(&self.storage, bucket_name)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?
@@ -1648,13 +1928,126 @@ impl ObjectManager {
         }?;
 
         if bucket.region != self.region {
-            return Err(Status::failed_precondition(format!(
-                "Bucket is in region {}",
-                bucket.region
-            )));
+            return Err(self.remote_bucket_status(&bucket.region));
         }
 
         Ok(bucket)
+    }
+
+    fn remote_bucket_status(&self, bucket_region: &str) -> Status {
+        let action = routing::remote_bucket_routing_action(self.cross_region_routing_policy, false);
+        let (code, message, action_name) = match action {
+            routing::RemoteBucketRoutingAction::Redirect => (
+                tonic::Code::FailedPrecondition,
+                format!("Bucket is in region {bucket_region}; redirect required"),
+                "redirect",
+            ),
+            routing::RemoteBucketRoutingAction::Proxy => (
+                tonic::Code::Unavailable,
+                format!("Bucket is in region {bucket_region}; native proxy is unavailable"),
+                "proxy_unavailable",
+            ),
+            routing::RemoteBucketRoutingAction::RejectLocalOnly => (
+                tonic::Code::FailedPrecondition,
+                format!("Bucket is in region {bucket_region}; cross-region routing is disabled"),
+                "local_only",
+            ),
+            routing::RemoteBucketRoutingAction::ProxyUnavailable => (
+                tonic::Code::Unavailable,
+                format!("Bucket is in region {bucket_region}; cross-region proxy is unavailable"),
+                "proxy_unavailable",
+            ),
+        };
+        let mut status = Status::new(code, message);
+        if let Ok(value) = MetadataValue::try_from(bucket_region) {
+            status.metadata_mut().insert("x-anvil-bucket-region", value);
+        }
+        if let Ok(value) = MetadataValue::try_from(action_name) {
+            status
+                .metadata_mut()
+                .insert("x-anvil-cross-region-action", value);
+        }
+        status
+    }
+
+    async fn resolve_followed_link(
+        &self,
+        bucket: &Bucket,
+        initial_link: Object,
+        claims: Option<&auth::Claims>,
+    ) -> Result<(Object, object_links::FollowedObjectLink), Status> {
+        let initial_descriptor = object_links::link_descriptor(&bucket.name, &initial_link)
+            .ok_or_else(|| Status::internal("Object link descriptor missing"))?;
+        if initial_descriptor.resolution != object_links::ObjectLinkResolution::Follow {
+            return Err(Status::failed_precondition("ObjectLinkRedirectRequired"));
+        }
+
+        let mut current_link = initial_link;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..object_links::MAX_LINK_RESOLUTION_DEPTH {
+            let Some(link) = current_link.link.clone() else {
+                return Err(Status::failed_precondition("InvalidObjectLink"));
+            };
+            let seen_key = format!("{}:{}", current_link.key, current_link.version_id);
+            if !seen.insert(seen_key) {
+                return Err(Status::failed_precondition("ObjectLinkLoop"));
+            }
+            if !bucket.is_public_read {
+                let claims =
+                    claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
+                if !self
+                    .object_read_allowed(claims, &bucket.name, &link.target_key, None)
+                    .await?
+                {
+                    return Err(Status::permission_denied("Permission denied"));
+                }
+            }
+
+            let target = match link.target_version {
+                Some(version_id) => {
+                    metadata_journal::read_object_version(
+                        &self.storage,
+                        bucket,
+                        &self.encryption_key,
+                        &link.target_key,
+                        version_id,
+                    )
+                    .await
+                }
+                None => {
+                    metadata_journal::read_current_object(
+                        &self.storage,
+                        bucket,
+                        &self.encryption_key,
+                        &link.target_key,
+                    )
+                    .await
+                }
+            }
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::failed_precondition("DanglingObjectLink"))?;
+            if target.deleted_at.is_some() {
+                return Err(Status::failed_precondition("DanglingObjectLink"));
+            }
+            match target.kind {
+                object_links::ObjectEntryKind::Blob => {
+                    let response_etag = object_links::followed_link_etag(&current_link, &target)
+                        .ok_or_else(|| Status::internal("Object link ETag missing"))?;
+                    let mut served = target;
+                    served.etag = response_etag.clone();
+                    let followed = object_links::FollowedObjectLink {
+                        descriptor: initial_descriptor,
+                        response_etag,
+                        target_version: served.version_id,
+                    };
+                    return Ok((served, followed));
+                }
+                object_links::ObjectEntryKind::Link => {
+                    current_link = target;
+                }
+            }
+        }
+        Err(Status::failed_precondition("ObjectLinkDepthExceeded"))
     }
 
     async fn object_read_allowed(
@@ -1836,16 +2229,24 @@ impl ObjectManager {
     }
 
     async fn get_tenant_bucket(&self, tenant_id: i64, bucket_name: &str) -> Result<Bucket, Status> {
+        if let Some(locator) = self
+            .persistence
+            .get_mesh_bucket_locator(tenant_id, bucket_name)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            && locator.status != crate::mesh_directory::BucketLocatorStatus::Deleted
+            && locator.home_region.as_str() != self.region.as_str()
+        {
+            return Err(self.remote_bucket_status(locator.home_region.as_str()));
+        }
+
         let bucket = bucket_journal::read_current_bucket(&self.storage, tenant_id, bucket_name)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
 
         if bucket.region != self.region {
-            return Err(Status::failed_precondition(format!(
-                "Bucket is in region {}",
-                bucket.region
-            )));
+            return Err(self.remote_bucket_status(&bucket.region));
         }
 
         Ok(bucket)

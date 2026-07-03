@@ -13,6 +13,10 @@ use anvil::anvil_api::{
 use anvil::formats::full_text::{FullTextDocument, build_full_text_postings};
 use anvil::formats::vector::{VectorMetric, VectorModality, VectorPayload, VectorRecord};
 use anvil::full_text_segment::{FullTextSegmentWrite, write_full_text_segment};
+use anvil::partition_fence::{
+    AcquireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal, OwnershipResource,
+    OwnershipResourceKind, acquire_ownership,
+};
 use anvil::search_query::{FullTextSegmentQuery, query_full_text_segment};
 use anvil::vector_segment::{VectorSegmentEntry, VectorSegmentWrite, write_vector_segment};
 use anvil_test_utils::*;
@@ -899,6 +903,110 @@ async fn test_full_text_index_build_uses_source_cursor_snapshot() {
         serde_json::from_slice(&segment.document_table).unwrap();
     assert!(document_table.to_string().contains("docs/alpha.txt"));
     assert!(!document_table.to_string().contains("docs/future.txt"));
+}
+
+#[tokio::test]
+async fn test_index_build_requires_current_rfc_ownership_fence() {
+    let cluster = TestCluster::new(&["test-region-1"]).await;
+    let persistence = &cluster.states[0].persistence;
+    let tenant_id = 1;
+    let bucket_name = format!("index-fence-{}", uuid::Uuid::new_v4());
+    let bucket = persistence
+        .create_bucket(tenant_id, &bucket_name, "test-region-1")
+        .await
+        .unwrap();
+    let index = persistence
+        .create_index_definition(
+            tenant_id,
+            bucket.id,
+            "body",
+            "full_text",
+            serde_json::json!({"prefix": "docs/"}),
+            serde_json::json!({"source": "object_body_utf8"}),
+            "index_only",
+            serde_json::json!({"positions": true}),
+        )
+        .await
+        .unwrap();
+    persistence
+        .create_index_definition_event(tenant_id, bucket.id, &bucket.name, &index, "create")
+        .await
+        .unwrap();
+    persistence
+        .create_object(
+            tenant_id,
+            bucket.id,
+            "docs/alpha.txt",
+            &hex::encode([33; 32]),
+            20,
+            "etag-alpha",
+            Some("text/plain"),
+            None,
+            None,
+            Some(b"alpha fence visible".to_vec()),
+        )
+        .await
+        .unwrap();
+    let source_cursor = persistence
+        .list_tasks()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|task| {
+            task.task_type == anvil::tasks::TaskType::IndexBuild
+                && task.payload["index_id"] == serde_json::json!(index.id)
+        })
+        .and_then(|task| task.payload["source_cursor"].as_u64())
+        .expect("index build task records source cursor");
+    let index_storage_id = anvil::index_journal::index_storage_id(tenant_id, bucket.id, index.id);
+    let resource = OwnershipResource {
+        resource_kind: OwnershipResourceKind::IndexPartition,
+        resource_id: format!(
+            "tenant/{tenant_id}/bucket/{}/index_build/{index_storage_id}",
+            bucket.id
+        ),
+    };
+    let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+
+    acquire_ownership(
+        &cluster.states[0].storage,
+        AcquireOwnership {
+            request_id: "other-node-index-owner".to_string(),
+            idempotency_key: "other-node-index-owner".to_string(),
+            resource,
+            owner: OwnershipPrincipal {
+                tenant_id: 0,
+                principal_kind: "node".to_string(),
+                principal_id: "other-node".to_string(),
+                actor_instance_id: "other-node".to_string(),
+                display_name: "other-node".to_string(),
+                region: "test-region-1".to_string(),
+                cell: "default".to_string(),
+            },
+            now_nanos,
+            ttl_nanos: i64::try_from(MAX_OWNERSHIP_LEASE_MS)
+                .unwrap()
+                .saturating_mul(1_000_000),
+        },
+        &hex::decode(&cluster.states[0].config.anvil_secret_encryption_key).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let err = persistence
+        .build_index_task(
+            tenant_id,
+            bucket.id,
+            index.id,
+            index.version,
+            u128::from(source_cursor),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("OwnershipHeld"),
+        "unexpected error: {err}"
+    );
 }
 
 #[tokio::test]

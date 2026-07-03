@@ -1,17 +1,30 @@
 use crate::AppState;
 use crate::auth::Claims;
 use crate::s3_auth::{aws_chunked_decoder, sigv4_auth};
+use anvil_core::anvil_api::internal_proxy_service_client::InternalProxyServiceClient;
+use anvil_core::anvil_api::{
+    ProxyHeader, ProxyRequestChunk, ProxyRequestHeader, ProxyResponseHeader, proxy_request_chunk,
+    proxy_response_chunk,
+};
 use anvil_core::auth;
 use anvil_core::bucket_journal;
-use anvil_core::object_manager::ObjectWriteOptions;
+use anvil_core::mesh_directory::{BucketLocatorStatus, TenantNameStatus};
+use anvil_core::mesh_lifecycle::{LifecycleState, NodeCapability};
+use anvil_core::object_links;
+use anvil_core::object_manager::{ObjectLinkReadMode, ObjectWriteOptions};
 use anvil_core::observability::RESERVED_NAMESPACE_REJECTION_COUNT;
 use anvil_core::permissions::AnvilAction;
 use anvil_core::persistence::Object;
+use anvil_core::routing::{
+    self, CrossRegionRoutingPolicy, HostAliasDescriptor, ObjectRoute, RouteRequest, RouteSource,
+    RoutingConfig, RoutingError,
+};
 use anvil_core::validation;
 use axum::{
     Router,
-    body::Body,
-    extract::{Path, Query, Request, State},
+    body::{Body, Bytes},
+    extract::{ConnectInfo, Path, Query, Request, State},
+    http::{self, HeaderMap, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, put},
@@ -20,6 +33,7 @@ use futures_core::Stream;
 use futures_util::stream::StreamExt;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::pin::Pin;
 
 #[derive(Deserialize)]
@@ -116,14 +130,400 @@ pub fn app(state: AppState) -> Router {
                 .head(head_object),
         )
         .with_state(state.clone())
-        .route_layer(middleware::from_fn(aws_chunked_decoder))
-        .route_layer(middleware::from_fn_with_state(state.clone(), sigv4_auth))
-        .route_layer(middleware::from_fn_with_state(
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            reserved_namespace_guard,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            s3_host_routing,
+        ))
+        .layer(middleware::from_fn(aws_chunked_decoder))
+        .layer(middleware::from_fn_with_state(state.clone(), sigv4_auth))
+        .layer(middleware::from_fn_with_state(
             state,
             reserved_namespace_guard,
         ));
 
     public.merge(s3_routes)
+}
+
+#[derive(Debug, Clone)]
+struct S3HostRoute(ObjectRoute);
+
+async fn s3_host_routing(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
+    let Some(config) = s3_routing_config(&state) else {
+        return next.run(req).await;
+    };
+    let host = match request_host(&req, state.config.as_ref()) {
+        Ok(Some(host)) => host,
+        Ok(None) => return next.run(req).await,
+        Err(err) => return s3_routing_error(err),
+    };
+
+    let request = RouteRequest {
+        host: &host,
+        path: req.uri().path(),
+    };
+    match routing::parse_object_route(request.clone(), &config, &[]) {
+        Ok(route) => {
+            if let Err(err) = rewrite_s3_host_route_uri(&mut req, &route) {
+                return s3_routing_error(err);
+            }
+            req.extensions_mut().insert(S3HostRoute(route));
+            next.run(req).await
+        }
+        Err(RoutingError::UnknownHost) => {
+            let alias = match active_s3_host_alias(&state, &host).await {
+                Ok(Some(alias)) => alias,
+                Ok(None) => return next.run(req).await,
+                Err(response) => return response,
+            };
+            match routing::parse_object_route(request, &config, &[alias]) {
+                Ok(route) => {
+                    if let Err(err) = rewrite_s3_host_route_uri(&mut req, &route) {
+                        return s3_routing_error(err);
+                    }
+                    req.extensions_mut().insert(S3HostRoute(route));
+                    next.run(req).await
+                }
+                Err(RoutingError::UnknownHost) => next.run(req).await,
+                Err(err) => s3_routing_error(err),
+            }
+        }
+        Err(err) => s3_routing_error(err),
+    }
+}
+
+async fn active_s3_host_alias(
+    state: &AppState,
+    host: &str,
+) -> Result<Option<HostAliasDescriptor>, Response> {
+    let host = match routing::normalize_alias_hostname(host) {
+        Ok(host) => host,
+        Err(_) => return Ok(None),
+    };
+    match state.persistence.get_host_alias_descriptor(&host).await {
+        Ok(Some(alias)) if alias.state == routing::HostAliasState::Active => Ok(Some(alias)),
+        Ok(_) => Ok(None),
+        Err(error) => Err(s3_error(
+            "InternalError",
+            &format!("Failed to load host alias: {error}"),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        )),
+    }
+}
+
+fn s3_routing_config(state: &AppState) -> Option<RoutingConfig> {
+    let configured = state.config.public_region_base_domain.trim();
+    if configured.is_empty() {
+        return None;
+    }
+
+    let region_prefix = format!("{}.", state.region);
+    let base_domain = configured
+        .strip_prefix(&region_prefix)
+        .unwrap_or(configured);
+    RoutingConfig::new(base_domain).ok()
+}
+
+fn request_host(
+    req: &Request,
+    config: &anvil_core::config::Config,
+) -> Result<Option<String>, RoutingError> {
+    let Some(raw_authority) = raw_request_authority(req) else {
+        return Ok(None);
+    };
+    let Some(remote_peer) = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|connect_info| connect_info.0.ip())
+    else {
+        return routing::normalize_alias_hostname(raw_authority).map(Some);
+    };
+    let trusted_proxies = trusted_proxy_source_ranges(config);
+    let forwarded_headers = forwarded_headers(req.headers());
+    routing::effective_host(
+        raw_authority,
+        remote_peer,
+        &trusted_proxies,
+        &forwarded_headers,
+    )
+    .map(Some)
+}
+
+fn raw_request_authority(req: &Request) -> Option<&str> {
+    req.headers()
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| req.uri().authority().map(|authority| authority.as_str()))
+}
+
+fn trusted_proxy_source_ranges(config: &anvil_core::config::Config) -> Vec<routing::TrustedProxy> {
+    routing::parse_trusted_proxies(&config.trusted_proxy_source_ranges).unwrap_or_default()
+}
+
+fn forwarded_headers(headers: &HeaderMap) -> routing::ForwardedHeaders {
+    routing::ForwardedHeaders {
+        forwarded: header_values(headers, "forwarded"),
+        x_forwarded_host: header_values(headers, "x-forwarded-host"),
+    }
+}
+
+fn header_values(headers: &HeaderMap, name: &'static str) -> Vec<String> {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_string)
+        .collect()
+}
+
+fn rewrite_s3_host_route_uri(req: &mut Request, route: &ObjectRoute) -> Result<(), RoutingError> {
+    let mut parts = req.uri().clone().into_parts();
+    let path = s3_route_rewrite_path(route);
+    let path_and_query = match req.uri().query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path,
+    };
+    parts.path_and_query = Some(
+        path_and_query
+            .parse()
+            .map_err(|_| RoutingError::InvalidPath)?,
+    );
+    let uri = Uri::from_parts(parts).map_err(|_| RoutingError::InvalidPath)?;
+    *req.uri_mut() = uri;
+    Ok(())
+}
+
+fn s3_route_rewrite_path(route: &ObjectRoute) -> String {
+    let mut path = String::new();
+    path.push('/');
+    push_percent_encoded_path(&mut path, &route.bucket, true);
+    path.push('/');
+    push_percent_encoded_path(&mut path, &route.key, false);
+    path
+}
+
+fn push_percent_encoded_path(out: &mut String, value: &str, encode_slash: bool) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            b'/' if !encode_slash => out.push(byte as char),
+            _ => {
+                out.push('%');
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+        }
+    }
+}
+
+fn s3_routing_error(err: RoutingError) -> Response {
+    s3_error(
+        "InvalidRequest",
+        &err.to_string(),
+        axum::http::StatusCode::BAD_REQUEST,
+    )
+}
+
+fn s3_host_route(req: &Request) -> Option<ObjectRoute> {
+    req.extensions()
+        .get::<S3HostRoute>()
+        .map(|route| route.0.clone())
+}
+
+fn s3_routed_bucket(req: &Request, fallback_bucket: String) -> String {
+    s3_host_route(req)
+        .map(|route| route.bucket)
+        .unwrap_or(fallback_bucket)
+}
+
+fn s3_routed_bucket_key(
+    req: &Request,
+    fallback_bucket: String,
+    fallback_key: String,
+) -> (String, String) {
+    s3_host_route(req)
+        .map(|route| (route.bucket, route.key))
+        .unwrap_or((fallback_bucket, fallback_key))
+}
+
+fn s3_routed_object(req: &Request) -> Option<(String, String)> {
+    s3_host_route(req)
+        .filter(|route| !route.key.is_empty())
+        .map(|route| (route.bucket, route.key))
+}
+
+fn s3_routed_bucket_without_key(req: &Request) -> Option<String> {
+    s3_host_route(req)
+        .filter(|route| route.key.is_empty())
+        .map(|route| route.bucket)
+}
+
+#[derive(Debug, Clone)]
+struct CheckedS3Route {
+    claims: Option<Claims>,
+    tenant_id: Option<i64>,
+    remote_bucket: Option<RemoteBucketProxyTarget>,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteBucketProxyTarget {
+    region: String,
+    bucket_locator_generation: u64,
+    endpoint: String,
+}
+
+async fn s3_checked_route(
+    state: &AppState,
+    route: Option<ObjectRoute>,
+    claims: Option<Claims>,
+) -> Result<CheckedS3Route, Response> {
+    let Some(route) = route else {
+        return Ok(CheckedS3Route {
+            claims,
+            tenant_id: None,
+            remote_bucket: None,
+        });
+    };
+
+    let route_tenant_id = match &route.source {
+        RouteSource::HostAlias { .. } => route.tenant.parse::<i64>().map_err(|_| {
+            s3_error(
+                "InvalidRequest",
+                "Host alias target tenant id is invalid",
+                axum::http::StatusCode::BAD_REQUEST,
+            )
+        })?,
+        RouteSource::PathStyle | RouteSource::VirtualHost => {
+            let descriptor = state
+                .persistence
+                .get_mesh_tenant_name_locator(&route.tenant)
+                .await
+                .map_err(|error| {
+                    s3_error(
+                        "InvalidRequest",
+                        &format!("Failed to resolve tenant route: {error}"),
+                        axum::http::StatusCode::BAD_REQUEST,
+                    )
+                })?
+                .ok_or_else(|| {
+                    s3_error(
+                        "NoSuchTenant",
+                        "The specified tenant does not exist",
+                        axum::http::StatusCode::NOT_FOUND,
+                    )
+                })?;
+            if descriptor.status != TenantNameStatus::Active {
+                return Err(s3_error(
+                    "NoSuchTenant",
+                    "The specified tenant does not exist",
+                    axum::http::StatusCode::NOT_FOUND,
+                ));
+            }
+            descriptor.tenant_id.as_str().parse::<i64>().map_err(|_| {
+                s3_error(
+                    "InvalidRequest",
+                    "Tenant route resolved to an invalid tenant id",
+                    axum::http::StatusCode::BAD_REQUEST,
+                )
+            })?
+        }
+    };
+
+    if let Some(claims) = claims.as_ref()
+        && route_tenant_id != claims.tenant_id
+    {
+        return Err(s3_error(
+            "AccessDenied",
+            "Credentials are not valid for routed tenant",
+            axum::http::StatusCode::FORBIDDEN,
+        ));
+    }
+
+    if let Some(locator) = state
+        .persistence
+        .get_mesh_bucket_locator(route_tenant_id, &route.bucket)
+        .await
+        .map_err(|error| {
+            s3_error(
+                "InvalidRequest",
+                &format!("Failed to resolve bucket route: {error}"),
+                axum::http::StatusCode::BAD_REQUEST,
+            )
+        })?
+        && locator.status != BucketLocatorStatus::Deleted
+        && locator.home_region.as_str() != state.region.as_str()
+    {
+        let proxy_target = select_remote_bucket_proxy_target(state, locator.home_region.as_str())
+            .await
+            .map_err(|error| {
+                s3_error(
+                    "InternalError",
+                    &format!("Failed to resolve remote proxy target: {error}"),
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                )
+            })?;
+        if route.key.is_empty() {
+            return Err(s3_remote_bucket_response(
+                state.config.cross_region_routing_policy,
+                locator.home_region.as_str(),
+                proxy_target.is_some(),
+            ));
+        }
+        match routing::remote_bucket_routing_action(
+            state.config.cross_region_routing_policy,
+            proxy_target.is_some(),
+        ) {
+            routing::RemoteBucketRoutingAction::Proxy => {
+                let endpoint = proxy_target.expect("proxy target checked above");
+                return Ok(CheckedS3Route {
+                    claims,
+                    tenant_id: Some(route_tenant_id),
+                    remote_bucket: Some(RemoteBucketProxyTarget {
+                        region: locator.home_region.as_str().to_string(),
+                        bucket_locator_generation: locator.generation,
+                        endpoint,
+                    }),
+                });
+            }
+            _ => {
+                return Err(s3_remote_bucket_response(
+                    state.config.cross_region_routing_policy,
+                    locator.home_region.as_str(),
+                    proxy_target.is_some(),
+                ));
+            }
+        }
+    }
+
+    Ok(CheckedS3Route {
+        claims,
+        tenant_id: Some(route_tenant_id),
+        remote_bucket: None,
+    })
+}
+
+fn s3_query_map(uri: &Uri) -> HashMap<String, String> {
+    uri.query()
+        .map(|query| {
+            query
+                .split('&')
+                .filter(|pair| !pair.is_empty())
+                .map(|pair| {
+                    let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+                    (
+                        percent_decode_query_component(name),
+                        percent_decode_query_component(value),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn reserved_namespace_guard(
@@ -146,6 +546,12 @@ async fn reserved_namespace_guard(
 }
 
 fn request_targets_reserved_namespace(req: &Request) -> bool {
+    if let Some(route) = s3_host_route(req) {
+        if !route.key.is_empty() && validation::is_reserved_internal_key(&route.key) {
+            return true;
+        }
+    }
+
     let path = req.uri().path().trim_start_matches('/');
     let mut parts = path.splitn(2, '/');
     let _bucket = parts.next();
@@ -221,6 +627,11 @@ fn hex_value(byte: u8) -> Option<u8> {
 }
 
 async fn list_buckets(State(state): State<AppState>, req: Request) -> Response {
+    if let Some(bucket) = s3_routed_bucket_without_key(&req) {
+        let q = s3_query_map(req.uri());
+        return Box::pin(list_objects(State(state), Path(bucket), Query(q), req)).await;
+    }
+
     let claims = match req.extensions().get::<Claims>().cloned() {
         Some(c) => c,
         None => {
@@ -231,6 +642,13 @@ async fn list_buckets(State(state): State<AppState>, req: Request) -> Response {
             );
         }
     };
+    let checked_route = match s3_checked_route(&state, s3_host_route(&req), Some(claims)).await {
+        Ok(checked_route) => checked_route,
+        Err(response) => return response,
+    };
+    let claims = checked_route
+        .claims
+        .expect("authenticated delete bucket path supplied claims");
 
     match state
         .bucket_manager
@@ -278,13 +696,17 @@ async fn list_buckets(State(state): State<AppState>, req: Request) -> Response {
 
 async fn create_bucket(
     State(state): State<AppState>,
-    Path(bucket): Path<String>,
+    Path(mut bucket): Path<String>,
     Query(q): Query<HashMap<String, String>>,
     req: Request,
 ) -> Response {
     // The S3 `CreateBucket` operation can contain an XML body with the location
     // constraint. We must consume the body for the handler to be matched correctly,
     // even if we don't use the content for now.
+    if let Some((bucket, key)) = s3_routed_object(&req) {
+        return Box::pin(put_object(State(state), Path((bucket, key)), Query(q), req)).await;
+    }
+    bucket = s3_routed_bucket(&req, bucket);
 
     // Claims may be absent for anonymous; handler will enforce bucket public access
     let claims = req.extensions().get::<Claims>().cloned();
@@ -298,6 +720,13 @@ async fn create_bucket(
             );
         }
     };
+    let checked_route = match s3_checked_route(&state, s3_host_route(&req), Some(claims)).await {
+        Ok(checked_route) => checked_route,
+        Err(response) => return response,
+    };
+    let claims = checked_route
+        .claims
+        .expect("authenticated create bucket path supplied claims");
 
     if q.contains_key("versioning") {
         return put_bucket_versioning_response(state, claims, &bucket, req).await;
@@ -348,12 +777,17 @@ async fn create_bucket(
 }
 
 async fn get_bucket_versioning_response(state: AppState, claims: Claims, bucket: &str) -> Response {
-    if !auth::is_authorized(AnvilAction::BucketRead, bucket, &claims.scopes) {
-        return s3_error(
-            "AccessDenied",
-            "Permission denied",
-            axum::http::StatusCode::FORBIDDEN,
-        );
+    match s3_remote_bucket_response_for_authorized_claims(
+        &state,
+        &claims,
+        bucket,
+        AnvilAction::BucketRead,
+    )
+    .await
+    {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(response) => return response,
     }
 
     match bucket_journal::read_current_bucket(&state.storage, claims.tenant_id, bucket).await {
@@ -384,12 +818,17 @@ async fn put_bucket_versioning_response(
     bucket: &str,
     req: Request,
 ) -> Response {
-    if !auth::is_authorized(AnvilAction::BucketWrite, bucket, &claims.scopes) {
-        return s3_error(
-            "AccessDenied",
-            "Permission denied",
-            axum::http::StatusCode::FORBIDDEN,
-        );
+    match s3_remote_bucket_response_for_authorized_claims(
+        &state,
+        &claims,
+        bucket,
+        AnvilAction::BucketWrite,
+    )
+    .await
+    {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(response) => return response,
     }
 
     match bucket_journal::read_current_bucket(&state.storage, claims.tenant_id, bucket).await {
@@ -443,9 +882,21 @@ async fn put_bucket_versioning_response(
 
 async fn delete_bucket(
     State(state): State<AppState>,
-    Path(bucket): Path<String>,
+    Path(mut bucket): Path<String>,
     req: Request,
 ) -> Response {
+    if let Some((bucket, key)) = s3_routed_object(&req) {
+        let q = s3_query_map(req.uri());
+        return Box::pin(delete_object(
+            State(state),
+            Path((bucket, key)),
+            Query(q),
+            req,
+        ))
+        .await;
+    }
+    bucket = s3_routed_bucket(&req, bucket);
+
     let claims = match req.extensions().get::<Claims>().cloned() {
         Some(c) => c,
         None => {
@@ -456,6 +907,19 @@ async fn delete_bucket(
             );
         }
     };
+
+    match s3_remote_bucket_response_for_authorized_claims(
+        &state,
+        &claims,
+        &bucket,
+        AnvilAction::BucketDelete,
+    )
+    .await
+    {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(response) => return response,
+    }
 
     match state
         .bucket_manager
@@ -497,23 +961,628 @@ async fn delete_bucket(
 }
 
 fn s3_redirect(region: &str) -> Response {
+    let request_id = new_s3_request_id();
+    let escaped_region = xml_escape(region);
     let body = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\n  <Code>PermanentRedirect</Code>\n  <Message>The bucket is in this region: {}. Please use this region to retry the request.</Message>\n  <BucketRegion>{}</BucketRegion>\n</Error>\n",
-        region, region
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\n  <Code>PermanentRedirect</Code>\n  <Message>The bucket is in this region: {escaped_region}. Please use this region to retry the request.</Message>\n  <BucketRegion>{escaped_region}</BucketRegion>\n  <RequestId>{request_id}</RequestId>\n</Error>\n"
     );
     Response::builder()
         .status(axum::http::StatusCode::MOVED_PERMANENTLY)
         .header("Content-Type", "application/xml")
+        .header("x-amz-request-id", request_id)
         .header("x-amz-bucket-region", region)
         .body(Body::from(body))
         .unwrap()
 }
 
+async fn select_remote_bucket_proxy_target(
+    state: &AppState,
+    region: &str,
+) -> anyhow::Result<Option<String>> {
+    let mut nodes = state
+        .persistence
+        .list_node_descriptors(Some(region), None)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    Ok(nodes.into_iter().find_map(|node| {
+        let can_proxy = node.state == LifecycleState::Active
+            && node
+                .capabilities
+                .iter()
+                .any(|capability| *capability == NodeCapability::Object)
+            && !node.public_api_addr.trim().is_empty();
+        can_proxy.then(|| normalize_proxy_endpoint(&node.public_api_addr))
+    }))
+}
+
+fn normalize_proxy_endpoint(endpoint: &str) -> String {
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    }
+}
+
+fn s3_remote_bucket_response(
+    policy: CrossRegionRoutingPolicy,
+    region: &str,
+    proxy_available: bool,
+) -> Response {
+    match routing::remote_bucket_routing_action(policy, proxy_available) {
+        routing::RemoteBucketRoutingAction::Redirect => s3_redirect(region),
+        routing::RemoteBucketRoutingAction::Proxy => add_bucket_region_header(
+            s3_error(
+                "InternalError",
+                "Cross-region proxying was selected for an operation that cannot be proxied",
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            region,
+        ),
+        routing::RemoteBucketRoutingAction::RejectLocalOnly => add_bucket_region_header(
+            s3_error(
+                "InvalidRequest",
+                &format!(
+                    "Bucket is in region {region}; cross-region routing is disabled by local_only policy"
+                ),
+                axum::http::StatusCode::BAD_REQUEST,
+            ),
+            region,
+        ),
+        routing::RemoteBucketRoutingAction::ProxyUnavailable => add_bucket_region_header(
+            s3_error(
+                "ServiceUnavailable",
+                &format!(
+                    "Bucket is in region {region}; cross-region proxying is required by policy but is not implemented"
+                ),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            region,
+        ),
+    }
+}
+
+async fn s3_object_proxy_response_if_needed(
+    state: &AppState,
+    checked_route: &CheckedS3Route,
+    claims: Option<&Claims>,
+    bucket: &str,
+    key: &str,
+    method: &str,
+    headers: &HeaderMap,
+    uri: &Uri,
+    version_id: Option<uuid::Uuid>,
+    body: Option<Body>,
+) -> Option<Response> {
+    let claims = match claims {
+        Some(claims) => claims,
+        None => {
+            let tenant_id = checked_route.tenant_id?;
+            let locator = state
+                .persistence
+                .get_mesh_bucket_locator(tenant_id, bucket)
+                .await
+                .ok()
+                .flatten()?;
+            if locator.status == BucketLocatorStatus::Deleted
+                || locator.home_region.as_str() == state.region.as_str()
+            {
+                return None;
+            }
+            return Some(s3_remote_bucket_response(
+                state.config.cross_region_routing_policy,
+                locator.home_region.as_str(),
+                false,
+            ));
+        }
+    };
+
+    let target =
+        match s3_object_proxy_target_if_needed(state, checked_route, claims, bucket).await? {
+            Ok(target) => target,
+            Err(response) => return Some(response),
+        };
+    Some(
+        proxy_s3_object_request(
+            state, target, claims, bucket, key, method, headers, uri, version_id, body,
+        )
+        .await,
+    )
+}
+
+async fn s3_object_proxy_target_if_needed(
+    state: &AppState,
+    checked_route: &CheckedS3Route,
+    claims: &Claims,
+    bucket: &str,
+) -> Option<Result<RemoteBucketProxyTarget, Response>> {
+    match checked_route.remote_bucket.clone() {
+        Some(target) => Some(Ok(target)),
+        None => match state
+            .persistence
+            .get_mesh_bucket_locator(claims.tenant_id, bucket)
+            .await
+        {
+            Ok(Some(locator))
+                if locator.status != BucketLocatorStatus::Deleted
+                    && locator.home_region.as_str() != state.region.as_str() =>
+            {
+                let proxy_endpoint =
+                    match select_remote_bucket_proxy_target(state, locator.home_region.as_str())
+                        .await
+                    {
+                        Ok(endpoint) => endpoint,
+                        Err(error) => {
+                            return Some(Err(s3_error(
+                                "InternalError",
+                                &format!("Failed to resolve remote proxy target: {error}"),
+                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            )));
+                        }
+                    };
+                match routing::remote_bucket_routing_action(
+                    state.config.cross_region_routing_policy,
+                    proxy_endpoint.is_some(),
+                ) {
+                    routing::RemoteBucketRoutingAction::Proxy => {
+                        Some(Ok(RemoteBucketProxyTarget {
+                            region: locator.home_region.as_str().to_string(),
+                            bucket_locator_generation: locator.generation,
+                            endpoint: proxy_endpoint.expect("proxy target checked above"),
+                        }))
+                    }
+                    _ => {
+                        return Some(Err(s3_remote_bucket_response(
+                            state.config.cross_region_routing_policy,
+                            locator.home_region.as_str(),
+                            proxy_endpoint.is_some(),
+                        )));
+                    }
+                }
+            }
+            Ok(_) => None,
+            Err(error) => {
+                return Some(Err(s3_error(
+                    "InternalError",
+                    &format!("Failed to resolve bucket route: {error}"),
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                )));
+            }
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn proxy_s3_object_request(
+    state: &AppState,
+    target: RemoteBucketProxyTarget,
+    claims: &Claims,
+    bucket: &str,
+    key: &str,
+    method: &str,
+    headers: &HeaderMap,
+    uri: &Uri,
+    version_id: Option<uuid::Uuid>,
+    body: Option<Body>,
+) -> Response {
+    let request_id = new_s3_request_id();
+    let mut proxy_headers = http_headers_to_proxy_headers(headers);
+    if let Some(version_id) = version_id {
+        proxy_headers.push(proxy_header("x-anvil-version-id", version_id.to_string()));
+    }
+    let authz_context = match serde_json::to_vec(claims) {
+        Ok(authz_context) => authz_context,
+        Err(error) => {
+            return s3_error(
+                "InternalError",
+                &format!("Failed to encode proxy authorisation context: {error}"),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    };
+    let host = headers
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let header = ProxyRequestHeader {
+        request_id: request_id.clone(),
+        idempotency_key: headers
+            .get("x-anvil-idempotency-key")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string(),
+        principal_id: claims.sub.clone(),
+        tenant_id: claims.tenant_id.to_string(),
+        bucket_name: bucket.to_string(),
+        object_key: key.to_string(),
+        method: method.to_ascii_uppercase(),
+        canonical_host: host,
+        canonical_path: uri
+            .path_and_query()
+            .map(|path| path.as_str())
+            .unwrap_or_else(|| uri.path())
+            .to_string(),
+        bucket_locator_generation: target.bucket_locator_generation,
+        headers: proxy_headers,
+        authz_context,
+    };
+
+    let token = match state.jwt_manager.mint_token(
+        "internal".to_string(),
+        vec!["internal:proxy_object|*".to_string()],
+        0,
+    ) {
+        Ok(token) => token,
+        Err(error) => {
+            return s3_error(
+                "InternalError",
+                &format!("Failed to mint internal proxy token: {error}"),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    };
+
+    let mut client = match InternalProxyServiceClient::connect(target.endpoint.clone()).await {
+        Ok(client) => client,
+        Err(error) => {
+            return add_bucket_region_header(
+                s3_error(
+                    "ServiceUnavailable",
+                    &format!(
+                        "Failed to connect to cross-region proxy in {}: {error}",
+                        target.region
+                    ),
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                ),
+                &target.region,
+            );
+        }
+    };
+
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    tokio::spawn(async move {
+        if tx
+            .send(ProxyRequestChunk {
+                part: Some(proxy_request_chunk::Part::Header(header)),
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if let Some(body) = body {
+            let mut stream = body.into_data_stream();
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        if tx
+                            .send(ProxyRequestChunk {
+                                part: Some(proxy_request_chunk::Part::Body(bytes.to_vec())),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "failed to read S3 proxy request body");
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+    request.metadata_mut().insert(
+        "authorization",
+        match format!("Bearer {token}").parse() {
+            Ok(value) => value,
+            Err(_) => {
+                return s3_error(
+                    "InternalError",
+                    "Failed to encode internal proxy token",
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                );
+            }
+        },
+    );
+
+    let response = match client.proxy_object(request).await {
+        Ok(response) => response,
+        Err(status) => return s3_proxy_status_to_response(status, &target.region),
+    };
+    let mut stream = response.into_inner();
+    let first = match stream.next().await {
+        Some(Ok(chunk)) => chunk,
+        Some(Err(status)) => return s3_proxy_status_to_response(status, &target.region),
+        None => {
+            return add_bucket_region_header(
+                s3_error(
+                    "ServiceUnavailable",
+                    "Cross-region proxy returned no response",
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                ),
+                &target.region,
+            );
+        }
+    };
+    let response_header = match first.part {
+        Some(proxy_response_chunk::Part::Header(header)) => header,
+        _ => {
+            return s3_error(
+                "InternalError",
+                "Cross-region proxy response did not start with a header",
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    };
+    s3_proxy_response_to_http(method, &target.region, headers, response_header, stream)
+}
+
+fn http_headers_to_proxy_headers(headers: &HeaderMap) -> Vec<ProxyHeader> {
+    headers
+        .iter()
+        .filter(|(name, _)| *name != http::header::AUTHORIZATION)
+        .flat_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|_| proxy_header(name.as_str(), value.as_bytes()))
+        })
+        .collect()
+}
+
+fn proxy_header(name: &str, value: impl AsRef<[u8]>) -> ProxyHeader {
+    ProxyHeader {
+        name: name.to_ascii_lowercase(),
+        value: value.as_ref().to_vec(),
+    }
+}
+
+fn s3_proxy_status_to_response(status: tonic::Status, region: &str) -> Response {
+    let status_code = match status.code() {
+        tonic::Code::InvalidArgument => axum::http::StatusCode::BAD_REQUEST,
+        tonic::Code::Unauthenticated => axum::http::StatusCode::UNAUTHORIZED,
+        tonic::Code::PermissionDenied => axum::http::StatusCode::FORBIDDEN,
+        tonic::Code::FailedPrecondition => axum::http::StatusCode::PRECONDITION_FAILED,
+        tonic::Code::NotFound => axum::http::StatusCode::NOT_FOUND,
+        tonic::Code::Unavailable => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        _ => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    add_bucket_region_header(
+        s3_error("CrossRegionProxyError", status.message(), status_code),
+        region,
+    )
+}
+
+fn s3_proxy_response_to_http(
+    method: &str,
+    region: &str,
+    request_headers: &HeaderMap,
+    header: ProxyResponseHeader,
+    stream: tonic::Streaming<anvil_core::anvil_api::ProxyResponseChunk>,
+) -> Response {
+    let mut status = axum::http::StatusCode::from_u16(header.status as u16)
+        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+    let proxy_headers = header.headers;
+    let content_length = proxy_header_value(&proxy_headers, "content-length")
+        .and_then(|value| value.parse::<u64>().ok());
+    let etag = proxy_header_value(&proxy_headers, "etag");
+    let last_modified = proxy_header_value(&proxy_headers, "x-anvil-created-at")
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+        .map(|value| value.with_timezone(&chrono::Utc));
+
+    if status.is_success()
+        && (method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD"))
+        && let (Some(etag), Some(last_modified)) = (etag.as_deref(), last_modified)
+        && let Some(response) = evaluate_object_preconditions(request_headers, etag, last_modified)
+    {
+        return response;
+    }
+
+    let range = if status == axum::http::StatusCode::OK && method.eq_ignore_ascii_case("GET") {
+        match parse_http_range(request_headers, content_length) {
+            Ok(Some(requested_range)) => {
+                let Some(content_length) = content_length else {
+                    return invalid_range_response(0);
+                };
+                match requested_range.resolve(content_length) {
+                    Ok(range) => {
+                        status = axum::http::StatusCode::PARTIAL_CONTENT;
+                        Some(range)
+                    }
+                    Err(response) => return response,
+                }
+            }
+            Ok(None) => None,
+            Err(response) => return response,
+        }
+    } else {
+        None
+    };
+
+    let mut builder = Response::builder().status(status);
+    for proxy_header in proxy_headers {
+        builder = add_proxy_response_header(builder, proxy_header);
+    }
+    builder = builder.header("x-amz-bucket-region", region);
+    if let Some(last_modified) = last_modified {
+        builder = builder.header(
+            "Last-Modified",
+            httpdate::fmt_http_date(object_last_modified_time(last_modified)),
+        );
+    }
+    if let Some(range) = range {
+        builder = builder.header("Content-Length", range.len()).header(
+            "Content-Range",
+            format!(
+                "bytes {}-{}/{}",
+                range.start,
+                range.end,
+                content_length.unwrap_or_default()
+            ),
+        );
+    } else if let Some(content_length) = content_length {
+        builder = builder.header("Content-Length", content_length);
+    }
+    if method.eq_ignore_ascii_case("HEAD") || status == axum::http::StatusCode::NO_CONTENT {
+        return builder.body(Body::empty()).unwrap();
+    }
+
+    let body_stream: Pin<Box<dyn Stream<Item = Result<Vec<u8>, tonic::Status>> + Send + 'static>> =
+        Box::pin(stream.filter_map(|chunk| async move {
+            match chunk {
+                Ok(chunk) => match chunk.part {
+                    Some(proxy_response_chunk::Part::Body(bytes)) => Some(Ok(bytes)),
+                    Some(proxy_response_chunk::Part::Header(_)) | None => None,
+                },
+                Err(status) => Some(Err(status)),
+            }
+        }));
+    let body_stream = match range {
+        Some(range) => slice_stream_by_range(body_stream, range),
+        None => body_stream,
+    };
+    let body_stream = body_stream.map(|chunk| match chunk {
+        Ok(bytes) => Ok(Bytes::from(bytes)),
+        Err(status) => Err(axum::Error::new(status)),
+    });
+    builder.body(Body::from_stream(body_stream)).unwrap()
+}
+
+fn proxy_header_value(headers: &[ProxyHeader], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case(name))
+        .and_then(|header| std::str::from_utf8(&header.value).ok())
+        .map(ToOwned::to_owned)
+}
+
+fn add_proxy_response_header(
+    mut builder: http::response::Builder,
+    header: ProxyHeader,
+) -> http::response::Builder {
+    let name = match header.name.as_str() {
+        "x-anvil-version-id" => "x-amz-version-id",
+        "content-length" | "x-anvil-created-at" => return builder,
+        other => other,
+    };
+    if let (Ok(name), Ok(value)) = (
+        http::header::HeaderName::from_bytes(name.as_bytes()),
+        http::HeaderValue::from_bytes(&header.value),
+    ) {
+        builder = builder.header(name, value);
+    }
+    builder
+}
+
+fn add_bucket_region_header(mut response: Response, region: &str) -> Response {
+    if let Ok(value) = http::HeaderValue::from_str(region) {
+        response.headers_mut().insert("x-amz-bucket-region", value);
+    }
+    response
+}
+
+fn remote_bucket_region_from_status(status: &tonic::Status) -> Option<String> {
+    status
+        .metadata()
+        .get("x-anvil-bucket-region")
+        .and_then(|value| value.to_str().ok())
+        .filter(|region| !region.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            status
+                .message()
+                .strip_prefix("Bucket is in region ")
+                .and_then(|rest| {
+                    rest.split(';')
+                        .next()
+                        .map(str::trim)
+                        .filter(|region| !region.is_empty())
+                        .map(ToOwned::to_owned)
+                })
+        })
+}
+
+fn s3_remote_bucket_response_from_status(
+    status: &tonic::Status,
+    cross_region_policy: CrossRegionRoutingPolicy,
+) -> Option<Response> {
+    remote_bucket_region_from_status(status)
+        .map(|region| s3_remote_bucket_response(cross_region_policy, &region, false))
+}
+
+fn s3_unavailable_status_to_response(
+    status: &tonic::Status,
+    cross_region_policy: CrossRegionRoutingPolicy,
+) -> Response {
+    s3_remote_bucket_response_from_status(status, cross_region_policy).unwrap_or_else(|| {
+        s3_error(
+            "ServiceUnavailable",
+            status.message(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        )
+    })
+}
+
+async fn s3_remote_bucket_response_for_authorized_claims(
+    state: &AppState,
+    claims: &Claims,
+    bucket: &str,
+    action: AnvilAction,
+) -> Result<Option<Response>, Response> {
+    if !auth::is_authorized(action, bucket, &claims.scopes) {
+        return Err(s3_error(
+            "AccessDenied",
+            "Permission denied",
+            axum::http::StatusCode::FORBIDDEN,
+        ));
+    }
+
+    match state
+        .persistence
+        .get_mesh_bucket_locator(claims.tenant_id, bucket)
+        .await
+    {
+        Ok(Some(locator))
+            if locator.status != BucketLocatorStatus::Deleted
+                && locator.home_region.as_str() != state.region.as_str() =>
+        {
+            Ok(Some(s3_remote_bucket_response(
+                state.config.cross_region_routing_policy,
+                locator.home_region.as_str(),
+                false,
+            )))
+        }
+        Ok(_) => Ok(None),
+        Err(error) => Err(s3_error(
+            "InternalError",
+            &format!("Failed to resolve bucket route: {error}"),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        )),
+    }
+}
+
 async fn head_bucket(
     State(state): State<AppState>,
-    Path(bucket_name): Path<String>,
+    Path(mut bucket_name): Path<String>,
     req: Request,
 ) -> Response {
+    if let Some((bucket, key)) = s3_routed_object(&req) {
+        let q = s3_query_map(req.uri());
+        return Box::pin(head_object(
+            State(state),
+            Path((bucket, key)),
+            Query(q),
+            req,
+        ))
+        .await;
+    }
+    bucket_name = s3_routed_bucket(&req, bucket_name);
+
     let claims = match req.extensions().get::<Claims>().cloned() {
         Some(c) => c,
         None => {
@@ -524,12 +1593,36 @@ async fn head_bucket(
             );
         }
     };
+    let checked_route = match s3_checked_route(&state, s3_host_route(&req), Some(claims)).await {
+        Ok(checked_route) => checked_route,
+        Err(response) => return response,
+    };
+    let claims = checked_route
+        .claims
+        .expect("authenticated head bucket path supplied claims");
+
+    match s3_remote_bucket_response_for_authorized_claims(
+        &state,
+        &claims,
+        &bucket_name,
+        AnvilAction::BucketRead,
+    )
+    .await
+    {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(response) => return response,
+    }
 
     match bucket_journal::read_current_bucket(&state.storage, claims.tenant_id, &bucket_name).await
     {
         Ok(Some(bucket)) => {
             if bucket.region != state.region {
-                return s3_redirect(&bucket.region);
+                return s3_remote_bucket_response(
+                    state.config.cross_region_routing_policy,
+                    &bucket.region,
+                    false,
+                );
             }
             (axum::http::StatusCode::OK, "").into_response()
         }
@@ -552,12 +1645,34 @@ async fn list_objects(
     Query(q): Query<HashMap<String, String>>,
     req: Request,
 ) -> Response {
-    let claims = req.extensions().get::<Claims>().cloned();
+    if let Some((bucket, key)) = s3_routed_object(&req) {
+        return Box::pin(get_object(State(state), Path((bucket, key)), Query(q), req)).await;
+    }
+    let Path(bucket) = bucket;
+    let bucket = s3_routed_bucket(&req, bucket);
+    let checked_route = match s3_checked_route(
+        &state,
+        s3_host_route(&req),
+        req.extensions().get::<Claims>().cloned(),
+    )
+    .await
+    {
+        Ok(checked_route) => checked_route,
+        Err(response) => return response,
+    };
+    let claims = checked_route.claims.clone();
 
     if q.contains_key("versions") {
         let request_is_authenticated = req.extensions().get::<Claims>().is_some();
-        return list_object_versions_response(state, claims, &bucket, &q, request_is_authenticated)
-            .await;
+        return list_object_versions_response(
+            state,
+            claims,
+            checked_route.tenant_id,
+            &bucket,
+            &q,
+            request_is_authenticated,
+        )
+        .await;
     }
 
     if q.contains_key("uploads") {
@@ -631,8 +1746,9 @@ async fn list_objects(
 
     match state
         .object_manager
-        .list_objects(
+        .list_objects_for_tenant(
             claims,
+            checked_route.tenant_id,
             &bucket,
             &prefix,
             &start_after,
@@ -704,9 +1820,11 @@ async fn list_objects(
         }
         Err(status) => match status.code() {
             tonic::Code::FailedPrecondition => {
-                if status.message().starts_with("Bucket is in region ") {
-                    let region = status.message().trim_start_matches("Bucket is in region ");
-                    return s3_redirect(region);
+                if let Some(response) = s3_remote_bucket_response_from_status(
+                    &status,
+                    state.config.cross_region_routing_policy,
+                ) {
+                    return response;
                 }
                 s3_error(
                     "PreconditionFailed",
@@ -734,6 +1852,9 @@ async fn list_objects(
                 status.message(),
                 axum::http::StatusCode::FORBIDDEN,
             ),
+            tonic::Code::Unavailable => {
+                s3_unavailable_status_to_response(&status, state.config.cross_region_routing_policy)
+            }
             _ => s3_error(
                 "InternalError",
                 status.message(),
@@ -745,10 +1866,21 @@ async fn list_objects(
 
 async fn post_bucket(
     State(state): State<AppState>,
-    Path(bucket): Path<String>,
+    Path(mut bucket): Path<String>,
     Query(q): Query<HashMap<String, String>>,
     req: Request,
 ) -> Response {
+    if let Some((bucket, key)) = s3_routed_object(&req) {
+        return Box::pin(post_object(
+            State(state),
+            Path((bucket, key)),
+            Query(q),
+            req,
+        ))
+        .await;
+    }
+    bucket = s3_routed_bucket(&req, bucket);
+
     let claims = match req.extensions().get::<Claims>().cloned() {
         Some(claims) => claims,
         None => {
@@ -759,6 +1891,13 @@ async fn post_bucket(
             );
         }
     };
+    let checked_route = match s3_checked_route(&state, s3_host_route(&req), Some(claims)).await {
+        Ok(checked_route) => checked_route,
+        Err(response) => return response,
+    };
+    let claims = checked_route
+        .claims
+        .expect("authenticated post bucket path supplied claims");
 
     if q.contains_key("delete") {
         let bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
@@ -869,9 +2008,11 @@ async fn delete_objects(
                 }
             }
             Err(status) if status.code() == tonic::Code::FailedPrecondition => {
-                if status.message().starts_with("Bucket is in region ") {
-                    let region = status.message().trim_start_matches("Bucket is in region ");
-                    return s3_redirect(region);
+                if let Some(response) = s3_remote_bucket_response_from_status(
+                    &status,
+                    state.config.cross_region_routing_policy,
+                ) {
+                    return response;
                 }
                 errors.push(DeleteObjectError::from_status(
                     key,
@@ -880,6 +2021,12 @@ async fn delete_objects(
                 ));
             }
             Err(status) => {
+                if let Some(response) = s3_remote_bucket_response_from_status(
+                    &status,
+                    state.config.cross_region_routing_policy,
+                ) {
+                    return response;
+                }
                 errors.push(DeleteObjectError::from_status(
                     key,
                     requested_version_id,
@@ -984,12 +2131,17 @@ fn delete_objects_result_response(
 }
 
 async fn get_bucket_location_response(state: AppState, claims: Claims, bucket: &str) -> Response {
-    if !auth::is_authorized(AnvilAction::BucketRead, bucket, &claims.scopes) {
-        return s3_error(
-            "AccessDenied",
-            "Permission denied",
-            axum::http::StatusCode::FORBIDDEN,
-        );
+    match s3_remote_bucket_response_for_authorized_claims(
+        &state,
+        &claims,
+        bucket,
+        AnvilAction::BucketRead,
+    )
+    .await
+    {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(response) => return response,
     }
 
     match bucket_journal::read_current_bucket(&state.storage, claims.tenant_id, bucket).await {
@@ -1111,13 +2263,19 @@ async fn list_multipart_uploads_response(
                 .body(Body::from(xml))
                 .unwrap()
         }
-        Err(status) => s3_status_to_response_for_auth(status, true, "NoSuchBucket"),
+        Err(status) => s3_status_to_response_for_auth(
+            status,
+            true,
+            "NoSuchBucket",
+            state.config.cross_region_routing_policy,
+        ),
     }
 }
 
 async fn list_object_versions_response(
     state: AppState,
     claims: Option<Claims>,
+    route_tenant_id: Option<i64>,
     bucket: &str,
     q: &HashMap<String, String>,
     request_is_authenticated: bool,
@@ -1140,8 +2298,9 @@ async fn list_object_versions_response(
 
     match state
         .object_manager
-        .list_object_versions(
+        .list_object_versions_for_tenant(
             claims,
+            route_tenant_id,
             bucket,
             &prefix,
             &key_marker,
@@ -1217,9 +2376,12 @@ async fn list_object_versions_response(
                 .body(Body::from(xml))
                 .unwrap()
         }
-        Err(status) => {
-            s3_status_to_response_for_auth(status, request_is_authenticated, "NoSuchBucket")
-        }
+        Err(status) => s3_status_to_response_for_auth(
+            status,
+            request_is_authenticated,
+            "NoSuchBucket",
+            state.config.cross_region_routing_policy,
+        ),
     }
 }
 
@@ -1227,12 +2389,18 @@ fn s3_status_to_response_for_auth(
     status: tonic::Status,
     request_is_authenticated: bool,
     not_found_code: &str,
+    cross_region_policy: CrossRegionRoutingPolicy,
 ) -> Response {
+    if let Some(response) = s3_remote_bucket_response_from_status(&status, cross_region_policy) {
+        return response;
+    }
+
     match status.code() {
         tonic::Code::FailedPrecondition => {
-            if status.message().starts_with("Bucket is in region ") {
-                let region = status.message().trim_start_matches("Bucket is in region ");
-                return s3_redirect(region);
+            if let Some(response) =
+                s3_remote_bucket_response_from_status(&status, cross_region_policy)
+            {
+                return response;
             }
             s3_error(
                 "PreconditionFailed",
@@ -1435,6 +2603,7 @@ mod list_bucket_pagination_tests {
             tenant_id: 0,
             bucket_id: 0,
             key: key.to_string(),
+            kind: object_links::ObjectEntryKind::Blob,
             content_hash: String::new(),
             size: 0,
             etag: String::new(),
@@ -1452,6 +2621,7 @@ mod list_bucket_pagination_tests {
             shard_map: None,
             inline_payload: None,
             checksum: None,
+            link: None,
         }
     }
 }
@@ -1473,11 +2643,26 @@ async fn readiness_check(State(state): State<AppState>) -> Response {
 
 async fn get_object(
     State(state): State<AppState>,
-    Path((bucket, key)): Path<(String, String)>,
+    Path((mut bucket, mut key)): Path<(String, String)>,
     Query(q): Query<HashMap<String, String>>,
     req: Request,
 ) -> Response {
-    let claims = req.extensions().get::<Claims>().cloned();
+    if let Some(bucket) = s3_routed_bucket_without_key(&req) {
+        return Box::pin(list_objects(State(state), Path(bucket), Query(q), req)).await;
+    }
+    (bucket, key) = s3_routed_bucket_key(&req, bucket, key);
+
+    let checked_route = match s3_checked_route(
+        &state,
+        s3_host_route(&req),
+        req.extensions().get::<Claims>().cloned(),
+    )
+    .await
+    {
+        Ok(checked_route) => checked_route,
+        Err(response) => return response,
+    };
+    let claims = checked_route.claims.clone();
     if let Some(upload_id) = q.get("uploadId") {
         let claims = match claims {
             Some(claims) => claims,
@@ -1506,6 +2691,33 @@ async fn get_object(
         Ok(version_id) => version_id,
         Err(response) => return response,
     };
+    if is_link_metadata_request(req.headers()) {
+        return get_object_link_metadata_response(
+            state,
+            claims,
+            checked_route.tenant_id,
+            &bucket,
+            &key,
+            version_id,
+        )
+        .await;
+    }
+    if let Some(response) = s3_object_proxy_response_if_needed(
+        &state,
+        &checked_route,
+        checked_route.claims.as_ref(),
+        &bucket,
+        &key,
+        "GET",
+        req.headers(),
+        req.uri(),
+        version_id,
+        None,
+    )
+    .await
+    {
+        return response;
+    }
     let requested_range = match parse_http_range(req.headers(), None) {
         Ok(range) => range,
         Err(response) => return response,
@@ -1513,10 +2725,22 @@ async fn get_object(
 
     match state
         .object_manager
-        .get_object(claims, bucket, key, version_id)
+        .get_object_with_link_mode_for_tenant(
+            claims,
+            checked_route.tenant_id,
+            bucket,
+            key,
+            version_id,
+            ObjectLinkReadMode::Follow,
+        )
         .await
     {
-        Ok((object, stream)) => {
+        Ok(result) => {
+            let anvil_core::object_manager::ObjectReadResult {
+                object,
+                stream,
+                followed_link,
+            } = result;
             if let Some(response) =
                 evaluate_object_preconditions(req.headers(), &object.etag, object.created_at)
             {
@@ -1544,6 +2768,7 @@ async fn get_object(
                 .header("ETag", object.etag)
                 .header("Accept-Ranges", "bytes")
                 .header("x-amz-version-id", object.version_id.to_string());
+            builder = add_followed_link_headers(builder, followed_link.as_ref());
             builder = add_s3_user_metadata_headers(builder, object.user_meta.as_ref());
             if let Some(range) = range {
                 builder = builder.header(
@@ -1559,9 +2784,11 @@ async fn get_object(
         }
         Err(status) => match status.code() {
             tonic::Code::FailedPrecondition => {
-                if status.message().starts_with("Bucket is in region ") {
-                    let region = status.message().trim_start_matches("Bucket is in region ");
-                    return s3_redirect(region);
+                if let Some(response) = s3_remote_bucket_response_from_status(
+                    &status,
+                    state.config.cross_region_routing_policy,
+                ) {
+                    return response;
                 }
                 s3_error(
                     "PreconditionFailed",
@@ -1589,12 +2816,170 @@ async fn get_object(
                 status.message(),
                 axum::http::StatusCode::FORBIDDEN,
             ),
+            tonic::Code::Unavailable => {
+                s3_unavailable_status_to_response(&status, state.config.cross_region_routing_policy)
+            }
             _ => s3_error(
                 "InternalError",
                 status.message(),
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             ),
         },
+    }
+}
+
+async fn get_object_link_metadata_response(
+    state: AppState,
+    claims: Option<Claims>,
+    route_tenant_id: Option<i64>,
+    bucket: &str,
+    key: &str,
+    version_id: Option<uuid::Uuid>,
+) -> Response {
+    match state
+        .object_manager
+        .read_object_link_for_tenant(claims.clone(), route_tenant_id, bucket, key, version_id)
+        .await
+    {
+        Ok(descriptor) => {
+            let body = match serde_json::to_vec(&descriptor) {
+                Ok(body) => body,
+                Err(error) => {
+                    return s3_error(
+                        "InternalError",
+                        &error.to_string(),
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    );
+                }
+            };
+            let builder = Response::builder()
+                .status(axum::http::StatusCode::OK)
+                .header("Content-Type", object_links::LINK_METADATA_CONTENT_TYPE)
+                .header("Content-Length", body.len())
+                .header("ETag", object_links::link_metadata_etag(&descriptor));
+            add_link_descriptor_headers(builder, &descriptor)
+                .body(Body::from(body))
+                .unwrap()
+        }
+        Err(status) => link_status_to_response(
+            status,
+            claims.is_some(),
+            state.config.cross_region_routing_policy,
+        ),
+    }
+}
+
+async fn head_object_link_metadata_response(
+    state: AppState,
+    claims: Option<Claims>,
+    route_tenant_id: Option<i64>,
+    bucket: &str,
+    key: &str,
+    version_id: Option<uuid::Uuid>,
+) -> Response {
+    match state
+        .object_manager
+        .read_object_link_for_tenant(claims.clone(), route_tenant_id, bucket, key, version_id)
+        .await
+    {
+        Ok(descriptor) => {
+            let content_length = serde_json::to_vec(&descriptor)
+                .map(|body| body.len())
+                .unwrap_or(0);
+            let builder = Response::builder()
+                .status(axum::http::StatusCode::OK)
+                .header("Content-Type", object_links::LINK_METADATA_CONTENT_TYPE)
+                .header("Content-Length", content_length)
+                .header("ETag", object_links::link_metadata_etag(&descriptor));
+            add_link_descriptor_headers(builder, &descriptor)
+                .body(Body::empty())
+                .unwrap()
+        }
+        Err(status) => link_status_to_response(
+            status,
+            claims.is_some(),
+            state.config.cross_region_routing_policy,
+        ),
+    }
+}
+
+fn is_link_metadata_request(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get("x-anvil-link-mode")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("metadata"))
+}
+
+fn add_followed_link_headers(
+    builder: axum::http::response::Builder,
+    followed_link: Option<&object_links::FollowedObjectLink>,
+) -> axum::http::response::Builder {
+    let Some(followed_link) = followed_link else {
+        return builder;
+    };
+    add_link_descriptor_headers(builder, &followed_link.descriptor)
+}
+
+fn add_link_descriptor_headers(
+    builder: axum::http::response::Builder,
+    descriptor: &object_links::ObjectLinkDescriptor,
+) -> axum::http::response::Builder {
+    builder
+        .header("x-anvil-object-kind", "link")
+        .header("x-anvil-link-key", descriptor.link_key.clone())
+        .header("x-anvil-link-generation", descriptor.generation.to_string())
+        .header(
+            "x-anvil-link-target-version",
+            descriptor.target_version.clone().unwrap_or_default(),
+        )
+}
+
+fn link_status_to_response(
+    status: tonic::Status,
+    has_claims: bool,
+    cross_region_policy: CrossRegionRoutingPolicy,
+) -> Response {
+    if let Some(response) = s3_remote_bucket_response_from_status(&status, cross_region_policy) {
+        return response;
+    }
+
+    match status.code() {
+        tonic::Code::NotFound => {
+            if has_claims {
+                s3_error(
+                    "NoSuchKey",
+                    status.message(),
+                    axum::http::StatusCode::NOT_FOUND,
+                )
+            } else {
+                s3_error(
+                    "AccessDenied",
+                    status.message(),
+                    axum::http::StatusCode::FORBIDDEN,
+                )
+            }
+        }
+        tonic::Code::PermissionDenied => s3_error(
+            "AccessDenied",
+            status.message(),
+            axum::http::StatusCode::FORBIDDEN,
+        ),
+        tonic::Code::FailedPrecondition => s3_error(
+            status.message(),
+            status.message(),
+            axum::http::StatusCode::PRECONDITION_FAILED,
+        ),
+        tonic::Code::InvalidArgument => s3_error(
+            "InvalidArgument",
+            status.message(),
+            axum::http::StatusCode::BAD_REQUEST,
+        ),
+        tonic::Code::Unavailable => s3_unavailable_status_to_response(&status, cross_region_policy),
+        _ => s3_error(
+            "InternalError",
+            status.message(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ),
     }
 }
 
@@ -1668,16 +3053,26 @@ async fn list_multipart_parts_response(
                 .body(Body::from(xml))
                 .unwrap()
         }
-        Err(status) => s3_status_to_response_for_auth(status, true, "NoSuchUpload"),
+        Err(status) => s3_status_to_response_for_auth(
+            status,
+            true,
+            "NoSuchUpload",
+            state.config.cross_region_routing_policy,
+        ),
     }
 }
 
 async fn put_object(
     State(state): State<AppState>,
-    Path((bucket, key)): Path<(String, String)>,
+    Path((mut bucket, mut key)): Path<(String, String)>,
     Query(q): Query<HashMap<String, String>>,
     req: Request,
 ) -> Response {
+    if let Some(bucket) = s3_routed_bucket_without_key(&req) {
+        return Box::pin(create_bucket(State(state), Path(bucket), Query(q), req)).await;
+    }
+    (bucket, key) = s3_routed_bucket_key(&req, bucket, key);
+
     let claims = match req.extensions().get::<Claims>().cloned() {
         Some(c) => c,
         None => {
@@ -1688,6 +3083,14 @@ async fn put_object(
             );
         }
     };
+    let checked_route = match s3_checked_route(&state, s3_host_route(&req), Some(claims)).await {
+        Ok(checked_route) => checked_route,
+        Err(response) => return response,
+    };
+    let claims = checked_route
+        .claims
+        .clone()
+        .expect("authenticated put object path supplied claims");
     let copy_source = match req.headers().get("x-amz-copy-source") {
         Some(value) => match value.to_str() {
             Ok(value) => Some(value.to_owned()),
@@ -1746,6 +3149,32 @@ async fn put_object(
         .await;
     }
 
+    if let Some(proxy_target) =
+        s3_object_proxy_target_if_needed(&state, &checked_route, &claims, &bucket).await
+    {
+        return match proxy_target {
+            Ok(proxy_target) => {
+                let headers = req.headers().clone();
+                let uri = req.uri().clone();
+                let body = req.into_body();
+                proxy_s3_object_request(
+                    &state,
+                    proxy_target,
+                    &claims,
+                    &bucket,
+                    &key,
+                    "PUT",
+                    &headers,
+                    &uri,
+                    None,
+                    Some(body),
+                )
+                .await
+            }
+            Err(response) => response,
+        };
+    }
+
     if request_has_write_etag_preconditions(req.headers()) {
         let current = match state
             .object_manager
@@ -1753,7 +3182,14 @@ async fn put_object(
             .await
         {
             Ok(current) => current,
-            Err(status) => return s3_status_to_response_for_auth(status, true, "NoSuchBucket"),
+            Err(status) => {
+                return s3_status_to_response_for_auth(
+                    status,
+                    true,
+                    "NoSuchBucket",
+                    state.config.cross_region_routing_policy,
+                );
+            }
         };
         if let Some(response) = evaluate_write_etag_preconditions(
             req.headers(),
@@ -1796,9 +3232,11 @@ async fn put_object(
             .unwrap(),
         Err(status) => match status.code() {
             tonic::Code::FailedPrecondition => {
-                if status.message().starts_with("Bucket is in region ") {
-                    let region = status.message().trim_start_matches("Bucket is in region ");
-                    return s3_redirect(region);
+                if let Some(response) = s3_remote_bucket_response_from_status(
+                    &status,
+                    state.config.cross_region_routing_policy,
+                ) {
+                    return response;
                 }
                 s3_error(
                     "PreconditionFailed",
@@ -1816,6 +3254,9 @@ async fn put_object(
                 status.message(),
                 axum::http::StatusCode::FORBIDDEN,
             ),
+            tonic::Code::Unavailable => {
+                s3_unavailable_status_to_response(&status, state.config.cross_region_routing_policy)
+            }
             _ => s3_error(
                 "InternalError",
                 status.message(),
@@ -1827,10 +3268,15 @@ async fn put_object(
 
 async fn post_object(
     State(state): State<AppState>,
-    Path((bucket, key)): Path<(String, String)>,
+    Path((mut bucket, mut key)): Path<(String, String)>,
     Query(q): Query<HashMap<String, String>>,
     req: Request,
 ) -> Response {
+    if let Some(bucket) = s3_routed_bucket_without_key(&req) {
+        return Box::pin(post_bucket(State(state), Path(bucket), Query(q), req)).await;
+    }
+    (bucket, key) = s3_routed_bucket_key(&req, bucket, key);
+
     let claims = match req.extensions().get::<Claims>().cloned() {
         Some(c) => c,
         None => {
@@ -1841,6 +3287,13 @@ async fn post_object(
             );
         }
     };
+    let checked_route = match s3_checked_route(&state, s3_host_route(&req), Some(claims)).await {
+        Ok(checked_route) => checked_route,
+        Err(response) => return response,
+    };
+    let claims = checked_route
+        .claims
+        .expect("authenticated post object path supplied claims");
 
     if q.contains_key("uploads") {
         return initiate_multipart_upload(state, claims, bucket, key).await;
@@ -1894,7 +3347,12 @@ async fn initiate_multipart_upload(
                 .body(Body::from(xml))
                 .unwrap()
         }
-        Err(status) => s3_status_to_response_for_auth(status, true, "NoSuchBucket"),
+        Err(status) => s3_status_to_response_for_auth(
+            status,
+            true,
+            "NoSuchBucket",
+            state.config.cross_region_routing_policy,
+        ),
     }
 }
 
@@ -1925,7 +3383,12 @@ async fn upload_part(
             .header("ETag", format!("\"{}\"", result.etag))
             .body(Body::empty())
             .unwrap(),
-        Err(status) => s3_status_to_response_for_auth(status, true, "NoSuchUpload"),
+        Err(status) => s3_status_to_response_for_auth(
+            status,
+            true,
+            "NoSuchUpload",
+            state.config.cross_region_routing_policy,
+        ),
     }
 }
 
@@ -1985,7 +3448,12 @@ async fn complete_multipart_upload(
                 .body(Body::from(xml))
                 .unwrap()
         }
-        Err(status) => s3_status_to_response_for_auth(status, true, "NoSuchUpload"),
+        Err(status) => s3_status_to_response_for_auth(
+            status,
+            true,
+            "NoSuchUpload",
+            state.config.cross_region_routing_policy,
+        ),
     }
 }
 
@@ -2013,7 +3481,13 @@ async fn copy_object(
         .await
     {
         Ok(source) => source,
-        Err(status) => return copy_status_to_response(status, "NoSuchKey"),
+        Err(status) => {
+            return copy_status_to_response(
+                status,
+                "NoSuchKey",
+                state.config.cross_region_routing_policy,
+            );
+        }
     };
 
     if let Some(response) =
@@ -2051,7 +3525,11 @@ async fn copy_object(
                 .body(Body::from(xml))
                 .unwrap()
         }
-        Err(status) => copy_status_to_response(status, "NoSuchBucket"),
+        Err(status) => copy_status_to_response(
+            status,
+            "NoSuchBucket",
+            state.config.cross_region_routing_policy,
+        ),
     }
 }
 
@@ -2100,12 +3578,21 @@ fn percent_decode_path_component(value: &str) -> String {
     percent_decode(value.as_bytes())
 }
 
-fn copy_status_to_response(status: tonic::Status, not_found_code: &str) -> Response {
+fn copy_status_to_response(
+    status: tonic::Status,
+    not_found_code: &str,
+    cross_region_policy: CrossRegionRoutingPolicy,
+) -> Response {
+    if let Some(response) = s3_remote_bucket_response_from_status(&status, cross_region_policy) {
+        return response;
+    }
+
     match status.code() {
         tonic::Code::FailedPrecondition => {
-            if status.message().starts_with("Bucket is in region ") {
-                let region = status.message().trim_start_matches("Bucket is in region ");
-                return s3_redirect(region);
+            if let Some(response) =
+                s3_remote_bucket_response_from_status(&status, cross_region_policy)
+            {
+                return response;
             }
             s3_error(
                 "PreconditionFailed",
@@ -2138,10 +3625,15 @@ fn copy_status_to_response(status: tonic::Status, not_found_code: &str) -> Respo
 
 async fn delete_object(
     State(state): State<AppState>,
-    Path((bucket, key)): Path<(String, String)>,
+    Path((mut bucket, mut key)): Path<(String, String)>,
     Query(q): Query<HashMap<String, String>>,
     req: Request,
 ) -> Response {
+    if let Some(bucket) = s3_routed_bucket_without_key(&req) {
+        return Box::pin(delete_bucket(State(state), Path(bucket), req)).await;
+    }
+    (bucket, key) = s3_routed_bucket_key(&req, bucket, key);
+
     let claims = match req.extensions().get::<Claims>().cloned() {
         Some(c) => c,
         None => {
@@ -2152,6 +3644,14 @@ async fn delete_object(
             );
         }
     };
+    let checked_route = match s3_checked_route(&state, s3_host_route(&req), Some(claims)).await {
+        Ok(checked_route) => checked_route,
+        Err(response) => return response,
+    };
+    let claims = checked_route
+        .claims
+        .clone()
+        .expect("authenticated delete object path supplied claims");
 
     if let Some(upload_id) = q.get("uploadId") {
         let upload_id = match uuid::Uuid::parse_str(upload_id) {
@@ -2172,6 +3672,23 @@ async fn delete_object(
         Err(response) => return response,
     };
 
+    if let Some(response) = s3_object_proxy_response_if_needed(
+        &state,
+        &checked_route,
+        Some(&claims),
+        &bucket,
+        &key,
+        "DELETE",
+        req.headers(),
+        req.uri(),
+        version_id,
+        None,
+    )
+    .await
+    {
+        return response;
+    }
+
     if let Some(version_id) = version_id {
         return match state
             .object_manager
@@ -2187,7 +3704,9 @@ async fn delete_object(
                 }
                 builder.body(Body::empty()).unwrap()
             }
-            Err(status) => s3_delete_status_to_response(status),
+            Err(status) => {
+                s3_delete_status_to_response(status, state.config.cross_region_routing_policy)
+            }
         };
     }
 
@@ -2202,16 +3721,26 @@ async fn delete_object(
             .header("x-amz-version-id", delete_marker.version_id.to_string())
             .body(Body::empty())
             .unwrap(),
-        Err(status) => s3_delete_status_to_response(status),
+        Err(status) => {
+            s3_delete_status_to_response(status, state.config.cross_region_routing_policy)
+        }
     }
 }
 
-fn s3_delete_status_to_response(status: tonic::Status) -> Response {
+fn s3_delete_status_to_response(
+    status: tonic::Status,
+    cross_region_policy: CrossRegionRoutingPolicy,
+) -> Response {
+    if let Some(response) = s3_remote_bucket_response_from_status(&status, cross_region_policy) {
+        return response;
+    }
+
     match status.code() {
         tonic::Code::FailedPrecondition => {
-            if status.message().starts_with("Bucket is in region ") {
-                let region = status.message().trim_start_matches("Bucket is in region ");
-                return s3_redirect(region);
+            if let Some(response) =
+                s3_remote_bucket_response_from_status(&status, cross_region_policy)
+            {
+                return response;
             }
             s3_error(
                 "PreconditionFailed",
@@ -2257,28 +3786,87 @@ async fn abort_multipart_upload(
             .status(axum::http::StatusCode::NO_CONTENT)
             .body(Body::empty())
             .unwrap(),
-        Err(status) => s3_status_to_response_for_auth(status, true, "NoSuchUpload"),
+        Err(status) => s3_status_to_response_for_auth(
+            status,
+            true,
+            "NoSuchUpload",
+            state.config.cross_region_routing_policy,
+        ),
     }
 }
 
 async fn head_object(
     State(state): State<AppState>,
-    Path((bucket, key)): Path<(String, String)>,
+    Path((mut bucket, mut key)): Path<(String, String)>,
     Query(q): Query<HashMap<String, String>>,
     req: Request,
 ) -> Response {
-    let claims = req.extensions().get::<Claims>().cloned();
+    if let Some(bucket) = s3_routed_bucket_without_key(&req) {
+        return Box::pin(head_bucket(State(state), Path(bucket), req)).await;
+    }
+    (bucket, key) = s3_routed_bucket_key(&req, bucket, key);
+
+    let checked_route = match s3_checked_route(
+        &state,
+        s3_host_route(&req),
+        req.extensions().get::<Claims>().cloned(),
+    )
+    .await
+    {
+        Ok(checked_route) => checked_route,
+        Err(response) => return response,
+    };
+    let claims = checked_route.claims.clone();
     let version_id = match parse_s3_version_id(&q) {
         Ok(version_id) => version_id,
         Err(response) => return response,
     };
+    if is_link_metadata_request(req.headers()) {
+        return head_object_link_metadata_response(
+            state,
+            claims,
+            checked_route.tenant_id,
+            &bucket,
+            &key,
+            version_id,
+        )
+        .await;
+    }
+
+    if let Some(response) = s3_object_proxy_response_if_needed(
+        &state,
+        &checked_route,
+        checked_route.claims.as_ref(),
+        &bucket,
+        &key,
+        "HEAD",
+        req.headers(),
+        req.uri(),
+        version_id,
+        None,
+    )
+    .await
+    {
+        return response;
+    }
 
     match state
         .object_manager
-        .head_object(claims, &bucket, &key, version_id)
+        .head_object_with_link_mode_for_tenant(
+            claims,
+            checked_route.tenant_id,
+            &bucket,
+            &key,
+            version_id,
+            ObjectLinkReadMode::Follow,
+        )
         .await
     {
-        Ok(object) => {
+        Ok(result) => {
+            let anvil_core::object_manager::ObjectHeadResult {
+                object,
+                followed_link,
+            } = result;
             if let Some(response) =
                 evaluate_object_preconditions(req.headers(), &object.etag, object.created_at)
             {
@@ -2294,15 +3882,18 @@ async fn head_object(
                 .header("ETag", object.etag)
                 .header("Accept-Ranges", "bytes")
                 .header("x-amz-version-id", object.version_id.to_string());
+            let builder = add_followed_link_headers(builder, followed_link.as_ref());
             add_s3_user_metadata_headers(builder, object.user_meta.as_ref())
                 .body(Body::empty())
                 .unwrap()
         }
         Err(status) => match status.code() {
             tonic::Code::FailedPrecondition => {
-                if status.message().starts_with("Bucket is in region ") {
-                    let region = status.message().trim_start_matches("Bucket is in region ");
-                    return s3_redirect(region);
+                if let Some(response) = s3_remote_bucket_response_from_status(
+                    &status,
+                    state.config.cross_region_routing_policy,
+                ) {
+                    return response;
                 }
                 s3_error(
                     "PreconditionFailed",
@@ -2330,6 +3921,9 @@ async fn head_object(
                 status.message(),
                 axum::http::StatusCode::FORBIDDEN,
             ),
+            tonic::Code::Unavailable => {
+                s3_unavailable_status_to_response(&status, state.config.cross_region_routing_policy)
+            }
             _ => s3_error(
                 "InternalError",
                 status.message(),
@@ -2647,10 +4241,303 @@ fn parse_s3_version_id(q: &HashMap<String, String>) -> Result<Option<uuid::Uuid>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anvil_core::{
+        mesh_directory::{
+            self, BucketId, BucketLocatorDescriptor, BucketName, CellId, MeshControlWriteAuthority,
+            MeshId, RegionName, RoutingRecordFamily, TenantId,
+        },
+        partition_fence::{
+            PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
+        },
+    };
     use futures_util::TryStreamExt;
+    use tempfile::tempdir;
 
     fn request(uri: &str) -> Request {
         Request::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    fn host_request(host: &str, remote: &str, forwarded_host: Option<&str>) -> Request {
+        let mut builder = Request::builder().uri("/object.txt").header("host", host);
+        if let Some(forwarded_host) = forwarded_host {
+            builder = builder.header("x-forwarded-host", forwarded_host);
+        }
+        let mut req = builder.body(Body::empty()).unwrap();
+        req.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            remote.parse().unwrap(),
+            41_000,
+        )));
+        req
+    }
+
+    fn routing_config_with_trusted_ranges(ranges: &[&str]) -> anvil_core::config::Config {
+        anvil_core::config::Config {
+            trusted_proxy_source_ranges: ranges.iter().map(|range| range.to_string()).collect(),
+            ..anvil_core::config::Config::default()
+        }
+    }
+
+    fn routing_config_with_policy(
+        storage_path: &std::path::Path,
+        policy: CrossRegionRoutingPolicy,
+    ) -> anvil_core::config::Config {
+        anvil_core::config::Config {
+            jwt_secret: "test-secret".to_string(),
+            anvil_secret_encryption_key:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            public_api_addr: "test-node".to_string(),
+            api_listen_addr: "127.0.0.1:0".to_string(),
+            region: "us-east-1".to_string(),
+            storage_path: storage_path.to_string_lossy().to_string(),
+            cross_region_routing_policy: policy,
+            ..anvil_core::config::Config::default()
+        }
+    }
+
+    async fn seeded_remote_bucket_route(
+        policy: CrossRegionRoutingPolicy,
+    ) -> (tempfile::TempDir, AppState, Claims, ObjectRoute) {
+        let temp = tempdir().unwrap();
+        let storage_path = temp.path().join("storage");
+        let state = AppState::new(routing_config_with_policy(&storage_path, policy), None)
+            .await
+            .unwrap();
+        let tenant = state
+            .persistence
+            .create_tenant("acme", "remote-bucket-test")
+            .await
+            .unwrap();
+        state
+            .persistence
+            .create_bucket(tenant.id, "releases", "eu-west-1")
+            .await
+            .unwrap();
+        let claims = Claims {
+            sub: "test-app".to_string(),
+            exp: usize::MAX,
+            scopes: Vec::new(),
+            tenant_id: tenant.id,
+            jti: None,
+        };
+        let route = ObjectRoute {
+            tenant: "acme".to_string(),
+            bucket: "releases".to_string(),
+            region: "us-east-1".to_string(),
+            key: "object.txt".to_string(),
+            source: RouteSource::PathStyle,
+        };
+        (temp, state, claims, route)
+    }
+
+    async fn seed_active_proxy_node(state: &AppState, region: &str, endpoint: &str) {
+        use anvil_core::mesh_lifecycle::{
+            CreateRegionDescriptor, LifecycleState, NodeCapability, RegisterCellDescriptor,
+            RegisterNodeDescriptor,
+        };
+
+        state
+            .persistence
+            .create_region_descriptor(CreateRegionDescriptor {
+                mesh_id: "default".to_string(),
+                region: region.to_string(),
+                public_base_url: format!("https://{region}.anvil-storage.test"),
+                virtual_host_suffix: format!("{region}.anvil-storage.test"),
+                placement_weight: 100,
+                default_cell: Some("default".to_string()),
+            })
+            .await
+            .unwrap();
+        state
+            .persistence
+            .register_cell_descriptor(RegisterCellDescriptor {
+                mesh_id: "default".to_string(),
+                region: region.to_string(),
+                cell_id: "default".to_string(),
+                placement_weight: 100,
+            })
+            .await
+            .unwrap();
+        state
+            .persistence
+            .transition_cell_descriptor(region, "default", 1, LifecycleState::Active)
+            .await
+            .unwrap();
+        state
+            .persistence
+            .register_node_descriptor(RegisterNodeDescriptor {
+                mesh_id: "default".to_string(),
+                node_id: "remote-object-node".to_string(),
+                region: region.to_string(),
+                cell_id: "default".to_string(),
+                libp2p_peer_id: "remote-peer".to_string(),
+                public_api_addr: endpoint.to_string(),
+                public_cluster_addrs: Vec::new(),
+                capabilities: vec![NodeCapability::Object],
+            })
+            .await
+            .unwrap();
+        state
+            .persistence
+            .transition_node_descriptor("remote-object-node", 1, LifecycleState::Active, None)
+            .await
+            .unwrap();
+    }
+
+    async fn seeded_remote_bucket_locator_only(
+        policy: CrossRegionRoutingPolicy,
+    ) -> (tempfile::TempDir, AppState, Claims, String) {
+        let temp = tempdir().unwrap();
+        let storage_path = temp.path().join("storage");
+        let state = AppState::new(routing_config_with_policy(&storage_path, policy), None)
+            .await
+            .unwrap();
+        let tenant = state
+            .persistence
+            .create_tenant("acme", "remote-locator-only-test")
+            .await
+            .unwrap();
+        let bucket_name = BucketName::canonicalize("releases").unwrap();
+        let object_prefix = format!("objects/{}/{}/", tenant.id, bucket_name.as_str());
+        let locator = BucketLocatorDescriptor::active(
+            MeshId::new("default").unwrap(),
+            TenantId::new(tenant.id.to_string()).unwrap(),
+            bucket_name.clone(),
+            BucketId::new("remote-bucket-id").unwrap(),
+            RegionName::new("eu-west-1").unwrap(),
+            CellId::new("default").unwrap(),
+            "regional-primary",
+            object_prefix,
+            "2026-07-02T00:00:00Z",
+        )
+        .unwrap();
+        let partition = locator.partition();
+        let control_partition_id = mesh_directory::control_partition_id(
+            RoutingRecordFamily::BucketLocator.stream_family(),
+            &partition,
+        );
+        let signing_key = hex::decode(&state.config.anvil_secret_encryption_key).unwrap();
+        let recovering = acquire_partition_recovery(
+            &state.storage,
+            PartitionRecoveryAcquire {
+                partition_family: mesh_directory::CONTROL_PARTITION_FAMILY.to_string(),
+                partition_id: control_partition_id,
+                owner_node_id: state.config.node_id.clone(),
+                recovered_through_sequence: 0,
+                recovered_manifest_hash: hex::encode([0; 32]),
+                now_nanos: 1,
+            },
+            &signing_key,
+        )
+        .await
+        .unwrap();
+        let ready = publish_partition_ready(
+            &state.storage,
+            &recovering.partition_family,
+            &recovering.partition_id,
+            &state.config.node_id,
+            recovering.fence_token,
+            0,
+            &hex::encode([0; 32]),
+            2,
+            &signing_key,
+        )
+        .await
+        .unwrap();
+        mesh_directory::write_bucket_locator(
+            &state.storage,
+            &locator,
+            MeshControlWriteAuthority {
+                permit: &ready.write_permit().unwrap(),
+                signing_key: &signing_key,
+            },
+        )
+        .await
+        .unwrap();
+
+        let claims = Claims {
+            sub: "test-app".to_string(),
+            exp: usize::MAX,
+            scopes: vec!["*|*".to_string()],
+            tenant_id: tenant.id,
+            jti: None,
+        };
+        (temp, state, claims, bucket_name.as_str().to_string())
+    }
+
+    async fn seeded_local_object_link() -> (tempfile::TempDir, AppState, Claims, String, String) {
+        let temp = tempdir().unwrap();
+        let storage_path = temp.path().join("storage");
+        let state = AppState::new(
+            routing_config_with_policy(&storage_path, CrossRegionRoutingPolicy::RedirectPreferred),
+            None,
+        )
+        .await
+        .unwrap();
+        let tenant = state
+            .persistence
+            .create_tenant("acme", "local-link-test")
+            .await
+            .unwrap();
+        let bucket = state
+            .persistence
+            .create_bucket(tenant.id, "releases", "us-east-1")
+            .await
+            .unwrap();
+        state
+            .persistence
+            .create_object(
+                tenant.id,
+                bucket.id,
+                "versions/app-v1.bin",
+                "payload-hash-v1",
+                14,
+                "etag-v1",
+                Some("application/octet-stream"),
+                None,
+                None,
+                Some(b"linked payload".to_vec()),
+            )
+            .await
+            .unwrap();
+        state
+            .persistence
+            .put_object_link(object_links::PutObjectLinkRequest {
+                tenant_id: tenant.id,
+                bucket_id: bucket.id,
+                link_key: "latest.bin".to_string(),
+                target_key: "versions/app-v1.bin".to_string(),
+                target_version: None,
+                resolution: object_links::ObjectLinkResolution::Follow,
+                expected_generation: None,
+                create_only: true,
+                allow_dangling: false,
+                idempotency_key: "local-link".to_string(),
+                created_by: "principal:test".to_string(),
+            })
+            .await
+            .unwrap();
+        let claims = Claims {
+            sub: "test-app".to_string(),
+            exp: usize::MAX,
+            scopes: vec!["*|*".to_string()],
+            tenant_id: tenant.id,
+            jti: None,
+        };
+        (temp, state, claims, bucket.name, "latest.bin".to_string())
+    }
+
+    async fn response_xml(response: Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        std::str::from_utf8(&body).unwrap().to_string()
+    }
+
+    async fn response_body(response: Response) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap()
+            .to_vec()
     }
 
     fn request_with_copy_source(uri: &str, copy_source: &str) -> Request {
@@ -2691,6 +4578,51 @@ mod tests {
         headers
     }
 
+    #[test]
+    fn s3_host_routing_accepts_forwarded_host_only_from_trusted_ranges() {
+        let config = routing_config_with_trusted_ranges(&["127.0.0.1/32"]);
+        let req = host_request(
+            "internal.anvil-storage.test",
+            "127.0.0.1",
+            Some("Bucket.Default.Test-Region-1.Anvil-Storage.Test"),
+        );
+
+        let host = request_host(&req, &config).expect("effective host");
+
+        assert_eq!(
+            host.as_deref(),
+            Some("bucket.default.test-region-1.anvil-storage.test")
+        );
+    }
+
+    #[test]
+    fn s3_host_routing_ignores_untrusted_forwarded_host() {
+        let config = routing_config_with_trusted_ranges(&["10.0.0.0/8"]);
+        let req = host_request(
+            "internal.anvil-storage.test",
+            "127.0.0.1",
+            Some("bucket.default.test-region-1.anvil-storage.test"),
+        );
+
+        let host = request_host(&req, &config).expect("effective host");
+
+        assert_eq!(host.as_deref(), Some("internal.anvil-storage.test"));
+    }
+
+    #[test]
+    fn s3_host_routing_rejects_ambiguous_forwarded_host_chains() {
+        let config = routing_config_with_trusted_ranges(&["127.0.0.1/32"]);
+        let req = host_request(
+            "internal.anvil-storage.test",
+            "127.0.0.1",
+            Some("one.example.test, two.example.test"),
+        );
+
+        let err = request_host(&req, &config).unwrap_err();
+
+        assert_eq!(err, RoutingError::AmbiguousForwardedHost);
+    }
+
     #[tokio::test]
     async fn s3_error_responses_include_request_id_in_header_and_xml() {
         let response = s3_error(
@@ -2724,6 +4656,7 @@ mod tests {
             tonic::Status::not_found("missing protected object"),
             false,
             "NoSuchKey",
+            CrossRegionRoutingPolicy::RedirectPreferred,
         );
         assert_eq!(unauthenticated.status(), axum::http::StatusCode::FORBIDDEN);
         assert!(unauthenticated.headers().contains_key("x-amz-request-id"));
@@ -2738,6 +4671,7 @@ mod tests {
             tonic::Status::not_found("missing visible object"),
             true,
             "NoSuchKey",
+            CrossRegionRoutingPolicy::RedirectPreferred,
         );
         assert_eq!(authenticated.status(), axum::http::StatusCode::NOT_FOUND);
         let body = axum::body::to_bytes(authenticated.into_body(), 1024)
@@ -2745,6 +4679,296 @@ mod tests {
             .unwrap();
         let xml = std::str::from_utf8(&body).unwrap();
         assert!(xml.contains("<Code>NoSuchKey</Code>"));
+    }
+
+    #[tokio::test]
+    async fn remote_bucket_locator_local_only_rejects_cross_region_route() {
+        let (_temp, state, claims, route) =
+            seeded_remote_bucket_route(CrossRegionRoutingPolicy::LocalOnly).await;
+
+        let response = s3_checked_route(&state, Some(route), Some(claims))
+            .await
+            .unwrap_err();
+
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers().get("x-amz-bucket-region").unwrap(),
+            "eu-west-1"
+        );
+        let xml = response_xml(response).await;
+        assert!(xml.contains("<Code>InvalidRequest</Code>"));
+        assert!(xml.contains("local_only"));
+    }
+
+    #[tokio::test]
+    async fn remote_bucket_locator_redirect_preferred_returns_s3_wrong_region_response() {
+        let (_temp, state, claims, route) =
+            seeded_remote_bucket_route(CrossRegionRoutingPolicy::RedirectPreferred).await;
+
+        let response = s3_checked_route(&state, Some(route), Some(claims))
+            .await
+            .unwrap_err();
+
+        assert_eq!(response.status(), axum::http::StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            response.headers().get("x-amz-bucket-region").unwrap(),
+            "eu-west-1"
+        );
+        assert!(response.headers().contains_key("x-amz-request-id"));
+        assert!(!response.headers().contains_key("x-anvil-bucket-region"));
+        assert!(
+            !response
+                .headers()
+                .contains_key("x-anvil-cross-region-action")
+        );
+        let xml = response_xml(response).await;
+        assert!(xml.contains("<Code>PermanentRedirect</Code>"));
+        assert!(xml.contains("<BucketRegion>eu-west-1</BucketRegion>"));
+        assert!(xml.contains("<RequestId>"));
+    }
+
+    #[tokio::test]
+    async fn remote_bucket_locator_proxy_preferred_redirects_when_proxy_is_absent() {
+        let (_temp, state, claims, route) =
+            seeded_remote_bucket_route(CrossRegionRoutingPolicy::ProxyPreferred).await;
+
+        let response = s3_checked_route(&state, Some(route), Some(claims))
+            .await
+            .unwrap_err();
+
+        assert_eq!(response.status(), axum::http::StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            response.headers().get("x-amz-bucket-region").unwrap(),
+            "eu-west-1"
+        );
+        let xml = response_xml(response).await;
+        assert!(xml.contains("<Code>PermanentRedirect</Code>"));
+        assert!(xml.contains("<BucketRegion>eu-west-1</BucketRegion>"));
+    }
+
+    #[tokio::test]
+    async fn remote_bucket_locator_proxy_required_reports_unavailable_without_proxy() {
+        let (_temp, state, claims, route) =
+            seeded_remote_bucket_route(CrossRegionRoutingPolicy::ProxyRequired).await;
+
+        let response = s3_checked_route(&state, Some(route), Some(claims))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            response.headers().get("x-amz-bucket-region").unwrap(),
+            "eu-west-1"
+        );
+        let xml = response_xml(response).await;
+        assert!(xml.contains("<Code>ServiceUnavailable</Code>"));
+        assert!(xml.contains("not implemented"));
+    }
+
+    #[tokio::test]
+    async fn remote_bucket_locator_proxy_required_selects_active_remote_object_node() {
+        let (_temp, state, claims, route) =
+            seeded_remote_bucket_route(CrossRegionRoutingPolicy::ProxyRequired).await;
+        seed_active_proxy_node(&state, "eu-west-1", "127.0.0.1:50091").await;
+
+        let checked = s3_checked_route(&state, Some(route), Some(claims))
+            .await
+            .unwrap();
+        let target = checked
+            .remote_bucket
+            .expect("proxy_required with active object node must select proxy target");
+
+        assert_eq!(target.region, "eu-west-1");
+        assert_eq!(target.endpoint, "http://127.0.0.1:50091");
+        assert!(target.bucket_locator_generation > 0);
+    }
+
+    #[tokio::test]
+    async fn remote_bucket_status_metadata_maps_to_s3_without_private_headers() {
+        let mut status =
+            tonic::Status::unavailable("Bucket is in region eu-west-1; proxy details hidden");
+        status
+            .metadata_mut()
+            .insert("x-anvil-bucket-region", "eu-west-1".parse().unwrap());
+        status.metadata_mut().insert(
+            "x-anvil-cross-region-action",
+            "proxy_unavailable".parse().unwrap(),
+        );
+
+        let response = s3_status_to_response_for_auth(
+            status,
+            true,
+            "NoSuchBucket",
+            CrossRegionRoutingPolicy::ProxyRequired,
+        );
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            response.headers().get("x-amz-bucket-region").unwrap(),
+            "eu-west-1"
+        );
+        assert!(!response.headers().contains_key("x-anvil-bucket-region"));
+        assert!(
+            !response
+                .headers()
+                .contains_key("x-anvil-cross-region-action")
+        );
+        let xml = response_xml(response).await;
+        assert!(xml.contains("<Code>ServiceUnavailable</Code>"));
+        assert!(!xml.contains("proxy details hidden"));
+    }
+
+    #[tokio::test]
+    async fn remote_bucket_message_parser_strips_internal_suffix_for_redirects() {
+        let status =
+            tonic::Status::failed_precondition("Bucket is in region eu-west-1; redirect required");
+
+        let response = s3_status_to_response_for_auth(
+            status,
+            true,
+            "NoSuchBucket",
+            CrossRegionRoutingPolicy::RedirectPreferred,
+        );
+
+        assert_eq!(response.status(), axum::http::StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            response.headers().get("x-amz-bucket-region").unwrap(),
+            "eu-west-1"
+        );
+        let xml = response_xml(response).await;
+        assert!(xml.contains("<BucketRegion>eu-west-1</BucketRegion>"));
+        assert!(!xml.contains("redirect required"));
+    }
+
+    #[tokio::test]
+    async fn head_bucket_uses_remote_locator_before_local_bucket_metadata() {
+        let (_temp, state, claims, bucket) =
+            seeded_remote_bucket_locator_only(CrossRegionRoutingPolicy::RedirectPreferred).await;
+        let mut req = Request::builder()
+            .uri(format!("/{bucket}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(claims);
+
+        let response = head_bucket(State(state), Path(bucket), req).await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            response.headers().get("x-amz-bucket-region").unwrap(),
+            "eu-west-1"
+        );
+        let xml = response_xml(response).await;
+        assert!(xml.contains("<Code>PermanentRedirect</Code>"));
+        assert!(xml.contains("<BucketRegion>eu-west-1</BucketRegion>"));
+    }
+
+    #[tokio::test]
+    async fn object_link_get_and_head_follow_by_default_with_link_headers() {
+        let (_temp, state, claims, bucket, link_key) = seeded_local_object_link().await;
+        let mut get_req = Request::builder()
+            .uri(format!("/{bucket}/{link_key}"))
+            .body(Body::empty())
+            .unwrap();
+        get_req.extensions_mut().insert(claims.clone());
+
+        let get_response = get_object(
+            State(state.clone()),
+            Path((bucket.clone(), link_key.clone())),
+            Query(HashMap::new()),
+            get_req,
+        )
+        .await;
+
+        assert_eq!(get_response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            get_response.headers().get("x-anvil-object-kind").unwrap(),
+            "link"
+        );
+        assert_eq!(
+            get_response.headers().get("x-anvil-link-key").unwrap(),
+            "latest.bin"
+        );
+        assert_eq!(
+            get_response
+                .headers()
+                .get("x-anvil-link-generation")
+                .unwrap(),
+            "1"
+        );
+        assert!(
+            get_response
+                .headers()
+                .get("ETag")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("link-follow-")
+        );
+        assert_eq!(response_body(get_response).await, b"linked payload");
+
+        let mut head_req = Request::builder()
+            .method(axum::http::Method::HEAD)
+            .uri(format!("/{bucket}/{link_key}"))
+            .body(Body::empty())
+            .unwrap();
+        head_req.extensions_mut().insert(claims);
+
+        let head_response = head_object(
+            State(state),
+            Path((bucket, link_key)),
+            Query(HashMap::new()),
+            head_req,
+        )
+        .await;
+
+        assert_eq!(head_response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            head_response.headers().get("x-anvil-object-kind").unwrap(),
+            "link"
+        );
+        assert_eq!(head_response.headers().get("Content-Length").unwrap(), "14");
+        assert!(response_body(head_response).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn object_link_metadata_mode_returns_descriptor_json() {
+        let (_temp, state, claims, bucket, link_key) = seeded_local_object_link().await;
+        let mut req = Request::builder()
+            .uri(format!("/{bucket}/{link_key}"))
+            .header("x-anvil-link-mode", "metadata")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(claims);
+
+        let response = get_object(
+            State(state),
+            Path((bucket, link_key)),
+            Query(HashMap::new()),
+            req,
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response.headers().get("Content-Type").unwrap(),
+            object_links::LINK_METADATA_CONTENT_TYPE
+        );
+        assert_eq!(
+            response.headers().get("x-anvil-object-kind").unwrap(),
+            "link"
+        );
+        let descriptor: serde_json::Value =
+            serde_json::from_slice(&response_body(response).await).unwrap();
+        assert_eq!(descriptor["schema"], "anvil.object_link.v1");
+        assert_eq!(descriptor["link_key"], "latest.bin");
+        assert_eq!(descriptor["target_key"], "versions/app-v1.bin");
+        assert_eq!(descriptor["resolution"], "follow");
     }
 
     #[test]

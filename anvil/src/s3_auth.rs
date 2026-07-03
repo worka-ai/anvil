@@ -13,7 +13,7 @@ use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
 use axum::{
     body::Body,
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{self, HeaderMap},
     middleware::Next,
     response::Response,
@@ -22,6 +22,7 @@ use axum::{
 use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
 use sha2::{Digest, Sha256};
+use std::net::SocketAddr;
 use subtle::ConstantTimeEq;
 use time::{Date, Month, PrimitiveDateTime, Time as Tm};
 use tracing::{debug, info, warn};
@@ -217,8 +218,17 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
             .unwrap();
     }
 
-    let host = effective_host(&parts);
-    let scheme = detect_scheme(&parts.headers, &parts);
+    let host = match sigv4_effective_host(state.config.as_ref(), &parts) {
+        Ok(host) => host,
+        Err(err) => {
+            warn!(error = %err, "Rejected SigV4 request with invalid forwarded host metadata");
+            return Response::builder()
+                .status(400)
+                .body(Body::from(err.to_string()))
+                .unwrap();
+        }
+    };
+    let scheme = detect_scheme(state.config.as_ref(), &parts.headers, &parts);
     let path_q = parts
         .uri
         .path_and_query()
@@ -272,7 +282,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
 
     let signed_set: HashSet<&str> = parsed.signed_headers.iter().map(|s| s.as_str()).collect();
 
-    if signed_set.contains("host") && !hdrs.contains_key("host") {
+    if signed_set.contains("host") {
         hdrs.insert("host".to_string(), host.clone());
     }
 
@@ -534,41 +544,92 @@ struct ParsedAuth {
     signature: String,
 }
 
-fn effective_host(parts: &http::request::Parts) -> String {
-    // 1) HTTP/2 authority from URI, if present
-    if let Some(auth) = parts.uri.authority() {
-        return auth.as_str().to_string();
-    }
-    // 2) Host header
-    if let Some(h) = parts
-        .headers
-        .get(http::header::HOST)
-        .and_then(|h| h.to_str().ok())
-    {
-        return h.to_string();
-    }
-    // 3) Forwarded host from proxy
-    if let Some(h) = parts
-        .headers
-        .get("x-forwarded-host")
-        .and_then(|h| h.to_str().ok())
-    {
-        return h.to_string();
-    }
-    "localhost".to_string()
+fn sigv4_effective_host(
+    config: &anvil_core::config::Config,
+    parts: &http::request::Parts,
+) -> Result<String, anvil_core::routing::RoutingError> {
+    let raw_authority = raw_request_authority(parts).unwrap_or("localhost");
+    let Some(remote_peer) = parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|connect_info| connect_info.0.ip())
+    else {
+        return Ok(raw_authority.to_string());
+    };
+    let trusted_proxies = trusted_proxy_source_ranges(config);
+    let forwarded_headers = forwarded_headers(&parts.headers);
+    anvil_core::routing::effective_host_authority(
+        raw_authority,
+        remote_peer,
+        &trusted_proxies,
+        &forwarded_headers,
+    )
 }
 
-// prefer XFP, then URI scheme, then https (since client talked TLS to Caddy)
-fn detect_scheme(headers: &HeaderMap, parts: &http::request::Parts) -> &'static str {
-    if let Some(v) = headers
-        .get("x-forwarded-proto")
-        .and_then(|h| h.to_str().ok())
-    {
-        if v.eq_ignore_ascii_case("https") {
-            return "https";
-        }
-        if v.eq_ignore_ascii_case("http") {
-            return "http";
+fn raw_request_authority(parts: &http::request::Parts) -> Option<&str> {
+    // 1) HTTP/2 authority from URI, if present
+    parts
+        .uri
+        .authority()
+        .map(|authority| authority.as_str())
+        // 2) Host header
+        .or_else(|| {
+            parts
+                .headers
+                .get(http::header::HOST)
+                .and_then(|h| h.to_str().ok())
+        })
+}
+
+fn trusted_proxy_source_ranges(
+    config: &anvil_core::config::Config,
+) -> Vec<anvil_core::routing::TrustedProxy> {
+    anvil_core::routing::parse_trusted_proxies(&config.trusted_proxy_source_ranges)
+        .unwrap_or_default()
+}
+
+fn forwarded_headers(headers: &HeaderMap) -> anvil_core::routing::ForwardedHeaders {
+    anvil_core::routing::ForwardedHeaders {
+        forwarded: header_values(headers, "forwarded"),
+        x_forwarded_host: header_values(headers, "x-forwarded-host"),
+    }
+}
+
+fn header_values(headers: &HeaderMap, name: &'static str) -> Vec<String> {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_string)
+        .collect()
+}
+
+// Prefer X-Forwarded-Proto only when it comes from a configured trusted proxy.
+fn detect_scheme(
+    config: &anvil_core::config::Config,
+    headers: &HeaderMap,
+    parts: &http::request::Parts,
+) -> &'static str {
+    let trusted_forwarding = parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|connect_info| connect_info.0.ip())
+        .is_some_and(|remote_peer| {
+            trusted_proxy_source_ranges(config)
+                .iter()
+                .any(|proxy| proxy.contains(remote_peer))
+        });
+    if trusted_forwarding {
+        if let Some(v) = headers
+            .get("x-forwarded-proto")
+            .and_then(|h| h.to_str().ok())
+        {
+            if v.eq_ignore_ascii_case("https") {
+                return "https";
+            }
+            if v.eq_ignore_ascii_case("http") {
+                return "http";
+            }
         }
     }
     if let Some(s) = parts.uri.scheme_str() {
@@ -729,6 +790,114 @@ mod tests {
         let final_signature = aws_chunk_signature(verification, &previous, b"");
         body.extend_from_slice(format!("0;chunk-signature={final_signature}\r\n\r\n").as_bytes());
         body
+    }
+
+    fn sigv4_config_with_trusted_ranges(ranges: &[&str]) -> anvil_core::config::Config {
+        anvil_core::config::Config {
+            trusted_proxy_source_ranges: ranges.iter().map(|range| range.to_string()).collect(),
+            ..anvil_core::config::Config::default()
+        }
+    }
+
+    fn sigv4_parts(
+        host: &str,
+        remote: &str,
+        forwarded_host: Option<&str>,
+        forwarded_proto: Option<&str>,
+    ) -> http::request::Parts {
+        let mut builder = Request::builder().uri("/bucket/key").header("host", host);
+        if let Some(forwarded_host) = forwarded_host {
+            builder = builder.header("x-forwarded-host", forwarded_host);
+        }
+        if let Some(forwarded_proto) = forwarded_proto {
+            builder = builder.header("x-forwarded-proto", forwarded_proto);
+        }
+        let req = builder.body(Body::empty()).unwrap();
+        let (mut parts, _) = req.into_parts();
+        parts.extensions.insert(ConnectInfo(SocketAddr::new(
+            remote.parse().unwrap(),
+            41_000,
+        )));
+        parts
+    }
+
+    #[test]
+    fn sigv4_effective_host_accepts_forwarded_host_only_from_trusted_ranges() {
+        let config = sigv4_config_with_trusted_ranges(&["127.0.0.1/32"]);
+        let parts = sigv4_parts(
+            "internal.anvil-storage.test:50051",
+            "127.0.0.1",
+            Some("bucket.default.test-region-1.anvil-storage.test:443"),
+            None,
+        );
+
+        let host = sigv4_effective_host(&config, &parts).expect("effective host");
+
+        assert_eq!(host, "bucket.default.test-region-1.anvil-storage.test:443");
+    }
+
+    #[test]
+    fn sigv4_effective_host_ignores_untrusted_forwarded_host() {
+        let config = sigv4_config_with_trusted_ranges(&["10.0.0.0/8"]);
+        let parts = sigv4_parts(
+            "internal.anvil-storage.test:50051",
+            "127.0.0.1",
+            Some("bucket.default.test-region-1.anvil-storage.test"),
+            None,
+        );
+
+        let host = sigv4_effective_host(&config, &parts).expect("effective host");
+
+        assert_eq!(host, "internal.anvil-storage.test:50051");
+    }
+
+    #[test]
+    fn sigv4_effective_host_rejects_ambiguous_forwarded_host_chains() {
+        let config = sigv4_config_with_trusted_ranges(&["127.0.0.1/32"]);
+        let parts = sigv4_parts(
+            "internal.anvil-storage.test",
+            "127.0.0.1",
+            Some("one.example.test, two.example.test"),
+            None,
+        );
+
+        let err = sigv4_effective_host(&config, &parts).unwrap_err();
+
+        assert_eq!(
+            err,
+            anvil_core::routing::RoutingError::AmbiguousForwardedHost
+        );
+    }
+
+    #[test]
+    fn sigv4_scheme_uses_forwarded_proto_only_from_trusted_ranges() {
+        let trusted_config = sigv4_config_with_trusted_ranges(&["127.0.0.1/32"]);
+        let trusted_parts = sigv4_parts(
+            "internal.anvil-storage.test",
+            "127.0.0.1",
+            None,
+            Some("http"),
+        );
+        assert_eq!(
+            detect_scheme(&trusted_config, &trusted_parts.headers, &trusted_parts),
+            "http"
+        );
+
+        let untrusted_config = sigv4_config_with_trusted_ranges(&["10.0.0.0/8"]);
+        let untrusted_parts = sigv4_parts(
+            "internal.anvil-storage.test",
+            "127.0.0.1",
+            None,
+            Some("http"),
+        );
+        assert_eq!(
+            detect_scheme(
+                &untrusted_config,
+                &untrusted_parts.headers,
+                &untrusted_parts
+            ),
+            "https"
+        );
     }
 
     #[tokio::test]

@@ -5,7 +5,7 @@ use hmac::{Hmac, Mac};
 use libp2p::{
     PeerId, Swarm,
     gossipsub::{self, IdentTopic as Topic},
-    identity, mdns,
+    mdns,
     swarm::{NetworkBehaviour, SwarmEvent},
 };
 use serde::{Deserialize, Serialize};
@@ -139,7 +139,9 @@ impl From<mdns::Event> for ClusterEvent {
 }
 
 pub async fn create_swarm(config: Arc<crate::config::Config>) -> Result<Swarm<ClusterBehaviour>> {
-    let local_key = identity::Keypair::generate_ed25519();
+    let local_key = crate::cluster_identity::load_or_create_cluster_keypair(
+        config.resolved_cluster_keypair_path(),
+    )?;
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
         .with_tokio()

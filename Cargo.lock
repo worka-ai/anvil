@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-storage"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "prost",
  "tokio",
@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-storage-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anvil-server",
  "anyhow",
@@ -310,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-storage-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
@@ -347,6 +347,7 @@ dependencies = [
  "hyper 1.7.0",
  "hyper-rustls 0.27.7",
  "hyper-util",
+ "idna 1.1.0",
  "jsonwebtoken",
  "lazy_static",
  "libp2p",
@@ -395,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "anvil-storage-test-utils"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anvil-server",
  "anvil-storage-core",

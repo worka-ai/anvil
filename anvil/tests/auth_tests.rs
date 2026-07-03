@@ -2561,10 +2561,13 @@ async fn test_reset_app_secret() {
 }
 
 #[tokio::test]
-async fn test_admin_cli_set_public_access() {
+async fn test_service_set_public_access() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
     let mut bucket_client = BucketServiceClient::connect(cluster.grpc_addrs[0].clone())
         .await
         .unwrap();
@@ -2630,23 +2633,18 @@ async fn test_admin_cli_set_public_access() {
         "Object should be private initially"
     );
 
-    // 3. Use the admin CLI to make the bucket public.
-    let admin_args = &["run", "--bin", "admin", "--"];
-    let set_public_status = std::process::Command::new("cargo")
-        .args(admin_args.iter().chain(&[
-            "--anvil-secret-encryption-key",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--storage-path",
-            &cluster.admin_state_path,
-            "bucket",
-            "set-public-access",
-            "--bucket",
-            &bucket_name,
-            "--allow",
-        ]))
-        .status()
-        .unwrap();
-    assert!(set_public_status.success());
+    // 3. Make the bucket public through the running service. The direct
+    // storage-admin binary is an offline tool and correctly refuses to race an
+    // active server's ownership fences.
+    let mut set_public_req = tonic::Request::new(SetPublicAccessRequest {
+        bucket: bucket_name.clone(),
+        allow_public_read: true,
+    });
+    set_public_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    auth_client.set_public_access(set_public_req).await.unwrap();
 
     // 4. Verify the object IS public now, with retries for cache consistency.
     let mut resp_after = None;

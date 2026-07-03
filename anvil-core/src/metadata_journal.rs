@@ -4,6 +4,7 @@ use crate::formats::{
     segment::{SegmentBody, SegmentRecord},
     validate_journal_chain,
 };
+use crate::object_links;
 use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
 use crate::persistence::{Bucket, Object, ObjectVersion, ObjectVersionsPage};
 use crate::storage::Storage;
@@ -66,6 +67,8 @@ struct ObjectVersionBody {
     bucket_name: String,
     object_key: String,
     event: String,
+    #[serde(default)]
+    kind: object_links::ObjectEntryKind,
     version_id: String,
     mutation_id: String,
     content_hash: String,
@@ -85,6 +88,8 @@ struct ObjectVersionBody {
     inline_payload: Option<Vec<u8>>,
     #[serde(default)]
     checksum: Option<Vec<u8>>,
+    #[serde(default)]
+    link: Option<object_links::ObjectLinkTarget>,
     delete_marker: bool,
     created_at: String,
     deleted_at: Option<String>,
@@ -97,6 +102,8 @@ struct DirectoryEntryBody {
     bucket_name: String,
     object_key: String,
     event: String,
+    #[serde(default)]
+    kind: object_links::ObjectEntryKind,
     #[serde(default)]
     id: i64,
     version_id: String,
@@ -121,6 +128,8 @@ struct DirectoryEntryBody {
     user_meta: Option<serde_json::Value>,
     #[serde(default)]
     shard_map: Option<serde_json::Value>,
+    #[serde(default)]
+    link: Option<object_links::ObjectLinkTarget>,
     delete_marker: bool,
     created_at: String,
     deleted_at: Option<String>,
@@ -180,6 +189,7 @@ async fn append_object_mutation_inner(
         bucket_name: bucket.name.clone(),
         object_key: object.key.clone(),
         event: mutation.event_name().to_string(),
+        kind: object.kind,
         version_id: object.version_id.to_string(),
         mutation_id: object.mutation_id.to_string(),
         content_hash: object.content_hash.clone(),
@@ -195,6 +205,7 @@ async fn append_object_mutation_inner(
         shard_map: object.shard_map.clone(),
         inline_payload: object.inline_payload.clone(),
         checksum: object.checksum.clone(),
+        link: object.link.clone(),
         delete_marker: mutation.is_delete_marker(),
         created_at: object.created_at.to_rfc3339(),
         deleted_at: object.deleted_at.map(|ts| ts.to_rfc3339()),
@@ -215,6 +226,7 @@ async fn append_object_mutation_inner(
         bucket_name: bucket.name.clone(),
         object_key: object.key.clone(),
         event: mutation.event_name().to_string(),
+        kind: object.kind,
         id: object.id,
         version_id: object.version_id.to_string(),
         mutation_id: object.mutation_id.to_string(),
@@ -229,6 +241,7 @@ async fn append_object_mutation_inner(
         storage_class: object.storage_class,
         user_meta: object.user_meta.clone(),
         shard_map: object.shard_map.clone(),
+        link: object.link.clone(),
         delete_marker: mutation.is_delete_marker(),
         created_at: object.created_at.to_rfc3339(),
         deleted_at: object.deleted_at.map(|ts| ts.to_rfc3339()),
@@ -1360,6 +1373,7 @@ fn directory_entry_from_object_version_body(body: &ObjectVersionBody) -> Directo
         bucket_name: body.bucket_name.clone(),
         object_key: body.object_key.clone(),
         event: body.event.clone(),
+        kind: body.kind,
         id: body.id,
         version_id: body.version_id.clone(),
         mutation_id: body.mutation_id.clone(),
@@ -1374,6 +1388,7 @@ fn directory_entry_from_object_version_body(body: &ObjectVersionBody) -> Directo
         storage_class: body.storage_class,
         user_meta: body.user_meta.clone(),
         shard_map: body.shard_map.clone(),
+        link: body.link.clone(),
         delete_marker: body.delete_marker,
         created_at: body.created_at.clone(),
         deleted_at: body.deleted_at.clone(),
@@ -1654,6 +1669,7 @@ fn object_from_body(body: &ObjectVersionBody) -> Result<Object> {
         tenant_id: body.tenant_id,
         bucket_id: body.bucket_id,
         key: body.object_key.clone(),
+        kind: body.kind,
         content_hash: body.content_hash.clone(),
         size: body.size,
         etag: body.etag.clone(),
@@ -1675,6 +1691,7 @@ fn object_from_body(body: &ObjectVersionBody) -> Result<Object> {
         shard_map: body.shard_map.clone(),
         inline_payload: body.inline_payload.clone(),
         checksum: body.checksum.clone(),
+        link: body.link.clone(),
     })
 }
 
@@ -1684,6 +1701,7 @@ fn object_from_directory_body(body: &DirectoryEntryBody) -> Result<Object> {
         tenant_id: body.tenant_id,
         bucket_id: body.bucket_id,
         key: body.object_key.clone(),
+        kind: body.kind,
         content_hash: body.content_hash.clone(),
         size: body.size,
         etag: body.etag.clone(),
@@ -1705,6 +1723,7 @@ fn object_from_directory_body(body: &DirectoryEntryBody) -> Result<Object> {
         shard_map: body.shard_map.clone(),
         inline_payload: None,
         checksum: None,
+        link: body.link.clone(),
     })
 }
 
@@ -1994,6 +2013,7 @@ mod tests {
             tenant_id: 3,
             bucket_id: 7,
             key: key.to_string(),
+            kind: object_links::ObjectEntryKind::Blob,
             content_hash: format!("hash-{id}"),
             size: 42,
             etag: format!("etag-{id}"),
@@ -2011,6 +2031,7 @@ mod tests {
             shard_map: None,
             inline_payload: None,
             checksum: None,
+            link: None,
         }
     }
 

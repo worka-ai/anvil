@@ -2,6 +2,647 @@ syntax = "proto3";
 
 package anvil;
 
+service AdminService {
+  rpc CreateTenant(CreateTenantRequest) returns (TenantAdminResponse);
+  rpc CreateApplication(CreateApplicationRequest) returns (ApplicationSecretResponse);
+  rpc RotateApplicationSecret(RotateApplicationSecretRequest) returns (ApplicationSecretResponse);
+  rpc CreateBucketAdmin(CreateBucketAdminRequest) returns (BucketAdminResponse);
+  rpc SetBucketPublicAccessAdmin(SetBucketPublicAccessAdminRequest) returns (BucketAdminResponse);
+
+  rpc CreateObjectLink(CreateObjectLinkRequest) returns (ObjectLinkResponse);
+  rpc UpdateObjectLink(UpdateObjectLinkRequest) returns (ObjectLinkResponse);
+  rpc DeleteObjectLink(DeleteObjectLinkRequest) returns (AdminMutationResponse);
+  rpc ReadObjectLink(ReadObjectLinkRequest) returns (ObjectLinkResponse);
+  rpc ListObjectLinks(ListObjectLinksRequest) returns (ListObjectLinksResponse);
+
+  rpc CreateHostAlias(CreateHostAliasRequest) returns (HostAliasResponse);
+  rpc ActivateHostAlias(ActivateHostAliasRequest) returns (HostAliasResponse);
+  rpc SuspendHostAlias(SuspendHostAliasRequest) returns (HostAliasResponse);
+  rpc DeleteHostAlias(DeleteHostAliasRequest) returns (AdminMutationResponse);
+  rpc ReadHostAlias(ReadHostAliasRequest) returns (HostAliasResponse);
+  rpc ListHostAliases(ListHostAliasesRequest) returns (ListHostAliasesResponse);
+
+  rpc CreateRegion(CreateRegionRequest) returns (RegionResponse);
+  rpc ActivateRegion(ActivateRegionRequest) returns (RegionResponse);
+  rpc SetRegionReadOnly(SetRegionReadOnlyRequest) returns (RegionResponse);
+  rpc DrainRegion(DrainRegionRequest) returns (DrainOperationResponse);
+  rpc RemoveRegion(RemoveRegionRequest) returns (AdminMutationResponse);
+  rpc ListRegions(ListRegionsRequest) returns (ListRegionsResponse);
+
+  rpc RegisterCell(RegisterCellRequest) returns (CellResponse);
+  rpc ActivateCell(ActivateCellRequest) returns (CellResponse);
+  rpc DrainCell(DrainCellRequest) returns (DrainOperationResponse);
+  rpc RemoveCell(RemoveCellRequest) returns (AdminMutationResponse);
+  rpc ListCells(ListCellsRequest) returns (ListCellsResponse);
+
+  rpc RegisterNode(RegisterNodeRequest) returns (NodeResponse);
+  rpc ActivateNode(ActivateNodeRequest) returns (NodeResponse);
+  rpc DrainNode(DrainNodeRequest) returns (DrainOperationResponse);
+  rpc ForceOfflineNode(ForceOfflineNodeRequest) returns (NodeResponse);
+  rpc RemoveNode(RemoveNodeRequest) returns (AdminMutationResponse);
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+
+  rpc ListRoutingRecords(ListRoutingRecordsRequest) returns (ListRoutingRecordsResponse);
+  rpc RepairRoutingRecord(RepairRoutingRecordRequest) returns (AdminMutationResponse);
+
+  rpc RunRepair(RunRepairRequest) returns (RepairTaskResponse);
+  rpc ListDiagnostics(ListDiagnosticsRequest) returns (DiagnosticsResponse);
+  rpc ListAuditEvents(ListAuditEventsRequest) returns (AuditEventsResponse);
+}
+
+message AdminRequestContext {
+  string request_id = 1;
+  string idempotency_key = 2;
+  string audit_reason = 3;
+  uint64 expected_generation = 4;
+}
+
+message AdminPrincipal {
+  string principal_id = 1;
+  string tenant_id = 2;
+  repeated string authenticated_methods = 3;
+}
+
+message AdminMutationResponse {
+  string request_id = 1;
+  string resource_id = 2;
+  uint64 generation = 3;
+  string audit_event_id = 4;
+  bool idempotent_replay = 5;
+}
+
+message AdminError {
+  string request_id = 1;
+  string code = 2;
+  string message = 3;
+  string resource_id = 4;
+  uint64 current_generation = 5;
+}
+
+message PageRequest {
+  string cursor = 1;
+  uint32 limit = 2;
+}
+
+message PageResponse {
+  string next_cursor = 1;
+  bool has_more = 2;
+}
+
+enum NodeCapability {
+  NODE_CAPABILITY_UNSPECIFIED = 0;
+  NODE_CAPABILITY_OBJECT = 1;
+  NODE_CAPABILITY_INDEX = 2;
+  NODE_CAPABILITY_PERSONALDB = 3;
+  NODE_CAPABILITY_GATEWAY = 4;
+  NODE_CAPABILITY_ADMIN = 5;
+}
+
+enum ObjectLinkResolution {
+  OBJECT_LINK_RESOLUTION_UNSPECIFIED = 0;
+  OBJECT_LINK_RESOLUTION_FOLLOW = 1;
+  OBJECT_LINK_RESOLUTION_REDIRECT = 2;
+}
+
+enum RegionDrainDisposition {
+  REGION_DRAIN_DISPOSITION_UNSPECIFIED = 0;
+  REGION_DRAIN_DISPOSITION_BLOCK_UNTIL_EMPTY = 1;
+  REGION_DRAIN_DISPOSITION_REMAIN_PROXY_ONLY = 2;
+  REGION_DRAIN_DISPOSITION_READ_ONLY_UNTIL_REMOVED = 3;
+  REGION_DRAIN_DISPOSITION_DELETE_AFTER_RETENTION = 4;
+}
+
+enum LifecycleState {
+  LIFECYCLE_STATE_UNSPECIFIED = 0;
+  LIFECYCLE_STATE_JOINING = 1;
+  LIFECYCLE_STATE_ACTIVE = 2;
+  LIFECYCLE_STATE_READ_ONLY = 3;
+  LIFECYCLE_STATE_DRAINING = 4;
+  LIFECYCLE_STATE_DRAINED = 5;
+  LIFECYCLE_STATE_DRAINED_WITH_EXCEPTIONS = 6;
+  LIFECYCLE_STATE_OFFLINE = 7;
+  LIFECYCLE_STATE_REMOVED = 8;
+}
+
+enum HostAliasState {
+  HOST_ALIAS_STATE_UNSPECIFIED = 0;
+  HOST_ALIAS_STATE_PENDING_VERIFICATION = 1;
+  HOST_ALIAS_STATE_ACTIVE = 2;
+  HOST_ALIAS_STATE_SUSPENDED = 3;
+  HOST_ALIAS_STATE_DELETED = 4;
+}
+
+enum RoutingRecordFamily {
+  ROUTING_RECORD_FAMILY_UNSPECIFIED = 0;
+  ROUTING_RECORD_FAMILY_TENANT_NAME = 1;
+  ROUTING_RECORD_FAMILY_TENANT_LOCATOR = 2;
+  ROUTING_RECORD_FAMILY_BUCKET_LOCATOR = 3;
+  ROUTING_RECORD_FAMILY_HOST_ALIAS = 4;
+}
+
+enum RepairKind {
+  REPAIR_KIND_UNSPECIFIED = 0;
+  REPAIR_KIND_INDEX = 1;
+  REPAIR_KIND_DIRECTORY_INDEX = 2;
+  REPAIR_KIND_AUTHZ_DERIVED_INDEX = 3;
+  REPAIR_KIND_PERSONALDB_LOG_CHAIN = 4;
+  REPAIR_KIND_MESH_ROUTING_PROJECTION = 5;
+}
+
+message NodeDrainDescriptor {
+  string started_at = 1;
+  uint64 graceful_timeout_ms = 2;
+  bool force_after_timeout = 3;
+}
+
+message NodeDescriptor {
+  string schema = 1;
+  string mesh_id = 2;
+  string node_id = 3;
+  string region = 4;
+  string cell_id = 5;
+  string libp2p_peer_id = 6;
+  string public_api_addr = 7;
+  repeated string public_cluster_addrs = 8;
+  repeated NodeCapability capabilities = 9;
+  LifecycleState state = 10;
+  NodeDrainDescriptor drain = 11;
+  string last_heartbeat_at = 12;
+  string created_at = 13;
+  string updated_at = 14;
+  uint64 generation = 15;
+}
+
+message RegionDescriptor {
+  string schema = 1;
+  string mesh_id = 2;
+  string region = 3;
+  LifecycleState state = 4;
+  string public_base_url = 5;
+  string virtual_host_suffix = 6;
+  uint32 placement_weight = 7;
+  string default_cell = 8;
+  string created_at = 9;
+  string updated_at = 10;
+  uint64 generation = 11;
+}
+
+message CellDescriptor {
+  string schema = 1;
+  string mesh_id = 2;
+  string region = 3;
+  string cell_id = 4;
+  LifecycleState state = 5;
+  uint32 placement_weight = 6;
+  string created_at = 7;
+  string updated_at = 8;
+  uint64 generation = 9;
+}
+
+message ObjectLinkDescriptor {
+  string schema = 1;
+  string tenant_id = 2;
+  string bucket_name = 3;
+  string link_key = 4;
+  string target_key = 5;
+  string target_version = 6;
+  ObjectLinkResolution resolution = 7;
+  string created_at = 8;
+  string updated_at = 9;
+  string created_by = 10;
+  uint64 generation = 11;
+}
+
+message HostAliasDescriptor {
+  string schema = 1;
+  string hostname = 2;
+  string tenant_id = 3;
+  string bucket_name = 4;
+  string region = 5;
+  string prefix = 6;
+  HostAliasState state = 7;
+  string created_at = 8;
+  string updated_at = 9;
+  uint64 generation = 10;
+}
+
+message TenantAdminDescriptor {
+  string tenant_id = 1;
+  string name = 2;
+  string home_region = 3;
+}
+
+message CreateTenantRequest {
+  AdminRequestContext context = 1;
+  string name = 2;
+  string home_region = 3;
+}
+
+message TenantAdminResponse {
+  string request_id = 1;
+  TenantAdminDescriptor tenant = 2;
+  string audit_event_id = 3;
+}
+
+message CreateApplicationRequest {
+  AdminRequestContext context = 1;
+  string tenant_id = 2;
+  string app_name = 3;
+}
+
+message RotateApplicationSecretRequest {
+  AdminRequestContext context = 1;
+  string tenant_id = 2;
+  string app_name = 3;
+}
+
+message ApplicationSecretResponse {
+  string request_id = 1;
+  string tenant_id = 2;
+  string app_name = 3;
+  string client_id = 4;
+  string client_secret = 5;
+  string audit_event_id = 6;
+}
+
+message CreateBucketAdminRequest {
+  AdminRequestContext context = 1;
+  string tenant_id = 2;
+  string bucket_name = 3;
+  string region = 4;
+}
+
+message SetBucketPublicAccessAdminRequest {
+  AdminRequestContext context = 1;
+  string tenant_id = 2;
+  string bucket_name = 3;
+  bool allow_public_read = 4;
+}
+
+message BucketAdminResponse {
+  string request_id = 1;
+  Bucket bucket = 2;
+  string audit_event_id = 3;
+}
+
+message CreateObjectLinkRequest {
+  AdminRequestContext context = 1;
+  string tenant_id = 2;
+  string bucket_name = 3;
+  string link_key = 4;
+  string target_key = 5;
+  string target_version = 6;
+  ObjectLinkResolution resolution = 7;
+  bool allow_dangling = 8;
+}
+
+message UpdateObjectLinkRequest {
+  AdminRequestContext context = 1;
+  string tenant_id = 2;
+  string bucket_name = 3;
+  string link_key = 4;
+  string target_key = 5;
+  string target_version = 6;
+  ObjectLinkResolution resolution = 7;
+  bool allow_dangling = 8;
+}
+
+message DeleteObjectLinkRequest {
+  AdminRequestContext context = 1;
+  string tenant_id = 2;
+  string bucket_name = 3;
+  string link_key = 4;
+}
+
+message ReadObjectLinkRequest {
+  string request_id = 1;
+  string tenant_id = 2;
+  string bucket_name = 3;
+  string link_key = 4;
+}
+
+message ListObjectLinksRequest {
+  string tenant_id = 1;
+  string bucket_name = 2;
+  string prefix = 3;
+  PageRequest page = 4;
+}
+
+message CreateHostAliasRequest {
+  AdminRequestContext context = 1;
+  string hostname = 2;
+  string tenant_id = 3;
+  string bucket_name = 4;
+  string region = 5;
+  string prefix = 6;
+}
+
+message ActivateHostAliasRequest {
+  AdminRequestContext context = 1;
+  string hostname = 2;
+}
+
+message SuspendHostAliasRequest {
+  AdminRequestContext context = 1;
+  string hostname = 2;
+}
+
+message DeleteHostAliasRequest {
+  AdminRequestContext context = 1;
+  string hostname = 2;
+}
+
+message ReadHostAliasRequest {
+  string request_id = 1;
+  string hostname = 2;
+}
+
+message ListHostAliasesRequest {
+  string region = 1;
+  PageRequest page = 2;
+}
+
+message ObjectLinkResponse {
+  string request_id = 1;
+  ObjectLinkDescriptor link = 2;
+  string audit_event_id = 3;
+}
+
+message ListObjectLinksResponse {
+  PageResponse page = 1;
+  repeated ObjectLinkDescriptor links = 2;
+}
+
+message HostAliasResponse {
+  string request_id = 1;
+  HostAliasDescriptor host_alias = 2;
+  string audit_event_id = 3;
+}
+
+message ListHostAliasesResponse {
+  PageResponse page = 1;
+  repeated HostAliasDescriptor host_aliases = 2;
+}
+
+message BucketDrainOverride {
+  string tenant_id = 1;
+  string bucket_name = 2;
+  RegionDrainDisposition disposition = 3;
+  string reason = 4;
+  string expires_at = 5;
+}
+
+message DrainOperationResponse {
+  string request_id = 1;
+  string resource_id = 2;
+  LifecycleState state = 3;
+  uint64 generation = 4;
+  string audit_event_id = 5;
+}
+
+message CreateRegionRequest {
+  AdminRequestContext context = 1;
+  string region = 2;
+  string public_base_url = 3;
+  string virtual_host_suffix = 4;
+  uint32 placement_weight = 5;
+  string default_cell = 6;
+}
+
+message ActivateRegionRequest {
+  AdminRequestContext context = 1;
+  string region = 2;
+  string activation_checkpoint_json = 3;
+}
+
+message SetRegionReadOnlyRequest {
+  AdminRequestContext context = 1;
+  string region = 2;
+}
+
+message DrainRegionRequest {
+  AdminRequestContext context = 1;
+  string region = 2;
+  RegionDrainDisposition default_disposition = 3;
+  repeated BucketDrainOverride bucket_overrides = 4;
+}
+
+message RemoveRegionRequest {
+  AdminRequestContext context = 1;
+  string region = 2;
+}
+
+message ListRegionsRequest {
+  PageRequest page = 1;
+}
+
+message RegisterCellRequest {
+  AdminRequestContext context = 1;
+  string region = 2;
+  string cell_id = 3;
+  uint32 placement_weight = 4;
+}
+
+message ActivateCellRequest {
+  AdminRequestContext context = 1;
+  string region = 2;
+  string cell_id = 3;
+}
+
+message DrainCellRequest {
+  AdminRequestContext context = 1;
+  string region = 2;
+  string cell_id = 3;
+}
+
+message RemoveCellRequest {
+  AdminRequestContext context = 1;
+  string region = 2;
+  string cell_id = 3;
+}
+
+message ListCellsRequest {
+  string region = 1;
+  PageRequest page = 2;
+}
+
+message RegisterNodeRequest {
+  AdminRequestContext context = 1;
+  string node_id = 2;
+  string region = 3;
+  string cell_id = 4;
+  string libp2p_peer_id = 5;
+  repeated string public_cluster_addrs = 6;
+  string public_api_addr = 7;
+  repeated NodeCapability capabilities = 8;
+}
+
+message ActivateNodeRequest {
+  AdminRequestContext context = 1;
+  string node_id = 2;
+}
+
+message DrainNodeRequest {
+  AdminRequestContext context = 1;
+  string node_id = 2;
+  uint64 graceful_timeout_ms = 3;
+  bool force_after_timeout = 4;
+}
+
+message ForceOfflineNodeRequest {
+  AdminRequestContext context = 1;
+  string node_id = 2;
+}
+
+message RemoveNodeRequest {
+  AdminRequestContext context = 1;
+  string node_id = 2;
+}
+
+message ListNodesRequest {
+  string region = 1;
+  string cell_id = 2;
+  PageRequest page = 3;
+}
+
+message NodeResponse {
+  string request_id = 1;
+  NodeDescriptor node = 2;
+  string audit_event_id = 3;
+}
+
+message RegionResponse {
+  string request_id = 1;
+  RegionDescriptor region = 2;
+  string audit_event_id = 3;
+}
+
+message CellResponse {
+  string request_id = 1;
+  CellDescriptor cell = 2;
+  string audit_event_id = 3;
+}
+
+message ListNodesResponse {
+  PageResponse page = 1;
+  repeated NodeDescriptor nodes = 2;
+}
+
+message ListRegionsResponse {
+  PageResponse page = 1;
+  repeated RegionDescriptor regions = 2;
+}
+
+message ListCellsResponse {
+  PageResponse page = 1;
+  repeated CellDescriptor cells = 2;
+}
+
+message RoutingRecordDescriptor {
+  RoutingRecordFamily family = 1;
+  string record_key = 2;
+  string partition = 3;
+  string descriptor_key = 4;
+  uint64 generation = 5;
+  string payload_json = 6;
+}
+
+message ListRoutingRecordsRequest {
+  RoutingRecordFamily family = 1;
+  PageRequest page = 2;
+}
+
+message ListRoutingRecordsResponse {
+  PageResponse page = 1;
+  repeated RoutingRecordDescriptor records = 2;
+}
+
+message RepairRoutingRecordRequest {
+  AdminRequestContext context = 1;
+  RoutingRecordFamily family = 2;
+  string record_key = 3;
+}
+
+message RunRepairRequest {
+  AdminRequestContext context = 1;
+  RepairKind repair_kind = 2;
+  string tenant_id = 3;
+  string bucket_name = 4;
+  string index_name = 5;
+  string derived_index_id = 6;
+  string database_id = 7;
+  bool rebuild = 8;
+}
+
+message RepairTaskResponse {
+  string request_id = 1;
+  string repair_task_id = 2;
+  string status = 3;
+  string scope_kind = 4;
+  string scope_id = 5;
+  repeated RepairFindingRecord findings = 6;
+  string audit_event_id = 7;
+  string details_json = 8;
+}
+
+message ListDiagnosticsRequest {
+  string request_id = 1;
+  string source = 2;
+  string tenant_id = 3;
+  string bucket_name = 4;
+  string index_name = 5;
+  string severity = 6;
+  PageRequest page = 7;
+}
+
+message DiagnosticRecord {
+  string diagnostic_id = 1;
+  string scope_kind = 2;
+  string scope_id = 3;
+  string source = 4;
+  string severity = 5;
+  string code = 6;
+  string message = 7;
+  string object_key = 8;
+  string version_id = 9;
+  string details_json = 10;
+  int64 created_at_nanos = 11;
+  uint64 cursor = 12;
+}
+
+message DiagnosticsResponse {
+  string request_id = 1;
+  PageResponse page = 2;
+  repeated DiagnosticRecord diagnostics = 3;
+  string data_source = 4;
+}
+
+message ListAuditEventsRequest {
+  string request_id = 1;
+  string principal_id = 2;
+  string resource_id = 3;
+  string action = 4;
+  PageRequest page = 5;
+}
+
+message AuditEventRecord {
+  string audit_event_id = 1;
+  string request_id = 2;
+  string principal_id = 3;
+  string resource_id = 4;
+  string action = 5;
+  string audit_reason = 6;
+  string created_at = 7;
+  string details_json = 8;
+}
+
+message AuditEventsResponse {
+  string request_id = 1;
+  PageResponse page = 2;
+  repeated AuditEventRecord events = 3;
+  string data_source = 4;
+}
+
 // Bucket Service
 service BucketService {
   rpc CreateBucket(CreateBucketRequest) returns (CreateBucketResponse);
@@ -888,6 +1529,13 @@ message AbortMultipartResponse {
     uint64 watch_cursor = 6;
 }
 
+
+
+
+
+
+
+
 service AuthService {
   rpc GetAccessToken(GetAccessTokenRequest) returns (GetAccessTokenResponse);
   rpc GrantAccess(GrantAccessRequest) returns (GrantAccessResponse);
@@ -916,6 +1564,11 @@ service CoordinationService {
   rpc CommitTaskLease(CommitTaskLeaseRequest) returns (CommitTaskLeaseResponse);
   rpc ReadTaskLease(ReadTaskLeaseRequest) returns (ReadTaskLeaseResponse);
   rpc ForceReleaseTaskLease(ForceReleaseTaskLeaseRequest) returns (ForceReleaseTaskLeaseResponse);
+  rpc AcquireOwnership(AcquireOwnershipRequest) returns (OwnershipFenceResponse);
+  rpc RenewOwnership(RenewOwnershipRequest) returns (OwnershipFenceResponse);
+  rpc TransferOwnership(TransferOwnershipRequest) returns (OwnershipFenceResponse);
+  rpc ReleaseOwnership(ReleaseOwnershipRequest) returns (OwnershipFenceResponse);
+  rpc ForceExpireOwnership(ForceExpireOwnershipRequest) returns (OwnershipFenceResponse);
 }
 
 service PersonalDbService {
@@ -1347,6 +2000,101 @@ message ForceReleaseTaskLeaseResponse {
     TaskLease previous_lease = 2;
 }
 
+message OwnershipResource {
+    OwnershipResourceKind resource_kind = 1;
+    string resource_id = 2;
+}
+
+message AcquireOwnershipRequest {
+    string request_id = 1;
+    string idempotency_key = 2;
+    // Non-authoritative diagnostic label. The stored security owner is derived
+    // from authenticated claims on the server.
+    string owner_label = 3;
+    OwnershipResource resource = 4;
+    uint64 requested_lease_ms = 5;
+}
+
+message RenewOwnershipRequest {
+    string request_id = 1;
+    // Non-authoritative diagnostic label. The authenticated owner still wins.
+    string owner_label = 2;
+    OwnershipResource resource = 3;
+    uint64 current_fence = 4;
+    uint64 requested_lease_ms = 5;
+}
+
+message TransferOwnershipRequest {
+    string request_id = 1;
+    string idempotency_key = 2;
+    // Non-authoritative diagnostic label for the caller.
+    string owner_label = 3;
+    OwnershipResource resource = 4;
+    uint64 current_fence = 5;
+    // Non-authoritative diagnostic label for the post-transfer owner record.
+    string new_owner_label = 6;
+    string new_owner_principal_kind = 7;
+    string new_owner_principal_id = 8;
+    string new_owner_actor_instance_id = 9;
+    string new_owner_region = 10;
+    string new_owner_cell = 11;
+}
+
+message ReleaseOwnershipRequest {
+    string request_id = 1;
+    string idempotency_key = 2;
+    // Non-authoritative diagnostic label. The stored security owner is derived
+    // from authenticated claims on the server.
+    string owner_label = 3;
+    OwnershipResource resource = 4;
+    uint64 current_fence = 5;
+    bool administrative_force = 6;
+}
+
+message ForceExpireOwnershipRequest {
+    string request_id = 1;
+    string idempotency_key = 2;
+    OwnershipResource resource = 3;
+    string reason = 4;
+}
+
+message OwnershipFenceResponse {
+    string request_id = 1;
+    OwnershipResource resource = 2;
+    string owner_node_id = 3;
+    string owner_region = 4;
+    string owner_cell = 5;
+    uint64 fence = 6;
+    OwnershipFenceState state = 7;
+    string lease_expires_at = 8;
+    uint64 generation = 9;
+    bool idempotent_replay = 10;
+    int64 owner_tenant_id = 11;
+    string owner_principal_kind = 12;
+    string owner_principal_id = 13;
+    string owner_actor_instance_id = 14;
+}
+
+enum OwnershipResourceKind {
+    OWNERSHIP_RESOURCE_KIND_UNSPECIFIED = 0;
+    OWNERSHIP_RESOURCE_KIND_CONTROL_PARTITION = 1;
+    OWNERSHIP_RESOURCE_KIND_BUCKET_PRIMARY = 2;
+    OWNERSHIP_RESOURCE_KIND_OBJECT_PARTITION = 3;
+    OWNERSHIP_RESOURCE_KIND_INDEX_PARTITION = 4;
+    OWNERSHIP_RESOURCE_KIND_PERSONALDB_GROUP = 5;
+    OWNERSHIP_RESOURCE_KIND_TASK_QUEUE = 6;
+    OWNERSHIP_RESOURCE_KIND_WATCH_PARTITION = 7;
+}
+
+enum OwnershipFenceState {
+    OWNERSHIP_FENCE_STATE_UNSPECIFIED = 0;
+    OWNERSHIP_FENCE_STATE_ACTIVE = 1;
+    OWNERSHIP_FENCE_STATE_TRANSFERRING = 2;
+    OWNERSHIP_FENCE_STATE_DRAINING = 3;
+    OWNERSHIP_FENCE_STATE_EXPIRED = 4;
+    OWNERSHIP_FENCE_STATE_RELEASED = 5;
+}
+
 message WatchAuthzTupleLogRequest {
     uint64 after_revision = 1;
     string namespace = 2;
@@ -1638,6 +2386,14 @@ message WatchPersonalDbProjectionResponse {
     string emitted_at = 13;
     WatchEventEnvelope envelope = 20;
 }
+
+
+
+
+
+
+
+
 
 
 // ---------- Model Service ----------

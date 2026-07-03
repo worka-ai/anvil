@@ -5,6 +5,7 @@ use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::Subcommand;
 use serde::Deserialize;
+use tokio::io::AsyncWriteExt;
 use tokio_stream::iter;
 
 #[derive(Subcommand)]
@@ -124,17 +125,48 @@ pub async fn handle_object_command(command: &ObjectCommands, ctx: &Context) -> a
 
             if let Some(dest_path) = dest {
                 let mut file = tokio::fs::File::create(dest_path).await?;
+                let mut expected_len = None;
+                let mut bytes_written = 0_u64;
                 while let Some(chunk) = stream.message().await? {
-                    if let Some(api::get_object_response::Data::Chunk(bytes)) = chunk.data {
-                        tokio::io::AsyncWriteExt::write_all(&mut file, &bytes).await?;
+                    match chunk.data {
+                        Some(api::get_object_response::Data::Metadata(info)) => {
+                            expected_len = Some(u64::try_from(info.content_length)?);
+                        }
+                        Some(api::get_object_response::Data::Chunk(bytes)) => {
+                            file.write_all(&bytes).await?;
+                            bytes_written = bytes_written.saturating_add(bytes.len() as u64);
+                        }
+                        None => {}
                     }
+                }
+                file.flush().await?;
+                if let Some(expected_len) = expected_len {
+                    anyhow::ensure!(
+                        bytes_written == expected_len,
+                        "downloaded {bytes_written} bytes from {src}, expected {expected_len}"
+                    );
                 }
                 println!("Downloaded {} to {}", src, dest_path);
             } else {
+                let mut expected_len = None;
+                let mut bytes_written = 0_u64;
                 while let Some(chunk) = stream.message().await? {
-                    if let Some(api::get_object_response::Data::Chunk(bytes)) = chunk.data {
-                        print!("{}", String::from_utf8_lossy(&bytes));
+                    match chunk.data {
+                        Some(api::get_object_response::Data::Metadata(info)) => {
+                            expected_len = Some(u64::try_from(info.content_length)?);
+                        }
+                        Some(api::get_object_response::Data::Chunk(bytes)) => {
+                            bytes_written = bytes_written.saturating_add(bytes.len() as u64);
+                            print!("{}", String::from_utf8_lossy(&bytes));
+                        }
+                        None => {}
                     }
+                }
+                if let Some(expected_len) = expected_len {
+                    anyhow::ensure!(
+                        bytes_written == expected_len,
+                        "downloaded {bytes_written} bytes from {src}, expected {expected_len}"
+                    );
                 }
             }
         }

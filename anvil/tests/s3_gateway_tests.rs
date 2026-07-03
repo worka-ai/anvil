@@ -4,6 +4,9 @@ use anvil::anvil_api::{
     CreateIndexRequest, GetAccessTokenRequest, IndexKind, QueryIndexRequest,
     SetPublicAccessRequest, WriteAuthzTupleRequest,
 };
+use anvil::mesh_lifecycle::{CreateHostAliasDescriptor, CreateRegionDescriptor, LifecycleState};
+use anvil::object_links::{ObjectLinkResolution, PutObjectLinkRequest};
+use anvil::routing::{HostAliasState, RoutingConfig};
 use anvil::storage::{DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES, ExternalChunkManifest};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
@@ -260,6 +263,321 @@ async fn get_token_for_scopes(
         .unwrap()
         .into_inner()
         .access_token
+}
+
+#[tokio::test]
+async fn test_s3_regional_host_routing_reads_same_object_and_rejects_dotted_hosts() {
+    let mut cluster = TestCluster::new_with_config(&["test-region-1"], |config| {
+        config.public_region_base_domain = "test-region-1.anvil-storage.test".to_string();
+        config.mesh_id = "mesh-test".to_string();
+    })
+    .await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
+    let s3 = s3_client(http_base, "test-app", "test-secret");
+    let bucket = format!("host-route-{}", uuid::Uuid::new_v4());
+    let key = "nested/host-routed.txt";
+    let body = b"regional host routing resolves the same object";
+
+    s3.create_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("CreateBucket should succeed");
+    s3.put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(body))
+        .send()
+        .await
+        .expect("PutObject should succeed");
+
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut public_req = tonic::Request::new(SetPublicAccessRequest {
+        bucket: bucket.clone(),
+        allow_public_read: true,
+    });
+    public_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", cluster.token).parse().unwrap(),
+    );
+    auth_client.set_public_access(public_req).await.unwrap();
+
+    let http = reqwest::Client::new();
+    let path_style = http
+        .get(format!("{http_base}/default/{bucket}/{key}"))
+        .header(reqwest::header::HOST, "test-region-1.anvil-storage.test")
+        .send()
+        .await
+        .expect("path-style regional GET should send");
+    assert_eq!(path_style.status(), reqwest::StatusCode::OK);
+    assert_eq!(path_style.bytes().await.unwrap().as_ref(), body);
+
+    let virtual_host = http
+        .get(format!("{http_base}/{key}"))
+        .header(
+            reqwest::header::HOST,
+            format!("{bucket}.default.test-region-1.anvil-storage.test"),
+        )
+        .send()
+        .await
+        .expect("virtual-host regional GET should send");
+    assert_eq!(virtual_host.status(), reqwest::StatusCode::OK);
+    assert_eq!(virtual_host.bytes().await.unwrap().as_ref(), body);
+
+    let dotted_bucket = http
+        .get(format!("{http_base}/{key}"))
+        .header(
+            reqwest::header::HOST,
+            format!("assets.{bucket}.default.test-region-1.anvil-storage.test"),
+        )
+        .send()
+        .await
+        .expect("dotted bucket host form should send");
+    assert_eq!(dotted_bucket.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let dotted_tenant = http
+        .get(format!("{http_base}/{key}"))
+        .header(
+            reqwest::header::HOST,
+            format!("{bucket}.team.default.test-region-1.anvil-storage.test"),
+        )
+        .send()
+        .await
+        .expect("dotted tenant host form should send");
+    assert_eq!(dotted_tenant.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_s3_regional_routes_public_reads_to_tenant_scoped_duplicate_bucket() {
+    let mut cluster = TestCluster::new_with_config(&["test-region-1"], |config| {
+        config.public_region_base_domain = "test-region-1.anvil-storage.test".to_string();
+        config.mesh_id = "mesh-test".to_string();
+    })
+    .await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
+    let s3 = s3_client(http_base, "test-app", "test-secret");
+    let bucket = format!("tenant-scoped-{}", uuid::Uuid::new_v4());
+    let key = "same/key.txt";
+    let default_only_key = "default-only.txt";
+    let routed_only_key = "routed-only.txt";
+    let link_key = "latest.txt";
+    let default_body = b"default tenant object";
+    let routed_body = b"routed tenant object";
+    let routed_only_body = b"routed tenant only";
+
+    s3.create_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("default tenant CreateBucket should succeed");
+    s3.put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(default_body))
+        .send()
+        .await
+        .expect("default tenant PutObject should succeed");
+    s3.put_object()
+        .bucket(&bucket)
+        .key(default_only_key)
+        .body(ByteStream::from_static(b"default tenant only"))
+        .send()
+        .await
+        .expect("default tenant-only PutObject should succeed");
+
+    let persistence = &cluster.states[0].persistence;
+    let routed_tenant = persistence
+        .create_tenant("tenant-b", "unused")
+        .await
+        .expect("routed tenant should be created");
+    let routed_bucket = persistence
+        .create_bucket(routed_tenant.id, &bucket, "test-region-1")
+        .await
+        .expect("same bucket name should be allowed in another tenant");
+    persistence
+        .create_object(
+            routed_tenant.id,
+            routed_bucket.id,
+            key,
+            "routed-object-hash",
+            routed_body.len() as i64,
+            "routed-object-etag",
+            Some("text/plain"),
+            None,
+            None,
+            Some(routed_body.to_vec()),
+        )
+        .await
+        .expect("routed tenant object should be written");
+    persistence
+        .create_object(
+            routed_tenant.id,
+            routed_bucket.id,
+            routed_only_key,
+            "routed-only-object-hash",
+            routed_only_body.len() as i64,
+            "routed-only-object-etag",
+            Some("text/plain"),
+            None,
+            None,
+            Some(routed_only_body.to_vec()),
+        )
+        .await
+        .expect("routed tenant-only object should be written");
+    persistence
+        .put_object_link(PutObjectLinkRequest {
+            tenant_id: routed_tenant.id,
+            bucket_id: routed_bucket.id,
+            link_key: link_key.to_string(),
+            target_key: key.to_string(),
+            target_version: None,
+            resolution: ObjectLinkResolution::Follow,
+            expected_generation: None,
+            create_only: true,
+            allow_dangling: false,
+            idempotency_key: "test-routed-link".to_string(),
+            created_by: "test".to_string(),
+        })
+        .await
+        .expect("routed tenant object link should be written");
+    persistence
+        .set_bucket_public_access(routed_tenant.id, &bucket, true)
+        .await
+        .expect("routed tenant bucket should be public");
+
+    let response = reqwest::Client::new()
+        .get(format!("{http_base}/tenant-b/{bucket}/{key}"))
+        .header(reqwest::header::HOST, "test-region-1.anvil-storage.test")
+        .send()
+        .await
+        .expect("tenant-routed public GET should send");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.bytes().await.unwrap().as_ref(), routed_body);
+
+    let versions = reqwest::Client::new()
+        .get(format!("{http_base}/tenant-b/{bucket}?versions"))
+        .header(reqwest::header::HOST, "test-region-1.anvil-storage.test")
+        .send()
+        .await
+        .expect("tenant-routed public version listing should send");
+    assert_eq!(versions.status(), reqwest::StatusCode::OK);
+    let versions_xml = versions.text().await.expect("version listing body");
+    assert!(versions_xml.contains(routed_only_key));
+    assert!(!versions_xml.contains(default_only_key));
+
+    let link_metadata = reqwest::Client::new()
+        .get(format!("{http_base}/tenant-b/{bucket}/{link_key}"))
+        .header(reqwest::header::HOST, "test-region-1.anvil-storage.test")
+        .header("x-anvil-link-mode", "metadata")
+        .send()
+        .await
+        .expect("tenant-routed link metadata GET should send");
+    assert_eq!(link_metadata.status(), reqwest::StatusCode::OK);
+    let link_metadata = link_metadata
+        .json::<serde_json::Value>()
+        .await
+        .expect("link metadata JSON");
+    assert_eq!(link_metadata["tenant_id"], routed_tenant.id.to_string());
+    assert_eq!(link_metadata["link_key"], link_key);
+    assert_eq!(link_metadata["target_key"], key);
+}
+
+#[tokio::test]
+async fn test_s3_custom_host_alias_routes_to_bucket_prefix() {
+    let mut cluster = TestCluster::new_with_config(&["test-region-1"], |config| {
+        config.public_region_base_domain = "test-region-1.anvil-storage.test".to_string();
+        config.mesh_id = "mesh-test".to_string();
+    })
+    .await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
+    let s3 = s3_client(http_base, "test-app", "test-secret");
+    let bucket = format!("host-alias-{}", uuid::Uuid::new_v4());
+    let key = "public/latest.exe";
+    let body = b"custom host alias resolves through the configured prefix";
+
+    s3.create_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("CreateBucket should succeed");
+    s3.put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(body))
+        .send()
+        .await
+        .expect("PutObject should succeed");
+
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut public_req = tonic::Request::new(SetPublicAccessRequest {
+        bucket: bucket.clone(),
+        allow_public_read: true,
+    });
+    public_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", cluster.token).parse().unwrap(),
+    );
+    auth_client.set_public_access(public_req).await.unwrap();
+
+    let persistence = &cluster.states[0].persistence;
+    let region = persistence
+        .create_region_descriptor(CreateRegionDescriptor {
+            mesh_id: cluster.states[0].config.mesh_id.clone(),
+            region: "test-region-1".to_string(),
+            public_base_url: "https://test-region-1.anvil-storage.test".to_string(),
+            virtual_host_suffix: "test-region-1.anvil-storage.test".to_string(),
+            placement_weight: 100,
+            default_cell: None,
+        })
+        .await
+        .expect("region descriptor should be created");
+    persistence
+        .transition_region_descriptor("test-region-1", region.generation, LifecycleState::Active)
+        .await
+        .expect("region descriptor should activate");
+
+    let hostname = format!("assets-{}.example.test", uuid::Uuid::new_v4().simple());
+    let routing_config =
+        RoutingConfig::new("anvil-storage.test").expect("valid routing base domain");
+    let alias = persistence
+        .create_host_alias_descriptor(
+            &routing_config,
+            CreateHostAliasDescriptor {
+                hostname: hostname.clone(),
+                tenant_id: "1".to_string(),
+                bucket_name: bucket.clone(),
+                region: "test-region-1".to_string(),
+                prefix: "public/".to_string(),
+            },
+        )
+        .await
+        .expect("host alias should be created");
+    let alias = persistence
+        .transition_host_alias_descriptor(&hostname, alias.generation, HostAliasState::Active)
+        .await
+        .expect("host alias should activate");
+    assert_eq!(alias.state, HostAliasState::Active);
+
+    let response = reqwest::Client::new()
+        .get(format!("{http_base}/latest.exe"))
+        .header(reqwest::header::HOST, hostname)
+        .send()
+        .await
+        .expect("custom host alias GET should send");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.bytes().await.unwrap().as_ref(), body);
 }
 
 #[tokio::test]

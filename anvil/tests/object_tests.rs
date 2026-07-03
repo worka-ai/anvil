@@ -19,7 +19,18 @@ use anvil::observability::{
     OBJECT_READ_LATENCY, OBJECT_WRITE_LATENCY, PREFIX_LIST_LATENCY,
     RESERVED_NAMESPACE_REJECTION_COUNT,
 };
+use anvil::routing::CrossRegionRoutingPolicy;
 use anvil::storage::{DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES, ExternalChunkManifest};
+use anvil::{
+    auth::Claims,
+    mesh_directory::{
+        self, BucketId, BucketLocatorDescriptor, BucketName, CellId, MeshControlWriteAuthority,
+        MeshId, RegionName, RoutingRecordFamily, TenantId,
+    },
+    partition_fence::{
+        PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
+    },
+};
 use anvil_test_utils::*;
 use tonic::{Code, Status};
 
@@ -41,6 +52,125 @@ fn assert_reserved_namespace_status<T>(result: Result<T, Status>) {
     assert!(
         err.message().contains("UnauthorizedReservedNamespace"),
         "expected UnauthorizedReservedNamespace, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn native_object_routes_use_mesh_locator_before_local_bucket_metadata() {
+    let cluster = TestCluster::new_with_config(&["us-west-2"], |config| {
+        config.cross_region_routing_policy = CrossRegionRoutingPolicy::ProxyRequired;
+    })
+    .await;
+    let state = &cluster.states[0];
+    let signing_key = hex::decode(&state.config.anvil_secret_encryption_key).unwrap();
+    let bucket_name = BucketName::canonicalize("remote-bucket").unwrap();
+    let locator = BucketLocatorDescriptor::active(
+        MeshId::new("default").unwrap(),
+        TenantId::new("1").unwrap(),
+        bucket_name.clone(),
+        BucketId::new("bucket-remote").unwrap(),
+        RegionName::new("eu-west-1").unwrap(),
+        CellId::new("default").unwrap(),
+        "regional-primary",
+        "objects/1/remote-bucket/",
+        "2026-07-02T00:00:00Z",
+    )
+    .unwrap();
+    let partition = locator.partition();
+    let control_partition_id = mesh_directory::control_partition_id(
+        RoutingRecordFamily::BucketLocator.stream_family(),
+        &partition,
+    );
+    let recovering = acquire_partition_recovery(
+        &state.storage,
+        PartitionRecoveryAcquire {
+            partition_family: mesh_directory::CONTROL_PARTITION_FAMILY.to_string(),
+            partition_id: control_partition_id,
+            owner_node_id: state.config.node_id.clone(),
+            recovered_through_sequence: 0,
+            recovered_manifest_hash: hex::encode([0; 32]),
+            now_nanos: 1,
+        },
+        &signing_key,
+    )
+    .await
+    .unwrap();
+    let ready = publish_partition_ready(
+        &state.storage,
+        &recovering.partition_family,
+        &recovering.partition_id,
+        &state.config.node_id,
+        recovering.fence_token,
+        0,
+        &hex::encode([0; 32]),
+        2,
+        &signing_key,
+    )
+    .await
+    .unwrap();
+    mesh_directory::write_bucket_locator(
+        &state.storage,
+        &locator,
+        MeshControlWriteAuthority {
+            permit: &ready.write_permit().unwrap(),
+            signing_key: &signing_key,
+        },
+    )
+    .await
+    .unwrap();
+
+    let err = state
+        .object_manager
+        .list_objects_for_tenant(
+            Some(Claims {
+                sub: "test-app".to_string(),
+                exp: usize::MAX,
+                scopes: vec!["*|*".to_string()],
+                tenant_id: 1,
+                jti: None,
+            }),
+            Some(1),
+            bucket_name.as_str(),
+            "",
+            "",
+            10,
+            "",
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code(), Code::Unavailable);
+    assert_eq!(
+        err.metadata()
+            .get("x-anvil-bucket-region")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "eu-west-1"
+    );
+    assert_eq!(
+        err.metadata()
+            .get("x-anvil-cross-region-action")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "proxy_unavailable"
+    );
+
+    let write_err = state
+        .object_manager
+        .initiate_multipart_upload(1, bucket_name.as_str(), "upload.bin", &["*|*".to_string()])
+        .await
+        .unwrap_err();
+    assert_eq!(write_err.code(), Code::Unavailable);
+    assert_eq!(
+        write_err
+            .metadata()
+            .get("x-anvil-bucket-region")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "eu-west-1"
     );
 }
 
@@ -186,6 +316,104 @@ macro_rules! assert_native_mutation_response {
         assert!(!$response.record_hash.is_empty());
         assert!($response.watch_cursor > 0);
     }};
+}
+
+#[tokio::test]
+async fn native_object_routes_apply_cross_region_policy_before_local_metadata() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut object_client = ObjectServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: "remote-bucket".to_string(),
+                region: "test-region-2".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let err = object_client
+        .get_object(authorized(
+            GetObjectRequest {
+                bucket_name: "remote-bucket".to_string(),
+                object_key: "any.txt".to_string(),
+                version_id: None,
+            },
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(
+        err.metadata().get("x-anvil-bucket-region").unwrap(),
+        "test-region-2"
+    );
+    assert_eq!(
+        err.metadata().get("x-anvil-cross-region-action").unwrap(),
+        "redirect"
+    );
+}
+
+#[tokio::test]
+async fn native_object_routes_report_proxy_required_as_unavailable_when_proxy_is_absent() {
+    let mut cluster = TestCluster::new_with_config(&["test-region-1"], |config| {
+        config.cross_region_routing_policy =
+            anvil::routing::CrossRegionRoutingPolicy::ProxyRequired;
+    })
+    .await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut object_client = ObjectServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: "remote-bucket".to_string(),
+                region: "test-region-2".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let err = object_client
+        .list_objects(authorized(
+            ListObjectsRequest {
+                bucket_name: "remote-bucket".to_string(),
+                prefix: String::new(),
+                start_after: String::new(),
+                delimiter: String::new(),
+                max_keys: 100,
+            },
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable);
+    assert_eq!(
+        err.metadata().get("x-anvil-bucket-region").unwrap(),
+        "test-region-2"
+    );
+    assert_eq!(
+        err.metadata().get("x-anvil-cross-region-action").unwrap(),
+        "proxy_unavailable"
+    );
 }
 
 #[tokio::test]
