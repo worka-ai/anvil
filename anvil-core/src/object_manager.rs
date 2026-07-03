@@ -106,6 +106,13 @@ pub struct ObjectReadResult {
     pub followed_link: Option<object_links::FollowedObjectLink>,
 }
 
+struct ComposeStreamState {
+    manager: ObjectManager,
+    claims: auth::Claims,
+    sources: std::vec::IntoIter<ComposeSource>,
+    current: Option<Pin<Box<dyn Stream<Item = Result<Vec<u8>, Status>> + Send + 'static>>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ObjectHeadResult {
     pub object: Object,
@@ -1796,43 +1803,50 @@ impl ObjectManager {
             ));
         }
 
-        let manager = self.clone();
-        let source_claims = claims.clone();
-        let (tx, rx) = mpsc::channel(4);
-
-        tokio::spawn(async move {
-            for source in sources {
-                let source_stream = match manager
-                    .get_object(
-                        Some(source_claims.clone()),
-                        source.bucket_name,
-                        source.object_key,
-                        source.version_id,
-                    )
-                    .await
-                {
-                    Ok((_object, stream)) => stream,
-                    Err(status) => {
-                        let _ = tx.send(Err(status)).await;
-                        return;
+        let state = ComposeStreamState {
+            manager: self.clone(),
+            claims: claims.clone(),
+            sources: sources.into_iter(),
+            current: None,
+        };
+        let composed_stream = Box::pin(futures_util::stream::try_unfold(
+            state,
+            |mut state| async move {
+                loop {
+                    if let Some(current) = state.current.as_mut() {
+                        match current.next().await {
+                            Some(Ok(chunk)) => return Ok(Some((chunk, state))),
+                            Some(Err(status)) => return Err(status),
+                            None => {
+                                state.current = None;
+                                continue;
+                            }
+                        }
                     }
-                };
 
-                futures_util::pin_mut!(source_stream);
-                while let Some(chunk) = source_stream.next().await {
-                    if tx.send(chunk).await.is_err() {
-                        return;
-                    }
+                    let Some(source) = state.sources.next() else {
+                        return Ok(None);
+                    };
+                    let (_object, stream) = state
+                        .manager
+                        .get_object(
+                            Some(state.claims.clone()),
+                            source.bucket_name,
+                            source.object_key,
+                            source.version_id,
+                        )
+                        .await?;
+                    state.current = Some(stream);
                 }
-            }
-        });
+            },
+        ));
 
         self.put_object(
             claims.tenant_id,
             destination_bucket_name,
             destination_object_key,
             &claims.scopes,
-            ReceiverStream::new(rx),
+            composed_stream,
             ObjectWriteOptions::default(),
         )
         .await
