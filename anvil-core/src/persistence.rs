@@ -6011,11 +6011,7 @@ mod tests {
 
         drop(persistence);
 
-        let restarted_config = Config {
-            public_api_addr: "test-node-after-restart".to_string(),
-            ..first_config
-        };
-        let replayed = Persistence::new(&restarted_config, None).unwrap();
+        let replayed = Persistence::new(&first_config, None).unwrap();
 
         assert!(
             replayed
@@ -6239,11 +6235,7 @@ mod tests {
         assert_eq!(sealed.directory_record_count, 2);
 
         drop(persistence);
-        let restarted_config = Config {
-            public_api_addr: "test-node-after-compaction".to_string(),
-            ..first_config
-        };
-        let restarted = Persistence::new(&restarted_config, None).unwrap();
+        let restarted = Persistence::new(&first_config, None).unwrap();
 
         let replayed = restarted
             .get_object(bucket.id, "docs/a.txt")
