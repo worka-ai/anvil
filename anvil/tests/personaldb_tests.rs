@@ -10,8 +10,9 @@ use anvil::anvil_api::{
 use anvil::anvil_personaldb_sqlite_changeset::iterate_changeset;
 use anvil::formats::hash32;
 use anvil::partition_fence::{
-    AcquireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal, OwnershipResource,
-    OwnershipResourceKind, acquire_ownership, read_ownership_fence, read_partition_owner,
+    AcquireOwnership, ForceExpireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal,
+    OwnershipResource, OwnershipResourceKind, acquire_ownership, force_expire_ownership,
+    read_ownership_fence, read_partition_owner,
 };
 use anvil::personaldb_envelope::{
     PersonalDbEnvelopeDerivationInput, derive_verified_mutation_envelope,
@@ -595,7 +596,7 @@ async fn personaldb_concurrent_same_base_submits_publish_one_witness_commit() {
 }
 
 #[tokio::test]
-async fn personaldb_group_owner_transfer_commits_once_across_nodes() {
+async fn personaldb_group_owner_handoff_after_force_expiry_commits_once_across_nodes() {
     let mut cluster = TestCluster::new(&["test-region-1", "test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(20)).await;
 
@@ -637,7 +638,45 @@ async fn personaldb_group_owner_transfer_commits_once_across_nodes() {
     .await
     .unwrap()
     .expect("first commit writes partition owner");
-    assert_eq!(first_owner.owner_node_id, cluster.grpc_addrs[0]);
+    assert_eq!(first_owner.owner_node_id, cluster.states[0].config.node_id);
+
+    let ownership_resource = OwnershipResource {
+        resource_kind: OwnershipResourceKind::PersonalDbGroup,
+        resource_id: format!("tenant/1/personaldb/{database_id}"),
+    };
+    let now_nanos = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .expect("valid timestamp");
+    force_expire_ownership(
+        &cluster.states[0].storage,
+        ForceExpireOwnership {
+            request_id: format!("force-expire-personaldb-{database_id}"),
+            idempotency_key: format!("force-expire-personaldb-{database_id}"),
+            resource: ownership_resource,
+            admin: OwnershipPrincipal {
+                tenant_id: 0,
+                principal_kind: "node".to_string(),
+                principal_id: cluster.states[0].config.node_id.clone(),
+                actor_instance_id: cluster.states[0].config.node_id.clone(),
+                display_name: cluster.states[0].config.node_id.clone(),
+                region: if cluster.states[0].config.region.is_empty() {
+                    "default".to_string()
+                } else {
+                    cluster.states[0].config.region.clone()
+                },
+                cell: if cluster.states[0].config.cell_id.is_empty() {
+                    "default".to_string()
+                } else {
+                    cluster.states[0].config.cell_id.clone()
+                },
+            },
+            reason: "personaldb owner handoff test".to_string(),
+            now_nanos,
+        },
+        &hex::decode(&cluster.states[0].config.anvil_secret_encryption_key).unwrap(),
+    )
+    .await
+    .expect("force expiry allows owner handoff");
 
     let second = node_b
         .submit_personal_db_changeset(authorized(
@@ -667,7 +706,7 @@ async fn personaldb_group_owner_transfer_commits_once_across_nodes() {
     .await
     .unwrap()
     .expect("second commit publishes new partition owner");
-    assert_eq!(second_owner.owner_node_id, cluster.grpc_addrs[1]);
+    assert_eq!(second_owner.owner_node_id, cluster.states[1].config.node_id);
     assert_eq!(second_owner.fence_token, first_owner.fence_token + 1);
 
     let stale_base = node_a
