@@ -120,8 +120,7 @@ impl TestCluster {
         let config = Arc::new(config);
 
         let unique_regions: HashSet<String> = regions.iter().map(|s| s.to_string()).collect();
-        let first_region = regions.first().copied().unwrap_or("default");
-        let admin_state_path = storage_path.join(format!("node-{first_region}-0"));
+        let admin_state_path = storage_path.clone();
         let mut states = Vec::new();
         for (node_index, region_name) in regions.iter().enumerate() {
             let mut node_config = config.deref().clone();
