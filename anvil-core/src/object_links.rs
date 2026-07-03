@@ -376,4 +376,137 @@ mod tests {
 
         assert_ne!(etag_v1, etag_v2);
     }
+
+    #[tokio::test]
+    async fn moving_link_changes_resolved_target_without_copying_payload() {
+        let (_temp, persistence, bucket) = seeded().await;
+        let created = persistence
+            .put_object_link(link_request(&bucket, "latest.bin", "versions/app-v1.bin"))
+            .await
+            .unwrap();
+
+        assert_eq!(created.link.size, 0);
+        assert!(created.link.inline_payload.is_none());
+        let resolved_v1 = persistence
+            .resolve_object_link_target(bucket.id, "latest.bin")
+            .await
+            .unwrap();
+        assert_eq!(resolved_v1.key, "versions/app-v1.bin");
+        assert_eq!(
+            resolved_v1.inline_payload.as_deref(),
+            Some(b"hello world".as_slice())
+        );
+
+        let mut update = link_request(&bucket, "latest.bin", "versions/app-v2.bin");
+        update.create_only = false;
+        update.expected_generation = Some(created.descriptor.generation);
+        let updated = persistence.put_object_link(update).await.unwrap();
+
+        assert_eq!(updated.link.size, 0);
+        assert!(updated.link.inline_payload.is_none());
+        let resolved_v2 = persistence
+            .resolve_object_link_target(bucket.id, "latest.bin")
+            .await
+            .unwrap();
+        assert_eq!(resolved_v2.key, "versions/app-v2.bin");
+        assert_eq!(
+            resolved_v2.inline_payload.as_deref(),
+            Some(b"hello again".as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn live_and_pinned_target_versions_resolve_as_specified() {
+        let (_temp, persistence, bucket) = seeded().await;
+        let v1 = persistence
+            .create_object(
+                bucket.tenant_id,
+                bucket.id,
+                "channels/app.bin",
+                "payload-hash-live-v1",
+                7,
+                "etag-live-v1",
+                Some("application/octet-stream"),
+                None,
+                None,
+                Some(b"live-v1".to_vec()),
+            )
+            .await
+            .unwrap();
+        let v2 = persistence
+            .create_object(
+                bucket.tenant_id,
+                bucket.id,
+                "channels/app.bin",
+                "payload-hash-live-v2",
+                7,
+                "etag-live-v2",
+                Some("application/octet-stream"),
+                None,
+                None,
+                Some(b"live-v2".to_vec()),
+            )
+            .await
+            .unwrap();
+
+        persistence
+            .put_object_link(link_request(&bucket, "live.bin", "channels/app.bin"))
+            .await
+            .unwrap();
+        let mut pinned = link_request(&bucket, "pinned.bin", "channels/app.bin");
+        pinned.target_version = Some(v1.version_id);
+        persistence.put_object_link(pinned).await.unwrap();
+
+        let live = persistence
+            .resolve_object_link_target(bucket.id, "live.bin")
+            .await
+            .unwrap();
+        let pinned = persistence
+            .resolve_object_link_target(bucket.id, "pinned.bin")
+            .await
+            .unwrap();
+
+        assert_eq!(live.version_id, v2.version_id);
+        assert_eq!(live.inline_payload.as_deref(), Some(b"live-v2".as_slice()));
+        assert_eq!(pinned.version_id, v1.version_id);
+        assert_eq!(
+            pinned.inline_payload.as_deref(),
+            Some(b"live-v1".as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn link_resolution_detects_loops_and_depth_limit() {
+        let (_temp, persistence, bucket) = seeded().await;
+        let mut loop_a = link_request(&bucket, "loop-a.bin", "loop-b.bin");
+        loop_a.allow_dangling = true;
+        persistence.put_object_link(loop_a).await.unwrap();
+        let mut loop_b = link_request(&bucket, "loop-b.bin", "loop-a.bin");
+        loop_b.allow_dangling = true;
+        persistence.put_object_link(loop_b).await.unwrap();
+
+        let loop_err = persistence
+            .resolve_object_link_target(bucket.id, "loop-a.bin")
+            .await
+            .unwrap_err();
+        assert!(matches!(loop_err, ObjectLinkError::LinkLoop));
+
+        for index in 0..=MAX_LINK_RESOLUTION_DEPTH {
+            let link_key = format!("chain-{index}.bin");
+            let target_key = if index == MAX_LINK_RESOLUTION_DEPTH {
+                "versions/app-v1.bin".to_string()
+            } else {
+                format!("chain-{}.bin", index + 1)
+            };
+            let mut request = link_request(&bucket, &link_key, &target_key);
+            request.allow_dangling = true;
+            persistence.put_object_link(request).await.unwrap();
+        }
+
+        let depth_err = persistence
+            .resolve_object_link_target(bucket.id, "chain-0.bin")
+            .await
+            .unwrap_err();
+        assert!(matches!(depth_err, ObjectLinkError::LinkDepthExceeded));
+    }
 }

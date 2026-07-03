@@ -302,6 +302,17 @@ mod tests {
                 .code(),
             Code::InvalidArgument
         );
+
+        let other_sort_binding = AdminCursorBinding {
+            sort: "link_key.desc",
+            ..binding
+        };
+        assert_eq!(
+            decode_page_cursor(Some(&page), &other_sort_binding, KEY)
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
     }
 
     #[test]

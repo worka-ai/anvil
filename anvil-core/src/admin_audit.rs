@@ -88,6 +88,26 @@ pub async fn list_audit_events(
     Ok(out)
 }
 
+pub fn audit_event_position(event: &AdminAuditEvent) -> String {
+    format!("{}:{}", event.created_at, event.audit_event_id)
+}
+
+pub fn audit_event_revision_generation(event: &AdminAuditEvent) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"anvil-admin-audit-event-revision-v1");
+    update_hash_part(&mut hasher, event.schema.as_bytes());
+    update_hash_part(&mut hasher, event.audit_event_id.as_bytes());
+    update_hash_part(&mut hasher, event.request_id.as_bytes());
+    update_hash_part(&mut hasher, event.principal_id.as_bytes());
+    update_hash_part(&mut hasher, event.resource_id.as_bytes());
+    update_hash_part(&mut hasher, event.action.as_bytes());
+    update_hash_part(&mut hasher, event.audit_reason.as_bytes());
+    update_hash_part(&mut hasher, event.created_at.as_bytes());
+    update_hash_part(&mut hasher, event.details_json.as_bytes());
+    let digest = hasher.finalize();
+    u64::from_le_bytes(digest.as_bytes()[0..8].try_into().expect("blake3 digest"))
+}
+
 fn matches_filter(event: &AdminAuditEvent, filter: &AuditEventFilter<'_>) -> bool {
     filter
         .principal_id
@@ -96,6 +116,11 @@ fn matches_filter(event: &AdminAuditEvent, filter: &AuditEventFilter<'_>) -> boo
             .resource_id
             .is_none_or(|resource_id| event.resource_id == resource_id)
         && filter.action.is_none_or(|action| event.action == action)
+}
+
+fn update_hash_part(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
 }
 
 #[cfg(test)]

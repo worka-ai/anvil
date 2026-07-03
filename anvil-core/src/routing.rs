@@ -599,7 +599,15 @@ mod tests {
     #[test]
     fn chooses_remote_bucket_action_from_policy_and_proxy_availability() {
         assert_eq!(
+            remote_bucket_routing_action(CrossRegionRoutingPolicy::RedirectPreferred, true),
+            RemoteBucketRoutingAction::Redirect
+        );
+        assert_eq!(
             remote_bucket_routing_action(CrossRegionRoutingPolicy::LocalOnly, false),
+            RemoteBucketRoutingAction::RejectLocalOnly
+        );
+        assert_eq!(
+            remote_bucket_routing_action(CrossRegionRoutingPolicy::LocalOnly, true),
             RemoteBucketRoutingAction::RejectLocalOnly
         );
         assert_eq!(
@@ -617,6 +625,10 @@ mod tests {
         assert_eq!(
             remote_bucket_routing_action(CrossRegionRoutingPolicy::ProxyRequired, false),
             RemoteBucketRoutingAction::ProxyUnavailable
+        );
+        assert_eq!(
+            remote_bucket_routing_action(CrossRegionRoutingPolicy::ProxyRequired, true),
+            RemoteBucketRoutingAction::Proxy
         );
     }
 

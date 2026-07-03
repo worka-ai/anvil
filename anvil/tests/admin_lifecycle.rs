@@ -677,6 +677,39 @@ async fn admin_lifecycle_rejects_invalid_region_cell_and_node_transitions() {
         .into_inner();
     assert_eq!(listed.nodes.len(), 1);
     assert_eq!(listed.nodes[0].state, 4);
+
+    let lifecycle_diagnostics = client
+        .list_diagnostics(with_auth(
+            tonic::Request::new(ListDiagnosticsRequest {
+                request_id: "req-list-lifecycle-diagnostics".to_string(),
+                source: "mesh_lifecycle".to_string(),
+                tenant_id: String::new(),
+                bucket_name: String::new(),
+                index_name: String::new(),
+                severity: String::new(),
+                page: None,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .diagnostics;
+    let node_diagnostic = lifecycle_diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "mesh_node_not_active")
+        .expect("draining node should be reported in lifecycle diagnostics");
+    let node_diagnostic_details: serde_json::Value =
+        serde_json::from_str(&node_diagnostic.details_json).unwrap();
+    assert_eq!(
+        node_diagnostic_details["runtime_ownership_blocker_count"],
+        0
+    );
+    assert!(node_diagnostic_details["runtime_ownership_blockers"].is_array());
+    assert_eq!(
+        node_diagnostic_details["ownership_repair"]["proposed_action"],
+        "no_runtime_ownership_repair_needed"
+    );
 }
 
 #[tokio::test]
@@ -1069,6 +1102,37 @@ async fn admin_routing_records_list_and_repair_mesh_locators() {
                 .details_json
                 .contains(&format!("{}/route-bucket", tenant.id))
     }));
+    let route_diagnostic = diagnostics_after_delete
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.code == "mesh_control_projection_missing_record"
+                && diagnostic
+                    .details_json
+                    .contains(&format!("{}/route-bucket", tenant.id))
+        })
+        .expect("routing projection diagnostic should name the missing record");
+    let route_diagnostic_details: serde_json::Value =
+        serde_json::from_str(&route_diagnostic.details_json).unwrap();
+    assert_eq!(
+        route_diagnostic_details["descriptor_key"],
+        bucket_record.descriptor_key
+    );
+    assert_eq!(route_diagnostic_details["repair_safe"], true);
+    assert_eq!(
+        route_diagnostic_details["proposed_action"],
+        "repair_routing_record_from_control_stream"
+    );
+    assert!(
+        route_diagnostic_details["stream_sequence"]
+            .as_u64()
+            .is_some()
+    );
+    assert!(
+        route_diagnostic_details["stream_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("blake3:")
+    );
 
     let repaired = client
         .repair_routing_record(with_auth(
@@ -1130,6 +1194,31 @@ async fn admin_routing_records_list_and_repair_mesh_locators() {
         projection_repair
             .details_json
             .contains("\"repaired_count\":1")
+    );
+    assert_eq!(projection_repair.findings.len(), 1);
+    assert_eq!(
+        projection_repair.findings[0].code,
+        "mesh_control_projection_missing_record"
+    );
+    assert_eq!(
+        projection_repair.findings[0].proposed_action,
+        "RebuildDerivedIndex"
+    );
+    assert!(
+        projection_repair.findings[0]
+            .evidence_json
+            .contains(&bucket_record.descriptor_key)
+    );
+    let projection_repair_details: serde_json::Value =
+        serde_json::from_str(&projection_repair.details_json).unwrap();
+    assert_eq!(projection_repair_details["repaired_count"], 1);
+    assert_eq!(
+        projection_repair_details["repaired_records"][0]["descriptor_key"],
+        bucket_record.descriptor_key
+    );
+    assert_eq!(
+        projection_repair_details["repaired_records"][0]["repair_result"]["applied_action"],
+        "repair_routing_record_from_control_stream"
     );
     let diagnostics_after_repair = client
         .list_diagnostics(with_auth(
@@ -1862,6 +1951,97 @@ async fn admin_mutations_are_returned_by_durable_audit_listing() {
         .await
         .unwrap()
         .into_inner();
+
+    let first_page = client
+        .list_audit_events(with_auth(
+            tonic::Request::new(ListAuditEventsRequest {
+                request_id: "req-list-admin-audit-page-1".to_string(),
+                principal_id: "admin-principal".to_string(),
+                resource_id: String::new(),
+                action: String::new(),
+                page: Some(PageRequest {
+                    cursor: String::new(),
+                    limit: 2,
+                }),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first_page.events.len(), 2);
+    let first_page_cursor = first_page.page.unwrap().next_cursor;
+    assert!(!first_page_cursor.is_empty());
+
+    let second_page = client
+        .list_audit_events(with_auth(
+            tonic::Request::new(ListAuditEventsRequest {
+                request_id: "req-list-admin-audit-page-2".to_string(),
+                principal_id: "admin-principal".to_string(),
+                resource_id: String::new(),
+                action: String::new(),
+                page: Some(PageRequest {
+                    cursor: first_page_cursor.clone(),
+                    limit: 2,
+                }),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second_page.events.len(), 2);
+    assert_ne!(
+        first_page.events[0].audit_event_id,
+        second_page.events[0].audit_event_id
+    );
+
+    let filter_mismatch = client
+        .list_audit_events(with_auth(
+            tonic::Request::new(ListAuditEventsRequest {
+                request_id: "req-list-admin-audit-page-filter-mismatch".to_string(),
+                principal_id: "admin-principal".to_string(),
+                resource_id: String::new(),
+                action: "admin.tenant.create".to_string(),
+                page: Some(PageRequest {
+                    cursor: first_page_cursor.clone(),
+                    limit: 2,
+                }),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(filter_mismatch.code(), Code::InvalidArgument);
+
+    client
+        .create_tenant(with_auth(
+            tonic::Request::new(CreateTenantRequest {
+                context: Some(context("audit-cursor-stale-create-tenant", 0)),
+                name: "audit-cursor-stale-tenant".to_string(),
+                home_region: "eu-west-1".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap();
+    let stale_revision = client
+        .list_audit_events(with_auth(
+            tonic::Request::new(ListAuditEventsRequest {
+                request_id: "req-list-admin-audit-page-stale-revision".to_string(),
+                principal_id: "admin-principal".to_string(),
+                resource_id: String::new(),
+                action: String::new(),
+                page: Some(PageRequest {
+                    cursor: first_page_cursor,
+                    limit: 2,
+                }),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(stale_revision.code(), Code::InvalidArgument);
 
     let find_event = |action: &str| {
         audit

@@ -3,6 +3,9 @@ use anvil::anvil_api as api;
 use anvil::anvil_api::admin_service_client::AdminServiceClient;
 use clap::{Args, Subcommand, ValueEnum};
 use serde::Serialize;
+use serde_json::{Value, json};
+use std::future::Future;
+use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -535,13 +538,37 @@ pub struct MutationOptions {
     /// AdminRequestContext.audit_reason. Required for all mutations.
     #[clap(long)]
     audit_reason: String,
-    /// AdminRequestContext.expected_generation. Use 0 for create/register requests.
+    /// AdminRequestContext.expected_generation. Required for update/delete commands; create/register commands default to 0.
     #[clap(long)]
-    expected_generation: u64,
+    expected_generation: Option<u64>,
 }
 
 impl MutationOptions {
-    fn to_context(&self) -> api::AdminRequestContext {
+    fn to_create_context(&self) -> anyhow::Result<api::AdminRequestContext> {
+        let expected_generation = self.expected_generation.unwrap_or(0);
+        if expected_generation != 0 {
+            anyhow::bail!(
+                "create/register commands must use --expected-generation 0 when supplied"
+            );
+        }
+        Ok(self.context_with_generation(expected_generation))
+    }
+
+    fn to_update_context(&self) -> anyhow::Result<api::AdminRequestContext> {
+        let Some(expected_generation) = self.expected_generation else {
+            anyhow::bail!("--expected-generation is required for update/delete lifecycle commands");
+        };
+        if expected_generation == 0 {
+            anyhow::bail!("update/delete commands must use a non-zero --expected-generation");
+        }
+        Ok(self.context_with_generation(expected_generation))
+    }
+
+    fn to_action_context(&self) -> api::AdminRequestContext {
+        self.context_with_generation(self.expected_generation.unwrap_or(0))
+    }
+
+    fn context_with_generation(&self, expected_generation: u64) -> api::AdminRequestContext {
         api::AdminRequestContext {
             request_id: self
                 .request_id
@@ -552,7 +579,7 @@ impl MutationOptions {
                 .clone()
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             audit_reason: self.audit_reason.clone(),
-            expected_generation: self.expected_generation,
+            expected_generation,
         }
     }
 }
@@ -781,18 +808,21 @@ async fn handle_tenant_command(
             name,
             home_region,
         } => {
-            let response = client
-                .create_tenant(with_auth(
+            let admin_context = context.to_create_context()?;
+            print_rpc_response(
+                "tenant",
+                Some(&admin_context),
+                None,
+                client.create_tenant(with_auth(
                     api::CreateTenantRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         name: name.clone(),
                         home_region: home_region.clone(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
     }
     Ok(())
@@ -809,36 +839,42 @@ async fn handle_app_command(
             tenant_id,
             app_name,
         } => {
-            let response = client
-                .create_application(with_auth(
+            let admin_context = context.to_create_context()?;
+            print_rpc_response(
+                "application",
+                Some(&admin_context),
+                None,
+                client.create_application(with_auth(
                     api::CreateApplicationRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         tenant_id: tenant_id.clone(),
                         app_name: app_name.clone(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         AppCommands::RotateSecret {
             context,
             tenant_id,
             app_name,
         } => {
-            let response = client
-                .rotate_application_secret(with_auth(
+            let admin_context = context.to_update_context()?;
+            print_rpc_response(
+                "application",
+                Some(&admin_context),
+                None,
+                client.rotate_application_secret(with_auth(
                     api::RotateApplicationSecretRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         tenant_id: tenant_id.clone(),
                         app_name: app_name.clone(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
     }
     Ok(())
@@ -856,19 +892,22 @@ async fn handle_bucket_command(
             bucket_name,
             region,
         } => {
-            let response = client
-                .create_bucket_admin(with_auth(
+            let admin_context = context.to_create_context()?;
+            print_rpc_response(
+                "bucket",
+                Some(&admin_context),
+                None,
+                client.create_bucket_admin(with_auth(
                     api::CreateBucketAdminRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         tenant_id: tenant_id.clone(),
                         bucket_name: bucket_name.clone(),
                         region: region.clone(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         BucketCommands::PublicAccess {
             command:
@@ -879,19 +918,22 @@ async fn handle_bucket_command(
                     allow,
                 },
         } => {
-            let response = client
-                .set_bucket_public_access_admin(with_auth(
+            let admin_context = context.to_update_context()?;
+            print_rpc_response(
+                "bucket",
+                Some(&admin_context),
+                None,
+                client.set_bucket_public_access_admin(with_auth(
                     api::SetBucketPublicAccessAdminRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         tenant_id: tenant_id.clone(),
                         bucket_name: bucket_name.clone(),
                         allow_public_read: *allow,
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
     }
     Ok(())
@@ -911,10 +953,14 @@ async fn handle_region_command(
             placement_weight,
             default_cell,
         } => {
-            let response = client
-                .create_region(with_auth(
+            let admin_context = context.to_create_context()?;
+            print_rpc_response(
+                "region",
+                Some(&admin_context),
+                None,
+                client.create_region(with_auth(
                     api::CreateRegionRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         region: region.clone(),
                         public_base_url: public_base_url.clone(),
                         virtual_host_suffix: virtual_host_suffix.clone(),
@@ -922,10 +968,9 @@ async fn handle_region_command(
                         default_cell: default_cell.clone().unwrap_or_default(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         RegionCommands::Activate {
             context,
@@ -940,31 +985,37 @@ async fn handle_region_command(
                         activation_checkpoint.display()
                     )
                 })?;
-            let response = client
-                .activate_region(with_auth(
+            let admin_context = context.to_update_context()?;
+            print_rpc_response(
+                "region",
+                Some(&admin_context),
+                None,
+                client.activate_region(with_auth(
                     api::ActivateRegionRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         region: region.clone(),
                         activation_checkpoint_json,
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         RegionCommands::SetReadOnly { context, region } => {
-            let response = client
-                .set_region_read_only(with_auth(
+            let admin_context = context.to_update_context()?;
+            print_rpc_response(
+                "region",
+                Some(&admin_context),
+                None,
+                client.set_region_read_only(with_auth(
                     api::SetRegionReadOnlyRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         region: region.clone(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         RegionCommands::Drain {
             context,
@@ -972,10 +1023,14 @@ async fn handle_region_command(
             default_disposition,
             bucket_overrides,
         } => {
-            let response = client
-                .drain_region(with_auth(
+            let admin_context = context.to_update_context()?;
+            print_rpc_response(
+                "region",
+                Some(&admin_context),
+                None,
+                client.drain_region(with_auth(
                     api::DrainRegionRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         region: region.clone(),
                         default_disposition: default_disposition.to_proto(),
                         bucket_overrides: bucket_overrides
@@ -984,35 +1039,39 @@ async fn handle_region_command(
                             .collect(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         RegionCommands::Remove { context, region } => {
-            let response = client
-                .remove_region(with_auth(
+            let admin_context = context.to_update_context()?;
+            print_rpc_response(
+                "region",
+                Some(&admin_context),
+                None,
+                client.remove_region(with_auth(
                     api::RemoveRegionRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         region: region.clone(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         RegionCommands::List { page } => {
-            let response = client
-                .list_regions(with_auth(
+            print_rpc_response(
+                "regions",
+                None,
+                None,
+                client.list_regions(with_auth(
                     api::ListRegionsRequest {
                         page: page.to_page_request(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
     }
 
@@ -1031,86 +1090,100 @@ async fn handle_cell_command(
             cell_id,
             placement_weight,
         } => {
-            let response = client
-                .register_cell(with_auth(
+            let admin_context = context.to_create_context()?;
+            print_rpc_response(
+                "cell",
+                Some(&admin_context),
+                None,
+                client.register_cell(with_auth(
                     api::RegisterCellRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         region: region.clone(),
                         cell_id: cell_id.clone(),
                         placement_weight: *placement_weight,
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         CellCommands::Activate {
             context,
             region,
             cell_id,
         } => {
-            let response = client
-                .activate_cell(with_auth(
+            let admin_context = context.to_update_context()?;
+            print_rpc_response(
+                "cell",
+                Some(&admin_context),
+                None,
+                client.activate_cell(with_auth(
                     api::ActivateCellRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         region: region.clone(),
                         cell_id: cell_id.clone(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         CellCommands::Drain {
             context,
             region,
             cell_id,
         } => {
-            let response = client
-                .drain_cell(with_auth(
+            let admin_context = context.to_update_context()?;
+            print_rpc_response(
+                "cell",
+                Some(&admin_context),
+                None,
+                client.drain_cell(with_auth(
                     api::DrainCellRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         region: region.clone(),
                         cell_id: cell_id.clone(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         CellCommands::Remove {
             context,
             region,
             cell_id,
         } => {
-            let response = client
-                .remove_cell(with_auth(
+            let admin_context = context.to_update_context()?;
+            print_rpc_response(
+                "cell",
+                Some(&admin_context),
+                None,
+                client.remove_cell(with_auth(
                     api::RemoveCellRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         region: region.clone(),
                         cell_id: cell_id.clone(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         CellCommands::List { region, page } => {
-            let response = client
-                .list_cells(with_auth(
+            print_rpc_response(
+                "cells",
+                None,
+                None,
+                client.list_cells(with_auth(
                     api::ListCellsRequest {
                         region: region.clone().unwrap_or_default(),
                         page: page.to_page_request(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
     }
 
@@ -1133,10 +1206,14 @@ async fn handle_node_command(
             public_cluster_addrs,
             capabilities,
         } => {
-            let response = client
-                .register_node(with_auth(
+            let admin_context = context.to_create_context()?;
+            print_rpc_response(
+                "node",
+                Some(&admin_context),
+                None,
+                client.register_node(with_auth(
                     api::RegisterNodeRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         node_id: node_id.clone(),
                         region: region.clone(),
                         cell_id: cell_id.clone(),
@@ -1149,23 +1226,25 @@ async fn handle_node_command(
                             .collect(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         NodeCommands::Activate { context, node_id } => {
-            let response = client
-                .activate_node(with_auth(
+            let admin_context = context.to_update_context()?;
+            print_rpc_response(
+                "node",
+                Some(&admin_context),
+                None,
+                client.activate_node(with_auth(
                     api::ActivateNodeRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         node_id: node_id.clone(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         NodeCommands::Drain {
             context,
@@ -1173,63 +1252,74 @@ async fn handle_node_command(
             graceful_timeout_ms,
             force_after_timeout,
         } => {
-            let response = client
-                .drain_node(with_auth(
+            let admin_context = context.to_update_context()?;
+            print_rpc_response(
+                "node",
+                Some(&admin_context),
+                None,
+                client.drain_node(with_auth(
                     api::DrainNodeRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         node_id: node_id.clone(),
                         graceful_timeout_ms: *graceful_timeout_ms,
                         force_after_timeout: *force_after_timeout,
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         NodeCommands::ForceOffline { context, node_id } => {
-            let response = client
-                .force_offline_node(with_auth(
+            let admin_context = context.to_update_context()?;
+            print_rpc_response(
+                "node",
+                Some(&admin_context),
+                None,
+                client.force_offline_node(with_auth(
                     api::ForceOfflineNodeRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         node_id: node_id.clone(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         NodeCommands::Remove { context, node_id } => {
-            let response = client
-                .remove_node(with_auth(
+            let admin_context = context.to_update_context()?;
+            print_rpc_response(
+                "node",
+                Some(&admin_context),
+                None,
+                client.remove_node(with_auth(
                     api::RemoveNodeRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         node_id: node_id.clone(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         NodeCommands::List {
             region,
             cell_id,
             page,
         } => {
-            let response = client
-                .list_nodes(with_auth(
+            print_rpc_response(
+                "nodes",
+                None,
+                None,
+                client.list_nodes(with_auth(
                     api::ListNodesRequest {
                         region: region.clone().unwrap_or_default(),
                         cell_id: cell_id.clone().unwrap_or_default(),
                         page: page.to_page_request(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
     }
 
@@ -1252,10 +1342,14 @@ async fn handle_link_command(
             resolution,
             allow_dangling,
         } => {
-            let response = client
-                .create_object_link(with_auth(
+            let admin_context = context.to_create_context()?;
+            print_rpc_response(
+                "object_link",
+                Some(&admin_context),
+                None,
+                client.create_object_link(with_auth(
                     api::CreateObjectLinkRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         tenant_id: tenant_id.clone(),
                         bucket_name: bucket_name.clone(),
                         link_key: link_key.clone(),
@@ -1265,10 +1359,9 @@ async fn handle_link_command(
                         allow_dangling: *allow_dangling,
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         LinkCommands::Update {
             context,
@@ -1280,10 +1373,14 @@ async fn handle_link_command(
             resolution,
             allow_dangling,
         } => {
-            let response = client
-                .update_object_link(with_auth(
+            let admin_context = context.to_update_context()?;
+            print_rpc_response(
+                "object_link",
+                Some(&admin_context),
+                None,
+                client.update_object_link(with_auth(
                     api::UpdateObjectLinkRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         tenant_id: tenant_id.clone(),
                         bucket_name: bucket_name.clone(),
                         link_key: link_key.clone(),
@@ -1293,10 +1390,9 @@ async fn handle_link_command(
                         allow_dangling: *allow_dangling,
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         LinkCommands::Delete {
             context,
@@ -1304,19 +1400,22 @@ async fn handle_link_command(
             bucket_name,
             link_key,
         } => {
-            let response = client
-                .delete_object_link(with_auth(
+            let admin_context = context.to_update_context()?;
+            print_rpc_response(
+                "object_link",
+                Some(&admin_context),
+                None,
+                client.delete_object_link(with_auth(
                     api::DeleteObjectLinkRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         tenant_id: tenant_id.clone(),
                         bucket_name: bucket_name.clone(),
                         link_key: link_key.clone(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         LinkCommands::Read {
             request_id,
@@ -1324,21 +1423,22 @@ async fn handle_link_command(
             bucket_name,
             link_key,
         } => {
-            let response = client
-                .read_object_link(with_auth(
+            let request_id = request_id_or_cli(request_id);
+            print_rpc_response(
+                "object_link",
+                None,
+                Some(&request_id),
+                client.read_object_link(with_auth(
                     api::ReadObjectLinkRequest {
-                        request_id: request_id
-                            .clone()
-                            .unwrap_or_else(|| format!("cli-{}", uuid::Uuid::new_v4())),
+                        request_id: request_id.clone(),
                         tenant_id: tenant_id.clone(),
                         bucket_name: bucket_name.clone(),
                         link_key: link_key.clone(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         LinkCommands::List {
             tenant_id,
@@ -1346,8 +1446,11 @@ async fn handle_link_command(
             prefix,
             page,
         } => {
-            let response = client
-                .list_object_links(with_auth(
+            print_rpc_response(
+                "object_links",
+                None,
+                None,
+                client.list_object_links(with_auth(
                     api::ListObjectLinksRequest {
                         tenant_id: tenant_id.clone(),
                         bucket_name: bucket_name.clone(),
@@ -1355,10 +1458,9 @@ async fn handle_link_command(
                         page: page.to_page_request(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
     }
 
@@ -1379,10 +1481,14 @@ async fn handle_host_alias_command(
             region,
             prefix,
         } => {
-            let response = client
-                .create_host_alias(with_auth(
+            let admin_context = context.to_create_context()?;
+            print_rpc_response(
+                "host_alias",
+                Some(&admin_context),
+                None,
+                client.create_host_alias(with_auth(
                     api::CreateHostAliasRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         hostname: hostname.clone(),
                         tenant_id: tenant_id.clone(),
                         bucket_name: bucket_name.clone(),
@@ -1390,80 +1496,91 @@ async fn handle_host_alias_command(
                         prefix: prefix.clone(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         HostAliasCommands::Activate { context, hostname } => {
-            let response = client
-                .activate_host_alias(with_auth(
+            let admin_context = context.to_update_context()?;
+            print_rpc_response(
+                "host_alias",
+                Some(&admin_context),
+                None,
+                client.activate_host_alias(with_auth(
                     api::ActivateHostAliasRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         hostname: hostname.clone(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         HostAliasCommands::Suspend { context, hostname } => {
-            let response = client
-                .suspend_host_alias(with_auth(
+            let admin_context = context.to_update_context()?;
+            print_rpc_response(
+                "host_alias",
+                Some(&admin_context),
+                None,
+                client.suspend_host_alias(with_auth(
                     api::SuspendHostAliasRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         hostname: hostname.clone(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         HostAliasCommands::Delete { context, hostname } => {
-            let response = client
-                .delete_host_alias(with_auth(
+            let admin_context = context.to_update_context()?;
+            print_rpc_response(
+                "host_alias",
+                Some(&admin_context),
+                None,
+                client.delete_host_alias(with_auth(
                     api::DeleteHostAliasRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         hostname: hostname.clone(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         HostAliasCommands::Read {
             request_id,
             hostname,
         } => {
-            let response = client
-                .read_host_alias(with_auth(
+            let request_id = request_id_or_cli(request_id);
+            print_rpc_response(
+                "host_alias",
+                None,
+                Some(&request_id),
+                client.read_host_alias(with_auth(
                     api::ReadHostAliasRequest {
-                        request_id: request_id
-                            .clone()
-                            .unwrap_or_else(|| format!("cli-{}", uuid::Uuid::new_v4())),
+                        request_id: request_id.clone(),
                         hostname: hostname.clone(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         HostAliasCommands::List { region, page } => {
-            let response = client
-                .list_host_aliases(with_auth(
+            print_rpc_response(
+                "host_aliases",
+                None,
+                None,
+                client.list_host_aliases(with_auth(
                     api::ListHostAliasesRequest {
                         region: region.clone().unwrap_or_default(),
                         page: page.to_page_request(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
     }
 
@@ -1477,35 +1594,40 @@ async fn handle_routing_command(
 ) -> anyhow::Result<()> {
     match command {
         RoutingCommands::List { family, page } => {
-            let response = client
-                .list_routing_records(with_auth(
+            print_rpc_response(
+                "routing_records",
+                None,
+                None,
+                client.list_routing_records(with_auth(
                     api::ListRoutingRecordsRequest {
                         family: family.map(RoutingRecordFamilyArg::to_proto).unwrap_or(0),
                         page: page.to_page_request(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
         RoutingCommands::Repair {
             context,
             family,
             record_key,
         } => {
-            let response = client
-                .repair_routing_record(with_auth(
+            let admin_context = context.to_update_context()?;
+            print_rpc_response(
+                "routing_record",
+                Some(&admin_context),
+                None,
+                client.repair_routing_record(with_auth(
                     api::RepairRoutingRecordRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         family: family.to_proto(),
                         record_key: record_key.clone(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
     }
 
@@ -1528,10 +1650,14 @@ async fn handle_repair_command(
             database_id,
             rebuild,
         } => {
-            let response = client
-                .run_repair(with_auth(
+            let admin_context = context.to_action_context();
+            print_rpc_response(
+                "repair_task",
+                Some(&admin_context),
+                None,
+                client.run_repair(with_auth(
                     api::RunRepairRequest {
-                        context: Some(context.to_context()),
+                        context: Some(admin_context.clone()),
                         repair_kind: repair_kind.to_proto(),
                         tenant_id: tenant_id.clone(),
                         bucket_name: bucket_name.clone().unwrap_or_default(),
@@ -1541,10 +1667,9 @@ async fn handle_repair_command(
                         rebuild: *rebuild,
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
     }
 
@@ -1566,10 +1691,14 @@ async fn handle_diagnostics_command(
             severity,
             page,
         } => {
-            let response = client
-                .list_diagnostics(with_auth(
+            let request_id = request_id_or_cli(request_id);
+            print_rpc_response(
+                "diagnostics",
+                None,
+                Some(&request_id),
+                client.list_diagnostics(with_auth(
                     api::ListDiagnosticsRequest {
-                        request_id: request_id_or_cli(request_id),
+                        request_id: request_id.clone(),
                         source: source.clone().unwrap_or_default(),
                         tenant_id: tenant_id.clone().unwrap_or_default(),
                         bucket_name: bucket_name.clone().unwrap_or_default(),
@@ -1578,10 +1707,9 @@ async fn handle_diagnostics_command(
                         page: page.to_page_request(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
     }
 
@@ -1601,20 +1729,23 @@ async fn handle_audit_command(
             action,
             page,
         } => {
-            let response = client
-                .list_audit_events(with_auth(
+            let request_id = request_id_or_cli(request_id);
+            print_rpc_response(
+                "audit_events",
+                None,
+                Some(&request_id),
+                client.list_audit_events(with_auth(
                     api::ListAuditEventsRequest {
-                        request_id: request_id_or_cli(request_id),
+                        request_id: request_id.clone(),
                         principal_id: principal_id.clone().unwrap_or_default(),
                         resource_id: resource_id.clone().unwrap_or_default(),
                         action: action.clone().unwrap_or_default(),
                         page: page.to_page_request(),
                     },
                     token,
-                )?)
-                .await?
-                .into_inner();
-            print_json(&response)?;
+                )?),
+            )
+            .await?;
         }
     }
 
@@ -1638,9 +1769,148 @@ fn request_id_or_cli(request_id: &Option<String>) -> String {
         .unwrap_or_else(|| format!("cli-{}", uuid::Uuid::new_v4()))
 }
 
+async fn print_rpc_response<T, F>(
+    resource_type: &'static str,
+    context: Option<&api::AdminRequestContext>,
+    request_id: Option<&str>,
+    rpc: F,
+) -> anyhow::Result<()>
+where
+    T: Serialize,
+    F: Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+{
+    match rpc.await {
+        Ok(response) => print_admin_success(resource_type, &response.into_inner(), context),
+        Err(status) => {
+            print_admin_error(resource_type, context, request_id, &status)?;
+            Err(status.into())
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct AdminCliJsonOutput {
+    schema: &'static str,
+    request_id: String,
+    ok: bool,
+    resource_type: String,
+    resource: Option<Value>,
+    generation: Option<u64>,
+    audit_event_id: String,
+    idempotency_key: Option<String>,
+    error: Option<AdminCliJsonError>,
+}
+
+#[derive(Serialize)]
+struct AdminCliJsonError {
+    request_id: String,
+    code: String,
+    message: String,
+    resource_id: String,
+    current_generation: u64,
+}
+
+fn print_admin_success<T: Serialize>(
+    resource_type: &'static str,
+    value: &T,
+    context: Option<&api::AdminRequestContext>,
+) -> anyhow::Result<()> {
+    let value = serde_json::to_value(value)?;
+    let resource = admin_cli_resource(&value);
+    let request_id = value
+        .get("request_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .or_else(|| context.map(|context| context.request_id.as_str()))
+        .unwrap_or_default()
+        .to_string();
+    let audit_event_id = value
+        .get("audit_event_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let generation = value.get("generation").and_then(Value::as_u64).or_else(|| {
+        resource
+            .as_ref()
+            .and_then(|resource| resource.get("generation"))
+            .and_then(Value::as_u64)
+    });
+    let output = AdminCliJsonOutput {
+        schema: "anvil.admin_cli.output.v1",
+        request_id,
+        ok: true,
+        resource_type: resource_type.to_string(),
+        resource,
+        generation,
+        audit_event_id,
+        idempotency_key: context.map(|context| context.idempotency_key.clone()),
+        error: None,
+    };
+    print_json(&output)
+}
+
+fn print_admin_error(
+    resource_type: &'static str,
+    context: Option<&api::AdminRequestContext>,
+    request_id: Option<&str>,
+    status: &tonic::Status,
+) -> anyhow::Result<()> {
+    let request_id = request_id
+        .filter(|value| !value.is_empty())
+        .or_else(|| context.map(|context| context.request_id.as_str()))
+        .unwrap_or_default()
+        .to_string();
+    let output = AdminCliJsonOutput {
+        schema: "anvil.admin_cli.output.v1",
+        request_id: request_id.clone(),
+        ok: false,
+        resource_type: resource_type.to_string(),
+        resource: None,
+        generation: None,
+        audit_event_id: String::new(),
+        idempotency_key: context.map(|context| context.idempotency_key.clone()),
+        error: Some(AdminCliJsonError {
+            request_id,
+            code: format!("{:?}", status.code()),
+            message: status.message().to_string(),
+            resource_id: String::new(),
+            current_generation: 0,
+        }),
+    };
+    print_json(&output)
+}
+
+fn admin_cli_resource(value: &Value) -> Option<Value> {
+    for field in [
+        "tenant",
+        "bucket",
+        "link",
+        "host_alias",
+        "region",
+        "cell",
+        "node",
+    ] {
+        if let Some(resource) = value.get(field) {
+            return Some(resource.clone());
+        }
+    }
+    if let Some(resource_id) = value.get("resource_id") {
+        return Some(json!({
+            "resource_id": resource_id,
+            "generation": value.get("generation").cloned().unwrap_or(Value::Null),
+            "idempotent_replay": value
+                .get("idempotent_replay")
+                .cloned()
+                .unwrap_or(Value::Bool(false)),
+        }));
+    }
+    Some(value.clone())
+}
+
 fn print_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
-    serde_json::to_writer_pretty(std::io::stdout().lock(), value)?;
-    println!();
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer_pretty(&mut stdout, value)?;
+    writeln!(stdout)?;
     Ok(())
 }
 
@@ -1770,7 +2040,7 @@ mod tests {
             request_id: Some(format!("req-{label}")),
             idempotency_key: Some(format!("idem-{label}")),
             audit_reason: format!("test {label}"),
-            expected_generation,
+            expected_generation: Some(expected_generation),
         }
     }
 
@@ -1867,14 +2137,35 @@ mod tests {
             request_id: None,
             idempotency_key: None,
             audit_reason: "planned maintenance".to_string(),
-            expected_generation: 42,
+            expected_generation: Some(42),
         }
-        .to_context();
+        .to_action_context();
 
         assert!(context.request_id.starts_with("cli-"));
         assert!(!context.idempotency_key.is_empty());
         assert_eq!(context.audit_reason, "planned maintenance");
         assert_eq!(context.expected_generation, 42);
+    }
+
+    #[test]
+    fn mutation_context_helpers_enforce_generation_contract() {
+        let create = MutationOptions {
+            request_id: Some("req-create".to_string()),
+            idempotency_key: Some("idem-create".to_string()),
+            audit_reason: "create resource".to_string(),
+            expected_generation: None,
+        };
+        assert_eq!(create.to_create_context().unwrap().expected_generation, 0);
+        assert!(create.to_update_context().is_err());
+
+        let update = MutationOptions {
+            request_id: Some("req-update".to_string()),
+            idempotency_key: Some("idem-update".to_string()),
+            audit_reason: "update resource".to_string(),
+            expected_generation: Some(7),
+        };
+        assert_eq!(update.to_update_context().unwrap().expected_generation, 7);
+        assert!(update.to_create_context().is_err());
     }
 
     #[test]
@@ -1933,7 +2224,7 @@ mod tests {
         assert!(context.request_id.is_none());
         assert!(context.idempotency_key.is_none());
         assert_eq!(context.audit_reason, "bootstrap region");
-        assert_eq!(context.expected_generation, 0);
+        assert_eq!(context.expected_generation, Some(0));
         assert_eq!(region, "eu-west-1");
     }
 
@@ -2006,7 +2297,7 @@ mod tests {
         };
 
         assert_eq!(context.audit_reason, "publish latest");
-        assert_eq!(context.expected_generation, 0);
+        assert_eq!(context.expected_generation, Some(0));
         assert_eq!(tenant_id, "tenant-a");
         assert_eq!(bucket_name, "releases");
         assert_eq!(link_key, "latest.exe");
@@ -2037,7 +2328,7 @@ mod tests {
         };
 
         assert_eq!(context.audit_reason, "dns verified");
-        assert_eq!(context.expected_generation, 7);
+        assert_eq!(context.expected_generation, Some(7));
         assert_eq!(hostname, "cdn.example.com");
     }
 
@@ -2062,7 +2353,7 @@ mod tests {
             panic!("expected region set-read-only command");
         };
         assert_eq!(context.audit_reason, "maintenance window");
-        assert_eq!(context.expected_generation, 11);
+        assert_eq!(context.expected_generation, Some(11));
         assert_eq!(region, "eu-west-1");
 
         let node_cli = TestAdminCli::try_parse_from([
@@ -2084,7 +2375,7 @@ mod tests {
             panic!("expected node force-offline command");
         };
         assert_eq!(context.audit_reason, "lost heartbeat");
-        assert_eq!(context.expected_generation, 12);
+        assert_eq!(context.expected_generation, Some(12));
         assert_eq!(node_id, "node-a");
     }
 
@@ -2135,7 +2426,7 @@ mod tests {
             panic!("expected routing repair command");
         };
         assert_eq!(context.audit_reason, "rebuild missing locator");
-        assert_eq!(context.expected_generation, 1);
+        assert_eq!(context.expected_generation, Some(1));
         assert_eq!(family.to_proto(), 1);
         assert_eq!(record_key, "acme");
     }
@@ -2174,7 +2465,7 @@ mod tests {
             panic!("expected repair run command");
         };
         assert_eq!(context.audit_reason, "verify directory");
-        assert_eq!(context.expected_generation, 0);
+        assert_eq!(context.expected_generation, Some(0));
         assert_eq!(repair_kind.to_proto(), 2);
         assert_eq!(tenant_id, "acme");
         assert_eq!(bucket_name.as_deref(), Some("releases"));
@@ -2309,7 +2600,7 @@ mod tests {
         else {
             panic!("expected app rotate-secret command");
         };
-        assert_eq!(context.expected_generation, 1);
+        assert_eq!(context.expected_generation, Some(1));
         assert_eq!(tenant_id, "acme");
         assert_eq!(app_name, "publisher");
 
@@ -2363,7 +2654,11 @@ mod tests {
             .create_tenant(
                 with_auth(
                     api::CreateTenantRequest {
-                        context: Some(mutation_options("admin-diag-tenant", 0).to_context()),
+                        context: Some(
+                            mutation_options("admin-diag-tenant", 0)
+                                .to_create_context()
+                                .unwrap(),
+                        ),
                         name: "acme".to_string(),
                         home_region: "eu-west-1".to_string(),
                     },
@@ -2377,7 +2672,11 @@ mod tests {
             .create_bucket_admin(
                 with_auth(
                     api::CreateBucketAdminRequest {
-                        context: Some(mutation_options("admin-diag-bucket", 0).to_context()),
+                        context: Some(
+                            mutation_options("admin-diag-bucket", 0)
+                                .to_create_context()
+                                .unwrap(),
+                        ),
                         tenant_id: "acme".to_string(),
                         bucket_name: "releases".to_string(),
                         region: "eu-west-1".to_string(),
@@ -2393,7 +2692,9 @@ mod tests {
             .run_repair(
                 with_auth(
                     api::RunRepairRequest {
-                        context: Some(mutation_options("admin-directory-repair", 0).to_context()),
+                        context: Some(
+                            mutation_options("admin-directory-repair", 0).to_action_context(),
+                        ),
                         repair_kind: RepairKindArg::DirectoryIndex.to_proto(),
                         tenant_id: "acme".to_string(),
                         bucket_name: "releases".to_string(),

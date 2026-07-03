@@ -669,11 +669,12 @@ impl AdminService for AppState {
         let req = request.into_inner();
         let page = req.page.as_ref();
         let limit = page_limit(page);
-        let host_aliases = self
+        let mut host_aliases = self
             .persistence
             .list_host_alias_descriptors(none_if_empty(&req.region))
             .await
             .map_err(lifecycle_status)?;
+        host_aliases.sort_by(|left, right| left.hostname.cmp(&right.hostname));
         let revision = admin_cursor::collection_revision(
             host_aliases
                 .iter()
@@ -1787,7 +1788,15 @@ impl AdminService for AppState {
         let revision = admin_cursor::collection_revision(
             events
                 .iter()
-                .map(|event| (event.audit_event_id.as_str(), 1_u64)),
+                .map(|event| {
+                    (
+                        audit_cursor_position(event),
+                        admin_audit::audit_event_revision_generation(event),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|(position, generation)| (position.as_str(), *generation)),
         );
         let filters = [
             ("principal_id", req.principal_id.as_str()),
@@ -2131,31 +2140,49 @@ async fn run_mesh_routing_projection_repair(
         .map_err(|err| Status::internal(err.to_string()))?;
     let mut repaired_records = Vec::new();
     let mut skipped_records = Vec::new();
+    let mut findings = Vec::new();
+    let repair_task_id = format!("mesh-routing-projection-repair-{audit_event_id}");
 
-    for diagnostic in diagnostics {
+    for (index, diagnostic) in diagnostics.into_iter().enumerate() {
         if !diagnostic.repair_safe
             || diagnostic.proposed_action != "repair_routing_record_from_control_stream"
             || diagnostic.record_key.trim().is_empty()
         {
-            skipped_records.push(json!({
-                "stream_family": diagnostic.stream_family,
-                "partition": diagnostic.partition,
-                "record_key": diagnostic.record_key,
+            let repair_result = json!({
+                "applied_action": "skipped",
                 "code": diagnostic.code,
                 "reason": "diagnostic is not safe for automatic routing projection repair",
-            }));
+            });
+            let evidence = mesh_routing_projection_evidence(&diagnostic, Some(repair_result));
+            skipped_records.push(evidence.clone());
+            findings.push(mesh_routing_projection_repair_finding_record(
+                &repair_task_id,
+                index,
+                &diagnostic,
+                "RequiresOperatorReview",
+                "ManualReview",
+                &evidence,
+            ));
             continue;
         }
         let Some(family) =
             mesh_directory::RoutingRecordFamily::from_stream_family(&diagnostic.stream_family)
         else {
-            skipped_records.push(json!({
-                "stream_family": diagnostic.stream_family,
-                "partition": diagnostic.partition,
-                "record_key": diagnostic.record_key,
+            let repair_result = json!({
+                "applied_action": "skipped",
                 "code": diagnostic.code,
                 "reason": "unknown routing record stream family",
-            }));
+            });
+            let evidence = mesh_routing_projection_evidence(&diagnostic, Some(repair_result));
+            skipped_records.push(evidence.clone());
+            findings.push(mesh_routing_projection_repair_finding_record(
+                &repair_task_id,
+                index,
+                &diagnostic,
+                "RequiresOperatorReview",
+                "ManualReview",
+                &evidence,
+            ));
             continue;
         };
         match state
@@ -2163,20 +2190,40 @@ async fn run_mesh_routing_projection_repair(
             .repair_mesh_routing_record(family, &diagnostic.record_key)
             .await
         {
-            Ok(record) => repaired_records.push(json!({
-                "stream_family": diagnostic.stream_family,
-                "partition": diagnostic.partition,
-                "record_key": diagnostic.record_key,
-                "descriptor_key": record.descriptor_key,
-                "generation": record.generation,
-            })),
-            Err(err) => skipped_records.push(json!({
-                "stream_family": diagnostic.stream_family,
-                "partition": diagnostic.partition,
-                "record_key": diagnostic.record_key,
-                "code": diagnostic.code,
-                "reason": err.to_string(),
-            })),
+            Ok(record) => {
+                let repair_result = json!({
+                    "applied_action": "repair_routing_record_from_control_stream",
+                    "descriptor_key": record.descriptor_key,
+                    "generation": record.generation,
+                });
+                let evidence = mesh_routing_projection_evidence(&diagnostic, Some(repair_result));
+                repaired_records.push(evidence.clone());
+                findings.push(mesh_routing_projection_repair_finding_record(
+                    &repair_task_id,
+                    index,
+                    &diagnostic,
+                    "RebuiltDerivedIndex",
+                    "RebuildDerivedIndex",
+                    &evidence,
+                ));
+            }
+            Err(err) => {
+                let repair_result = json!({
+                    "applied_action": "skipped",
+                    "code": diagnostic.code,
+                    "reason": err.to_string(),
+                });
+                let evidence = mesh_routing_projection_evidence(&diagnostic, Some(repair_result));
+                skipped_records.push(evidence.clone());
+                findings.push(mesh_routing_projection_repair_finding_record(
+                    &repair_task_id,
+                    index,
+                    &diagnostic,
+                    "RequiresOperatorReview",
+                    "ManualReview",
+                    &evidence,
+                ));
+            }
         }
     }
 
@@ -2190,11 +2237,11 @@ async fn run_mesh_routing_projection_repair(
 
     Ok(RepairTaskResponse {
         request_id: request_id.to_string(),
-        repair_task_id: format!("mesh-routing-projection-repair-{audit_event_id}"),
+        repair_task_id,
         status: status.to_string(),
         scope_kind: "mesh_routing_projection".to_string(),
         scope_id: state.config.mesh_id.clone(),
-        findings: Vec::new(),
+        findings,
         audit_event_id: audit_event_id.to_string(),
         details_json: json!({
             "repair_kind": "mesh_routing_projection",
@@ -2285,6 +2332,7 @@ fn mesh_routing_projection_diagnostic_to_admin_record(
     cursor: u64,
     diagnostic: mesh_control_stream::ControlProjectionDiagnostic,
 ) -> Result<DiagnosticRecord, Status> {
+    let details = mesh_routing_projection_evidence(&diagnostic, None);
     let scope_id = format!(
         "{}/{}/{}",
         diagnostic.stream_family, diagnostic.partition, diagnostic.record_key
@@ -2299,22 +2347,85 @@ fn mesh_routing_projection_diagnostic_to_admin_record(
         message: diagnostic.message,
         object_key: String::new(),
         version_id: String::new(),
-        details_json: json!({
-            "stream_family": diagnostic.stream_family,
-            "partition": diagnostic.partition,
-            "record_key": diagnostic.record_key,
-            "stream_sequence": diagnostic.stream_sequence,
-            "stream_generation": diagnostic.stream_generation,
-            "stream_digest": diagnostic.stream_digest,
-            "projection_generation": diagnostic.projection_generation,
-            "projection_digest": diagnostic.projection_digest,
-            "repair_safe": diagnostic.repair_safe,
-            "proposed_action": diagnostic.proposed_action,
-        })
-        .to_string(),
+        details_json: details.to_string(),
         created_at_nanos: Utc::now().timestamp_nanos_opt().unwrap_or_default(),
         cursor,
     })
+}
+
+fn mesh_routing_projection_evidence(
+    diagnostic: &mesh_control_stream::ControlProjectionDiagnostic,
+    repair_result: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let family = mesh_directory::RoutingRecordFamily::from_stream_family(&diagnostic.stream_family);
+    let descriptor_key = family
+        .filter(|_| !diagnostic.record_key.trim().is_empty())
+        .and_then(|family| {
+            mesh_directory::routing_record_descriptor_key_for_key(family, &diagnostic.record_key)
+                .ok()
+        });
+    let expected_partition = family
+        .filter(|_| !diagnostic.record_key.trim().is_empty())
+        .and_then(|family| {
+            mesh_directory::routing_record_partition_for_key(family, &diagnostic.record_key).ok()
+        });
+
+    json!({
+        "stream_family": &diagnostic.stream_family,
+        "partition": &diagnostic.partition,
+        "expected_partition": expected_partition,
+        "record_key": &diagnostic.record_key,
+        "descriptor_key": descriptor_key,
+        "stream_sequence": diagnostic.stream_sequence,
+        "stream_generation": diagnostic.stream_generation,
+        "stream_digest": diagnostic.stream_digest.as_deref(),
+        "projection_generation": diagnostic.projection_generation,
+        "projection_digest": diagnostic.projection_digest.as_deref(),
+        "repair_safe": diagnostic.repair_safe,
+        "proposed_action": diagnostic.proposed_action,
+        "repair_result": repair_result,
+    })
+}
+
+fn mesh_routing_projection_repair_finding_record(
+    repair_task_id: &str,
+    index: usize,
+    diagnostic: &mesh_control_stream::ControlProjectionDiagnostic,
+    status: &str,
+    proposed_action: &str,
+    evidence: &serde_json::Value,
+) -> RepairFindingRecord {
+    let subject_id = format!(
+        "{}/{}/{}",
+        diagnostic.stream_family, diagnostic.partition, diagnostic.record_key
+    );
+    let evidence_json = evidence.to_string();
+    RepairFindingRecord {
+        finding_id: format!("{repair_task_id}-finding-{:04}", index + 1),
+        scope_kind: "mesh_routing_projection".to_string(),
+        scope_id: subject_id.clone(),
+        repair_task_id: repair_task_id.to_string(),
+        lease_fence_token: 0,
+        severity: diagnostic.severity.to_string(),
+        status: status.to_string(),
+        code: diagnostic.code.to_string(),
+        message: diagnostic.message.clone(),
+        subjects: vec![RepairSubjectRecord {
+            subject_kind: "mesh_control_stream_record".to_string(),
+            subject_id,
+            generation: diagnostic.stream_generation.unwrap_or_default(),
+            has_generation: diagnostic.stream_generation.is_some(),
+            cursor_low: diagnostic.stream_sequence.unwrap_or_default(),
+            cursor_high: 0,
+            has_cursor: diagnostic.stream_sequence.is_some(),
+            expected_hash: diagnostic.stream_digest.clone().unwrap_or_default(),
+            actual_hash: diagnostic.projection_digest.clone().unwrap_or_default(),
+        }],
+        proposed_action: proposed_action.to_string(),
+        evidence_json,
+        created_at_nanos: Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        finding_hash: hex::encode(blake3::hash(evidence.to_string().as_bytes()).as_bytes()),
+    }
 }
 
 fn diagnostic_position(diagnostic: &DiagnosticRecord) -> String {
@@ -2414,6 +2525,22 @@ async fn mesh_lifecycle_diagnostics(state: &AppState) -> Result<Vec<DiagnosticRe
         .map_err(lifecycle_status)?
     {
         if node.state != CoreLifecycleState::Active {
+            let runtime_ownership_blockers = match node.state {
+                CoreLifecycleState::Draining
+                | CoreLifecycleState::Drained
+                | CoreLifecycleState::Offline
+                | CoreLifecycleState::Removed => state
+                    .persistence
+                    .node_runtime_ownership_blockers(&node.node_id)
+                    .await
+                    .map_err(|err| Status::internal(err.to_string()))?,
+                _ => Vec::new(),
+            };
+            let proposed_action = if runtime_ownership_blockers.is_empty() {
+                "no_runtime_ownership_repair_needed"
+            } else {
+                "force_offline_node_to_expire_runtime_ownership"
+            };
             push(
                 "node",
                 node.node_id.clone(),
@@ -2435,6 +2562,14 @@ async fn mesh_lifecycle_diagnostics(state: &AppState) -> Result<Vec<DiagnosticRe
                     "region": node.region,
                     "cell_id": node.cell_id,
                     "drain": node.drain,
+                    "runtime_ownership_blocker_count": runtime_ownership_blockers.len(),
+                    "runtime_ownership_blockers": runtime_ownership_blockers,
+                    "ownership_repair": {
+                        "node_id": node.node_id,
+                        "owner_region": node.region,
+                        "owner_cell": node.cell_id,
+                        "proposed_action": proposed_action,
+                    },
                 }),
             );
         }
@@ -2778,7 +2913,7 @@ fn region_drain_disposition_name(value: i32) -> &'static str {
 }
 
 fn audit_cursor_position(event: &AdminAuditEvent) -> String {
-    format!("{}:{}", event.created_at, event.audit_event_id)
+    admin_audit::audit_event_position(event)
 }
 
 fn audit_event_to_proto(event: AdminAuditEvent) -> AuditEventRecord {

@@ -2155,6 +2155,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn region_activation_requires_active_cell_and_node() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let region = create_test_region(&storage).await;
+        let checkpoint = ActivationCheckpoint {
+            schema: ACTIVATION_CHECKPOINT_SCHEMA.to_string(),
+            mesh_id: "mesh-a".to_string(),
+            region: "eu-west-1".to_string(),
+            created_at: "2026-07-02T00:00:00Z".to_string(),
+            required_streams: vec![],
+        };
+
+        let missing_cell = activate_region(&storage, "eu-west-1", region.generation, &checkpoint)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(missing_cell, LifecycleError::InvalidArgument(message) if message.contains("active cell"))
+        );
+
+        let cell = register_test_cell(&storage).await;
+        transition_cell(
+            &storage,
+            "eu-west-1",
+            "cell-a",
+            cell.generation,
+            LifecycleState::Active,
+        )
+        .await
+        .unwrap();
+        let missing_node = activate_region(&storage, "eu-west-1", region.generation, &checkpoint)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(missing_node, LifecycleError::InvalidArgument(message) if message.contains("active node"))
+        );
+
+        let node = register_test_node(&storage).await;
+        transition_node(
+            &storage,
+            "node-a",
+            node.generation,
+            LifecycleState::Active,
+            None,
+        )
+        .await
+        .unwrap();
+        let active = activate_region(&storage, "eu-west-1", region.generation, &checkpoint)
+            .await
+            .unwrap();
+        assert_eq!(active.state, LifecycleState::Active);
+    }
+
+    #[tokio::test]
     async fn writable_placement_rejects_non_active_region() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
