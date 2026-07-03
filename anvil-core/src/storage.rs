@@ -1131,6 +1131,7 @@ impl Storage {
             overall_hasher.update(&chunk);
             total_bytes += chunk.len() as i64;
         }
+        file.flush().await?;
 
         let content_hash = overall_hasher.finalize().to_hex().to_string();
         info!(
