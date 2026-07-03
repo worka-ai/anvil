@@ -325,6 +325,10 @@ pub struct AppendStreamRecord {
     pub record_sequence: i64,
     pub payload_hash: String,
     pub payload_size: i64,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub user_meta: Option<JsonValue>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -3546,6 +3550,8 @@ impl Persistence {
         stream_row_id: i64,
         payload_hash: &str,
         payload_size: i64,
+        content_type: Option<String>,
+        user_meta: Option<JsonValue>,
     ) -> Result<AppendStreamRecordMutation> {
         let (tenant_id, bucket_id) =
             append_journal::find_append_stream_partition(&self.storage, stream_row_id)
@@ -3559,6 +3565,8 @@ impl Persistence {
             stream_row_id,
             payload_hash,
             payload_size,
+            content_type,
+            user_meta,
             &permit,
             &self.partition_owner_signing_key,
         )
@@ -3570,6 +3578,15 @@ impl Persistence {
         stream_row_id: i64,
     ) -> Result<Vec<AppendStreamRecord>> {
         append_journal::list_append_stream_records(&self.storage, stream_row_id).await
+    }
+
+    pub async fn list_append_stream_records_for_bucket(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+    ) -> Result<Vec<(AppendStream, AppendStreamRecord)>> {
+        append_journal::list_append_stream_records_for_bucket(&self.storage, tenant_id, bucket_id)
+            .await
     }
 
     pub async fn seal_append_stream(
@@ -5801,7 +5818,7 @@ mod tests {
             .unwrap()
             .stream;
         persistence
-            .append_stream_record(append_stream.id, "event-payload-hash", 42)
+            .append_stream_record(append_stream.id, "event-payload-hash", 42, None, None)
             .await
             .unwrap();
 
@@ -6467,7 +6484,7 @@ mod tests {
             .unwrap()
             .stream;
         persistence
-            .append_stream_record(stream.id, "payload-hash", 13)
+            .append_stream_record(stream.id, "payload-hash", 13, None, None)
             .await
             .unwrap();
         persistence

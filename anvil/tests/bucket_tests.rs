@@ -227,6 +227,8 @@ async fn test_delete_bucket_rejects_retained_objects() {
                     bucket_name: bucket_name.clone(),
                     object_key,
                     mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    content_type: None,
+                    user_metadata_json: String::new(),
                 },
             )),
         },

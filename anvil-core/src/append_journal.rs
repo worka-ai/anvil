@@ -135,11 +135,7 @@ pub async fn get_active_append_stream(
         .await?
         .streams
         .into_values()
-        .find(|stream| {
-            stream.stream_key == stream_key
-                && stream.stream_id == stream_id
-                && stream.sealed_at.is_none()
-        }))
+        .find(|stream| stream.stream_key == stream_key && stream.stream_id == stream_id))
 }
 
 #[cfg(test)]
@@ -149,7 +145,16 @@ async fn append_stream_record(
     payload_hash: &str,
     payload_size: i64,
 ) -> Result<AppendStreamRecordMutation> {
-    append_stream_record_inner(storage, stream_row_id, payload_hash, payload_size, None).await
+    append_stream_record_inner(
+        storage,
+        stream_row_id,
+        payload_hash,
+        payload_size,
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn append_stream_record_with_permit(
@@ -157,6 +162,8 @@ pub(crate) async fn append_stream_record_with_permit(
     stream_row_id: i64,
     payload_hash: &str,
     payload_size: i64,
+    content_type: Option<String>,
+    user_meta: Option<serde_json::Value>,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<AppendStreamRecordMutation> {
@@ -166,6 +173,8 @@ pub(crate) async fn append_stream_record_with_permit(
         stream_row_id,
         payload_hash,
         payload_size,
+        content_type,
+        user_meta,
         Some(permit),
     )
     .await
@@ -176,6 +185,8 @@ async fn append_stream_record_inner(
     stream_row_id: i64,
     payload_hash: &str,
     payload_size: i64,
+    content_type: Option<String>,
+    user_meta: Option<serde_json::Value>,
     permit: Option<&PartitionWritePermit>,
 ) -> Result<AppendStreamRecordMutation> {
     let (tenant_id, bucket_id, _) = find_stream(storage, stream_row_id)
@@ -200,6 +211,8 @@ async fn append_stream_record_inner(
         record_sequence: next_seq,
         payload_hash: payload_hash.to_string(),
         payload_size,
+        content_type,
+        user_meta,
         created_at: Utc::now(),
     };
     let receipt = append_body(
@@ -229,6 +242,27 @@ pub async fn list_append_stream_records(
         .filter(|record| record.stream_id == stream_row_id)
         .collect::<Vec<_>>();
     records.sort_by_key(|record| record.record_sequence);
+    Ok(records)
+}
+
+pub async fn list_append_stream_records_for_bucket(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+) -> Result<Vec<(AppendStream, AppendStreamRecord)>> {
+    let state = read_state(storage, tenant_id, bucket_id).await?;
+    let mut records = Vec::new();
+    for record in state.records.into_values() {
+        if let Some(stream) = state.streams.get(&record.stream_id) {
+            records.push((stream.clone(), record));
+        }
+    }
+    records.sort_by(|left, right| {
+        left.0
+            .stream_key
+            .cmp(&right.0.stream_key)
+            .then(left.1.record_sequence.cmp(&right.1.record_sequence))
+    });
     Ok(records)
 }
 
@@ -269,12 +303,6 @@ async fn seal_append_stream_inner(
         require_append_metadata_permit(tenant_id, bucket_id, permit)?;
     }
     let fence_token = permit.map(|permit| permit.fence_token).unwrap_or(0);
-    if stream.sealed_at.is_some() {
-        return Ok(SealAppendStreamMutation {
-            sealed: false,
-            receipt: None,
-        });
-    }
     stream.sealed_at = Some(Utc::now());
     stream.segment_hash = Some(segment_hash.to_string());
     let receipt = append_body(
@@ -563,7 +591,17 @@ mod tests {
             get_active_append_stream(&storage, 1, 2, "stream", stream.stream_id)
                 .await
                 .unwrap()
-                .is_none()
+                .is_some()
+        );
+        append_stream_record(&storage, stream.id, "hash-c", 30)
+            .await
+            .unwrap();
+        assert_eq!(
+            list_append_stream_records(&storage, stream.id)
+                .await
+                .unwrap()
+                .len(),
+            3
         );
     }
 
@@ -578,9 +616,18 @@ mod tests {
             create_append_stream_with_permit(&storage, 1, 2, "bucket", "stream", &permit, KEY)
                 .await
                 .unwrap();
-        append_stream_record_with_permit(&storage, stream.stream.id, "hash-a", 10, &permit, KEY)
-            .await
-            .unwrap();
+        append_stream_record_with_permit(
+            &storage,
+            stream.stream.id,
+            "hash-a",
+            10,
+            None,
+            None,
+            &permit,
+            KEY,
+        )
+        .await
+        .unwrap();
         seal_append_stream_with_permit(&storage, stream.stream.id, "segment-a", &permit, KEY)
             .await
             .unwrap();
@@ -628,6 +675,8 @@ mod tests {
             stream.stream.id,
             "hash-a",
             10,
+            None,
+            None,
             &stale_permit,
             KEY,
         )

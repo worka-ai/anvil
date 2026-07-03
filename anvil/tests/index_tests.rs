@@ -4,7 +4,8 @@ use anvil::anvil_api::index_service_client::IndexServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::repair_service_client::RepairServiceClient;
 use anvil::anvil_api::{
-    CreateBucketRequest, CreateIndexRequest, DisableIndexRequest, DropIndexRequest, IndexKind,
+    self, AppendStreamRecordRequest, CreateAppendStreamRequest, CreateBucketRequest,
+    CreateIndexRequest, DisableIndexRequest, DropIndexRequest, IndexKind,
     ListIndexDiagnosticsRequest, ListIndexesRequest, ListRepairFindingsRequest,
     NativeMutationContext, ObjectMetadata, PutObjectRequest, QueryIndexRequest, RepairIndexRequest,
     UpdateIndexRequest, WatchIndexDefinitionRequest, WatchIndexPartitionRequest,
@@ -46,6 +47,32 @@ fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
     }
 }
 
+async fn wait_for_index_build_task(
+    cluster: &TestCluster,
+    timeout: Duration,
+) -> Vec<anvil::persistence::TaskRecord> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut tasks = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
+        if tasks.iter().any(|task| {
+            task.task_type == anvil::tasks::TaskType::IndexBuild
+                && task.status == anvil::tasks::TaskStatus::Completed
+        }) {
+            return tasks;
+        }
+        assert!(
+            !tasks.iter().any(|task| {
+                task.task_type == anvil::tasks::TaskType::IndexBuild
+                    && task.status == anvil::tasks::TaskStatus::Failed
+            }),
+            "index build task failed; tasks={tasks:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tasks
+}
+
 async fn persist_index_object(
     cluster: &TestCluster,
     bucket_id: i64,
@@ -71,6 +98,349 @@ async fn persist_index_object(
         )
         .await
         .expect("persist index test object");
+}
+
+async fn put_json_object(
+    object_client: &mut ObjectServiceClient<tonic::transport::Channel>,
+    token: &str,
+    bucket_id: i64,
+    bucket_name: &str,
+    key: &str,
+    value: serde_json::Value,
+    tag: &str,
+) {
+    let metadata = PutObjectRequest {
+        data: Some(anvil_api::put_object_request::Data::Metadata(
+            ObjectMetadata {
+                bucket_name: bucket_name.to_string(),
+                object_key: key.to_string(),
+                mutation_context: Some(native_mutation_context(bucket_id, tag)),
+                content_type: Some("application/json".to_string()),
+                user_metadata_json: String::new(),
+            },
+        )),
+    };
+    let chunk = PutObjectRequest {
+        data: Some(anvil_api::put_object_request::Data::Chunk(
+            serde_json::to_vec(&value).unwrap(),
+        )),
+    };
+    object_client
+        .put_object(authorized(tokio_stream::iter(vec![metadata, chunk]), token))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_typed_json_index_queries_canonical_object_body_with_range_order_and_page_token() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
+
+    let bucket_name = "typed-json-index-bucket".to_string();
+    let bucket_id = bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
+
+    put_json_object(
+        &mut object_client,
+        &token,
+        bucket_id,
+        &bucket_name,
+        "queue/item-a.json",
+        serde_json::json!({"state": {
+            "queue_name": "outbound",
+            "state": "pending",
+            "available_at": "2026-07-03T10:00:00Z",
+            "priority": 20,
+            "item_id": "item-a"
+        }}),
+        "typed-a",
+    )
+    .await;
+    put_json_object(
+        &mut object_client,
+        &token,
+        bucket_id,
+        &bucket_name,
+        "queue/item-b.json",
+        serde_json::json!({"state": {
+            "queue_name": "outbound",
+            "state": "failed",
+            "available_at": "2026-07-03T10:00:00Z",
+            "priority": 50,
+            "item_id": "item-b"
+        }}),
+        "typed-b",
+    )
+    .await;
+    put_json_object(
+        &mut object_client,
+        &token,
+        bucket_id,
+        &bucket_name,
+        "queue/item-c.json",
+        serde_json::json!({"state": {
+            "queue_name": "outbound",
+            "state": "pending",
+            "available_at": "2026-07-04T10:00:00Z",
+            "priority": 100,
+            "item_id": "item-c"
+        }}),
+        "typed-c",
+    )
+    .await;
+
+    index_client
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket_name: bucket_name.clone(),
+                name: "due-work".to_string(),
+                kind: IndexKind::TypedJson as i32,
+                selector_json: serde_json::json!({"prefix": "queue/"}).to_string(),
+                extractor_json: serde_json::json!({}).to_string(),
+                authorization_mode: "inherit_object".to_string(),
+                build_policy_json: serde_json::json!({
+                    "source_kind": "object_current",
+                    "fields": [
+                        {"name": "queue_name", "extractor": "/state/queue_name", "required": true},
+                        {"name": "state", "extractor": "/state/state", "required": true},
+                        {"name": "available_at", "extractor": "/state/available_at", "required": true},
+                        {"name": "priority", "extractor": "/state/priority", "required": true},
+                        {"name": "item_id", "extractor": "/state/item_id", "required": true}
+                    ],
+                    "default_order": [
+                        {"field": "available_at", "direction": "asc"},
+                        {"field": "priority", "direction": "desc"},
+                        {"field": "item_id", "direction": "asc"}
+                    ]
+                })
+                .to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let first_page = index_client
+        .query_index(authorized(
+            QueryIndexRequest {
+                bucket_name: bucket_name.clone(),
+                index_name: "due-work".to_string(),
+                query_text: String::new(),
+                query_vector: vec![],
+                limit: 1,
+                phrase: false,
+                path_prefix: "queue/".to_string(),
+                metadata_filters_json: String::new(),
+                typed_predicates_json: serde_json::json!([
+                    {"field": "queue_name", "op": "eq", "value": "outbound"},
+                    {"field": "state", "op": "in", "values": ["pending", "failed"]},
+                    {"field": "available_at", "op": "lte", "value": "2026-07-03T12:00:00Z"}
+                ])
+                .to_string(),
+                typed_order_json: String::new(),
+                page_token: String::new(),
+                require_caught_up_to_watch_cursor: String::new(),
+                lag_timeout_ms: 0,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first_page.hits.len(), 1);
+    assert_eq!(first_page.hits[0].object_key, "queue/item-b.json");
+    assert!(!first_page.next_page_token.is_empty());
+    assert!(first_page.is_caught_up);
+
+    let second_page = index_client
+        .query_index(authorized(
+            QueryIndexRequest {
+                bucket_name,
+                index_name: "due-work".to_string(),
+                query_text: String::new(),
+                query_vector: vec![],
+                limit: 10,
+                phrase: false,
+                path_prefix: "queue/".to_string(),
+                metadata_filters_json: String::new(),
+                typed_predicates_json: serde_json::json!([
+                    {"field": "queue_name", "op": "eq", "value": "outbound"},
+                    {"field": "state", "op": "in", "values": ["pending", "failed"]},
+                    {"field": "available_at", "op": "lte", "value": "2026-07-03T12:00:00Z"}
+                ])
+                .to_string(),
+                typed_order_json: String::new(),
+                page_token: first_page.next_page_token,
+                require_caught_up_to_watch_cursor: first_page.source_watch_cursor_high.to_string(),
+                lag_timeout_ms: 1000,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second_page.hits.len(), 1);
+    assert_eq!(second_page.hits[0].object_key, "queue/item-a.json");
+}
+
+#[tokio::test]
+async fn test_typed_json_index_queries_append_record_payloads() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
+
+    let bucket_name = "typed-json-append-index-bucket".to_string();
+    let bucket_id = bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
+
+    let stream = object_client
+        .create_append_stream(authorized(
+            CreateAppendStreamRequest {
+                bucket_name: bucket_name.clone(),
+                stream_key: "audit/tenant-a".to_string(),
+                mutation_context: Some(native_mutation_context(bucket_id, "append-stream")),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    for (idx, payload) in [
+        serde_json::json!({"event": {"kind": "attempt", "severity": "warn", "attempt": 2}}),
+        serde_json::json!({"event": {"kind": "attempt", "severity": "info", "attempt": 1}}),
+        serde_json::json!({"event": {"kind": "repair", "severity": "warn", "attempt": 3}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        object_client
+            .append_stream_record(authorized(
+                AppendStreamRecordRequest {
+                    bucket_name: bucket_name.clone(),
+                    stream_key: "audit/tenant-a".to_string(),
+                    stream_id: stream.stream_id.clone(),
+                    payload: serde_json::to_vec(&payload).unwrap(),
+                    mutation_context: Some(native_mutation_context(
+                        bucket_id,
+                        &format!("append-record-{idx}"),
+                    )),
+                    content_type: Some("application/json".to_string()),
+                    user_metadata_json: serde_json::json!({"source": "test"}).to_string(),
+                    precondition: None,
+                },
+                &token,
+            ))
+            .await
+            .unwrap();
+    }
+
+    index_client
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket_name: bucket_name.clone(),
+                name: "append-events".to_string(),
+                kind: IndexKind::TypedJson as i32,
+                selector_json: serde_json::json!({"prefix": "audit/"}).to_string(),
+                extractor_json: serde_json::json!({}).to_string(),
+                authorization_mode: "inherit_object".to_string(),
+                build_policy_json: serde_json::json!({
+                    "source_kind": "append_record",
+                    "fields": [
+                        {"name": "stream", "extractor": "append_stream_key", "required": true},
+                        {"name": "sequence", "extractor": "append_record_sequence", "required": true},
+                        {"name": "kind", "extractor": "append_payload_json_pointer:/event/kind", "required": true},
+                        {"name": "severity", "extractor": "append_payload_json_pointer:/event/severity", "required": true},
+                        {"name": "attempt", "extractor": "append_payload_json_pointer:/event/attempt", "required": true},
+                        {"name": "source", "extractor": "append_user_metadata_json_pointer:/source", "required": true}
+                    ],
+                    "default_order": [
+                        {"field": "attempt", "direction": "asc"},
+                        {"field": "sequence", "direction": "asc"}
+                    ]
+                })
+                .to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let response = index_client
+        .query_index(authorized(
+            QueryIndexRequest {
+                bucket_name,
+                index_name: "append-events".to_string(),
+                query_text: String::new(),
+                query_vector: vec![],
+                limit: 10,
+                phrase: false,
+                path_prefix: "audit/".to_string(),
+                metadata_filters_json: String::new(),
+                typed_predicates_json: serde_json::json!([
+                    {"field": "kind", "op": "eq", "value": "attempt"},
+                    {"field": "severity", "op": "in", "values": ["info", "warn"]},
+                    {"field": "source", "op": "eq", "value": "test"}
+                ])
+                .to_string(),
+                typed_order_json: String::new(),
+                page_token: String::new(),
+                require_caught_up_to_watch_cursor: String::new(),
+                lag_timeout_ms: 0,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.hits.len(), 2);
+    assert_eq!(response.hits[0].object_key, "audit/tenant-a");
+    let first_values: serde_json::Value =
+        serde_json::from_str(&response.hits[0].metadata_json).unwrap();
+    assert_eq!(first_values["typed_values"]["attempt"], 1);
+    let second_values: serde_json::Value =
+        serde_json::from_str(&response.hits[1].metadata_json).unwrap();
+    assert_eq!(second_values["typed_values"]["attempt"], 2);
 }
 
 #[tokio::test]
@@ -377,6 +747,11 @@ async fn test_query_path_and_metadata_filter_indexes_from_object_metadata() {
                 phrase: false,
                 path_prefix: "docs/".to_string(),
                 metadata_filters_json: String::new(),
+                typed_predicates_json: String::new(),
+                typed_order_json: String::new(),
+                page_token: String::new(),
+                require_caught_up_to_watch_cursor: String::new(),
+                lag_timeout_ms: 0,
             },
             &token,
         ))
@@ -408,6 +783,11 @@ async fn test_query_path_and_metadata_filter_indexes_from_object_metadata() {
                     "/nested/state": "open"
                 })
                 .to_string(),
+                typed_predicates_json: String::new(),
+                typed_order_json: String::new(),
+                page_token: String::new(),
+                require_caught_up_to_watch_cursor: String::new(),
+                lag_timeout_ms: 0,
             },
             &token,
         ))
@@ -488,6 +868,8 @@ async fn test_full_text_index_builds_from_object_write_task() {
                     bucket_name: bucket_name.clone(),
                     object_key: "docs/alpha.txt".to_string(),
                     mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    content_type: None,
+                    user_metadata_json: String::new(),
                 },
             )),
         },
@@ -518,6 +900,11 @@ async fn test_full_text_index_builds_from_object_write_task() {
                     phrase: false,
                     path_prefix: String::new(),
                     metadata_filters_json: String::new(),
+                    typed_predicates_json: String::new(),
+                    typed_order_json: String::new(),
+                    page_token: String::new(),
+                    require_caught_up_to_watch_cursor: String::new(),
+                    lag_timeout_ms: 0,
                 },
                 &token,
             ))
@@ -665,6 +1052,8 @@ async fn test_full_text_index_build_extracts_json_pointer_from_object_write_task
                     bucket_name: bucket_name.clone(),
                     object_key: "docs/report.json".to_string(),
                     mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    content_type: None,
+                    user_metadata_json: String::new(),
                 },
             )),
         },
@@ -695,6 +1084,11 @@ async fn test_full_text_index_build_extracts_json_pointer_from_object_write_task
                     phrase: false,
                     path_prefix: String::new(),
                     metadata_filters_json: String::new(),
+                    typed_predicates_json: String::new(),
+                    typed_order_json: String::new(),
+                    page_token: String::new(),
+                    require_caught_up_to_watch_cursor: String::new(),
+                    lag_timeout_ms: 0,
                 },
                 &token,
             ))
@@ -1492,6 +1886,11 @@ async fn test_repair_rebuilds_missing_vector_segment_from_base_journal() {
                 phrase: false,
                 path_prefix: String::new(),
                 metadata_filters_json: String::new(),
+                typed_predicates_json: String::new(),
+                typed_order_json: String::new(),
+                page_token: String::new(),
+                require_caught_up_to_watch_cursor: String::new(),
+                lag_timeout_ms: 0,
             },
             &token,
         ))
@@ -1713,6 +2112,8 @@ async fn test_vector_index_builds_from_object_write_task() {
                     bucket_name: bucket_name.clone(),
                     object_key: "docs/vector.json".to_string(),
                     mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    content_type: None,
+                    user_metadata_json: String::new(),
                 },
             )),
         },
@@ -1743,6 +2144,11 @@ async fn test_vector_index_builds_from_object_write_task() {
                     phrase: false,
                     path_prefix: String::new(),
                     metadata_filters_json: String::new(),
+                    typed_predicates_json: String::new(),
+                    typed_order_json: String::new(),
+                    page_token: String::new(),
+                    require_caught_up_to_watch_cursor: String::new(),
+                    lag_timeout_ms: 0,
                 },
                 &token,
             ))
@@ -1783,11 +2189,14 @@ async fn test_vector_index_builds_from_object_write_task() {
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "docs/vector.json");
     assert_eq!(response.hits[0].vector_id, 1);
-    let tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
-    assert!(tasks.iter().any(|task| {
-        task.task_type == anvil::tasks::TaskType::IndexBuild
-            && task.status == anvil::tasks::TaskStatus::Completed
-    }));
+    let tasks = wait_for_index_build_task(&cluster, Duration::from_secs(10)).await;
+    assert!(
+        tasks.iter().any(|task| {
+            task.task_type == anvil::tasks::TaskType::IndexBuild
+                && task.status == anvil::tasks::TaskStatus::Completed
+        }),
+        "index build task should complete after searchable result; tasks={tasks:?}"
+    );
     assert!(!tasks.iter().any(|task| {
         task.task_type == anvil::tasks::TaskType::IndexBuild
             && task.status == anvil::tasks::TaskStatus::Failed
@@ -1988,6 +2397,8 @@ async fn test_vector_index_build_records_dimension_mismatch_diagnostic() {
                     bucket_name: bucket_name.clone(),
                     object_key: "docs/bad-vector.json".to_string(),
                     mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    content_type: None,
+                    user_metadata_json: String::new(),
                 },
             )),
         },
@@ -2135,6 +2546,8 @@ async fn test_hybrid_index_builds_text_and_vector_segments_from_object_write_tas
                     bucket_name: bucket_name.clone(),
                     object_key: "docs/hybrid.json".to_string(),
                     mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    content_type: None,
+                    user_metadata_json: String::new(),
                 },
             )),
         },
@@ -2163,6 +2576,11 @@ async fn test_hybrid_index_builds_text_and_vector_segments_from_object_write_tas
                     phrase: false,
                     path_prefix: String::new(),
                     metadata_filters_json: String::new(),
+                    typed_predicates_json: String::new(),
+                    typed_order_json: String::new(),
+                    page_token: String::new(),
+                    require_caught_up_to_watch_cursor: String::new(),
+                    lag_timeout_ms: 0,
                 },
                 &token,
             ))
@@ -2331,6 +2749,11 @@ async fn test_query_full_text_index_reads_latest_segment() {
                 phrase: false,
                 path_prefix: String::new(),
                 metadata_filters_json: String::new(),
+                typed_predicates_json: String::new(),
+                typed_order_json: String::new(),
+                page_token: String::new(),
+                require_caught_up_to_watch_cursor: String::new(),
+                lag_timeout_ms: 0,
             },
             &token,
         ))
@@ -2440,6 +2863,11 @@ async fn test_query_full_text_phrase_requires_position_enabled_index() {
                 phrase: true,
                 path_prefix: String::new(),
                 metadata_filters_json: String::new(),
+                typed_predicates_json: String::new(),
+                typed_order_json: String::new(),
+                page_token: String::new(),
+                require_caught_up_to_watch_cursor: String::new(),
+                lag_timeout_ms: 0,
             },
             &token,
         ))
@@ -2581,6 +3009,11 @@ async fn test_query_vector_index_reads_latest_segment() {
                 phrase: false,
                 path_prefix: String::new(),
                 metadata_filters_json: String::new(),
+                typed_predicates_json: String::new(),
+                typed_order_json: String::new(),
+                page_token: String::new(),
+                require_caught_up_to_watch_cursor: String::new(),
+                lag_timeout_ms: 0,
             },
             &token,
         ))
@@ -2770,6 +3203,11 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
                 phrase: false,
                 path_prefix: String::new(),
                 metadata_filters_json: String::new(),
+                typed_predicates_json: String::new(),
+                typed_order_json: String::new(),
+                page_token: String::new(),
+                require_caught_up_to_watch_cursor: String::new(),
+                lag_timeout_ms: 0,
             },
             &token,
         ))
@@ -2812,6 +3250,11 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
                 phrase: false,
                 path_prefix: "docs/hybrid-a".to_string(),
                 metadata_filters_json: serde_json::json!({"tier": "gold"}).to_string(),
+                typed_predicates_json: String::new(),
+                typed_order_json: String::new(),
+                page_token: String::new(),
+                require_caught_up_to_watch_cursor: String::new(),
+                lag_timeout_ms: 0,
             },
             &token,
         ))
@@ -2967,6 +3410,11 @@ async fn test_query_inherit_object_vector_filters_results_by_object_read_scope()
                 phrase: false,
                 path_prefix: String::new(),
                 metadata_filters_json: String::new(),
+                typed_predicates_json: String::new(),
+                typed_order_json: String::new(),
+                page_token: String::new(),
+                require_caught_up_to_watch_cursor: String::new(),
+                lag_timeout_ms: 0,
             },
             &limited_token,
         ))
@@ -3135,6 +3583,11 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
                 phrase: false,
                 path_prefix: String::new(),
                 metadata_filters_json: String::new(),
+                typed_predicates_json: String::new(),
+                typed_order_json: String::new(),
+                page_token: String::new(),
+                require_caught_up_to_watch_cursor: String::new(),
+                lag_timeout_ms: 0,
             },
             &limited_token,
         ))
@@ -3185,6 +3638,11 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
                 phrase: false,
                 path_prefix: String::new(),
                 metadata_filters_json: String::new(),
+                typed_predicates_json: String::new(),
+                typed_order_json: String::new(),
+                page_token: String::new(),
+                require_caught_up_to_watch_cursor: String::new(),
+                lag_timeout_ms: 0,
             },
             &tuple_token,
         ))
@@ -3518,6 +3976,11 @@ async fn wait_for_vector_hit(
                     phrase: false,
                     path_prefix: String::new(),
                     metadata_filters_json: String::new(),
+                    typed_predicates_json: String::new(),
+                    typed_order_json: String::new(),
+                    page_token: String::new(),
+                    require_caught_up_to_watch_cursor: String::new(),
+                    lag_timeout_ms: 0,
                 },
                 token,
             ))

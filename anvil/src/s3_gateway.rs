@@ -2723,6 +2723,8 @@ async fn get_object(
         Err(response) => return response,
     };
 
+    let response_bucket = bucket.clone();
+    let response_key = key.clone();
     match state
         .object_manager
         .get_object_with_link_mode_for_tenant(
@@ -2777,9 +2779,17 @@ async fn get_object(
                 );
             }
             builder
-                .body(Body::from_stream(
-                    body_stream.map(|r| r.map_err(|e| axum::Error::new(e))),
-                ))
+                .body(Body::from_stream(body_stream.map(move |r| {
+                    r.map_err(|e| {
+                        tracing::warn!(
+                            bucket = %response_bucket,
+                            key = %response_key,
+                            error = %e,
+                            "S3 object body stream failed"
+                        );
+                        axum::Error::new(e)
+                    })
+                })))
                 .unwrap()
         }
         Err(status) => match status.code() {

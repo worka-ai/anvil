@@ -888,6 +888,7 @@ enum IndexKind {
     INDEX_KIND_HYBRID = 5;
     INDEX_KIND_PERSONALDB_ROW_METADATA = 6;
     INDEX_KIND_GIT_SOURCE = 7;
+    INDEX_KIND_TYPED_JSON = 8;
 }
 
 message CreateIndexRequest {
@@ -958,6 +959,11 @@ message QueryIndexRequest {
     bool phrase = 6;
     string path_prefix = 7;
     string metadata_filters_json = 8;
+    string typed_predicates_json = 9;
+    string typed_order_json = 10;
+    string page_token = 11;
+    string require_caught_up_to_watch_cursor = 12;
+    uint64 lag_timeout_ms = 13;
 }
 
 message IndexQueryHit {
@@ -980,6 +986,11 @@ message QueryIndexResponse {
     uint64 index_generation = 3;
     uint64 authz_revision = 4;
     string scoring_recipe_json = 5;
+    string next_page_token = 6;
+    uint64 source_watch_cursor_high = 7;
+    uint64 index_watch_cursor_applied = 8;
+    bool is_caught_up = 9;
+    uint64 lag_record_count_hint = 10;
 }
 
 message WatchIndexDefinitionRequest {
@@ -1198,7 +1209,10 @@ service ObjectService {
   rpc WatchPrefix(WatchPrefixRequest) returns (stream WatchPrefixResponse);
   rpc CreateAppendStream(CreateAppendStreamRequest) returns (CreateAppendStreamResponse);
   rpc AppendStreamRecord(AppendStreamRecordRequest) returns (AppendStreamRecordResponse);
+  rpc ReadAppendStream(ReadAppendStreamRequest) returns (ReadAppendStreamResponse);
+  rpc TailAppendStream(TailAppendStreamRequest) returns (stream TailAppendStreamResponse);
   rpc SealAppendStreamSegment(SealAppendStreamSegmentRequest) returns (SealAppendStreamSegmentResponse);
+  rpc MutationBatch(MutationBatchRequest) returns (MutationBatchResponse);
   rpc InitiateMultipartUpload(InitiateMultipartRequest) returns (InitiateMultipartResponse);
   rpc UploadPart(stream UploadPartRequest) returns (UploadPartResponse);
   rpc CompleteMultipartUpload(CompleteMultipartRequest) returns (CompleteMultipartResponse);
@@ -1226,6 +1240,8 @@ message ObjectMetadata {
     string bucket_name = 1;
     string object_key = 2;
     NativeMutationContext mutation_context = 3;
+    optional string content_type = 4;
+    string user_metadata_json = 5;
 }
 
 message PutObjectResponse {
@@ -1256,6 +1272,7 @@ message ObjectInfo {
     string content_type = 1;
     int64 content_length = 2;
     string version_id = 3;
+    string user_metadata_json = 4;
 }
 
 
@@ -1292,6 +1309,8 @@ message HeadObjectResponse {
     string record_hash = 6;
     uint64 authz_revision = 7;
     string index_policy_snapshot = 8;
+    string content_type = 9;
+    string user_metadata_json = 10;
 }
 
 message ListObjectsRequest {
@@ -1307,6 +1326,8 @@ message ObjectSummary {
     int64 size = 2;
     string etag = 3;
     string last_modified = 4;
+    string content_type = 5;
+    string user_metadata_json = 6;
 }
 
 message ListObjectsResponse {
@@ -1330,6 +1351,8 @@ message ObjectVersionSummary {
     string last_modified = 5;
     bool is_delete_marker = 6;
     bool is_latest = 7;
+    string content_type = 8;
+    string user_metadata_json = 9;
 }
 
 message ListObjectVersionsResponse {
@@ -1445,6 +1468,7 @@ message PatchJsonObjectRequest {
     optional string base_version_id = 3;
     string merge_patch_json = 4;
     NativeMutationContext mutation_context = 5;
+    WritePrecondition precondition = 6;
 }
 
 message PatchJsonObjectResponse {
@@ -1465,6 +1489,7 @@ message CompareAndSwapManifestRequest {
     uint64 expected_revision = 3;
     string manifest_json = 4;
     NativeMutationContext mutation_context = 5;
+    WritePrecondition precondition = 6;
 }
 
 message CompareAndSwapManifestResponse {
@@ -1519,6 +1544,9 @@ message AppendStreamRecordRequest {
     string stream_id = 3;
     bytes payload = 4;
     NativeMutationContext mutation_context = 5;
+    optional string content_type = 6;
+    string user_metadata_json = 7;
+    WritePrecondition precondition = 8;
 }
 
 message AppendStreamRecordResponse {
@@ -1530,6 +1558,46 @@ message AppendStreamRecordResponse {
     string record_hash = 6;
     uint64 authz_revision = 7;
     uint64 watch_cursor = 8;
+    string content_type = 9;
+    string user_metadata_json = 10;
+}
+
+message ReadAppendStreamRequest {
+    string bucket_name = 1;
+    string stream_key = 2;
+    string stream_id = 3;
+    uint64 after_sequence = 4;
+    uint32 limit = 5;
+    bool include_payload = 6;
+}
+
+message AppendStreamRecordInfo {
+    uint64 record_sequence = 1;
+    string payload_hash = 2;
+    int64 payload_size = 3;
+    string created_at = 4;
+    string content_type = 5;
+    string user_metadata_json = 6;
+    bytes payload = 7;
+}
+
+message ReadAppendStreamResponse {
+    repeated AppendStreamRecordInfo records = 1;
+    uint64 next_after_sequence = 2;
+    bool is_end = 3;
+}
+
+message TailAppendStreamRequest {
+    string bucket_name = 1;
+    string stream_key = 2;
+    string stream_id = 3;
+    uint64 from_sequence = 4;
+    bool include_payload = 5;
+    uint32 poll_interval_ms = 6;
+}
+
+message TailAppendStreamResponse {
+    AppendStreamRecordInfo record = 1;
 }
 
 message SealAppendStreamSegmentRequest {
@@ -1537,6 +1605,7 @@ message SealAppendStreamSegmentRequest {
     string stream_key = 2;
     string stream_id = 3;
     NativeMutationContext mutation_context = 4;
+    WritePrecondition precondition = 5;
 }
 
 message SealAppendStreamSegmentResponse {
@@ -1548,6 +1617,107 @@ message SealAppendStreamSegmentResponse {
     string record_hash = 6;
     uint64 authz_revision = 7;
     uint64 watch_cursor = 8;
+}
+
+message ObjectVersionPrecondition {
+    string bucket_name = 1;
+    string object_key = 2;
+    optional string expected_version_id = 3;
+    bool must_not_exist = 4;
+}
+
+message LeaseFencePrecondition {
+    string task_id = 1;
+    uint64 fence_token = 2;
+}
+
+message WritePrecondition {
+    repeated ObjectVersionPrecondition object_versions = 1;
+    LeaseFencePrecondition lease_fence = 2;
+}
+
+message MutationBatchRequest {
+    string bucket_name = 1;
+    NativeMutationContext mutation_context = 2;
+    WritePrecondition precondition = 3;
+    repeated MutationBatchOperation operations = 4;
+}
+
+message MutationBatchOperation {
+    oneof op {
+        MutationBatchPutObject put_object = 1;
+        MutationBatchPatchJsonObject patch_json_object = 2;
+        MutationBatchDeleteObject delete_object = 3;
+        MutationBatchAppendStreamRecord append_stream_record = 4;
+        MutationBatchCheckpointTaskLease checkpoint_task_lease = 5;
+        MutationBatchCommitTaskLease commit_task_lease = 6;
+        MutationBatchCompareAndSwapManifest compare_and_swap_manifest = 7;
+    }
+}
+
+message MutationBatchPutObject {
+    string object_key = 1;
+    bytes payload = 2;
+    optional string content_type = 3;
+    string user_metadata_json = 4;
+}
+
+message MutationBatchPatchJsonObject {
+    string object_key = 1;
+    optional string base_version_id = 2;
+    string merge_patch_json = 3;
+}
+
+message MutationBatchDeleteObject {
+    string object_key = 1;
+    optional string version_id = 2;
+}
+
+message MutationBatchAppendStreamRecord {
+    string stream_key = 1;
+    string stream_id = 2;
+    bytes payload = 3;
+    optional string content_type = 4;
+    string user_metadata_json = 5;
+}
+
+message MutationBatchCheckpointTaskLease {
+    string task_id = 1;
+    uint64 fence_token = 2;
+    uint64 checkpoint_cursor_low = 3;
+    uint64 checkpoint_cursor_high = 4;
+}
+
+message MutationBatchCommitTaskLease {
+    string task_id = 1;
+    uint64 fence_token = 2;
+    uint64 committed_cursor_low = 3;
+    uint64 committed_cursor_high = 4;
+}
+
+message MutationBatchCompareAndSwapManifest {
+    string manifest_key = 1;
+    uint64 expected_revision = 2;
+    string manifest_json = 3;
+}
+
+message MutationBatchOperationReceipt {
+    string operation = 1;
+    string object_key = 2;
+    string version_id = 3;
+    string mutation_id = 4;
+    string payload_hash = 5;
+    string record_hash = 6;
+    uint64 append_record_sequence = 7;
+    uint64 manifest_revision = 8;
+    uint64 lease_fence_token = 9;
+}
+
+message MutationBatchResponse {
+    string batch_id = 1;
+    repeated MutationBatchOperationReceipt operation_receipts = 2;
+    uint64 watch_cursor = 3;
+    string mutation_id = 4;
 }
 
 message CompleteMultipartResponse {

@@ -6,7 +6,7 @@ use crate::permissions::AnvilAction;
 use crate::{
     AppState, auth, authz_journal, bucket_journal,
     services::watch_envelope::{self, WatchEnvelopeParts},
-    watch_log,
+    task_lease, watch_log,
 };
 use futures_util::StreamExt;
 use serde::{Serialize, de::DeserializeOwned};
@@ -23,6 +23,9 @@ impl ObjectService for AppState {
     type WatchPrefixStream = std::pin::Pin<
         Box<dyn futures_core::Stream<Item = Result<WatchPrefixResponse, Status>> + Send>,
     >;
+    type TailAppendStreamStream = std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = Result<TailAppendStreamResponse, Status>> + Send>,
+    >;
 
     async fn put_object(
         &self,
@@ -36,15 +39,20 @@ impl ObjectService for AppState {
 
         let mut stream = request.into_inner();
 
-        let (bucket_name, object_key, mutation_context) = match stream.next().await {
-            Some(Ok(chunk)) => match chunk.data {
-                Some(put_object_request::Data::Metadata(meta)) => {
-                    (meta.bucket_name, meta.object_key, meta.mutation_context)
-                }
-                _ => return Err(Status::invalid_argument("First chunk must be metadata")),
-            },
-            _ => return Err(Status::invalid_argument("Empty stream")),
-        };
+        let (bucket_name, object_key, mutation_context, content_type, user_metadata) =
+            match stream.next().await {
+                Some(Ok(chunk)) => match chunk.data {
+                    Some(put_object_request::Data::Metadata(meta)) => (
+                        meta.bucket_name,
+                        meta.object_key,
+                        meta.mutation_context,
+                        meta.content_type,
+                        parse_user_metadata_json(&meta.user_metadata_json)?,
+                    ),
+                    _ => return Err(Status::invalid_argument("First chunk must be metadata")),
+                },
+                _ => return Err(Status::invalid_argument("Empty stream")),
+            };
         validate_native_mutation_context(self, &claims, &bucket_name, mutation_context.as_ref())
             .await?;
         let target = NativeIdempotencyTarget::new("PutObject", &bucket_name, &object_key);
@@ -85,7 +93,10 @@ impl ObjectService for AppState {
                 &object_key,
                 &claims.scopes,
                 data_stream,
-                ObjectWriteOptions::default(),
+                ObjectWriteOptions {
+                    content_type,
+                    user_metadata,
+                },
             )
             .await?;
         let watch_cursor = object_watch_cursor(self, &object).await?;
@@ -129,6 +140,7 @@ impl ObjectService for AppState {
                 content_type: object.content_type.clone().unwrap_or_default(),
                 content_length: object.size,
                 version_id: object.version_id.to_string(),
+                user_metadata_json: json_object_string(object.user_meta.as_ref()),
             };
             if tx
                 .send(Ok(GetObjectResponse {
@@ -276,6 +288,8 @@ impl ObjectService for AppState {
             authz_revision: u64::try_from(object.authz_revision)
                 .map_err(|_| Status::internal("Invalid authz revision"))?,
             index_policy_snapshot: object.index_policy_snapshot,
+            content_type: object.content_type.unwrap_or_default(),
+            user_metadata_json: json_object_string(object.user_meta.as_ref()),
         }))
     }
 
@@ -308,6 +322,8 @@ impl ObjectService for AppState {
                 size: o.size,
                 last_modified: o.created_at.to_string(),
                 etag: o.etag,
+                content_type: o.content_type.unwrap_or_default(),
+                user_metadata_json: json_object_string(o.user_meta.as_ref()),
             })
             .collect();
 
@@ -351,6 +367,8 @@ impl ObjectService for AppState {
                     etag: object.etag,
                     is_delete_marker: version.is_delete_marker,
                     is_latest: version.is_latest,
+                    content_type: object.content_type.unwrap_or_default(),
+                    user_metadata_json: json_object_string(object.user_meta.as_ref()),
                 }
             })
             .collect();
@@ -580,6 +598,7 @@ impl ObjectService for AppState {
             AnvilAction::ObjectWrite,
         )
         .await?;
+        enforce_write_precondition(self, &claims, req.precondition.as_ref()).await?;
 
         let object = self
             .object_manager
@@ -655,6 +674,7 @@ impl ObjectService for AppState {
             AnvilAction::ObjectWrite,
         )
         .await?;
+        enforce_write_precondition(self, &claims, req.precondition.as_ref()).await?;
         let result = self
             .object_manager
             .compare_and_swap_manifest(
@@ -855,8 +875,10 @@ impl ObjectService for AppState {
             AnvilAction::ObjectWrite,
         )
         .await?;
+        enforce_write_precondition(self, &claims, req.precondition.as_ref()).await?;
         let stream_id = uuid::Uuid::parse_str(&req.stream_id)
             .map_err(|_| Status::invalid_argument("Invalid stream_id"))?;
+        let user_metadata = parse_user_metadata_json(&req.user_metadata_json)?;
         let record = self
             .object_manager
             .append_stream_record(
@@ -865,6 +887,8 @@ impl ObjectService for AppState {
                 &req.stream_key,
                 stream_id,
                 req.payload,
+                req.content_type,
+                user_metadata,
                 &claims.scopes,
             )
             .await?;
@@ -879,9 +903,108 @@ impl ObjectService for AppState {
             record_hash: record.receipt.record_hash,
             authz_revision,
             watch_cursor: record.receipt.watch_cursor,
+            content_type: record.content_type.unwrap_or_default(),
+            user_metadata_json: json_object_string(record.user_metadata.as_ref()),
         };
         complete_native_mutation(self, &attempt, &target, &response).await?;
         Ok(Response::new(response))
+    }
+
+    async fn read_append_stream(
+        &self,
+        request: Request<ReadAppendStreamRequest>,
+    ) -> Result<Response<ReadAppendStreamResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        let stream_id = uuid::Uuid::parse_str(&req.stream_id)
+            .map_err(|_| Status::invalid_argument("Invalid stream_id"))?;
+        let records = self
+            .object_manager
+            .read_append_stream_records(
+                claims,
+                &req.bucket_name,
+                &req.stream_key,
+                stream_id,
+                req.after_sequence,
+                req.limit,
+                req.include_payload,
+            )
+            .await?;
+        let next_after_sequence = records
+            .last()
+            .map(|record| record.record_sequence)
+            .unwrap_or(req.after_sequence);
+        let records = records.into_iter().map(append_stream_record_info).collect();
+        Ok(Response::new(ReadAppendStreamResponse {
+            records,
+            next_after_sequence,
+            is_end: true,
+        }))
+    }
+
+    async fn tail_append_stream(
+        &self,
+        request: Request<TailAppendStreamRequest>,
+    ) -> Result<Response<Self::TailAppendStreamStream>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        let stream_id = uuid::Uuid::parse_str(&req.stream_id)
+            .map_err(|_| Status::invalid_argument("Invalid stream_id"))?;
+        let (tx, rx) = mpsc::channel(32);
+        let state = self.clone();
+        let poll_interval =
+            std::time::Duration::from_millis(u64::from(req.poll_interval_ms).clamp(100, 30_000));
+        tokio::spawn(async move {
+            let mut after_sequence = req.from_sequence.saturating_sub(1);
+            loop {
+                let records = state
+                    .object_manager
+                    .read_append_stream_records(
+                        claims.clone(),
+                        &req.bucket_name,
+                        &req.stream_key,
+                        stream_id,
+                        after_sequence,
+                        100,
+                        req.include_payload,
+                    )
+                    .await;
+                match records {
+                    Ok(records) if records.is_empty() => {
+                        tokio::time::sleep(poll_interval).await;
+                    }
+                    Ok(records) => {
+                        for record in records {
+                            after_sequence = record.record_sequence;
+                            if tx
+                                .send(Ok(TailAppendStreamResponse {
+                                    record: Some(append_stream_record_info(record)),
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    Err(status) => {
+                        let _ = tx.send(Err(status)).await;
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(Response::new(
+            Box::pin(ReceiverStream::new(rx)) as Self::TailAppendStreamStream
+        ))
     }
 
     async fn seal_append_stream_segment(
@@ -927,6 +1050,7 @@ impl ObjectService for AppState {
             AnvilAction::ObjectWrite,
         )
         .await?;
+        enforce_write_precondition(self, &claims, req.precondition.as_ref()).await?;
         let version_id = req.stream_id.clone();
         let stream_id = uuid::Uuid::parse_str(&req.stream_id)
             .map_err(|_| Status::invalid_argument("Invalid stream_id"))?;
@@ -953,6 +1077,267 @@ impl ObjectService for AppState {
             watch_cursor: sealed.receipt.watch_cursor,
         };
         complete_native_mutation(self, &attempt, &target, &response).await?;
+        Ok(Response::new(response))
+    }
+
+    async fn mutation_batch(
+        &self,
+        request: Request<MutationBatchRequest>,
+    ) -> Result<Response<MutationBatchResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        validate_native_mutation_context(
+            self,
+            &claims,
+            &req.bucket_name,
+            req.mutation_context.as_ref(),
+        )
+        .await?;
+        if req.operations.is_empty() {
+            return Err(Status::invalid_argument(
+                "MutationBatch requires at least one operation",
+            ));
+        }
+        validate_mutation_batch_operations(&req)?;
+        validate_mutation_batch_authorization(&claims, &req)?;
+        let operation_digest = mutation_batch_digest(&req)?;
+        let context = req
+            .mutation_context
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?;
+        let target =
+            NativeIdempotencyTarget::new("MutationBatch", &req.bucket_name, "mutation_batch")
+                .with_parameters(serde_json::json!({ "request_digest": operation_digest }));
+        let _idempotency_guard = acquire_native_mutation_lock(self, context).await?;
+        let replay = native_idempotency::load_response::<MutationBatchResponse>(
+            &self.storage,
+            context,
+            &target,
+        )
+        .await?;
+        if let Some(response) = replay {
+            return Ok(Response::new(response));
+        }
+        let _operation_guards =
+            acquire_mutation_batch_operation_locks(self, claims.tenant_id, &req).await?;
+        enforce_write_precondition(self, &claims, req.precondition.as_ref()).await?;
+
+        let mut receipts = Vec::with_capacity(req.operations.len());
+        let mut max_watch_cursor = 0_u64;
+        for operation in req.operations {
+            let Some(op) = operation.op else {
+                return Err(Status::invalid_argument(
+                    "MutationBatch operation is missing op",
+                ));
+            };
+            match op {
+                mutation_batch_operation::Op::PutObject(op) => {
+                    let object = self
+                        .object_manager
+                        .put_object(
+                            claims.tenant_id,
+                            &req.bucket_name,
+                            &op.object_key,
+                            &claims.scopes,
+                            futures_util::stream::iter(vec![Ok(op.payload)]),
+                            ObjectWriteOptions {
+                                content_type: op.content_type,
+                                user_metadata: parse_user_metadata_json(&op.user_metadata_json)?,
+                            },
+                        )
+                        .await?;
+                    let watch_cursor = object_watch_cursor(self, &object).await?;
+                    max_watch_cursor = max_watch_cursor.max(watch_cursor);
+                    receipts.push(MutationBatchOperationReceipt {
+                        operation: "put_object".to_string(),
+                        object_key: object.key,
+                        version_id: object.version_id.to_string(),
+                        mutation_id: object.mutation_id.to_string(),
+                        payload_hash: object.content_hash,
+                        record_hash: object.record_hash,
+                        append_record_sequence: 0,
+                        manifest_revision: 0,
+                        lease_fence_token: 0,
+                    });
+                }
+                mutation_batch_operation::Op::PatchJsonObject(op) => {
+                    let object = self
+                        .object_manager
+                        .patch_json_object(
+                            claims.clone(),
+                            &req.bucket_name,
+                            &op.object_key,
+                            parse_optional_version_id(op.base_version_id.as_deref())?,
+                            &op.merge_patch_json,
+                        )
+                        .await?;
+                    let watch_cursor = object_watch_cursor(self, &object).await?;
+                    max_watch_cursor = max_watch_cursor.max(watch_cursor);
+                    receipts.push(MutationBatchOperationReceipt {
+                        operation: "patch_json_object".to_string(),
+                        object_key: object.key,
+                        version_id: object.version_id.to_string(),
+                        mutation_id: object.mutation_id.to_string(),
+                        payload_hash: object.content_hash,
+                        record_hash: object.record_hash,
+                        append_record_sequence: 0,
+                        manifest_revision: 0,
+                        lease_fence_token: 0,
+                    });
+                }
+                mutation_batch_operation::Op::DeleteObject(op) => {
+                    let deleted = if let Some(version_id) =
+                        parse_optional_version_id(op.version_id.as_deref())?
+                    {
+                        self.object_manager
+                            .delete_object_version(
+                                claims.tenant_id,
+                                &req.bucket_name,
+                                &op.object_key,
+                                version_id,
+                                &claims.scopes,
+                            )
+                            .await?
+                    } else {
+                        self.object_manager
+                            .delete_object(
+                                claims.tenant_id,
+                                &req.bucket_name,
+                                &op.object_key,
+                                &claims.scopes,
+                            )
+                            .await?
+                    };
+                    let watch_cursor = object_watch_cursor(self, &deleted).await?;
+                    max_watch_cursor = max_watch_cursor.max(watch_cursor);
+                    receipts.push(MutationBatchOperationReceipt {
+                        operation: "delete_object".to_string(),
+                        object_key: deleted.key,
+                        version_id: deleted.version_id.to_string(),
+                        mutation_id: deleted.mutation_id.to_string(),
+                        payload_hash: deleted.content_hash,
+                        record_hash: deleted.record_hash,
+                        append_record_sequence: 0,
+                        manifest_revision: 0,
+                        lease_fence_token: 0,
+                    });
+                }
+                mutation_batch_operation::Op::AppendStreamRecord(op) => {
+                    let stream_id = uuid::Uuid::parse_str(&op.stream_id)
+                        .map_err(|_| Status::invalid_argument("Invalid stream_id"))?;
+                    let record = self
+                        .object_manager
+                        .append_stream_record(
+                            claims.tenant_id,
+                            &req.bucket_name,
+                            &op.stream_key,
+                            stream_id,
+                            op.payload,
+                            op.content_type,
+                            parse_user_metadata_json(&op.user_metadata_json)?,
+                            &claims.scopes,
+                        )
+                        .await?;
+                    max_watch_cursor = max_watch_cursor.max(record.receipt.watch_cursor);
+                    receipts.push(MutationBatchOperationReceipt {
+                        operation: "append_stream_record".to_string(),
+                        object_key: op.stream_key,
+                        version_id: record.record_sequence.to_string(),
+                        mutation_id: record.receipt.mutation_id.to_string(),
+                        payload_hash: record.payload_hash,
+                        record_hash: record.receipt.record_hash,
+                        append_record_sequence: record.record_sequence,
+                        manifest_revision: 0,
+                        lease_fence_token: 0,
+                    });
+                }
+                mutation_batch_operation::Op::CheckpointTaskLease(op) => {
+                    let owner = lease_owner_from_claims(&claims);
+                    let lease = self
+                        .persistence
+                        .checkpoint_named_task_lease(
+                            &op.task_id,
+                            &owner,
+                            op.fence_token,
+                            join_u128(op.checkpoint_cursor_low, op.checkpoint_cursor_high),
+                        )
+                        .await
+                        .map_err(lease_error_status)?;
+                    receipts.push(MutationBatchOperationReceipt {
+                        operation: "checkpoint_task_lease".to_string(),
+                        object_key: op.task_id,
+                        version_id: lease.lease_epoch.to_string(),
+                        mutation_id: String::new(),
+                        payload_hash: String::new(),
+                        record_hash: lease.lease_hash.unwrap_or_default(),
+                        append_record_sequence: 0,
+                        manifest_revision: 0,
+                        lease_fence_token: lease.fence_token,
+                    });
+                }
+                mutation_batch_operation::Op::CommitTaskLease(op) => {
+                    let owner = lease_owner_from_claims(&claims);
+                    let lease = self
+                        .persistence
+                        .commit_named_task_lease(
+                            &op.task_id,
+                            &owner,
+                            op.fence_token,
+                            join_u128(op.committed_cursor_low, op.committed_cursor_high),
+                        )
+                        .await
+                        .map_err(lease_error_status)?;
+                    receipts.push(MutationBatchOperationReceipt {
+                        operation: "commit_task_lease".to_string(),
+                        object_key: op.task_id,
+                        version_id: lease.lease_epoch.to_string(),
+                        mutation_id: String::new(),
+                        payload_hash: String::new(),
+                        record_hash: lease.lease_hash.unwrap_or_default(),
+                        append_record_sequence: 0,
+                        manifest_revision: 0,
+                        lease_fence_token: lease.fence_token,
+                    });
+                }
+                mutation_batch_operation::Op::CompareAndSwapManifest(op) => {
+                    let result = self
+                        .object_manager
+                        .compare_and_swap_manifest(
+                            claims.tenant_id,
+                            &req.bucket_name,
+                            &op.manifest_key,
+                            op.expected_revision,
+                            &op.manifest_json,
+                            &claims.scopes,
+                        )
+                        .await?;
+                    max_watch_cursor = max_watch_cursor.max(result.receipt.watch_cursor);
+                    receipts.push(MutationBatchOperationReceipt {
+                        operation: "compare_and_swap_manifest".to_string(),
+                        object_key: op.manifest_key,
+                        version_id: result.revision.to_string(),
+                        mutation_id: result.receipt.mutation_id.to_string(),
+                        payload_hash: result.manifest_hash,
+                        record_hash: result.receipt.record_hash,
+                        append_record_sequence: 0,
+                        manifest_revision: result.revision,
+                        lease_fence_token: 0,
+                    });
+                }
+            }
+        }
+
+        let response = MutationBatchResponse {
+            batch_id: operation_digest,
+            operation_receipts: receipts,
+            watch_cursor: max_watch_cursor,
+            mutation_id: context.request_id.clone(),
+        };
+        native_idempotency::store_response(&self.storage, context, &target, &response).await?;
         Ok(Response::new(response))
     }
 
@@ -1274,7 +1659,8 @@ impl ObjectService for AppState {
 
 struct NativeMutationAttempt<'a> {
     context: &'a NativeMutationContext,
-    _guard: OwnedMutexGuard<()>,
+    _idempotency_guard: OwnedMutexGuard<()>,
+    _target_guard: OwnedMutexGuard<()>,
 }
 
 async fn begin_native_mutation<'a, T>(
@@ -1290,12 +1676,14 @@ where
     let context =
         context.ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?;
     validate_native_mutation_target_authorization(target, scopes, action)?;
-    let guard = acquire_native_mutation_lock(state, context).await?;
+    let idempotency_guard = acquire_native_mutation_lock(state, context).await?;
+    let target_guard = acquire_native_target_lock(state, context, target).await?;
     let replay = native_idempotency::load_response(&state.storage, context, target).await?;
     Ok((
         NativeMutationAttempt {
             context,
-            _guard: guard,
+            _idempotency_guard: idempotency_guard,
+            _target_guard: target_guard,
         },
         replay,
     ))
@@ -1341,7 +1729,25 @@ async fn acquire_native_mutation_lock(
     state: &AppState,
     context: &NativeMutationContext,
 ) -> Result<OwnedMutexGuard<()>, Status> {
-    let lock_key = native_mutation_lock_key(context);
+    acquire_native_lock_key(state, native_mutation_lock_key(context)).await
+}
+
+async fn acquire_native_target_lock(
+    state: &AppState,
+    context: &NativeMutationContext,
+    target: &NativeIdempotencyTarget,
+) -> Result<OwnedMutexGuard<()>, Status> {
+    acquire_native_lock_key(
+        state,
+        native_target_lock_key(context.tenant_id, &target.bucket_name, &target.object_key),
+    )
+    .await
+}
+
+async fn acquire_native_lock_key(
+    state: &AppState,
+    lock_key: String,
+) -> Result<OwnedMutexGuard<()>, Status> {
     let lock = {
         let mut locks = state.native_mutation_locks.lock().await;
         locks
@@ -1359,6 +1765,16 @@ fn native_mutation_lock_key(context: &NativeMutationContext) -> String {
     hasher.update(context.principal.as_bytes());
     hasher.update(&[0]);
     hasher.update(context.idempotency_key.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn native_target_lock_key(tenant_id: i64, bucket_name: &str, object_key: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"native-target");
+    hasher.update(&tenant_id.to_le_bytes());
+    hasher.update(bucket_name.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(object_key.as_bytes());
     hasher.finalize().to_hex().to_string()
 }
 
@@ -1532,6 +1948,40 @@ fn parse_authz_zookie(value: &str) -> Result<Option<i64>, Status> {
     Ok(Some(revision))
 }
 
+fn parse_user_metadata_json(value: &str) -> Result<Option<serde_json::Value>, Status> {
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    let parsed: serde_json::Value = serde_json::from_str(value)
+        .map_err(|e| Status::invalid_argument(format!("Invalid user_metadata_json: {e}")))?;
+    if !parsed.is_object() {
+        return Err(Status::invalid_argument(
+            "user_metadata_json must be a JSON object",
+        ));
+    }
+    Ok(Some(parsed))
+}
+
+fn json_object_string(value: Option<&serde_json::Value>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "{}".to_string())
+}
+
+fn append_stream_record_info(
+    record: crate::object_manager::AppendStreamRecordRead,
+) -> AppendStreamRecordInfo {
+    AppendStreamRecordInfo {
+        record_sequence: record.record_sequence,
+        payload_hash: record.payload_hash,
+        payload_size: record.payload_size,
+        created_at: record.created_at.to_rfc3339(),
+        content_type: record.content_type.unwrap_or_default(),
+        user_metadata_json: json_object_string(record.user_metadata.as_ref()),
+        payload: record.payload.unwrap_or_default(),
+    }
+}
+
 async fn latest_authz_revision(state: &AppState, tenant_id: i64) -> Result<u64, Status> {
     let revision = authz_journal::latest_authz_revision(&state.storage, tenant_id)
         .await
@@ -1565,6 +2015,298 @@ async fn object_watch_cursor(
 
 fn object_authz_revision(object: &crate::persistence::Object) -> Result<u64, Status> {
     u64::try_from(object.authz_revision).map_err(|_| Status::internal("Invalid authz revision"))
+}
+
+async fn enforce_write_precondition(
+    state: &AppState,
+    claims: &auth::Claims,
+    precondition: Option<&WritePrecondition>,
+) -> Result<(), Status> {
+    let Some(precondition) = precondition else {
+        return Ok(());
+    };
+    for object_precondition in &precondition.object_versions {
+        if object_precondition.bucket_name.trim().is_empty()
+            || object_precondition.object_key.trim().is_empty()
+        {
+            return Err(Status::invalid_argument(
+                "ObjectVersionPrecondition requires bucket_name and object_key",
+            ));
+        }
+        let expected_version_id =
+            parse_optional_version_id(object_precondition.expected_version_id.as_deref())?;
+        let head = state
+            .object_manager
+            .head_object(
+                Some(claims.clone()),
+                &object_precondition.bucket_name,
+                &object_precondition.object_key,
+                None,
+            )
+            .await;
+        match (
+            object_precondition.must_not_exist,
+            expected_version_id,
+            head,
+        ) {
+            (true, _, Ok(_)) => {
+                return Err(Status::failed_precondition(
+                    "ObjectVersionPreconditionFailed",
+                ));
+            }
+            (true, _, Err(status)) if status.code() == tonic::Code::NotFound => {}
+            (true, _, Err(status)) => return Err(status),
+            (false, Some(expected), Ok(object)) if object.version_id == expected => {}
+            (false, Some(_), Ok(_)) => {
+                return Err(Status::failed_precondition(
+                    "ObjectVersionPreconditionFailed",
+                ));
+            }
+            (false, Some(_), Err(status)) if status.code() == tonic::Code::NotFound => {
+                return Err(Status::failed_precondition(
+                    "ObjectVersionPreconditionFailed",
+                ));
+            }
+            (false, Some(_), Err(status)) => return Err(status),
+            (false, None, _) => {
+                return Err(Status::invalid_argument(
+                    "ObjectVersionPrecondition requires expected_version_id or must_not_exist",
+                ));
+            }
+        }
+    }
+
+    if let Some(lease_fence) = precondition.lease_fence.as_ref() {
+        validate_task_lease_id(&lease_fence.task_id)?;
+        let lease = state
+            .persistence
+            .read_named_task_lease(claims.tenant_id, &lease_fence.task_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::failed_precondition(task_lease::LEASE_EXPIRED))?;
+        let owner = lease_owner_from_claims(claims);
+        if !lease.owner.same_security_owner(&owner) {
+            return Err(Status::permission_denied(task_lease::LEASE_OWNER_MISMATCH));
+        }
+        if lease.fence_token != lease_fence.fence_token {
+            return Err(Status::failed_precondition(task_lease::STALE_FENCE));
+        }
+        if lease.expires_at_nanos <= current_time_nanos()? {
+            return Err(Status::failed_precondition(task_lease::LEASE_EXPIRED));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_mutation_batch_operations(req: &MutationBatchRequest) -> Result<(), Status> {
+    for operation in &req.operations {
+        let Some(op) = operation.op.as_ref() else {
+            return Err(Status::invalid_argument(
+                "MutationBatch operation is missing op",
+            ));
+        };
+        match op {
+            mutation_batch_operation::Op::PutObject(op) if op.object_key.trim().is_empty() => {
+                return Err(Status::invalid_argument(
+                    "put_object.object_key is required",
+                ));
+            }
+            mutation_batch_operation::Op::PatchJsonObject(op)
+                if op.object_key.trim().is_empty() =>
+            {
+                return Err(Status::invalid_argument(
+                    "patch_json_object.object_key is required",
+                ));
+            }
+            mutation_batch_operation::Op::DeleteObject(op) if op.object_key.trim().is_empty() => {
+                return Err(Status::invalid_argument(
+                    "delete_object.object_key is required",
+                ));
+            }
+            mutation_batch_operation::Op::AppendStreamRecord(op)
+                if op.stream_key.trim().is_empty() || op.stream_id.trim().is_empty() =>
+            {
+                return Err(Status::invalid_argument(
+                    "append_stream_record stream_key and stream_id are required",
+                ));
+            }
+            mutation_batch_operation::Op::CheckpointTaskLease(op)
+                if op.task_id.trim().is_empty() || op.fence_token == 0 =>
+            {
+                return Err(Status::invalid_argument(
+                    "task lease batch operation requires task_id and fence_token",
+                ));
+            }
+            mutation_batch_operation::Op::CommitTaskLease(op)
+                if op.task_id.trim().is_empty() || op.fence_token == 0 =>
+            {
+                return Err(Status::invalid_argument(
+                    "task lease batch operation requires task_id and fence_token",
+                ));
+            }
+            mutation_batch_operation::Op::CompareAndSwapManifest(op)
+                if op.manifest_key.trim().is_empty() =>
+            {
+                return Err(Status::invalid_argument(
+                    "compare_and_swap_manifest.manifest_key is required",
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_mutation_batch_authorization(
+    claims: &auth::Claims,
+    req: &MutationBatchRequest,
+) -> Result<(), Status> {
+    for operation in &req.operations {
+        let Some(op) = operation.op.as_ref() else {
+            continue;
+        };
+        match op {
+            mutation_batch_operation::Op::CheckpointTaskLease(op) => {
+                if !auth::is_authorized(
+                    AnvilAction::CoordinationLeaseWrite,
+                    &task_lease_resource(&op.task_id),
+                    &claims.scopes,
+                ) {
+                    return Err(Status::permission_denied("Permission denied"));
+                }
+            }
+            mutation_batch_operation::Op::CommitTaskLease(op) => {
+                if !auth::is_authorized(
+                    AnvilAction::CoordinationLeaseWrite,
+                    &task_lease_resource(&op.task_id),
+                    &claims.scopes,
+                ) {
+                    return Err(Status::permission_denied("Permission denied"));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct MutationBatchDigestInput<'a> {
+    precondition: Option<&'a WritePrecondition>,
+    operations: &'a [MutationBatchOperation],
+}
+
+fn mutation_batch_digest(req: &MutationBatchRequest) -> Result<String, Status> {
+    let input = MutationBatchDigestInput {
+        precondition: req.precondition.as_ref(),
+        operations: &req.operations,
+    };
+    Ok(blake3::hash(
+        &serde_json::to_vec(&input)
+            .map_err(|e| Status::internal(format!("Serialize mutation batch: {e}")))?,
+    )
+    .to_hex()
+    .to_string())
+}
+
+fn task_lease_resource(task_id: &str) -> String {
+    format!("task_lease/{task_id}")
+}
+
+async fn acquire_mutation_batch_operation_locks(
+    state: &AppState,
+    tenant_id: i64,
+    req: &MutationBatchRequest,
+) -> Result<Vec<OwnedMutexGuard<()>>, Status> {
+    let mut keys = Vec::new();
+    for operation in &req.operations {
+        let Some(op) = operation.op.as_ref() else {
+            continue;
+        };
+        let key = match op {
+            mutation_batch_operation::Op::PutObject(op) => op.object_key.as_str(),
+            mutation_batch_operation::Op::PatchJsonObject(op) => op.object_key.as_str(),
+            mutation_batch_operation::Op::DeleteObject(op) => op.object_key.as_str(),
+            mutation_batch_operation::Op::AppendStreamRecord(op) => op.stream_key.as_str(),
+            mutation_batch_operation::Op::CompareAndSwapManifest(op) => op.manifest_key.as_str(),
+            mutation_batch_operation::Op::CheckpointTaskLease(op) => {
+                keys.push(native_target_lock_key(
+                    tenant_id,
+                    &req.bucket_name,
+                    &format!("_task_lease/{}", op.task_id),
+                ));
+                continue;
+            }
+            mutation_batch_operation::Op::CommitTaskLease(op) => {
+                keys.push(native_target_lock_key(
+                    tenant_id,
+                    &req.bucket_name,
+                    &format!("_task_lease/{}", op.task_id),
+                ));
+                continue;
+            }
+        };
+        keys.push(native_target_lock_key(tenant_id, &req.bucket_name, key));
+    }
+    keys.sort();
+    keys.dedup();
+
+    let mut guards = Vec::with_capacity(keys.len());
+    for key in keys {
+        guards.push(acquire_native_lock_key(state, key).await?);
+    }
+    Ok(guards)
+}
+
+fn lease_owner_from_claims(claims: &auth::Claims) -> task_lease::TaskLeaseOwner {
+    let actor_instance_id = claims.jti.clone().unwrap_or_else(|| claims.sub.clone());
+    task_lease::TaskLeaseOwner {
+        tenant_id: claims.tenant_id,
+        principal_kind: "app".to_string(),
+        principal_id: claims.sub.clone(),
+        actor_instance_id,
+        display_name: claims.sub.clone(),
+    }
+}
+
+fn current_time_nanos() -> Result<i64, Status> {
+    chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .ok_or_else(|| Status::internal("current time exceeds supported range"))
+}
+
+fn join_u128(low: u64, high: u64) -> u128 {
+    ((high as u128) << 64) | low as u128
+}
+
+fn lease_error_status(error: anyhow::Error) -> Status {
+    let message = error.to_string();
+    if message.contains(task_lease::LEASE_HELD) {
+        Status::failed_precondition(task_lease::LEASE_HELD)
+    } else if message.contains(task_lease::LEASE_EXPIRED) {
+        Status::failed_precondition(task_lease::LEASE_EXPIRED)
+    } else if message.contains(task_lease::STALE_FENCE) {
+        Status::failed_precondition(task_lease::STALE_FENCE)
+    } else if message.contains(task_lease::LEASE_OWNER_MISMATCH) {
+        Status::permission_denied(task_lease::LEASE_OWNER_MISMATCH)
+    } else if message.contains(task_lease::LEASE_CAS_CONFLICT) {
+        Status::aborted(task_lease::LEASE_CAS_CONFLICT)
+    } else {
+        Status::failed_precondition(message)
+    }
+}
+
+fn validate_task_lease_id(value: &str) -> Result<(), Status> {
+    if value.trim().is_empty()
+        || value.len() > 256
+        || value.chars().any(|ch| ch.is_control())
+        || value.contains("..")
+        || value.starts_with('/')
+    {
+        return Err(Status::invalid_argument("Invalid task_id"));
+    }
+    Ok(())
 }
 
 fn watch_event_response(

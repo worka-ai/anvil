@@ -1,15 +1,19 @@
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
+use anvil::anvil_api::coordination_service_client::CoordinationServiceClient;
 use anvil::anvil_api::index_service_client::IndexServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::repair_service_client::RepairServiceClient;
 use anvil::anvil_api::{
-    self, AbortMultipartRequest, AppendStreamRecordRequest, CompareAndSwapManifestRequest,
-    CompleteMultipartPart, CompleteMultipartRequest, ComposeObjectRequest, ComposeObjectSource,
-    CopyObjectRequest, CreateAppendStreamRequest, CreateBucketRequest, CreateIndexRequest,
-    DeleteObjectRequest, GetObjectRequest, HeadObjectRequest, IndexKind, InitiateMultipartRequest,
-    ListObjectVersionsRequest, ListObjectsRequest, NativeMutationContext, ObjectMetadata,
-    PatchJsonObjectRequest, PutObjectRequest, RepairDirectoryIndexRequest,
-    SealAppendStreamSegmentRequest, UploadPartMetadata, UploadPartRequest, WatchPrefixRequest,
+    self, AbortMultipartRequest, AcquireTaskLeaseRequest, AppendStreamRecordRequest,
+    CompareAndSwapManifestRequest, CompleteMultipartPart, CompleteMultipartRequest,
+    ComposeObjectRequest, ComposeObjectSource, CopyObjectRequest, CreateAppendStreamRequest,
+    CreateBucketRequest, CreateIndexRequest, DeleteObjectRequest, GetObjectRequest,
+    HeadObjectRequest, IndexKind, InitiateMultipartRequest, LeaseFencePrecondition,
+    ListObjectVersionsRequest, ListObjectsRequest, MutationBatchOperation,
+    MutationBatchPatchJsonObject, MutationBatchRequest, NativeMutationContext, ObjectMetadata,
+    PatchJsonObjectRequest, PutObjectRequest, ReadAppendStreamRequest, RepairDirectoryIndexRequest,
+    SealAppendStreamSegmentRequest, TailAppendStreamRequest, UploadPartMetadata, UploadPartRequest,
+    WatchPrefixRequest, WritePrecondition,
 };
 use futures_util::StreamExt;
 use std::time::Duration;
@@ -210,6 +214,8 @@ fn put_object_chunks(
                     bucket_name: bucket_name.to_string(),
                     object_key: object_key.to_string(),
                     mutation_context,
+                    content_type: None,
+                    user_metadata_json: String::new(),
                 },
             )),
         },
@@ -1007,6 +1013,8 @@ async fn test_delete_object_creates_delete_marker() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+        content_type: None,
+        user_metadata_json: String::new(),
     };
     let chunks = vec![
         PutObjectRequest {
@@ -1150,6 +1158,8 @@ async fn test_delete_object_specific_version_removes_only_that_version() {
                     bucket_name: bucket_name.clone(),
                     object_key: object_key.clone(),
                     mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    content_type: None,
+                    user_metadata_json: String::new(),
                 },
             )),
         },
@@ -1177,6 +1187,8 @@ async fn test_delete_object_specific_version_removes_only_that_version() {
                     bucket_name: bucket_name.clone(),
                     object_key: object_key.clone(),
                     mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    content_type: None,
+                    user_metadata_json: String::new(),
                 },
             )),
         },
@@ -1441,6 +1453,8 @@ async fn test_utf8_object_keys_with_spaces_round_trip() {
                     bucket_name: bucket_name.clone(),
                     object_key: object_key.clone(),
                     mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    content_type: None,
+                    user_metadata_json: String::new(),
                 },
             )),
         },
@@ -1496,6 +1510,8 @@ async fn test_utf8_object_keys_with_spaces_round_trip() {
                             bucket_id,
                             "object-metadata",
                         )),
+                        content_type: None,
+                        user_metadata_json: String::new(),
                     },
                 )),
             },
@@ -1593,6 +1609,8 @@ async fn test_listing_omits_reserved_internal_object_keys() {
                     bucket_name: bucket_name.clone(),
                     object_key: visible_key.clone(),
                     mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    content_type: None,
+                    user_metadata_json: String::new(),
                 },
             )),
         },
@@ -1716,6 +1734,8 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
                     bucket_name: bucket_name.clone(),
                     object_key: visible_key.clone(),
                     mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    content_type: None,
+                    user_metadata_json: String::new(),
                 },
             )),
         },
@@ -1739,6 +1759,8 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
                     bucket_name: bucket_name.clone(),
                     object_key: reserved_key.clone(),
                     mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    content_type: None,
+                    user_metadata_json: String::new(),
                 },
             )),
         },
@@ -1838,6 +1860,8 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
                             bucket_id,
                             "reserved-prefix-put",
                         )),
+                        content_type: None,
+                        user_metadata_json: String::new(),
                     },
                 )),
             },
@@ -1951,6 +1975,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         base_version_id: None,
         merge_patch_json: r#"{"patched":true}"#.to_string(),
         mutation_context: Some(native_mutation_context(bucket_id, "patch-json-object")),
+        precondition: None,
     });
     patch_reserved.metadata_mut().insert(
         "authorization",
@@ -1967,6 +1992,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
             bucket_id,
             "compare-and-swap-manifest",
         )),
+        precondition: None,
     });
     manifest_reserved.metadata_mut().insert(
         "authorization",
@@ -2014,6 +2040,9 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         stream_id: uuid::Uuid::new_v4().to_string(),
         payload: b"reserved append payload".to_vec(),
         mutation_context: Some(native_mutation_context(bucket_id, "append-stream-record")),
+        content_type: None,
+        user_metadata_json: String::new(),
+        precondition: None,
     });
     append_record_reserved.metadata_mut().insert(
         "authorization",
@@ -2030,6 +2059,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         stream_key: reserved_key.clone(),
         stream_id: uuid::Uuid::new_v4().to_string(),
         mutation_context: Some(native_mutation_context(bucket_id, "seal-append-stream")),
+        precondition: None,
     });
     seal_append_reserved.metadata_mut().insert(
         "authorization",
@@ -2117,6 +2147,8 @@ async fn test_head_object() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+        content_type: None,
+        user_metadata_json: String::new(),
     };
     let chunks = vec![
         PutObjectRequest {
@@ -2203,6 +2235,8 @@ async fn test_inline_payload_threshold_is_recorded_and_readable() {
                     bucket_name: bucket_name.clone(),
                     object_key: inline_key.clone(),
                     mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    content_type: None,
+                    user_metadata_json: String::new(),
                 },
             )),
         },
@@ -2230,6 +2264,8 @@ async fn test_inline_payload_threshold_is_recorded_and_readable() {
                 bucket_name: bucket_name.clone(),
                 object_key: external_key.clone(),
                 mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                content_type: None,
+                user_metadata_json: String::new(),
             },
         )),
     }];
@@ -2436,6 +2472,8 @@ async fn test_object_version_records_index_policy_snapshot_and_mutation_metadata
                     bucket_name: bucket_name.clone(),
                     object_key: object_key.clone(),
                     mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    content_type: None,
+                    user_metadata_json: String::new(),
                 },
             )),
         },
@@ -2519,6 +2557,8 @@ async fn test_copy_object_creates_independent_destination_version() {
         bucket_name: bucket_name.clone(),
         object_key: source_key.clone(),
         mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+        content_type: None,
+        user_metadata_json: String::new(),
     };
     let chunks = vec![
         PutObjectRequest {
@@ -2775,6 +2815,8 @@ async fn test_watch_prefix_streams_snapshot_and_live_events() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+        content_type: None,
+        user_metadata_json: String::new(),
     };
     let chunks = vec![
         PutObjectRequest {
@@ -2908,6 +2950,9 @@ async fn test_append_stream_records_are_ordered_and_sealable() {
         stream_id: stream_id.clone(),
         payload: b"first".to_vec(),
         mutation_context: Some(native_mutation_context(bucket_id, "append-stream-record")),
+        content_type: None,
+        user_metadata_json: String::new(),
+        precondition: None,
     });
     first_req.metadata_mut().insert(
         "authorization",
@@ -2930,6 +2975,9 @@ async fn test_append_stream_records_are_ordered_and_sealable() {
         stream_id: stream_id.clone(),
         payload: b"second".to_vec(),
         mutation_context: Some(native_mutation_context(bucket_id, "append-stream-record")),
+        content_type: None,
+        user_metadata_json: String::new(),
+        precondition: None,
     });
     second_req.metadata_mut().insert(
         "authorization",
@@ -2949,6 +2997,7 @@ async fn test_append_stream_records_are_ordered_and_sealable() {
         stream_key: stream_key.clone(),
         stream_id: stream_id.clone(),
         mutation_context: Some(native_mutation_context(bucket_id, "seal-append-stream")),
+        precondition: None,
     });
     seal_req.metadata_mut().insert(
         "authorization",
@@ -2966,22 +3015,338 @@ async fn test_append_stream_records_are_ordered_and_sealable() {
     assert!(sealed.watch_cursor > second.watch_cursor);
 
     let mut append_after_seal = Request::new(AppendStreamRecordRequest {
-        bucket_name,
-        stream_key,
-        stream_id,
-        payload: b"must fail".to_vec(),
+        bucket_name: bucket_name.clone(),
+        stream_key: stream_key.clone(),
+        stream_id: stream_id.clone(),
+        payload: b"third".to_vec(),
         mutation_context: Some(native_mutation_context(bucket_id, "append-stream-record")),
+        content_type: None,
+        user_metadata_json: String::new(),
+        precondition: None,
     });
     append_after_seal.metadata_mut().insert(
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
     );
-    assert!(
-        object_client
-            .append_stream_record(append_after_seal)
-            .await
-            .is_err()
+    let third = object_client
+        .append_stream_record(append_after_seal)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(third.record_sequence, 3);
+
+    let mut read_req = Request::new(ReadAppendStreamRequest {
+        bucket_name: bucket_name.clone(),
+        stream_key: stream_key.clone(),
+        stream_id: stream_id.clone(),
+        after_sequence: 0,
+        limit: 10,
+        include_payload: true,
+    });
+    read_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
     );
+    let records = object_client
+        .read_append_stream(read_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .records;
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0].record_sequence, 1);
+    assert_eq!(records[0].payload, b"first".to_vec());
+    assert_eq!(records[2].record_sequence, 3);
+    assert_eq!(records[2].payload, b"third".to_vec());
+
+    let mut tail_req = Request::new(TailAppendStreamRequest {
+        bucket_name,
+        stream_key,
+        stream_id,
+        from_sequence: 3,
+        include_payload: true,
+        poll_interval_ms: 100,
+    });
+    tail_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let mut tail = object_client
+        .tail_append_stream(tail_req)
+        .await
+        .unwrap()
+        .into_inner();
+    let tailed = tokio::time::timeout(Duration::from_secs(2), tail.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .record
+        .unwrap();
+    assert_eq!(tailed.record_sequence, 3);
+    assert_eq!(tailed.payload, b"third".to_vec());
+}
+
+#[tokio::test]
+async fn test_grpc_object_metadata_round_trips_through_get_head_and_list() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr).await.unwrap();
+
+    let bucket_name = "test-object-metadata-bucket".to_string();
+    let object_key = "catalog/item.json".to_string();
+    let bucket_id = bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
+
+    let user_metadata = serde_json::json!({"queue": "outbound", "state": "pending"}).to_string();
+    let metadata = PutObjectRequest {
+        data: Some(anvil_api::put_object_request::Data::Metadata(
+            ObjectMetadata {
+                bucket_name: bucket_name.clone(),
+                object_key: object_key.clone(),
+                mutation_context: Some(native_mutation_context(bucket_id, "metadata-roundtrip")),
+                content_type: Some("application/json".to_string()),
+                user_metadata_json: user_metadata.clone(),
+            },
+        )),
+    };
+    let chunk = PutObjectRequest {
+        data: Some(anvil_api::put_object_request::Data::Chunk(
+            br#"{"ok":true}"#.to_vec(),
+        )),
+    };
+    object_client
+        .put_object(authorized(
+            tokio_stream::iter(vec![metadata, chunk]),
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let head = object_client
+        .head_object(authorized(
+            HeadObjectRequest {
+                bucket_name: bucket_name.clone(),
+                object_key: object_key.clone(),
+                version_id: None,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(head.content_type, "application/json");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&head.user_metadata_json).unwrap(),
+        serde_json::from_str::<serde_json::Value>(&user_metadata).unwrap()
+    );
+
+    let listed = object_client
+        .list_objects(authorized(
+            ListObjectsRequest {
+                bucket_name: bucket_name.clone(),
+                prefix: "catalog/".to_string(),
+                delimiter: String::new(),
+                start_after: String::new(),
+                max_keys: 10,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .objects;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].content_type, "application/json");
+
+    let mut stream = object_client
+        .get_object(authorized(
+            GetObjectRequest {
+                bucket_name,
+                object_key,
+                version_id: None,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let metadata_frame = stream.next().await.unwrap().unwrap();
+    let Some(anvil_api::get_object_response::Data::Metadata(info)) = metadata_frame.data else {
+        panic!("first get_object frame was not metadata");
+    };
+    assert_eq!(info.content_type, "application/json");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&info.user_metadata_json).unwrap(),
+        serde_json::from_str::<serde_json::Value>(&user_metadata).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_mutation_batch_rejects_stale_lease_fence_for_state_update() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut coordination_client = CoordinationServiceClient::connect(grpc_addr).await.unwrap();
+
+    let bucket_name = "test-fenced-batch-bucket".to_string();
+    let object_key = "queue/item-1.json".to_string();
+    let bucket_id = bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
+
+    let metadata = PutObjectRequest {
+        data: Some(anvil_api::put_object_request::Data::Metadata(
+            ObjectMetadata {
+                bucket_name: bucket_name.clone(),
+                object_key: object_key.clone(),
+                mutation_context: Some(native_mutation_context(bucket_id, "fenced-seed")),
+                content_type: Some("application/json".to_string()),
+                user_metadata_json: String::new(),
+            },
+        )),
+    };
+    let chunk = PutObjectRequest {
+        data: Some(anvil_api::put_object_request::Data::Chunk(
+            br#"{"state":{"state":"pending"}}"#.to_vec(),
+        )),
+    };
+    object_client
+        .put_object(authorized(
+            tokio_stream::iter(vec![metadata, chunk]),
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let task_id = "queue-item-1".to_string();
+    let lease = coordination_client
+        .acquire_task_lease(authorized(
+            AcquireTaskLeaseRequest {
+                task_id: task_id.clone(),
+                task_kind: "queue_item".to_string(),
+                partition_family: "queue".to_string(),
+                partition_id: hex::encode([1_u8; 32]),
+                owner_label: "worker-a".to_string(),
+                source_cursor_low: 0,
+                source_cursor_high: 0,
+                requested_ttl_nanos: 60_000_000_000,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .lease
+        .unwrap();
+
+    let batch = object_client
+        .mutation_batch(authorized(
+            MutationBatchRequest {
+                bucket_name: bucket_name.clone(),
+                mutation_context: Some(native_mutation_context(bucket_id, "fenced-batch-claim")),
+                precondition: Some(WritePrecondition {
+                    object_versions: vec![],
+                    lease_fence: Some(LeaseFencePrecondition {
+                        task_id: task_id.clone(),
+                        fence_token: lease.fence_token,
+                    }),
+                }),
+                operations: vec![MutationBatchOperation {
+                    op: Some(anvil_api::mutation_batch_operation::Op::PatchJsonObject(
+                        MutationBatchPatchJsonObject {
+                            object_key: object_key.clone(),
+                            base_version_id: None,
+                            merge_patch_json: serde_json::json!({
+                                "state": {"state": "leased"}
+                            })
+                            .to_string(),
+                        },
+                    )),
+                }],
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(batch.operation_receipts.len(), 1);
+
+    coordination_client
+        .commit_task_lease(authorized(
+            anvil_api::CommitTaskLeaseRequest {
+                task_id: task_id.clone(),
+                fence_token: lease.fence_token,
+                committed_cursor_low: 1,
+                committed_cursor_high: 0,
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let stale = object_client
+        .mutation_batch(authorized(
+            MutationBatchRequest {
+                bucket_name,
+                mutation_context: Some(native_mutation_context(bucket_id, "fenced-batch-stale")),
+                precondition: Some(WritePrecondition {
+                    object_versions: vec![],
+                    lease_fence: Some(LeaseFencePrecondition {
+                        task_id,
+                        fence_token: lease.fence_token,
+                    }),
+                }),
+                operations: vec![MutationBatchOperation {
+                    op: Some(anvil_api::mutation_batch_operation::Op::PatchJsonObject(
+                        MutationBatchPatchJsonObject {
+                            object_key,
+                            base_version_id: None,
+                            merge_patch_json: serde_json::json!({
+                                "state": {"state": "completed"}
+                            })
+                            .to_string(),
+                        },
+                    )),
+                }],
+            },
+            &token,
+        ))
+        .await;
+    assert!(stale.is_err());
 }
 
 #[tokio::test]
@@ -3024,6 +3389,7 @@ async fn test_compare_and_swap_manifest_enforces_expected_revision() {
             bucket_id,
             "compare-and-swap-manifest",
         )),
+        precondition: None,
     });
     create_manifest.metadata_mut().insert(
         "authorization",
@@ -3048,6 +3414,7 @@ async fn test_compare_and_swap_manifest_enforces_expected_revision() {
             bucket_id,
             "compare-and-swap-manifest",
         )),
+        precondition: None,
     });
     stale_update.metadata_mut().insert(
         "authorization",
@@ -3069,6 +3436,7 @@ async fn test_compare_and_swap_manifest_enforces_expected_revision() {
             bucket_id,
             "compare-and-swap-manifest",
         )),
+        precondition: None,
     });
     valid_update.metadata_mut().insert(
         "authorization",
@@ -3321,6 +3689,8 @@ async fn test_compose_object_concatenates_sources_in_order() {
             bucket_name: bucket_name.clone(),
             object_key: key.to_string(),
             mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+            content_type: None,
+            user_metadata_json: String::new(),
         };
         let chunks = vec![
             PutObjectRequest {
@@ -3436,6 +3806,8 @@ async fn test_patch_json_object_writes_new_merged_version() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+        content_type: None,
+        user_metadata_json: String::new(),
     };
     let initial_json = br#"{"title":"old","stats":{"open":2,"closed":1},"remove_me":true}"#;
     let chunks = vec![
@@ -3467,6 +3839,7 @@ async fn test_patch_json_object_writes_new_merged_version() {
         base_version_id: Some(put_res.version_id.clone()),
         merge_patch_json: r#"{"title":"new","stats":{"open":3},"remove_me":null}"#.to_string(),
         mutation_context: Some(native_mutation_context(bucket_id, "patch-json-object")),
+        precondition: None,
     });
     patch_req.metadata_mut().insert(
         "authorization",
@@ -3546,6 +3919,8 @@ async fn test_list_objects_with_delimiter() {
             bucket_name: bucket_name.clone(),
             object_key: key.to_string(),
             mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+            content_type: None,
+            user_metadata_json: String::new(),
         };
         let chunks = vec![
             PutObjectRequest {

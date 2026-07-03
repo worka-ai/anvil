@@ -142,6 +142,8 @@ async fn put_test_object(
                         "test-app",
                         "put-test-object",
                     )),
+                    content_type: None,
+                    user_metadata_json: String::new(),
                 },
             )),
         },
@@ -1523,6 +1525,8 @@ async fn test_object_read_uses_relationship_authorization_before_streaming_bytes
                         "test-app",
                         "object-metadata",
                     )),
+                    content_type: None,
+                    user_metadata_json: String::new(),
                 },
             )),
         },
@@ -2319,6 +2323,8 @@ async fn test_set_public_access_and_get() {
             "test-app",
             "object-metadata",
         )),
+        content_type: None,
+        user_metadata_json: String::new(),
     };
     let chunks = vec![
         PutObjectRequest {
@@ -2466,6 +2472,8 @@ async fn test_service_set_public_access() {
             "test-app",
             "object-metadata",
         )),
+        content_type: None,
+        user_metadata_json: String::new(),
     };
     let chunks = vec![
         PutObjectRequest {

@@ -82,6 +82,8 @@ async fn test_distributed_put_and_get() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+        content_type: None,
+        user_metadata_json: String::new(),
     };
     let mut chunks = vec![PutObjectRequest {
         data: Some(anvil_api::put_object_request::Data::Metadata(metadata)),
@@ -180,6 +182,8 @@ async fn test_single_node_put() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+        content_type: None,
+        user_metadata_json: String::new(),
     };
     let chunks = vec![
         PutObjectRequest {
@@ -249,6 +253,8 @@ async fn test_multi_region_list_and_isolation() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+        content_type: None,
+        user_metadata_json: String::new(),
     };
     let chunks = vec![
         PutObjectRequest {

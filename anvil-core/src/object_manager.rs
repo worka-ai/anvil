@@ -106,6 +106,17 @@ pub struct ObjectReadResult {
     pub followed_link: Option<object_links::FollowedObjectLink>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AppendStreamRecordRead {
+    pub record_sequence: u64,
+    pub payload_hash: String,
+    pub payload_size: i64,
+    pub content_type: Option<String>,
+    pub user_metadata: Option<JsonValue>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub payload: Option<Vec<u8>>,
+}
+
 struct ComposeStreamState {
     manager: ObjectManager,
     claims: auth::Claims,
@@ -154,6 +165,8 @@ pub struct AppendStreamRecordResult {
     pub record_sequence: u64,
     pub payload_hash: String,
     pub payload_size: i64,
+    pub content_type: Option<String>,
+    pub user_metadata: Option<JsonValue>,
     pub receipt: MetadataMutationReceipt,
 }
 
@@ -716,6 +729,8 @@ impl ObjectManager {
         stream_key: &str,
         stream_id: uuid::Uuid,
         payload: Vec<u8>,
+        content_type: Option<String>,
+        user_metadata: Option<JsonValue>,
         scopes: &[String],
     ) -> Result<AppendStreamRecordResult, Status> {
         self.validate_write_request(bucket_name, stream_key, scopes)?;
@@ -734,7 +749,13 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))?;
         let mutation = self
             .persistence
-            .append_stream_record(stream.id, &payload_hash, payload.len() as i64)
+            .append_stream_record(
+                stream.id,
+                &payload_hash,
+                payload.len() as i64,
+                content_type.clone(),
+                user_metadata.clone(),
+            )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -743,6 +764,8 @@ impl ObjectManager {
                 .map_err(|_| Status::internal("Invalid record sequence"))?,
             payload_hash,
             payload_size: payload.len() as i64,
+            content_type,
+            user_metadata,
             receipt: mutation.receipt,
         })
     }
@@ -797,6 +820,68 @@ impl ObjectManager {
             segment_hash,
             receipt,
         })
+    }
+
+    pub async fn read_append_stream_records(
+        &self,
+        claims: auth::Claims,
+        bucket_name: &str,
+        stream_key: &str,
+        stream_id: uuid::Uuid,
+        after_sequence: u64,
+        limit: u32,
+        include_payload: bool,
+    ) -> Result<Vec<AppendStreamRecordRead>, Status> {
+        if !auth::is_authorized(AnvilAction::ObjectRead, bucket_name, &claims.scopes)
+            && !auth::is_authorized(AnvilAction::ObjectList, bucket_name, &claims.scopes)
+        {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+        let bucket = self
+            .get_tenant_bucket(claims.tenant_id, bucket_name)
+            .await?;
+        let stream = self
+            .persistence
+            .get_active_append_stream(claims.tenant_id, bucket.id, stream_key, stream_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Append stream not found"))?;
+        let mut records = self
+            .persistence
+            .list_append_stream_records(stream.id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .into_iter()
+            .filter(|record| u64::try_from(record.record_sequence).unwrap_or(0) > after_sequence)
+            .collect::<Vec<_>>();
+        records.sort_by_key(|record| record.record_sequence);
+        let limit = if limit == 0 { 100 } else { limit.min(1000) } as usize;
+        records.truncate(limit);
+
+        let mut out = Vec::with_capacity(records.len());
+        for record in records {
+            let payload = if include_payload {
+                Some(
+                    self.storage
+                        .retrieve_whole_object(&record.payload_hash)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?,
+                )
+            } else {
+                None
+            };
+            out.push(AppendStreamRecordRead {
+                record_sequence: u64::try_from(record.record_sequence)
+                    .map_err(|_| Status::internal("Invalid append record sequence"))?,
+                payload_hash: record.payload_hash,
+                payload_size: record.payload_size,
+                content_type: record.content_type,
+                user_metadata: record.user_meta,
+                created_at: record.created_at,
+                payload,
+            });
+        }
+        Ok(out)
     }
 
     pub async fn compare_and_swap_manifest(

@@ -251,6 +251,77 @@ async fn test_s3_regional_host_routing_reads_same_object_and_rejects_dotted_host
 }
 
 #[tokio::test]
+async fn test_s3_public_get_returns_latest_overwritten_inline_object() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let app_name = format!("s3-public-overwrite-{}", uuid::Uuid::new_v4());
+    let (client_id, client_secret) = create_app(&cluster, &app_name).await;
+    grant_wildcard_policy(&cluster, &app_name).await;
+
+    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
+    let s3 = s3_client(http_base, &client_id, &client_secret);
+    let bucket = format!("public-overwrite-{}", uuid::Uuid::new_v4());
+    let key = "models/gpt-oss-20b/anvil-index.json";
+    let first = br#"{"files":[{"path":"config.json"}]}"#;
+    let second = br#"{"files":[{"path":"config.json"},{"path":"README.md"}]}"#;
+
+    s3.create_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("CreateBucket should succeed");
+
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut public_req = tonic::Request::new(SetPublicAccessRequest {
+        bucket: bucket.clone(),
+        allow_public_read: true,
+    });
+    public_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", cluster.token).parse().unwrap(),
+    );
+    auth_client.set_public_access(public_req).await.unwrap();
+
+    s3.put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(first))
+        .send()
+        .await
+        .expect("first inline PUT should succeed");
+    assert_public_get_body(http_base, &bucket, key, first).await;
+
+    s3.put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(second))
+        .send()
+        .await
+        .expect("overwriting inline PUT should succeed");
+    assert_public_get_body(http_base, &bucket, key, second).await;
+}
+
+async fn assert_public_get_body(http_base: &str, bucket: &str, key: &str, expected: &[u8]) {
+    let response = reqwest::Client::new()
+        .get(format!("{http_base}/{bucket}/{key}"))
+        .send()
+        .await
+        .expect("public GET should send");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let content_length = response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    assert_eq!(content_length, Some(expected.len()));
+    let body = response.bytes().await.expect("public GET body should read");
+    assert_eq!(body.as_ref(), expected);
+}
+
+#[tokio::test]
 async fn test_s3_regional_routes_public_reads_to_tenant_scoped_duplicate_bucket() {
     let mut cluster = TestCluster::new_with_config(&["test-region-1"], |config| {
         config.public_region_base_domain = "test-region-1.anvil-storage.test".to_string();
@@ -1200,6 +1271,11 @@ async fn test_s3_put_triggers_full_text_index_build() {
                     phrase: false,
                     path_prefix: String::new(),
                     metadata_filters_json: String::new(),
+                    typed_predicates_json: String::new(),
+                    typed_order_json: String::new(),
+                    page_token: String::new(),
+                    require_caught_up_to_watch_cursor: String::new(),
+                    lag_timeout_ms: 0,
                 },
                 &cluster.token,
             ))
@@ -1292,6 +1368,11 @@ async fn test_s3_put_metadata_field_triggers_full_text_index_build() {
                     phrase: false,
                     path_prefix: String::new(),
                     metadata_filters_json: String::new(),
+                    typed_predicates_json: String::new(),
+                    typed_order_json: String::new(),
+                    page_token: String::new(),
+                    require_caught_up_to_watch_cursor: String::new(),
+                    lag_timeout_ms: 0,
                 },
                 &cluster.token,
             ))
@@ -1386,6 +1467,11 @@ async fn test_s3_put_personaldb_table_column_triggers_full_text_index_build() {
                     phrase: false,
                     path_prefix: String::new(),
                     metadata_filters_json: String::new(),
+                    typed_predicates_json: String::new(),
+                    typed_order_json: String::new(),
+                    page_token: String::new(),
+                    require_caught_up_to_watch_cursor: String::new(),
+                    lag_timeout_ms: 0,
                 },
                 &cluster.token,
             ))
@@ -1475,6 +1561,11 @@ async fn test_s3_put_media_transcript_triggers_full_text_index_build() {
                     phrase: false,
                     path_prefix: String::new(),
                     metadata_filters_json: String::new(),
+                    typed_predicates_json: String::new(),
+                    typed_order_json: String::new(),
+                    page_token: String::new(),
+                    require_caught_up_to_watch_cursor: String::new(),
+                    lag_timeout_ms: 0,
                 },
                 &cluster.token,
             ))
@@ -1571,6 +1662,11 @@ async fn test_s3_put_triggers_vector_index_build() {
                     phrase: false,
                     path_prefix: String::new(),
                     metadata_filters_json: String::new(),
+                    typed_predicates_json: String::new(),
+                    typed_order_json: String::new(),
+                    page_token: String::new(),
+                    require_caught_up_to_watch_cursor: String::new(),
+                    lag_timeout_ms: 0,
                 },
                 &cluster.token,
             ))
