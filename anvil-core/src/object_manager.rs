@@ -1852,27 +1852,50 @@ impl ObjectManager {
         destination_bucket_name: &str,
         destination_object_key: &str,
     ) -> Result<Object, Status> {
-        let (source_object, source_stream) = self
-            .get_object(
-                Some(claims.clone()),
-                source_bucket_name.to_string(),
-                source_object_key.to_string(),
-                source_version_id,
-            )
-            .await?;
-
-        self.put_object(
-            claims.tenant_id,
+        self.validate_write_request(
             destination_bucket_name,
             destination_object_key,
             &claims.scopes,
-            source_stream,
-            ObjectWriteOptions {
-                content_type: source_object.content_type,
-                user_metadata: source_object.user_meta,
-            },
+        )?;
+        let source_object = self
+            .head_object(
+                Some(claims.clone()),
+                source_bucket_name,
+                source_object_key,
+                source_version_id,
+            )
+            .await?;
+        let destination_bucket = self
+            .get_tenant_bucket(claims.tenant_id, destination_bucket_name)
+            .await?;
+
+        let copied = self
+            .persistence
+            .create_object(
+                claims.tenant_id,
+                destination_bucket.id,
+                destination_object_key,
+                &source_object.content_hash,
+                source_object.size,
+                &source_object.etag,
+                source_object.content_type.as_deref(),
+                source_object.user_meta,
+                source_object.shard_map,
+                source_object.inline_payload,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        self.publish_object_watch_event(
+            claims.tenant_id,
+            &destination_bucket,
+            &copied,
+            "copy",
+            false,
         )
-        .await
+        .await?;
+
+        Ok(copied)
     }
 
     pub async fn compose_object(
