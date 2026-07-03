@@ -121,23 +121,39 @@ impl TestCluster {
 
         let unique_regions: HashSet<String> = regions.iter().map(|s| s.to_string()).collect();
         let first_region = regions.first().copied().unwrap_or("default");
-        let admin_state_path = storage_path.join(format!("node-{first_region}"));
+        let admin_state_path = storage_path.join(format!("node-{first_region}-0"));
         let mut states = Vec::new();
-        for region_name in regions {
+        for (node_index, region_name) in regions.iter().enumerate() {
             let mut node_config = config.deref().clone();
             node_config.region = region_name.to_string();
             node_config.metadata_cache_ttl_secs = 1;
-            node_config.storage_path = storage_path
-                .join(format!("node-{region_name}"))
+            node_config.storage_path = storage_path.to_string_lossy().into_owned();
+            node_config.node_id_path = storage_path
+                .join(format!("node-{region_name}-{node_index}.id"))
+                .to_string_lossy()
+                .into_owned();
+            node_config.cluster_keypair_path = storage_path
+                .join(format!(
+                    "node-{region_name}-{node_index}.cluster-keypair.pb"
+                ))
                 .to_string_lossy()
                 .into_owned();
             let state = AppState::new(node_config, None).await.unwrap();
             state.persistence.create_region(region_name).await.unwrap();
-            let tenant = state
+            let tenant = if let Some(existing) = state
                 .persistence
-                .create_tenant("default", "default-key")
+                .get_tenant_by_name("default")
                 .await
-                .unwrap();
+                .unwrap()
+            {
+                existing
+            } else {
+                state
+                    .persistence
+                    .create_tenant("default", "default-key")
+                    .await
+                    .unwrap()
+            };
             let encryption_key = hex::decode(&state.config.anvil_secret_encryption_key).unwrap();
             if state
                 .persistence
