@@ -107,6 +107,7 @@ impl TestCluster {
             storage_path: storage_path.to_string_lossy().into_owned(),
             personaldb_snapshot_entry_threshold: 1024,
             personaldb_snapshot_payload_bytes_threshold: 64 * 1024 * 1024,
+            allow_test_only_embedding_provider: true,
             ..anvil_core::config::Config::default()
         };
         configure(&mut config);

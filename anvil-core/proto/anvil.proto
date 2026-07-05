@@ -307,8 +307,6 @@ message SecretEncryptionKeyRotationResponse {
   uint64 app_secrets_rotated = 5;
   uint64 hf_keys_examined = 6;
   uint64 hf_keys_rotated = 7;
-  uint64 shard_files_examined = 8;
-  uint64 shard_files_rotated = 9;
   uint64 already_active = 10;
   string audit_event_id = 11;
 }
@@ -784,6 +782,7 @@ service IndexService {
   rpc DropIndex(DropIndexRequest) returns (DropIndexResponse);
   rpc ListIndexes(ListIndexesRequest) returns (ListIndexesResponse);
   rpc QueryIndex(QueryIndexRequest) returns (QueryIndexResponse);
+  rpc QuerySpec(QuerySpecRequest) returns (QuerySpecResponse);
   rpc WatchIndexDefinition(WatchIndexDefinitionRequest) returns (stream WatchIndexDefinitionResponse);
   rpc WatchIndexPartition(WatchIndexPartitionRequest) returns (stream WatchIndexPartitionResponse);
   rpc ListIndexDiagnostics(ListIndexDiagnosticsRequest) returns (ListIndexDiagnosticsResponse);
@@ -991,6 +990,21 @@ message QueryIndexResponse {
     uint64 index_watch_cursor_applied = 8;
     bool is_caught_up = 9;
     uint64 lag_record_count_hint = 10;
+}
+
+
+message QuerySpecRequest {
+    string query_spec_json = 1;
+    string page_token = 2;
+    uint64 lag_timeout_ms = 3;
+    bool accept_degraded = 4;
+}
+
+message QuerySpecResponse {
+    QueryIndexResponse result = 1;
+    string canonical_query_hash = 2;
+    string plan_json = 3;
+    repeated string diagnostics = 4;
 }
 
 message WatchIndexDefinitionRequest {
@@ -1745,14 +1759,6 @@ message AbortMultipartResponse {
     string record_hash = 4;
     uint64 authz_revision = 5;
     uint64 watch_cursor = 6;
-}
-
-// Internal Service for node-to-node communication
-service InternalAnvilService {
-  rpc PutShard(stream PutShardRequest) returns (PutShardResponse);
-  rpc GetShard(GetShardRequest) returns (stream GetShardResponse);
-  rpc CommitShard(CommitShardRequest) returns (CommitShardResponse);
-  rpc DeleteShard(DeleteShardRequest) returns (DeleteShardResponse);
 }
 
 service InternalProxyService {
@@ -2652,38 +2658,6 @@ message WatchPersonalDbProjectionResponse {
     WatchEventEnvelope envelope = 20;
 }
 
-
-message PutShardRequest {
-    string upload_id = 1;
-    uint32 shard_index = 2;
-    bytes data = 3;
-}
-
-message PutShardResponse {}
-
-message CommitShardRequest {
-    string upload_id = 1;
-    uint32 shard_index = 2;
-    string final_object_hash = 3;
-}
-
-message CommitShardResponse {}
-
-message GetShardRequest {
-    string object_hash = 1;
-    uint32 shard_index = 2;
-}
-
-message GetShardResponse {
-    bytes data = 1;
-}
-
-message DeleteShardRequest {
-    string object_hash = 1;
-    uint32 shard_index = 2;
-}
-
-message DeleteShardResponse {}
 
 // ---------- Model Service ----------
 service ModelService {

@@ -90,10 +90,6 @@ pub enum AnvilAction {
     CoordinationLeaseAdmin,
 
     // Internal actions
-    InternalPutShard,
-    InternalGetShard,
-    InternalCommitShard,
-    InternalDeleteShard,
     InternalProxyObject,
 }
 
@@ -183,10 +179,6 @@ impl fmt::Display for AnvilAction {
             AnvilAction::CoordinationLeaseAdmin => "coordination:lease_admin",
 
             // Internal actions
-            AnvilAction::InternalPutShard => "internal:put_shard",
-            AnvilAction::InternalGetShard => "internal:get_shard",
-            AnvilAction::InternalCommitShard => "internal:commit_shard",
-            AnvilAction::InternalDeleteShard => "internal:delete_shard",
             AnvilAction::InternalProxyObject => "internal:proxy_object",
         };
         write!(f, "{}", s)
@@ -281,10 +273,6 @@ impl FromStr for AnvilAction {
             "coordination:lease_admin" => Ok(AnvilAction::CoordinationLeaseAdmin),
 
             // Internal actions
-            "internal:put_shard" => Ok(AnvilAction::InternalPutShard),
-            "internal:get_shard" => Ok(AnvilAction::InternalGetShard),
-            "internal:commit_shard" => Ok(AnvilAction::InternalCommitShard),
-            "internal:delete_shard" => Ok(AnvilAction::InternalDeleteShard),
             "internal:proxy_object" => Ok(AnvilAction::InternalProxyObject),
 
             _ => Err(anyhow::anyhow!("Unknown action: {}", s)),
@@ -334,8 +322,7 @@ mod tests {
             AnvilAction::CoordinationLeaseRead,
             AnvilAction::CoordinationLeaseWrite,
             AnvilAction::CoordinationLeaseAdmin,
-            AnvilAction::InternalPutShard,
-            AnvilAction::InternalDeleteShard,
+            AnvilAction::InternalProxyObject,
         ];
 
         for action in actions {
