@@ -1033,7 +1033,7 @@ fn s3_remote_bucket_response(
             s3_error(
                 "ServiceUnavailable",
                 &format!(
-                    "Bucket is in region {region}; cross-region proxying is required by policy but is not implemented"
+                    "Bucket is in region {region}; cross-region proxying is required by policy but no eligible proxy target is available"
                 ),
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
             ),
@@ -2619,7 +2619,6 @@ mod list_bucket_pagination_tests {
             storage_class: None,
             user_meta: None,
             shard_map: None,
-            inline_payload: None,
             checksum: None,
             link: None,
         }
@@ -4772,7 +4771,7 @@ mod tests {
         );
         let xml = response_xml(response).await;
         assert!(xml.contains("<Code>ServiceUnavailable</Code>"));
-        assert!(xml.contains("not implemented"));
+        assert!(xml.contains("no eligible proxy target is available"));
     }
 
     #[tokio::test]

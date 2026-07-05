@@ -1,6 +1,13 @@
-use crate::storage::Storage;
+use crate::{
+    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    storage::Storage,
+};
 use anyhow::{Result, anyhow};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
+
+const GIT_SOURCE_MANIFEST_REF_PREFIX: &str = "git_source_manifest:";
+const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitSourceRepositoryManifest {
@@ -22,14 +29,33 @@ pub async fn write_git_source_repository_manifest(
     manifest: &GitSourceRepositoryManifest,
 ) -> Result<()> {
     validate_manifest(manifest)?;
-    let path = storage.git_source_manifest_path(manifest.tenant_id, &manifest.repository_id)?;
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let bytes = serde_json::to_vec_pretty(manifest)?;
-    let tmp = path.with_extension(format!("json.tmp-{}", uuid::Uuid::new_v4().simple()));
-    tokio::fs::write(&tmp, bytes).await?;
-    tokio::fs::rename(tmp, path).await?;
+    let ref_name = manifest_ref_name(manifest.tenant_id, &manifest.repository_id)?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: ref_name.clone(),
+            bytes: serde_json::to_vec(manifest)?,
+            region_id: "local".to_string(),
+            mutation_id: format!(
+                "git-source-manifest:{}:{}",
+                manifest.tenant_id, manifest.repository_id
+            ),
+        })
+        .await?;
+    store
+        .compare_and_swap_ref(CompareAndSwapRef {
+            ref_name,
+            expected_generation: None,
+            expected_target: None,
+            require_absent: false,
+            require_present: false,
+            fence: None,
+            authz_revision: None,
+            source_watch_cursor: None,
+            new_target: encode_core_object_ref_target(&object_ref)?,
+            transaction_id: None,
+        })
+        .await?;
     Ok(())
 }
 
@@ -38,12 +64,18 @@ pub async fn read_git_source_repository_manifest(
     tenant_id: i64,
     repository_id: &str,
 ) -> Result<Option<GitSourceRepositoryManifest>> {
-    let path = storage.git_source_manifest_path(tenant_id, repository_id)?;
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(ref_value) = store
+        .read_ref(&manifest_ref_name(tenant_id, repository_id)?)
+        .await?
+    else {
+        return Ok(None);
     };
+    let bytes = store
+        .get_blob(GetBlob {
+            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+        })
+        .await?;
     let manifest: GitSourceRepositoryManifest = serde_json::from_slice(&bytes)?;
     validate_manifest(&manifest)?;
     if manifest.tenant_id != tenant_id || manifest.repository_id != repository_id {
@@ -68,12 +100,51 @@ fn validate_manifest(manifest: &GitSourceRepositoryManifest) -> Result<()> {
     if manifest.generation == 0 {
         return Err(anyhow!("git source manifest generation must be positive"));
     }
-    if !manifest.index_path.starts_with("_anvil/") {
+    if !manifest.index_path.starts_with("git_source_index:") {
         return Err(anyhow!(
-            "git source manifest index path must be storage-relative"
+            "git source manifest index path must be a CoreStore git source index ref"
         ));
     }
     Ok(())
+}
+
+fn manifest_ref_name(tenant_id: i64, repository_id: &str) -> Result<String> {
+    require_safe_component(repository_id, "repository_id")?;
+    Ok(format!(
+        "{GIT_SOURCE_MANIFEST_REF_PREFIX}tenant:{tenant_id}:repository:{repository_id}"
+    ))
+}
+
+fn require_safe_component(value: &str, field: &'static str) -> Result<()> {
+    require_nonempty(value, field)?;
+    if value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains(':')
+        || value.chars().any(char::is_control)
+    {
+        return Err(anyhow!(
+            "git source manifest {field} is not a safe component"
+        ));
+    }
+    Ok(())
+}
+
+fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
+    Ok(format!(
+        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
+    ))
+}
+
+fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
+    let encoded = target
+        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
+        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
+    Ok(serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded)?,
+    )?)
 }
 
 fn require_nonempty(value: &str, field: &'static str) -> Result<()> {
@@ -102,7 +173,10 @@ mod tests {
             source_hash: hex::encode([4; 32]),
             generation: 7,
             record_count: 12,
-            index_path: "_anvil/git/tenants/tenant-3/repositories/repo-alpha/indexes/generation-00000000000000000007-source.angit".to_string(),
+            index_path: format!(
+                "git_source_index:tenant:3:repository:repo-alpha:generation:00000000000000000007:source:{}",
+                hex::encode([4; 32])
+            ),
             updated_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
         };
         write_git_source_repository_manifest(&storage, &manifest)

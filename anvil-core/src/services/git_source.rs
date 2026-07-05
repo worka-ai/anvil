@@ -77,7 +77,7 @@ impl GitSourceService for AppState {
         let generation = self
             .next_git_source_generation(claims.tenant_id, &metadata.repository_id)
             .await?;
-        let index_path = git_source_index::write_git_source_index(
+        let index_ref = git_source_index::write_git_source_index(
             &self.storage,
             git_source_index::GitSourceIndexWrite {
                 tenant_id: claims.tenant_id,
@@ -90,10 +90,6 @@ impl GitSourceService for AppState {
         )
         .await
         .map_err(|err| Status::internal(err.to_string()))?;
-        let index_path_relative = self
-            .storage
-            .relative_storage_path(&index_path)
-            .map_err(|err| Status::internal(err.to_string()))?;
         let updated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         git_source_manifest::write_git_source_repository_manifest(
             &self.storage,
@@ -107,7 +103,7 @@ impl GitSourceService for AppState {
                 source_hash: source_hash_hex.clone(),
                 generation,
                 record_count: parsed.records.len() as u64,
-                index_path: index_path_relative.clone(),
+                index_path: index_ref.clone(),
                 updated_at: updated_at.clone(),
             },
         )
@@ -133,7 +129,7 @@ impl GitSourceService for AppState {
             event_type: "index_published".to_string(),
             generation,
             source_hash: source_hash_hex.clone(),
-            index_path: index_path_relative.clone(),
+            index_path: index_ref.clone(),
             pack_object_version_id: Some(pack_object.version_id.to_string()),
             emitted_at: updated_at,
         };
@@ -158,7 +154,7 @@ impl GitSourceService for AppState {
             payload_hash: pack_object.content_hash,
             generation,
             source_hash: source_hash_hex,
-            index_path: index_path_relative,
+            index_path: index_ref,
             record_count: parsed.records.len() as u64,
             watch_cursor_low,
             watch_cursor_high,
@@ -378,7 +374,7 @@ impl AppState {
             *version_id.as_bytes(),
         )
         .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        let index_path = git_source_index::write_git_source_index(
+        let index_ref = git_source_index::write_git_source_index(
             &self.storage,
             git_source_index::GitSourceIndexWrite {
                 tenant_id,
@@ -391,13 +387,9 @@ impl AppState {
         )
         .await
         .map_err(|err| Status::internal(err.to_string()))?;
-        let index_path_relative = self
-            .storage
-            .relative_storage_path(&index_path)
-            .map_err(|err| Status::internal(err.to_string()))?;
-        if index_path_relative != manifest.index_path {
+        if index_ref != manifest.index_path {
             let mut updated = manifest;
-            updated.index_path = index_path_relative;
+            updated.index_path = index_ref;
             updated.record_count = parsed.records.len() as u64;
             updated.updated_at =
                 chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);

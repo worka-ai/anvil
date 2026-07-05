@@ -1,17 +1,23 @@
+use crate::core_store::{
+    CompareAndSwapRef, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
+    CoreObjectRef, CoreStore, CoreTransactionUpdate, GetBlob, PutBlob, ReadStream,
+};
 use crate::storage::Storage;
 use anyhow::{Context, Result as AnyhowResult, anyhow};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::convert::TryInto;
 use std::fmt;
-use std::io::ErrorKind;
-use std::path::Path;
-use tokio::io::AsyncWriteExt;
 
 pub const CONTROL_STREAM_MAGIC: &[u8; 8] = b"ANVCTL1\0";
 pub const CONTROL_STREAM_VERSION: u16 = 1;
 pub const CONTROL_STREAM_FIXED_HEADER_LEN: usize = 8 + 2 + 4 + 8 + 4 + 4;
 pub const CONTROL_CHECKPOINT_SCHEMA: &str = "anvil.mesh.control_checkpoint.v1";
+const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
+const CONTROL_STREAM_ID_PREFIX: &str = "mesh_control_stream:";
+const CONTROL_CHECKPOINT_REF_PREFIX: &str = "mesh_control_checkpoint:";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ControlStreamFrameError {
@@ -313,12 +319,12 @@ pub struct ControlProjectionDiagnostic {
 }
 
 pub async fn diagnose_control_stream_projection(
-    path: impl AsRef<Path>,
+    storage: &Storage,
     stream_family: &str,
     partition: &str,
     projected_records: &[ControlProjectionRecord],
 ) -> AnyhowResult<Vec<ControlProjectionDiagnostic>> {
-    let log = read_control_stream_log(path).await?;
+    let log = read_control_stream_log(storage, stream_family, partition).await?;
     let mut diagnostics = Vec::new();
     if let Some(partial) = &log.partial_final_frame {
         diagnostics.push(ControlProjectionDiagnostic {
@@ -594,12 +600,12 @@ pub async fn diagnose_control_stream_projection(
 }
 
 pub async fn latest_projected_record_from_control_stream(
-    path: impl AsRef<Path>,
+    storage: &Storage,
     stream_family: &str,
     partition: &str,
     record_key: &str,
 ) -> AnyhowResult<Option<ControlProjectionRecord>> {
-    let log = read_control_stream_log(path).await?;
+    let log = read_control_stream_log(storage, stream_family, partition).await?;
     if log.partial_final_frame.is_some() {
         return Err(anyhow!(
             "control stream {stream_family}/{partition} has a partial final frame"
@@ -639,7 +645,7 @@ pub async fn write_control_checkpoint(
     checkpoint: &ControlCheckpointRecord,
 ) -> AnyhowResult<()> {
     validate_control_checkpoint(checkpoint)?;
-    let path = storage.mesh_control_checkpoint_path(
+    let ref_name = control_checkpoint_ref_name(
         &checkpoint.region,
         &checkpoint.stream_family,
         &checkpoint.partition,
@@ -677,16 +683,37 @@ pub async fn write_control_checkpoint(
             return Ok(());
         }
     }
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let tmp_path = path.with_extension(format!("json.tmp-{}", uuid::Uuid::new_v4()));
-    let mut file = tokio::fs::File::create(&tmp_path).await?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let current = store.read_ref(&ref_name).await?;
     let bytes = serde_json::to_vec_pretty(checkpoint)?;
-    file.write_all(&bytes).await?;
-    file.sync_all().await?;
-    drop(file);
-    tokio::fs::rename(tmp_path, path).await?;
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: ref_name.clone(),
+            bytes,
+            region_id: "local".to_string(),
+            mutation_id: format!(
+                "mesh-control-checkpoint:{}:{}:{}:{}",
+                checkpoint.mesh_id,
+                checkpoint.region,
+                checkpoint.stream_family,
+                checkpoint.partition
+            ),
+        })
+        .await?;
+    store
+        .compare_and_swap_ref(CompareAndSwapRef {
+            ref_name,
+            expected_generation: current.as_ref().map(|value| value.generation),
+            expected_target: current.as_ref().map(|value| value.target.clone()),
+            require_absent: current.is_none(),
+            require_present: current.is_some(),
+            fence: None,
+            authz_revision: None,
+            source_watch_cursor: None,
+            new_target: encode_core_object_ref_target(&object_ref)?,
+            transaction_id: None,
+        })
+        .await?;
     Ok(())
 }
 
@@ -696,12 +723,13 @@ pub async fn read_control_checkpoint(
     stream_family: &str,
     partition: &str,
 ) -> AnyhowResult<Option<ControlCheckpointRecord>> {
-    let path = storage.mesh_control_checkpoint_path(region, stream_family, partition)?;
-    let bytes = match tokio::fs::read(path).await {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
+    let ref_name = control_checkpoint_ref_name(region, stream_family, partition)?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(ref_value) = store.read_ref(&ref_name).await? else {
+        return Ok(None);
     };
+    let object_ref = decode_core_object_ref_target(&ref_value.target)?;
+    let bytes = store.get_blob(GetBlob { object_ref }).await?;
     let checkpoint: ControlCheckpointRecord = serde_json::from_slice(&bytes)?;
     validate_control_checkpoint(&checkpoint)?;
     if checkpoint.region != region
@@ -861,22 +889,65 @@ pub fn decode_control_stream_log(
     })
 }
 
-pub async fn read_control_stream_log(path: impl AsRef<Path>) -> AnyhowResult<ControlStreamLog> {
-    let path = path.as_ref();
-    let bytes = match tokio::fs::read(path).await {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(ControlStreamLog::default()),
-        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
-    };
-    decode_control_stream_log(&bytes).map_err(Into::into)
+pub async fn read_control_stream_log(
+    storage: &Storage,
+    stream_family: &str,
+    partition: &str,
+) -> AnyhowResult<ControlStreamLog> {
+    let stream_id = control_stream_id(stream_family, partition)?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let records = store
+        .read_stream(ReadStream {
+            stream_id: stream_id.clone(),
+            after_sequence: 0,
+            limit: 0,
+        })
+        .await?;
+    let mut log_records = Vec::new();
+    let mut offset = 0_u64;
+    for record in records {
+        let (frame, used) = ControlStreamFrame::decode(&record.payload)
+            .map_err(|err| anyhow!("decode CoreStore control stream {stream_id}: {err}"))?;
+        if used != record.payload.len() {
+            return Err(anyhow!(
+                "CoreStore control stream {stream_id} record {} has trailing bytes",
+                record.sequence
+            ));
+        }
+        let metadata = frame.metadata()?;
+        if metadata.sequence.get() != record.sequence {
+            return Err(anyhow!(
+                "CoreStore control stream {stream_id} sequence mismatch: frame {}, stream {}",
+                metadata.sequence.get(),
+                record.sequence
+            ));
+        }
+        log_records.push(ControlStreamLogRecord {
+            offset,
+            encoded_len: used,
+            metadata,
+            frame,
+        });
+        offset = offset
+            .checked_add(used as u64)
+            .ok_or_else(|| anyhow!("CoreStore control stream {stream_id} offset overflow"))?;
+    }
+    Ok(ControlStreamLog {
+        records: log_records,
+        complete_len: offset,
+        partial_final_frame: None,
+    })
 }
 
 pub async fn append_control_stream_frame(
-    path: impl AsRef<Path>,
+    storage: &Storage,
+    stream_family: &str,
+    partition: &str,
     frame: &ControlStreamFrame,
+    precondition: Option<CoreMutationPrecondition>,
 ) -> AnyhowResult<ControlStreamAppend> {
-    let path = path.as_ref();
-    let existing = read_control_stream_log(path).await?;
+    let stream_id = control_stream_id(stream_family, partition)?;
+    let existing = read_control_stream_log(storage, stream_family, partition).await?;
     if let Some(partial) = existing.partial_final_frame {
         return Err(anyhow!(
             "control stream log has partial final frame at offset {} ({} of {} bytes)",
@@ -888,28 +959,74 @@ pub async fn append_control_stream_frame(
 
     let encoded = frame.encode()?;
     let metadata = frame.metadata()?;
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("create control stream directory {}", parent.display()))?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let receipt = store
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id: format!(
+                "mesh-control:{}:{}:{}",
+                stream_family,
+                partition,
+                metadata.sequence.get()
+            ),
+            scope_partition: partition.to_string(),
+            committed_by_principal: format!(
+                "partition-owner:mesh_control:{stream_family}:{partition}"
+            ),
+            preconditions: precondition.into_iter().collect(),
+            operations: vec![CoreMutationOperation::StreamAppend {
+                partition_id: partition.to_string(),
+                stream_id: stream_id.clone(),
+                record_kind: "mesh.control.frame".to_string(),
+                payload: encoded.clone(),
+                idempotency_key: None,
+            }],
+        })
+        .await
+        .with_context(|| format!("append CoreStore control stream {stream_id}"))?;
+    let visible_sequence = receipt
+        .visible_updates
+        .iter()
+        .find_map(|update| match update {
+            CoreTransactionUpdate::StreamAppend {
+                stream_id: update_stream_id,
+                visible_sequence,
+                ..
+            } if update_stream_id == &stream_id => Some(*visible_sequence),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow!("CoreStore control stream batch did not append {stream_id}"))?;
+    if visible_sequence != metadata.sequence.get() {
+        return Err(anyhow!(
+            "CoreStore control stream {stream_id} assigned sequence {}, but frame declared {}",
+            visible_sequence,
+            metadata.sequence.get()
+        ));
     }
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await
-        .with_context(|| format!("open control stream log {}", path.display()))?;
-    file.write_all(&encoded)
-        .await
-        .with_context(|| format!("append control stream log {}", path.display()))?;
-    file.sync_data()
-        .await
-        .with_context(|| format!("sync control stream log {}", path.display()))?;
     Ok(ControlStreamAppend {
         offset: existing.complete_len,
         encoded_len: encoded.len(),
         position: metadata.into(),
     })
+}
+
+pub async fn list_control_stream_partitions(
+    storage: &Storage,
+    stream_family: &str,
+) -> AnyhowResult<Vec<String>> {
+    validate_control_stream_scope(stream_family, "control stream family")?;
+    let prefix = control_stream_prefix(stream_family);
+    let store = CoreStore::new(storage.clone()).await?;
+    let mut partitions = Vec::new();
+    for stream_id in store.list_stream_ids(&prefix).await? {
+        let Some(partition) = stream_id.strip_prefix(&prefix) else {
+            continue;
+        };
+        validate_control_stream_partition(partition)?;
+        partitions.push(partition.to_string());
+    }
+    partitions.sort();
+    partitions.dedup();
+    Ok(partitions)
 }
 
 fn decode_fixed_header(
@@ -1045,6 +1162,73 @@ fn projection_digest(payload_json: &[u8]) -> AnyhowResult<String> {
 
 fn is_delete_operation(operation: &str) -> bool {
     matches!(operation, "delete" | "deleted")
+}
+
+fn control_stream_id(stream_family: &str, partition: &str) -> AnyhowResult<String> {
+    validate_control_stream_scope(stream_family, "control stream family")?;
+    validate_control_stream_partition(partition)?;
+    Ok(format!(
+        "{CONTROL_STREAM_ID_PREFIX}{stream_family}:{partition}"
+    ))
+}
+
+fn control_stream_prefix(stream_family: &str) -> String {
+    format!("{CONTROL_STREAM_ID_PREFIX}{stream_family}:")
+}
+
+fn control_checkpoint_ref_name(
+    region: &str,
+    stream_family: &str,
+    partition: &str,
+) -> AnyhowResult<String> {
+    validate_control_stream_scope(region, "control checkpoint region")?;
+    validate_control_stream_scope(stream_family, "control checkpoint stream family")?;
+    validate_control_stream_partition(partition)?;
+    Ok(format!(
+        "{CONTROL_CHECKPOINT_REF_PREFIX}region:{region}:stream:{stream_family}:partition:{partition}"
+    ))
+}
+
+fn validate_control_stream_scope(value: &str, context: &str) -> AnyhowResult<()> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains(':')
+        || value.chars().any(|ch| ch == '\0' || ch.is_control())
+    {
+        return Err(anyhow!("{context} is not a safe path component"));
+    }
+    Ok(())
+}
+
+fn validate_control_stream_partition(value: &str) -> AnyhowResult<()> {
+    if value.len() != 4
+        || !value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(anyhow!(
+            "control stream partition must be four lowercase hex characters"
+        ));
+    }
+    Ok(())
+}
+
+fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> AnyhowResult<String> {
+    Ok(format!(
+        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
+    ))
+}
+
+fn decode_core_object_ref_target(target: &str) -> AnyhowResult<CoreObjectRef> {
+    let encoded = target
+        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
+        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
+    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
 }
 
 #[cfg(test)]
@@ -1211,14 +1395,18 @@ mod tests {
     #[tokio::test]
     async fn append_and_read_control_stream_log() {
         let dir = tempdir().unwrap();
-        let path = dir
-            .path()
-            .join("_anvil/control/v1/streams/bucket_locator/0a7f.anlog");
+        let storage = Storage::new_at(dir.path()).await.unwrap();
         let first = ControlStreamFrame::new(sample_header(1), sample_payload());
         let second = ControlStreamFrame::new(sample_header(2), sample_payload());
 
-        let first_append = append_control_stream_frame(&path, &first).await.unwrap();
-        let second_append = append_control_stream_frame(&path, &second).await.unwrap();
+        let first_append =
+            append_control_stream_frame(&storage, "bucket_locator", "0a7f", &first, None)
+                .await
+                .unwrap();
+        let second_append =
+            append_control_stream_frame(&storage, "bucket_locator", "0a7f", &second, None)
+                .await
+                .unwrap();
         let first_len = first.encode().unwrap().len();
 
         assert_eq!(first_append.offset, 0);
@@ -1226,7 +1414,9 @@ mod tests {
         assert_eq!(second_append.offset, first_len as u64);
         assert_eq!(second_append.position.sequence.get(), 2);
 
-        let log = read_control_stream_log(&path).await.unwrap();
+        let log = read_control_stream_log(&storage, "bucket_locator", "0a7f")
+            .await
+            .unwrap();
         assert_eq!(log.records.len(), 2);
         assert_eq!(log.partial_final_frame, None);
         assert_eq!(log.records[1].metadata.sequence.get(), 2);
@@ -1234,24 +1424,13 @@ mod tests {
 
     #[tokio::test]
     async fn append_rejects_log_with_partial_final_frame() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("stream.anlog");
-        let encoded = ControlStreamFrame::new(sample_header(1), sample_payload())
+        let partial = ControlStreamFrame::new(sample_header(1), sample_payload())
             .encode()
             .unwrap();
-        tokio::fs::write(&path, &encoded[..encoded.len() - 1])
-            .await
-            .unwrap();
-
-        let err = append_control_stream_frame(
-            &path,
-            &ControlStreamFrame::new(sample_header(2), sample_payload()),
-        )
-        .await
-        .unwrap_err();
+        let err = decode_control_stream_log(&partial[..partial.len() - 1]).unwrap();
         assert!(
-            err.to_string()
-                .contains("control stream log has partial final frame")
+            err.partial_final_frame.is_some(),
+            "partial frame must remain a byte-format validation concern"
         );
     }
 
@@ -1280,9 +1459,6 @@ mod tests {
             Some(checkpoint)
         );
 
-        let scoped_path = storage
-            .mesh_control_checkpoint_path("eu-west-1", "bucket_locator", "0a7f")
-            .unwrap();
         let mismatched_body = ControlCheckpointRecord::new(
             "mesh-a",
             "us-east-1",
@@ -1292,12 +1468,33 @@ mod tests {
             digest,
             "2026-07-02T00:00:00Z",
         );
-        tokio::fs::write(
-            scoped_path,
-            serde_json::to_vec_pretty(&mismatched_body).unwrap(),
-        )
-        .await
-        .unwrap();
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        let ref_name = control_checkpoint_ref_name("eu-west-1", "bucket_locator", "0a7f").unwrap();
+        let current = store.read_ref(&ref_name).await.unwrap();
+        let object_ref = store
+            .put_blob(PutBlob {
+                logical_name: ref_name.clone(),
+                bytes: serde_json::to_vec_pretty(&mismatched_body).unwrap(),
+                region_id: "local".to_string(),
+                mutation_id: "mismatched-checkpoint-test".to_string(),
+            })
+            .await
+            .unwrap();
+        store
+            .compare_and_swap_ref(CompareAndSwapRef {
+                ref_name,
+                expected_generation: current.as_ref().map(|value| value.generation),
+                expected_target: current.as_ref().map(|value| value.target.clone()),
+                require_absent: current.is_none(),
+                require_present: current.is_some(),
+                fence: None,
+                authz_revision: None,
+                source_watch_cursor: None,
+                new_target: encode_core_object_ref_target(&object_ref).unwrap(),
+                transaction_id: None,
+            })
+            .await
+            .unwrap();
 
         let err = read_control_checkpoint(&storage, "eu-west-1", "bucket_locator", "0a7f")
             .await
@@ -1415,9 +1612,7 @@ mod tests {
     #[tokio::test]
     async fn projection_diagnostic_detects_stream_projection_payload_mismatch() {
         let dir = tempdir().unwrap();
-        let path = dir
-            .path()
-            .join("_anvil/control/v1/streams/bucket_locator/0a7f.anlog");
+        let storage = Storage::new_at(dir.path()).await.unwrap();
         let stream_payload =
             br#"{"tenant_id":"tenant_acme","bucket_name":"releases","home_region":"eu-west-1"}"#;
         let projection_payload =
@@ -1426,10 +1621,12 @@ mod tests {
             sample_header_for_payload(1, stream_payload),
             stream_payload.to_vec(),
         );
-        append_control_stream_frame(&path, &frame).await.unwrap();
+        append_control_stream_frame(&storage, "bucket_locator", "0a7f", &frame, None)
+            .await
+            .unwrap();
 
         let clean = diagnose_control_stream_projection(
-            &path,
+            &storage,
             "bucket_locator",
             "0a7f",
             &[ControlProjectionRecord::new(
@@ -1443,7 +1640,7 @@ mod tests {
         assert!(clean.is_empty());
 
         let diagnostics = diagnose_control_stream_projection(
-            &path,
+            &storage,
             "bucket_locator",
             "0a7f",
             &[ControlProjectionRecord::new(

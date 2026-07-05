@@ -1,3 +1,4 @@
+use crate::core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob};
 use crate::mesh_control_stream::{
     ControlRecordDigest, ControlStreamFrame, ControlStreamSequence, read_control_checkpoint,
     read_control_stream_log,
@@ -6,12 +7,12 @@ use crate::mesh_directory::{self, BucketLocatorDescriptor, BucketLocatorStatus};
 use crate::partition_fence::{self, PartitionWritePermit};
 use crate::routing::{self, HostAliasDescriptor, HostAliasState, RoutingConfig};
 use crate::storage::Storage;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::ErrorKind;
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
 
 pub const REGION_DESCRIPTOR_SCHEMA: &str = "anvil.mesh.region.v1";
 pub const CELL_DESCRIPTOR_SCHEMA: &str = "anvil.mesh.cell.v1";
@@ -22,6 +23,8 @@ pub const REGION_DESCRIPTOR_STREAM_FAMILY: &str = "region_descriptor";
 pub const CELL_DESCRIPTOR_STREAM_FAMILY: &str = "cell_descriptor";
 pub const NODE_DESCRIPTOR_STREAM_FAMILY: &str = "node_descriptor";
 const CONTROL_MUTATION_SCHEMA: &str = "anvil.mesh.control_mutation.v1";
+const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
+const MESH_LIFECYCLE_STATE_REF: &str = "mesh_lifecycle_state:global";
 
 #[derive(Debug, Error)]
 pub enum LifecycleError {
@@ -67,6 +70,8 @@ pub enum LifecycleError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }
 
 pub type LifecycleResult<T> = Result<T, LifecycleError>;
@@ -269,28 +274,55 @@ pub struct MeshLifecycleState {
 }
 
 pub async fn read_state(storage: &Storage) -> LifecycleResult<MeshLifecycleState> {
-    let mut state = match tokio::fs::read(storage.mesh_lifecycle_state_path()).await {
-        Ok(bytes) => serde_json::from_slice(&bytes)?,
-        Err(err) if err.kind() == ErrorKind::NotFound => MeshLifecycleState::default(),
-        Err(err) => return Err(err.into()),
-    };
+    let mut state = read_lifecycle_state_projection(storage).await?;
     overlay_lifecycle_control_streams(storage, &mut state).await?;
     Ok(state)
 }
 
 async fn write_state(storage: &Storage, state: &MeshLifecycleState) -> LifecycleResult<()> {
-    let path = storage.mesh_lifecycle_state_path();
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+    let store = CoreStore::new(storage.clone()).await?;
+    let current = store.read_ref(MESH_LIFECYCLE_STATE_REF).await?;
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: MESH_LIFECYCLE_STATE_REF.to_string(),
+            bytes: serde_json::to_vec_pretty(state)?,
+            region_id: "local".to_string(),
+            mutation_id: format!("mesh-lifecycle-state:{}", uuid::Uuid::new_v4()),
+        })
+        .await?;
+    store
+        .compare_and_swap_ref(CompareAndSwapRef {
+            ref_name: MESH_LIFECYCLE_STATE_REF.to_string(),
+            expected_generation: current.as_ref().map(|value| value.generation),
+            expected_target: current.as_ref().map(|value| value.target.clone()),
+            require_absent: current.is_none(),
+            require_present: current.is_some(),
+            fence: None,
+            authz_revision: None,
+            source_watch_cursor: None,
+            new_target: encode_core_object_ref_target(&object_ref)?,
+            transaction_id: None,
+        })
+        .await?;
+    Ok(())
+}
 
-    let tmp_path = path.with_extension(format!("json.tmp-{}", uuid::Uuid::new_v4()));
-    let mut file = tokio::fs::File::create(&tmp_path).await?;
-    let bytes = serde_json::to_vec_pretty(state)?;
-    file.write_all(&bytes).await?;
-    file.sync_all().await?;
-    drop(file);
-    tokio::fs::rename(tmp_path, path).await?;
+async fn read_lifecycle_state_projection(storage: &Storage) -> LifecycleResult<MeshLifecycleState> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(ref_value) = store.read_ref(MESH_LIFECYCLE_STATE_REF).await? else {
+        return Ok(MeshLifecycleState::default());
+    };
+    let object_ref = decode_core_object_ref_target(&ref_value.target)?;
+    let bytes = store.get_blob(GetBlob { object_ref }).await?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[cfg(test)]
+async fn delete_lifecycle_state_projection(storage: &Storage) -> LifecycleResult<()> {
+    let store = CoreStore::new(storage.clone()).await?;
+    store
+        .delete_ref(MESH_LIFECYCLE_STATE_REF, None, None, false)
+        .await?;
     Ok(())
 }
 
@@ -299,23 +331,12 @@ async fn overlay_lifecycle_control_streams(
     state: &mut MeshLifecycleState,
 ) -> LifecycleResult<()> {
     for stream_family in lifecycle_control_stream_families() {
-        let family_path = storage
-            .mesh_control_stream_family_path(stream_family)
-            .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
-        let mut entries = match tokio::fs::read_dir(&family_path).await {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == ErrorKind::NotFound => continue,
-            Err(err) => return Err(err.into()),
-        };
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("anlog") {
-                continue;
-            }
-            let Some(partition) = path.file_stem().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            let log = read_control_stream_log(&path).await.map_err(|err| {
+        for partition in
+            crate::mesh_control_stream::list_control_stream_partitions(storage, stream_family)
+                .await
+                .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?
+        {
+            let log = read_control_stream_log(storage, stream_family, &partition).await.map_err(|err| {
                 LifecycleError::InvalidArgument(format!(
                     "could not replay lifecycle control stream {stream_family}/{partition}: {err}"
                 ))
@@ -324,7 +345,7 @@ async fn overlay_lifecycle_control_streams(
                 apply_lifecycle_control_frame(
                     state,
                     stream_family,
-                    partition,
+                    &partition,
                     &record.frame.header_json,
                     &record.frame.payload_json,
                 )?;
@@ -1676,20 +1697,21 @@ async fn append_lifecycle_control_mutation<T: Serialize>(
                 .to_string(),
         ));
     }
-    partition_fence::validate_partition_write(storage, authority.permit, authority.signing_key)
-        .await
-        .map_err(|rejection| {
-            LifecycleError::InvalidArgument(format!(
-                "lifecycle control write fence rejected for {stream_family}/{partition}: {}: {}",
-                rejection.code.as_str(),
-                rejection.reason
-            ))
-        })?;
+    let partition_precondition = partition_fence::partition_write_ref_precondition(
+        storage,
+        authority.permit,
+        authority.signing_key,
+    )
+    .await
+    .map_err(|rejection| {
+        LifecycleError::InvalidArgument(format!(
+            "lifecycle control write fence rejected for {stream_family}/{partition}: {}: {}",
+            rejection.code.as_str(),
+            rejection.reason
+        ))
+    })?;
 
-    let stream_path = storage
-        .mesh_control_stream_path(stream_family, partition)
-        .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
-    let existing_log = read_control_stream_log(&stream_path)
+    let existing_log = read_control_stream_log(storage, stream_family, partition)
         .await
         .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
     let sequence = existing_log
@@ -1717,9 +1739,15 @@ async fn append_lifecycle_control_mutation<T: Serialize>(
         "created_at": Utc::now().to_rfc3339(),
     }))?;
     let frame = ControlStreamFrame::new(header_json, payload_json);
-    crate::mesh_control_stream::append_control_stream_frame(stream_path, &frame)
-        .await
-        .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
+    crate::mesh_control_stream::append_control_stream_frame(
+        storage,
+        stream_family,
+        partition,
+        &frame,
+        Some(partition_precondition),
+    )
+    .await
+    .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
     Ok(())
 }
 
@@ -1831,14 +1859,6 @@ async fn validate_activation_checkpoint_streams(
     }
 
     for required in &checkpoint.required_streams {
-        let path = storage
-            .mesh_control_stream_path(&required.stream_family, &required.partition)
-            .map_err(|err| {
-                LifecycleError::InvalidArgument(format!(
-                    "activation checkpoint stream {}/{} is invalid: {err}",
-                    required.stream_family, required.partition
-                ))
-            })?;
         let Some(region_checkpoint) = read_control_checkpoint(
             storage,
             &checkpoint.region,
@@ -1889,12 +1909,14 @@ async fn validate_activation_checkpoint_streams(
             continue;
         }
 
-        let log = read_control_stream_log(&path).await.map_err(|err| {
-            LifecycleError::InvalidArgument(format!(
-                "activation checkpoint could not read control stream {}/{}: {err}",
-                required.stream_family, required.partition
-            ))
-        })?;
+        let log = read_control_stream_log(storage, &required.stream_family, &required.partition)
+            .await
+            .map_err(|err| {
+                LifecycleError::InvalidArgument(format!(
+                    "activation checkpoint could not read control stream {}/{}: {err}",
+                    required.stream_family, required.partition
+                ))
+            })?;
         let mut found_sequence = false;
         for record in log.records {
             if record.metadata.sequence == required.sequence {
@@ -1929,28 +1951,12 @@ async fn existing_control_stream_partitions(
         .map(|family| family.stream_family())
         .chain(lifecycle_control_stream_families().into_iter());
     for stream_family in stream_families {
-        let family_path = storage
-            .mesh_control_stream_family_path(stream_family)
-            .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
-        let mut entries = match tokio::fs::read_dir(&family_path).await {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == ErrorKind::NotFound => continue,
-            Err(err) => return Err(err.into()),
-        };
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("anlog") {
-                continue;
-            }
-            let Some(partition) = path.file_stem().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            if storage
-                .mesh_control_stream_path(stream_family, partition)
-                .is_ok()
-            {
-                streams.push((stream_family.to_string(), partition.to_string()));
-            }
+        for partition in
+            crate::mesh_control_stream::list_control_stream_partitions(storage, stream_family)
+                .await
+                .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?
+        {
+            streams.push((stream_family.to_string(), partition));
         }
     }
     Ok(streams)
@@ -1999,6 +2005,28 @@ fn require_nonempty(value: &str, field: &str) -> LifecycleResult<()> {
 
 fn timestamp_now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> LifecycleResult<String> {
+    Ok(format!(
+        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
+    ))
+}
+
+fn decode_core_object_ref_target(target: &str) -> LifecycleResult<CoreObjectRef> {
+    let encoded = target
+        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
+        .ok_or_else(|| {
+            LifecycleError::InvalidArgument(
+                "CoreStore ref target is not a CoreObjectRef".to_string(),
+            )
+        })?;
+    Ok(serde_json::from_slice(
+        &URL_SAFE_NO_PAD.decode(encoded).map_err(|err| {
+            LifecycleError::InvalidArgument(format!("CoreStore ref target is invalid: {err}"))
+        })?,
+    )?)
 }
 
 #[cfg(test)]
@@ -2536,9 +2564,7 @@ mod tests {
         );
         assert_eq!(replayed.nodes["node-a"].state, LifecycleState::Active);
 
-        tokio::fs::remove_file(storage.mesh_lifecycle_state_path())
-            .await
-            .unwrap();
+        delete_lifecycle_state_projection(&storage).await.unwrap();
         let replayed_without_projection = read_state(&storage).await.unwrap();
         assert_eq!(
             replayed_without_projection.regions["eu-west-1"].generation,
@@ -2701,9 +2727,6 @@ mod tests {
         sequence: u64,
         digest: ControlRecordDigest,
     ) {
-        let path = storage
-            .mesh_control_stream_path(stream_family, partition)
-            .unwrap();
         let header_json = serde_json::json!({
             "schema": "anvil.mesh.control_mutation.v1",
             "mesh_id": "mesh-a",
@@ -2723,11 +2746,14 @@ mod tests {
         .to_string()
         .into_bytes();
         crate::mesh_control_stream::append_control_stream_frame(
-            path,
+            storage,
+            stream_family,
+            partition,
             &crate::mesh_control_stream::ControlStreamFrame::new(
                 header_json,
                 br#"{"ok":true}"#.to_vec(),
             ),
+            None,
         )
         .await
         .unwrap();
@@ -2765,9 +2791,6 @@ mod tests {
         descriptor: &T,
     ) {
         let partition = lifecycle_control_partition(stream_family, record_key);
-        let path = storage
-            .mesh_control_stream_path(stream_family, &partition)
-            .unwrap();
         let payload_json = serde_json::to_vec(descriptor).unwrap();
         let digest = ControlRecordDigest::blake3(&payload_json);
         let header_json = serde_json::json!({
@@ -2789,8 +2812,11 @@ mod tests {
         .to_string()
         .into_bytes();
         crate::mesh_control_stream::append_control_stream_frame(
-            path,
+            storage,
+            stream_family,
+            &partition,
             &crate::mesh_control_stream::ControlStreamFrame::new(header_json, payload_json),
+            None,
         )
         .await
         .unwrap();
