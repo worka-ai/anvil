@@ -1,28 +1,14 @@
-use crate::formats::{
-    BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, Hash32, JournalFrame, JournalRecordKind,
-    hash32, validate_journal_chain,
+use crate::core_store::{
+    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreStore, ReadStream,
 };
-use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
+use crate::formats::{Hash32, JournalFrame, JournalRecordKind, hash32, validate_journal_chain};
+use crate::partition_fence::{PartitionWritePermit, partition_write_ref_precondition};
 use crate::persistence::{ManifestCasResult, MetadataMutationReceipt};
 use crate::storage::Storage;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::path::Path;
-use tokio::io::AsyncWriteExt;
-
-#[derive(Debug, Serialize)]
-struct ManifestJournalHeader<'a> {
-    tenant_id: String,
-    bucket_id: String,
-    partition_family: &'static str,
-    partition_id: String,
-    fence_token: u64,
-    first_sequence: u64,
-    created_at: &'a str,
-    codec: &'static str,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManifestBody {
@@ -54,6 +40,7 @@ async fn compare_and_swap_manifest(
         manifest,
         manifest_hash,
         0,
+        None,
     )
     .await
 }
@@ -71,7 +58,8 @@ pub(crate) async fn compare_and_swap_manifest_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<Option<ManifestCasResult>> {
     require_manifest_cas_permit(tenant_id, bucket_id, permit)?;
-    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
+    let partition_precondition =
+        partition_write_ref_precondition(storage, permit, partition_owner_signing_key).await?;
     compare_and_swap_manifest_inner(
         storage,
         tenant_id,
@@ -81,6 +69,7 @@ pub(crate) async fn compare_and_swap_manifest_with_permit(
         manifest,
         manifest_hash,
         permit.fence_token,
+        Some(partition_precondition),
     )
     .await
 }
@@ -95,6 +84,7 @@ async fn compare_and_swap_manifest_inner(
     manifest: JsonValue,
     manifest_hash: &str,
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<Option<ManifestCasResult>> {
     let current = current_revision(storage, tenant_id, bucket_id, object_key).await?;
     if expected_revision != current {
@@ -115,6 +105,7 @@ async fn compare_and_swap_manifest_inner(
             updated_at: Utc::now(),
         },
         fence_token,
+        partition_precondition,
     )
     .await?;
     Ok(Some(ManifestCasResult {
@@ -143,13 +134,13 @@ async fn append_manifest(
     storage: &Storage,
     body: ManifestBody,
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<MetadataMutationReceipt> {
-    let path = storage.manifest_cas_journal_path(body.tenant_id, body.bucket_id);
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    ensure_header(&path, body.tenant_id, body.bucket_id, fence_token).await?;
-    let previous = read_frames(&path).await.unwrap_or_default();
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let stream_id = manifest_cas_stream_id(body.tenant_id, body.bucket_id);
+    let previous = read_frames(&core_store, &stream_id)
+        .await
+        .unwrap_or_default();
     let sequence = previous
         .last()
         .map(|frame| frame.partition_sequence + 1)
@@ -182,12 +173,31 @@ async fn append_manifest(
         record_hash: hex::encode(frame.record_hash),
         watch_cursor: frame.partition_sequence,
     };
-    let mut file = tokio::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
+    let partition_id = hex::encode(manifest_cas_partition_id(body.tenant_id, body.bucket_id));
+    core_store
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id: format!(
+                "manifest-cas:{}:{}:{mutation_id}",
+                body.tenant_id, body.bucket_id
+            ),
+            scope_partition: partition_id.clone(),
+            committed_by_principal: manifest_cas_partition_principal(
+                body.tenant_id,
+                body.bucket_id,
+            ),
+            preconditions: partition_precondition.into_iter().collect(),
+            operations: vec![CoreMutationOperation::StreamAppend {
+                partition_id,
+                stream_id,
+                record_kind: "manifest_cas".to_string(),
+                payload: frame.encode(),
+                idempotency_key: Some(format!(
+                    "manifest-cas:{}:{}:{mutation_id}",
+                    body.tenant_id, body.bucket_id
+                )),
+            }],
+        })
         .await?;
-    file.write_all(&frame.encode()).await?;
-    file.sync_data().await?;
     Ok(receipt)
 }
 
@@ -196,8 +206,8 @@ async fn read_manifest_bodies(
     tenant_id: i64,
     bucket_id: i64,
 ) -> Result<Vec<ManifestBody>> {
-    let path = storage.manifest_cas_journal_path(tenant_id, bucket_id);
-    let frames = read_frames(&path).await?;
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let frames = read_frames(&core_store, &manifest_cas_stream_id(tenant_id, bucket_id)).await?;
     frames
         .into_iter()
         .filter(|frame| frame.record_kind == JournalRecordKind::ManifestCas)
@@ -205,65 +215,20 @@ async fn read_manifest_bodies(
         .collect()
 }
 
-async fn ensure_header(
-    path: &Path,
-    tenant_id: i64,
-    bucket_id: i64,
-    fence_token: u64,
-) -> Result<()> {
-    if tokio::fs::try_exists(path).await? {
-        return Ok(());
-    }
-    let created_at = Utc::now().to_rfc3339();
-    let header_json = serde_json::to_vec(&ManifestJournalHeader {
-        tenant_id: tenant_id.to_string(),
-        bucket_id: bucket_id.to_string(),
-        partition_family: "manifest_cas",
-        partition_id: hex::encode(manifest_cas_partition_id(tenant_id, bucket_id)),
-        fence_token,
-        first_sequence: 1,
-        created_at: &created_at,
-        codec: "none",
-    })?;
-    let header = BinaryEnvelopeHeader::new(FileFamily::MetadataJournal, 0, 0, header_json);
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .await
-        .with_context(|| format!("create manifest journal {}", path.display()))?;
-    file.write_all(&header.encode()).await?;
-    file.sync_data().await?;
-    Ok(())
-}
-
-async fn read_frames(path: &Path) -> Result<Vec<JournalFrame>> {
-    if tokio::fs::metadata(path).await.is_err() {
-        return Ok(Vec::new());
-    }
-    decode_journal_file(&tokio::fs::read(path).await?)
-}
-
-fn decode_journal_file(bytes: &[u8]) -> Result<Vec<JournalFrame>> {
-    let header = BinaryEnvelopeHeader::decode(bytes)?;
-    if header.family != FileFamily::MetadataJournal {
-        anyhow::bail!("manifest journal has wrong file family");
-    }
-    let mut input = &bytes[COMMON_HEADER_LEN + header.header_json.len()..];
+async fn read_frames(core_store: &CoreStore, stream_id: &str) -> Result<Vec<JournalFrame>> {
+    let records = core_store
+        .read_stream(ReadStream {
+            stream_id: stream_id.to_string(),
+            after_sequence: 0,
+            limit: 0,
+        })
+        .await?;
     let mut frames = Vec::new();
-    while !input.is_empty() {
-        if input.len() < 4 {
-            anyhow::bail!("truncated manifest journal frame length");
+    for record in records {
+        if record.record_kind != "manifest_cas" {
+            continue;
         }
-        let frame_len = u32::from_le_bytes(input[0..4].try_into().unwrap()) as usize;
-        let frame_end = 4usize
-            .checked_add(frame_len)
-            .ok_or_else(|| anyhow!("invalid manifest journal frame length"))?;
-        if input.len() < frame_end {
-            anyhow::bail!("truncated manifest journal frame");
-        }
-        frames.push(JournalFrame::decode(&input[..frame_end])?);
-        input = &input[frame_end..];
+        frames.push(JournalFrame::decode(&record.payload)?);
     }
     validate_journal_chain(&frames)?;
     Ok(frames)
@@ -271,6 +236,30 @@ fn decode_journal_file(bytes: &[u8]) -> Result<Vec<JournalFrame>> {
 
 pub fn manifest_cas_partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/bucket/{bucket_id}/manifest_cas").as_bytes())
+}
+
+fn manifest_cas_stream_id(tenant_id: i64, bucket_id: i64) -> String {
+    format!("manifest_cas:tenant:{tenant_id}:bucket:{bucket_id}")
+}
+
+fn manifest_cas_partition_principal(tenant_id: i64, bucket_id: i64) -> String {
+    format!("partition-owner:manifest_cas:{tenant_id}:{bucket_id}")
+}
+
+#[cfg(test)]
+pub(crate) async fn read_manifest_frame_fences_for_test(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+) -> Result<Vec<u64>> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    Ok(
+        read_frames(&core_store, &manifest_cas_stream_id(tenant_id, bucket_id))
+            .await?
+            .into_iter()
+            .map(|frame| frame.fence_token)
+            .collect(),
+    )
 }
 
 fn require_manifest_cas_permit(
@@ -343,16 +332,10 @@ mod tests {
         .unwrap();
         assert_eq!(result.revision, 1);
 
-        let journal = tokio::fs::read(storage.manifest_cas_journal_path(1, 2))
+        let core_store = CoreStore::new(storage.clone()).await.unwrap();
+        let frames = read_frames(&core_store, &manifest_cas_stream_id(1, 2))
             .await
             .unwrap();
-        let header = BinaryEnvelopeHeader::decode(&journal).unwrap();
-        let header_json: serde_json::Value = serde_json::from_slice(&header.header_json).unwrap();
-        assert_eq!(header_json["partition_family"], "manifest_cas");
-        assert_eq!(header_json["partition_id"], permit.partition_id);
-        assert_eq!(header_json["fence_token"], permit.fence_token);
-
-        let frames = decode_journal_file(&journal).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].fence_token, permit.fence_token);
     }
@@ -383,6 +366,53 @@ mod tests {
             err.to_string()
                 .contains("write permit owner is not current")
         );
+    }
+
+    #[tokio::test]
+    pub(crate) async fn manifest_cas_batch_rejects_stale_partition_precondition() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let owner = ready_owner(&storage, 1, 2, "node-a").await;
+        let stale_permit = owner.write_permit().unwrap();
+        let stale_precondition = partition_write_ref_precondition(&storage, &stale_permit, KEY)
+            .await
+            .unwrap();
+        let newer = ready_owner(&storage, 1, 2, "node-b").await;
+        assert!(newer.fence_token > stale_permit.fence_token);
+
+        let err = compare_and_swap_manifest_inner(
+            &storage,
+            1,
+            2,
+            "manifest.json",
+            0,
+            json!({"a":1}),
+            "hash-a",
+            stale_permit.fence_token,
+            Some(stale_precondition),
+        )
+        .await
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("generation mismatch") || message.contains("target mismatch"),
+            "unexpected stale precondition error: {message}"
+        );
+
+        compare_and_swap_manifest_with_permit(
+            &storage,
+            1,
+            2,
+            "manifest.json",
+            0,
+            json!({"a":1}),
+            "hash-a",
+            &newer.write_permit().unwrap(),
+            KEY,
+        )
+        .await
+        .unwrap()
+        .unwrap();
     }
 
     async fn ready_owner(

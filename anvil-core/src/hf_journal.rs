@@ -1,16 +1,14 @@
-use crate::formats::{
-    BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, Hash32, JournalFrame, JournalRecordKind,
-    hash32, validate_journal_chain,
+use crate::core_store::{
+    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreStore, ReadStream,
 };
-use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
+use crate::formats::{Hash32, JournalFrame, JournalRecordKind, hash32, validate_journal_chain};
+use crate::partition_fence::{PartitionWritePermit, partition_write_ref_precondition};
 use crate::persistence::{HfIngestion, HfIngestionItem, HfIngestionJob, HfKey};
 use crate::storage::Storage;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
-use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HfMutationKind {
@@ -31,16 +29,6 @@ impl HfMutationKind {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct HfJournalHeader<'a> {
-    partition_family: &'static str,
-    partition_id: String,
-    fence_token: u64,
-    first_sequence: u64,
-    created_at: &'a str,
-    codec: &'static str,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HfBody {
     event: String,
@@ -58,6 +46,12 @@ struct HfState {
     items: BTreeMap<i64, HfIngestionItem>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct HfWriteGuard {
+    fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
+}
+
 #[cfg(test)]
 async fn create_key(
     storage: &Storage,
@@ -65,7 +59,14 @@ async fn create_key(
     token_encrypted: &[u8],
     note: Option<&str>,
 ) -> Result<()> {
-    create_key_inner(storage, name, token_encrypted, note, 0).await
+    create_key_inner(
+        storage,
+        name,
+        token_encrypted,
+        note,
+        HfWriteGuard::default(),
+    )
+    .await
 }
 
 pub(crate) async fn create_key_with_permit(
@@ -76,8 +77,8 @@ pub(crate) async fn create_key_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
-    let fence_token = validate_hf_write(storage, permit, partition_owner_signing_key).await?;
-    create_key_inner(storage, name, token_encrypted, note, fence_token).await
+    let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
+    create_key_inner(storage, name, token_encrypted, note, guard).await
 }
 
 async fn create_key_inner(
@@ -85,7 +86,7 @@ async fn create_key_inner(
     name: &str,
     token_encrypted: &[u8],
     note: Option<&str>,
-    fence_token: u64,
+    guard: HfWriteGuard,
 ) -> Result<()> {
     let state = read_state(storage).await?;
     if state.keys.values().any(|key| key.name == name) {
@@ -106,14 +107,14 @@ async fn create_key_inner(
         None,
         None,
         None,
-        fence_token,
+        guard,
     )
     .await
 }
 
 #[cfg(test)]
 async fn delete_key(storage: &Storage, name: &str) -> Result<u64> {
-    delete_key_inner(storage, name, 0).await
+    delete_key_inner(storage, name, HfWriteGuard::default()).await
 }
 
 pub(crate) async fn delete_key_with_permit(
@@ -122,11 +123,11 @@ pub(crate) async fn delete_key_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<u64> {
-    let fence_token = validate_hf_write(storage, permit, partition_owner_signing_key).await?;
-    delete_key_inner(storage, name, fence_token).await
+    let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
+    delete_key_inner(storage, name, guard).await
 }
 
-async fn delete_key_inner(storage: &Storage, name: &str, fence_token: u64) -> Result<u64> {
+async fn delete_key_inner(storage: &Storage, name: &str, guard: HfWriteGuard) -> Result<u64> {
     let state = read_state(storage).await?;
     let deleted = state.keys.values().any(|key| key.name == name);
     if deleted {
@@ -137,7 +138,7 @@ async fn delete_key_inner(storage: &Storage, name: &str, fence_token: u64) -> Re
             Some(name.to_string()),
             None,
             None,
-            fence_token,
+            guard,
         )
         .await?;
     }
@@ -178,7 +179,7 @@ pub(crate) async fn update_key_encrypted_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
-    let fence_token = validate_hf_write(storage, permit, partition_owner_signing_key).await?;
+    let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
     let state = read_state(storage).await?;
     let mut key = state
         .keys
@@ -194,7 +195,7 @@ pub(crate) async fn update_key_encrypted_with_permit(
         None,
         None,
         None,
-        fence_token,
+        guard,
     )
     .await
 }
@@ -239,7 +240,7 @@ async fn create_ingestion(
         target_prefix,
         include_globs,
         exclude_globs,
-        0,
+        HfWriteGuard::default(),
     )
     .await
 }
@@ -260,7 +261,7 @@ pub(crate) async fn create_ingestion_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<i64> {
-    let fence_token = validate_hf_write(storage, permit, partition_owner_signing_key).await?;
+    let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
     create_ingestion_inner(
         storage,
         key_id,
@@ -273,7 +274,7 @@ pub(crate) async fn create_ingestion_with_permit(
         target_prefix,
         include_globs,
         exclude_globs,
-        fence_token,
+        guard,
     )
     .await
 }
@@ -291,7 +292,7 @@ async fn create_ingestion_inner(
     target_prefix: Option<&str>,
     include_globs: &[String],
     exclude_globs: &[String],
-    fence_token: u64,
+    guard: HfWriteGuard,
 ) -> Result<i64> {
     let state = read_state(storage).await?;
     let id = next_ingestion_id(&state)?;
@@ -319,7 +320,7 @@ async fn create_ingestion_inner(
             finished_at: None,
         }),
         None,
-        fence_token,
+        guard,
     )
     .await?;
     Ok(id)
@@ -351,7 +352,7 @@ async fn update_ingestion_state(
     state_value: crate::tasks::HFIngestionState,
     error: Option<&str>,
 ) -> Result<()> {
-    update_ingestion_state_inner(storage, id, state_value, error, 0).await
+    update_ingestion_state_inner(storage, id, state_value, error, HfWriteGuard::default()).await
 }
 
 pub(crate) async fn update_ingestion_state_with_permit(
@@ -362,8 +363,8 @@ pub(crate) async fn update_ingestion_state_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
-    let fence_token = validate_hf_write(storage, permit, partition_owner_signing_key).await?;
-    update_ingestion_state_inner(storage, id, state_value, error, fence_token).await
+    let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
+    update_ingestion_state_inner(storage, id, state_value, error, guard).await
 }
 
 async fn update_ingestion_state_inner(
@@ -371,7 +372,7 @@ async fn update_ingestion_state_inner(
     id: i64,
     state_value: crate::tasks::HFIngestionState,
     error: Option<&str>,
-    fence_token: u64,
+    guard: HfWriteGuard,
 ) -> Result<()> {
     let Some(mut job) = read_state(storage).await?.ingestions.remove(&id) else {
         return Ok(());
@@ -396,7 +397,7 @@ async fn update_ingestion_state_inner(
         None,
         Some(job),
         None,
-        fence_token,
+        guard,
     )
     .await
 }
@@ -407,11 +408,11 @@ pub(crate) async fn cancel_ingestion_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<u64> {
-    let fence_token = validate_hf_write(storage, permit, partition_owner_signing_key).await?;
-    cancel_ingestion_inner(storage, id, fence_token).await
+    let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
+    cancel_ingestion_inner(storage, id, guard).await
 }
 
-async fn cancel_ingestion_inner(storage: &Storage, id: i64, fence_token: u64) -> Result<u64> {
+async fn cancel_ingestion_inner(storage: &Storage, id: i64, guard: HfWriteGuard) -> Result<u64> {
     let Some(mut job) = read_state(storage).await?.ingestions.remove(&id) else {
         return Ok(0);
     };
@@ -430,7 +431,7 @@ async fn cancel_ingestion_inner(storage: &Storage, id: i64, fence_token: u64) ->
         None,
         Some(job),
         None,
-        fence_token,
+        guard,
     )
     .await?;
     Ok(1)
@@ -444,7 +445,15 @@ async fn add_item(
     size: Option<i64>,
     etag: Option<&str>,
 ) -> Result<i64> {
-    add_item_inner(storage, ingestion_id, path, size, etag, 0).await
+    add_item_inner(
+        storage,
+        ingestion_id,
+        path,
+        size,
+        etag,
+        HfWriteGuard::default(),
+    )
+    .await
 }
 
 pub(crate) async fn add_item_with_permit(
@@ -456,8 +465,8 @@ pub(crate) async fn add_item_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<i64> {
-    let fence_token = validate_hf_write(storage, permit, partition_owner_signing_key).await?;
-    add_item_inner(storage, ingestion_id, path, size, etag, fence_token).await
+    let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
+    add_item_inner(storage, ingestion_id, path, size, etag, guard).await
 }
 
 async fn add_item_inner(
@@ -466,7 +475,7 @@ async fn add_item_inner(
     path: &str,
     size: Option<i64>,
     etag: Option<&str>,
-    fence_token: u64,
+    guard: HfWriteGuard,
 ) -> Result<i64> {
     let state = read_state(storage).await?;
     let mut item = state
@@ -499,7 +508,7 @@ async fn add_item_inner(
         None,
         None,
         Some(item),
-        fence_token,
+        guard,
     )
     .await?;
     Ok(id)
@@ -513,8 +522,8 @@ pub(crate) async fn update_item_state_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
-    let fence_token = validate_hf_write(storage, permit, partition_owner_signing_key).await?;
-    update_item_state_inner(storage, id, state_value, error, fence_token).await
+    let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
+    update_item_state_inner(storage, id, state_value, error, guard).await
 }
 
 async fn update_item_state_inner(
@@ -522,7 +531,7 @@ async fn update_item_state_inner(
     id: i64,
     state_value: crate::tasks::HFIngestionItemState,
     error: Option<&str>,
-    fence_token: u64,
+    guard: HfWriteGuard,
 ) -> Result<()> {
     let Some(mut item) = read_state(storage).await?.items.remove(&id) else {
         return Ok(());
@@ -547,14 +556,14 @@ async fn update_item_state_inner(
         None,
         None,
         Some(item),
-        fence_token,
+        guard,
     )
     .await
 }
 
 #[cfg(test)]
 async fn update_item_success(storage: &Storage, id: i64, size: i64, etag: &str) -> Result<()> {
-    update_item_success_inner(storage, id, size, etag, 0).await
+    update_item_success_inner(storage, id, size, etag, HfWriteGuard::default()).await
 }
 
 pub(crate) async fn update_item_success_with_permit(
@@ -565,8 +574,8 @@ pub(crate) async fn update_item_success_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
-    let fence_token = validate_hf_write(storage, permit, partition_owner_signing_key).await?;
-    update_item_success_inner(storage, id, size, etag, fence_token).await
+    let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
+    update_item_success_inner(storage, id, size, etag, guard).await
 }
 
 async fn update_item_success_inner(
@@ -574,7 +583,7 @@ async fn update_item_success_inner(
     id: i64,
     size: i64,
     etag: &str,
-    fence_token: u64,
+    guard: HfWriteGuard,
 ) -> Result<()> {
     let Some(mut item) = read_state(storage).await?.items.remove(&id) else {
         return Ok(());
@@ -590,7 +599,7 @@ async fn update_item_success_inner(
         None,
         None,
         Some(item),
-        fence_token,
+        guard,
     )
     .await
 }
@@ -691,7 +700,7 @@ fn count_items(state: &HfState, id: i64, item_state: crate::tasks::HFIngestionIt
 }
 
 async fn read_state(storage: &Storage) -> Result<HfState> {
-    let frames = read_frames(&storage.hf_journal_path()).await?;
+    let frames = read_hf_journal_frames(storage).await?;
     let mut state = HfState::default();
     for frame in frames {
         if frame.record_kind != JournalRecordKind::HfMetadata {
@@ -732,14 +741,12 @@ async fn append_body(
     key_name: Option<String>,
     ingestion: Option<HfIngestion>,
     item: Option<HfIngestionItem>,
-    fence_token: u64,
+    guard: HfWriteGuard,
 ) -> Result<()> {
-    let path = storage.hf_journal_path();
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    ensure_header(&path, fence_token).await?;
-    let previous = read_frames(&path).await.unwrap_or_default();
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let previous = read_hf_journal_frames_from_store(&core_store)
+        .await
+        .unwrap_or_default();
     let sequence = previous
         .last()
         .map(|frame| frame.partition_sequence + 1)
@@ -763,7 +770,7 @@ async fn append_body(
     let frame = JournalFrame::new(
         JournalRecordKind::HfMetadata,
         sequence,
-        fence_token,
+        guard.fence_token,
         *mutation_id.as_bytes(),
         hash32(format!("hf/{key_text}").as_bytes()),
         previous_hash,
@@ -776,67 +783,44 @@ async fn append_body(
             emitted_at: Utc::now().to_rfc3339(),
         })?,
     );
-    let mut file = tokio::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
+    let partition_id = hex::encode(hf_partition_id());
+    core_store
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id: format!("hf-metadata:{mutation_id}"),
+            scope_partition: partition_id.clone(),
+            committed_by_principal: hf_partition_principal(),
+            preconditions: guard.partition_precondition.into_iter().collect(),
+            operations: vec![CoreMutationOperation::StreamAppend {
+                partition_id,
+                stream_id: hf_metadata_stream_id(),
+                record_kind: "hf_metadata".to_string(),
+                payload: frame.encode(),
+                idempotency_key: Some(format!("hf-metadata:{mutation_id}")),
+            }],
+        })
         .await?;
-    file.write_all(&frame.encode()).await?;
-    file.sync_data().await?;
     Ok(())
 }
 
-async fn ensure_header(path: &Path, fence_token: u64) -> Result<()> {
-    if tokio::fs::try_exists(path).await? {
-        return Ok(());
-    }
-    let created_at = Utc::now().to_rfc3339();
-    let header_json = serde_json::to_vec(&HfJournalHeader {
-        partition_family: "hf_metadata",
-        partition_id: hex::encode(hf_partition_id()),
-        fence_token,
-        first_sequence: 1,
-        created_at: &created_at,
-        codec: "none",
-    })?;
-    let header = BinaryEnvelopeHeader::new(FileFamily::MetadataJournal, 0, 0, header_json);
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .await
-        .with_context(|| format!("create hf journal {}", path.display()))?;
-    file.write_all(&header.encode()).await?;
-    file.sync_data().await?;
-    Ok(())
+async fn read_hf_journal_frames(storage: &Storage) -> Result<Vec<JournalFrame>> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    read_hf_journal_frames_from_store(&core_store).await
 }
 
-async fn read_frames(path: &Path) -> Result<Vec<JournalFrame>> {
-    if tokio::fs::metadata(path).await.is_err() {
-        return Ok(Vec::new());
-    }
-    decode_journal_file(&tokio::fs::read(path).await?)
-}
-
-fn decode_journal_file(bytes: &[u8]) -> Result<Vec<JournalFrame>> {
-    let header = BinaryEnvelopeHeader::decode(bytes)?;
-    if header.family != FileFamily::MetadataJournal {
-        anyhow::bail!("hf journal has wrong file family");
-    }
-    let mut input = &bytes[COMMON_HEADER_LEN + header.header_json.len()..];
+async fn read_hf_journal_frames_from_store(core_store: &CoreStore) -> Result<Vec<JournalFrame>> {
+    let records = core_store
+        .read_stream(ReadStream {
+            stream_id: hf_metadata_stream_id(),
+            after_sequence: 0,
+            limit: 0,
+        })
+        .await?;
     let mut frames = Vec::new();
-    while !input.is_empty() {
-        if input.len() < 4 {
-            anyhow::bail!("truncated hf journal frame length");
+    for record in records {
+        if record.record_kind != "hf_metadata" {
+            continue;
         }
-        let frame_len = u32::from_le_bytes(input[0..4].try_into().unwrap()) as usize;
-        let frame_end = 4usize
-            .checked_add(frame_len)
-            .ok_or_else(|| anyhow!("invalid hf journal frame length"))?;
-        if input.len() < frame_end {
-            anyhow::bail!("truncated hf journal frame");
-        }
-        frames.push(JournalFrame::decode(&input[..frame_end])?);
-        input = &input[frame_end..];
+        frames.push(JournalFrame::decode(&record.payload)?);
     }
     validate_journal_chain(&frames)?;
     Ok(frames)
@@ -879,14 +863,35 @@ pub fn hf_partition_id() -> Hash32 {
     hash32(b"hf_metadata/global")
 }
 
-async fn validate_hf_write(
+fn hf_metadata_stream_id() -> String {
+    "hf_metadata:global".to_string()
+}
+
+fn hf_partition_principal() -> String {
+    "partition-owner:hf_metadata:global".to_string()
+}
+
+#[cfg(test)]
+pub(crate) async fn read_hf_frame_fences_for_test(storage: &Storage) -> Result<Vec<u64>> {
+    Ok(read_hf_journal_frames(storage)
+        .await?
+        .into_iter()
+        .map(|frame| frame.fence_token)
+        .collect())
+}
+
+async fn hf_write_guard(
     storage: &Storage,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
-) -> Result<u64> {
+) -> Result<HfWriteGuard> {
     require_hf_permit(permit)?;
-    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
-    Ok(permit.fence_token)
+    Ok(HfWriteGuard {
+        fence_token: permit.fence_token,
+        partition_precondition: Some(
+            partition_write_ref_precondition(storage, permit, partition_owner_signing_key).await?,
+        ),
+    })
 }
 
 fn require_hf_permit(permit: &PartitionWritePermit) -> Result<()> {
@@ -968,7 +973,7 @@ mod tests {
     }
 
     #[tokio::test]
-    pub(crate) async fn hf_journal_with_permit_writes_fenced_frames_and_header() {
+    pub(crate) async fn hf_journal_with_permit_writes_fenced_frames() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, "node-a").await;
@@ -1029,14 +1034,7 @@ mod tests {
             .await
             .unwrap();
 
-        let journal = tokio::fs::read(storage.hf_journal_path()).await.unwrap();
-        let header = BinaryEnvelopeHeader::decode(&journal).unwrap();
-        let header_json: serde_json::Value = serde_json::from_slice(&header.header_json).unwrap();
-        assert_eq!(header_json["partition_family"], "hf_metadata");
-        assert_eq!(header_json["partition_id"], permit.partition_id);
-        assert_eq!(header_json["fence_token"], permit.fence_token);
-
-        let frames = decode_journal_file(&journal).unwrap();
+        let frames = read_hf_journal_frames(&storage).await.unwrap();
         assert_eq!(frames.len(), 7);
         assert!(
             frames
@@ -1068,6 +1066,48 @@ mod tests {
             err.to_string()
                 .contains("write permit owner is not current")
         );
+    }
+
+    #[tokio::test]
+    pub(crate) async fn hf_journal_batch_rejects_stale_partition_precondition() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let owner = ready_owner(&storage, "node-a").await;
+        let stale_permit = owner.write_permit().unwrap();
+        let stale_precondition = partition_write_ref_precondition(&storage, &stale_permit, KEY)
+            .await
+            .unwrap();
+        let newer = ready_owner(&storage, "node-b").await;
+        assert!(newer.fence_token > stale_permit.fence_token);
+
+        let err = create_key_inner(
+            &storage,
+            "primary",
+            b"secret",
+            Some("note"),
+            HfWriteGuard {
+                fence_token: stale_permit.fence_token,
+                partition_precondition: Some(stale_precondition),
+            },
+        )
+        .await
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("generation mismatch") || message.contains("target mismatch"),
+            "unexpected stale precondition error: {message}"
+        );
+
+        create_key_with_permit(
+            &storage,
+            "primary",
+            b"secret",
+            Some("note"),
+            &newer.write_permit().unwrap(),
+            KEY,
+        )
+        .await
+        .unwrap();
     }
 
     async fn ready_owner(

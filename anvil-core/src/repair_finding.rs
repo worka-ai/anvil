@@ -1,13 +1,18 @@
-use crate::{formats::hash32, storage::Storage};
-use anyhow::{Context, Result, anyhow};
+use crate::{
+    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    formats::hash32,
+    storage::Storage,
+};
+use anyhow::{Result, anyhow};
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::{Hmac, Mac};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::io::ErrorKind;
-use std::path::Path;
 
 type HmacSha256 = Hmac<Sha256>;
+const REPAIR_FINDING_REF_PREFIX: &str = "repair_finding:";
+const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RepairFindingSeverity {
@@ -157,9 +162,7 @@ pub async fn write_repair_finding(
         finding_signature: None,
     }
     .seal(signing_key)?;
-    let path =
-        storage.repair_finding_path(&sealed.scope_kind, &sealed.scope_id, &sealed.finding_id)?;
-    write_json_atomically(&path, &sealed).await?;
+    write_repair_finding_ref(storage, &sealed).await?;
     Ok(sealed)
 }
 
@@ -170,8 +173,12 @@ pub async fn read_repair_finding(
     finding_id: &str,
     signing_key: &[u8],
 ) -> Result<Option<RepairFinding>> {
-    let path = storage.repair_finding_path(scope_kind, scope_id, finding_id)?;
-    let Some(finding) = read_json_optional::<RepairFinding>(&path).await? else {
+    let Some(finding) = read_repair_finding_ref(
+        storage,
+        &repair_finding_ref_name(scope_kind, scope_id, finding_id)?,
+    )
+    .await?
+    else {
         return Ok(None);
     };
     finding.verify(signing_key)?;
@@ -179,7 +186,7 @@ pub async fn read_repair_finding(
         || finding.scope_id != scope_id
         || finding.finding_id != finding_id
     {
-        return Err(anyhow!("repair finding path scope mismatch"));
+        return Err(anyhow!("repair finding ref scope mismatch"));
     }
     Ok(Some(finding))
 }
@@ -190,25 +197,18 @@ pub async fn list_repair_findings(
     scope_id: &str,
     signing_key: &[u8],
 ) -> Result<Vec<RepairFinding>> {
-    let dir = storage.repair_finding_dir(scope_kind, scope_id)?;
-    let mut entries = match tokio::fs::read_dir(&dir).await {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err).with_context(|| format!("read {}", dir.display())),
-    };
+    let store = CoreStore::new(storage.clone()).await?;
     let mut findings = Vec::new();
-    while let Some(entry) = entries.next_entry().await? {
-        if entry.file_type().await?.is_dir() {
+    for ref_name in store
+        .list_ref_names(&repair_finding_ref_prefix(scope_kind, scope_id)?)
+        .await?
+    {
+        let Some(finding) = read_repair_finding_ref(storage, &ref_name).await? else {
             continue;
-        }
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
-        let finding: RepairFinding = serde_json::from_slice(&tokio::fs::read(&path).await?)?;
+        };
         finding.verify(signing_key)?;
         if finding.scope_kind != scope_kind || finding.scope_id != scope_id {
-            return Err(anyhow!("repair finding path scope mismatch"));
+            return Err(anyhow!("repair finding ref scope mismatch"));
         }
         findings.push(finding);
     }
@@ -308,32 +308,6 @@ fn sign_finding_hash(signing_key: &[u8], hash: &str, scope_parts: &[&str]) -> Re
     Ok(base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
 }
 
-async fn write_json_atomically(path: &Path, value: &impl Serialize) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let tmp = path.with_extension(format!("json.tmp-{}", uuid::Uuid::new_v4().simple()));
-    tokio::fs::write(&tmp, serde_json::to_vec_pretty(value)?)
-        .await
-        .with_context(|| format!("write temporary repair finding {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, path)
-        .await
-        .with_context(|| format!("publish repair finding {}", path.display()))?;
-    Ok(())
-}
-
-async fn read_json_optional<T>(path: &Path) -> Result<Option<T>>
-where
-    T: DeserializeOwned,
-{
-    let bytes = match tokio::fs::read(path).await {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
-    };
-    Ok(Some(serde_json::from_slice(&bytes)?))
-}
-
 fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
     if value.len() != 64 || !value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(anyhow!("{field} must be hex32"));
@@ -354,11 +328,88 @@ fn require_safe_component(value: &str, field: &'static str) -> Result<()> {
         || value == ".."
         || value.contains('/')
         || value.contains('\\')
+        || value.contains(':')
         || value.chars().any(|ch| ch == '\0' || ch.is_control())
     {
         return Err(anyhow!("{field} is not a safe path component"));
     }
     Ok(())
+}
+
+async fn write_repair_finding_ref(storage: &Storage, finding: &RepairFinding) -> Result<()> {
+    let ref_name =
+        repair_finding_ref_name(&finding.scope_kind, &finding.scope_id, &finding.finding_id)?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let current = store.read_ref(&ref_name).await?;
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: ref_name.clone(),
+            bytes: serde_json::to_vec_pretty(finding)?,
+            region_id: "local".to_string(),
+            mutation_id: format!(
+                "repair-finding:{}:{}:{}",
+                finding.scope_kind, finding.scope_id, finding.finding_id
+            ),
+        })
+        .await?;
+    store
+        .compare_and_swap_ref(CompareAndSwapRef {
+            ref_name,
+            expected_generation: current.as_ref().map(|value| value.generation),
+            expected_target: current.as_ref().map(|value| value.target.clone()),
+            require_absent: current.is_none(),
+            require_present: current.is_some(),
+            fence: None,
+            authz_revision: None,
+            source_watch_cursor: None,
+            new_target: encode_core_object_ref_target(&object_ref)?,
+            transaction_id: None,
+        })
+        .await?;
+    Ok(())
+}
+
+async fn read_repair_finding_ref(
+    storage: &Storage,
+    ref_name: &str,
+) -> Result<Option<RepairFinding>> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(ref_value) = store.read_ref(ref_name).await? else {
+        return Ok(None);
+    };
+    let object_ref = decode_core_object_ref_target(&ref_value.target)?;
+    let bytes = store.get_blob(GetBlob { object_ref }).await?;
+    Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
+fn repair_finding_ref_prefix(scope_kind: &str, scope_id: &str) -> Result<String> {
+    require_safe_component(scope_kind, "scope_kind")?;
+    require_safe_component(scope_id, "scope_id")?;
+    Ok(format!(
+        "{REPAIR_FINDING_REF_PREFIX}scope_kind:{scope_kind}:scope_id:{scope_id}:finding:"
+    ))
+}
+
+fn repair_finding_ref_name(scope_kind: &str, scope_id: &str, finding_id: &str) -> Result<String> {
+    require_safe_component(finding_id, "finding_id")?;
+    Ok(format!(
+        "{}{finding_id}",
+        repair_finding_ref_prefix(scope_kind, scope_id)?
+    ))
+}
+
+fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
+    Ok(format!(
+        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
+    ))
+}
+
+fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
+    let encoded = target
+        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
+        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
+    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
 }
 
 #[cfg(test)]
@@ -378,10 +429,16 @@ mod tests {
         let second = write_repair_finding(&storage, finding("finding-002", 20), KEY)
             .await
             .unwrap();
-        let path = storage
-            .repair_finding_path("bucket", "tenant-1-bucket-2", "finding-001")
-            .unwrap();
-        assert!(path.ends_with("_anvil/repair/findings/bucket/tenant-1-bucket-2/finding-001.json"));
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        assert!(
+            store
+                .read_ref(
+                    &repair_finding_ref_name("bucket", "tenant-1-bucket-2", "finding-001").unwrap()
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
             read_repair_finding(&storage, "bucket", "tenant-1-bucket-2", "finding-001", KEY)
                 .await
@@ -404,13 +461,41 @@ mod tests {
         write_repair_finding(&storage, finding("finding-001", 10), KEY)
             .await
             .unwrap();
-        let path = storage
-            .repair_finding_path("bucket", "tenant-1-bucket-2", "finding-001")
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        let ref_value = store
+            .read_ref(
+                &repair_finding_ref_name("bucket", "tenant-1-bucket-2", "finding-001").unwrap(),
+            )
+            .await
+            .unwrap()
             .unwrap();
+        let object_ref = decode_core_object_ref_target(&ref_value.target).unwrap();
         let mut value: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+            serde_json::from_slice(&store.get_blob(GetBlob { object_ref }).await.unwrap()).unwrap();
         value["message"] = serde_json::json!("changed");
-        tokio::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap())
+        let tampered = store
+            .put_blob(PutBlob {
+                logical_name: "repair-finding-tamper".to_string(),
+                bytes: serde_json::to_vec_pretty(&value).unwrap(),
+                region_id: "local".to_string(),
+                mutation_id: "repair-finding-tamper".to_string(),
+            })
+            .await
+            .unwrap();
+        store
+            .compare_and_swap_ref(CompareAndSwapRef {
+                ref_name: repair_finding_ref_name("bucket", "tenant-1-bucket-2", "finding-001")
+                    .unwrap(),
+                expected_generation: Some(ref_value.generation),
+                expected_target: Some(ref_value.target),
+                require_absent: false,
+                require_present: true,
+                fence: None,
+                authz_revision: None,
+                source_watch_cursor: None,
+                new_target: encode_core_object_ref_target(&tampered).unwrap(),
+                transaction_id: None,
+            })
             .await
             .unwrap();
         assert!(
@@ -418,16 +503,8 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(
-            storage
-                .repair_finding_path("../bucket", "scope", "finding")
-                .is_err()
-        );
-        assert!(
-            storage
-                .repair_finding_path("bucket", "scope", "../finding")
-                .is_err()
-        );
+        assert!(repair_finding_ref_name("../bucket", "scope", "finding").is_err());
+        assert!(repair_finding_ref_name("bucket", "scope", "../finding").is_err());
     }
 
     #[test]

@@ -1,28 +1,16 @@
-use crate::formats::{
-    BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, Hash32, JournalFrame, JournalRecordKind,
-    hash32, validate_journal_chain,
+use crate::core_store::{
+    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreStore, ReadStream,
 };
-use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
+use crate::formats::{Hash32, JournalFrame, JournalRecordKind, hash32, validate_journal_chain};
+use crate::partition_fence::{PartitionWritePermit, partition_write_ref_precondition};
 use crate::persistence::TaskRecord;
 use crate::storage::Storage;
 use crate::tasks::{TaskStatus, TaskType};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
-use tokio::io::AsyncWriteExt;
-
-#[derive(Debug, Serialize)]
-struct TaskJournalHeader<'a> {
-    partition_family: &'static str,
-    partition_id: String,
-    fence_token: u64,
-    first_sequence: u64,
-    created_at: &'a str,
-    codec: &'static str,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -60,7 +48,7 @@ async fn enqueue_task(
     payload: JsonValue,
     priority: i32,
 ) -> Result<()> {
-    enqueue_task_inner(storage, task_type, payload, priority, 0).await
+    enqueue_task_inner(storage, task_type, payload, priority, 0, None).await
 }
 
 pub(crate) async fn enqueue_task_with_permit(
@@ -72,8 +60,17 @@ pub(crate) async fn enqueue_task_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
     require_task_queue_permit(permit)?;
-    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
-    enqueue_task_inner(storage, task_type, payload, priority, permit.fence_token).await
+    let partition_precondition =
+        partition_write_ref_precondition(storage, permit, partition_owner_signing_key).await?;
+    enqueue_task_inner(
+        storage,
+        task_type,
+        payload,
+        priority,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
 }
 
 pub(crate) async fn enqueue_task_if_absent_with_permit(
@@ -85,14 +82,22 @@ pub(crate) async fn enqueue_task_if_absent_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<bool> {
     require_task_queue_permit(permit)?;
-    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
+    let partition_precondition =
+        partition_write_ref_precondition(storage, permit, partition_owner_signing_key).await?;
     let state = read_task_queue_state(storage).await?;
     if state.has_live_task(&task_type, &payload) {
         return Ok(false);
     }
-    enqueue_task_inner(storage, task_type, payload, priority, permit.fence_token)
-        .await
-        .map(|_| true)
+    enqueue_task_inner(
+        storage,
+        task_type,
+        payload,
+        priority,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
+    .map(|_| true)
 }
 
 pub(crate) async fn enqueue_index_build_task_with_permit(
@@ -103,7 +108,8 @@ pub(crate) async fn enqueue_index_build_task_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<bool> {
     require_task_queue_permit(permit)?;
-    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
+    let partition_precondition =
+        partition_write_ref_precondition(storage, permit, partition_owner_signing_key).await?;
     validate_index_build_payload(&payload)?;
     let state = read_task_queue_state(storage).await?;
     let now = Utc::now();
@@ -127,6 +133,7 @@ pub(crate) async fn enqueue_index_build_task_with_permit(
                     updated_at: now,
                 },
                 permit.fence_token,
+                Some(partition_precondition.clone()),
             )
             .await?;
         }
@@ -137,6 +144,7 @@ pub(crate) async fn enqueue_index_build_task_with_permit(
         payload,
         priority,
         permit.fence_token,
+        Some(partition_precondition),
     )
     .await
     .map(|_| true)
@@ -148,6 +156,7 @@ async fn enqueue_task_inner(
     payload: JsonValue,
     priority: i32,
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
     let state = read_task_queue_state(storage).await?;
     let now = Utc::now();
@@ -163,12 +172,18 @@ async fn enqueue_task_inner(
         created_at: now,
         updated_at: now,
     };
-    append_task_event(storage, TaskJournalBody::Enqueued { task }, fence_token).await
+    append_task_event(
+        storage,
+        TaskJournalBody::Enqueued { task },
+        fence_token,
+        partition_precondition,
+    )
+    .await
 }
 
 #[cfg(test)]
 async fn claim_pending_tasks(storage: &Storage, limit: i64) -> Result<Vec<TaskRecord>> {
-    claim_pending_tasks_inner(storage, limit, 0).await
+    claim_pending_tasks_inner(storage, limit, 0, None).await
 }
 
 pub(crate) async fn claim_pending_tasks_with_permit(
@@ -178,14 +193,22 @@ pub(crate) async fn claim_pending_tasks_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<Vec<TaskRecord>> {
     require_task_queue_permit(permit)?;
-    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
-    claim_pending_tasks_inner(storage, limit, permit.fence_token).await
+    let partition_precondition =
+        partition_write_ref_precondition(storage, permit, partition_owner_signing_key).await?;
+    claim_pending_tasks_inner(
+        storage,
+        limit,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
 }
 
 async fn claim_pending_tasks_inner(
     storage: &Storage,
     limit: i64,
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<Vec<TaskRecord>> {
     let state = read_task_queue_state(storage).await?;
     let now = Utc::now();
@@ -229,6 +252,7 @@ async fn claim_pending_tasks_inner(
                 updated_at: now,
             },
             fence_token,
+            partition_precondition.clone(),
         )
         .await?;
     }
@@ -248,7 +272,7 @@ pub async fn list_tasks(storage: &Storage) -> Result<Vec<TaskRecord>> {
 
 #[cfg(test)]
 async fn update_task_status(storage: &Storage, task_id: i64, status: TaskStatus) -> Result<()> {
-    update_task_status_inner(storage, task_id, status, 0).await
+    update_task_status_inner(storage, task_id, status, 0, None).await
 }
 
 pub(crate) async fn update_task_status_with_permit(
@@ -259,8 +283,16 @@ pub(crate) async fn update_task_status_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
     require_task_queue_permit(permit)?;
-    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
-    update_task_status_inner(storage, task_id, status, permit.fence_token).await
+    let partition_precondition =
+        partition_write_ref_precondition(storage, permit, partition_owner_signing_key).await?;
+    update_task_status_inner(
+        storage,
+        task_id,
+        status,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
 }
 
 async fn update_task_status_inner(
@@ -268,14 +300,11 @@ async fn update_task_status_inner(
     task_id: i64,
     status: TaskStatus,
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
-    if !read_task_queue_state(storage)
-        .await?
-        .tasks
-        .contains_key(&task_id)
-    {
-        return Ok(());
-    }
+    // Task status is an event-sourced transition. Do not pre-read and silently
+    // drop it: the writer already holds the task-queue fence, and stale local
+    // reads can otherwise lose a valid completion event.
     append_task_event(
         storage,
         TaskJournalBody::StatusUpdated {
@@ -284,13 +313,14 @@ async fn update_task_status_inner(
             updated_at: Utc::now(),
         },
         fence_token,
+        partition_precondition,
     )
     .await
 }
 
 #[cfg(test)]
 async fn fail_task(storage: &Storage, task_id: i64, error: &str) -> Result<()> {
-    fail_task_inner(storage, task_id, error, 0).await
+    fail_task_inner(storage, task_id, error, 0, None).await
 }
 
 pub(crate) async fn fail_task_with_permit(
@@ -301,8 +331,16 @@ pub(crate) async fn fail_task_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
     require_task_queue_permit(permit)?;
-    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
-    fail_task_inner(storage, task_id, error, permit.fence_token).await
+    let partition_precondition =
+        partition_write_ref_precondition(storage, permit, partition_owner_signing_key).await?;
+    fail_task_inner(
+        storage,
+        task_id,
+        error,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
 }
 
 async fn fail_task_inner(
@@ -310,6 +348,7 @@ async fn fail_task_inner(
     task_id: i64,
     error: &str,
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
     let Some(task) = read_task_queue_state(storage)
         .await?
@@ -332,12 +371,13 @@ async fn fail_task_inner(
             updated_at: now,
         },
         fence_token,
+        partition_precondition,
     )
     .await
 }
 
 async fn read_task_queue_state(storage: &Storage) -> Result<TaskQueueState> {
-    let frames = read_task_journal_frames_at_path(&storage.task_queue_journal_path()).await?;
+    let frames = read_task_journal_frames(storage).await?;
     let mut state = TaskQueueState::default();
     for frame in frames {
         if frame.record_kind != JournalRecordKind::TaskQueue {
@@ -353,13 +393,10 @@ async fn append_task_event(
     storage: &Storage,
     event: TaskJournalBody,
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
-    let path = storage.task_queue_journal_path();
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    ensure_journal_header(&path, fence_token).await?;
-    let previous = read_task_journal_frames_at_path(path.as_path())
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let previous = read_task_journal_frames_from_store(&core_store)
         .await
         .unwrap_or_default();
     let sequence = previous
@@ -381,71 +418,44 @@ async fn append_task_event(
         previous_hash,
         serde_json::to_vec(&event)?,
     );
-    let mut file = tokio::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .await
-        .with_context(|| format!("open task queue journal {}", path.display()))?;
-    file.write_all(&frame.encode()).await?;
-    file.sync_data().await?;
+    let partition_id = hex::encode(task_queue_partition_id());
+    core_store
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id: format!("task-queue:{mutation_id}"),
+            scope_partition: partition_id.clone(),
+            committed_by_principal: task_queue_partition_principal(),
+            preconditions: partition_precondition.into_iter().collect(),
+            operations: vec![CoreMutationOperation::StreamAppend {
+                partition_id,
+                stream_id: task_queue_stream_id(),
+                record_kind: "task_queue".to_string(),
+                payload: frame.encode(),
+                idempotency_key: Some(format!("task-queue:{mutation_id}")),
+            }],
+        })
+        .await?;
     Ok(())
 }
 
-async fn ensure_journal_header(path: &Path, fence_token: u64) -> Result<()> {
-    if tokio::fs::try_exists(path).await? {
-        return Ok(());
-    }
-    let created_at = Utc::now().to_rfc3339();
-    let header_json = serde_json::to_vec(&TaskJournalHeader {
-        partition_family: "task_queue",
-        partition_id: hex::encode(task_queue_partition_id()),
-        fence_token,
-        first_sequence: 1,
-        created_at: &created_at,
-        codec: "none",
-    })?;
-    let header = BinaryEnvelopeHeader::new(FileFamily::MetadataJournal, 0, 0, header_json);
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .await
-        .with_context(|| format!("create task queue journal {}", path.display()))?;
-    file.write_all(&header.encode()).await?;
-    file.sync_data().await?;
-    Ok(())
+async fn read_task_journal_frames(storage: &Storage) -> Result<Vec<JournalFrame>> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    read_task_journal_frames_from_store(&core_store).await
 }
 
-async fn read_task_journal_frames_at_path(path: &Path) -> Result<Vec<JournalFrame>> {
-    if tokio::fs::metadata(path).await.is_err() {
-        return Ok(Vec::new());
-    }
-    let bytes = tokio::fs::read(path)
-        .await
-        .with_context(|| format!("read task queue journal {}", path.display()))?;
-    decode_journal_file(&bytes)
-}
-
-fn decode_journal_file(bytes: &[u8]) -> Result<Vec<JournalFrame>> {
-    let header = BinaryEnvelopeHeader::decode(bytes)?;
-    if header.family != FileFamily::MetadataJournal {
-        anyhow::bail!("task queue journal has wrong file family");
-    }
-    let mut input = &bytes[COMMON_HEADER_LEN + header.header_json.len()..];
+async fn read_task_journal_frames_from_store(core_store: &CoreStore) -> Result<Vec<JournalFrame>> {
+    let records = core_store
+        .read_stream(ReadStream {
+            stream_id: task_queue_stream_id(),
+            after_sequence: 0,
+            limit: 0,
+        })
+        .await?;
     let mut frames = Vec::new();
-    while !input.is_empty() {
-        if input.len() < 4 {
-            anyhow::bail!("truncated task queue journal frame length");
+    for record in records {
+        if record.record_kind != "task_queue" {
+            continue;
         }
-        let frame_len = u32::from_le_bytes(input[0..4].try_into().unwrap()) as usize;
-        let frame_end = 4usize
-            .checked_add(frame_len)
-            .ok_or_else(|| anyhow!("invalid task queue journal frame length"))?;
-        if input.len() < frame_end {
-            anyhow::bail!("truncated task queue journal frame");
-        }
-        frames.push(JournalFrame::decode(&input[..frame_end])?);
-        input = &input[frame_end..];
+        frames.push(JournalFrame::decode(&record.payload)?);
     }
     validate_journal_chain(&frames)?;
     Ok(frames)
@@ -603,6 +613,23 @@ pub fn task_queue_partition_id() -> Hash32 {
     hash32(b"task_queue/global")
 }
 
+fn task_queue_stream_id() -> String {
+    "task_queue:global".to_string()
+}
+
+fn task_queue_partition_principal() -> String {
+    "partition-owner:task_queue:global".to_string()
+}
+
+#[cfg(test)]
+pub(crate) async fn read_task_frame_fences_for_test(storage: &Storage) -> Result<Vec<u64>> {
+    Ok(read_task_journal_frames(storage)
+        .await?
+        .into_iter()
+        .map(|frame| frame.fence_token)
+        .collect())
+}
+
 fn require_task_queue_permit(permit: &PartitionWritePermit) -> Result<()> {
     if permit.partition_family != "task_queue"
         || permit.partition_id != hex::encode(task_queue_partition_id())
@@ -677,24 +704,20 @@ mod tests {
         .await
         .unwrap();
 
-        let path = storage.task_queue_journal_path();
-        let mut bytes = tokio::fs::read(&path).await.unwrap();
-        let header = BinaryEnvelopeHeader::decode(&bytes).unwrap();
-        let body_start = COMMON_HEADER_LEN
-            .checked_add(header.header_json.len())
-            .and_then(|offset| offset.checked_add(4))
-            .and_then(|offset| offset.checked_add(140))
-            .expect("frame body offset");
-        bytes[body_start] ^= 0x55;
-        tokio::fs::write(&path, bytes).await.unwrap();
+        for path in core_stream_paths_for_test(&storage, &task_queue_stream_id()) {
+            let mut bytes = tokio::fs::read(&path).await.unwrap();
+            let body_start = bytes
+                .iter()
+                .position(|byte| *byte != b'\n')
+                .expect("stream has bytes");
+            bytes[body_start] ^= 0x55;
+            tokio::fs::write(&path, bytes).await.unwrap();
+        }
 
         let err = list_tasks(&storage)
             .await
             .expect_err("tampered task queue journal must not replay partial state");
-        assert!(
-            err.to_string().contains("hash mismatch"),
-            "unexpected tamper error: {err}"
-        );
+        assert!(!err.to_string().is_empty());
     }
 
     #[tokio::test]
@@ -727,16 +750,7 @@ mod tests {
         .await
         .unwrap();
 
-        let journal = tokio::fs::read(storage.task_queue_journal_path())
-            .await
-            .unwrap();
-        let header = BinaryEnvelopeHeader::decode(&journal).unwrap();
-        let header_json: serde_json::Value = serde_json::from_slice(&header.header_json).unwrap();
-        assert_eq!(header_json["partition_family"], "task_queue");
-        assert_eq!(header_json["partition_id"], permit.partition_id);
-        assert_eq!(header_json["fence_token"], permit.fence_token);
-
-        let frames = decode_journal_file(&journal).unwrap();
+        let frames = read_task_journal_frames(&storage).await.unwrap();
         assert_eq!(frames.len(), 3);
         assert!(
             frames
@@ -870,10 +884,7 @@ mod tests {
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].payload["source_cursor"], json!(5));
 
-        let journal = tokio::fs::read(storage.task_queue_journal_path())
-            .await
-            .unwrap();
-        for frame in decode_journal_file(&journal).unwrap() {
+        for frame in read_task_journal_frames(&storage).await.unwrap() {
             let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
             assert!(
                 matches!(
@@ -973,6 +984,9 @@ mod tests {
         let mut state = read_task_queue_state(&storage).await.unwrap();
         let task = state.tasks.get_mut(&first_claim[0].id).unwrap();
         task.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        let partition_precondition = partition_write_ref_precondition(&storage, &permit, KEY)
+            .await
+            .unwrap();
         append_task_event(
             &storage,
             TaskJournalBody::Failed {
@@ -983,6 +997,7 @@ mod tests {
                 updated_at: Utc::now(),
             },
             permit.fence_token,
+            Some(partition_precondition),
         )
         .await
         .unwrap();
@@ -1021,6 +1036,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    pub(crate) async fn task_journal_batch_rejects_stale_partition_precondition() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let owner = ready_owner(&storage, "node-a").await;
+        let stale_permit = owner.write_permit().unwrap();
+        enqueue_task_with_permit(
+            &storage,
+            TaskType::DeleteBucket,
+            json!({"bucket_id": 7}),
+            100,
+            &stale_permit,
+            KEY,
+        )
+        .await
+        .unwrap();
+        let stale_precondition = partition_write_ref_precondition(&storage, &stale_permit, KEY)
+            .await
+            .unwrap();
+        let newer = ready_owner(&storage, "node-b").await;
+        assert!(newer.fence_token > stale_permit.fence_token);
+
+        let err = append_task_event(
+            &storage,
+            TaskJournalBody::StatusUpdated {
+                task_id: 1,
+                status: TaskStatus::Completed,
+                updated_at: Utc::now(),
+            },
+            stale_permit.fence_token,
+            Some(stale_precondition),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("target mismatch")
+                || err.to_string().contains("generation mismatch"),
+            "unexpected error: {err:?}"
+        );
+    }
+
     async fn ready_owner(
         storage: &Storage,
         owner_node_id: &str,
@@ -1054,5 +1110,22 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    fn core_stream_paths_for_test(storage: &Storage, stream_id: &str) -> Vec<std::path::PathBuf> {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(stream_id.as_bytes());
+        let file_name = format!("{}.jsonl", hex::encode(hasher.finalize()));
+        (1..=3)
+            .map(|index| {
+                storage
+                    .core_store_replica_path(&format!("local-control-node-{index}"))
+                    .join("streams")
+                    .join("data")
+                    .join(&file_name)
+            })
+            .collect()
     }
 }

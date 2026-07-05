@@ -1,25 +1,13 @@
-use crate::formats::{
-    BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, Hash32, JournalFrame, JournalRecordKind,
-    hash32, validate_journal_chain,
+use crate::core_store::{
+    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreStore, ReadStream,
 };
-use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
+use crate::formats::{Hash32, JournalFrame, JournalRecordKind, hash32, validate_journal_chain};
+use crate::partition_fence::{PartitionWritePermit, partition_write_ref_precondition};
 use crate::persistence::{App, AppDetails, Tenant};
 use crate::storage::Storage;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
-use tokio::io::AsyncWriteExt;
-
-#[derive(Debug, Serialize)]
-struct ControlJournalHeader<'a> {
-    partition_family: &'static str,
-    partition_id: String,
-    fence_token: u64,
-    first_sequence: u64,
-    created_at: &'a str,
-    codec: &'static str,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -150,7 +138,7 @@ impl ControlState {
 }
 
 pub async fn read_control_state(storage: &Storage) -> Result<ControlState> {
-    let frames = read_control_journal_frames_at_path(&storage.control_journal_path()).await?;
+    let frames = read_control_journal_frames(storage).await?;
     let mut state = ControlState::default();
     for frame in frames {
         if frame.record_kind != JournalRecordKind::ControlPlane {
@@ -164,7 +152,7 @@ pub async fn read_control_state(storage: &Storage) -> Result<ControlState> {
 
 #[cfg(test)]
 async fn create_region(storage: &Storage, name: &str) -> Result<bool> {
-    create_region_inner(storage, name, 0).await
+    create_region_inner(storage, name, 0, None).await
 }
 
 pub(crate) async fn create_region_with_permit(
@@ -173,11 +161,23 @@ pub(crate) async fn create_region_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<bool> {
-    let fence_token = validate_control_write(storage, permit, partition_owner_signing_key).await?;
-    create_region_inner(storage, name, fence_token).await
+    let partition_precondition =
+        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    create_region_inner(
+        storage,
+        name,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
 }
 
-async fn create_region_inner(storage: &Storage, name: &str, fence_token: u64) -> Result<bool> {
+async fn create_region_inner(
+    storage: &Storage,
+    name: &str,
+    fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
+) -> Result<bool> {
     require_nonempty(name, "region")?;
     let state = read_control_state(storage).await?;
     if state.regions.contains(name) {
@@ -190,6 +190,7 @@ async fn create_region_inner(storage: &Storage, name: &str, fence_token: u64) ->
         },
         region_key_hash(name),
         fence_token,
+        partition_precondition,
     )
     .await?;
     Ok(true)
@@ -197,7 +198,7 @@ async fn create_region_inner(storage: &Storage, name: &str, fence_token: u64) ->
 
 #[cfg(test)]
 async fn create_tenant(storage: &Storage, name: &str) -> Result<Tenant> {
-    create_tenant_inner(storage, name, 0).await
+    create_tenant_inner(storage, name, 0, None).await
 }
 
 pub(crate) async fn create_tenant_with_permit(
@@ -206,11 +207,23 @@ pub(crate) async fn create_tenant_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<Tenant> {
-    let fence_token = validate_control_write(storage, permit, partition_owner_signing_key).await?;
-    create_tenant_inner(storage, name, fence_token).await
+    let partition_precondition =
+        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    create_tenant_inner(
+        storage,
+        name,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
 }
 
-async fn create_tenant_inner(storage: &Storage, name: &str, fence_token: u64) -> Result<Tenant> {
+async fn create_tenant_inner(
+    storage: &Storage,
+    name: &str,
+    fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
+) -> Result<Tenant> {
     require_nonempty(name, "tenant")?;
     let state = read_control_state(storage).await?;
     if let Some(existing) = state.tenant_by_name(name) {
@@ -228,6 +241,7 @@ async fn create_tenant_inner(storage: &Storage, name: &str, fence_token: u64) ->
         },
         tenant_key_hash(&tenant.name),
         fence_token,
+        partition_precondition,
     )
     .await?;
     Ok(tenant)
@@ -241,7 +255,16 @@ async fn create_app(
     client_id: &str,
     encrypted_secret: &[u8],
 ) -> Result<App> {
-    create_app_inner(storage, tenant_id, name, client_id, encrypted_secret, 0).await
+    create_app_inner(
+        storage,
+        tenant_id,
+        name,
+        client_id,
+        encrypted_secret,
+        0,
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn create_app_with_permit(
@@ -253,14 +276,16 @@ pub(crate) async fn create_app_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<App> {
-    let fence_token = validate_control_write(storage, permit, partition_owner_signing_key).await?;
+    let partition_precondition =
+        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
     create_app_inner(
         storage,
         tenant_id,
         name,
         client_id,
         encrypted_secret,
-        fence_token,
+        permit.fence_token,
+        Some(partition_precondition),
     )
     .await
 }
@@ -272,6 +297,7 @@ async fn create_app_inner(
     client_id: &str,
     encrypted_secret: &[u8],
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<App> {
     require_nonempty(name, "app")?;
     require_nonempty(client_id, "client_id")?;
@@ -299,6 +325,7 @@ async fn create_app_inner(
         },
         app_key_hash(tenant_id, name),
         fence_token,
+        partition_precondition,
     )
     .await?;
     Ok(app)
@@ -306,7 +333,7 @@ async fn create_app_inner(
 
 #[cfg(test)]
 async fn update_app_secret(storage: &Storage, app_id: i64, encrypted_secret: &[u8]) -> Result<()> {
-    update_app_secret_inner(storage, app_id, encrypted_secret, 0).await
+    update_app_secret_inner(storage, app_id, encrypted_secret, 0, None).await
 }
 
 pub(crate) async fn update_app_secret_with_permit(
@@ -316,8 +343,16 @@ pub(crate) async fn update_app_secret_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
-    let fence_token = validate_control_write(storage, permit, partition_owner_signing_key).await?;
-    update_app_secret_inner(storage, app_id, encrypted_secret, fence_token).await
+    let partition_precondition =
+        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    update_app_secret_inner(
+        storage,
+        app_id,
+        encrypted_secret,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
 }
 
 async fn update_app_secret_inner(
@@ -325,6 +360,7 @@ async fn update_app_secret_inner(
     app_id: i64,
     encrypted_secret: &[u8],
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
     let state = read_control_state(storage).await?;
     if !state.apps.contains_key(&app_id) {
@@ -338,13 +374,14 @@ async fn update_app_secret_inner(
         },
         app_id_key_hash(app_id),
         fence_token,
+        partition_precondition,
     )
     .await
 }
 
 #[cfg(test)]
 async fn grant_policy(storage: &Storage, app_id: i64, resource: &str, action: &str) -> Result<()> {
-    grant_policy_inner(storage, app_id, resource, action, 0).await
+    grant_policy_inner(storage, app_id, resource, action, 0, None).await
 }
 
 pub(crate) async fn grant_policy_with_permit(
@@ -355,8 +392,17 @@ pub(crate) async fn grant_policy_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
-    let fence_token = validate_control_write(storage, permit, partition_owner_signing_key).await?;
-    grant_policy_inner(storage, app_id, resource, action, fence_token).await
+    let partition_precondition =
+        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    grant_policy_inner(
+        storage,
+        app_id,
+        resource,
+        action,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
 }
 
 async fn grant_policy_inner(
@@ -365,6 +411,7 @@ async fn grant_policy_inner(
     resource: &str,
     action: &str,
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
     let state = read_control_state(storage).await?;
     if !state.apps.contains_key(&app_id) {
@@ -379,13 +426,14 @@ async fn grant_policy_inner(
         },
         policy_key_hash(app_id, resource, action),
         fence_token,
+        partition_precondition,
     )
     .await
 }
 
 #[cfg(test)]
 async fn revoke_policy(storage: &Storage, app_id: i64, resource: &str, action: &str) -> Result<()> {
-    revoke_policy_inner(storage, app_id, resource, action, 0).await
+    revoke_policy_inner(storage, app_id, resource, action, 0, None).await
 }
 
 pub(crate) async fn revoke_policy_with_permit(
@@ -396,8 +444,17 @@ pub(crate) async fn revoke_policy_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
-    let fence_token = validate_control_write(storage, permit, partition_owner_signing_key).await?;
-    revoke_policy_inner(storage, app_id, resource, action, fence_token).await
+    let partition_precondition =
+        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    revoke_policy_inner(
+        storage,
+        app_id,
+        resource,
+        action,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
 }
 
 async fn revoke_policy_inner(
@@ -406,6 +463,7 @@ async fn revoke_policy_inner(
     resource: &str,
     action: &str,
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
     append_control_event(
         storage,
@@ -416,6 +474,7 @@ async fn revoke_policy_inner(
         },
         policy_key_hash(app_id, resource, action),
         fence_token,
+        partition_precondition,
     )
     .await
 }
@@ -425,13 +484,10 @@ async fn append_control_event(
     event: ControlEventBody,
     key_hash: Hash32,
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
-    let path = storage.control_journal_path();
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    ensure_journal_header(&path, fence_token).await?;
-    let previous = read_control_journal_frames_at_path(path.as_path())
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let previous = read_control_journal_frames_from_store(&core_store)
         .await
         .unwrap_or_default();
     let sequence = previous
@@ -452,71 +508,46 @@ async fn append_control_event(
         previous_hash,
         serde_json::to_vec(&event)?,
     );
-    let mut file = tokio::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .await
-        .with_context(|| format!("open control journal {}", path.display()))?;
-    file.write_all(&frame.encode()).await?;
-    file.sync_data().await?;
+    let partition_id = hex::encode(control_partition_id());
+    core_store
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id: format!("control-plane:{mutation_id}"),
+            scope_partition: partition_id.clone(),
+            committed_by_principal: control_partition_principal(),
+            preconditions: partition_precondition.into_iter().collect(),
+            operations: vec![CoreMutationOperation::StreamAppend {
+                partition_id,
+                stream_id: control_plane_stream_id(),
+                record_kind: "control_plane".to_string(),
+                payload: frame.encode(),
+                idempotency_key: Some(format!("control-plane:{mutation_id}")),
+            }],
+        })
+        .await?;
     Ok(())
 }
 
-async fn ensure_journal_header(path: &Path, fence_token: u64) -> Result<()> {
-    if tokio::fs::try_exists(path).await? {
-        return Ok(());
-    }
-    let created_at = chrono::Utc::now().to_rfc3339();
-    let header_json = serde_json::to_vec(&ControlJournalHeader {
-        partition_family: "control_plane",
-        partition_id: hex::encode(control_partition_id()),
-        fence_token,
-        first_sequence: 1,
-        created_at: &created_at,
-        codec: "none",
-    })?;
-    let header = BinaryEnvelopeHeader::new(FileFamily::MetadataJournal, 0, 0, header_json);
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .await
-        .with_context(|| format!("create control journal {}", path.display()))?;
-    file.write_all(&header.encode()).await?;
-    file.sync_data().await?;
-    Ok(())
+async fn read_control_journal_frames(storage: &Storage) -> Result<Vec<JournalFrame>> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    read_control_journal_frames_from_store(&core_store).await
 }
 
-async fn read_control_journal_frames_at_path(path: &Path) -> Result<Vec<JournalFrame>> {
-    if tokio::fs::metadata(path).await.is_err() {
-        return Ok(Vec::new());
-    }
-    let bytes = tokio::fs::read(path)
-        .await
-        .with_context(|| format!("read control journal {}", path.display()))?;
-    decode_journal_file(&bytes)
-}
-
-fn decode_journal_file(bytes: &[u8]) -> Result<Vec<JournalFrame>> {
-    let header = BinaryEnvelopeHeader::decode(bytes)?;
-    if header.family != FileFamily::MetadataJournal {
-        anyhow::bail!("control journal has wrong file family");
-    }
-    let mut input = &bytes[COMMON_HEADER_LEN + header.header_json.len()..];
+async fn read_control_journal_frames_from_store(
+    core_store: &CoreStore,
+) -> Result<Vec<JournalFrame>> {
+    let records = core_store
+        .read_stream(ReadStream {
+            stream_id: control_plane_stream_id(),
+            after_sequence: 0,
+            limit: 0,
+        })
+        .await?;
     let mut frames = Vec::new();
-    while !input.is_empty() {
-        if input.len() < 4 {
-            anyhow::bail!("truncated control journal frame length");
+    for record in records {
+        if record.record_kind != "control_plane" {
+            continue;
         }
-        let frame_len = u32::from_le_bytes(input[0..4].try_into().unwrap()) as usize;
-        let frame_end = 4usize
-            .checked_add(frame_len)
-            .ok_or_else(|| anyhow!("invalid control journal frame length"))?;
-        if input.len() < frame_end {
-            anyhow::bail!("truncated control journal frame");
-        }
-        frames.push(JournalFrame::decode(&input[..frame_end])?);
-        input = &input[frame_end..];
+        frames.push(JournalFrame::decode(&record.payload)?);
     }
     validate_journal_chain(&frames)?;
     Ok(frames)
@@ -615,14 +646,30 @@ pub fn control_partition_id() -> Hash32 {
     hash32(b"control_plane/global")
 }
 
-async fn validate_control_write(
+fn control_plane_stream_id() -> String {
+    "control_plane:global".to_string()
+}
+
+fn control_partition_principal() -> String {
+    "partition-owner:control_plane:global".to_string()
+}
+
+#[cfg(test)]
+pub(crate) async fn read_control_frame_fences_for_test(storage: &Storage) -> Result<Vec<u64>> {
+    Ok(read_control_journal_frames(storage)
+        .await?
+        .into_iter()
+        .map(|frame| frame.fence_token)
+        .collect())
+}
+
+async fn control_write_precondition(
     storage: &Storage,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
-) -> Result<u64> {
+) -> Result<CoreMutationPrecondition> {
     require_control_permit(permit)?;
-    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
-    Ok(permit.fence_token)
+    Ok(partition_write_ref_precondition(storage, permit, partition_owner_signing_key).await?)
 }
 
 fn require_control_permit(permit: &PartitionWritePermit) -> Result<()> {
@@ -692,11 +739,8 @@ mod tests {
             b"secret-b".to_vec()
         );
         assert_eq!(replayed.policies_for_app(app.id), vec!["*|*".to_string()]);
-        assert!(
-            storage
-                .control_journal_path()
-                .ends_with("_anvil/meta/control.anjournal")
-        );
+        let frames = read_control_journal_frames(&storage).await.unwrap();
+        assert_eq!(frames.len(), 7);
     }
 
     #[tokio::test]
@@ -750,16 +794,7 @@ mod tests {
             .await
             .unwrap();
 
-        let journal = tokio::fs::read(storage.control_journal_path())
-            .await
-            .unwrap();
-        let header = BinaryEnvelopeHeader::decode(&journal).unwrap();
-        let header_json: serde_json::Value = serde_json::from_slice(&header.header_json).unwrap();
-        assert_eq!(header_json["partition_family"], "control_plane");
-        assert_eq!(header_json["partition_id"], permit.partition_id);
-        assert_eq!(header_json["fence_token"], permit.fence_token);
-
-        let frames = decode_journal_file(&journal).unwrap();
+        let frames = read_control_journal_frames(&storage).await.unwrap();
         assert_eq!(frames.len(), 6);
         assert!(
             frames
@@ -783,6 +818,39 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("write permit owner is not current")
+        );
+    }
+
+    #[tokio::test]
+    pub(crate) async fn control_journal_batch_rejects_stale_partition_precondition() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let owner = ready_owner(&storage, "node-a").await;
+        let stale_permit = owner.write_permit().unwrap();
+        let stale_precondition = partition_write_ref_precondition(&storage, &stale_permit, KEY)
+            .await
+            .unwrap();
+        let newer = ready_owner(&storage, "node-b").await;
+        assert!(newer.fence_token > stale_permit.fence_token);
+
+        let err = create_region_inner(
+            &storage,
+            "local",
+            stale_permit.fence_token,
+            Some(stale_precondition),
+        )
+        .await
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("generation mismatch") || message.contains("target mismatch"),
+            "unexpected stale precondition error: {message}"
+        );
+
+        assert!(
+            create_region_with_permit(&storage, "local", &newer.write_permit().unwrap(), KEY)
+                .await
+                .unwrap()
         );
     }
 

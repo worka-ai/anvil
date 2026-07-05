@@ -1,7 +1,15 @@
-use crate::{anvil_api::NativeMutationContext, storage::Storage};
+use crate::{
+    anvil_api::NativeMutationContext,
+    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    storage::Storage,
+};
+use base64::Engine;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
 use tonic::Status;
+
+const NATIVE_IDEMPOTENCY_REF_PREFIX: &str = "native_idempotency:";
+const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NativeIdempotencyTarget {
@@ -111,43 +119,43 @@ where
     };
     record.record_hash = record_hash(&record)?;
 
-    let path = storage
-        .native_idempotency_record_path(
-            context.tenant_id,
-            context.bucket_id,
-            &record_key_hash(context),
-        )
-        .map_err(|e| Status::internal(e.to_string()))?;
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-    }
-    let temp_path = path.with_extension(format!("json.tmp-{}", uuid::Uuid::new_v4()));
-    let bytes = serde_json::to_vec_pretty(&record)
+    let bytes = serde_json::to_vec(&record)
         .map_err(|e| Status::internal(format!("Serialize native idempotency record: {e}")))?;
-    let mut file = tokio::fs::File::create(&temp_path)
+    let ref_name = record_ref_name(context);
+    let store = CoreStore::new(storage.clone())
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
-    use tokio::io::AsyncWriteExt;
-    file.write_all(&bytes)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-    file.sync_data()
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: ref_name.clone(),
+            bytes,
+            region_id: "local".to_string(),
+            mutation_id: format!("native-idempotency:{}", context.request_id),
+        })
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
-    if tokio::fs::metadata(&path).await.is_ok() {
-        let _ = tokio::fs::remove_file(&temp_path).await;
+    if let Err(error) = store
+        .compare_and_swap_ref(CompareAndSwapRef {
+            ref_name,
+            expected_generation: None,
+            expected_target: None,
+            require_absent: true,
+            require_present: false,
+            fence: None,
+            authz_revision: None,
+            source_watch_cursor: None,
+            new_target: encode_core_object_ref_target(&object_ref)
+                .map_err(|e| Status::internal(e.to_string()))?,
+            transaction_id: None,
+        })
+        .await
+    {
         let existing = read_record(storage, context)
             .await?
-            .ok_or_else(|| Status::internal("Native idempotency record disappeared"))?;
+            .ok_or_else(|| Status::internal(error.to_string()))?;
         validate_record_context(&existing, context, target)?;
-        return Ok(());
     }
-    tokio::fs::rename(&temp_path, &path)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
     Ok(())
 }
 
@@ -155,18 +163,23 @@ async fn read_record(
     storage: &Storage,
     context: &NativeMutationContext,
 ) -> Result<Option<NativeIdempotencyRecord>, Status> {
-    let path = storage
-        .native_idempotency_record_path(
-            context.tenant_id,
-            context.bucket_id,
-            &record_key_hash(context),
-        )
+    let store = CoreStore::new(storage.clone())
+        .await
         .map_err(|e| Status::internal(e.to_string()))?;
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(Status::internal(error.to_string())),
+    let Some(ref_value) = store
+        .read_ref(&record_ref_name(context))
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+    else {
+        return Ok(None);
     };
+    let bytes = store
+        .get_blob(GetBlob {
+            object_ref: decode_core_object_ref_target(&ref_value.target)
+                .map_err(|e| Status::internal(e.to_string()))?,
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
     let record: NativeIdempotencyRecord = serde_json::from_slice(&bytes)
         .map_err(|e| Status::internal(format!("Invalid native idempotency record: {e}")))?;
     if record.record_hash != record_hash(&record)? {
@@ -205,6 +218,33 @@ fn record_key_hash(context: &NativeMutationContext) -> String {
     hasher.update(&[0]);
     hasher.update(context.idempotency_key.as_bytes());
     hasher.finalize().to_hex().to_string()
+}
+
+fn record_ref_name(context: &NativeMutationContext) -> String {
+    format!(
+        "{NATIVE_IDEMPOTENCY_REF_PREFIX}tenant:{}:bucket:{}:hash:{}",
+        context.tenant_id,
+        context.bucket_id,
+        record_key_hash(context)
+    )
+}
+
+fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String, Status> {
+    Ok(format!(
+        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(object_ref).map_err(|e| Status::internal(e.to_string()))?)
+    ))
+}
+
+fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef, Status> {
+    let encoded = target
+        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
+        .ok_or_else(|| Status::internal("CoreStore ref target is not a CoreObjectRef"))?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|e| Status::internal(e.to_string()))?;
+    serde_json::from_slice(&bytes).map_err(|e| Status::internal(e.to_string()))
 }
 
 fn record_hash(record: &NativeIdempotencyRecord) -> Result<String, Status> {

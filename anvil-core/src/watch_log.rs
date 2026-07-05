@@ -1,32 +1,12 @@
-use crate::formats::{
-    BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, FormatError, hash32, watch::WatchRecord,
-};
+use crate::core_store::{AppendStreamRecord, CoreStore, ReadStream, StreamAppendReceipt};
+use crate::formats::{hash32, watch::WatchRecord};
 use crate::persistence::{Bucket, Object, ObjectWatchEvent};
 use crate::storage::Storage;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use tokio::io::AsyncWriteExt;
 
 const OBJECT_WATCH_PARTITION_FAMILY: u16 = 1;
 const OBJECT_WATCH_RECORD_KIND: u16 = 1;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WatchLogHeader {
-    pub tenant_id: String,
-    pub bucket_id: String,
-    pub watch_stream: String,
-    pub partition_family: String,
-    pub partition_id: String,
-    pub created_at: String,
-    pub codec: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DecodedWatchLog {
-    pub header: WatchLogHeader,
-    pub records: Vec<WatchRecord>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ObjectWatchPayload {
@@ -49,32 +29,7 @@ pub async fn append_object_watch_record(
     bucket: &Bucket,
     object: &Object,
     event: &ObjectWatchEvent,
-) -> Result<PathBuf> {
-    let path = storage.object_watch_path(bucket.tenant_id, bucket.id);
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    if tokio::fs::metadata(&path).await.is_err() {
-        let header = WatchLogHeader {
-            tenant_id: bucket.tenant_id.to_string(),
-            bucket_id: bucket.id.to_string(),
-            watch_stream: "object_prefix".to_string(),
-            partition_family: "object_metadata".to_string(),
-            partition_id: hex::encode(partition_id(bucket.tenant_id, bucket.id)),
-            created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-            codec: "none".to_string(),
-        };
-        let header_json = serde_json::to_vec(&header)?;
-        let envelope = BinaryEnvelopeHeader::new(FileFamily::WatchSegment, 0, 0, header_json);
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .await?;
-        file.write_all(&envelope.encode()).await?;
-        file.sync_data().await?;
-    }
-
+) -> Result<StreamAppendReceipt> {
     let payload = serde_json::to_vec(&ObjectWatchPayload {
         bucket_name: event.bucket_name.clone(),
         key: event.key.clone(),
@@ -100,13 +55,21 @@ pub async fn append_object_watch_record(
         0,
         payload,
     );
-    let mut file = tokio::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .await?;
-    file.write_all(&record.encode()).await?;
-    file.sync_data().await?;
-    Ok(path)
+    let core_store = CoreStore::new(storage.clone()).await?;
+    core_store
+        .append_stream(AppendStreamRecord {
+            stream_id: object_watch_stream_id(bucket.tenant_id, bucket.id),
+            partition_id: hex::encode(partition_id(bucket.tenant_id, bucket.id)),
+            record_kind: "object_watch".to_string(),
+            payload: record.encode(),
+            fence: None,
+            transaction_id: None,
+            idempotency_key: Some(format!(
+                "object-watch:{}:{}:{}",
+                bucket.tenant_id, bucket.id, event.mutation_id
+            )),
+        })
+        .await
 }
 
 pub async fn latest_object_watch_cursor(
@@ -115,15 +78,9 @@ pub async fn latest_object_watch_cursor(
     bucket_id: i64,
     version_id: uuid::Uuid,
 ) -> Result<Option<u128>> {
-    let path = storage.object_watch_path(tenant_id, bucket_id);
-    let decoded = match tokio::fs::read(&path).await {
-        Ok(bytes) => decode_watch_log(&bytes)?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
+    let records = read_object_watch_records(storage, tenant_id, bucket_id).await?;
     let expected = version_id.to_string();
-    Ok(decoded
-        .records
+    Ok(records
         .into_iter()
         .filter_map(|record| {
             let payload: ObjectWatchPayload = serde_json::from_slice(&record.payload).ok()?;
@@ -140,15 +97,10 @@ pub async fn list_object_watch_events(
     after_cursor: i64,
     limit: usize,
 ) -> Result<Vec<ObjectWatchEvent>> {
-    let path = storage.object_watch_path(tenant_id, bucket_id);
-    let decoded = match tokio::fs::read(&path).await {
-        Ok(bytes) => decode_watch_log(&bytes)?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err.into()),
-    };
+    let records = read_object_watch_records(storage, tenant_id, bucket_id).await?;
 
     let mut events = Vec::new();
-    for record in decoded.records {
+    for record in records {
         if record.cursor <= after_cursor as u128 {
             continue;
         }
@@ -192,32 +144,39 @@ pub async fn list_object_watch_events(
     Ok(events)
 }
 
-pub fn decode_watch_log(input: &[u8]) -> Result<DecodedWatchLog> {
-    let envelope = BinaryEnvelopeHeader::decode(input)?;
-    if envelope.family != FileFamily::WatchSegment {
-        return Err(anyhow!("watch log file family mismatch"));
-    }
-    let header: WatchLogHeader = serde_json::from_slice(&envelope.header_json)?;
-    let header_len = COMMON_HEADER_LEN
-        .checked_add(envelope.header_json.len())
-        .ok_or_else(|| anyhow!("watch log header length overflow"))?;
-    let mut body = &input[header_len..];
-    let mut records = Vec::new();
-    while !body.is_empty() {
-        match WatchRecord::decode(body) {
-            Ok((record, used)) => {
-                records.push(record);
-                body = &body[used..];
-            }
-            Err(FormatError::TooShort { .. }) | Err(FormatError::HashMismatch { .. }) => break,
-            Err(err) => return Err(err.into()),
+async fn read_object_watch_records(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+) -> Result<Vec<WatchRecord>> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let records = core_store
+        .read_stream(ReadStream {
+            stream_id: object_watch_stream_id(tenant_id, bucket_id),
+            after_sequence: 0,
+            limit: 0,
+        })
+        .await?;
+    let mut decoded = Vec::new();
+    for record in records {
+        if record.record_kind != "object_watch" {
+            continue;
         }
+        let (watch_record, used) = WatchRecord::decode(&record.payload)?;
+        if used != record.payload.len() {
+            return Err(anyhow!("object watch CoreStore record has trailing bytes"));
+        }
+        decoded.push(watch_record);
     }
-    Ok(DecodedWatchLog { header, records })
+    Ok(decoded)
 }
 
 fn partition_id(tenant_id: i64, bucket_id: i64) -> [u8; 32] {
     hash32(format!("tenant:{tenant_id}:bucket:{bucket_id}:watch:object").as_bytes())
+}
+
+fn object_watch_stream_id(tenant_id: i64, bucket_id: i64) -> String {
+    format!("object_watch:tenant:{tenant_id}:bucket:{bucket_id}")
 }
 
 #[cfg(test)]
@@ -261,7 +220,6 @@ mod tests {
             storage_class: None,
             user_meta: None,
             shard_map: None,
-            inline_payload: None,
             checksum: None,
             link: None,
         }
@@ -291,7 +249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_object_watch_record_writes_active_watch_log() {
+    async fn append_object_watch_record_writes_core_store_watch_stream() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let bucket = sample_bucket();
@@ -305,7 +263,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let path = append_object_watch_record(
+        let receipt = append_object_watch_record(
             &storage,
             &bucket,
             &second,
@@ -313,21 +271,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(path, storage.object_watch_path(bucket.tenant_id, bucket.id));
+        assert_eq!(receipt.sequence, 2);
 
-        let decoded = decode_watch_log(&tokio::fs::read(path).await.unwrap()).unwrap();
-        assert_eq!(decoded.header.partition_family, "object_metadata");
-        assert_eq!(decoded.records.len(), 2);
-        assert_eq!(decoded.records[0].cursor, 1);
-        assert_eq!(decoded.records[1].cursor, 2);
-
-        let mut corrupted = tokio::fs::read(storage.object_watch_path(bucket.tenant_id, bucket.id))
+        let decoded = read_object_watch_records(&storage, bucket.tenant_id, bucket.id)
             .await
             .unwrap();
-        let last = corrupted.len() - 1;
-        corrupted[last] ^= 1;
-        let decoded = decode_watch_log(&corrupted).unwrap();
-        assert_eq!(decoded.records.len(), 1);
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].cursor, 1);
+        assert_eq!(decoded[1].cursor, 2);
     }
 
     #[tokio::test]

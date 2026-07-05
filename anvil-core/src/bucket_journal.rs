@@ -1,15 +1,13 @@
-use crate::formats::{
-    BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, Hash32, JournalFrame, JournalRecordKind,
-    hash32, validate_journal_chain,
+use crate::core_store::{
+    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreStore, ReadStream,
 };
-use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
+use crate::formats::{Hash32, JournalFrame, JournalRecordKind, hash32, validate_journal_chain};
+use crate::partition_fence::{PartitionWritePermit, partition_write_ref_precondition};
 use crate::persistence::{Bucket, BucketMetadataEvent};
 use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
-use std::path::Path;
-use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BucketJournalMutation {
@@ -26,17 +24,6 @@ impl BucketJournalMutation {
             Self::Delete => "delete",
         }
     }
-}
-
-#[derive(Debug, Serialize)]
-struct BucketJournalHeader<'a> {
-    tenant_id: String,
-    partition_family: &'static str,
-    partition_id: String,
-    fence_token: u64,
-    first_sequence: u64,
-    created_at: &'a str,
-    codec: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,20 +46,22 @@ async fn append_bucket_mutation(
     bucket: &Bucket,
     mutation: BucketJournalMutation,
 ) -> Result<()> {
-    append_bucket_mutation_to_path(
-        storage.bucket_metadata_journal_path(bucket.tenant_id),
+    append_bucket_mutation_to_stream(
+        storage,
         bucket,
         mutation,
         BucketJournalScope::Tenant(bucket.tenant_id),
         0,
+        None,
     )
     .await?;
-    append_bucket_mutation_to_path(
-        storage.global_bucket_metadata_journal_path(),
+    append_bucket_mutation_to_stream(
+        storage,
         bucket,
         mutation,
         BucketJournalScope::Global,
         0,
+        None,
     )
     .await
 }
@@ -89,22 +78,28 @@ pub(crate) async fn append_bucket_mutation_with_permits(
     let global_scope = BucketJournalScope::Global;
     require_bucket_scope_permit(tenant_scope, tenant_permit)?;
     require_bucket_scope_permit(global_scope, global_permit)?;
-    validate_partition_write(storage, tenant_permit, partition_owner_signing_key).await?;
-    validate_partition_write(storage, global_permit, partition_owner_signing_key).await?;
-    append_bucket_mutation_to_path(
-        storage.bucket_metadata_journal_path(bucket.tenant_id),
+    let tenant_precondition =
+        partition_write_ref_precondition(storage, tenant_permit, partition_owner_signing_key)
+            .await?;
+    let global_precondition =
+        partition_write_ref_precondition(storage, global_permit, partition_owner_signing_key)
+            .await?;
+    append_bucket_mutation_to_stream(
+        storage,
         bucket,
         mutation,
         tenant_scope,
         tenant_permit.fence_token,
+        Some(tenant_precondition),
     )
     .await?;
-    append_bucket_mutation_to_path(
-        storage.global_bucket_metadata_journal_path(),
+    append_bucket_mutation_to_stream(
+        storage,
         bucket,
         mutation,
         global_scope,
         global_permit.fence_token,
+        Some(global_precondition),
     )
     .await
 }
@@ -114,7 +109,7 @@ pub async fn read_public_bucket_by_name(
     bucket_name: &str,
 ) -> Result<Option<Bucket>> {
     Ok(
-        read_current_buckets_from_path(storage.global_bucket_metadata_journal_path())
+        read_current_buckets_from_stream(storage, BucketJournalScope::Global)
             .await?
             .into_iter()
             .find(|bucket| bucket.name == bucket_name && bucket.is_public_read),
@@ -126,7 +121,7 @@ pub async fn read_current_bucket_by_name(
     bucket_name: &str,
 ) -> Result<Option<Bucket>> {
     Ok(
-        read_current_buckets_from_path(storage.global_bucket_metadata_journal_path())
+        read_current_buckets_from_stream(storage, BucketJournalScope::Global)
             .await?
             .into_iter()
             .find(|bucket| bucket.name == bucket_name),
@@ -138,7 +133,7 @@ pub async fn read_current_bucket_by_id(
     bucket_id: i64,
 ) -> Result<Option<Bucket>> {
     Ok(
-        read_current_buckets_from_path(storage.global_bucket_metadata_journal_path())
+        read_current_buckets_from_stream(storage, BucketJournalScope::Global)
             .await?
             .into_iter()
             .find(|bucket| bucket.id == bucket_id),
@@ -146,8 +141,7 @@ pub async fn read_current_bucket_by_id(
 }
 
 pub async fn next_bucket_id(storage: &Storage) -> Result<i64> {
-    let frames =
-        read_bucket_journal_frames_at_path(&storage.global_bucket_metadata_journal_path()).await?;
+    let frames = read_bucket_journal_frames(storage, BucketJournalScope::Global).await?;
     let max_bucket_id = frames
         .into_iter()
         .filter(|frame| frame.record_kind == JournalRecordKind::BucketMetadata)
@@ -162,19 +156,16 @@ pub async fn next_bucket_id(storage: &Storage) -> Result<i64> {
         .ok_or_else(|| anyhow::anyhow!("bucket id overflow"))
 }
 
-async fn append_bucket_mutation_to_path(
-    path: std::path::PathBuf,
+async fn append_bucket_mutation_to_stream(
+    storage: &Storage,
     bucket: &Bucket,
     mutation: BucketJournalMutation,
     scope: BucketJournalScope,
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    ensure_journal_header(&path, scope, fence_token).await?;
-
-    let previous = read_bucket_journal_frames_at_path(path.as_path())
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let previous = read_bucket_journal_frames_from_store(&core_store, scope)
         .await
         .unwrap_or_default();
     let sequence = previous
@@ -207,13 +198,26 @@ async fn append_bucket_mutation_to_path(
         body,
     );
 
-    let mut file = tokio::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .await
-        .with_context(|| format!("open bucket metadata journal {}", path.display()))?;
-    file.write_all(&frame.encode()).await?;
-    file.sync_data().await?;
+    let partition_id = hex::encode(scope.partition_id());
+    core_store
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id: format!("bucket-metadata:{}:{}", scope.stream_id(), mutation_id),
+            scope_partition: partition_id.clone(),
+            committed_by_principal: scope.partition_principal(),
+            preconditions: partition_precondition.into_iter().collect(),
+            operations: vec![CoreMutationOperation::StreamAppend {
+                partition_id,
+                stream_id: scope.stream_id(),
+                record_kind: "bucket_metadata".to_string(),
+                payload: frame.encode(),
+                idempotency_key: Some(format!(
+                    "bucket-metadata:{}:{}",
+                    scope.stream_id(),
+                    mutation_id
+                )),
+            }],
+        })
+        .await?;
     Ok(())
 }
 
@@ -229,7 +233,7 @@ pub async fn read_current_bucket(
 }
 
 pub async fn read_current_buckets(storage: &Storage, tenant_id: i64) -> Result<Vec<Bucket>> {
-    read_current_buckets_from_path(storage.bucket_metadata_journal_path(tenant_id)).await
+    read_current_buckets_from_stream(storage, BucketJournalScope::Tenant(tenant_id)).await
 }
 
 pub async fn latest_bucket_metadata_event(
@@ -252,8 +256,7 @@ pub async fn list_bucket_metadata_events(
     after_cursor: i64,
     limit: usize,
 ) -> Result<Vec<BucketMetadataEvent>> {
-    let path = storage.bucket_metadata_journal_path(tenant_id);
-    let frames = read_bucket_journal_frames_at_path(path.as_path()).await?;
+    let frames = read_bucket_journal_frames(storage, BucketJournalScope::Tenant(tenant_id)).await?;
     let mut events = Vec::new();
     for frame in frames {
         if frame.record_kind != JournalRecordKind::BucketMetadata {
@@ -281,8 +284,7 @@ pub async fn list_bucket_metadata_events_by_bucket_id(
     after_cursor: i64,
     limit: usize,
 ) -> Result<Vec<BucketMetadataEvent>> {
-    let path = storage.bucket_metadata_journal_path(tenant_id);
-    let frames = read_bucket_journal_frames_at_path(path.as_path()).await?;
+    let frames = read_bucket_journal_frames(storage, BucketJournalScope::Tenant(tenant_id)).await?;
     let mut events = Vec::new();
     for frame in frames {
         if frame.record_kind != JournalRecordKind::BucketMetadata {
@@ -303,8 +305,11 @@ pub async fn list_bucket_metadata_events_by_bucket_id(
     Ok(events)
 }
 
-async fn read_current_buckets_from_path(path: std::path::PathBuf) -> Result<Vec<Bucket>> {
-    let frames = read_bucket_journal_frames_at_path(path.as_path()).await?;
+async fn read_current_buckets_from_stream(
+    storage: &Storage,
+    scope: BucketJournalScope,
+) -> Result<Vec<Bucket>> {
+    let frames = read_bucket_journal_frames(storage, scope).await?;
     let mut buckets = std::collections::BTreeMap::<String, Bucket>::new();
     for frame in frames {
         if frame.record_kind != JournalRecordKind::BucketMetadata {
@@ -331,69 +336,34 @@ async fn read_current_buckets_from_path(path: std::path::PathBuf) -> Result<Vec<
     Ok(buckets.into_values().collect())
 }
 
-async fn read_bucket_journal_frames_at_path(path: &Path) -> Result<Vec<JournalFrame>> {
-    if tokio::fs::metadata(path).await.is_err() {
-        return Ok(Vec::new());
-    }
-    let bytes = tokio::fs::read(path)
-        .await
-        .with_context(|| format!("read bucket metadata journal {}", path.display()))?;
-    decode_journal_file(&bytes)
+async fn read_bucket_journal_frames(
+    storage: &Storage,
+    scope: BucketJournalScope,
+) -> Result<Vec<JournalFrame>> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    read_bucket_journal_frames_from_store(&core_store, scope).await
 }
 
-fn decode_journal_file(bytes: &[u8]) -> Result<Vec<JournalFrame>> {
-    let header = BinaryEnvelopeHeader::decode(bytes)?;
-    if header.family != FileFamily::MetadataJournal {
-        anyhow::bail!("bucket metadata journal has wrong file family");
-    }
-    let mut input = &bytes[COMMON_HEADER_LEN + header.header_json.len()..];
+async fn read_bucket_journal_frames_from_store(
+    core_store: &CoreStore,
+    scope: BucketJournalScope,
+) -> Result<Vec<JournalFrame>> {
+    let records = core_store
+        .read_stream(ReadStream {
+            stream_id: scope.stream_id(),
+            after_sequence: 0,
+            limit: 0,
+        })
+        .await?;
     let mut frames = Vec::new();
-    while !input.is_empty() {
-        if input.len() < 4 {
-            anyhow::bail!("truncated bucket metadata journal frame length");
+    for record in records {
+        if record.record_kind != "bucket_metadata" {
+            continue;
         }
-        let frame_len = u32::from_le_bytes(input[0..4].try_into().unwrap()) as usize;
-        let frame_end = 4usize
-            .checked_add(frame_len)
-            .ok_or_else(|| anyhow::anyhow!("invalid bucket metadata journal frame length"))?;
-        if input.len() < frame_end {
-            anyhow::bail!("truncated bucket metadata journal frame");
-        }
-        frames.push(JournalFrame::decode(&input[..frame_end])?);
-        input = &input[frame_end..];
+        frames.push(JournalFrame::decode(&record.payload)?);
     }
     validate_journal_chain(&frames)?;
     Ok(frames)
-}
-
-async fn ensure_journal_header(
-    path: &Path,
-    scope: BucketJournalScope,
-    fence_token: u64,
-) -> Result<()> {
-    if tokio::fs::try_exists(path).await? {
-        return Ok(());
-    }
-    let created_at = chrono::Utc::now().to_rfc3339();
-    let header_json = serde_json::to_vec(&BucketJournalHeader {
-        tenant_id: scope.tenant_label(),
-        partition_family: "bucket_metadata",
-        partition_id: hex::encode(scope.partition_id()),
-        fence_token,
-        first_sequence: 1,
-        created_at: &created_at,
-        codec: "none",
-    })?;
-    let header = BinaryEnvelopeHeader::new(FileFamily::MetadataJournal, 0, 0, header_json);
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .await
-        .with_context(|| format!("create bucket metadata journal {}", path.display()))?;
-    file.write_all(&header.encode()).await?;
-    file.sync_data().await?;
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -403,10 +373,10 @@ enum BucketJournalScope {
 }
 
 impl BucketJournalScope {
-    fn tenant_label(self) -> String {
+    fn stream_id(self) -> String {
         match self {
-            Self::Tenant(tenant_id) => tenant_id.to_string(),
-            Self::Global => "*".to_string(),
+            Self::Tenant(tenant_id) => format!("bucket_metadata:tenant:{tenant_id}"),
+            Self::Global => "bucket_metadata:global".to_string(),
         }
     }
 
@@ -414,6 +384,15 @@ impl BucketJournalScope {
         match self {
             Self::Tenant(tenant_id) => tenant_bucket_partition_id(tenant_id),
             Self::Global => global_bucket_partition_id(),
+        }
+    }
+
+    fn partition_principal(self) -> String {
+        match self {
+            Self::Tenant(tenant_id) => {
+                format!("partition-owner:bucket_metadata:tenant:{tenant_id}")
+            }
+            Self::Global => "partition-owner:bucket_metadata:global".to_string(),
         }
     }
 }
@@ -424,6 +403,24 @@ pub fn tenant_bucket_partition_id(tenant_id: i64) -> Hash32 {
 
 pub fn global_bucket_partition_id() -> Hash32 {
     hash32(b"bucket_metadata/global")
+}
+
+#[cfg(test)]
+pub(crate) async fn read_bucket_frame_fences_for_test(
+    storage: &Storage,
+    tenant_id: i64,
+) -> Result<(Vec<u64>, Vec<u64>)> {
+    let tenant = read_bucket_journal_frames(storage, BucketJournalScope::Tenant(tenant_id))
+        .await?
+        .into_iter()
+        .map(|frame| frame.fence_token)
+        .collect();
+    let global = read_bucket_journal_frames(storage, BucketJournalScope::Global)
+        .await?
+        .into_iter()
+        .map(|frame| frame.fence_token)
+        .collect();
+    Ok((tenant, global))
 }
 
 fn require_bucket_scope_permit(
@@ -648,18 +645,16 @@ mod tests {
         .await
         .unwrap();
 
-        let tenant_frames = read_bucket_journal_frames_at_path(
-            &storage.bucket_metadata_journal_path(bucket.tenant_id),
-        )
-        .await
-        .unwrap();
+        let tenant_frames =
+            read_bucket_journal_frames(&storage, BucketJournalScope::Tenant(bucket.tenant_id))
+                .await
+                .unwrap();
         assert_eq!(tenant_frames.len(), 1);
         assert_eq!(tenant_frames[0].fence_token, tenant_permit.fence_token);
 
-        let global_frames =
-            read_bucket_journal_frames_at_path(&storage.global_bucket_metadata_journal_path())
-                .await
-                .unwrap();
+        let global_frames = read_bucket_journal_frames(&storage, BucketJournalScope::Global)
+            .await
+            .unwrap();
         assert_eq!(global_frames.len(), 1);
         assert_eq!(global_frames[0].fence_token, global_permit.fence_token);
     }
@@ -698,5 +693,36 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bucket_journal_batch_rejects_stale_partition_precondition() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let bucket = bucket(1, "stale-precondition-bucket", false);
+        let tenant_scope = BucketJournalScope::Tenant(bucket.tenant_id);
+        let stale_tenant = ready_bucket_permit(&storage, tenant_scope, "node-a").await;
+        let stale_precondition =
+            partition_write_ref_precondition(&storage, &stale_tenant, PARTITION_OWNER_KEY)
+                .await
+                .unwrap();
+        let fresh_tenant = ready_bucket_permit(&storage, tenant_scope, "node-b").await;
+        assert_eq!(fresh_tenant.fence_token, stale_tenant.fence_token + 1);
+
+        let rejected = append_bucket_mutation_to_stream(
+            &storage,
+            &bucket,
+            BucketJournalMutation::Create,
+            tenant_scope,
+            stale_tenant.fence_token,
+            Some(stale_precondition),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            rejected.to_string().contains("target mismatch")
+                || rejected.to_string().contains("generation mismatch"),
+            "unexpected error: {rejected:?}"
+        );
     }
 }

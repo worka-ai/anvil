@@ -1,11 +1,6 @@
 use crate::{
-    access_control,
-    anvil_api::{
-        CommitShardRequest, GetShardRequest, PutShardRequest, internal_anvil_service_client,
-    },
-    auth, bucket_journal,
-    cluster::ClusterState,
-    crypto::EncryptionKeyring,
+    access_control, auth, bucket_journal,
+    core_store::{CoreObjectRef, CoreStore, GetBlob, PutBlob},
     metadata_journal, object_links,
     observability::{
         OBJECT_READ_LATENCY, OBJECT_WRITE_LATENCY, Observability, PREFIX_LIST_LATENCY,
@@ -16,42 +11,27 @@ use crate::{
         Bucket, MetadataMutationReceipt, Object, ObjectVersion, ObjectVersionsPage,
         ObjectWatchEvent, Persistence,
     },
-    placement::PlacementManager,
     routing::{self, CrossRegionRoutingPolicy},
-    sharding::ShardManager,
-    storage::{ExternalChunkManifest, Storage},
+    storage::Storage,
     validation, watch_log,
 };
 use futures_util::{Stream, StreamExt};
 use serde_json::Value as JsonValue;
 use std::pin::Pin;
-use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 use tonic::metadata::MetadataValue;
 use tracing::info;
 
-const INLINE_PAYLOAD_MAX_BYTES: i64 = 64 * 1024;
-
-#[derive(Debug, Clone, Default)]
-struct CommittedPayload {
-    inline_payload: Option<Vec<u8>>,
-    chunk_manifest: Option<ExternalChunkManifest>,
-}
-
 #[derive(Debug, Clone)]
 pub struct ObjectManager {
     persistence: Persistence,
-    placer: PlacementManager,
-    cluster: ClusterState,
-    sharder: ShardManager,
     storage: Storage,
+    core_store: CoreStore,
     region: String,
     cross_region_routing_policy: CrossRegionRoutingPolicy,
-    jwt_manager: Arc<auth::JwtManager>,
     signing_key: Vec<u8>,
-    secret_keyring: Arc<EncryptionKeyring>,
     watch_tx: broadcast::Sender<ObjectWatchEvent>,
     observability: Observability,
 }
@@ -130,36 +110,6 @@ pub struct ObjectHeadResult {
     pub followed_link: Option<object_links::FollowedObjectLink>,
 }
 
-async fn commit_temp_payload(
-    storage: &Storage,
-    temp_path: &std::path::Path,
-    total_bytes: i64,
-    content_hash: &str,
-) -> Result<CommittedPayload, Status> {
-    if total_bytes <= INLINE_PAYLOAD_MAX_BYTES {
-        let payload = tokio::fs::read(temp_path)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        tokio::fs::remove_file(temp_path)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        return Ok(CommittedPayload {
-            inline_payload: Some(payload),
-            chunk_manifest: None,
-        });
-    }
-
-    info!("Committing external object chunks");
-    let chunk_manifest = storage
-        .commit_external_chunks(temp_path, content_hash)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-    Ok(CommittedPayload {
-        inline_payload: None,
-        chunk_manifest: Some(chunk_manifest),
-    })
-}
-
 #[derive(Debug, Clone)]
 pub struct AppendStreamRecordResult {
     pub record_sequence: u64,
@@ -194,29 +144,21 @@ impl ObjectManager {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         persistence: Persistence,
-        placer: PlacementManager,
-        cluster: ClusterState,
-        sharder: ShardManager,
         storage: Storage,
+        core_store: CoreStore,
         region: String,
         cross_region_routing_policy: CrossRegionRoutingPolicy,
-        jwt_manager: Arc<auth::JwtManager>,
         signing_key: Vec<u8>,
-        secret_keyring: Arc<EncryptionKeyring>,
         watch_tx: broadcast::Sender<ObjectWatchEvent>,
         observability: Observability,
     ) -> Self {
         Self {
             persistence,
-            placer,
-            cluster,
-            sharder,
             storage,
+            core_store,
             region,
             cross_region_routing_policy,
-            jwt_manager,
             signing_key,
-            secret_keyring,
             watch_tx,
             observability,
         }
@@ -235,7 +177,7 @@ impl ObjectManager {
         bucket_name: &str,
         object_key: &str,
         scopes: &[String],
-        mut data_stream: impl Stream<Item = Result<Vec<u8>, Status>> + Unpin,
+        data_stream: impl Stream<Item = Result<Vec<u8>, Status>> + Unpin,
         options: ObjectWriteOptions,
     ) -> Result<Object, Status> {
         let _latency = self
@@ -270,132 +212,32 @@ impl ObjectManager {
             return Err(Status::permission_denied("Permission denied"));
         }
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
-        let nodes = self
-            .placer
-            .calculate_placement(object_key, &self.cluster, self.sharder.total_shards())
-            .await;
-
-        let total_bytes;
-        let content_hash;
-        let mut committed_payload = CommittedPayload::default();
-
-        if nodes.len() < self.sharder.total_shards() {
-            if nodes.len() >= 1 {
-                // Single-node case: stream to a whole file.
-                let (temp_path, bytes, hash) = self
-                    .storage
-                    .stream_to_temp_file(data_stream)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                total_bytes = bytes;
-                content_hash = hash;
-                committed_payload =
-                    commit_temp_payload(&self.storage, &temp_path, total_bytes, &content_hash)
-                        .await?;
-            } else {
-                // No peers known; fallback to single-node path as well
-                let (temp_path, bytes, hash) = self
-                    .storage
-                    .stream_to_temp_file(data_stream)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                total_bytes = bytes;
-                content_hash = hash;
-                committed_payload =
-                    commit_temp_payload(&self.storage, &temp_path, total_bytes, &content_hash)
-                        .await?;
-            }
-        } else {
-            // Distributed case: stream and erasure code stripes.
-            let mut overall_hasher = blake3::Hasher::new();
-            let mut bytes_so_far = 0;
-            let upload_id = uuid::Uuid::new_v4().to_string();
-
-            let stripe_size = 1024 * 64; // 64KB per shard in a stripe
-            let data_shards_count = self.sharder.data_shards();
-            let stripe_buffer_size = stripe_size * data_shards_count;
-            let mut stripe_buffer = Vec::with_capacity(stripe_buffer_size);
-
-            let mut clients = Vec::new();
-            let cluster_map = self.cluster.read().await;
-            for peer_id in &nodes {
-                let peer_info = cluster_map.get(peer_id).ok_or_else(|| {
-                    Status::internal("Placement selected a peer that is not in the cluster state")
-                })?;
-                let addr = peer_info.grpc_addr.clone();
-                let endpoint = if addr.starts_with("http://") || addr.starts_with("https://") {
-                    addr
-                } else {
-                    format!("http://{}", addr)
-                };
-                let client =
-                    internal_anvil_service_client::InternalAnvilServiceClient::connect(endpoint)
-                        .await
-                        .map_err(|e| Status::unavailable(e.to_string()))?;
-                clients.push(client);
-            }
-
-            while let Some(chunk_result) = data_stream.next().await {
-                let chunk = chunk_result?;
-                overall_hasher.update(&chunk);
-                bytes_so_far += chunk.len();
-                stripe_buffer.extend_from_slice(&chunk);
-
-                while stripe_buffer.len() >= stripe_buffer_size {
-                    let stripe_data = stripe_buffer
-                        .drain(..stripe_buffer_size)
-                        .collect::<Vec<_>>();
-                    self.send_stripe(&clients, &upload_id, stripe_data, stripe_size)
-                        .await?;
-                }
-            }
-
-            if !stripe_buffer.is_empty() {
-                stripe_buffer.resize(stripe_buffer_size, 0);
-                self.send_stripe(&clients, &upload_id, stripe_buffer, stripe_size)
-                    .await?;
-            }
-
-            total_bytes = bytes_so_far as i64;
-            content_hash = overall_hasher.finalize().to_hex().to_string();
-
-            let mut futures = Vec::new();
-            for (i, client) in clients.into_iter().enumerate() {
-                let scope = format!("internal:commit_shard|{}/{}", content_hash, i);
-                let token = self
-                    .jwt_manager
-                    .mint_token("internal".to_string(), vec![scope], 0)
-                    .map_err(|e| Status::internal(e.to_string()))?;
-
-                let mut client = client.clone();
-                let request = CommitShardRequest {
-                    upload_id: upload_id.clone(),
-                    shard_index: i as u32,
-                    final_object_hash: content_hash.clone(),
-                };
-                let mut req = tonic::Request::new(request);
-                req.metadata_mut().insert(
-                    "authorization",
-                    format!("Bearer {}", token).parse().unwrap(),
-                );
-                futures.push(async move { client.commit_shard(req).await });
-            }
-            futures::future::try_join_all(futures)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-        }
-
-        let shard_map_json = if nodes.len() >= self.sharder.total_shards() {
-            let peer_ids: Vec<String> = nodes.iter().map(|p| p.to_base58()).collect();
-            Some(serde_json::json!(peer_ids))
-        } else {
-            committed_payload
-                .chunk_manifest
-                .as_ref()
-                .map(serde_json::to_value)
-                .transpose()
-                .map_err(|e| Status::internal(e.to_string()))?
-        };
+        let (temp_path, total_bytes, _legacy_hash) = self
+            .storage
+            .stream_to_temp_file(data_stream)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let payload = tokio::fs::read(&temp_path)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        tokio::fs::remove_file(&temp_path)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let object_ref = self
+            .core_store
+            .put_blob(PutBlob {
+                logical_name: format!(
+                    "tenant:{tenant_id}/bucket:{}/object:{}",
+                    bucket.name, object_key
+                ),
+                bytes: payload,
+                region_id: self.region.clone(),
+                mutation_id: uuid::Uuid::new_v4().to_string(),
+            })
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let content_hash = object_ref.hash.clone();
+        let shard_map_json = Some(core_object_ref_to_shard_map(&object_ref));
 
         let object = self
             .persistence
@@ -409,7 +251,7 @@ impl ObjectManager {
                 options.content_type.as_deref(),
                 options.user_metadata,
                 shard_map_json,
-                committed_payload.inline_payload,
+                None,
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -461,22 +303,39 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Multipart upload not found"))?;
 
-        let (temp_path, bytes, content_hash) = self
+        let (temp_path, bytes, _legacy_content_hash) = self
             .storage
             .stream_to_temp_file(data_stream)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        self.storage
-            .commit_whole_object(&temp_path, &content_hash)
+
+        let payload = tokio::fs::read(&temp_path)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        tokio::fs::remove_file(&temp_path)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let object_ref = self
+            .core_store
+            .put_blob(PutBlob {
+                logical_name: format!(
+                    "tenant:{tenant_id}/bucket:{}/multipart:{upload_id}/part:{part_number}",
+                    bucket.name
+                ),
+                bytes: payload,
+                region_id: self.region.clone(),
+                mutation_id: uuid::Uuid::new_v4().to_string(),
+            })
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let content_hash = object_ref.hash.clone();
 
         let mutation = self
             .persistence
             .upsert_multipart_part(
                 upload.id,
                 part_number,
-                &content_hash,
+                object_ref,
                 bytes as i64,
                 &content_hash,
             )
@@ -521,7 +380,7 @@ impl ObjectManager {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let mut ordered_hashes = Vec::with_capacity(parts.len());
+        let mut ordered_part_refs = Vec::with_capacity(parts.len());
         for expected in parts {
             let stored = stored_parts
                 .iter()
@@ -534,14 +393,14 @@ impl ObjectManager {
                     "Complete request part ETag mismatch",
                 ));
             }
-            ordered_hashes.push(stored.content_hash.clone());
+            ordered_part_refs.push(stored.object_ref.clone());
         }
 
-        let storage = self.storage.clone();
+        let core_store = self.core_store.clone();
         let (tx, rx) = mpsc::channel(4);
         tokio::spawn(async move {
-            for content_hash in ordered_hashes {
-                let bytes = match storage.retrieve_whole_object(&content_hash).await {
+            for object_ref in ordered_part_refs {
+                let bytes = match core_store.get_blob(GetBlob { object_ref }).await {
                     Ok(bytes) => bytes,
                     Err(error) => {
                         let _ = tx.send(Err(Status::internal(error.to_string()))).await;
@@ -742,17 +601,28 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Append stream not found"))?;
 
-        let payload_hash = blake3::hash(&payload).to_hex().to_string();
-        self.storage
-            .store_whole_object(&payload_hash, &payload)
+        let payload_size = payload.len() as i64;
+        let object_ref = self
+            .core_store
+            .put_blob(PutBlob {
+                logical_name: format!(
+                    "tenant:{tenant_id}/bucket:{}/append:{stream_key}/record:{}",
+                    bucket.name,
+                    uuid::Uuid::new_v4()
+                ),
+                bytes: payload,
+                region_id: self.region.clone(),
+                mutation_id: uuid::Uuid::new_v4().to_string(),
+            })
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        let payload_hash = object_ref.hash.clone();
         let mutation = self
             .persistence
             .append_stream_record(
                 stream.id,
-                &payload_hash,
-                payload.len() as i64,
+                object_ref,
+                payload_size,
                 content_type.clone(),
                 user_metadata.clone(),
             )
@@ -763,7 +633,7 @@ impl ObjectManager {
             record_sequence: u64::try_from(mutation.record.record_sequence)
                 .map_err(|_| Status::internal("Invalid record sequence"))?,
             payload_hash,
-            payload_size: payload.len() as i64,
+            payload_size,
             content_type,
             user_metadata,
             receipt: mutation.receipt,
@@ -862,8 +732,10 @@ impl ObjectManager {
         for record in records {
             let payload = if include_payload {
                 Some(
-                    self.storage
-                        .retrieve_whole_object(&record.payload_hash)
+                    self.core_store
+                        .get_blob(GetBlob {
+                            object_ref: record.payload_object_ref.clone(),
+                        })
                         .await
                         .map_err(|e| Status::internal(e.to_string()))?,
                 )
@@ -924,56 +796,6 @@ impl ObjectManager {
             manifest_hash: result.manifest_hash,
             receipt: result.receipt,
         })
-    }
-
-    async fn send_stripe(
-        &self,
-        clients: &[internal_anvil_service_client::InternalAnvilServiceClient<
-            tonic::transport::Channel,
-        >],
-        upload_id: &str,
-        stripe_data: Vec<u8>,
-        stripe_size: usize,
-    ) -> Result<(), Status> {
-        let mut shards: Vec<Vec<u8>> = stripe_data
-            .chunks(stripe_size)
-            .map(|c| c.to_vec())
-            .collect();
-        shards.resize(self.sharder.total_shards(), vec![0; stripe_size]);
-        self.sharder
-            .encode(&mut shards, &self.secret_keyring)
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        let mut futures = Vec::new();
-        for (i, shard_data) in shards.into_iter().enumerate() {
-            let scope = format!("internal:put_shard|{}/{}", upload_id, i);
-            let token = self
-                .jwt_manager
-                .mint_token("internal".to_string(), vec![scope], 0)
-                .map_err(|e| Status::internal(e.to_string()))?;
-
-            let request = PutShardRequest {
-                upload_id: upload_id.to_string(),
-                shard_index: i as u32,
-                data: shard_data,
-            };
-
-            let mut client = clients[i].clone();
-            let request_stream = tokio_stream::iter(vec![request]);
-            let mut req = tonic::Request::new(request_stream);
-            req.metadata_mut().insert(
-                "authorization",
-                format!("Bearer {}", token).parse().unwrap(),
-            );
-
-            futures.push(async move { client.put_shard(req).await });
-        }
-
-        futures::future::try_join_all(futures)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        Ok(())
     }
 
     pub async fn get_object(
@@ -1098,245 +920,34 @@ impl ObjectManager {
             followed_link = Some(link);
         }
 
-        if let Some(inline_payload) = object.inline_payload.clone() {
-            let chunks = inline_payload
-                .chunks(1024 * 64)
-                .map(|chunk| Ok(chunk.to_vec()))
-                .collect::<Vec<Result<Vec<u8>, Status>>>();
-            return Ok(ObjectReadResult {
-                object,
-                stream: Box::pin(futures_util::stream::iter(chunks)),
-                followed_link,
-            });
-        }
-
         let (tx, rx) = mpsc::channel(4);
         let app_state = self.clone();
         let object_clone = object.clone();
 
         tokio::spawn(async move {
-            if let Some(manifest) = object_clone
+            let Some(object_ref) = object_clone
                 .shard_map
                 .as_ref()
-                .and_then(external_chunk_manifest_from_shard_map)
-            {
-                for expected_index in 0..manifest.chunks.len() {
-                    let record = &manifest.chunks[expected_index];
-                    if record.chunk_index != expected_index as u64 {
-                        let _ = tx
-                            .send(Err(Status::internal(
-                                "Object data unavailable: invalid external chunk order",
-                            )))
-                            .await;
-                        return;
-                    }
-                    let chunk = match app_state
-                        .storage
-                        .retrieve_external_chunk(&record.storage_ref)
-                        .await
-                    {
-                        Ok(chunk) => chunk,
-                        Err(error) => {
-                            let _ = tx.send(Err(Status::not_found(error.to_string()))).await;
-                            return;
-                        }
-                    };
-                    if chunk.len() as u64 != record.plaintext_length {
-                        let _ = tx
-                            .send(Err(Status::internal(
-                                "Object data unavailable: external chunk length mismatch",
-                            )))
-                            .await;
-                        return;
-                    }
-                    let actual_hash = blake3::hash(&chunk).to_hex().to_string();
-                    if actual_hash != record.payload_chunk_hash
-                        || actual_hash != record.storage_chunk_hash
-                    {
-                        let _ = tx
-                            .send(Err(Status::internal(
-                                "Object data unavailable: external chunk hash mismatch",
-                            )))
-                            .await;
-                        return;
-                    }
-                    for part in chunk.chunks(1024 * 64) {
-                        if tx.send(Ok(part.to_vec())).await.is_err() {
-                            return;
-                        }
-                    }
-                }
-                return;
-            }
-
-            // Prefer whole-object if available
-            if let Ok(full_data) = app_state
-                .storage
-                .retrieve_whole_object(&object_clone.content_hash)
-                .await
-            {
-                for chunk in full_data.chunks(1024 * 64) {
-                    if tx.send(Ok(chunk.to_vec())).await.is_err() {
-                        break;
-                    }
-                }
-                return;
-            }
-
-            // Strict shard map usage
-            let shard_map_peer_ids: Vec<libp2p::PeerId> = match object_clone.shard_map.as_ref() {
-                Some(map_json) => {
-                    let peer_strs: Vec<String> = match serde_json::from_value(map_json.clone()) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            let _ = tx
-                                .send(Err(Status::not_found(
-                                    "Object data unavailable: invalid shard map",
-                                )))
-                                .await;
-                            return;
-                        }
-                    };
-                    let mut ids = Vec::with_capacity(peer_strs.len());
-                    for s in peer_strs {
-                        match s.parse() {
-                            Ok(pid) => ids.push(pid),
-                            Err(_) => {
-                                let _ = tx
-                                    .send(Err(Status::not_found(
-                                        "Object data unavailable: bad peer id in shard map",
-                                    )))
-                                    .await;
-                                return;
-                            }
-                        }
-                    }
-                    ids
-                }
-                None => {
-                    let _ = tx
-                        .send(Err(Status::not_found("Object data unavailable")))
-                        .await;
-                    return;
-                }
-            };
-
-            let total_shards = app_state.sharder.total_shards();
-            if shard_map_peer_ids.len() < total_shards {
+                .and_then(core_object_ref_from_shard_map)
+            else {
                 let _ = tx
                     .send(Err(Status::not_found(
-                        "Object data unavailable: incomplete shard map",
+                        "Object data unavailable: object is not CoreStore-backed",
                     )))
                     .await;
                 return;
-            }
+            };
 
-            let mut shards = Vec::with_capacity(total_shards);
-            for i in 0..total_shards {
-                let shard_data = app_state
-                    .storage
-                    .retrieve_shard(&object_clone.content_hash, i as u32)
-                    .await
-                    .ok();
-                shards.push(shard_data);
-            }
-
-            let mut missing_shards_futures = Vec::new();
-            for i in 0..total_shards {
-                if shards[i].is_none() {
-                    let peer_id = &shard_map_peer_ids[i];
-                    let cluster_map = app_state.cluster.read().await;
-                    if let Some(peer_info) = cluster_map.get(peer_id) {
-                        let grpc_addr = peer_info.grpc_addr.clone();
-                        let object_hash = object_clone.content_hash.clone();
-                        let jwt_manager = app_state.jwt_manager.clone();
-                        missing_shards_futures.push(async move {
-                            let endpoint = if grpc_addr.starts_with("http://")
-                                || grpc_addr.starts_with("https://")
-                            {
-                                grpc_addr
-                            } else {
-                                format!("http://{}", grpc_addr)
-                            };
-                            let mut client =
-                                internal_anvil_service_client::InternalAnvilServiceClient::connect(
-                                    endpoint,
-                                )
-                                .await
-                                .map_err(|e| {
-                                    Status::internal(format!("Failed to connect to peer: {}", e))
-                                })?;
-                            let scope = format!("internal:get_shard|{}/{}", object_hash, i);
-                            let token = jwt_manager
-                                .mint_token("internal".to_string(), vec![scope], 0)
-                                .map_err(|e| Status::internal(e.to_string()))?;
-                            let mut req = tonic::Request::new(GetShardRequest {
-                                object_hash: object_hash.clone(),
-                                shard_index: i as u32,
-                            });
-                            req.metadata_mut().insert(
-                                "authorization",
-                                format!("Bearer {}", token).parse().unwrap(),
-                            );
-                            let mut stream = client.get_shard(req).await?.into_inner();
-                            let mut shard_data = Vec::new();
-                            while let Some(chunk_res) = stream.next().await {
-                                let chunk = chunk_res?;
-                                shard_data.extend_from_slice(&chunk.data);
-                            }
-                            Ok((i, shard_data))
-                        });
-                    } else {
-                        let _ = tx
-                            .send(Err(Status::not_found(
-                                "Object data unavailable: peer missing from cluster",
-                            )))
-                            .await;
-                        return;
+            match app_state.core_store.get_blob(GetBlob { object_ref }).await {
+                Ok(full_data) => {
+                    for chunk in full_data.chunks(1024 * 64) {
+                        if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                            return;
+                        }
                     }
                 }
-            }
-
-            let results: Vec<Result<(usize, Vec<u8>), Status>> =
-                futures::future::join_all(missing_shards_futures).await;
-            for result in results {
-                match result {
-                    Ok((index, data)) => shards[index] = Some(data),
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        return;
-                    }
-                }
-            }
-
-            if app_state
-                .sharder
-                .reconstruct(&mut shards, &app_state.secret_keyring)
-                .is_err()
-            {
-                let _ = tx
-                    .send(Err(Status::internal("Failed to reconstruct object data")))
-                    .await;
-                return;
-            }
-
-            // Stream reconstructed data in 64KB chunks
-            let mut full_data = Vec::new();
-            let data_shards = &shards[..app_state.sharder.data_shards()];
-            for data_shard_opt in data_shards {
-                if let Some(sd) = data_shard_opt {
-                    full_data.extend_from_slice(sd);
-                } else {
-                    let _ = tx
-                        .send(Err(Status::internal("Failed to reconstruct data")))
-                        .await;
-                    return;
-                }
-            }
-            full_data.truncate(object_clone.size as usize);
-            for chunk in full_data.chunks(1024 * 64) {
-                if tx.send(Ok(chunk.to_vec())).await.is_err() {
-                    break;
+                Err(error) => {
+                    let _ = tx.send(Err(Status::not_found(error.to_string()))).await;
                 }
             }
         });
@@ -1881,7 +1492,7 @@ impl ObjectManager {
                 source_object.content_type.as_deref(),
                 source_object.user_meta,
                 source_object.shard_map,
-                source_object.inline_payload,
+                None,
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -2465,9 +2076,24 @@ fn validate_multipart_part_number(part_number: i32) -> Result<(), Status> {
     }
 }
 
-fn external_chunk_manifest_from_shard_map(value: &JsonValue) -> Option<ExternalChunkManifest> {
-    let manifest = serde_json::from_value::<ExternalChunkManifest>(value.clone()).ok()?;
-    (manifest.kind == "external_chunks_v1").then_some(manifest)
+fn core_object_ref_to_shard_map(object_ref: &CoreObjectRef) -> JsonValue {
+    serde_json::json!({
+        "schema": "anvil.core.object_ref.v1",
+        "hash": object_ref.hash,
+        "logical_size": object_ref.logical_size,
+        "manifest_ref": object_ref.manifest_ref,
+    })
+}
+
+fn core_object_ref_from_shard_map(value: &JsonValue) -> Option<CoreObjectRef> {
+    if value.get("schema")?.as_str()? != "anvil.core.object_ref.v1" {
+        return None;
+    }
+    Some(CoreObjectRef {
+        hash: value.get("hash")?.as_str()?.to_string(),
+        logical_size: value.get("logical_size")?.as_u64()?,
+        manifest_ref: value.get("manifest_ref")?.as_str()?.to_string(),
+    })
 }
 
 fn trim_s3_etag(value: &str) -> &str {
