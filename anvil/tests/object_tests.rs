@@ -9,11 +9,12 @@ use anvil::anvil_api::{
     ComposeObjectRequest, ComposeObjectSource, CopyObjectRequest, CreateAppendStreamRequest,
     CreateBucketRequest, CreateIndexRequest, DeleteObjectRequest, GetObjectRequest,
     HeadObjectRequest, IndexKind, InitiateMultipartRequest, LeaseFencePrecondition,
-    ListObjectVersionsRequest, ListObjectsRequest, MutationBatchOperation,
-    MutationBatchPatchJsonObject, MutationBatchRequest, NativeMutationContext, ObjectMetadata,
-    PatchJsonObjectRequest, PutObjectRequest, ReadAppendStreamRequest, RepairDirectoryIndexRequest,
-    SealAppendStreamSegmentRequest, TailAppendStreamRequest, UploadPartMetadata, UploadPartRequest,
-    WatchPrefixRequest, WritePrecondition,
+    ListObjectVersionsRequest, ListObjectsRequest, MutationBatchAppendStreamRecord,
+    MutationBatchOperation, MutationBatchPatchJsonObject, MutationBatchRequest,
+    NativeMutationContext, ObjectMetadata, PatchJsonObjectRequest, PutObjectRequest,
+    ReadAppendStreamRequest, RepairDirectoryIndexRequest, SealAppendStreamSegmentRequest,
+    TailAppendStreamRequest, UploadPartMetadata, UploadPartRequest, WatchPrefixRequest,
+    WritePrecondition,
 };
 use futures_util::StreamExt;
 use std::time::Duration;
@@ -24,9 +25,9 @@ use anvil::observability::{
     RESERVED_NAMESPACE_REJECTION_COUNT,
 };
 use anvil::routing::CrossRegionRoutingPolicy;
-use anvil::storage::{DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES, ExternalChunkManifest};
 use anvil::{
     auth::Claims,
+    core_store::CoreStore,
     mesh_directory::{
         self, BucketId, BucketLocatorDescriptor, BucketName, CellId, MeshControlWriteAuthority,
         MeshId, RegionName, RoutingRecordFamily, TenantId,
@@ -912,9 +913,17 @@ async fn test_repair_rebuilds_missing_directory_segment_from_metadata_journal() 
         .await
         .unwrap()
         .expect("object metadata compaction writes directory segment");
-    tokio::fs::remove_file(&sealed.directory_path)
+    let directory_ref_name = sealed
+        .directory_ref
+        .strip_prefix("coreref:")
+        .expect("directory segment ref should be a CoreStore ref");
+    let store = CoreStore::new(cluster.states[0].storage.clone())
         .await
-        .expect("remove directory segment to force repair");
+        .unwrap();
+    store
+        .delete_ref(directory_ref_name, None, None, true)
+        .await
+        .expect("remove directory segment ref to force repair");
 
     let mut repair_client = RepairServiceClient::connect(grpc_addr.clone())
         .await
@@ -2195,7 +2204,7 @@ async fn test_head_object() {
 }
 
 #[tokio::test]
-async fn test_inline_payload_threshold_is_recorded_and_readable() {
+async fn test_object_payloads_are_corestore_backed_and_readable() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
@@ -2257,7 +2266,7 @@ async fn test_inline_payload_threshold_is_recorded_and_readable() {
         .unwrap()
         .into_inner();
 
-    let external_content = vec![9_u8; DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES + 123];
+    let external_content = vec![9_u8; 128 * 1024 + 123];
     let mut external_chunks = vec![PutObjectRequest {
         data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
             ObjectMetadata {
@@ -2306,9 +2315,14 @@ async fn test_inline_payload_threshold_is_recorded_and_readable() {
         .await
         .unwrap()
         .expect("inline object version should exist");
+    let inline_shard_map = inline_object
+        .shard_map
+        .as_ref()
+        .expect("inline object should record a CoreStore object ref");
+    assert_eq!(inline_shard_map["schema"], "anvil.core.object_ref.v1");
     assert_eq!(
-        inline_object.inline_payload.as_deref(),
-        Some(&inline_content[..])
+        inline_shard_map["logical_size"].as_u64(),
+        Some(inline_content.len() as u64)
     );
 
     let external_object = cluster.states[0]
@@ -2321,40 +2335,15 @@ async fn test_inline_payload_threshold_is_recorded_and_readable() {
         .await
         .unwrap()
         .expect("external object version should exist");
-    assert!(external_object.inline_payload.is_none());
-    let manifest: ExternalChunkManifest = serde_json::from_value(
-        external_object
-            .shard_map
-            .clone()
-            .expect("external object should record chunk manifest"),
-    )
-    .expect("external chunk manifest should decode");
-    assert_eq!(manifest.kind, "external_chunks_v1");
-    assert_eq!(manifest.chunk_size, DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES);
-    assert_eq!(manifest.chunks.len(), 2);
+    let external_shard_map = external_object
+        .shard_map
+        .as_ref()
+        .expect("external object should record a CoreStore object ref");
+    assert_eq!(external_shard_map["schema"], "anvil.core.object_ref.v1");
     assert_eq!(
-        manifest
-            .chunks
-            .iter()
-            .map(|chunk| chunk.plaintext_length as usize)
-            .sum::<usize>(),
-        external_content.len()
+        external_shard_map["logical_size"].as_u64(),
+        Some(external_content.len() as u64)
     );
-    for (idx, record) in manifest.chunks.iter().enumerate() {
-        assert_eq!(record.chunk_index, idx as u64);
-        assert_eq!(record.compression, "none");
-        assert!(record.storage_ref.starts_with("_anvil/payloads/chunks/"));
-        let path = cluster.states[0].storage.external_chunk_path(
-            &external_object.content_hash,
-            record.chunk_index,
-            &record.payload_chunk_hash,
-        );
-        assert!(
-            path.exists(),
-            "external chunk path should exist: {}",
-            path.display()
-        );
-    }
 
     let mut get_req = Request::new(GetObjectRequest {
         bucket_name: bucket_name.clone(),
@@ -3305,6 +3294,24 @@ async fn test_mutation_batch_rejects_stale_lease_fence_for_state_update() {
         .into_inner();
     assert_eq!(batch.operation_receipts.len(), 1);
 
+    let stream_key = "queue/item-1-attempts".to_string();
+    let create_stream = object_client
+        .create_append_stream(authorized(
+            CreateAppendStreamRequest {
+                bucket_name: bucket_name.clone(),
+                stream_key: stream_key.clone(),
+                mutation_context: Some(native_mutation_context(
+                    bucket_id,
+                    "fenced-batch-create-stream",
+                )),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let stream_id = create_stream.stream_id;
+
     coordination_client
         .commit_task_lease(authorized(
             anvil_api::CommitTaskLeaseRequest {
@@ -3321,19 +3328,19 @@ async fn test_mutation_batch_rejects_stale_lease_fence_for_state_update() {
     let stale = object_client
         .mutation_batch(authorized(
             MutationBatchRequest {
-                bucket_name,
+                bucket_name: bucket_name.clone(),
                 mutation_context: Some(native_mutation_context(bucket_id, "fenced-batch-stale")),
                 precondition: Some(WritePrecondition {
                     object_versions: vec![],
                     lease_fence: Some(LeaseFencePrecondition {
-                        task_id,
+                        task_id: task_id.clone(),
                         fence_token: lease.fence_token,
                     }),
                 }),
                 operations: vec![MutationBatchOperation {
                     op: Some(anvil_api::mutation_batch_operation::Op::PatchJsonObject(
                         MutationBatchPatchJsonObject {
-                            object_key,
+                            object_key: object_key.clone(),
                             base_version_id: None,
                             merge_patch_json: serde_json::json!({
                                 "state": {"state": "completed"}
@@ -3347,6 +3354,40 @@ async fn test_mutation_batch_rejects_stale_lease_fence_for_state_update() {
         ))
         .await;
     assert!(stale.is_err());
+
+    let stale_append = object_client
+        .mutation_batch(authorized(
+            MutationBatchRequest {
+                bucket_name,
+                mutation_context: Some(native_mutation_context(
+                    bucket_id,
+                    "fenced-batch-stale-append",
+                )),
+                precondition: Some(WritePrecondition {
+                    object_versions: vec![],
+                    lease_fence: Some(LeaseFencePrecondition {
+                        task_id,
+                        fence_token: lease.fence_token,
+                    }),
+                }),
+                operations: vec![MutationBatchOperation {
+                    op: Some(anvil_api::mutation_batch_operation::Op::AppendStreamRecord(
+                        MutationBatchAppendStreamRecord {
+                            stream_key,
+                            stream_id,
+                            payload: br#"{"attempt":1}"#.to_vec(),
+                            content_type: Some("application/json".to_string()),
+                            user_metadata_json: String::new(),
+                        },
+                    )),
+                }],
+            },
+            &token,
+        ))
+        .await
+        .expect_err("stale lease fence must not append a protected stream record");
+    assert_eq!(stale_append.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(stale_append.message(), "LeaseExpired");
 }
 
 #[tokio::test]

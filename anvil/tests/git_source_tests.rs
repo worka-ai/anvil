@@ -3,6 +3,7 @@ use anvil::anvil_api::{
     GetGitBlobByPathRequest, GetGitObjectRequest, GitPackMetadata, ListGitTreeRequest,
     PutGitPackRequest, WatchGitSourceRequest, put_git_pack_request,
 };
+use anvil::core_store::CoreStore;
 use anvil::formats::git::{GitHashAlgorithm, GitSourceRecord};
 use anvil::git_source_index::{GitSourceIndexWrite, write_git_source_index};
 use anvil::git_source_watch::{GitSourceWatchPayload, append_git_source_watch_record};
@@ -248,14 +249,28 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
     assert_eq!(response.record_count, 1);
     assert_eq!(response.watch_cursor_low, 1);
     assert_eq!(response.watch_cursor_high, 0);
-    assert!(response.index_path.starts_with("_anvil/"));
-    let index_path = cluster.states[0]
-        .storage
-        .resolve_relative_storage_path(&response.index_path)
+    assert!(response.index_path.starts_with("git_source_index:"));
+    let core_store = CoreStore::new(cluster.states[0].storage.clone())
+        .await
         .unwrap();
-    assert!(tokio::fs::try_exists(&index_path).await.unwrap());
-    tokio::fs::remove_file(&index_path).await.unwrap();
-    assert!(!tokio::fs::try_exists(&index_path).await.unwrap());
+    assert!(
+        core_store
+            .read_ref(&response.index_path)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    core_store
+        .delete_ref(&response.index_path, None, None, true)
+        .await
+        .unwrap();
+    assert!(
+        core_store
+            .read_ref(&response.index_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     let blob = client
         .get_git_blob_by_path(authorized(
@@ -274,8 +289,12 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
     assert_eq!(blob.tree_path, "README.md");
     assert_eq!(blob.pack_object_version_id, response.version_id);
     assert!(
-        tokio::fs::try_exists(&index_path).await.unwrap(),
-        "git source query must rebuild a missing derived index from stored pack bytes"
+        core_store
+            .read_ref(&response.index_path)
+            .await
+            .unwrap()
+            .is_some(),
+        "git source query must rebuild a missing derived index ref from stored pack bytes"
     );
 
     let s3 = cluster

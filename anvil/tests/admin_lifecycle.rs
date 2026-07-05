@@ -136,39 +136,20 @@ async fn activation_checkpoint_json_from_existing_streams(
         .map(|family| family.stream_family())
         .chain(anvil::mesh_lifecycle::lifecycle_control_stream_families().into_iter());
     for stream_family in stream_families {
-        let family_path = node
-            .state
-            .storage
-            .mesh_control_stream_family_path(stream_family)
+        let partitions = anvil::mesh_control_stream::list_control_stream_partitions(
+            &node.state.storage,
+            stream_family,
+        )
+        .await
+        .unwrap();
+        for partition in partitions {
+            let log = anvil::mesh_control_stream::read_control_stream_log(
+                &node.state.storage,
+                stream_family,
+                &partition,
+            )
+            .await
             .unwrap();
-        let mut entries = match tokio::fs::read_dir(&family_path).await {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => panic!("read control stream directory {family_path:?}: {err}"),
-        };
-        while let Some(entry) = entries.next_entry().await.unwrap() {
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("anlog") {
-                continue;
-            }
-            let Some(partition) = path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .map(str::to_string)
-            else {
-                continue;
-            };
-            if node
-                .state
-                .storage
-                .mesh_control_stream_path(stream_family, &partition)
-                .is_err()
-            {
-                continue;
-            }
-            let log = anvil::mesh_control_stream::read_control_stream_log(&path)
-                .await
-                .unwrap();
             let Some(record) = log.records.last() else {
                 continue;
             };
@@ -1156,14 +1137,17 @@ async fn admin_routing_records_list_and_repair_mesh_locators() {
         .cloned()
         .expect("bucket locator record should be listed");
 
-    let descriptor_relative = bucket_record
-        .descriptor_key
-        .strip_prefix("_anvil/control/v1/mesh/")
+    anvil::core_store::CoreStore::new(node.state.storage.clone())
+        .await
+        .unwrap()
+        .delete_ref(
+            &format!("mesh_directory:{}", bucket_record.descriptor_key),
+            None,
+            None,
+            true,
+        )
+        .await
         .unwrap();
-    let descriptor_path = std::path::Path::new(&node.state.config.storage_path)
-        .join("_anvil/control/v1/mesh")
-        .join(descriptor_relative);
-    tokio::fs::remove_file(&descriptor_path).await.unwrap();
 
     let missing_after_delete = client
         .list_routing_records(with_auth(
@@ -1273,7 +1257,17 @@ async fn admin_routing_records_list_and_repair_mesh_locators() {
             .iter()
             .any(|record| record.record_key == format!("{}/route-bucket", tenant.id))
     );
-    tokio::fs::remove_file(&descriptor_path).await.unwrap();
+    anvil::core_store::CoreStore::new(node.state.storage.clone())
+        .await
+        .unwrap()
+        .delete_ref(
+            &format!("mesh_directory:{}", bucket_record.descriptor_key),
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
     let projection_repair = client
         .run_repair(with_auth(
             tonic::Request::new(RunRepairRequest {
@@ -1758,7 +1752,7 @@ async fn admin_object_links_are_cas_checked_metadata_entries() {
         .unwrap()
         .unwrap();
     assert_eq!(link_entry.size, 0);
-    assert!(link_entry.inline_payload.is_none());
+    assert!(link_entry.shard_map.is_none());
 
     let stale_update = client
         .update_object_link(with_auth(
@@ -1808,7 +1802,7 @@ async fn admin_object_links_are_cas_checked_metadata_entries() {
         .unwrap()
         .unwrap();
     assert_eq!(updated_entry.size, 0);
-    assert!(updated_entry.inline_payload.is_none());
+    assert!(updated_entry.shard_map.is_none());
 
     let stale_delete = client
         .delete_object_link(with_auth(
@@ -1861,26 +1855,24 @@ async fn admin_object_links_are_cas_checked_metadata_entries() {
             .unwrap()
             .is_none()
     );
-    assert_eq!(
-        node.state
-            .persistence
-            .get_object(bucket.id, "versions/app-v1.bin")
-            .await
-            .unwrap()
-            .unwrap()
-            .inline_payload,
-        target_v1.inline_payload
-    );
-    assert_eq!(
-        node.state
-            .persistence
-            .get_object(bucket.id, "versions/app-v2.bin")
-            .await
-            .unwrap()
-            .unwrap()
-            .inline_payload,
-        target_v2.inline_payload
-    );
+    let stored_v1 = node
+        .state
+        .persistence
+        .get_object(bucket.id, "versions/app-v1.bin")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_v1.content_hash, target_v1.content_hash);
+    assert_eq!(stored_v1.shard_map, target_v1.shard_map);
+    let stored_v2 = node
+        .state
+        .persistence
+        .get_object(bucket.id, "versions/app-v2.bin")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_v2.content_hash, target_v2.content_hash);
+    assert_eq!(stored_v2.shard_map, target_v2.shard_map);
 }
 
 #[tokio::test]

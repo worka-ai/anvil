@@ -4,10 +4,10 @@ use anvil::anvil_api::{
     CreateIndexRequest, GetAccessTokenRequest, IndexKind, QueryIndexRequest,
     SetPublicAccessRequest, WriteAuthzTupleRequest,
 };
+use anvil::formats::vector::VECTOR_INDEX_SCHEMA;
 use anvil::mesh_lifecycle::{CreateHostAliasDescriptor, CreateRegionDescriptor, LifecycleState};
 use anvil::object_links::{ObjectLinkResolution, PutObjectLinkRequest};
 use anvil::routing::{HostAliasState, RoutingConfig};
-use anvil::storage::{DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES, ExternalChunkManifest};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
@@ -42,6 +42,33 @@ fn authorized<T>(message: T, token: &str) -> Request<T> {
     );
     request
 }
+
+fn rfc_vector_policy(
+    extractor_kind: &str,
+    provider: &str,
+    model: &str,
+    dimension: u16,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema": VECTOR_INDEX_SCHEMA,
+        "source": {"kind": "object_current"},
+        "extractor": {"kind": extractor_kind},
+        "embedding": {
+            "provider": provider,
+            "model": model,
+            "dimension": dimension,
+            "modality": "text",
+            "normalisation": "unit_l2",
+            "chunking": {"strategy": "whole_object"}
+        },
+        "ann": {
+            "algorithm": "hnsw",
+            "metric": "cosine"
+        }
+    })
+}
+
+const LARGE_OBJECT_RANGE_SPLIT_BYTES: usize = 1024 * 1024;
 
 fn run_large_s3_gateway_test(future: Pin<Box<dyn Future<Output = ()> + Send>>) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1037,7 +1064,7 @@ async fn test_s3_active_get_survives_object_metadata_compaction() {
     let client = s3_client(http_base, &client_id, &client_secret);
     let bucket = format!("s3-active-compact-{}", uuid::Uuid::new_v4());
     let key = "large/active-read.bin";
-    let object_len = DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES + 257;
+    let object_len = LARGE_OBJECT_RANGE_SPLIT_BYTES + 257;
     let payload: Vec<u8> = (0..object_len)
         .map(|index| ((index * 31 + 17) % 251) as u8)
         .collect();
@@ -1147,9 +1174,7 @@ async fn test_s3_writes_trigger_worker_metadata_compaction() {
         .await
         .unwrap()
         .expect("bucket metadata should exist");
-    let manifest_path = cluster.states[0]
-        .storage
-        .metadata_manifest_path(1, bucket_record.id);
+    let manifest_ref = format!("metadata_manifest:tenant:1:bucket:{}", bucket_record.id);
 
     let completed_task = {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -1170,8 +1195,13 @@ async fn test_s3_writes_trigger_worker_metadata_compaction() {
         }
     };
     assert!(
-        tokio::fs::metadata(&manifest_path).await.is_ok(),
-        "worker-completed compaction should publish an object metadata manifest"
+        cluster.states[0]
+            .core_store
+            .read_ref(&manifest_ref)
+            .await
+            .unwrap()
+            .is_some(),
+        "worker-completed compaction should publish an object metadata manifest ref"
     );
     let lease = cluster.states[0]
         .persistence
@@ -1620,16 +1650,14 @@ async fn test_s3_put_triggers_vector_index_build() {
                 name: "embedding".to_string(),
                 kind: IndexKind::Vector as i32,
                 selector_json: serde_json::json!({"prefix": "docs/"}).to_string(),
-                extractor_json: serde_json::json!({"source": "object_body_json_vector"})
-                    .to_string(),
+                extractor_json: serde_json::json!({}).to_string(),
                 authorization_mode: "index_only".to_string(),
-                build_policy_json: serde_json::json!({
-                    "dimension": 2,
-                    "metric": "cosine",
-                    "modality": "text",
-                    "embedding_model": "test-explicit-vector",
-                    "chunking": {"kind": "whole_object"}
-                })
+                build_policy_json: rfc_vector_policy(
+                    "object_body_json_vector",
+                    "caller_supplied",
+                    "test-explicit-vector",
+                    2,
+                )
                 .to_string(),
             },
             &cluster.token,
@@ -1699,7 +1727,7 @@ fn test_s3_public_and_private_access() {
 }
 
 #[test]
-fn test_s3_large_object_uses_external_chunks_and_ranges_across_chunk_boundary() {
+fn test_s3_large_object_uses_corestore_ref_and_ranges_across_large_object() {
     run_large_s3_gateway_test(Box::pin(async {
         let mut cluster = TestCluster::new(&["test-region-1"]).await;
         cluster.start_and_converge(Duration::from_secs(5)).await;
@@ -1712,7 +1740,7 @@ fn test_s3_large_object_uses_external_chunks_and_ranges_across_chunk_boundary() 
         let client = s3_client(http_base, &client_id, &client_secret);
         let bucket_name = format!("s3-large-chunks-{}", uuid::Uuid::new_v4());
         let object_key = "large/chunked.bin";
-        let object_len = DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES + 257;
+        let object_len = LARGE_OBJECT_RANGE_SPLIT_BYTES + 257;
         let content = (0..object_len)
             .map(|idx| (idx % 251) as u8)
             .collect::<Vec<_>>();
@@ -1746,35 +1774,15 @@ fn test_s3_large_object_uses_external_chunks_and_ranges_across_chunk_boundary() 
             .await
             .unwrap()
             .expect("large object metadata should exist");
-        assert!(object.inline_payload.is_none());
-        let manifest: ExternalChunkManifest = serde_json::from_value(
-            object
-                .shard_map
-                .clone()
-                .expect("large object should record external chunk manifest"),
-        )
-        .expect("external chunk manifest should decode");
-        assert_eq!(manifest.kind, "external_chunks_v1");
-        assert_eq!(manifest.chunk_size, DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES);
-        assert_eq!(manifest.chunks.len(), 2);
+        let shard_map = object
+            .shard_map
+            .as_ref()
+            .expect("large object should record a CoreStore object ref");
+        assert_eq!(shard_map["schema"], "anvil.core.object_ref.v1");
         assert_eq!(
-            manifest.chunks[0].plaintext_length as usize,
-            DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES
+            shard_map["logical_size"].as_u64(),
+            Some(content.len() as u64)
         );
-        assert_eq!(manifest.chunks[1].plaintext_length as usize, 257);
-        for record in &manifest.chunks {
-            assert!(record.storage_ref.starts_with("_anvil/payloads/chunks/"));
-            let chunk_path = cluster.states[0].storage.external_chunk_path(
-                &object.content_hash,
-                record.chunk_index,
-                &record.payload_chunk_hash,
-            );
-            assert!(
-                chunk_path.exists(),
-                "external chunk path should exist: {}",
-                chunk_path.display()
-            );
-        }
 
         let full_resp = client
             .get_object()
@@ -1786,8 +1794,8 @@ fn test_s3_large_object_uses_external_chunks_and_ranges_across_chunk_boundary() 
         let full = full_resp.body.collect().await.unwrap().into_bytes();
         assert_eq!(full.as_ref(), content.as_slice());
 
-        let range_start = DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES - 8;
-        let range_end = DEFAULT_EXTERNAL_CHUNK_SIZE_BYTES + 8;
+        let range_start = LARGE_OBJECT_RANGE_SPLIT_BYTES - 8;
+        let range_end = LARGE_OBJECT_RANGE_SPLIT_BYTES + 8;
         let range_resp = client
             .get_object()
             .bucket(&bucket_name)
@@ -1795,7 +1803,7 @@ fn test_s3_large_object_uses_external_chunks_and_ranges_across_chunk_boundary() 
             .range(format!("bytes={range_start}-{range_end}"))
             .send()
             .await
-            .expect("S3 range GET across external chunk boundary should succeed");
+            .expect("S3 range GET across large CoreStore-backed object should succeed");
         assert_eq!(
             range_resp.content_range(),
             Some(format!("bytes {range_start}-{range_end}/{object_len}").as_str())
