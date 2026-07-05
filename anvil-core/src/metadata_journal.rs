@@ -174,7 +174,8 @@ async fn append_object_mutation_inner(
 ) -> Result<()> {
     let core_store = CoreStore::new(storage.clone()).await?;
     let stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
-    let frames = read_metadata_journal_frames_from_store(&core_store, &stream_id)
+    let raw_stream_head = core_store.raw_stream_head(&stream_id).await?;
+    let frames = read_raw_metadata_journal_frames_from_store(&core_store, &stream_id)
         .await
         .unwrap_or_default();
     let previous_hash = frames
@@ -265,7 +266,12 @@ async fn append_object_mutation_inner(
     validate_journal_chain(&updated_frames)?;
 
     let partition_id = hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id));
-    let preconditions = partition_precondition.into_iter().collect();
+    let mut preconditions = partition_precondition.into_iter().collect::<Vec<_>>();
+    preconditions.push(CoreMutationPrecondition::StreamHead {
+        stream_id: stream_id.clone(),
+        expected_last_sequence: raw_stream_head.0,
+        expected_last_event_hash: raw_stream_head.1,
+    });
     core_store
         .commit_mutation_batch(CoreMutationBatch {
             transaction_id: format!(
@@ -2076,6 +2082,22 @@ async fn read_metadata_journal_frames_from_store(
             limit: 0,
         })
         .await?;
+    let mut frames = Vec::new();
+    for record in records {
+        if record.record_kind != "object_metadata" {
+            continue;
+        }
+        frames.push(JournalFrame::decode(&record.payload)?);
+    }
+    validate_journal_chain(&frames)?;
+    Ok(frames)
+}
+
+async fn read_raw_metadata_journal_frames_from_store(
+    core_store: &CoreStore,
+    stream_id: &str,
+) -> Result<Vec<JournalFrame>> {
+    let records = core_store.read_raw_stream(stream_id).await?;
     let mut frames = Vec::new();
     for record in records {
         if record.record_kind != "object_metadata" {

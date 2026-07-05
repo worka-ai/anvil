@@ -396,7 +396,9 @@ async fn append_task_event(
     partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    let previous = read_task_journal_frames_from_store(&core_store)
+    let stream_id = task_queue_stream_id();
+    let raw_stream_head = core_store.raw_stream_head(&stream_id).await?;
+    let previous = read_raw_task_journal_frames_from_store(&core_store)
         .await
         .unwrap_or_default();
     let sequence = previous
@@ -419,15 +421,21 @@ async fn append_task_event(
         serde_json::to_vec(&event)?,
     );
     let partition_id = hex::encode(task_queue_partition_id());
+    let mut preconditions = partition_precondition.into_iter().collect::<Vec<_>>();
+    preconditions.push(CoreMutationPrecondition::StreamHead {
+        stream_id: stream_id.clone(),
+        expected_last_sequence: raw_stream_head.0,
+        expected_last_event_hash: raw_stream_head.1,
+    });
     core_store
         .commit_mutation_batch(CoreMutationBatch {
             transaction_id: format!("task-queue:{mutation_id}"),
             scope_partition: partition_id.clone(),
             committed_by_principal: task_queue_partition_principal(),
-            preconditions: partition_precondition.into_iter().collect(),
+            preconditions,
             operations: vec![CoreMutationOperation::StreamAppend {
                 partition_id,
-                stream_id: task_queue_stream_id(),
+                stream_id,
                 record_kind: "task_queue".to_string(),
                 payload: frame.encode(),
                 idempotency_key: Some(format!("task-queue:{mutation_id}")),
@@ -450,6 +458,21 @@ async fn read_task_journal_frames_from_store(core_store: &CoreStore) -> Result<V
             limit: 0,
         })
         .await?;
+    let mut frames = Vec::new();
+    for record in records {
+        if record.record_kind != "task_queue" {
+            continue;
+        }
+        frames.push(JournalFrame::decode(&record.payload)?);
+    }
+    validate_journal_chain(&frames)?;
+    Ok(frames)
+}
+
+async fn read_raw_task_journal_frames_from_store(
+    core_store: &CoreStore,
+) -> Result<Vec<JournalFrame>> {
+    let records = core_store.read_raw_stream(&task_queue_stream_id()).await?;
     let mut frames = Vec::new();
     for record in records {
         if record.record_kind != "task_queue" {

@@ -17,7 +17,7 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
-const CORE_REF_LOCK_RETRY_ATTEMPTS: usize = 200;
+const CORE_REF_LOCK_RETRY_ATTEMPTS: usize = 12_000;
 const CORE_REF_LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
 const LOCAL_ERASURE_PROFILE_ID: &str = "rs_4_2_local_v1";
 const LOCAL_DATA_SHARDS: usize = 4;
@@ -114,11 +114,11 @@ struct StoredRefDirectoryEntry {
     updated_at: String,
 }
 
-struct CoreRefLock {
+struct CoreStoreLock {
     path: PathBuf,
 }
 
-impl Drop for CoreRefLock {
+impl Drop for CoreStoreLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
@@ -367,8 +367,19 @@ impl CoreStore {
     pub async fn append_stream(&self, input: AppendStreamRecord) -> Result<StreamAppendReceipt> {
         validate_logical_id(&input.stream_id, "stream id")?;
         validate_logical_id(&input.partition_id, "partition id")?;
+        let _stream_guard = self.acquire_stream_lock(&input.stream_id).await?;
         let _guard = self.write_lock.lock().await;
         self.append_stream_unlocked(input).await
+    }
+
+    pub(crate) async fn read_raw_stream(&self, stream_id: &str) -> Result<Vec<StreamRecord>> {
+        validate_logical_id(stream_id, "stream id")?;
+        self.read_all_stream_records(stream_id).await
+    }
+
+    pub(crate) async fn raw_stream_head(&self, stream_id: &str) -> Result<(u64, String)> {
+        let records = self.read_raw_stream(stream_id).await?;
+        Ok(stream_head_from_records(&records))
     }
 
     async fn append_stream_unlocked(
@@ -1339,6 +1350,7 @@ impl CoreStore {
         }
         validate_batch_partitions(&batch)?;
 
+        let _operation_guards = self.acquire_batch_locks(&batch).await?;
         let _guard = self.write_lock.lock().await;
         if self
             .read_transaction_unlocked(&batch.transaction_id)
@@ -1547,6 +1559,21 @@ impl CoreStore {
                         authenticated_principal: committed_by_principal.to_string(),
                     })
                     .await?;
+                }
+                CoreMutationPrecondition::StreamHead {
+                    stream_id,
+                    expected_last_sequence,
+                    expected_last_event_hash,
+                } => {
+                    let records = self.read_all_stream_records(stream_id).await?;
+                    let (actual_sequence, actual_hash) = stream_head_from_records(&records);
+                    if actual_sequence != *expected_last_sequence
+                        || actual_hash != *expected_last_event_hash
+                    {
+                        bail!(
+                            "CoreStore stream {stream_id} head mismatch: expected {expected_last_sequence}/{expected_last_event_hash}, got {actual_sequence}/{actual_hash}"
+                        );
+                    }
                 }
             }
         }
@@ -1900,13 +1927,56 @@ impl CoreStore {
         .await
     }
 
-    async fn acquire_ref_lock(&self, ref_name: &str) -> Result<CoreRefLock> {
+    async fn acquire_batch_locks(&self, batch: &CoreMutationBatch) -> Result<Vec<CoreStoreLock>> {
+        let mut locks = BTreeSet::new();
+        for precondition in &batch.preconditions {
+            match precondition {
+                CoreMutationPrecondition::Ref { ref_name, .. } => {
+                    validate_logical_id(ref_name, "precondition ref name")?;
+                    locks.insert(("refs", ref_name.clone()));
+                }
+                CoreMutationPrecondition::StreamHead { stream_id, .. } => {
+                    validate_logical_id(stream_id, "precondition stream id")?;
+                    locks.insert(("streams", stream_id.clone()));
+                }
+                CoreMutationPrecondition::Fence { fence_name, .. } => {
+                    validate_logical_id(fence_name, "precondition fence name")?;
+                }
+            }
+        }
+        for operation in &batch.operations {
+            match operation {
+                CoreMutationOperation::RefUpdate { ref_name, .. } => {
+                    locks.insert(("refs", ref_name.clone()));
+                }
+                CoreMutationOperation::StreamAppend { stream_id, .. } => {
+                    locks.insert(("streams", stream_id.clone()));
+                }
+            }
+        }
+
+        let mut guards = Vec::with_capacity(locks.len());
+        for (kind, id) in locks {
+            guards.push(self.acquire_named_lock(kind, &id).await?);
+        }
+        Ok(guards)
+    }
+
+    async fn acquire_ref_lock(&self, ref_name: &str) -> Result<CoreStoreLock> {
+        self.acquire_named_lock("refs", ref_name).await
+    }
+
+    async fn acquire_stream_lock(&self, stream_id: &str) -> Result<CoreStoreLock> {
+        self.acquire_named_lock("streams", stream_id).await
+    }
+
+    async fn acquire_named_lock(&self, kind: &str, id: &str) -> Result<CoreStoreLock> {
         let lock_path = self
             .storage
             .core_store_staging_path()
             .join("locks")
-            .join("refs")
-            .join(format!("{}.lock", logical_file_name(ref_name)));
+            .join(kind)
+            .join(format!("{}.lock", logical_file_name(id)));
         if let Some(parent) = lock_path.parent() {
             fs::create_dir_all(parent).await?;
         }
@@ -1917,7 +1987,7 @@ impl CoreStore {
                 .open(&lock_path)
                 .await
             {
-                Ok(_) => return Ok(CoreRefLock { path: lock_path }),
+                Ok(_) => return Ok(CoreStoreLock { path: lock_path }),
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                     tokio::time::sleep(CORE_REF_LOCK_RETRY_DELAY).await;
                 }
@@ -1928,7 +1998,7 @@ impl CoreStore {
                 }
             }
         }
-        bail!("CoreStore ref {ref_name} CAS lock was not acquired")
+        bail!("CoreStore {kind} {id} lock was not acquired")
     }
 
     fn shard_path(
@@ -2132,6 +2202,14 @@ fn strip_sha256_prefix(hash: &str) -> Result<&str> {
         .ok_or_else(|| anyhow!("CoreStore hash must have sha256: prefix"))
 }
 
+fn validate_hash(hash: &str, label: &str) -> Result<()> {
+    let value = strip_sha256_prefix(hash)?;
+    if value.len() != 64 || !value.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        bail!("CoreStore {label} must be a sha256 hash");
+    }
+    Ok(())
+}
+
 fn logical_file_name(value: &str) -> String {
     sha256_hex(value.as_bytes())
 }
@@ -2177,6 +2255,13 @@ fn parse_stream_cursor(cursor: &str) -> Result<(String, u64)> {
     Ok((stream_id.to_string(), sequence))
 }
 
+fn stream_head_from_records(records: &[StreamRecord]) -> (u64, String) {
+    records
+        .last()
+        .map(|record| (record.sequence, record.event_hash.clone()))
+        .unwrap_or_else(|| (0, ZERO_HASH.to_string()))
+}
+
 fn is_core_store_temp_entry(name: &std::ffi::OsStr) -> bool {
     name.to_str()
         .is_some_and(|value| value.starts_with('.') || value.ends_with(".tmp"))
@@ -2184,6 +2269,24 @@ fn is_core_store_temp_entry(name: &std::ffi::OsStr) -> bool {
 
 fn validate_batch_partitions(batch: &CoreMutationBatch) -> Result<()> {
     let mut ref_ops = BTreeSet::new();
+    for precondition in &batch.preconditions {
+        match precondition {
+            CoreMutationPrecondition::Ref { ref_name, .. } => {
+                validate_logical_id(ref_name, "precondition ref name")?;
+            }
+            CoreMutationPrecondition::Fence { fence_name, .. } => {
+                validate_logical_id(fence_name, "precondition fence name")?;
+            }
+            CoreMutationPrecondition::StreamHead {
+                stream_id,
+                expected_last_event_hash,
+                ..
+            } => {
+                validate_logical_id(stream_id, "precondition stream id")?;
+                validate_hash(expected_last_event_hash, "precondition stream head hash")?;
+            }
+        }
+    }
     for operation in &batch.operations {
         match operation {
             CoreMutationOperation::RefUpdate {

@@ -362,6 +362,11 @@ pub enum CoreMutationPrecondition {
         fence_name: String,
         fence_token: u64,
     },
+    StreamHead {
+        stream_id: String,
+        expected_last_sequence: u64,
+        expected_last_event_hash: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
