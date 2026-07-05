@@ -669,17 +669,8 @@ pub async fn status_summary(
     let downloading = count_items(&state, id, crate::tasks::HFIngestionItemState::Downloading);
     let stored = count_items(&state, id, crate::tasks::HFIngestionItemState::Stored);
     let failed = count_items(&state, id, crate::tasks::HFIngestionItemState::Failed);
-    let state_text = if job.state == crate::tasks::HFIngestionState::Running
-        && queued == 0
-        && downloading == 0
-        && (stored > 0 || failed > 0)
-    {
-        "completed".to_string()
-    } else {
-        job.state.as_str().to_string()
-    };
     Ok((
-        state_text,
+        job.state.as_str().to_string(),
         queued,
         downloading,
         stored,
