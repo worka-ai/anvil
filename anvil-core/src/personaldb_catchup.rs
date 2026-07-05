@@ -1,18 +1,18 @@
 use crate::{
-    formats::{hash32, personaldb::PersonalDbLogRecord},
+    formats::personaldb::PersonalDbLogRecord,
     personaldb_commit_store::{
-        read_personaldb_changeset_payload_by_index, read_personaldb_commit_certificate,
+        read_personaldb_changeset_payload_by_index, read_personaldb_changeset_payload_ref,
+        read_personaldb_commit_certificate, read_personaldb_commit_certificate_ref,
     },
     personaldb_control::PersonalDbCommitCertificate,
     personaldb_heads::{
         PersonalDbCommittedHead, PersonalDbSnapshotsHead, read_personaldb_committed_head,
         read_personaldb_group_manifest, read_personaldb_snapshots_head,
     },
-    personaldb_segment::read_personaldb_log_segment,
+    personaldb_segment::{list_personaldb_log_segment_refs, read_personaldb_log_segment},
     storage::Storage,
 };
 use anyhow::{Context, Result, anyhow};
-use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersonalDbCatchUpRequest {
@@ -134,10 +134,10 @@ async fn read_canonical_records(
     if committed_head.log_index == 0 {
         return Ok(Vec::new());
     }
-    let segment_paths = list_log_segment_paths(storage, committed_head, database_id).await?;
+    let segment_refs = list_log_segment_refs(storage, committed_head, database_id).await?;
     let mut records = Vec::new();
-    for path in segment_paths {
-        let segment = read_personaldb_log_segment(path).await?;
+    for segment_ref in segment_refs {
+        let segment = read_personaldb_log_segment(storage, &segment_ref).await?;
         for record in segment.records {
             if record.log_index <= committed_head.log_index {
                 records.push(record);
@@ -149,36 +149,16 @@ async fn read_canonical_records(
     Ok(records)
 }
 
-async fn list_log_segment_paths(
+async fn list_log_segment_refs(
     storage: &Storage,
     committed_head: &PersonalDbCommittedHead,
     database_id: &str,
-) -> Result<Vec<PathBuf>> {
+) -> Result<Vec<String>> {
     let tenant_id = committed_head
         .tenant_id
         .parse::<i64>()
         .context("personaldb committed head tenant id must be numeric")?;
-    let dir = storage.personaldb_log_segment_dir(tenant_id, database_id)?;
-    let mut entries = match tokio::fs::read_dir(&dir).await {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err).with_context(|| format!("read {}", dir.display())),
-    };
-    let mut paths = Vec::new();
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some("pdbseg") {
-            paths.push(path);
-        }
-    }
-    paths.sort_by_key(|path| {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.split('-').next())
-            .and_then(|start| start.parse::<u64>().ok())
-            .unwrap_or(u64::MAX)
-    });
-    Ok(paths)
+    list_personaldb_log_segment_refs(storage, tenant_id, database_id).await
 }
 
 fn ensure_head_matches_records(
@@ -279,15 +259,14 @@ async fn load_changeset_bytes(
     record: &PersonalDbLogRecord,
 ) -> Result<Vec<u8>> {
     if !record.payload_ref.is_empty() {
-        let relative = std::str::from_utf8(&record.payload_ref)?;
-        let path = storage.resolve_relative_storage_path(relative)?;
-        let bytes = tokio::fs::read(&path)
-            .await
-            .with_context(|| format!("read personaldb changeset payload {}", path.display()))?;
-        if hash32(&bytes) != record.changeset_payload_hash {
-            return Err(anyhow!("personaldb changeset payload hash mismatch"));
-        }
-        return Ok(bytes);
+        let payload_ref = std::str::from_utf8(&record.payload_ref)?;
+        return read_personaldb_changeset_payload_ref(
+            storage,
+            payload_ref,
+            record.changeset_payload_hash,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("personaldb changeset payload is missing"));
     }
     read_personaldb_changeset_payload_by_index(
         storage,
@@ -310,11 +289,12 @@ async fn load_certificate(
     let certificate_json = if !record.inline_certificate_json.is_empty() {
         record.inline_certificate_json.clone()
     } else if !record.certificate_ref.is_empty() {
-        let relative = std::str::from_utf8(&record.certificate_ref)?;
-        let path = storage.resolve_relative_storage_path(relative)?;
-        tokio::fs::read(&path)
-            .await
-            .with_context(|| format!("read personaldb commit certificate {}", path.display()))?
+        let certificate_ref = std::str::from_utf8(&record.certificate_ref)?;
+        let certificate =
+            read_personaldb_commit_certificate_ref(storage, certificate_ref, signing_key)
+                .await?
+                .ok_or_else(|| anyhow!("personaldb commit certificate is missing"))?;
+        serde_json::to_vec(&certificate)?
     } else {
         let entry_hash = hex::encode(record.entry_hash);
         let certificate = read_personaldb_commit_certificate(
@@ -586,10 +566,7 @@ mod tests {
                 .await
                 .unwrap();
 
-                let payload_ref = storage
-                    .relative_storage_path(&payload_paths.by_index_path)
-                    .unwrap()
-                    .into_bytes();
+                let payload_ref = payload_paths.by_index_ref.clone().into_bytes();
                 let provisional_record = PersonalDbLogRecord::new(
                     log_index,
                     1,
@@ -625,7 +602,7 @@ mod tests {
                 }
                 .seal(KEY)
                 .unwrap();
-                let certificate_path =
+                let certificate_ref =
                     write_personaldb_commit_certificate(&storage, 3, "db-alpha", &certificate, KEY)
                         .await
                         .unwrap();
@@ -641,17 +618,14 @@ mod tests {
                     [8; 32],
                     certificate_hash,
                     payload_ref,
-                    storage
-                        .relative_storage_path(&certificate_path)
-                        .unwrap()
-                        .into_bytes(),
+                    certificate_ref.into_bytes(),
                     Vec::new(),
                 );
                 previous = record.entry_hash;
                 records.push(record);
             }
 
-            let segment_path = write_personaldb_log_segment(
+            let segment_ref = write_personaldb_log_segment(
                 &storage,
                 PersonalDbLogSegmentWrite {
                     tenant_id: 3,
@@ -669,7 +643,7 @@ mod tests {
                 database_id: "db-alpha".to_string(),
                 log_index: 3,
                 log_hash: hex::encode(records.last().unwrap().entry_hash),
-                segment_path: storage.relative_storage_path(&segment_path).unwrap(),
+                segment_path: segment_ref,
                 row_index_generation: 0,
                 policy_epoch: 1,
                 membership_epoch: 1,

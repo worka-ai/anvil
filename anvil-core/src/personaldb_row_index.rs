@@ -1,12 +1,18 @@
-use crate::formats::{
-    BinaryEnvelopeHeader, BinaryFileFooter, COMMON_FOOTER_LEN, COMMON_HEADER_LEN, FileFamily,
-    Hash32, hash32, personaldb::RowIndexRecord,
+use crate::{
+    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    formats::{
+        BinaryEnvelopeHeader, BinaryFileFooter, COMMON_FOOTER_LEN, COMMON_HEADER_LEN, FileFamily,
+        Hash32, hash32, personaldb::RowIndexRecord,
+    },
+    storage::Storage,
 };
-use crate::storage::Storage;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use tokio::io::AsyncWriteExt;
+
+const PERSONALDB_ROW_INDEX_REF_PREFIX: &str = "personaldb_row_index:";
+const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersonalDbRowIndexHeader {
@@ -37,19 +43,16 @@ pub struct PersonalDbRowIndexWrite<'a> {
 pub async fn write_personaldb_row_index(
     storage: &Storage,
     input: PersonalDbRowIndexWrite<'_>,
-) -> Result<PathBuf> {
+) -> Result<String> {
     let mut records = input.records.to_vec();
     records.sort_by(compare_row_index_records);
     let body = encode_row_index_body(&records);
-    let path = storage.personaldb_row_index_path(
+    let ref_name = personaldb_row_index_ref_name(
         input.tenant_id,
         input.database_id,
         input.generation,
         &hex::encode(input.source_hash),
     )?;
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
 
     let header = PersonalDbRowIndexHeader {
         tenant_id: input.tenant_id.to_string(),
@@ -72,27 +75,54 @@ pub async fn write_personaldb_row_index(
         last_hash,
     );
 
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&path)
-        .await
-        .with_context(|| format!("create personaldb row index {}", path.display()))?;
-    file.write_all(&encoded_header).await?;
-    file.write_all(&body).await?;
-    file.write_all(&footer.encode()).await?;
-    file.sync_data().await?;
-    Ok(path)
+    let mut bytes = Vec::with_capacity(encoded_header.len() + body.len() + COMMON_FOOTER_LEN);
+    bytes.extend_from_slice(&encoded_header);
+    bytes.extend_from_slice(&body);
+    bytes.extend_from_slice(&footer.encode());
+
+    let store = CoreStore::new(storage.clone()).await?;
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: ref_name.clone(),
+            bytes,
+            region_id: "local".to_string(),
+            mutation_id: format!(
+                "personaldb-row-index:{}:{}:{}",
+                input.tenant_id, input.database_id, input.generation
+            ),
+        })
+        .await?;
+    store
+        .compare_and_swap_ref(CompareAndSwapRef {
+            ref_name: ref_name.clone(),
+            expected_generation: None,
+            expected_target: None,
+            require_absent: true,
+            require_present: false,
+            fence: None,
+            authz_revision: None,
+            source_watch_cursor: None,
+            new_target: encode_core_object_ref_target(&object_ref)?,
+            transaction_id: None,
+        })
+        .await?;
+    Ok(ref_name)
 }
 
 pub async fn read_personaldb_row_index(
-    path: impl Into<PathBuf>,
+    storage: &Storage,
+    row_index_ref: &str,
 ) -> Result<DecodedPersonalDbRowIndex> {
-    let path = path.into();
-    let bytes = tokio::fs::read(&path)
-        .await
-        .with_context(|| format!("read personaldb row index {}", path.display()))?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let ref_value = store
+        .read_ref(row_index_ref)
+        .await?
+        .ok_or_else(|| anyhow!("personaldb row index ref is missing"))?;
+    let bytes = store
+        .get_blob(GetBlob {
+            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+        })
+        .await?;
     decode_personaldb_row_index(&bytes)
 }
 
@@ -122,6 +152,59 @@ pub fn decode_personaldb_row_index(bytes: &[u8]) -> Result<DecodedPersonalDbRowI
     let records = decode_row_index_body(body)?;
     ensure_sorted(&records)?;
     Ok(DecodedPersonalDbRowIndex { header, records })
+}
+
+pub fn personaldb_row_index_ref_name(
+    tenant_id: i64,
+    database_id: &str,
+    generation: u64,
+    source_hash: &str,
+) -> Result<String> {
+    if tenant_id < 0 {
+        return Err(anyhow!(
+            "personaldb row index tenant id must be nonnegative"
+        ));
+    }
+    require_safe_component(database_id, "database_id")?;
+    validate_hex32(source_hash, "source_hash")?;
+    Ok(format!(
+        "{PERSONALDB_ROW_INDEX_REF_PREFIX}tenant:{tenant_id}:database:{database_id}:generation:{generation:020}:source:{source_hash}"
+    ))
+}
+
+fn require_safe_component(value: &str, field: &'static str) -> Result<()> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains(':')
+        || value.chars().any(char::is_control)
+    {
+        return Err(anyhow!("{field} is not a safe component"));
+    }
+    Ok(())
+}
+
+fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
+    if value.len() != 64 || !value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow!("{field} must be hex32"));
+    }
+    Ok(())
+}
+
+fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
+    Ok(format!(
+        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
+    ))
+}
+
+fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
+    let encoded = target
+        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
+        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
+    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
 }
 
 fn encode_row_index_body(records: &[RowIndexRecord]) -> Vec<u8> {
@@ -202,7 +285,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let records = vec![row(9), row(1), row(5)];
-        let path = write_personaldb_row_index(
+        let row_index_ref = write_personaldb_row_index(
             &storage,
             PersonalDbRowIndexWrite {
                 tenant_id: 4,
@@ -214,13 +297,13 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".rowidx"))
-        );
+        assert!(row_index_ref.starts_with(
+            "personaldb_row_index:tenant:4:database:db-alpha:generation:00000000000000000012:"
+        ));
 
-        let decoded = read_personaldb_row_index(path).await.unwrap();
+        let decoded = read_personaldb_row_index(&storage, &row_index_ref)
+            .await
+            .unwrap();
         assert_eq!(decoded.header.tenant_id, "4");
         assert_eq!(decoded.header.database_id, "db-alpha");
         assert_eq!(decoded.header.generation, 12);
@@ -233,7 +316,7 @@ mod tests {
     async fn personaldb_row_index_footer_protects_body() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let path = write_personaldb_row_index(
+        let row_index_ref = write_personaldb_row_index(
             &storage,
             PersonalDbRowIndexWrite {
                 tenant_id: 4,
@@ -245,7 +328,18 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut bytes = tokio::fs::read(path).await.unwrap();
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        let ref_value = store
+            .read_ref(&row_index_ref)
+            .await
+            .unwrap()
+            .expect("row index ref exists");
+        let mut bytes = store
+            .get_blob(GetBlob {
+                object_ref: decode_core_object_ref_target(&ref_value.target).unwrap(),
+            })
+            .await
+            .unwrap();
         bytes[COMMON_HEADER_LEN + 1] ^= 1;
         assert!(decode_personaldb_row_index(&bytes).is_err());
     }

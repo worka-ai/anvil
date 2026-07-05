@@ -1,16 +1,22 @@
-use crate::formats::{
-    BinaryEnvelopeHeader, BinaryFileFooter, COMMON_FOOTER_LEN, COMMON_HEADER_LEN, FileFamily,
-    Hash32,
-    authz::{TupleKey, TupleOperation, TupleValue},
-    hash32,
-    segment::{SegmentBody, SegmentRecord},
+use crate::{
+    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    formats::{
+        BinaryEnvelopeHeader, BinaryFileFooter, COMMON_FOOTER_LEN, COMMON_HEADER_LEN, FileFamily,
+        Hash32,
+        authz::{TupleKey, TupleOperation, TupleValue},
+        hash32,
+        segment::{SegmentBody, SegmentRecord},
+    },
+    persistence::AuthzTupleRecord,
+    storage::Storage,
 };
-use crate::persistence::AuthzTupleRecord;
-use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use tokio::io::AsyncWriteExt;
+
+const AUTHZ_TUPLE_SEGMENT_REF_PREFIX: &str = "authz_tuple_segment:";
+const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuthzSegmentHeader {
@@ -36,7 +42,7 @@ async fn write_authz_tuple_segment(
     storage: &Storage,
     tenant_id: i64,
     records: &[AuthzTupleRecord],
-) -> Result<PathBuf> {
+) -> Result<String> {
     write_authz_tuple_segment_inner(storage, tenant_id, records, 0).await
 }
 
@@ -45,7 +51,7 @@ pub(crate) async fn write_authz_tuple_segment_with_fence(
     tenant_id: i64,
     records: &[AuthzTupleRecord],
     source_fence_token: u64,
-) -> Result<PathBuf> {
+) -> Result<String> {
     write_authz_tuple_segment_inner(storage, tenant_id, records, source_fence_token).await
 }
 
@@ -54,17 +60,14 @@ async fn write_authz_tuple_segment_inner(
     tenant_id: i64,
     records: &[AuthzTupleRecord],
     source_fence_token: u64,
-) -> Result<PathBuf> {
+) -> Result<String> {
     let generation = records
         .iter()
         .map(|record| record.revision)
         .max()
         .unwrap_or(0);
     let generation = u64::try_from(generation).context("authz segment generation is negative")?;
-    let path = storage.authz_tuple_segment_path(tenant_id, generation);
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+    let ref_name = authz_tuple_segment_ref_name(tenant_id, generation)?;
 
     let header = AuthzSegmentHeader {
         tenant_id: tenant_id.to_string(),
@@ -90,30 +93,54 @@ async fn write_authz_tuple_segment_inner(
         last_hash,
     );
 
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&path)
-        .await
-        .with_context(|| format!("create authz tuple segment {}", path.display()))?;
-    file.write_all(&encoded_header).await?;
-    file.write_all(&body).await?;
-    file.write_all(&footer.encode()).await?;
-    file.sync_data().await?;
-    Ok(path)
+    let mut bytes = Vec::with_capacity(encoded_header.len() + body.len() + COMMON_FOOTER_LEN);
+    bytes.extend_from_slice(&encoded_header);
+    bytes.extend_from_slice(&body);
+    bytes.extend_from_slice(&footer.encode());
+
+    let store = CoreStore::new(storage.clone()).await?;
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: ref_name.clone(),
+            bytes,
+            region_id: "local".to_string(),
+            mutation_id: format!("authz-tuple-segment:{tenant_id}:{generation}"),
+        })
+        .await?;
+    store
+        .compare_and_swap_ref(CompareAndSwapRef {
+            ref_name: ref_name.clone(),
+            expected_generation: None,
+            expected_target: None,
+            require_absent: true,
+            require_present: false,
+            fence: None,
+            authz_revision: None,
+            source_watch_cursor: None,
+            new_target: encode_core_object_ref_target(&object_ref)?,
+            transaction_id: None,
+        })
+        .await?;
+    Ok(ref_name)
 }
 
 pub async fn read_latest_authz_tuple_segment(
     storage: &Storage,
     tenant_id: i64,
 ) -> Result<Option<DecodedAuthzSegment>> {
-    let Some(path) = latest_authz_tuple_segment_path(storage, tenant_id).await? else {
+    let Some(segment_ref) = latest_authz_tuple_segment_ref(storage, tenant_id).await? else {
         return Ok(None);
     };
-    let bytes = tokio::fs::read(&path)
-        .await
-        .with_context(|| format!("read authz tuple segment {}", path.display()))?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let ref_value = store
+        .read_ref(&segment_ref)
+        .await?
+        .ok_or_else(|| anyhow!("authz tuple segment ref is missing"))?;
+    let bytes = store
+        .get_blob(GetBlob {
+            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+        })
+        .await?;
     Ok(Some(decode_authz_tuple_segment(&bytes)?))
 }
 
@@ -150,38 +177,50 @@ pub fn decode_authz_tuple_segment(bytes: &[u8]) -> Result<DecodedAuthzSegment> {
     Ok(DecodedAuthzSegment { header, records })
 }
 
-async fn latest_authz_tuple_segment_path(
+async fn latest_authz_tuple_segment_ref(
     storage: &Storage,
     tenant_id: i64,
-) -> Result<Option<PathBuf>> {
-    let dir = storage.authz_tuple_segment_dir(tenant_id);
-    let mut entries = match tokio::fs::read_dir(&dir).await {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
-    let mut latest: Option<(u64, PathBuf)> = None;
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let Some(generation) = segment_generation_from_name(name) else {
-            continue;
-        };
-        match latest {
-            Some((current, _)) if generation <= current => {}
-            _ => latest = Some((generation, path)),
-        }
-    }
-    Ok(latest.map(|(_, path)| path))
+) -> Result<Option<String>> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let mut refs = store
+        .list_ref_names(&authz_tuple_segment_ref_prefix(tenant_id)?)
+        .await?;
+    refs.sort_by_key(|ref_name| segment_generation_from_ref(ref_name).unwrap_or(0));
+    Ok(refs.pop())
 }
 
-fn segment_generation_from_name(name: &str) -> Option<u64> {
-    name.strip_prefix("generation-")?
-        .strip_suffix(".anauthz")?
-        .parse()
-        .ok()
+fn authz_tuple_segment_ref_prefix(tenant_id: i64) -> Result<String> {
+    if tenant_id < 0 {
+        return Err(anyhow!("authz tuple segment tenant id must be nonnegative"));
+    }
+    Ok(format!(
+        "{AUTHZ_TUPLE_SEGMENT_REF_PREFIX}tenant:{tenant_id}:"
+    ))
+}
+
+fn authz_tuple_segment_ref_name(tenant_id: i64, generation: u64) -> Result<String> {
+    Ok(format!(
+        "{}generation:{generation:020}",
+        authz_tuple_segment_ref_prefix(tenant_id)?
+    ))
+}
+
+fn segment_generation_from_ref(ref_name: &str) -> Option<u64> {
+    ref_name.rsplit_once(":generation:")?.1.parse().ok()
+}
+
+fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
+    Ok(format!(
+        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
+    ))
+}
+
+fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
+    let encoded = target
+        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
+        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
+    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
 }
 
 fn segment_records_from_authz_records(records: &[AuthzTupleRecord]) -> Result<Vec<SegmentRecord>> {
@@ -353,12 +392,18 @@ mod tests {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let records = vec![record(2, "remove"), record(1, "add")];
-        let path = write_authz_tuple_segment(&storage, 7, &records)
+        let segment_ref = write_authz_tuple_segment(&storage, 7, &records)
             .await
             .unwrap();
-        assert_eq!(path, storage.authz_tuple_segment_path(7, 2));
+        assert_eq!(
+            segment_ref,
+            "authz_tuple_segment:tenant:7:generation:00000000000000000002"
+        );
 
-        let decoded = decode_authz_tuple_segment(&tokio::fs::read(path).await.unwrap()).unwrap();
+        let decoded = read_latest_authz_tuple_segment(&storage, 7)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(decoded.header.partition_family, "authz_tuple");
         assert_eq!(decoded.records.len(), 2);
         assert_eq!(decoded.records[0].revision, 1);

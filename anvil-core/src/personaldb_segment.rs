@@ -1,13 +1,17 @@
+use crate::core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob};
 use crate::formats::{
     BinaryEnvelopeHeader, BinaryFileFooter, COMMON_FOOTER_LEN, COMMON_HEADER_LEN, FileFamily,
     Hash32, hash32,
     personaldb::{PersonalDbLogRecord, validate_personaldb_log_chain},
 };
 use crate::storage::Storage;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use tokio::io::AsyncWriteExt;
+
+const PERSONALDB_LOG_SEGMENT_REF_PREFIX: &str = "personaldb_log_segment:";
+const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersonalDbLogSegmentHeader {
@@ -42,7 +46,7 @@ pub struct PersonalDbLogSegmentWrite<'a> {
 pub async fn write_personaldb_log_segment(
     storage: &Storage,
     input: PersonalDbLogSegmentWrite<'_>,
-) -> Result<PathBuf> {
+) -> Result<String> {
     if input.source_fence_token == 0 {
         return Err(anyhow!(
             "personaldb log segment source fence token must be nonzero"
@@ -60,16 +64,13 @@ pub async fn write_personaldb_log_segment(
     let membership_epoch = common_membership_epoch(input.records)?;
     let body = encode_log_segment_body(input.records);
     let segment_hash = hash32(&body);
-    let path = storage.personaldb_log_segment_path(
+    let ref_name = personaldb_log_segment_ref_name(
         input.tenant_id,
         input.database_id,
         start_log_index,
         end_log_index,
         &hex::encode(segment_hash),
     )?;
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
 
     let header = PersonalDbLogSegmentHeader {
         tenant_id: input.tenant_id.to_string(),
@@ -96,28 +97,67 @@ pub async fn write_personaldb_log_segment(
         last_hash,
     );
 
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&path)
-        .await
-        .with_context(|| format!("create personaldb log segment {}", path.display()))?;
-    file.write_all(&encoded_header).await?;
-    file.write_all(&body).await?;
-    file.write_all(&footer.encode()).await?;
-    file.sync_data().await?;
-    Ok(path)
+    let mut bytes = Vec::with_capacity(encoded_header.len() + body.len() + COMMON_FOOTER_LEN);
+    bytes.extend_from_slice(&encoded_header);
+    bytes.extend_from_slice(&body);
+    bytes.extend_from_slice(&footer.encode());
+    let store = CoreStore::new(storage.clone()).await?;
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: ref_name.clone(),
+            bytes,
+            region_id: "local".to_string(),
+            mutation_id: format!(
+                "personaldb-log-segment:{}:{}:{}:{}",
+                input.tenant_id, input.database_id, start_log_index, end_log_index
+            ),
+        })
+        .await?;
+    store
+        .compare_and_swap_ref(CompareAndSwapRef {
+            ref_name: ref_name.clone(),
+            expected_generation: None,
+            expected_target: None,
+            require_absent: true,
+            require_present: false,
+            fence: None,
+            authz_revision: None,
+            source_watch_cursor: None,
+            new_target: encode_core_object_ref_target(&object_ref)?,
+            transaction_id: None,
+        })
+        .await?;
+    Ok(ref_name)
 }
 
 pub async fn read_personaldb_log_segment(
-    path: impl Into<PathBuf>,
+    storage: &Storage,
+    segment_ref: &str,
 ) -> Result<DecodedPersonalDbLogSegment> {
-    let path = path.into();
-    let bytes = tokio::fs::read(&path)
-        .await
-        .with_context(|| format!("read personaldb log segment {}", path.display()))?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let ref_value = store
+        .read_ref(segment_ref)
+        .await?
+        .ok_or_else(|| anyhow!("personaldb log segment ref is missing"))?;
+    let bytes = store
+        .get_blob(GetBlob {
+            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+        })
+        .await?;
     decode_personaldb_log_segment(&bytes)
+}
+
+pub async fn list_personaldb_log_segment_refs(
+    storage: &Storage,
+    tenant_id: i64,
+    database_id: &str,
+) -> Result<Vec<String>> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let mut refs = store
+        .list_ref_names(&personaldb_log_segment_ref_prefix(tenant_id, database_id)?)
+        .await?;
+    refs.sort();
+    Ok(refs)
 }
 
 pub fn decode_personaldb_log_segment(bytes: &[u8]) -> Result<DecodedPersonalDbLogSegment> {
@@ -178,6 +218,67 @@ fn validate_log_segment_records(records: &[PersonalDbLogRecord]) -> Result<()> {
     let _ = common_policy_epoch(records)?;
     let _ = common_membership_epoch(records)?;
     Ok(())
+}
+
+fn personaldb_log_segment_ref_prefix(tenant_id: i64, database_id: &str) -> Result<String> {
+    if tenant_id < 0 {
+        return Err(anyhow!(
+            "personaldb log segment tenant id must be nonnegative"
+        ));
+    }
+    require_safe_component(database_id, "database_id")?;
+    Ok(format!(
+        "{PERSONALDB_LOG_SEGMENT_REF_PREFIX}tenant:{tenant_id}:database:{database_id}:"
+    ))
+}
+
+fn personaldb_log_segment_ref_name(
+    tenant_id: i64,
+    database_id: &str,
+    start_log_index: u64,
+    end_log_index: u64,
+    segment_hash: &str,
+) -> Result<String> {
+    validate_hex32(segment_hash, "segment_hash")?;
+    Ok(format!(
+        "{}start:{start_log_index:020}:end:{end_log_index:020}:hash:{segment_hash}",
+        personaldb_log_segment_ref_prefix(tenant_id, database_id)?
+    ))
+}
+
+fn require_safe_component(value: &str, field: &'static str) -> Result<()> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains(':')
+        || value.chars().any(char::is_control)
+    {
+        return Err(anyhow!("{field} is not a safe component"));
+    }
+    Ok(())
+}
+
+fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
+    if value.len() != 64 || !value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow!("{field} must be hex32"));
+    }
+    Ok(())
+}
+
+fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
+    Ok(format!(
+        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
+    ))
+}
+
+fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
+    let encoded = target
+        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
+        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
+    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
 }
 
 fn validate_header_matches_records(
@@ -278,7 +379,7 @@ mod tests {
         let second = record(2, first.entry_hash);
         let records = vec![first, second];
 
-        let path = write_personaldb_log_segment(
+        let segment_ref = write_personaldb_log_segment(
             &storage,
             PersonalDbLogSegmentWrite {
                 tenant_id: 9,
@@ -290,17 +391,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".pdbseg"))
-        );
-        assert!(
-            path.to_string_lossy()
-                .contains("00000000000000000001-00000000000000000002-")
-        );
+        assert!(segment_ref.starts_with("personaldb_log_segment:tenant:9:database:db-alpha:"));
+        assert!(segment_ref.contains("start:00000000000000000001:end:00000000000000000002:"));
 
-        let decoded = read_personaldb_log_segment(path).await.unwrap();
+        let decoded = read_personaldb_log_segment(&storage, &segment_ref)
+            .await
+            .unwrap();
         assert_eq!(decoded.header.tenant_id, "9");
         assert_eq!(decoded.header.database_id, "db-alpha");
         assert_eq!(decoded.header.start_log_index, 1);
@@ -360,7 +456,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let record = record(1, [0; 32]);
-        let path = write_personaldb_log_segment(
+        let segment_ref = write_personaldb_log_segment(
             &storage,
             PersonalDbLogSegmentWrite {
                 tenant_id: 9,
@@ -372,7 +468,18 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut bytes = tokio::fs::read(path).await.unwrap();
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        let ref_value = store
+            .read_ref(&segment_ref)
+            .await
+            .unwrap()
+            .expect("segment ref exists");
+        let mut bytes = store
+            .get_blob(GetBlob {
+                object_ref: decode_core_object_ref_target(&ref_value.target).unwrap(),
+            })
+            .await
+            .unwrap();
         bytes[COMMON_HEADER_LEN + 1] ^= 1;
         assert!(decode_personaldb_log_segment(&bytes).is_err());
     }

@@ -1,17 +1,22 @@
 use crate::{
+    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
     formats::{Hash32, hash32},
     personaldb_control::PersonalDbCommitCertificate,
     storage::Storage,
 };
-use anyhow::{Context, Result, anyhow};
-use serde::{Serialize, de::DeserializeOwned};
-use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use anyhow::{Result, anyhow};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+const PERSONALDB_CHANGESET_BY_INDEX_REF_PREFIX: &str = "personaldb_changeset_payload_by_index:";
+const PERSONALDB_CHANGESET_BY_HASH_REF_PREFIX: &str = "personaldb_changeset_payload_by_hash:";
+const PERSONALDB_COMMIT_CERTIFICATE_REF_PREFIX: &str = "personaldb_commit_certificate:";
+const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PersonalDbChangesetPayloadPaths {
-    pub by_index_path: PathBuf,
-    pub by_hash_path: PathBuf,
+pub struct PersonalDbChangesetPayloadRefs {
+    pub by_index_ref: String,
+    pub by_hash_ref: String,
 }
 
 pub async fn write_personaldb_changeset_payload(
@@ -21,31 +26,39 @@ pub async fn write_personaldb_changeset_payload(
     log_index: u64,
     expected_payload_hash: Hash32,
     changeset_bytes: &[u8],
-) -> Result<PersonalDbChangesetPayloadPaths> {
+) -> Result<PersonalDbChangesetPayloadRefs> {
     let actual_hash = hash32(changeset_bytes);
     if actual_hash != expected_payload_hash {
         return Err(anyhow!("personaldb changeset payload hash mismatch"));
     }
 
     let payload_hash_hex = hex::encode(expected_payload_hash);
-    let by_hash_path = storage.personaldb_changeset_payload_by_hash_path(
-        tenant_id,
-        database_id,
-        &payload_hash_hex,
-    )?;
-    let by_index_path = storage.personaldb_changeset_payload_by_index_path(
+    let by_hash_ref =
+        personaldb_changeset_payload_by_hash_ref_name(tenant_id, database_id, &payload_hash_hex)?;
+    let by_index_ref = personaldb_changeset_payload_by_index_ref_name(
         tenant_id,
         database_id,
         log_index,
         &payload_hash_hex,
     )?;
 
-    write_once(&by_hash_path, changeset_bytes).await?;
-    link_or_copy(&by_hash_path, &by_index_path).await?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: by_hash_ref.clone(),
+            bytes: changeset_bytes.to_vec(),
+            region_id: "local".to_string(),
+            mutation_id: format!(
+                "personaldb-changeset-payload:{tenant_id}:{database_id}:{log_index}:{payload_hash_hex}"
+            ),
+        })
+        .await?;
+    put_immutable_ref_target(&store, &by_hash_ref, changeset_bytes, &object_ref).await?;
+    put_immutable_ref_target(&store, &by_index_ref, changeset_bytes, &object_ref).await?;
 
-    Ok(PersonalDbChangesetPayloadPaths {
-        by_index_path,
-        by_hash_path,
+    Ok(PersonalDbChangesetPayloadRefs {
+        by_index_ref,
+        by_hash_ref,
     })
 }
 
@@ -55,12 +68,12 @@ pub async fn read_personaldb_changeset_payload_by_hash(
     database_id: &str,
     payload_hash: Hash32,
 ) -> Result<Option<Vec<u8>>> {
-    let path = storage.personaldb_changeset_payload_by_hash_path(
+    let ref_name = personaldb_changeset_payload_by_hash_ref_name(
         tenant_id,
         database_id,
         &hex::encode(payload_hash),
     )?;
-    read_payload_optional(&path, payload_hash).await
+    read_personaldb_changeset_payload_ref(storage, &ref_name, payload_hash).await
 }
 
 pub async fn read_personaldb_changeset_payload_by_index(
@@ -70,13 +83,33 @@ pub async fn read_personaldb_changeset_payload_by_index(
     log_index: u64,
     payload_hash: Hash32,
 ) -> Result<Option<Vec<u8>>> {
-    let path = storage.personaldb_changeset_payload_by_index_path(
+    let ref_name = personaldb_changeset_payload_by_index_ref_name(
         tenant_id,
         database_id,
         log_index,
         &hex::encode(payload_hash),
     )?;
-    read_payload_optional(&path, payload_hash).await
+    read_personaldb_changeset_payload_ref(storage, &ref_name, payload_hash).await
+}
+
+pub async fn read_personaldb_changeset_payload_ref(
+    storage: &Storage,
+    ref_name: &str,
+    expected_payload_hash: Hash32,
+) -> Result<Option<Vec<u8>>> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(ref_value) = store.read_ref(ref_name).await? else {
+        return Ok(None);
+    };
+    let bytes = store
+        .get_blob(GetBlob {
+            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+        })
+        .await?;
+    if hash32(&bytes) != expected_payload_hash {
+        return Err(anyhow!("personaldb changeset payload hash mismatch"));
+    }
+    Ok(Some(bytes))
 }
 
 pub async fn write_personaldb_commit_certificate(
@@ -85,7 +118,7 @@ pub async fn write_personaldb_commit_certificate(
     database_id: &str,
     certificate: &PersonalDbCommitCertificate,
     signing_key: &[u8],
-) -> Result<PathBuf> {
+) -> Result<String> {
     certificate.verify(signing_key)?;
     ensure_scope(
         tenant_id,
@@ -93,14 +126,27 @@ pub async fn write_personaldb_commit_certificate(
         &certificate.tenant_id,
         &certificate.database_id,
     )?;
-    let path = storage.personaldb_commit_certificate_path(
+    let ref_name = personaldb_commit_certificate_ref_name(
         tenant_id,
         database_id,
         certificate.log_index,
         &certificate.entry_hash,
     )?;
-    write_json_atomically(&path, certificate).await?;
-    Ok(path)
+    let bytes = serde_json::to_vec_pretty(certificate)?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: ref_name.clone(),
+            bytes: bytes.clone(),
+            region_id: "local".to_string(),
+            mutation_id: format!(
+                "personaldb-commit-certificate:{tenant_id}:{database_id}:{}:{}",
+                certificate.log_index, certificate.entry_hash
+            ),
+        })
+        .await?;
+    put_immutable_ref_target(&store, &ref_name, &bytes, &object_ref).await?;
+    Ok(ref_name)
 }
 
 pub async fn read_personaldb_commit_certificate(
@@ -111,107 +157,66 @@ pub async fn read_personaldb_commit_certificate(
     entry_hash: &str,
     signing_key: &[u8],
 ) -> Result<Option<PersonalDbCommitCertificate>> {
-    let path = storage.personaldb_commit_certificate_path(
-        tenant_id,
-        database_id,
-        log_index,
-        entry_hash,
-    )?;
-    let Some(certificate) = read_json_optional::<PersonalDbCommitCertificate>(&path).await? else {
+    let ref_name =
+        personaldb_commit_certificate_ref_name(tenant_id, database_id, log_index, entry_hash)?;
+    read_personaldb_commit_certificate_ref(storage, &ref_name, signing_key).await
+}
+
+pub async fn read_personaldb_commit_certificate_ref(
+    storage: &Storage,
+    ref_name: &str,
+    signing_key: &[u8],
+) -> Result<Option<PersonalDbCommitCertificate>> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(ref_value) = store.read_ref(ref_name).await? else {
         return Ok(None);
     };
+    let bytes = store
+        .get_blob(GetBlob {
+            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+        })
+        .await?;
+    let certificate: PersonalDbCommitCertificate = serde_json::from_slice(&bytes)?;
     certificate.verify(signing_key)?;
-    ensure_scope(
-        tenant_id,
-        database_id,
-        &certificate.tenant_id,
-        &certificate.database_id,
-    )?;
-    if certificate.log_index != log_index || certificate.entry_hash != entry_hash {
-        return Err(anyhow!("personaldb commit certificate path scope mismatch"));
-    }
     Ok(Some(certificate))
 }
 
-async fn read_payload_optional(
-    path: &Path,
-    expected_payload_hash: Hash32,
-) -> Result<Option<Vec<u8>>> {
-    let bytes = match tokio::fs::read(path).await {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
-    };
-    if hash32(&bytes) != expected_payload_hash {
-        return Err(anyhow!("personaldb changeset payload hash mismatch"));
-    }
-    Ok(Some(bytes))
+pub fn personaldb_changeset_payload_by_index_ref_name(
+    tenant_id: i64,
+    database_id: &str,
+    log_index: u64,
+    payload_hash: &str,
+) -> Result<String> {
+    validate_scope_component(tenant_id, database_id)?;
+    decode_hex32(payload_hash, "personaldb changeset payload hash")?;
+    Ok(format!(
+        "{PERSONALDB_CHANGESET_BY_INDEX_REF_PREFIX}tenant:{tenant_id}:database:{database_id}:log:{log_index:020}:hash:{payload_hash}"
+    ))
 }
 
-async fn write_once(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    match tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .await
-    {
-        Ok(mut file) => {
-            use tokio::io::AsyncWriteExt;
-            file.write_all(bytes).await?;
-            file.sync_data().await?;
-            Ok(())
-        }
-        Err(err) if err.kind() == ErrorKind::AlreadyExists => {
-            let existing = tokio::fs::read(path).await?;
-            if existing == bytes {
-                Ok(())
-            } else {
-                Err(anyhow!("personaldb immutable payload path collision"))
-            }
-        }
-        Err(err) => Err(err).with_context(|| format!("write {}", path.display())),
-    }
+pub fn personaldb_changeset_payload_by_hash_ref_name(
+    tenant_id: i64,
+    database_id: &str,
+    payload_hash: &str,
+) -> Result<String> {
+    validate_scope_component(tenant_id, database_id)?;
+    decode_hex32(payload_hash, "personaldb changeset payload hash")?;
+    Ok(format!(
+        "{PERSONALDB_CHANGESET_BY_HASH_REF_PREFIX}tenant:{tenant_id}:database:{database_id}:hash:{payload_hash}"
+    ))
 }
 
-async fn link_or_copy(source: &Path, destination: &Path) -> Result<()> {
-    if let Some(parent) = destination.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    if tokio::fs::hard_link(source, destination).await.is_ok() {
-        return Ok(());
-    }
-    let bytes = tokio::fs::read(source).await?;
-    write_once(destination, &bytes).await
-}
-
-async fn write_json_atomically(path: &Path, value: &impl Serialize) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let tmp = path.with_extension(format!("json.tmp-{}", uuid::Uuid::new_v4().simple()));
-    let bytes = serde_json::to_vec_pretty(value)?;
-    tokio::fs::write(&tmp, bytes)
-        .await
-        .with_context(|| format!("write temporary personaldb JSON file {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, path)
-        .await
-        .with_context(|| format!("publish personaldb JSON file {}", path.display()))?;
-    Ok(())
-}
-
-async fn read_json_optional<T>(path: &Path) -> Result<Option<T>>
-where
-    T: DeserializeOwned,
-{
-    let bytes = match tokio::fs::read(path).await {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
-    };
-    Ok(Some(serde_json::from_slice(&bytes)?))
+pub fn personaldb_commit_certificate_ref_name(
+    tenant_id: i64,
+    database_id: &str,
+    log_index: u64,
+    entry_hash: &str,
+) -> Result<String> {
+    validate_scope_component(tenant_id, database_id)?;
+    decode_hex32(entry_hash, "personaldb commit entry hash")?;
+    Ok(format!(
+        "{PERSONALDB_COMMIT_CERTIFICATE_REF_PREFIX}tenant:{tenant_id}:database:{database_id}:log:{log_index:020}:entry:{entry_hash}"
+    ))
 }
 
 fn ensure_scope(
@@ -229,6 +234,87 @@ fn ensure_scope(
     Ok(())
 }
 
+fn validate_scope_component(tenant_id: i64, database_id: &str) -> Result<()> {
+    if tenant_id < 0 {
+        return Err(anyhow!("personaldb tenant id must be nonnegative"));
+    }
+    if database_id.is_empty()
+        || database_id == "."
+        || database_id == ".."
+        || database_id.contains('/')
+        || database_id.contains('\\')
+        || database_id.contains(':')
+        || database_id.chars().any(char::is_control)
+    {
+        return Err(anyhow!("database_id is not a safe component"));
+    }
+    Ok(())
+}
+
+fn decode_hex32(value: &str, field: &'static str) -> Result<Hash32> {
+    if value.len() != 64 || !value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow!("{field} must be hex32"));
+    }
+    Ok(hex::decode(value)?
+        .try_into()
+        .map_err(|_| anyhow!("{field} must be hex32"))?)
+}
+
+async fn put_immutable_ref_target(
+    store: &CoreStore,
+    ref_name: &str,
+    bytes: &[u8],
+    object_ref: &CoreObjectRef,
+) -> Result<()> {
+    let target = encode_core_object_ref_target(object_ref)?;
+    match store
+        .compare_and_swap_ref(CompareAndSwapRef {
+            ref_name: ref_name.to_string(),
+            expected_generation: None,
+            expected_target: None,
+            require_absent: true,
+            require_present: false,
+            fence: None,
+            authz_revision: None,
+            source_watch_cursor: None,
+            new_target: target,
+            transaction_id: None,
+        })
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            let Some(existing) = store.read_ref(ref_name).await? else {
+                return Err(err);
+            };
+            let existing_bytes = store
+                .get_blob(GetBlob {
+                    object_ref: decode_core_object_ref_target(&existing.target)?,
+                })
+                .await?;
+            if existing_bytes == bytes {
+                Ok(())
+            } else {
+                Err(anyhow!("personaldb immutable commit ref collision"))
+            }
+        }
+    }
+}
+
+fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
+    Ok(format!(
+        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
+    ))
+}
+
+fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
+    let encoded = target
+        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
+        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
+    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,19 +329,19 @@ mod tests {
         let payload = b"sqlite changeset bytes";
         let payload_hash = hash32(payload);
 
-        let paths =
+        let refs =
             write_personaldb_changeset_payload(&storage, 9, "db-alpha", 42, payload_hash, payload)
                 .await
                 .unwrap();
 
-        assert!(paths.by_index_path.ends_with(format!(
-            "_anvil/personaldb/tenants/tenant-9/groups/db-alpha/log/payloads/by-index/00000000000000000042-{}.sqlite-changeset",
-            hex::encode(payload_hash)
-        )));
-        assert!(paths.by_hash_path.ends_with(format!(
-            "_anvil/personaldb/tenants/tenant-9/groups/db-alpha/log/payloads/by-hash/{}.sqlite-changeset",
-            hex::encode(payload_hash)
-        )));
+        assert!(
+            refs.by_index_ref
+                .starts_with("personaldb_changeset_payload_by_index:tenant:9:database:db-alpha:")
+        );
+        assert!(
+            refs.by_hash_ref
+                .starts_with("personaldb_changeset_payload_by_hash:tenant:9:database:db-alpha:")
+        );
 
         let by_hash =
             read_personaldb_changeset_payload_by_hash(&storage, 9, "db-alpha", payload_hash)
@@ -272,7 +358,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changeset_payload_rejects_hash_mismatch_and_path_collision() {
+    async fn changeset_payload_rejects_hash_mismatch_and_ref_collision() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let payload_hash = hash32(b"good");
@@ -283,13 +369,40 @@ mod tests {
                 .is_err()
         );
 
-        write_personaldb_changeset_payload(&storage, 9, "db-alpha", 1, payload_hash, b"good")
+        let refs =
+            write_personaldb_changeset_payload(&storage, 9, "db-alpha", 1, payload_hash, b"good")
+                .await
+                .unwrap();
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        let corrupt = store
+            .put_blob(PutBlob {
+                logical_name: "corrupt-changeset".to_string(),
+                bytes: b"corrupt".to_vec(),
+                region_id: "local".to_string(),
+                mutation_id: "corrupt-changeset".to_string(),
+            })
             .await
             .unwrap();
-        let by_hash_path = storage
-            .personaldb_changeset_payload_by_hash_path(9, "db-alpha", &hex::encode(payload_hash))
+        let current = store
+            .read_ref(&refs.by_hash_ref)
+            .await
+            .unwrap()
+            .expect("changeset ref exists");
+        store
+            .compare_and_swap_ref(CompareAndSwapRef {
+                ref_name: refs.by_hash_ref,
+                expected_generation: Some(current.generation),
+                expected_target: Some(current.target),
+                require_absent: false,
+                require_present: true,
+                fence: None,
+                authz_revision: None,
+                source_watch_cursor: None,
+                new_target: encode_core_object_ref_target(&corrupt).unwrap(),
+                transaction_id: None,
+            })
+            .await
             .unwrap();
-        tokio::fs::write(by_hash_path, b"corrupt").await.unwrap();
         assert!(
             read_personaldb_changeset_payload_by_hash(&storage, 9, "db-alpha", payload_hash)
                 .await
@@ -298,19 +411,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_certificate_round_trips_at_spec_path() {
+    async fn commit_certificate_round_trips_through_corestore_ref() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let certificate = sample_certificate().seal(KEY).unwrap();
 
-        let path = write_personaldb_commit_certificate(&storage, 9, "db-alpha", &certificate, KEY)
-            .await
-            .unwrap();
+        let ref_name =
+            write_personaldb_commit_certificate(&storage, 9, "db-alpha", &certificate, KEY)
+                .await
+                .unwrap();
 
-        assert!(path.ends_with(format!(
-            "_anvil/personaldb/tenants/tenant-9/groups/db-alpha/log/certificates/00000000000000000042-{}.certificate.json",
-            certificate.entry_hash
-        )));
+        assert!(ref_name.starts_with(
+            "personaldb_commit_certificate:tenant:9:database:db-alpha:log:00000000000000000042:"
+        ));
 
         let read = read_personaldb_commit_certificate(
             &storage,
@@ -331,17 +444,41 @@ mod tests {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let certificate = sample_certificate().seal(KEY).unwrap();
-        write_personaldb_commit_certificate(&storage, 9, "db-alpha", &certificate, KEY)
+        let ref_name =
+            write_personaldb_commit_certificate(&storage, 9, "db-alpha", &certificate, KEY)
+                .await
+                .unwrap();
+
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        let mut value = serde_json::to_value(&certificate).unwrap();
+        value["authz_revision"] = serde_json::json!(99);
+        let corrupt = store
+            .put_blob(PutBlob {
+                logical_name: "corrupt-certificate".to_string(),
+                bytes: serde_json::to_vec_pretty(&value).unwrap(),
+                region_id: "local".to_string(),
+                mutation_id: "corrupt-certificate".to_string(),
+            })
             .await
             .unwrap();
-
-        let path = storage
-            .personaldb_commit_certificate_path(9, "db-alpha", 42, &certificate.entry_hash)
-            .unwrap();
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
-        value["authz_revision"] = serde_json::json!(99);
-        tokio::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap())
+        let current = store
+            .read_ref(&ref_name)
+            .await
+            .unwrap()
+            .expect("certificate ref exists");
+        store
+            .compare_and_swap_ref(CompareAndSwapRef {
+                ref_name,
+                expected_generation: Some(current.generation),
+                expected_target: Some(current.target),
+                require_absent: false,
+                require_present: true,
+                fence: None,
+                authz_revision: None,
+                source_watch_cursor: None,
+                new_target: encode_core_object_ref_target(&corrupt).unwrap(),
+                transaction_id: None,
+            })
             .await
             .unwrap();
         assert!(

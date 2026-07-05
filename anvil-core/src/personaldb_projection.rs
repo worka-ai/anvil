@@ -1,8 +1,15 @@
-use crate::{formats::hash32, storage::Storage};
-use anyhow::{Context, Result, anyhow};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::io::ErrorKind;
-use std::path::Path;
+use crate::{
+    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    formats::hash32,
+    storage::Storage,
+};
+use anyhow::{Result, anyhow};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use serde::{Deserialize, Serialize};
+
+const PERSONALDB_PROJECTION_DEFINITION_REF_PREFIX: &str = "personaldb_projection_definition:";
+const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectionDefinition {
@@ -121,12 +128,38 @@ pub async fn write_projection_definition(
 ) -> Result<()> {
     definition.verify()?;
     ensure_scope(tenant_id, database_id, definition)?;
-    let path = storage.personaldb_projection_manifest_path(
-        tenant_id,
-        database_id,
-        &definition.projection_id,
-    )?;
-    write_json_atomically(&path, definition).await
+    let ref_name =
+        projection_definition_ref_name(tenant_id, database_id, &definition.projection_id)?;
+    let bytes = serde_json::to_vec_pretty(definition)?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: ref_name.clone(),
+            bytes,
+            region_id: "local".to_string(),
+            mutation_id: format!(
+                "personaldb-projection-definition:{tenant_id}:{database_id}:{}",
+                definition.projection_id
+            ),
+        })
+        .await?;
+    let new_target = encode_core_object_ref_target(&object_ref)?;
+    let current = store.read_ref(&ref_name).await?;
+    store
+        .compare_and_swap_ref(CompareAndSwapRef {
+            ref_name,
+            expected_generation: current.as_ref().map(|value| value.generation),
+            expected_target: current.map(|value| value.target),
+            require_absent: false,
+            require_present: false,
+            fence: None,
+            authz_revision: None,
+            source_watch_cursor: None,
+            new_target,
+            transaction_id: None,
+        })
+        .await?;
+    Ok(())
 }
 
 pub async fn read_projection_definition(
@@ -135,15 +168,13 @@ pub async fn read_projection_definition(
     database_id: &str,
     projection_id: &str,
 ) -> Result<Option<ProjectionDefinition>> {
-    let path =
-        storage.personaldb_projection_manifest_path(tenant_id, database_id, projection_id)?;
-    let Some(definition) = read_json_optional::<ProjectionDefinition>(&path).await? else {
+    let ref_name = projection_definition_ref_name(tenant_id, database_id, projection_id)?;
+    let Some(definition) = read_projection_definition_ref(storage, &ref_name).await? else {
         return Ok(None);
     };
-    definition.verify()?;
     ensure_scope(tenant_id, database_id, &definition)?;
     if definition.projection_id != projection_id {
-        return Err(anyhow!("projection definition path scope mismatch"));
+        return Err(anyhow!("projection definition ref scope mismatch"));
     }
     Ok(Some(definition))
 }
@@ -153,46 +184,21 @@ pub async fn list_projection_definitions_for_source(
     tenant_id: i64,
     source_database_id: &str,
 ) -> Result<Vec<ProjectionDefinition>> {
-    let groups_dir = storage.personaldb_tenant_groups_dir(tenant_id)?;
+    let store = CoreStore::new(storage.clone()).await?;
     let mut definitions = Vec::new();
-    let mut groups = match tokio::fs::read_dir(&groups_dir).await {
-        Ok(groups) => groups,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(definitions),
-        Err(err) => return Err(err).with_context(|| format!("read {}", groups_dir.display())),
-    };
-    while let Some(group) = groups.next_entry().await? {
-        let file_type = group.file_type().await?;
-        if !file_type.is_dir() {
+    for ref_name in store
+        .list_ref_names(&projection_definition_tenant_ref_prefix(tenant_id)?)
+        .await?
+    {
+        let Some(definition) = read_projection_definition_ref(storage, &ref_name).await? else {
             continue;
-        }
-        let database_id = group.file_name().to_string_lossy().into_owned();
-        let projections_dir = group.path().join("projections");
-        let mut projections = match tokio::fs::read_dir(&projections_dir).await {
-            Ok(projections) => projections,
-            Err(err) if err.kind() == ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(err).with_context(|| format!("read {}", projections_dir.display()));
-            }
         };
-        while let Some(projection) = projections.next_entry().await? {
-            let file_type = projection.file_type().await?;
-            if !file_type.is_dir() {
-                continue;
-            }
-            let projection_id = projection.file_name().to_string_lossy().into_owned();
-            let Some(definition) =
-                read_projection_definition(storage, tenant_id, &database_id, &projection_id)
-                    .await?
-            else {
-                continue;
-            };
-            if definition
-                .source_database_ids
-                .iter()
-                .any(|source| source == source_database_id)
-            {
-                definitions.push(definition);
-            }
+        if definition
+            .source_database_ids
+            .iter()
+            .any(|source| source == source_database_id)
+        {
+            definitions.push(definition);
         }
     }
     definitions.sort_by(|left, right| {
@@ -208,32 +214,39 @@ pub async fn list_projection_definitions_for_database(
     tenant_id: i64,
     database_id: &str,
 ) -> Result<Vec<ProjectionDefinition>> {
-    let projections_dir = storage
-        .personaldb_group_dir(tenant_id, database_id)?
-        .join("projections");
+    let store = CoreStore::new(storage.clone()).await?;
     let mut definitions = Vec::new();
-    let mut projections = match tokio::fs::read_dir(&projections_dir).await {
-        Ok(projections) => projections,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(definitions),
-        Err(err) => {
-            return Err(err).with_context(|| format!("read {}", projections_dir.display()));
+    for ref_name in store
+        .list_ref_names(&projection_definition_database_ref_prefix(
+            tenant_id,
+            database_id,
+        )?)
+        .await?
+    {
+        if let Some(definition) = read_projection_definition_ref(storage, &ref_name).await? {
+            definitions.push(definition);
         }
-    };
-    while let Some(projection) = projections.next_entry().await? {
-        let file_type = projection.file_type().await?;
-        if !file_type.is_dir() {
-            continue;
-        }
-        let projection_id = projection.file_name().to_string_lossy().into_owned();
-        let Some(definition) =
-            read_projection_definition(storage, tenant_id, database_id, &projection_id).await?
-        else {
-            continue;
-        };
-        definitions.push(definition);
     }
     definitions.sort_by(|left, right| left.projection_id.cmp(&right.projection_id));
     Ok(definitions)
+}
+
+async fn read_projection_definition_ref(
+    storage: &Storage,
+    ref_name: &str,
+) -> Result<Option<ProjectionDefinition>> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(ref_value) = store.read_ref(ref_name).await? else {
+        return Ok(None);
+    };
+    let bytes = store
+        .get_blob(GetBlob {
+            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+        })
+        .await?;
+    let definition: ProjectionDefinition = serde_json::from_slice(&bytes)?;
+    definition.verify()?;
+    Ok(Some(definition))
 }
 
 fn canonicalize_projection_definition(definition: &mut ProjectionDefinition) {
@@ -440,30 +453,63 @@ fn ensure_scope(
     Ok(())
 }
 
-async fn write_json_atomically(path: &Path, value: &impl Serialize) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+fn projection_definition_tenant_ref_prefix(tenant_id: i64) -> Result<String> {
+    if tenant_id < 0 {
+        return Err(anyhow!(
+            "projection definition tenant id must be nonnegative"
+        ));
     }
-    let tmp = path.with_extension(format!("json.tmp-{}", uuid::Uuid::new_v4().simple()));
-    tokio::fs::write(&tmp, serde_json::to_vec_pretty(value)?)
-        .await
-        .with_context(|| format!("write temporary projection definition {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, path)
-        .await
-        .with_context(|| format!("publish projection definition {}", path.display()))?;
+    Ok(format!(
+        "{PERSONALDB_PROJECTION_DEFINITION_REF_PREFIX}tenant:{tenant_id}:"
+    ))
+}
+
+fn projection_definition_database_ref_prefix(tenant_id: i64, database_id: &str) -> Result<String> {
+    require_safe_component(database_id, "database_id")?;
+    Ok(format!(
+        "{}database:{database_id}:",
+        projection_definition_tenant_ref_prefix(tenant_id)?
+    ))
+}
+
+fn projection_definition_ref_name(
+    tenant_id: i64,
+    database_id: &str,
+    projection_id: &str,
+) -> Result<String> {
+    require_safe_component(projection_id, "projection_id")?;
+    Ok(format!(
+        "{}projection:{projection_id}",
+        projection_definition_database_ref_prefix(tenant_id, database_id)?
+    ))
+}
+
+fn require_safe_component(value: &str, field: &'static str) -> Result<()> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains(':')
+        || value.chars().any(char::is_control)
+    {
+        return Err(anyhow!("{field} is not a safe component"));
+    }
     Ok(())
 }
 
-async fn read_json_optional<T>(path: &Path) -> Result<Option<T>>
-where
-    T: DeserializeOwned,
-{
-    let bytes = match tokio::fs::read(path).await {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
-    };
-    Ok(Some(serde_json::from_slice(&bytes)?))
+fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
+    Ok(format!(
+        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
+    ))
+}
+
+fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
+    let encoded = target
+        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
+        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
+    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
 }
 
 fn require_nonempty(value: &str, field: &'static str) -> Result<()> {
@@ -526,10 +572,11 @@ mod tests {
         write_projection_definition(&storage, 7, "projection-db", &definition)
             .await
             .unwrap();
-        let path = storage
-            .personaldb_projection_manifest_path(7, "projection-db", "projection-a")
-            .unwrap();
-        assert!(path.ends_with("_anvil/personaldb/tenants/tenant-7/groups/projection-db/projections/projection-a/manifest.json"));
+        let ref_name = projection_definition_ref_name(7, "projection-db", "projection-a").unwrap();
+        assert!(
+            ref_name
+                .starts_with("personaldb_projection_definition:tenant:7:database:projection-db:")
+        );
 
         let read = read_projection_definition(&storage, 7, "projection-db", "projection-a")
             .await
@@ -578,11 +625,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(
-            storage
-                .personaldb_projection_manifest_path(7, "projection-db", "../escape")
-                .is_err()
-        );
+        assert!(projection_definition_ref_name(7, "projection-db", "../escape").is_err());
     }
 
     fn sample_definition() -> ProjectionDefinition {

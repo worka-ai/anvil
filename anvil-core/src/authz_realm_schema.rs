@@ -1,9 +1,17 @@
 use crate::anvil_api::AuthzNamespaceSchema;
+use crate::core_store::{
+    CompareAndSwapRef, CoreObjectRef, CoreRefValue, CoreStore, GetBlob, PutBlob,
+};
 use crate::formats::hash32;
 use crate::storage::Storage;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+
+const AUTHZ_SCHEMA_REF_PREFIX: &str = "authz_schema:";
+const AUTHZ_SCHEMA_BINDING_REF_PREFIX: &str = "authz_schema_binding:";
+const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredSchemaRef {
@@ -84,7 +92,11 @@ pub async fn read_schema_revision(
     validate_schema_id(schema_id)?;
     match revision {
         Some(revision) => {
-            read_json(storage.authz_schema_revision_path(tenant_id, schema_id, revision)?).await
+            read_json_ref(
+                storage,
+                &schema_revision_ref_name(tenant_id, schema_id, revision)?,
+            )
+            .await
         }
         None => read_latest_schema_revision(storage, tenant_id, schema_id).await,
     }
@@ -112,8 +124,13 @@ pub async fn bind_schema(
     {
         return Err(anyhow!("authorization schema revision not found"));
     }
-    let current = read_schema_binding(storage, tenant_id, realm_id).await?;
-    let actual = current.as_ref().map(|binding| binding.binding_generation);
+    let current_state = read_json_ref_state::<StoredAuthzSchemaBinding>(
+        storage,
+        &schema_binding_ref_name(tenant_id, realm_id)?,
+    )
+    .await?;
+    let current = current_state.as_ref().map(|(_, binding)| binding);
+    let actual = current.map(|binding| binding.binding_generation);
     match (expected_generation, actual) {
         (None, None) | (Some(0), None) => {}
         (Some(expected), Some(actual)) if expected == actual => {}
@@ -128,8 +145,14 @@ pub async fn bind_schema(
         reason: reason.to_string(),
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
-    let path = storage.authz_schema_binding_path(tenant_id, realm_id)?;
-    write_json(path, &binding).await?;
+    write_json_ref_with_expected(
+        storage,
+        &schema_binding_ref_name(tenant_id, realm_id)?,
+        &binding,
+        current_state.as_ref().map(|(ref_value, _)| ref_value),
+        false,
+    )
+    .await?;
     Ok(binding)
 }
 
@@ -139,7 +162,7 @@ pub async fn read_schema_binding(
     realm_id: &str,
 ) -> Result<Option<StoredAuthzSchemaBinding>> {
     validate_realm_id(realm_id)?;
-    read_json(storage.authz_schema_binding_path(tenant_id, realm_id)?).await
+    read_json_ref(storage, &schema_binding_ref_name(tenant_id, realm_id)?).await
 }
 
 async fn write_schema_record(
@@ -147,14 +170,26 @@ async fn write_schema_record(
     tenant_id: i64,
     record: &StoredAuthzSchemaRevision,
 ) -> Result<()> {
-    let revision_path = storage.authz_schema_revision_path(
-        tenant_id,
-        &record.schema_ref.schema_id,
-        record.schema_ref.schema_revision,
-    )?;
-    write_json(revision_path, record).await?;
-    let latest_path = storage.authz_schema_latest_path(tenant_id, &record.schema_ref.schema_id)?;
-    write_json(latest_path, record).await
+    write_json_ref_with_expected(
+        storage,
+        &schema_revision_ref_name(
+            tenant_id,
+            &record.schema_ref.schema_id,
+            record.schema_ref.schema_revision,
+        )?,
+        record,
+        None,
+        true,
+    )
+    .await?;
+    write_json_ref_with_expected(
+        storage,
+        &schema_latest_ref_name(tenant_id, &record.schema_ref.schema_id)?,
+        record,
+        None,
+        false,
+    )
+    .await
 }
 
 async fn read_latest_schema_revision(
@@ -162,7 +197,7 @@ async fn read_latest_schema_revision(
     tenant_id: i64,
     schema_id: &str,
 ) -> Result<Option<StoredAuthzSchemaRevision>> {
-    read_json(storage.authz_schema_latest_path(tenant_id, schema_id)?).await
+    read_json_ref(storage, &schema_latest_ref_name(tenant_id, schema_id)?).await
 }
 
 async fn find_schema_by_digest(
@@ -171,17 +206,10 @@ async fn find_schema_by_digest(
     schema_id: &str,
     digest: &str,
 ) -> Result<Option<StoredAuthzSchemaRevision>> {
-    let latest_path = storage.authz_schema_latest_path(tenant_id, schema_id)?;
-    let Some(schema_dir) = latest_path.parent().map(|path| path.join("revisions")) else {
-        return Ok(None);
-    };
-    if tokio::fs::metadata(&schema_dir).await.is_err() {
-        return Ok(None);
-    }
-    let mut entries = tokio::fs::read_dir(&schema_dir).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        if entry.file_type().await?.is_file()
-            && let Some(record) = read_json::<StoredAuthzSchemaRevision>(entry.path()).await?
+    let store = CoreStore::new(storage.clone()).await?;
+    let prefix = schema_revision_ref_prefix(tenant_id, schema_id)?;
+    for ref_name in store.list_ref_names(&prefix).await? {
+        if let Some(record) = read_json_ref::<StoredAuthzSchemaRevision>(storage, &ref_name).await?
             && record.schema_ref.schema_digest == digest
         {
             return Ok(Some(record));
@@ -190,24 +218,58 @@ async fn find_schema_by_digest(
     Ok(None)
 }
 
-async fn read_json<T: for<'de> Deserialize<'de>>(path: PathBuf) -> Result<Option<T>> {
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
-    };
-    serde_json::from_slice(&bytes).with_context(|| format!("decode {}", path.display()))
+async fn read_json_ref<T: for<'de> Deserialize<'de>>(
+    storage: &Storage,
+    ref_name: &str,
+) -> Result<Option<T>> {
+    Ok(read_json_ref_state(storage, ref_name)
+        .await?
+        .map(|(_, value)| value))
 }
 
-async fn write_json<T: Serialize>(path: PathBuf, value: &T) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    tokio::fs::write(&tmp, serde_json::to_vec_pretty(value)?).await?;
-    tokio::fs::rename(&tmp, &path)
-        .await
-        .with_context(|| format!("publish {}", path.display()))?;
+async fn read_json_ref_state<T: for<'de> Deserialize<'de>>(
+    storage: &Storage,
+    ref_name: &str,
+) -> Result<Option<(CoreRefValue, T)>> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(ref_value) = store.read_ref(ref_name).await? else {
+        return Ok(None);
+    };
+    let object_ref = decode_core_object_ref_target(&ref_value.target)?;
+    let bytes = store.get_blob(GetBlob { object_ref }).await?;
+    Ok(Some((ref_value, serde_json::from_slice(&bytes)?)))
+}
+
+async fn write_json_ref_with_expected<T: Serialize>(
+    storage: &Storage,
+    ref_name: &str,
+    value: &T,
+    expected_ref: Option<&CoreRefValue>,
+    require_absent: bool,
+) -> Result<()> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: ref_name.to_string(),
+            bytes: serde_json::to_vec_pretty(value)?,
+            region_id: "local".to_string(),
+            mutation_id: format!("authz-schema:{}", uuid::Uuid::new_v4().simple()),
+        })
+        .await?;
+    store
+        .compare_and_swap_ref(CompareAndSwapRef {
+            ref_name: ref_name.to_string(),
+            expected_generation: expected_ref.map(|value| value.generation),
+            expected_target: expected_ref.map(|value| value.target.clone()),
+            require_absent,
+            require_present: expected_ref.is_some(),
+            fence: None,
+            authz_revision: None,
+            source_watch_cursor: None,
+            new_target: encode_core_object_ref_target(&object_ref)?,
+            transaction_id: None,
+        })
+        .await?;
     Ok(())
 }
 
@@ -229,10 +291,69 @@ fn validate_component(value: &str, name: &str) -> Result<()> {
         || value == "."
         || value == ".."
         || value.contains('/')
+        || value.contains(':')
         || value.chars().any(char::is_control)
     {
         Err(anyhow!("invalid {name}"))
     } else {
         Ok(())
     }
+}
+
+fn schema_revision_ref_prefix(tenant_id: i64, schema_id: &str) -> Result<String> {
+    validate_storage_tenant(tenant_id)?;
+    validate_schema_id(schema_id)?;
+    Ok(format!(
+        "{AUTHZ_SCHEMA_REF_PREFIX}tenant:{tenant_id}:schema:{schema_id}:revision:"
+    ))
+}
+
+fn schema_revision_ref_name(tenant_id: i64, schema_id: &str, revision: u64) -> Result<String> {
+    if revision == 0 {
+        return Err(anyhow!("authorization schema revision must be nonzero"));
+    }
+    Ok(format!(
+        "{}{revision:020}",
+        schema_revision_ref_prefix(tenant_id, schema_id)?
+    ))
+}
+
+fn schema_latest_ref_name(tenant_id: i64, schema_id: &str) -> Result<String> {
+    validate_storage_tenant(tenant_id)?;
+    validate_schema_id(schema_id)?;
+    Ok(format!(
+        "{AUTHZ_SCHEMA_REF_PREFIX}tenant:{tenant_id}:schema:{schema_id}:latest"
+    ))
+}
+
+fn schema_binding_ref_name(tenant_id: i64, realm_id: &str) -> Result<String> {
+    validate_storage_tenant(tenant_id)?;
+    validate_realm_id(realm_id)?;
+    Ok(format!(
+        "{AUTHZ_SCHEMA_BINDING_REF_PREFIX}tenant:{tenant_id}:realm:{realm_id}"
+    ))
+}
+
+fn validate_storage_tenant(tenant_id: i64) -> Result<()> {
+    if tenant_id < 0 {
+        Err(anyhow!(
+            "authorization storage tenant id must be nonnegative"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
+    Ok(format!(
+        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
+    ))
+}
+
+fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
+    let encoded = target
+        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
+        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
+    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
 }

@@ -1,12 +1,10 @@
 use crate::{
-    formats::{FileFamily, Hash32, hash32, watch::WatchRecord},
+    core_store::{AppendStreamRecord, CoreStore, ReadStream},
+    formats::{Hash32, hash32, watch::WatchRecord},
     storage::Storage,
-    watch_log::{DecodedWatchLog, WatchLogHeader, decode_watch_log},
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use tokio::io::AsyncWriteExt;
 
 const PERSONALDB_GROUP_PARTITION_FAMILY: u16 = 4;
 const PERSONALDB_GROUP_RECORD_KIND: u16 = 1;
@@ -63,19 +61,11 @@ pub async fn append_personaldb_group_watch_record(
     mutation_id: [u8; 16],
     authz_revision: u64,
     payload: PersonalDbGroupWatchPayload,
-) -> Result<PathBuf> {
+) -> Result<()> {
     validate_payload(database_id, &payload)?;
-    let path = storage.personaldb_group_watch_path(tenant_id, database_id)?;
-    ensure_watch_header(
-        tenant_id,
-        database_id,
-        "personaldb_group",
-        "personaldb_group",
-        partition_id(tenant_id, database_id),
-        &path,
-    )
-    .await?;
-    ensure_cursor_is_monotonic(&path, cursor).await?;
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let stream_id = personaldb_group_watch_stream_id(tenant_id, database_id);
+    ensure_cursor_is_monotonic(&core_store, &stream_id, "personaldb_group_watch", cursor).await?;
 
     let record = WatchRecord::new(
         cursor,
@@ -88,13 +78,20 @@ pub async fn append_personaldb_group_watch_record(
         payload.log_index,
         serde_json::to_vec(&payload)?,
     );
-    let mut file = tokio::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
+    core_store
+        .append_stream(AppendStreamRecord {
+            stream_id,
+            partition_id: hex::encode(partition_id(tenant_id, database_id)),
+            record_kind: "personaldb_group_watch".to_string(),
+            payload: record.encode(),
+            fence: None,
+            transaction_id: None,
+            idempotency_key: Some(format!(
+                "personaldb-group-watch:{tenant_id}:{database_id}:{cursor}"
+            )),
+        })
         .await?;
-    file.write_all(&record.encode()).await?;
-    file.sync_data().await?;
-    Ok(path)
+    Ok(())
 }
 
 pub async fn append_personaldb_projection_watch_record(
@@ -106,19 +103,17 @@ pub async fn append_personaldb_projection_watch_record(
     mutation_id: [u8; 16],
     authz_revision: u64,
     payload: PersonalDbProjectionWatchPayload,
-) -> Result<PathBuf> {
+) -> Result<()> {
     validate_projection_payload(database_id, projection_id, &payload)?;
-    let path = storage.personaldb_projection_watch_path(tenant_id, database_id, projection_id)?;
-    ensure_watch_header(
-        tenant_id,
-        &format!("{database_id}/{projection_id}"),
-        "personaldb_projection",
-        "personaldb_projection",
-        projection_partition_id(tenant_id, database_id, projection_id),
-        &path,
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let stream_id = personaldb_projection_watch_stream_id(tenant_id, database_id, projection_id);
+    ensure_cursor_is_monotonic(
+        &core_store,
+        &stream_id,
+        "personaldb_projection_watch",
+        cursor,
     )
     .await?;
-    ensure_cursor_is_monotonic(&path, cursor).await?;
 
     let record = WatchRecord::new(
         cursor,
@@ -131,13 +126,24 @@ pub async fn append_personaldb_projection_watch_record(
         payload.projection_log_index,
         serde_json::to_vec(&payload)?,
     );
-    let mut file = tokio::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
+    core_store
+        .append_stream(AppendStreamRecord {
+            stream_id,
+            partition_id: hex::encode(projection_partition_id(
+                tenant_id,
+                database_id,
+                projection_id,
+            )),
+            record_kind: "personaldb_projection_watch".to_string(),
+            payload: record.encode(),
+            fence: None,
+            transaction_id: None,
+            idempotency_key: Some(format!(
+                "personaldb-projection-watch:{tenant_id}:{database_id}:{projection_id}:{cursor}"
+            )),
+        })
         .await?;
-    file.write_all(&record.encode()).await?;
-    file.sync_data().await?;
-    Ok(path)
+    Ok(())
 }
 
 pub async fn list_personaldb_group_watch_events(
@@ -147,10 +153,15 @@ pub async fn list_personaldb_group_watch_events(
     after_cursor: u128,
     limit: usize,
 ) -> Result<Vec<PersonalDbGroupWatchEvent>> {
-    let path = storage.personaldb_group_watch_path(tenant_id, database_id)?;
-    let decoded = read_watch_or_empty(&path).await?;
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let records = read_watch_or_empty(
+        &core_store,
+        &personaldb_group_watch_stream_id(tenant_id, database_id),
+        "personaldb_group_watch",
+    )
+    .await?;
     let mut events = Vec::new();
-    for record in decoded.records {
+    for record in records {
         if record.cursor <= after_cursor {
             continue;
         }
@@ -183,10 +194,15 @@ pub async fn list_personaldb_projection_watch_events(
     after_cursor: u128,
     limit: usize,
 ) -> Result<Vec<PersonalDbProjectionWatchEvent>> {
-    let path = storage.personaldb_projection_watch_path(tenant_id, database_id, projection_id)?;
-    let decoded = read_watch_or_empty(&path).await?;
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let records = read_watch_or_empty(
+        &core_store,
+        &personaldb_projection_watch_stream_id(tenant_id, database_id, projection_id),
+        "personaldb_projection_watch",
+    )
+    .await?;
     let mut events = Vec::new();
-    for record in decoded.records {
+    for record in records {
         if record.cursor <= after_cursor {
             continue;
         }
@@ -216,10 +232,14 @@ pub async fn latest_personaldb_group_watch_cursor(
     tenant_id: i64,
     database_id: &str,
 ) -> Result<Option<u128>> {
-    let path = storage.personaldb_group_watch_path(tenant_id, database_id)?;
-    let decoded = read_watch_or_empty(&path).await?;
-    Ok(decoded
-        .records
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let records = read_watch_or_empty(
+        &core_store,
+        &personaldb_group_watch_stream_id(tenant_id, database_id),
+        "personaldb_group_watch",
+    )
+    .await?;
+    Ok(records
         .into_iter()
         .filter(|record| {
             record.partition_family == PERSONALDB_GROUP_PARTITION_FAMILY
@@ -236,10 +256,14 @@ pub async fn latest_personaldb_projection_watch_cursor(
     database_id: &str,
     projection_id: &str,
 ) -> Result<Option<u128>> {
-    let path = storage.personaldb_projection_watch_path(tenant_id, database_id, projection_id)?;
-    let decoded = read_watch_or_empty(&path).await?;
-    Ok(decoded
-        .records
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let records = read_watch_or_empty(
+        &core_store,
+        &personaldb_projection_watch_stream_id(tenant_id, database_id, projection_id),
+        "personaldb_projection_watch",
+    )
+    .await?;
+    Ok(records
         .into_iter()
         .filter(|record| {
             record.partition_family == PERSONALDB_PROJECTION_PARTITION_FAMILY
@@ -251,82 +275,42 @@ pub async fn latest_personaldb_projection_watch_cursor(
         .max())
 }
 
-async fn ensure_watch_header(
-    tenant_id: i64,
-    stream_key: &str,
-    watch_stream: &str,
-    partition_family: &str,
-    partition_id: Hash32,
-    path: &PathBuf,
+async fn ensure_cursor_is_monotonic(
+    core_store: &CoreStore,
+    stream_id: &str,
+    record_kind: &str,
+    cursor: u128,
 ) -> Result<()> {
-    if tokio::fs::metadata(path).await.is_ok() {
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let header = WatchLogHeader {
-        tenant_id: tenant_id.to_string(),
-        bucket_id: stream_key.to_string(),
-        watch_stream: watch_stream.to_string(),
-        partition_family: partition_family.to_string(),
-        partition_id: hex::encode(partition_id),
-        created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-        codec: "none".to_string(),
-    };
-    let envelope = crate::formats::BinaryEnvelopeHeader::new(
-        FileFamily::WatchSegment,
-        0,
-        0,
-        serde_json::to_vec(&header)?,
-    );
-    match tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .await
+    let records = read_watch_or_empty(core_store, stream_id, record_kind).await?;
+    if let Some(latest) = records.iter().map(|record| record.cursor).max()
+        && cursor <= latest
     {
-        Ok(mut file) => {
-            file.write_all(&envelope.encode()).await?;
-            file.sync_data().await?;
-            Ok(())
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(err) => {
-            Err(err).with_context(|| format!("create personaldb watch file {}", path.display()))
-        }
-    }
-}
-
-async fn ensure_cursor_is_monotonic(path: &PathBuf, cursor: u128) -> Result<()> {
-    let decoded = read_watch_or_empty(path).await?;
-    if let Some(latest) = decoded.records.iter().map(|record| record.cursor).max() {
-        if cursor <= latest {
-            return Err(anyhow!("personaldb watch cursor must be monotonic"));
-        }
+        return Err(anyhow!("personaldb watch cursor must be monotonic"));
     }
     Ok(())
 }
 
-async fn read_watch_or_empty(path: &PathBuf) -> Result<DecodedWatchLog> {
-    match tokio::fs::read(path).await {
-        Ok(bytes) => decode_watch_log(&bytes),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(DecodedWatchLog {
-            header: WatchLogHeader {
-                tenant_id: String::new(),
-                bucket_id: String::new(),
-                watch_stream: "personaldb_group".to_string(),
-                partition_family: "personaldb_group".to_string(),
-                partition_id: String::new(),
-                created_at: String::new(),
-                codec: "none".to_string(),
-            },
-            records: Vec::new(),
-        }),
-        Err(err) => {
-            Err(err).with_context(|| format!("read personaldb watch file {}", path.display()))
-        }
-    }
+async fn read_watch_or_empty(
+    core_store: &CoreStore,
+    stream_id: &str,
+    record_kind: &str,
+) -> Result<Vec<WatchRecord>> {
+    let records = core_store
+        .read_stream(ReadStream {
+            stream_id: stream_id.to_string(),
+            after_sequence: 0,
+            limit: 0,
+        })
+        .await?;
+    records
+        .into_iter()
+        .filter(|record| record.record_kind == record_kind)
+        .map(|record| {
+            WatchRecord::decode(&record.payload)
+                .map(|(record, _)| record)
+                .map_err(Into::into)
+        })
+        .collect()
 }
 
 fn validate_payload(database_id: &str, payload: &PersonalDbGroupWatchPayload) -> Result<()> {
@@ -383,6 +367,20 @@ fn projection_partition_id(tenant_id: i64, database_id: &str, projection_id: &st
     )
 }
 
+fn personaldb_group_watch_stream_id(tenant_id: i64, database_id: &str) -> String {
+    format!("watch:personaldb_group:tenant:{tenant_id}:database:{database_id}")
+}
+
+fn personaldb_projection_watch_stream_id(
+    tenant_id: i64,
+    database_id: &str,
+    projection_id: &str,
+) -> String {
+    format!(
+        "watch:personaldb_projection:tenant:{tenant_id}:database:{database_id}:projection:{projection_id}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,8 +397,10 @@ mod tests {
             .await
             .unwrap();
 
-        let path = storage.personaldb_group_watch_path(4, "db-alpha").unwrap();
-        assert!(path.ends_with("_anvil/watch/personaldb/tenant-4/groups/db-alpha.anwatch"));
+        assert_eq!(
+            personaldb_group_watch_stream_id(4, "db-alpha"),
+            "watch:personaldb_group:tenant:4:database:db-alpha"
+        );
         let events = list_personaldb_group_watch_events(&storage, 4, "db-alpha", 10, 10)
             .await
             .unwrap();
@@ -475,12 +475,10 @@ mod tests {
         .await
         .unwrap();
 
-        let path = storage
-            .personaldb_projection_watch_path(4, "projection-db", "projection-a")
-            .unwrap();
-        assert!(path.ends_with(
-            "_anvil/watch/personaldb/tenant-4/groups/projection-db/projections/projection-a.anwatch"
-        ));
+        assert_eq!(
+            personaldb_projection_watch_stream_id(4, "projection-db", "projection-a"),
+            "watch:personaldb_projection:tenant:4:database:projection-db:projection:projection-a"
+        );
         let events = list_personaldb_projection_watch_events(
             &storage,
             4,
