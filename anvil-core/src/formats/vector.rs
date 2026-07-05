@@ -7,9 +7,9 @@ pub const VECTOR_RECORD_LEN: usize = 8 + 16 + 4 + 1 + 1 + 2 + 8 + 8 + 4 + 32 + 8
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VectorBodyHeader {
     pub vector_count: u64,
-    pub vector_table_offset: u64,
-    pub vector_payload_offset: u64,
-    pub hnsw_graph_offset: u64,
+    pub record_table_offset: u64,
+    pub vector_blocks_offset: u64,
+    pub ann_blocks_offset: u64,
     pub deleted_bitset_offset: u64,
 }
 
@@ -17,9 +17,9 @@ impl VectorBodyHeader {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(VECTOR_BODY_HEADER_LEN);
         out.extend_from_slice(&self.vector_count.to_le_bytes());
-        out.extend_from_slice(&self.vector_table_offset.to_le_bytes());
-        out.extend_from_slice(&self.vector_payload_offset.to_le_bytes());
-        out.extend_from_slice(&self.hnsw_graph_offset.to_le_bytes());
+        out.extend_from_slice(&self.record_table_offset.to_le_bytes());
+        out.extend_from_slice(&self.vector_blocks_offset.to_le_bytes());
+        out.extend_from_slice(&self.ann_blocks_offset.to_le_bytes());
         out.extend_from_slice(&self.deleted_bitset_offset.to_le_bytes());
         out
     }
@@ -34,9 +34,9 @@ impl VectorBodyHeader {
         }
         Ok(Self {
             vector_count: u64::from_le_bytes(input[0..8].try_into().unwrap()),
-            vector_table_offset: u64::from_le_bytes(input[8..16].try_into().unwrap()),
-            vector_payload_offset: u64::from_le_bytes(input[16..24].try_into().unwrap()),
-            hnsw_graph_offset: u64::from_le_bytes(input[24..32].try_into().unwrap()),
+            record_table_offset: u64::from_le_bytes(input[8..16].try_into().unwrap()),
+            vector_blocks_offset: u64::from_le_bytes(input[16..24].try_into().unwrap()),
+            ann_blocks_offset: u64::from_le_bytes(input[24..32].try_into().unwrap()),
             deleted_bitset_offset: u64::from_le_bytes(input[32..40].try_into().unwrap()),
         })
     }
@@ -365,17 +365,26 @@ impl VectorModality {
 pub const DEFAULT_HNSW_M: u16 = 32;
 pub const DEFAULT_HNSW_EF_CONSTRUCTION: u16 = 200;
 pub const DEFAULT_HNSW_EF_SEARCH: u16 = 80;
+pub const VECTOR_INDEX_SCHEMA: &str = "anvil.index.vector_definition.v1";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorIndexDefinition {
+    pub source: serde_json::Value,
+    pub extractor: serde_json::Value,
+    pub embedding_provider: String,
     pub dimension: u16,
     pub metric: VectorMetric,
     pub modality: VectorModality,
     pub embedding_model: String,
+    pub embedding_model_version: Option<String>,
+    pub normalisation: String,
     pub chunking: serde_json::Value,
+    pub chunking_hash: String,
+    pub extractor_hash: String,
     pub hnsw_m: u16,
     pub hnsw_ef_construction: u16,
     pub hnsw_ef_search_default: u16,
+    pub provenance_hash: String,
 }
 
 impl VectorIndexDefinition {
@@ -383,52 +392,190 @@ impl VectorIndexDefinition {
         let object = value
             .as_object()
             .ok_or(FormatError::InvalidVectorIndexDefinition { field: "root" })?;
-        let dimension = required_u16(object, "dimension")?;
-        if dimension == 0 {
-            return Err(FormatError::InvalidVectorIndexDefinition { field: "dimension" });
+        if required_str(object, "schema")? != VECTOR_INDEX_SCHEMA {
+            return Err(FormatError::InvalidVectorIndexDefinition { field: "schema" });
         }
-        let metric = VectorMetric::from_name(required_str(object, "metric")?)?;
-        let modality = VectorModality::from_name(required_str(object, "modality")?)?;
-        let embedding_model = required_str(object, "embedding_model")?.to_string();
-        if embedding_model.trim().is_empty() {
+
+        let source = required_object_value(object, "source")?;
+        let extractor = required_object_value(object, "extractor")?;
+        required_str(
+            extractor
+                .as_object()
+                .ok_or(FormatError::InvalidVectorIndexDefinition { field: "extractor" })?,
+            "kind",
+        )?;
+
+        let embedding = required_object(object, "embedding")?;
+        let embedding_provider = required_str(embedding, "provider")?.to_string();
+        if embedding_provider.trim().is_empty() {
             return Err(FormatError::InvalidVectorIndexDefinition {
-                field: "embedding_model",
+                field: "embedding.provider",
             });
         }
-        let chunking = object
+        let embedding_model = required_str(embedding, "model")?.to_string();
+        if embedding_model.trim().is_empty() {
+            return Err(FormatError::InvalidVectorIndexDefinition {
+                field: "embedding.model",
+            });
+        }
+        let embedding_model_version = embedding
+            .get("model_version")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|value| !value.trim().is_empty());
+        let dimension = required_u16(embedding, "dimension")?;
+        if dimension == 0 {
+            return Err(FormatError::InvalidVectorIndexDefinition {
+                field: "embedding.dimension",
+            });
+        }
+        let modality = VectorModality::from_name(required_str(embedding, "modality")?)?;
+        let normalisation = required_str(embedding, "normalisation")?.to_string();
+        if normalisation.trim().is_empty() {
+            return Err(FormatError::InvalidVectorIndexDefinition {
+                field: "embedding.normalisation",
+            });
+        }
+        let chunking = embedding
             .get("chunking")
             .filter(|value| value.is_object())
             .cloned()
-            .ok_or(FormatError::InvalidVectorIndexDefinition { field: "chunking" })?;
-        let hnsw_m = optional_u16(object, "hnsw_m", DEFAULT_HNSW_M)?;
+            .ok_or(FormatError::InvalidVectorIndexDefinition {
+                field: "embedding.chunking",
+            })?;
+
+        let ann = required_object(object, "ann")?;
+        if required_str(ann, "algorithm")? != "hnsw" {
+            return Err(FormatError::InvalidVectorIndexDefinition {
+                field: "ann.algorithm",
+            });
+        }
+        let metric = VectorMetric::from_name(required_str(ann, "metric")?)?;
+        let hnsw_m = optional_u16(ann, "m", DEFAULT_HNSW_M)?;
         let hnsw_ef_construction =
-            optional_u16(object, "hnsw_ef_construction", DEFAULT_HNSW_EF_CONSTRUCTION)?;
+            optional_u16(ann, "ef_construction", DEFAULT_HNSW_EF_CONSTRUCTION)?;
         let hnsw_ef_search_default =
-            optional_u16(object, "hnsw_ef_search_default", DEFAULT_HNSW_EF_SEARCH)?;
+            optional_u16(ann, "ef_search_default", DEFAULT_HNSW_EF_SEARCH)?;
         if hnsw_m == 0 {
-            return Err(FormatError::InvalidVectorIndexDefinition { field: "hnsw_m" });
+            return Err(FormatError::InvalidVectorIndexDefinition { field: "ann.m" });
         }
         if hnsw_ef_construction == 0 {
             return Err(FormatError::InvalidVectorIndexDefinition {
-                field: "hnsw_ef_construction",
+                field: "ann.ef_construction",
             });
         }
         if hnsw_ef_search_default == 0 {
             return Err(FormatError::InvalidVectorIndexDefinition {
-                field: "hnsw_ef_search_default",
+                field: "ann.ef_search_default",
             });
         }
+        let chunking_hash = definition_value_hash(&chunking)?;
+        let extractor_hash = definition_value_hash(&extractor)?;
+        let provenance_hash = vector_provenance_hash(
+            &embedding_provider,
+            &embedding_model,
+            embedding_model_version.as_deref(),
+            dimension,
+            modality,
+            &normalisation,
+            &chunking,
+            &extractor,
+        )?;
         Ok(Self {
+            source,
+            extractor,
+            embedding_provider,
             dimension,
             metric,
             modality,
             embedding_model,
+            embedding_model_version,
+            normalisation,
             chunking,
+            chunking_hash,
+            extractor_hash,
             hnsw_m,
             hnsw_ef_construction,
             hnsw_ef_search_default,
+            provenance_hash,
         })
     }
+}
+
+fn definition_value_hash(value: &serde_json::Value) -> Result<String, FormatError> {
+    let bytes =
+        serde_json::to_vec(value).map_err(|_| FormatError::InvalidVectorIndexDefinition {
+            field: "definition_hash",
+        })?;
+    Ok(format!("blake3:{}", blake3::hash(&bytes).to_hex()))
+}
+
+fn vector_provenance_hash(
+    provider: &str,
+    model: &str,
+    model_version: Option<&str>,
+    dimension: u16,
+    modality: VectorModality,
+    normalisation: &str,
+    chunking: &serde_json::Value,
+    extractor: &serde_json::Value,
+) -> Result<String, FormatError> {
+    let mut provenance = serde_json::Map::new();
+    provenance.insert(
+        "provider".to_string(),
+        serde_json::Value::String(provider.to_string()),
+    );
+    provenance.insert(
+        "model".to_string(),
+        serde_json::Value::String(model.to_string()),
+    );
+    if let Some(model_version) = model_version {
+        provenance.insert(
+            "model_version".to_string(),
+            serde_json::Value::String(model_version.to_string()),
+        );
+    }
+    provenance.insert(
+        "dimension".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(dimension)),
+    );
+    provenance.insert(
+        "modality".to_string(),
+        serde_json::Value::String(modality.as_name().to_string()),
+    );
+    provenance.insert(
+        "normalisation".to_string(),
+        serde_json::Value::String(normalisation.to_string()),
+    );
+    provenance.insert("chunking".to_string(), chunking.clone());
+    provenance.insert("extractor".to_string(), extractor.clone());
+    let bytes = serde_json::to_vec(&serde_json::Value::Object(provenance)).map_err(|_| {
+        FormatError::InvalidVectorIndexDefinition {
+            field: "provenance",
+        }
+    })?;
+    Ok(format!("blake3:{}", blake3::hash(&bytes).to_hex()))
+}
+
+fn required_object_value(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+) -> Result<serde_json::Value, FormatError> {
+    object
+        .get(field)
+        .filter(|value| value.is_object())
+        .cloned()
+        .ok_or(FormatError::InvalidVectorIndexDefinition { field })
+}
+
+fn required_object<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, FormatError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_object)
+        .ok_or(FormatError::InvalidVectorIndexDefinition { field })
 }
 
 fn required_str<'a>(
@@ -581,9 +728,9 @@ mod tests {
     fn vector_body_header_round_trip() {
         let header = VectorBodyHeader {
             vector_count: 10,
-            vector_table_offset: 40,
-            vector_payload_offset: 400,
-            hnsw_graph_offset: 800,
+            record_table_offset: 40,
+            vector_blocks_offset: 400,
+            ann_blocks_offset: 800,
             deleted_bitset_offset: 1200,
         };
         assert_eq!(VectorBodyHeader::decode(&header.encode()).unwrap(), header);
@@ -692,24 +839,24 @@ mod tests {
 
     #[test]
     fn vector_index_definition_parses_required_shape_and_defaults() {
-        let definition = VectorIndexDefinition::from_json(&serde_json::json!({
-            "dimension": 768,
-            "metric": "cosine",
-            "modality": "text",
-            "embedding_model": "text-embedding-v1",
-            "chunking": {
-                "kind": "tokens",
-                "max_tokens": 512,
-                "overlap_tokens": 64
-            }
-        }))
+        let definition = VectorIndexDefinition::from_json(&rfc_vector_definition(
+            "cosine",
+            "text",
+            "test_only",
+            768,
+        ))
         .unwrap();
 
         assert_eq!(definition.dimension, 768);
         assert_eq!(definition.metric, VectorMetric::Cosine);
         assert_eq!(definition.modality, VectorModality::Text);
         assert_eq!(definition.embedding_model, "text-embedding-v1");
-        assert_eq!(definition.chunking["kind"], "tokens");
+        assert_eq!(definition.embedding_provider, "test_only");
+        assert_eq!(definition.normalisation, "unit_l2");
+        assert_eq!(definition.chunking["strategy"], "token_window");
+        assert!(definition.provenance_hash.starts_with("blake3:"));
+        assert!(definition.chunking_hash.starts_with("blake3:"));
+        assert!(definition.extractor_hash.starts_with("blake3:"));
         assert_eq!(definition.hnsw_m, DEFAULT_HNSW_M);
         assert_eq!(
             definition.hnsw_ef_construction,
@@ -731,17 +878,14 @@ mod tests {
                 ("audio", VectorModality::Audio),
                 ("video", VectorModality::Video),
             ] {
-                let definition = VectorIndexDefinition::from_json(&serde_json::json!({
-                    "dimension": 1024,
-                    "metric": metric,
-                    "modality": modality,
-                    "embedding_model": format!("{modality}-embedding-v1"),
-                    "chunking": {"kind": "fixed_bytes", "max_bytes": 65536},
-                    "hnsw_m": 48,
-                    "hnsw_ef_construction": 320,
-                    "hnsw_ef_search_default": 96
-                }))
-                .unwrap();
+                let mut value = rfc_vector_definition(metric, modality, "test_only", 1024);
+                value["embedding"]["model"] = serde_json::json!(format!("{modality}-embedding-v1"));
+                value["embedding"]["chunking"] =
+                    serde_json::json!({"strategy": "fixed_bytes", "max_bytes": 65536});
+                value["ann"]["m"] = serde_json::json!(48);
+                value["ann"]["ef_construction"] = serde_json::json!(320);
+                value["ann"]["ef_search_default"] = serde_json::json!(96);
+                let definition = VectorIndexDefinition::from_json(&value).unwrap();
                 assert_eq!(definition.metric, expected_metric);
                 assert_eq!(definition.modality, expected_modality);
                 assert_eq!(definition.hnsw_m, 48);
@@ -755,88 +899,35 @@ mod tests {
     fn vector_index_definition_rejects_invalid_shapes() {
         for (field, value) in [
             ("root", serde_json::json!("not an object")),
+            ("schema", without_field("schema")),
             (
-                "dimension",
-                serde_json::json!({
-                    "dimension": 0,
-                    "metric": "cosine",
-                    "modality": "text",
-                    "embedding_model": "text-embedding-v1",
-                    "chunking": {}
-                }),
+                "embedding.dimension",
+                with_path("embedding", "dimension", serde_json::json!(0)),
             ),
             (
                 "metric",
-                serde_json::json!({
-                    "dimension": 1,
-                    "metric": "manhattan",
-                    "modality": "text",
-                    "embedding_model": "text-embedding-v1",
-                    "chunking": {}
-                }),
+                with_path("ann", "metric", serde_json::json!("manhattan")),
             ),
             (
                 "modality",
-                serde_json::json!({
-                    "dimension": 1,
-                    "metric": "cosine",
-                    "modality": "binary",
-                    "embedding_model": "text-embedding-v1",
-                    "chunking": {}
-                }),
+                with_path("embedding", "modality", serde_json::json!("binary")),
             ),
             (
-                "embedding_model",
-                serde_json::json!({
-                    "dimension": 1,
-                    "metric": "cosine",
-                    "modality": "text",
-                    "embedding_model": "   ",
-                    "chunking": {}
-                }),
+                "embedding.model",
+                with_path("embedding", "model", serde_json::json!("   ")),
             ),
             (
-                "chunking",
-                serde_json::json!({
-                    "dimension": 1,
-                    "metric": "cosine",
-                    "modality": "text",
-                    "embedding_model": "text-embedding-v1",
-                    "chunking": "none"
-                }),
+                "embedding.chunking",
+                with_path("embedding", "chunking", serde_json::json!("none")),
+            ),
+            ("ann.m", with_path("ann", "m", serde_json::json!(0))),
+            (
+                "ann.ef_construction",
+                with_path("ann", "ef_construction", serde_json::json!(0)),
             ),
             (
-                "hnsw_m",
-                serde_json::json!({
-                    "dimension": 1,
-                    "metric": "cosine",
-                    "modality": "text",
-                    "embedding_model": "text-embedding-v1",
-                    "chunking": {},
-                    "hnsw_m": 0
-                }),
-            ),
-            (
-                "hnsw_ef_construction",
-                serde_json::json!({
-                    "dimension": 1,
-                    "metric": "cosine",
-                    "modality": "text",
-                    "embedding_model": "text-embedding-v1",
-                    "chunking": {},
-                    "hnsw_ef_construction": 0
-                }),
-            ),
-            (
-                "hnsw_ef_search_default",
-                serde_json::json!({
-                    "dimension": 1,
-                    "metric": "cosine",
-                    "modality": "text",
-                    "embedding_model": "text-embedding-v1",
-                    "chunking": {},
-                    "hnsw_ef_search_default": 0
-                }),
+                "ann.ef_search_default",
+                with_path("ann", "ef_search_default", serde_json::json!(0)),
             ),
         ] {
             assert_eq!(
@@ -844,6 +935,47 @@ mod tests {
                 FormatError::InvalidVectorIndexDefinition { field }
             );
         }
+    }
+
+    fn rfc_vector_definition(
+        metric: &str,
+        modality: &str,
+        provider: &str,
+        dimension: u16,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "schema": VECTOR_INDEX_SCHEMA,
+            "source": {"kind": "object_current", "prefix": "docs/"},
+            "extractor": {"kind": "object_body_utf8"},
+            "embedding": {
+                "provider": provider,
+                "model": "text-embedding-v1",
+                "dimension": dimension,
+                "modality": modality,
+                "normalisation": "unit_l2",
+                "chunking": {
+                    "strategy": "token_window",
+                    "max_tokens": 512,
+                    "overlap_tokens": 64
+                }
+            },
+            "ann": {
+                "algorithm": "hnsw",
+                "metric": metric
+            }
+        })
+    }
+
+    fn without_field(field: &str) -> serde_json::Value {
+        let mut value = rfc_vector_definition("cosine", "text", "test_only", 1);
+        value.as_object_mut().unwrap().remove(field);
+        value
+    }
+
+    fn with_path(parent: &str, field: &str, replacement: serde_json::Value) -> serde_json::Value {
+        let mut value = rfc_vector_definition("cosine", "text", "test_only", 1);
+        value[parent][field] = replacement;
+        value
     }
 
     #[test]

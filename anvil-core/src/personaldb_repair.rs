@@ -1,22 +1,22 @@
 use crate::{
     formats::{Hash32, hash32, personaldb::PersonalDbLogRecord},
     personaldb_commit_store::{
-        read_personaldb_changeset_payload_by_index, read_personaldb_commit_certificate,
+        read_personaldb_changeset_payload_by_index, read_personaldb_changeset_payload_ref,
+        read_personaldb_commit_certificate, read_personaldb_commit_certificate_ref,
     },
     personaldb_control::PersonalDbCommitCertificate,
     personaldb_heads::{
         PersonalDbCommittedHead, read_personaldb_committed_head, read_personaldb_group_manifest,
     },
-    personaldb_segment::read_personaldb_log_segment,
+    personaldb_segment::{list_personaldb_log_segment_refs, read_personaldb_log_segment},
     repair_finding::{
         RepairActionKind, RepairFinding, RepairFindingSeverity, RepairFindingStatus,
         RepairFindingWrite, RepairSubjectRef, write_repair_finding,
     },
     storage::Storage,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use serde_json::json;
-use std::{io::ErrorKind, path::PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PersonalDbLogChainRepairReason {
@@ -226,31 +226,27 @@ async fn read_records_through_head(
     database_id: &str,
     head: &PersonalDbCommittedHead,
 ) -> std::result::Result<Vec<PersonalDbLogRecord>, PersonalDbLogChainRepairReason> {
-    let segment_paths = list_log_segment_paths(storage, tenant_id, database_id)
+    let segment_refs = list_log_segment_refs(storage, tenant_id, database_id)
         .await
         .map_err(|err| PersonalDbLogChainRepairReason::InvalidLogSegment {
             segment_id: "segment-directory".to_string(),
             message: err.to_string(),
         })?;
-    if segment_paths.is_empty() {
+    if segment_refs.is_empty() {
         return Err(PersonalDbLogChainRepairReason::MissingLogSegment {
             expected_log_index: 1,
         });
     }
 
     let mut records = Vec::new();
-    for path in segment_paths {
-        let segment_id = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("unknown-segment")
-            .to_string();
-        let segment = read_personaldb_log_segment(&path).await.map_err(|err| {
-            PersonalDbLogChainRepairReason::InvalidLogSegment {
+    for segment_ref in segment_refs {
+        let segment_id = segment_ref.clone();
+        let segment = read_personaldb_log_segment(storage, &segment_ref)
+            .await
+            .map_err(|err| PersonalDbLogChainRepairReason::InvalidLogSegment {
                 segment_id: segment_id.clone(),
                 message: err.to_string(),
-            }
-        })?;
+            })?;
         if segment.header.tenant_id != tenant_id.to_string()
             || segment.header.database_id != database_id
         {
@@ -270,32 +266,12 @@ async fn read_records_through_head(
     Ok(records)
 }
 
-async fn list_log_segment_paths(
+async fn list_log_segment_refs(
     storage: &Storage,
     tenant_id: i64,
     database_id: &str,
-) -> Result<Vec<PathBuf>> {
-    let dir = storage.personaldb_log_segment_dir(tenant_id, database_id)?;
-    let mut entries = match tokio::fs::read_dir(&dir).await {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err).with_context(|| format!("read {}", dir.display())),
-    };
-    let mut paths = Vec::new();
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some("pdbseg") {
-            paths.push(path);
-        }
-    }
-    paths.sort_by_key(|path| {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.split('-').next())
-            .and_then(|start| start.parse::<u64>().ok())
-            .unwrap_or(u64::MAX)
-    });
-    Ok(paths)
+) -> Result<Vec<String>> {
+    list_personaldb_log_segment_refs(storage, tenant_id, database_id).await
 }
 
 fn validate_chain_against_manifest_and_head(
@@ -355,23 +331,21 @@ async fn verify_record_payload(
     record: &PersonalDbLogRecord,
 ) -> std::result::Result<(), PersonalDbLogChainRepairReason> {
     let bytes = if !record.payload_ref.is_empty() {
-        let relative = std::str::from_utf8(&record.payload_ref).map_err(|err| {
+        let payload_ref = std::str::from_utf8(&record.payload_ref).map_err(|err| {
             PersonalDbLogChainRepairReason::InvalidChangesetPayload {
                 log_index: record.log_index,
                 message: err.to_string(),
             }
         })?;
-        let path = storage
-            .resolve_relative_storage_path(relative)
-            .map_err(
-                |err| PersonalDbLogChainRepairReason::InvalidChangesetPayload {
-                    log_index: record.log_index,
-                    message: err.to_string(),
-                },
-            )?;
-        match tokio::fs::read(&path).await {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == ErrorKind::NotFound => {
+        match read_personaldb_changeset_payload_ref(
+            storage,
+            payload_ref,
+            record.changeset_payload_hash,
+        )
+        .await
+        {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
                 return Err(PersonalDbLogChainRepairReason::MissingChangesetPayload {
                     log_index: record.log_index,
                 });
@@ -433,23 +407,15 @@ async fn verify_record_certificate(
                 },
             )?
     } else if !record.certificate_ref.is_empty() {
-        let relative = std::str::from_utf8(&record.certificate_ref).map_err(|err| {
+        let certificate_ref = std::str::from_utf8(&record.certificate_ref).map_err(|err| {
             PersonalDbLogChainRepairReason::InvalidCommitCertificate {
                 log_index: record.log_index,
                 message: err.to_string(),
             }
         })?;
-        let path = storage
-            .resolve_relative_storage_path(relative)
-            .map_err(
-                |err| PersonalDbLogChainRepairReason::InvalidCommitCertificate {
-                    log_index: record.log_index,
-                    message: err.to_string(),
-                },
-            )?;
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == ErrorKind::NotFound => {
+        match read_personaldb_commit_certificate_ref(storage, certificate_ref, signing_key).await {
+            Ok(Some(certificate)) => certificate,
+            Ok(None) => {
                 return Err(PersonalDbLogChainRepairReason::MissingCommitCertificate {
                     log_index: record.log_index,
                 });
@@ -460,13 +426,7 @@ async fn verify_record_certificate(
                     message: err.to_string(),
                 });
             }
-        };
-        serde_json::from_slice::<PersonalDbCommitCertificate>(&bytes).map_err(|err| {
-            PersonalDbLogChainRepairReason::InvalidCommitCertificate {
-                log_index: record.log_index,
-                message: err.to_string(),
-            }
-        })?
+        }
     } else {
         let entry_hash = hex::encode(record.entry_hash);
         match read_personaldb_commit_certificate(
@@ -782,6 +742,7 @@ fn hex32(value: &str) -> Result<Hash32> {
 mod tests {
     use super::*;
     use crate::{
+        core_store::CoreStore,
         personaldb_commit_store::{
             write_personaldb_changeset_payload, write_personaldb_commit_certificate,
         },
@@ -811,16 +772,12 @@ mod tests {
     #[tokio::test]
     async fn missing_payload_requires_operator_review() {
         let fixture = Fixture::create().await;
-        let payload_path = fixture
-            .storage
-            .personaldb_changeset_payload_by_index_path(
-                7,
-                "db-alpha",
-                1,
-                &hex::encode(fixture.payload_hash),
-            )
+        CoreStore::new(fixture.storage.clone())
+            .await
+            .unwrap()
+            .delete_ref(&fixture.payload_ref, None, None, true)
+            .await
             .unwrap();
-        tokio::fs::remove_file(payload_path).await.unwrap();
 
         let report = repair_personaldb_log_chain(&fixture.storage, 7, "db-alpha", 9, KEY, KEY)
             .await
@@ -838,7 +795,10 @@ mod tests {
     #[tokio::test]
     async fn missing_certificate_requires_operator_review() {
         let fixture = Fixture::create().await;
-        tokio::fs::remove_file(&fixture.certificate_path)
+        CoreStore::new(fixture.storage.clone())
+            .await
+            .unwrap()
+            .delete_ref(&fixture.certificate_ref, None, None, true)
             .await
             .unwrap();
 
@@ -858,8 +818,8 @@ mod tests {
     struct Fixture {
         _temp: TempDir,
         storage: Storage,
-        payload_hash: Hash32,
-        certificate_path: PathBuf,
+        payload_ref: String,
+        certificate_ref: String,
     }
 
     impl Fixture {
@@ -880,10 +840,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let payload_ref = storage
-                .relative_storage_path(&payload_paths.by_index_path)
-                .unwrap()
-                .into_bytes();
+            let payload_ref = payload_paths.by_index_ref.clone();
             let provisional = PersonalDbLogRecord::new(
                 1,
                 1,
@@ -893,7 +850,7 @@ mod tests {
                 payload_hash,
                 hash32(b"envelope"),
                 [0; 32],
-                payload_ref.clone(),
+                payload_ref.clone().into_bytes(),
                 Vec::new(),
                 Vec::new(),
             );
@@ -919,7 +876,7 @@ mod tests {
             }
             .seal(KEY)
             .unwrap();
-            let certificate_path =
+            let certificate_ref =
                 write_personaldb_commit_certificate(&storage, 7, "db-alpha", &certificate, KEY)
                     .await
                     .unwrap();
@@ -932,11 +889,8 @@ mod tests {
                 payload_hash,
                 hash32(b"envelope"),
                 hex32(certificate.certificate_hash.as_deref().unwrap()).unwrap(),
-                payload_ref,
-                storage
-                    .relative_storage_path(&certificate_path)
-                    .unwrap()
-                    .into_bytes(),
+                payload_ref.clone().into_bytes(),
+                certificate_ref.clone().into_bytes(),
                 Vec::new(),
             );
             let manifest = PersonalDbGroupManifest {
@@ -961,7 +915,7 @@ mod tests {
             write_personaldb_group_manifest(&storage, 7, &manifest, KEY)
                 .await
                 .unwrap();
-            let segment_path = write_personaldb_log_segment(
+            let segment_ref = write_personaldb_log_segment(
                 &storage,
                 PersonalDbLogSegmentWrite {
                     tenant_id: 7,
@@ -979,7 +933,7 @@ mod tests {
                 database_id: "db-alpha".to_string(),
                 log_index: 1,
                 log_hash: hex::encode(record.entry_hash),
-                segment_path: storage.relative_storage_path(&segment_path).unwrap(),
+                segment_path: segment_ref,
                 row_index_generation: 0,
                 policy_epoch: 1,
                 membership_epoch: 1,
@@ -997,8 +951,8 @@ mod tests {
             Self {
                 _temp: temp,
                 storage,
-                payload_hash,
-                certificate_path,
+                payload_ref,
+                certificate_ref,
             }
         }
     }

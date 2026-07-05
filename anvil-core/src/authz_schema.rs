@@ -1,13 +1,18 @@
 use crate::{
     anvil_api::{AuthzNamespaceSchema, AuthzRelationRule, AuthzRelationSchema},
+    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
     formats::hash32,
     storage::Storage,
 };
 use anyhow::{Context, Result, anyhow};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::Path;
+
+const AUTHZ_NAMESPACE_SCHEMA_REF_PREFIX: &str = "authz_namespace_schema:";
+const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuthzNamespaceSchemaRecord {
@@ -78,8 +83,7 @@ pub async fn write_authz_namespace_schema(
     };
     record.record_hash = record_hash(&record)?;
     validate_record(&record, tenant_id, &record.namespace)?;
-    let path = storage.authz_namespace_schema_path(tenant_id, &record.namespace)?;
-    write_json_atomically(&path, &record).await?;
+    write_namespace_schema_ref(storage, &record).await?;
     Ok(record)
 }
 
@@ -88,14 +92,12 @@ pub async fn read_authz_namespace_schema(
     tenant_id: i64,
     namespace: &str,
 ) -> Result<Option<AuthzNamespaceSchemaRecord>> {
-    let path = storage.authz_namespace_schema_path(tenant_id, namespace)?;
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    let Some(record) =
+        read_namespace_schema_ref(storage, &namespace_schema_ref_name(tenant_id, namespace)?)
+            .await?
+    else {
+        return Ok(None);
     };
-    let record: AuthzNamespaceSchemaRecord =
-        serde_json::from_slice(&bytes).with_context(|| format!("decode {}", path.display()))?;
     validate_record(&record, tenant_id, namespace)?;
     Ok(Some(record))
 }
@@ -104,23 +106,15 @@ pub async fn list_authz_namespace_schemas(
     storage: &Storage,
     tenant_id: i64,
 ) -> Result<Vec<AuthzNamespaceSchemaRecord>> {
-    let dir = storage.authz_namespace_schema_dir(tenant_id);
+    let store = CoreStore::new(storage.clone()).await?;
     let mut records = Vec::new();
-    let mut entries = match tokio::fs::read_dir(&dir).await {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(records),
-        Err(err) => return Err(err).with_context(|| format!("list {}", dir.display())),
-    };
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+    for ref_name in store
+        .list_ref_names(&namespace_schema_ref_prefix(tenant_id)?)
+        .await?
+    {
+        let Some(record) = read_namespace_schema_ref(storage, &ref_name).await? else {
             continue;
-        }
-        let bytes = tokio::fs::read(&path)
-            .await
-            .with_context(|| format!("read {}", path.display()))?;
-        let record: AuthzNamespaceSchemaRecord =
-            serde_json::from_slice(&bytes).with_context(|| format!("decode {}", path.display()))?;
+        };
         validate_record(&record, tenant_id, &record.namespace)?;
         records.push(record);
     }
@@ -217,7 +211,12 @@ fn validate_component(value: &str, name: &str) -> Result<()> {
     if value.is_empty() {
         return Err(anyhow!("{name} must not be empty"));
     }
-    if value == "." || value == ".." || value.contains('/') || value.chars().any(char::is_control) {
+    if value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains(':')
+        || value.chars().any(char::is_control)
+    {
         return Err(anyhow!("{name} must be a safe component"));
     }
     Ok(())
@@ -272,25 +271,96 @@ fn canonical_schema(schema: &AuthzNamespaceSchema) -> AuthzNamespaceSchema {
     schema
 }
 
-async fn write_json_atomically(path: &Path, value: &impl Serialize) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("create {}", parent.display()))?;
-    }
-    let tmp = path.with_extension(format!("json.tmp-{}", uuid::Uuid::new_v4().simple()));
-    tokio::fs::write(&tmp, serde_json::to_vec_pretty(value)?)
-        .await
-        .with_context(|| {
-            format!(
-                "write temporary authorization namespace schema {}",
-                tmp.display()
-            )
-        })?;
-    tokio::fs::rename(&tmp, path)
-        .await
-        .with_context(|| format!("publish authorization namespace schema {}", path.display()))?;
+async fn write_namespace_schema_ref(
+    storage: &Storage,
+    record: &AuthzNamespaceSchemaRecord,
+) -> Result<()> {
+    let ref_name = namespace_schema_ref_name(record.tenant_id, &record.namespace)?;
+    let current = read_namespace_schema_ref_state(storage, &ref_name).await?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: ref_name.clone(),
+            bytes: serde_json::to_vec_pretty(record)?,
+            region_id: "local".to_string(),
+            mutation_id: format!(
+                "authz-namespace-schema:{}:{}:{}",
+                record.tenant_id, record.namespace, record.schema_version
+            ),
+        })
+        .await?;
+    store
+        .compare_and_swap_ref(CompareAndSwapRef {
+            ref_name,
+            expected_generation: current.as_ref().map(|(value, _)| value.generation),
+            expected_target: current.as_ref().map(|(value, _)| value.target.clone()),
+            require_absent: current.is_none(),
+            require_present: current.is_some(),
+            fence: None,
+            authz_revision: None,
+            source_watch_cursor: None,
+            new_target: encode_core_object_ref_target(&object_ref)?,
+            transaction_id: None,
+        })
+        .await?;
     Ok(())
+}
+
+async fn read_namespace_schema_ref(
+    storage: &Storage,
+    ref_name: &str,
+) -> Result<Option<AuthzNamespaceSchemaRecord>> {
+    Ok(read_namespace_schema_ref_state(storage, ref_name)
+        .await?
+        .map(|(_, record)| record))
+}
+
+async fn read_namespace_schema_ref_state(
+    storage: &Storage,
+    ref_name: &str,
+) -> Result<Option<(crate::core_store::CoreRefValue, AuthzNamespaceSchemaRecord)>> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(ref_value) = store.read_ref(ref_name).await? else {
+        return Ok(None);
+    };
+    let object_ref = decode_core_object_ref_target(&ref_value.target)?;
+    let bytes = store.get_blob(GetBlob { object_ref }).await?;
+    let record = serde_json::from_slice(&bytes).with_context(|| format!("decode {ref_name}"))?;
+    Ok(Some((ref_value, record)))
+}
+
+fn namespace_schema_ref_prefix(tenant_id: i64) -> Result<String> {
+    if tenant_id < 0 {
+        return Err(anyhow!(
+            "authorization schema tenant id must be nonnegative"
+        ));
+    }
+    Ok(format!(
+        "{AUTHZ_NAMESPACE_SCHEMA_REF_PREFIX}tenant:{tenant_id}:namespace:"
+    ))
+}
+
+fn namespace_schema_ref_name(tenant_id: i64, namespace: &str) -> Result<String> {
+    validate_component(namespace, "namespace")?;
+    Ok(format!(
+        "{}{}",
+        namespace_schema_ref_prefix(tenant_id)?,
+        namespace
+    ))
+}
+
+fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
+    Ok(format!(
+        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
+    ))
+}
+
+fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
+    let encoded = target
+        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
+        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
+    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
 }
 
 impl From<AuthzRelationRule> for AuthzRelationRuleRecord {

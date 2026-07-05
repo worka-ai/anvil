@@ -218,7 +218,7 @@ mod tests {
                 Some("application/octet-stream"),
                 Some(json!({"channel": "stable"})),
                 None,
-                Some(b"hello world".to_vec()),
+                None,
             )
             .await
             .unwrap();
@@ -233,7 +233,7 @@ mod tests {
                 Some("application/octet-stream"),
                 None,
                 None,
-                Some(b"hello again".to_vec()),
+                None,
             )
             .await
             .unwrap();
@@ -386,16 +386,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(created.link.size, 0);
-        assert!(created.link.inline_payload.is_none());
         let resolved_v1 = persistence
             .resolve_object_link_target(bucket.id, "latest.bin")
             .await
             .unwrap();
         assert_eq!(resolved_v1.key, "versions/app-v1.bin");
-        assert_eq!(
-            resolved_v1.inline_payload.as_deref(),
-            Some(b"hello world".as_slice())
-        );
+        assert_eq!(resolved_v1.content_hash, "payload-hash-v1");
 
         let mut update = link_request(&bucket, "latest.bin", "versions/app-v2.bin");
         update.create_only = false;
@@ -403,16 +399,12 @@ mod tests {
         let updated = persistence.put_object_link(update).await.unwrap();
 
         assert_eq!(updated.link.size, 0);
-        assert!(updated.link.inline_payload.is_none());
         let resolved_v2 = persistence
             .resolve_object_link_target(bucket.id, "latest.bin")
             .await
             .unwrap();
         assert_eq!(resolved_v2.key, "versions/app-v2.bin");
-        assert_eq!(
-            resolved_v2.inline_payload.as_deref(),
-            Some(b"hello again".as_slice())
-        );
+        assert_eq!(resolved_v2.content_hash, "payload-hash-v2");
     }
 
     #[tokio::test]
@@ -429,7 +421,7 @@ mod tests {
                 Some("application/octet-stream"),
                 None,
                 None,
-                Some(b"live-v1".to_vec()),
+                None,
             )
             .await
             .unwrap();
@@ -444,7 +436,7 @@ mod tests {
                 Some("application/octet-stream"),
                 None,
                 None,
-                Some(b"live-v2".to_vec()),
+                None,
             )
             .await
             .unwrap();
@@ -467,12 +459,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(live.version_id, v2.version_id);
-        assert_eq!(live.inline_payload.as_deref(), Some(b"live-v2".as_slice()));
+        assert_eq!(live.content_hash, "payload-hash-live-v2");
         assert_eq!(pinned.version_id, v1.version_id);
-        assert_eq!(
-            pinned.inline_payload.as_deref(),
-            Some(b"live-v1".as_slice())
-        );
+        assert_eq!(pinned.content_hash, "payload-hash-live-v1");
     }
 
     #[tokio::test]

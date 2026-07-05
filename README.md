@@ -19,6 +19,13 @@ Anvil moves those concerns into the storage layer. It stores objects, maintains 
 - **Source and model artefacts:** storage patterns for git packs, source indexes, model manifests, Hugging Face ingestion, media extraction diagnostics, and reproducibility records.
 - **Operational tooling:** an admin CLI, an application CLI, Docker image publication, S3 compatibility tests, release checks, and Fission-built documentation.
 
+
+## Storage Architecture
+
+Anvil's durable boundary is CoreStore. CoreStore has three primitives: immutable `CoreObject`s, ordered `CoreStream`s, and compare-and-swap `CoreRef`s. Objects, metadata, indexes, authorisation, PersonalDB, mesh routing, gateway records, task leases, audits, and repair evidence all persist through those primitives.
+
+This keeps S3 compatibility in the right place. S3 is a gateway for existing object tools; it is not the internal storage model. Native APIs, S3-compatible APIs, search, watches, and admin operations all resolve into the same object, authorisation, and CoreStore path.
+
 ## Release Surfaces
 
 This release ships Anvil through these supported surfaces:

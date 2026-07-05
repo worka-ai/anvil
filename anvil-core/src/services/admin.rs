@@ -254,7 +254,6 @@ impl AdminService for AppState {
 
         rotate_application_secret_envelopes(self, req.dry_run, &mut stats).await?;
         rotate_hf_secret_envelopes(self, req.dry_run, &mut stats).await?;
-        rotate_local_shard_envelopes(self, req.dry_run, &mut stats).await?;
 
         let audit_event_id = record_admin_audit_event(
             self,
@@ -270,8 +269,6 @@ impl AdminService for AppState {
                 "app_secrets_rotated": stats.app_secrets_rotated,
                 "hf_keys_examined": stats.hf_keys_examined,
                 "hf_keys_rotated": stats.hf_keys_rotated,
-                "shard_files_examined": stats.shard_files_examined,
-                "shard_files_rotated": stats.shard_files_rotated,
                 "already_active": stats.already_active,
             }),
         )
@@ -285,8 +282,6 @@ impl AdminService for AppState {
             app_secrets_rotated: stats.app_secrets_rotated,
             hf_keys_examined: stats.hf_keys_examined,
             hf_keys_rotated: stats.hf_keys_rotated,
-            shard_files_examined: stats.shard_files_examined,
-            shard_files_rotated: stats.shard_files_rotated,
             already_active: stats.already_active,
             audit_event_id,
         }))
@@ -2903,8 +2898,6 @@ struct SecretEncryptionRotationStats {
     app_secrets_rotated: u64,
     hf_keys_examined: u64,
     hf_keys_rotated: u64,
-    shard_files_examined: u64,
-    shard_files_rotated: u64,
     already_active: u64,
 }
 
@@ -2979,42 +2972,6 @@ async fn rotate_hf_secret_envelopes(
                     state
                         .persistence
                         .hf_update_key_encrypted(key.id, &rotated)
-                        .await
-                        .map_err(|err| Status::internal(err.to_string()))?;
-                }
-            }
-            None => stats.already_active += 1,
-        }
-    }
-    Ok(())
-}
-
-async fn rotate_local_shard_envelopes(
-    state: &AppState,
-    dry_run: bool,
-    stats: &mut SecretEncryptionRotationStats,
-) -> Result<(), Status> {
-    let shard_files = state
-        .storage
-        .list_committed_shard_files()
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?;
-    for path in shard_files {
-        stats.shard_files_examined += 1;
-        let data = tokio::fs::read(&path)
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?;
-        match state
-            .secret_keyring
-            .reencrypt_if_needed(&data)
-            .map_err(|err| Status::internal(err.to_string()))?
-        {
-            Some(rotated) => {
-                stats.shard_files_rotated += 1;
-                if !dry_run {
-                    state
-                        .storage
-                        .rewrite_storage_file(&path, &rotated)
                         .await
                         .map_err(|err| Status::internal(err.to_string()))?;
                 }
@@ -3387,7 +3344,9 @@ fn lifecycle_status(err: LifecycleError) -> Status {
         | LifecycleError::ActivationCheckpointNotReached { .. } => {
             Status::failed_precondition(err.to_string())
         }
-        LifecycleError::Io(_) | LifecycleError::Json(_) => Status::internal(err.to_string()),
+        LifecycleError::Io(_) | LifecycleError::Json(_) | LifecycleError::Other(_) => {
+            Status::internal(err.to_string())
+        }
     }
 }
 

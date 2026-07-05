@@ -11,7 +11,29 @@ use tonic::Code;
 
 use anvil_test_utils::*;
 
-fn count_shard_files(root: &Path, object_hash: &str) -> usize {
+fn count_corestore_shard_files(root: &Path, object_hash: &str) -> usize {
+    let object_hash = object_hash.strip_prefix("sha256:").unwrap_or(object_hash);
+    let prefix = object_hash.get(0..2).unwrap_or_default();
+    let replicas_root = root.join("_core").join("replicas");
+    let Ok(entries) = std::fs::read_dir(&replicas_root) else {
+        return 0;
+    };
+
+    entries
+        .flatten()
+        .map(|entry| {
+            entry
+                .path()
+                .join("blobs")
+                .join("sha256")
+                .join(prefix)
+                .join(object_hash)
+        })
+        .map(|path| count_shard_files(&path))
+        .sum()
+}
+
+fn count_shard_files(root: &Path) -> usize {
     let mut count = 0;
     let Ok(entries) = std::fs::read_dir(root) else {
         return 0;
@@ -20,17 +42,39 @@ fn count_shard_files(root: &Path, object_hash: &str) -> usize {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            count += count_shard_files(&path, object_hash);
+            count += count_shard_files(&path);
         } else if path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(&format!("{object_hash}-")))
+            .is_some_and(|name| name.starts_with("shard-") && name.ends_with(".bin"))
         {
             count += 1;
         }
     }
 
     count
+}
+
+fn count_corestore_manifest_replicas(root: &Path, object_hash: &str) -> usize {
+    let object_hash = object_hash.strip_prefix("sha256:").unwrap_or(object_hash);
+    let prefix = object_hash.get(0..2).unwrap_or_default();
+    let replicas_root = root.join("_core").join("replicas");
+    let Ok(entries) = std::fs::read_dir(&replicas_root) else {
+        return 0;
+    };
+
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .path()
+                .join("manifests")
+                .join("sha256")
+                .join(prefix)
+                .join(format!("{object_hash}.json"))
+                .is_file()
+        })
+        .count()
 }
 
 fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
@@ -82,6 +126,8 @@ async fn test_distributed_put_and_get() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+        content_type: None,
+        user_metadata_json: String::new(),
     };
     let mut chunks = vec![PutObjectRequest {
         data: Some(anvil_api::put_object_request::Data::Metadata(metadata)),
@@ -137,10 +183,16 @@ async fn test_distributed_put_and_get() {
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let shards_found = count_shard_files(&cluster.storage_path, &object_hash);
+    let shards_found = count_corestore_shard_files(&cluster.storage_path, &object_hash);
+    let manifest_replicas = count_corestore_manifest_replicas(&cluster.storage_path, &object_hash);
     assert!(
-        shards_found > 0,
-        "expected distributed shards for {object_hash} under {}",
+        shards_found >= 6,
+        "expected CoreStore erasure shards for {object_hash} under {}",
+        cluster.storage_path.display()
+    );
+    assert!(
+        manifest_replicas >= 3,
+        "expected CoreStore manifest quorum for {object_hash} under {}",
         cluster.storage_path.display()
     );
 }
@@ -180,6 +232,8 @@ async fn test_single_node_put() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+        content_type: None,
+        user_metadata_json: String::new(),
     };
     let chunks = vec![
         PutObjectRequest {
@@ -249,6 +303,8 @@ async fn test_multi_region_list_and_isolation() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+        content_type: None,
+        user_metadata_json: String::new(),
     };
     let chunks = vec![
         PutObjectRequest {

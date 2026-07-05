@@ -5,11 +5,12 @@ use crate::{
     anvil_personaldb_sqlite_changeset::iterate_changeset,
     auth, authz_journal,
     authz_scope::{DEFAULT_AUTHZ_REALM_ID, encode_realm_namespace},
+    core_store::CoreMutationPrecondition,
     error_codes::AnvilErrorCode,
     formats::{Hash32, hash32, personaldb::PersonalDbLogRecord as CorePersonalDbLogRecord},
     partition_fence::{
         PartitionRecoveryAcquire, PartitionWritePermit, acquire_partition_recovery,
-        publish_partition_ready, validate_partition_write,
+        partition_write_ref_precondition, publish_partition_ready,
     },
     permissions::AnvilAction,
     personaldb_catchup::{
@@ -28,7 +29,7 @@ use crate::{
     personaldb_heads::{
         PersonalDbCommittedHead, PersonalDbSnapshotsHead, read_personaldb_committed_head,
         read_personaldb_group_manifest, write_personaldb_committed_head,
-        write_personaldb_group_manifest,
+        write_personaldb_committed_head_with_preconditions, write_personaldb_group_manifest,
     },
     personaldb_projection::{
         ProjectionDefinition, WriteBackPolicy, list_projection_definitions_for_database,
@@ -668,11 +669,11 @@ impl AppState {
         })
     }
 
-    async fn validate_personaldb_group_write_permit(
+    async fn personaldb_group_write_precondition(
         &self,
         permit: &PartitionWritePermit,
-    ) -> Result<(), Status> {
-        validate_partition_write(&self.storage, permit, self.personaldb_signing_key())
+    ) -> Result<CoreMutationPrecondition, Status> {
+        partition_write_ref_precondition(&self.storage, permit, self.personaldb_signing_key())
             .await
             .map_err(|err| {
                 Status::failed_precondition(format!(
@@ -999,11 +1000,7 @@ impl AppState {
         )
         .await
         .map_err(internal_status)?;
-        let payload_ref = self
-            .storage
-            .relative_storage_path(&payload_paths.by_index_path)
-            .map_err(internal_status)?
-            .into_bytes();
+        let payload_ref = payload_paths.by_index_ref.clone().into_bytes();
 
         let provisional_record = CorePersonalDbLogRecord::new(
             proposed_log_index,
@@ -1040,7 +1037,7 @@ impl AppState {
         }
         .seal(signing_key)
         .map_err(internal_status)?;
-        let certificate_path = write_personaldb_commit_certificate(
+        let certificate_ref = write_personaldb_commit_certificate(
             &self.storage,
             actor.tenant_id,
             &validated.request.database_id,
@@ -1056,11 +1053,6 @@ impl AppState {
                 .ok_or_else(|| Status::internal("PersonalDB certificate hash missing"))?,
             "certificate hash",
         )?;
-        let certificate_ref = self
-            .storage
-            .relative_storage_path(&certificate_path)
-            .map_err(internal_status)?
-            .into_bytes();
         let record = CorePersonalDbLogRecord::new(
             proposed_log_index,
             validated.request.client_log_epoch,
@@ -1071,10 +1063,10 @@ impl AppState {
             envelope_hash,
             certificate_hash,
             payload_ref,
-            certificate_ref,
+            certificate_ref.into_bytes(),
             Vec::new(),
         );
-        let segment_path = write_personaldb_log_segment(
+        let segment_ref = write_personaldb_log_segment(
             &self.storage,
             PersonalDbLogSegmentWrite {
                 tenant_id: actor.tenant_id,
@@ -1105,7 +1097,8 @@ impl AppState {
             .await
             .map_err(internal_status)?;
         }
-        self.validate_personaldb_group_write_permit(&write_permit)
+        let write_precondition = self
+            .personaldb_group_write_precondition(&write_permit)
             .await?;
         let current_head_before_publish = read_personaldb_committed_head(
             &self.storage,
@@ -1130,10 +1123,7 @@ impl AppState {
             database_id: validated.request.database_id.clone(),
             log_index: proposed_log_index,
             log_hash: hex::encode(record.entry_hash),
-            segment_path: self
-                .storage
-                .relative_storage_path(&segment_path)
-                .map_err(internal_status)?,
+            segment_path: segment_ref,
             row_index_generation,
             policy_epoch: manifest.active_policy_epoch,
             membership_epoch: manifest.active_membership_epoch,
@@ -1145,12 +1135,13 @@ impl AppState {
         }
         .seal(signing_key)
         .map_err(internal_status)?;
-        write_personaldb_committed_head(
+        write_personaldb_committed_head_with_preconditions(
             &self.storage,
             actor.tenant_id,
             &validated.request.database_id,
             &committed_head,
             signing_key,
+            vec![write_precondition],
         )
         .await
         .map_err(internal_status)?;

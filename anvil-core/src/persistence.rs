@@ -11,9 +11,13 @@ use crate::{
     cache::MetadataCache,
     cluster::MetadataEvent,
     config::Config,
-    control_journal, directory_repair, hf_journal, index_builder, index_diagnostic_journal,
-    index_journal, index_repair, manifest_journal, mesh_control_stream, mesh_directory,
-    metadata_journal, model_journal, multipart_journal, object_links,
+    control_journal,
+    core_store::{CoreObjectRef, CoreStore, PutBlob},
+    directory_repair,
+    embedding_provider::EmbeddingProviderRegistry,
+    hf_journal, index_builder, index_diagnostic_journal, index_journal, index_repair,
+    manifest_journal, mesh_control_stream, mesh_directory, metadata_journal, model_journal,
+    multipart_journal, object_links,
     partition_fence::{
         AcquireOwnership, ForceExpireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal,
         OwnershipResource, OwnershipResourceKind, PartitionOwnerStatus, PartitionRecoveryAcquire,
@@ -38,6 +42,7 @@ pub struct Persistence {
     owner_node_id: String,
     partition_owner_signing_key: Vec<u8>,
     personaldb_signing_key: Vec<u8>,
+    embedding_providers: EmbeddingProviderRegistry,
     object_metadata_compaction_frame_threshold: u64,
     object_metadata_compaction_bytes_threshold: u64,
     task_lease_ttl_secs: u64,
@@ -175,7 +180,6 @@ pub struct Object {
     pub storage_class: Option<i16>,
     pub user_meta: Option<JsonValue>,
     pub shard_map: Option<JsonValue>,
-    pub inline_payload: Option<Vec<u8>>,
     pub checksum: Option<Vec<u8>>,
     #[serde(default)]
     pub link: Option<object_links::ObjectLinkTarget>,
@@ -244,6 +248,7 @@ pub struct MultipartUploadPart {
     pub upload_id: i64,
     pub part_number: i32,
     pub content_hash: String,
+    pub object_ref: CoreObjectRef,
     pub size: i64,
     pub etag: String,
     pub created_at: DateTime<Utc>,
@@ -324,7 +329,12 @@ pub struct AppendStreamRecord {
     pub stream_id: i64,
     pub record_sequence: i64,
     pub payload_hash: String,
+    pub payload_object_ref: CoreObjectRef,
     pub payload_size: i64,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub user_meta: Option<JsonValue>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -500,6 +510,20 @@ fn user_metadata_hash(user_meta: Option<&JsonValue>) -> String {
         .to_string()
 }
 
+fn core_object_ref_to_shard_map(object_ref: &CoreObjectRef) -> JsonValue {
+    serde_json::json!({
+        "schema": "anvil.core.object_ref.v1",
+        "hash": object_ref.hash,
+        "logical_size": object_ref.logical_size,
+        "manifest_ref": object_ref.manifest_ref,
+    })
+}
+
+fn is_retryable_partition_fence_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("generation mismatch") || message.contains("stale")
+}
+
 fn canonical_json_bytes(value: &JsonValue) -> Vec<u8> {
     match value {
         JsonValue::Null => b"null".to_vec(),
@@ -553,6 +577,7 @@ impl Persistence {
             owner_node_id: persistence_owner_node_id(config),
             partition_owner_signing_key: hex::decode(&config.anvil_secret_encryption_key)?,
             personaldb_signing_key: config.anvil_secret_encryption_key.as_bytes().to_vec(),
+            embedding_providers: EmbeddingProviderRegistry::from_config(config)?,
             object_metadata_compaction_frame_threshold: config
                 .object_metadata_compaction_frame_threshold,
             object_metadata_compaction_bytes_threshold: config
@@ -753,43 +778,20 @@ impl Persistence {
                     ));
             }
             let stream_family = family.stream_family();
-            let family_path = self
-                .storage
-                .mesh_control_stream_family_path(stream_family)?;
-            let mut entries = match tokio::fs::read_dir(&family_path).await {
-                Ok(entries) => entries,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(err.into()),
-            };
-            while let Some(entry) = entries.next_entry().await? {
-                let path = entry.path();
-                if path.extension().and_then(|value| value.to_str()) != Some("anlog") {
-                    continue;
-                }
-                let Some(partition) = path.file_stem().and_then(|value| value.to_str()) else {
-                    continue;
-                };
-                if self
-                    .storage
-                    .mesh_control_stream_path(stream_family, partition)
-                    .is_ok()
-                {
-                    by_stream
-                        .entry((family, partition.to_string()))
-                        .or_default();
-                }
+            for partition in
+                mesh_control_stream::list_control_stream_partitions(&self.storage, stream_family)
+                    .await?
+            {
+                by_stream.entry((family, partition)).or_default();
             }
         }
 
         let mut diagnostics = Vec::new();
         for ((family, partition), projected_records) in by_stream {
             let stream_family = family.stream_family();
-            let path = self
-                .storage
-                .mesh_control_stream_path(stream_family, &partition)?;
             diagnostics.extend(
                 mesh_control_stream::diagnose_control_stream_projection(
-                    path,
+                    &self.storage,
                     stream_family,
                     &partition,
                     &projected_records,
@@ -807,11 +809,8 @@ impl Persistence {
     ) -> Result<mesh_directory::RoutingRecordDescriptor> {
         let partition = mesh_directory::routing_record_partition_for_key(family, record_key)?;
         let stream_family = family.stream_family();
-        let stream_path = self
-            .storage
-            .mesh_control_stream_path(stream_family, &partition)?;
         let record = mesh_control_stream::latest_projected_record_from_control_stream(
-            stream_path,
+            &self.storage,
             stream_family,
             &partition,
             record_key,
@@ -2497,7 +2496,7 @@ impl Persistence {
         content_type: Option<&str>,
         user_meta: Option<JsonValue>,
         shard_map: Option<JsonValue>,
-        inline_payload: Option<Vec<u8>>,
+        payload: Option<Vec<u8>>,
     ) -> Result<Object> {
         let bucket = bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id)
             .await?
@@ -2507,6 +2506,25 @@ impl Persistence {
         }
         let version_id = uuid::Uuid::new_v4();
         let mutation_id = uuid::Uuid::new_v4();
+        let shard_map = match (shard_map, payload) {
+            (Some(shard_map), _) => Some(shard_map),
+            (None, Some(payload)) => {
+                let core_store = CoreStore::new(self.storage.clone()).await?;
+                let object_ref = core_store
+                    .put_blob(PutBlob {
+                        logical_name: format!(
+                            "object-payload/{}/{}/{}",
+                            tenant_id, bucket_id, version_id
+                        ),
+                        bytes: payload,
+                        region_id: self.region.clone(),
+                        mutation_id: mutation_id.to_string(),
+                    })
+                    .await?;
+                Some(core_object_ref_to_shard_map(&object_ref))
+            }
+            (None, None) => None,
+        };
         let index_policy_snapshot = self
             .active_index_policy_snapshot_hash(tenant_id, bucket_id)
             .await?;
@@ -2553,7 +2571,6 @@ impl Persistence {
             storage_class: None,
             user_meta,
             shard_map,
-            inline_payload,
             checksum: None,
             link: None,
         };
@@ -2745,7 +2762,6 @@ impl Persistence {
             storage_class: None,
             user_meta,
             shard_map: None,
-            inline_payload: None,
             checksum: None,
             link: Some(link),
         };
@@ -2940,7 +2956,6 @@ impl Persistence {
             storage_class: None,
             user_meta,
             shard_map: None,
-            inline_payload: None,
             checksum: None,
             link: Some(object_links::ObjectLinkTarget {
                 target_key: current_link.target_key.clone(),
@@ -3240,10 +3255,15 @@ impl Persistence {
         else {
             return Ok(None);
         };
-        let journal_path = self
-            .storage
-            .metadata_journal_path(bucket.tenant_id, bucket.id);
-        if tokio::fs::metadata(&journal_path).await.is_err() {
+        let active_stats = metadata_journal::active_object_journal_stats(
+            &self.storage,
+            &bucket,
+            &self.partition_owner_signing_key,
+        )
+        .await?;
+        if active_stats.last_sequence == 0
+            || active_stats.last_sequence <= active_stats.compacted_through_sequence
+        {
             return Ok(None);
         }
         let permit = self
@@ -3325,7 +3345,7 @@ impl Persistence {
         &self,
         upload_row_id: i64,
         part_number: i32,
-        content_hash: &str,
+        object_ref: CoreObjectRef,
         size: i64,
         etag: &str,
     ) -> Result<MultipartUploadPartMutation> {
@@ -3340,7 +3360,7 @@ impl Persistence {
             &self.storage,
             upload_row_id,
             part_number,
-            content_hash,
+            object_ref,
             size,
             etag,
             &permit,
@@ -3544,8 +3564,10 @@ impl Persistence {
     pub async fn append_stream_record(
         &self,
         stream_row_id: i64,
-        payload_hash: &str,
+        payload_object_ref: CoreObjectRef,
         payload_size: i64,
+        content_type: Option<String>,
+        user_meta: Option<JsonValue>,
     ) -> Result<AppendStreamRecordMutation> {
         let (tenant_id, bucket_id) =
             append_journal::find_append_stream_partition(&self.storage, stream_row_id)
@@ -3557,8 +3579,10 @@ impl Persistence {
         append_journal::append_stream_record_with_permit(
             &self.storage,
             stream_row_id,
-            payload_hash,
+            payload_object_ref,
             payload_size,
+            content_type,
+            user_meta,
             &permit,
             &self.partition_owner_signing_key,
         )
@@ -3570,6 +3594,15 @@ impl Persistence {
         stream_row_id: i64,
     ) -> Result<Vec<AppendStreamRecord>> {
         append_journal::list_append_stream_records(&self.storage, stream_row_id).await
+    }
+
+    pub async fn list_append_stream_records_for_bucket(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+    ) -> Result<Vec<(AppendStream, AppendStreamRecord)>> {
+        append_journal::list_append_stream_records_for_bucket(&self.storage, tenant_id, bucket_id)
+            .await
     }
 
     pub async fn seal_append_stream(
@@ -3953,16 +3986,38 @@ impl Persistence {
         bucket: &Bucket,
         index: &IndexDefinition,
     ) -> Result<bool> {
-        if !index.enabled || !matches!(index.kind.as_str(), "full_text" | "vector" | "hybrid") {
+        if !index.enabled
+            || !matches!(
+                index.kind.as_str(),
+                "path" | "metadata_filter" | "full_text" | "vector" | "hybrid" | "typed_json"
+            )
+        {
             return Ok(false);
         }
-        let stats = metadata_journal::active_object_journal_stats(
-            &self.storage,
-            bucket,
-            &self.partition_owner_signing_key,
-        )
-        .await?;
-        let source_cursor = index_repair::source_cursor_from_stats(stats);
+        let typed_json_source_kind = if index.kind == "typed_json" {
+            index
+                .build_policy
+                .get("source_kind")
+                .or_else(|| index.build_policy.get("source"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or("object_current")
+        } else {
+            "object_current"
+        };
+        let source_cursor = if index.kind == "typed_json"
+            && typed_json_source_kind == "append_record"
+        {
+            append_journal::append_record_source_cursor(&self.storage, bucket.tenant_id, bucket.id)
+                .await?
+        } else {
+            let stats = metadata_journal::active_object_journal_stats(
+                &self.storage,
+                bucket,
+                &self.partition_owner_signing_key,
+            )
+            .await?;
+            index_repair::source_cursor_from_stats(stats)
+        };
         if source_cursor == 0 {
             return Ok(false);
         }
@@ -3975,13 +4030,26 @@ impl Persistence {
             &self.partition_owner_signing_key,
         )
         .await?;
-        let source_manifest_hash = metadata_journal::object_metadata_source_checkpoint_hash(
-            &self.storage,
-            bucket,
-            &self.partition_owner_signing_key,
-            source_cursor,
-        )
-        .await?;
+        let source_manifest_hash =
+            if index.kind == "typed_json" && typed_json_source_kind == "append_record" {
+                blake3::hash(
+                    format!(
+                        "append_record:{}:{}:{}",
+                        bucket.tenant_id, bucket.id, source_cursor
+                    )
+                    .as_bytes(),
+                )
+                .to_hex()
+                .to_string()
+            } else {
+                metadata_journal::object_metadata_source_checkpoint_hash(
+                    &self.storage,
+                    bucket,
+                    &self.partition_owner_signing_key,
+                    source_cursor,
+                )
+                .await?
+            };
         let latest_proof = crate::derived_index_proof::read_latest_derived_index_proof(
             &self.storage,
             &index_storage_id,
@@ -3999,9 +4067,9 @@ impl Persistence {
                     .as_ref()
                     .map(|checkpoint| checkpoint.cursor)
                     .unwrap_or(0),
-                retained_start_cursor: u128::from(stats.compacted_through_sequence),
+                retained_start_cursor: 0,
                 latest_cursor: source_cursor,
-                manifest_checkpoint_cursor: u128::from(stats.compacted_through_sequence),
+                manifest_checkpoint_cursor: 0,
                 source_manifest_hash: source_manifest_hash.clone(),
                 required_source_cursor: source_cursor,
                 min_generation: index.version.max(1) as u64,
@@ -4081,6 +4149,17 @@ impl Persistence {
         self.ensure_index_build_ownership_fence(tenant_id, bucket_id, &index_storage_id)
             .await?;
         let outcome = match index.kind.as_str() {
+            "path" | "metadata_filter" => {
+                index_builder::build_metadata_backed_index(
+                    &self.storage,
+                    &bucket,
+                    &index,
+                    &self.partition_owner_signing_key,
+                    source_cursor,
+                    &self.owner_node_id,
+                )
+                .await?
+            }
             "full_text" => {
                 index_builder::build_full_text_index(
                     &self.storage,
@@ -4100,11 +4179,24 @@ impl Persistence {
                     &self.partition_owner_signing_key,
                     source_cursor,
                     &self.owner_node_id,
+                    &self.embedding_providers,
                 )
                 .await?
             }
             "hybrid" => {
                 index_builder::build_hybrid_index(
+                    &self.storage,
+                    &bucket,
+                    &index,
+                    &self.partition_owner_signing_key,
+                    source_cursor,
+                    &self.owner_node_id,
+                    &self.embedding_providers,
+                )
+                .await?
+            }
+            "typed_json" => {
+                index_builder::build_typed_json_index(
                     &self.storage,
                     &bucket,
                     &index,
@@ -4151,7 +4243,10 @@ impl Persistence {
             .await?
             .filter(|index| index.enabled)
             .ok_or_else(|| anyhow!("index definition not found"))?;
-        if !matches!(index.kind.as_str(), "full_text" | "vector" | "hybrid") {
+        if !matches!(
+            index.kind.as_str(),
+            "path" | "metadata_filter" | "full_text" | "vector" | "hybrid" | "typed_json"
+        ) {
             return Err(anyhow!(
                 "index kind does not have a repairable derived index"
             ));
@@ -4424,15 +4519,35 @@ impl Persistence {
     }
 
     async fn enqueue_index_build_task(&self, payload: JsonValue, priority: i32) -> Result<bool> {
-        let permit = self.task_queue_write_permit().await?;
-        task_journal::enqueue_index_build_task_with_permit(
-            &self.storage,
-            payload,
-            priority,
-            &permit,
-            &self.partition_owner_signing_key,
-        )
-        .await
+        let mut last_error = None;
+        for _ in 0..5 {
+            let permit = match self.task_queue_write_permit().await {
+                Ok(permit) => permit,
+                Err(error) if is_retryable_partition_fence_error(&error) => {
+                    last_error = Some(error);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match task_journal::enqueue_index_build_task_with_permit(
+                &self.storage,
+                payload.clone(),
+                priority,
+                &permit,
+                &self.partition_owner_signing_key,
+            )
+            .await
+            {
+                Ok(result) => return Ok(result),
+                Err(error) if is_retryable_partition_fence_error(&error) => {
+                    last_error = Some(error);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("index build task enqueue retry exhausted")))
     }
 
     pub async fn acquire_task_execution_lease(
@@ -4619,14 +4734,34 @@ impl Persistence {
     }
 
     pub async fn claim_pending_tasks(&self, limit: i64) -> Result<Vec<TaskRecord>> {
-        let permit = self.task_queue_write_permit().await?;
-        task_journal::claim_pending_tasks_with_permit(
-            &self.storage,
-            limit,
-            &permit,
-            &self.partition_owner_signing_key,
-        )
-        .await
+        let mut last_error = None;
+        for _ in 0..5 {
+            let permit = match self.task_queue_write_permit().await {
+                Ok(permit) => permit,
+                Err(error) if is_retryable_partition_fence_error(&error) => {
+                    last_error = Some(error);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match task_journal::claim_pending_tasks_with_permit(
+                &self.storage,
+                limit,
+                &permit,
+                &self.partition_owner_signing_key,
+            )
+            .await
+            {
+                Ok(tasks) => return Ok(tasks),
+                Err(error) if is_retryable_partition_fence_error(&error) => {
+                    last_error = Some(error);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("task claim retry exhausted")))
     }
 
     pub async fn list_tasks(&self) -> Result<Vec<TaskRecord>> {
@@ -4638,27 +4773,67 @@ impl Persistence {
         task_id: i64,
         status: crate::tasks::TaskStatus,
     ) -> Result<()> {
-        let permit = self.task_queue_write_permit().await?;
-        task_journal::update_task_status_with_permit(
-            &self.storage,
-            task_id,
-            status,
-            &permit,
-            &self.partition_owner_signing_key,
-        )
-        .await
+        let mut last_error = None;
+        for _ in 0..5 {
+            let permit = match self.task_queue_write_permit().await {
+                Ok(permit) => permit,
+                Err(error) if is_retryable_partition_fence_error(&error) => {
+                    last_error = Some(error);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match task_journal::update_task_status_with_permit(
+                &self.storage,
+                task_id,
+                status,
+                &permit,
+                &self.partition_owner_signing_key,
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) if is_retryable_partition_fence_error(&error) => {
+                    last_error = Some(error);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("task status update retry exhausted")))
     }
 
     pub async fn fail_task(&self, task_id: i64, error: &str) -> Result<()> {
-        let permit = self.task_queue_write_permit().await?;
-        task_journal::fail_task_with_permit(
-            &self.storage,
-            task_id,
-            error,
-            &permit,
-            &self.partition_owner_signing_key,
-        )
-        .await
+        let mut last_error = None;
+        for _ in 0..5 {
+            let permit = match self.task_queue_write_permit().await {
+                Ok(permit) => permit,
+                Err(error) if is_retryable_partition_fence_error(&error) => {
+                    last_error = Some(error);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match task_journal::fail_task_with_permit(
+                &self.storage,
+                task_id,
+                error,
+                &permit,
+                &self.partition_owner_signing_key,
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) if is_retryable_partition_fence_error(&error) => {
+                    last_error = Some(error);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("task failure update retry exhausted")))
     }
 
     pub async fn hf_create_key(
@@ -4972,6 +5147,9 @@ fn mesh_directory_lifecycle_error(
         mesh_directory::MeshDirectoryError::Json(err) => {
             crate::mesh_lifecycle::LifecycleError::Json(err)
         }
+        mesh_directory::MeshDirectoryError::Other(err) => {
+            crate::mesh_lifecycle::LifecycleError::Other(err)
+        }
     }
 }
 
@@ -5011,7 +5189,6 @@ fn task_payload_u128(task: &TaskRecord, field: &'static str) -> Result<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::formats::{BinaryEnvelopeHeader, COMMON_HEADER_LEN, JournalFrame};
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -5041,25 +5218,6 @@ mod tests {
             merkle_root: "abc".to_string(),
             meta: std::collections::HashMap::new(),
         }
-    }
-
-    async fn assert_journal_is_fenced(path: impl AsRef<std::path::Path>) {
-        let bytes = tokio::fs::read(path).await.unwrap();
-        let header = BinaryEnvelopeHeader::decode(&bytes).unwrap();
-        let header_json: serde_json::Value = serde_json::from_slice(&header.header_json).unwrap();
-        let header_fence = header_json["fence_token"].as_u64().unwrap();
-        assert!(header_fence > 0);
-
-        let mut input = &bytes[COMMON_HEADER_LEN + header.header_json.len()..];
-        let mut frames = Vec::new();
-        while !input.is_empty() {
-            let frame_len = u32::from_le_bytes(input[0..4].try_into().unwrap()) as usize;
-            let frame_end = 4 + frame_len;
-            frames.push(JournalFrame::decode(&input[..frame_end]).unwrap());
-            input = &input[frame_end..];
-        }
-        assert!(!frames.is_empty());
-        assert!(frames.iter().all(|frame| frame.fence_token == header_fence));
     }
 
     #[tokio::test]
@@ -5605,13 +5763,16 @@ mod tests {
             .unwrap()
             .expect("bucket locator");
         assert_eq!(bucket_locator.bucket_id.as_str(), bucket.id.to_string());
-        let path = mesh_descriptor_path(&persistence.storage, &bucket_locator.descriptor_key());
-        let mut projected: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        let mut projected: serde_json::Value = serde_json::to_value(&bucket_locator).unwrap();
         projected["home_region"] = json!("us-east-1");
-        tokio::fs::write(&path, serde_json::to_vec_pretty(&projected).unwrap())
-            .await
-            .unwrap();
+        mesh_directory::rebuild_routing_record_projection_from_payload(
+            &persistence.storage,
+            mesh_directory::RoutingRecordFamily::BucketLocator,
+            &format!("{}/docs", tenant.id),
+            &serde_json::to_vec_pretty(&projected).unwrap(),
+        )
+        .await
+        .unwrap();
 
         let diagnostics = persistence
             .diagnose_mesh_routing_projection(Some(
@@ -5718,18 +5879,6 @@ mod tests {
         (region, cell, node)
     }
 
-    fn mesh_descriptor_path(storage: &Storage, descriptor_key: &str) -> std::path::PathBuf {
-        let relative = descriptor_key
-            .strip_prefix(mesh_directory::MESH_DIRECTORY_ROOT)
-            .and_then(|value| value.strip_prefix('/'))
-            .expect("mesh descriptor key prefix");
-        relative
-            .split('/')
-            .fold(storage.mesh_directory_root_path(), |path, segment| {
-                path.join(segment)
-            })
-    }
-
     #[tokio::test]
     async fn persistence_replays_anvil_owned_state_after_fresh_instance() {
         let temp = tempdir().unwrap();
@@ -5765,7 +5914,7 @@ mod tests {
                 Some("text/plain"),
                 Some(json!({"label": "alpha"})),
                 None,
-                Some(b"hello world".to_vec()),
+                None,
             )
             .await
             .unwrap();
@@ -5780,7 +5929,7 @@ mod tests {
                 Some("text/plain"),
                 None,
                 None,
-                Some(b"hello again".to_vec()),
+                None,
             )
             .await
             .unwrap();
@@ -5791,7 +5940,13 @@ mod tests {
             .unwrap()
             .upload;
         persistence
-            .upsert_multipart_part(upload.id, 1, "part-hash-a", 4, "part-etag-a")
+            .upsert_multipart_part(
+                upload.id,
+                1,
+                payload_ref("part-hash-a", 4),
+                4,
+                "part-etag-a",
+            )
             .await
             .unwrap();
 
@@ -5801,7 +5956,13 @@ mod tests {
             .unwrap()
             .stream;
         persistence
-            .append_stream_record(append_stream.id, "event-payload-hash", 42)
+            .append_stream_record(
+                append_stream.id,
+                payload_ref("event-payload-hash", 42),
+                42,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -5934,10 +6095,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(replayed_object.version_id, object.version_id);
-        assert_eq!(
-            replayed_object.inline_payload.as_deref(),
-            Some(&b"hello world"[..])
-        );
+        assert_eq!(replayed_object.content_hash, object.content_hash);
         assert_eq!(replayed_object.user_meta.unwrap()["label"], "alpha");
 
         let (objects, common_prefixes) = replayed
@@ -6082,7 +6240,7 @@ mod tests {
                 Some("text/plain"),
                 Some(json!({"label": "a"})),
                 None,
-                Some(b"alpha".to_vec()),
+                None,
             )
             .await
             .unwrap();
@@ -6097,7 +6255,7 @@ mod tests {
                 Some("text/plain"),
                 None,
                 None,
-                Some(b"bravo".to_vec()),
+                None,
             )
             .await
             .unwrap();
@@ -6119,7 +6277,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(replayed.version_id, first.version_id);
-        assert_eq!(replayed.inline_payload.as_deref(), Some(&b"alpha"[..]));
+        assert_eq!(replayed.content_hash, first.content_hash);
         assert_eq!(replayed.user_meta.unwrap()["label"], "a");
 
         let (objects, common_prefixes) = restarted
@@ -6155,7 +6313,7 @@ mod tests {
                 Some("text/plain"),
                 None,
                 None,
-                Some(b"charlie".to_vec()),
+                None,
             )
             .await
             .unwrap();
@@ -6236,7 +6394,7 @@ mod tests {
                 Some("text/plain"),
                 None,
                 None,
-                Some(b"x".to_vec()),
+                None,
             )
             .await
             .unwrap_err();
@@ -6272,7 +6430,7 @@ mod tests {
                 Some("text/plain"),
                 None,
                 None,
-                Some(b"alpha".to_vec()),
+                None,
             )
             .await
             .unwrap();
@@ -6296,7 +6454,7 @@ mod tests {
                 Some("text/plain"),
                 None,
                 None,
-                Some(b"bravo".to_vec()),
+                None,
             )
             .await
             .unwrap();
@@ -6327,7 +6485,7 @@ mod tests {
                 Some("text/plain"),
                 None,
                 None,
-                Some(b"charlie".to_vec()),
+                None,
             )
             .await
             .unwrap();
@@ -6360,7 +6518,7 @@ mod tests {
                 Some("text/plain"),
                 None,
                 None,
-                Some(b"alpha".to_vec()),
+                None,
             )
             .await
             .unwrap();
@@ -6454,7 +6612,7 @@ mod tests {
             .unwrap()
             .upload;
         persistence
-            .upsert_multipart_part(upload.id, 1, "part-hash", 12, "part-etag")
+            .upsert_multipart_part(upload.id, 1, payload_ref("part-hash", 12), 12, "part-etag")
             .await
             .unwrap();
         persistence
@@ -6467,7 +6625,7 @@ mod tests {
             .unwrap()
             .stream;
         persistence
-            .append_stream_record(stream.id, "payload-hash", 13)
+            .append_stream_record(stream.id, payload_ref("payload-hash", 13), 13, None, None)
             .await
             .unwrap();
         persistence
@@ -6551,28 +6709,93 @@ mod tests {
             .await
             .unwrap();
 
-        assert_journal_is_fenced(persistence.storage.control_journal_path()).await;
-        assert_journal_is_fenced(persistence.storage.task_queue_journal_path()).await;
-        assert_journal_is_fenced(persistence.storage.model_metadata_journal_path()).await;
-        assert_journal_is_fenced(persistence.storage.hf_journal_path()).await;
-        assert_journal_is_fenced(persistence.storage.bucket_metadata_journal_path(1)).await;
-        assert_journal_is_fenced(persistence.storage.global_bucket_metadata_journal_path()).await;
-        assert_journal_is_fenced(persistence.storage.metadata_journal_path(1, bucket.id)).await;
-        assert_journal_is_fenced(persistence.storage.multipart_journal_path(1, bucket.id)).await;
-        assert_journal_is_fenced(persistence.storage.append_journal_path(1, bucket.id)).await;
-        assert_journal_is_fenced(persistence.storage.manifest_cas_journal_path(1, bucket.id)).await;
-        assert_journal_is_fenced(
-            persistence
-                .storage
-                .index_definition_journal_path(1, bucket.id),
+        let control_fences =
+            crate::control_journal::read_control_frame_fences_for_test(&persistence.storage)
+                .await
+                .unwrap();
+        assert!(control_fences.iter().all(|fence| *fence > 0));
+        let task_fences =
+            crate::task_journal::read_task_frame_fences_for_test(&persistence.storage)
+                .await
+                .unwrap();
+        assert!(task_fences.iter().all(|fence| *fence > 0));
+        let model_fences =
+            crate::model_journal::read_model_frame_fences_for_test(&persistence.storage)
+                .await
+                .unwrap();
+        assert!(model_fences.iter().all(|fence| *fence > 0));
+        let hf_fences = crate::hf_journal::read_hf_frame_fences_for_test(&persistence.storage)
+            .await
+            .expect("hf metadata journal fences");
+        assert!(hf_fences.iter().all(|fence| *fence > 0));
+        let (tenant_bucket_fences, global_bucket_fences) =
+            crate::bucket_journal::read_bucket_frame_fences_for_test(&persistence.storage, 1)
+                .await
+                .unwrap();
+        assert!(tenant_bucket_fences.iter().all(|fence| *fence > 0));
+        assert!(global_bucket_fences.iter().all(|fence| *fence > 0));
+        let object_fences = crate::metadata_journal::read_object_metadata_frame_fences_for_test(
+            &persistence.storage,
+            &bucket,
         )
-        .await;
-        assert_journal_is_fenced(
-            persistence
-                .storage
-                .index_diagnostic_journal_path(1, bucket.id),
+        .await
+        .expect("object metadata journal fences");
+        assert!(object_fences.iter().all(|fence| *fence > 0));
+        let multipart_fences = crate::multipart_journal::read_multipart_frame_fences_for_test(
+            &persistence.storage,
+            1,
+            bucket.id,
         )
-        .await;
-        assert_journal_is_fenced(persistence.storage.authz_tuple_journal_path(1)).await;
+        .await
+        .expect("multipart journal fences");
+        assert!(multipart_fences.iter().all(|fence| *fence > 0));
+        let append_fences = crate::append_journal::read_append_frame_fences_for_test(
+            &persistence.storage,
+            1,
+            bucket.id,
+        )
+        .await
+        .unwrap();
+        assert!(append_fences.iter().all(|fence| *fence > 0));
+        let manifest_fences = crate::manifest_journal::read_manifest_frame_fences_for_test(
+            &persistence.storage,
+            1,
+            bucket.id,
+        )
+        .await
+        .unwrap();
+        assert!(manifest_fences.iter().all(|fence| *fence > 0));
+        let index_fences = crate::index_journal::read_index_frame_fences_for_test(
+            &persistence.storage,
+            1,
+            bucket.id,
+        )
+        .await
+        .unwrap();
+        assert!(index_fences.iter().all(|fence| *fence > 0));
+        let diagnostic_fences =
+            crate::index_diagnostic_journal::read_index_diagnostic_frame_fences_for_test(
+                &persistence.storage,
+                1,
+                bucket.id,
+            )
+            .await
+            .unwrap();
+        assert!(diagnostic_fences.iter().all(|fence| *fence > 0));
+        let authz_fences =
+            crate::authz_journal::read_authz_frame_fences_for_test(&persistence.storage, 1)
+                .await
+                .expect("authz tuple journal fences");
+        assert!(authz_fences.iter().all(|fence| *fence > 0));
+    }
+    fn payload_ref(label: &str, logical_size: u64) -> crate::core_store::CoreObjectRef {
+        crate::core_store::CoreObjectRef {
+            hash: format!(
+                "sha256:{}",
+                hex::encode(blake3::hash(label.as_bytes()).as_bytes())
+            ),
+            logical_size,
+            manifest_ref: format!("manifest:{label}"),
+        }
     }
 }

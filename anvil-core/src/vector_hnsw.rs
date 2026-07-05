@@ -548,24 +548,35 @@ mod tests {
     fn segment_with_entries(entries: Vec<VectorSegmentEntry>) -> DecodedVectorSegment {
         DecodedVectorSegment {
             header: VectorSegmentHeader {
+                schema: "anvil.index.vector_segment_header.v1".to_string(),
                 index_id: "vectors".to_string(),
+                definition_hash: "blake3:test-definition".to_string(),
                 generation: 1,
                 dimension: 2,
                 metric: "cosine".to_string(),
+                algorithm: "hnsw".to_string(),
+                embedding_provider: "test_only".to_string(),
+                embedding_model_version: None,
+                embedding_normalisation: "unit_l2".to_string(),
+                embedding_chunking_hash: "blake3:test-chunking".to_string(),
+                extractor_definition_hash: "blake3:test-extractor".to_string(),
+                embedding_provenance_hash: "blake3:test-provenance".to_string(),
                 embedding_model: "test-model".to_string(),
                 modality: "text".to_string(),
+                vector_count: entries.len() as u64,
                 hnsw_m: 16,
                 hnsw_ef_construction: 80,
+                ann_format_hash: "blake3:test-ann-format".to_string(),
                 source_cursor: 0,
                 authz_revision: 0,
-                codec: "none".to_string(),
+                codec: "f32_le_v1".to_string(),
                 created_at: "2026-06-28T00:00:00.000000000Z".to_string(),
             },
             body_header: crate::formats::vector::VectorBodyHeader {
                 vector_count: entries.len() as u64,
-                vector_table_offset: 0,
-                vector_payload_offset: 0,
-                hnsw_graph_offset: 0,
+                record_table_offset: 0,
+                vector_blocks_offset: 0,
+                ann_blocks_offset: 0,
                 deleted_bitset_offset: 0,
             },
             entries,
@@ -579,6 +590,9 @@ mod tests {
 
     fn entry(vector_id: u64, values: [f32; 2], authz_label_hash: Hash32) -> VectorSegmentEntry {
         VectorSegmentEntry {
+            source_id_binary: vec![vector_id as u8],
+            source_generation: vector_id,
+            labels: Vec::new(),
             record: VectorRecord {
                 vector_id,
                 object_version_id: [vector_id as u8; 16],

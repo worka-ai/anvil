@@ -1,20 +1,19 @@
-use crate::formats::{
-    BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, Hash32, JournalFrame, JournalRecordKind,
-    hash32, validate_journal_chain,
+use crate::core_store::{
+    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreObjectRef, CoreStore,
+    ReadStream,
 };
-use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
+use crate::formats::{Hash32, JournalFrame, JournalRecordKind, hash32, validate_journal_chain};
+use crate::partition_fence::{PartitionWritePermit, partition_write_ref_precondition};
 use crate::persistence::{
     MetadataMutationReceipt, MultipartAbortMutation, MultipartCompletionMutation,
     MultipartPartsPage, MultipartUpload, MultipartUploadMutation, MultipartUploadPart,
     MultipartUploadPartMutation, MultipartUploadsPage,
 };
 use crate::storage::Storage;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::Path;
-use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MultipartMutationKind {
@@ -33,18 +32,6 @@ impl MultipartMutationKind {
             Self::AbortUpload => "abort_upload",
         }
     }
-}
-
-#[derive(Debug, Serialize)]
-struct MultipartJournalHeader<'a> {
-    tenant_id: String,
-    bucket_id: String,
-    partition_family: &'static str,
-    partition_id: String,
-    fence_token: u64,
-    first_sequence: u64,
-    created_at: &'a str,
-    codec: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,7 +55,7 @@ async fn create_multipart_upload(
     bucket_id: i64,
     key: &str,
 ) -> Result<MultipartUploadMutation> {
-    create_multipart_upload_inner(storage, tenant_id, bucket_id, key, 0).await
+    create_multipart_upload_inner(storage, tenant_id, bucket_id, key, 0, None).await
 }
 
 pub(crate) async fn create_multipart_upload_with_permit(
@@ -80,8 +67,17 @@ pub(crate) async fn create_multipart_upload_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<MultipartUploadMutation> {
     require_multipart_metadata_permit(tenant_id, bucket_id, permit)?;
-    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
-    create_multipart_upload_inner(storage, tenant_id, bucket_id, key, permit.fence_token).await
+    let partition_precondition =
+        partition_write_ref_precondition(storage, permit, partition_owner_signing_key).await?;
+    create_multipart_upload_inner(
+        storage,
+        tenant_id,
+        bucket_id,
+        key,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
 }
 
 async fn create_multipart_upload_inner(
@@ -90,6 +86,7 @@ async fn create_multipart_upload_inner(
     bucket_id: i64,
     key: &str,
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<MultipartUploadMutation> {
     let state = read_state(storage, tenant_id, bucket_id).await?;
     let id = next_upload_id(&state)?;
@@ -111,6 +108,7 @@ async fn create_multipart_upload_inner(
         Some(upload.clone()),
         None,
         fence_token,
+        partition_precondition,
     )
     .await?;
     Ok(MultipartUploadMutation { upload, receipt })
@@ -136,8 +134,12 @@ pub async fn get_active_multipart_upload(
 }
 
 pub async fn has_active_multipart_upload(storage: &Storage, bucket_id: i64) -> Result<bool> {
-    for path in storage.multipart_journal_paths().await? {
-        let state = read_state_from_path(&path).await?;
+    let core_store = CoreStore::new(storage.clone()).await?;
+    for stream_id in core_store
+        .list_stream_ids("multipart_metadata:tenant:")
+        .await?
+    {
+        let state = read_state_from_store(&core_store, &stream_id).await?;
         if state
             .uploads
             .into_values()
@@ -154,7 +156,7 @@ async fn upsert_multipart_part(
     storage: &Storage,
     upload_row_id: i64,
     part_number: i32,
-    content_hash: &str,
+    object_ref: CoreObjectRef,
     size: i64,
     etag: &str,
 ) -> Result<MultipartUploadPartMutation> {
@@ -162,7 +164,7 @@ async fn upsert_multipart_part(
         storage,
         upload_row_id,
         part_number,
-        content_hash,
+        object_ref,
         size,
         etag,
         None,
@@ -174,21 +176,20 @@ pub(crate) async fn upsert_multipart_part_with_permit(
     storage: &Storage,
     upload_row_id: i64,
     part_number: i32,
-    content_hash: &str,
+    object_ref: CoreObjectRef,
     size: i64,
     etag: &str,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<MultipartUploadPartMutation> {
-    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
     upsert_multipart_part_inner(
         storage,
         upload_row_id,
         part_number,
-        content_hash,
+        object_ref,
         size,
         etag,
-        Some(permit),
+        Some((permit, partition_owner_signing_key)),
     )
     .await
 }
@@ -197,18 +198,23 @@ async fn upsert_multipart_part_inner(
     storage: &Storage,
     upload_row_id: i64,
     part_number: i32,
-    content_hash: &str,
+    object_ref: CoreObjectRef,
     size: i64,
     etag: &str,
-    permit: Option<&PartitionWritePermit>,
+    permit: Option<(&PartitionWritePermit, &[u8])>,
 ) -> Result<MultipartUploadPartMutation> {
     let (tenant_id, bucket_id, _) = find_upload(storage, upload_row_id)
         .await?
         .ok_or_else(|| anyhow!("multipart upload not found"))?;
-    if let Some(permit) = permit {
+    let (fence_token, partition_precondition) = if let Some((permit, signing_key)) = permit {
         require_multipart_metadata_permit(tenant_id, bucket_id, permit)?;
-    }
-    let fence_token = permit.map(|permit| permit.fence_token).unwrap_or(0);
+        (
+            permit.fence_token,
+            Some(partition_write_ref_precondition(storage, permit, signing_key).await?),
+        )
+    } else {
+        (0, None)
+    };
     let state = read_state(storage, tenant_id, bucket_id).await?;
     let part = MultipartUploadPart {
         id: state
@@ -218,7 +224,8 @@ async fn upsert_multipart_part_inner(
             .unwrap_or(next_part_id(&state)?),
         upload_id: upload_row_id,
         part_number,
-        content_hash: content_hash.to_string(),
+        content_hash: object_ref.hash.clone(),
+        object_ref,
         size,
         etag: etag.to_string(),
         created_at: Utc::now(),
@@ -231,6 +238,7 @@ async fn upsert_multipart_part_inner(
         None,
         Some(part.clone()),
         fence_token,
+        partition_precondition,
     )
     .await?;
     Ok(MultipartUploadPartMutation { part, receipt })
@@ -294,8 +302,12 @@ pub async fn list_active_multipart_uploads(
     limit: i32,
 ) -> Result<MultipartUploadsPage> {
     let mut uploads = Vec::new();
-    for path in storage.multipart_journal_paths().await? {
-        let state = read_state_from_path(&path).await?;
+    let core_store = CoreStore::new(storage.clone()).await?;
+    for stream_id in core_store
+        .list_stream_ids("multipart_metadata:tenant:")
+        .await?
+    {
+        let state = read_state_from_store(&core_store, &stream_id).await?;
         uploads.extend(state.uploads.into_values().filter(|upload| {
             upload.bucket_id == bucket_id
                 && upload.key.starts_with(prefix)
@@ -368,14 +380,18 @@ pub(crate) async fn complete_multipart_upload_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<MultipartCompletionMutation> {
-    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
-    complete_multipart_upload_inner(storage, upload_row_id, Some(permit)).await
+    complete_multipart_upload_inner(
+        storage,
+        upload_row_id,
+        Some((permit, partition_owner_signing_key)),
+    )
+    .await
 }
 
 async fn complete_multipart_upload_inner(
     storage: &Storage,
     upload_row_id: i64,
-    permit: Option<&PartitionWritePermit>,
+    permit: Option<(&PartitionWritePermit, &[u8])>,
 ) -> Result<MultipartCompletionMutation> {
     let Some((tenant_id, bucket_id, mut upload)) = find_upload(storage, upload_row_id).await?
     else {
@@ -384,10 +400,15 @@ async fn complete_multipart_upload_inner(
             receipt: None,
         });
     };
-    if let Some(permit) = permit {
+    let (fence_token, partition_precondition) = if let Some((permit, signing_key)) = permit {
         require_multipart_metadata_permit(tenant_id, bucket_id, permit)?;
-    }
-    let fence_token = permit.map(|permit| permit.fence_token).unwrap_or(0);
+        (
+            permit.fence_token,
+            Some(partition_write_ref_precondition(storage, permit, signing_key).await?),
+        )
+    } else {
+        (0, None)
+    };
     upload.completed_at = Some(Utc::now());
     let receipt = append_body(
         storage,
@@ -397,6 +418,7 @@ async fn complete_multipart_upload_inner(
         Some(upload),
         None,
         fence_token,
+        partition_precondition,
     )
     .await?;
     Ok(MultipartCompletionMutation {
@@ -415,7 +437,8 @@ pub(crate) async fn abort_multipart_upload_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<MultipartAbortMutation> {
     require_multipart_metadata_permit(tenant_id, bucket_id, permit)?;
-    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
+    let partition_precondition =
+        partition_write_ref_precondition(storage, permit, partition_owner_signing_key).await?;
     abort_multipart_upload_inner(
         storage,
         tenant_id,
@@ -423,6 +446,7 @@ pub(crate) async fn abort_multipart_upload_with_permit(
         key,
         upload_id,
         permit.fence_token,
+        Some(partition_precondition),
     )
     .await
 }
@@ -434,6 +458,7 @@ async fn abort_multipart_upload_inner(
     key: &str,
     upload_id: uuid::Uuid,
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<MultipartAbortMutation> {
     let Some(mut upload) =
         get_active_multipart_upload(storage, tenant_id, bucket_id, key, upload_id).await?
@@ -452,6 +477,7 @@ async fn abort_multipart_upload_inner(
         Some(upload),
         None,
         fence_token,
+        partition_precondition,
     )
     .await?;
     Ok(MultipartAbortMutation {
@@ -473,8 +499,12 @@ async fn find_upload(
     storage: &Storage,
     upload_row_id: i64,
 ) -> Result<Option<(i64, i64, MultipartUpload)>> {
-    for path in storage.multipart_journal_paths().await? {
-        let state = read_state_from_path(&path).await?;
+    let core_store = CoreStore::new(storage.clone()).await?;
+    for stream_id in core_store
+        .list_stream_ids("multipart_metadata:tenant:")
+        .await?
+    {
+        let state = read_state_from_store(&core_store, &stream_id).await?;
         if let Some(upload) = state.uploads.get(&upload_row_id).cloned() {
             return Ok(Some((upload.tenant_id, upload.bucket_id, upload)));
         }
@@ -483,11 +513,16 @@ async fn find_upload(
 }
 
 async fn read_state(storage: &Storage, tenant_id: i64, bucket_id: i64) -> Result<MultipartState> {
-    read_state_from_path(&storage.multipart_journal_path(tenant_id, bucket_id)).await
+    let core_store = CoreStore::new(storage.clone()).await?;
+    read_state_from_store(
+        &core_store,
+        &multipart_metadata_stream_id(tenant_id, bucket_id),
+    )
+    .await
 }
 
-async fn read_state_from_path(path: &Path) -> Result<MultipartState> {
-    let frames = read_frames(path).await?;
+async fn read_state_from_store(core_store: &CoreStore, stream_id: &str) -> Result<MultipartState> {
+    let frames = read_frames_from_store(core_store, stream_id).await?;
     let mut state = MultipartState::default();
     for frame in frames {
         if frame.record_kind != JournalRecordKind::MultipartMetadata {
@@ -519,13 +554,13 @@ async fn append_body(
     upload: Option<MultipartUpload>,
     part: Option<MultipartUploadPart>,
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<MetadataMutationReceipt> {
-    let path = storage.multipart_journal_path(tenant_id, bucket_id);
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    ensure_header(&path, tenant_id, bucket_id, fence_token).await?;
-    let previous = read_frames(&path).await.unwrap_or_default();
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let stream_id = multipart_metadata_stream_id(tenant_id, bucket_id);
+    let previous = read_frames_from_store(&core_store, &stream_id)
+        .await
+        .unwrap_or_default();
     let sequence = previous
         .last()
         .map(|frame| frame.partition_sequence + 1)
@@ -569,77 +604,42 @@ async fn append_body(
         record_hash: hex::encode(frame.record_hash),
         watch_cursor: frame.partition_sequence,
     };
-    let mut file = tokio::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
+    let partition_id = hex::encode(multipart_metadata_partition_id(tenant_id, bucket_id));
+    core_store
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id: format!("multipart-metadata:{mutation_id}"),
+            scope_partition: partition_id.clone(),
+            committed_by_principal: multipart_metadata_partition_principal(tenant_id, bucket_id),
+            preconditions: partition_precondition.into_iter().collect(),
+            operations: vec![CoreMutationOperation::StreamAppend {
+                partition_id,
+                stream_id,
+                record_kind: "multipart_metadata".to_string(),
+                payload: frame.encode(),
+                idempotency_key: Some(format!("multipart-metadata:{mutation_id}")),
+            }],
+        })
         .await?;
-    file.write_all(&frame.encode()).await?;
-    file.sync_data().await?;
     Ok(receipt)
 }
 
-async fn ensure_header(
-    path: &Path,
-    tenant_id: i64,
-    bucket_id: i64,
-    fence_token: u64,
-) -> Result<()> {
-    if tokio::fs::try_exists(path).await? {
-        return Ok(());
-    }
-    let created_at = Utc::now().to_rfc3339();
-    let header_json = serde_json::to_vec(&MultipartJournalHeader {
-        tenant_id: tenant_id.to_string(),
-        bucket_id: bucket_id.to_string(),
-        partition_family: "multipart_metadata",
-        partition_id: hex::encode(multipart_metadata_partition_id(tenant_id, bucket_id)),
-        fence_token,
-        first_sequence: 1,
-        created_at: &created_at,
-        codec: "none",
-    })?;
-    let header = BinaryEnvelopeHeader::new(FileFamily::MetadataJournal, 0, 0, header_json);
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .await
-        .with_context(|| format!("create multipart journal {}", path.display()))?;
-    file.write_all(&header.encode()).await?;
-    file.sync_data().await?;
-    Ok(())
-}
-
-async fn read_frames(path: &Path) -> Result<Vec<JournalFrame>> {
-    if tokio::fs::metadata(path).await.is_err() {
-        return Ok(Vec::new());
-    }
-    let bytes = tokio::fs::read(path)
-        .await
-        .with_context(|| format!("read multipart journal {}", path.display()))?;
-    decode_journal_file(&bytes)
-}
-
-fn decode_journal_file(bytes: &[u8]) -> Result<Vec<JournalFrame>> {
-    let header = BinaryEnvelopeHeader::decode(bytes)?;
-    if header.family != FileFamily::MetadataJournal {
-        anyhow::bail!("multipart journal has wrong file family");
-    }
-    let mut input = &bytes[COMMON_HEADER_LEN + header.header_json.len()..];
+async fn read_frames_from_store(
+    core_store: &CoreStore,
+    stream_id: &str,
+) -> Result<Vec<JournalFrame>> {
+    let records = core_store
+        .read_stream(ReadStream {
+            stream_id: stream_id.to_string(),
+            after_sequence: 0,
+            limit: 0,
+        })
+        .await?;
     let mut frames = Vec::new();
-    while !input.is_empty() {
-        if input.len() < 4 {
-            anyhow::bail!("truncated multipart journal frame length");
+    for record in records {
+        if record.record_kind != "multipart_metadata" {
+            continue;
         }
-        let frame_len = u32::from_le_bytes(input[0..4].try_into().unwrap()) as usize;
-        let frame_end = 4usize
-            .checked_add(frame_len)
-            .ok_or_else(|| anyhow!("invalid multipart journal frame length"))?;
-        if input.len() < frame_end {
-            anyhow::bail!("truncated multipart journal frame");
-        }
-        frames.push(JournalFrame::decode(&input[..frame_end])?);
-        input = &input[frame_end..];
+        frames.push(JournalFrame::decode(&record.payload)?);
     }
     validate_journal_chain(&frames)?;
     Ok(frames)
@@ -669,6 +669,29 @@ fn next_part_id(state: &MultipartState) -> Result<i64> {
 
 pub fn multipart_metadata_partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/bucket/{bucket_id}/multipart").as_bytes())
+}
+
+fn multipart_metadata_stream_id(tenant_id: i64, bucket_id: i64) -> String {
+    format!("multipart_metadata:tenant:{tenant_id}:bucket:{bucket_id}")
+}
+
+fn multipart_metadata_partition_principal(tenant_id: i64, bucket_id: i64) -> String {
+    format!("partition-owner:multipart_metadata:{tenant_id}:{bucket_id}")
+}
+
+#[cfg(test)]
+pub(crate) async fn read_multipart_frame_fences_for_test(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+) -> Result<Vec<u64>> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let frames = read_frames_from_store(
+        &core_store,
+        &multipart_metadata_stream_id(tenant_id, bucket_id),
+    )
+    .await?;
+    Ok(frames.into_iter().map(|frame| frame.fence_token).collect())
 }
 
 fn require_multipart_metadata_permit(
@@ -703,12 +726,26 @@ mod tests {
             .await
             .unwrap()
             .upload;
-        upsert_multipart_part(&storage, upload.id, 1, "hash-a", 10, "etag-a")
-            .await
-            .unwrap();
-        upsert_multipart_part(&storage, upload.id, 1, "hash-b", 11, "etag-b")
-            .await
-            .unwrap();
+        upsert_multipart_part(
+            &storage,
+            upload.id,
+            1,
+            payload_ref("hash-a", 10),
+            10,
+            "etag-a",
+        )
+        .await
+        .unwrap();
+        upsert_multipart_part(
+            &storage,
+            upload.id,
+            1,
+            payload_ref("hash-b", 11),
+            11,
+            "etag-b",
+        )
+        .await
+        .unwrap();
         assert_eq!(
             list_multipart_parts(&storage, upload.id).await.unwrap()[0].etag,
             "etag-b"
@@ -734,7 +771,7 @@ mod tests {
     }
 
     #[tokio::test]
-    pub(crate) async fn multipart_journal_with_permit_writes_fenced_frames_and_header() {
+    pub(crate) async fn multipart_journal_with_permit_writes_fenced_frames() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, 1, 2, "node-a").await;
@@ -747,7 +784,7 @@ mod tests {
             &storage,
             upload.upload.id,
             1,
-            "hash-a",
+            payload_ref("hash-a", 10),
             10,
             "etag-a",
             &permit,
@@ -759,16 +796,10 @@ mod tests {
             .await
             .unwrap();
 
-        let journal = tokio::fs::read(storage.multipart_journal_path(1, 2))
+        let core_store = CoreStore::new(storage.clone()).await.unwrap();
+        let frames = read_frames_from_store(&core_store, &multipart_metadata_stream_id(1, 2))
             .await
             .unwrap();
-        let header = BinaryEnvelopeHeader::decode(&journal).unwrap();
-        let header_json: serde_json::Value = serde_json::from_slice(&header.header_json).unwrap();
-        assert_eq!(header_json["partition_family"], "multipart_metadata");
-        assert_eq!(header_json["partition_id"], permit.partition_id);
-        assert_eq!(header_json["fence_token"], permit.fence_token);
-
-        let frames = decode_journal_file(&journal).unwrap();
         assert_eq!(frames.len(), 3);
         assert!(
             frames
@@ -793,7 +824,7 @@ mod tests {
             &storage,
             upload.upload.id,
             1,
-            "hash-a",
+            payload_ref("hash-a", 10),
             10,
             "etag-a",
             &stale_permit,
@@ -805,6 +836,46 @@ mod tests {
             err.to_string()
                 .contains("write permit owner is not current")
         );
+    }
+
+    #[tokio::test]
+    pub(crate) async fn multipart_journal_batch_rejects_stale_partition_precondition() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let owner = ready_owner(&storage, 1, 2, "node-a").await;
+        let stale_permit = owner.write_permit().unwrap();
+        let stale_precondition = partition_write_ref_precondition(&storage, &stale_permit, KEY)
+            .await
+            .unwrap();
+        let newer = ready_owner(&storage, 1, 2, "node-b").await;
+        assert!(newer.fence_token > stale_permit.fence_token);
+
+        let err = create_multipart_upload_inner(
+            &storage,
+            1,
+            2,
+            "obj",
+            stale_permit.fence_token,
+            Some(stale_precondition),
+        )
+        .await
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("generation mismatch") || message.contains("target mismatch"),
+            "unexpected stale precondition error: {message}"
+        );
+
+        create_multipart_upload_with_permit(
+            &storage,
+            1,
+            2,
+            "obj",
+            &newer.write_permit().unwrap(),
+            KEY,
+        )
+        .await
+        .unwrap();
     }
 
     async fn ready_owner(
@@ -842,5 +913,16 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    fn payload_ref(label: &str, logical_size: u64) -> CoreObjectRef {
+        CoreObjectRef {
+            hash: format!(
+                "sha256:{}",
+                hex::encode(blake3::hash(label.as_bytes()).as_bytes())
+            ),
+            logical_size,
+            manifest_ref: format!("manifest:{label}"),
+        }
     }
 }

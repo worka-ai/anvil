@@ -86,7 +86,7 @@ async fn get_public_text_with_retry(url: &str, timeout: Duration) -> String {
                 last_error = format!("unexpected HTTP status {}", response.status());
             }
             Err(error) => {
-                last_error = format!("request failed: {error}");
+                last_error = format!("request failed: {error:?}");
             }
         }
 
@@ -102,6 +102,19 @@ struct ComposeGuard {
 
 impl Drop for ComposeGuard {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            let _ = Command::new("docker")
+                .args([
+                    "compose",
+                    "-f",
+                    self.compose_file.to_str().unwrap_or_default(),
+                    "logs",
+                    "--no-color",
+                    "anvil1",
+                ])
+                .status();
+        }
+
         let mut command = Command::new("docker");
         command.env(
             "ANVIL_IMAGE",

@@ -9,7 +9,7 @@ description: Build local-first applications that use Anvil as the PersonalDB wit
 
 A local-first application reads and writes a local SQLite database. The UI stays fast because ordinary views query local state. The application still needs shared truth: accepted changes, current heads, snapshots for new devices, projections for server-side queries, and authorisation rules.
 
-Anvil acts as the PersonalDB witness. It validates and records commits, signs accepted heads, stores snapshots, maintains projections, and authorizes every operation.
+Anvil acts as the PersonalDB witness. It validates and records commits, signs accepted heads, stores snapshots, maintains projections, and authorises every operation.
 
 ## Application components
 

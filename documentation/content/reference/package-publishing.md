@@ -9,6 +9,21 @@ description: Published Anvil artefacts and how each package is meant to be used.
 
 Anvil ships multiple packages because developers and operators enter the system through different tools. Operators need a server image. Rust developers may install the Rust client crate. Operators use the Docker image and release binaries. This release ships the Rust native client first; other language clients are outside the release scope. Everyone needs documentation matching the release.
 
+
+## Supported gateway surfaces
+
+Anvil's core model is gateway-neutral. A gateway is a protocol adapter that maps a request into an Anvil principal, tenant, bucket, resource, authorisation scope, object or repository prefix, and CoreStore-backed record family.
+
+| Gateway surface | Release status | What it stores |
+| --- | --- | --- |
+| Native gRPC API | Supported | Buckets, objects, indexes, watches, authorisation, PersonalDB, source/model artefacts, repair, and diagnostics. |
+| S3-compatible object API | Supported | Bucket and object operations for tools that already speak S3. |
+| Static host aliases | Supported as routing/control records | Hostname-to-bucket/prefix mappings used by object delivery paths. |
+| Object links | Supported | Symlink-like object aliases such as movable `latest` pointers. |
+| Registry gateway foundation | Supported as internal records | Gateway mounts, credentials, repositories, blobs, tags, upload sessions, token challenges, and audits. |
+
+Container registry, Rust crate registry, npm, PyPI, and Maven protocol handlers use the registry gateway foundation when those protocol endpoints are enabled in a later release. They are not separate storage systems and they do not get private durable files.
+
 ## Docker image
 
 The Docker image runs the Anvil server. It exposes the native API and S3-compatible gateway according to runtime configuration. It should be pinned by version and smoke-tested before production rollout.

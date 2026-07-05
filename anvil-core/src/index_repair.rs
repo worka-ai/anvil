@@ -214,34 +214,34 @@ async fn missing_proof_segments(
     for segment_hash in &proof.segment_hashes {
         let exists = match index_kind {
             "full_text" => {
-                segment_file_hash_exists(
-                    storage.full_text_segment_dir(index_storage_id)?,
-                    ".anfts",
+                full_text_segment::full_text_segment_hash_exists(
+                    storage,
+                    index_storage_id,
                     proof.generation,
                     segment_hash,
                 )
                 .await?
             }
             "vector" => {
-                segment_file_hash_exists(
-                    storage.vector_segment_dir(index_storage_id)?,
-                    ".anvec",
+                vector_segment::vector_segment_hash_exists(
+                    storage,
+                    index_storage_id,
                     proof.generation,
                     segment_hash,
                 )
                 .await?
             }
             "hybrid" => {
-                let full_text_exists = segment_file_hash_exists(
-                    storage.full_text_segment_dir(index_storage_id)?,
-                    ".anfts",
+                let full_text_exists = full_text_segment::full_text_segment_hash_exists(
+                    storage,
+                    index_storage_id,
                     proof.generation,
                     segment_hash,
                 )
                 .await?;
-                let vector_exists = segment_file_hash_exists(
-                    storage.vector_segment_dir(index_storage_id)?,
-                    ".anvec",
+                let vector_exists = vector_segment::vector_segment_hash_exists(
+                    storage,
+                    index_storage_id,
                     proof.generation,
                     segment_hash,
                 )
@@ -263,34 +263,6 @@ async fn missing_proof_segments(
         missing.push(format!("unreadable-{}", hex::encode(&error_hash[..8])));
     }
     Ok(missing)
-}
-
-async fn segment_file_hash_exists(
-    dir: std::path::PathBuf,
-    suffix: &str,
-    generation: u64,
-    expected_file_hash: &str,
-) -> Result<bool> {
-    let mut entries = match tokio::fs::read_dir(&dir).await {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(err.into()),
-    };
-    let generation_prefix = format!("generation-{generation:020}-");
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !name.starts_with(&generation_prefix) || !name.ends_with(suffix) {
-            continue;
-        }
-        let bytes = tokio::fs::read(&path).await?;
-        if blake3::hash(&bytes).to_hex().as_str() == expected_file_hash {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 async fn validate_latest_segment_readable(

@@ -63,6 +63,8 @@ async fn rust_client_calls_live_native_api() {
                 bucket_name: bucket_name.clone(),
                 object_key: object_key.clone(),
                 mutation_context: Some(native_mutation_context(bucket.bucket_id, "put-object")),
+                content_type: None,
+                user_metadata_json: String::new(),
             })),
         },
         PutObjectRequest {

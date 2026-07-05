@@ -99,7 +99,7 @@ Create indexes around stable access patterns:
 | `documents_embeddings` | Semantic search. |
 | `documents_source_artefacts` | Build or ingestion tracing. |
 
-Avoid one enormous "everything" index. Smaller, purpose-built indexes are easier to reason about, rebuild, authorize, and monitor.
+Avoid one enormous "everything" index. Smaller, purpose-built indexes are easier to reason about, rebuild, authorise, and monitor.
 
 ## Use object envelopes for records
 

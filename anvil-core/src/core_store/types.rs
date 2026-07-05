@@ -1,0 +1,430 @@
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+pub const CORE_OBJECT_MANIFEST_SCHEMA: &str = "anvil.core.object_manifest.v1";
+pub const CORE_REF_SCHEMA: &str = "anvil.core.ref_value.v1";
+pub const CORE_REF_UPDATE_SCHEMA: &str = "anvil.core.ref_update.v1";
+pub const CORE_TRANSACTION_SCHEMA: &str = "anvil.core.transaction.v1";
+pub const CORE_WATCH_EVENT_SCHEMA: &str = "anvil.core.watch_event.v1";
+pub const CORE_FENCE_SCHEMA: &str = "anvil.core.fence.v1";
+pub const CORE_ROOT_CATALOG_SCHEMA: &str = "anvil.core.root_catalog.v1";
+pub const CORE_QUORUM_PROFILE_SCHEMA: &str = "anvil.core.quorum_profile.v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PutBlob {
+    pub logical_name: String,
+    pub bytes: Vec<u8>,
+    pub region_id: String,
+    pub mutation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetBlob {
+    pub object_ref: CoreObjectRef,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreObjectRef {
+    pub hash: String,
+    pub logical_size: u64,
+    pub manifest_ref: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreObjectManifest {
+    pub schema: String,
+    pub mesh_id: String,
+    pub region_id: String,
+    pub object_hash: String,
+    pub logical_size: u64,
+    pub encoding: CoreObjectEncoding,
+    pub placements: Vec<CoreObjectPlacement>,
+    pub created_at: String,
+    pub mutation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreObjectEncoding {
+    pub profile_id: String,
+    pub data_shards: u16,
+    pub parity_shards: u16,
+    pub minimum_read_shards: u16,
+    pub minimum_write_ack_shards: u16,
+    pub stripe_size: u64,
+    pub placement_scope: String,
+    pub repair_priority: String,
+    pub encryption: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreObjectPlacement {
+    pub shard_index: u16,
+    pub node_id: String,
+    pub shard_hash: String,
+    pub stored_size: u64,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppendStreamRecord {
+    pub stream_id: String,
+    pub partition_id: String,
+    pub record_kind: String,
+    pub payload: Vec<u8>,
+    pub fence: Option<CoreFencePrecondition>,
+    pub transaction_id: Option<String>,
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadStream {
+    pub stream_id: String,
+    pub after_sequence: u64,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StreamAppendReceipt {
+    pub stream_id: String,
+    pub sequence: u64,
+    pub cursor: String,
+    pub event_hash: String,
+    pub idempotent_replay: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StreamRecord {
+    pub schema: String,
+    pub stream_id: String,
+    pub partition_id: String,
+    pub sequence: u64,
+    pub cursor: String,
+    pub previous_event_hash: String,
+    pub event_hash: String,
+    pub record_kind: String,
+    pub payload_hash: String,
+    pub payload: Vec<u8>,
+    pub transaction_id: Option<String>,
+    pub idempotency_key_hash: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SealStreamSegment {
+    pub stream_id: String,
+    pub partition_id: String,
+    pub through_sequence: Option<u64>,
+    pub segment_kind: String,
+    pub mutation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreSegmentRef {
+    pub stream_id: String,
+    pub partition_id: String,
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+    pub record_count: u64,
+    pub segment_kind: String,
+    pub object_ref: CoreObjectRef,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WatchRequest {
+    pub stream_prefix: String,
+    pub after_cursor: Option<String>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WatchEvent {
+    pub stream_id: String,
+    pub sequence: u64,
+    pub cursor: String,
+    pub previous_event_hash: String,
+    pub event_hash: String,
+    pub event_type: String,
+    pub record_kind: String,
+    pub payload_hash: String,
+    pub transaction_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcquireFence {
+    pub fence_name: String,
+    pub authenticated_principal: String,
+    pub ttl_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReleaseFence {
+    pub fence_name: String,
+    pub authenticated_principal: String,
+    pub fence_token: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FencedPermit {
+    pub fence_name: String,
+    pub owner_principal: String,
+    pub fence_token: u64,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreFenceRecord {
+    pub schema: String,
+    pub fence_name: String,
+    pub owner_principal: String,
+    pub fence_token: u64,
+    pub expires_at_ms: i64,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreRootCatalog {
+    pub schema: String,
+    pub mesh_id: String,
+    pub generation: u64,
+    pub previous_hash: String,
+    pub root_partitions: Vec<CoreRootPartition>,
+    pub placement_catalog_ref: String,
+    pub stream_directory_ref: String,
+    pub ref_directory_ref: String,
+    pub authz_system_realm_ref: String,
+    pub created_at: String,
+    pub signed_by: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreRootPartition {
+    pub partition_id: String,
+    pub owner_node_id: String,
+    pub fence: u64,
+    pub placement_group: String,
+    pub embedded_head_segment_manifest: CoreObjectManifest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreRootCatalogReceipt {
+    pub mesh_id: String,
+    pub generation: u64,
+    pub catalog_hash: String,
+    pub ref_generation: u64,
+    pub watch_cursor: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreQuorumProfile {
+    pub schema: String,
+    pub placement_group: String,
+    pub replica_count: u16,
+    pub write_quorum: u16,
+    pub read_quorum: u16,
+    pub fence_quorum: u16,
+    pub epoch: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreQuorumProfileReceipt {
+    pub placement_group: String,
+    pub epoch: u64,
+    pub profile_hash: String,
+    pub ref_generation: u64,
+    pub watch_cursor: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompareAndSwapRef {
+    pub ref_name: String,
+    pub expected_generation: Option<u64>,
+    pub expected_target: Option<String>,
+    pub require_absent: bool,
+    pub require_present: bool,
+    pub fence: Option<CoreFencePrecondition>,
+    pub authz_revision: Option<String>,
+    pub source_watch_cursor: Option<String>,
+    pub new_target: String,
+    pub transaction_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreFencePrecondition {
+    pub fence_name: String,
+    pub fence_token: u64,
+    pub authenticated_principal: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreRefValue {
+    pub schema: String,
+    pub ref_name: String,
+    pub generation: u64,
+    pub target: String,
+    pub transaction_id: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CasRefReceipt {
+    pub ref_name: String,
+    pub generation: u64,
+    pub previous_target: Option<String>,
+    pub new_target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreRefUpdateRecord {
+    pub schema: String,
+    pub ref_name: String,
+    pub previous_generation: Option<u64>,
+    pub new_generation: Option<u64>,
+    pub previous_target: Option<String>,
+    pub new_target: Option<String>,
+    pub preconditions: CoreRefUpdatePreconditions,
+    pub mutation_id: String,
+    pub transaction_id: Option<String>,
+    pub committed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreRefUpdatePreconditions {
+    pub expected_generation: Option<u64>,
+    pub expected_target: Option<String>,
+    pub require_absent: bool,
+    pub require_present: bool,
+    pub fence_token: Option<u64>,
+    pub authz_revision: Option<String>,
+    pub source_watch_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreTransaction {
+    pub schema: String,
+    pub transaction_id: String,
+    pub scope_partition: String,
+    pub state: CoreTransactionState,
+    pub preconditions_hash: String,
+    pub operations_hash: String,
+    pub prepared_refs: Vec<String>,
+    pub visible_updates: Vec<CoreTransactionUpdate>,
+    pub committed_at: String,
+    pub committed_by_principal: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CoreTransactionState {
+    Prepared,
+    Committed,
+    Aborted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CoreTransactionUpdate {
+    CoreRefUpdate {
+        ref_name: String,
+        new_generation: u64,
+    },
+    StreamAppend {
+        stream_id: String,
+        visible_sequence: u64,
+        prepared_record_hash: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreMutationBatch {
+    pub transaction_id: String,
+    pub scope_partition: String,
+    pub committed_by_principal: String,
+    pub preconditions: Vec<CoreMutationPrecondition>,
+    pub operations: Vec<CoreMutationOperation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CoreMutationPrecondition {
+    Ref {
+        ref_name: String,
+        expected_generation: Option<u64>,
+        expected_target: Option<String>,
+        require_absent: bool,
+        require_present: bool,
+        fence: Option<CoreFencePrecondition>,
+        authz_revision: Option<String>,
+        source_watch_cursor: Option<String>,
+    },
+    Fence {
+        fence_name: String,
+        fence_token: u64,
+    },
+    StreamHead {
+        stream_id: String,
+        expected_last_sequence: u64,
+        expected_last_event_hash: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CoreMutationOperation {
+    RefUpdate {
+        partition_id: String,
+        ref_name: String,
+        new_target: String,
+    },
+    StreamAppend {
+        partition_id: String,
+        stream_id: String,
+        record_kind: String,
+        payload: Vec<u8>,
+        idempotency_key: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreMutationBatchReceipt {
+    pub transaction_id: String,
+    pub scope_partition: String,
+    pub visible_updates: Vec<CoreTransactionUpdate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceId {
+    pub schema: String,
+    pub mesh_id: String,
+    pub anvil_storage_tenant_id: String,
+    pub authz_scope: AuthzScopeRef,
+    pub kind: SourceKind,
+    pub resource_namespace: String,
+    pub resource_id: String,
+    pub generation: u64,
+    pub tombstone: bool,
+    pub variant: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthzScopeRef {
+    pub anvil_storage_tenant_id: String,
+    pub authz_realm_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    ObjectCurrent,
+    ObjectVersion,
+    AppendRecord,
+    AuthzResource,
+    PackageRepository,
+    PackageVersion,
+    PackageFile,
+    PackageTag,
+    GitObject,
+    PersonalDatabaseRecord,
+    MeshControlRecord,
+}

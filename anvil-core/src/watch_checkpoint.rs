@@ -1,4 +1,5 @@
 use crate::{
+    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
     formats::hash32,
     partition_fence::{
         OWNERSHIP_EXPIRED, OWNERSHIP_NOT_FOUND, OWNERSHIP_OWNER_MISMATCH, OWNERSHIP_STALE_FENCE,
@@ -6,15 +7,15 @@ use crate::{
     },
     storage::Storage,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use base64::Engine;
 use hmac::{Hmac, Mac};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::io::ErrorKind;
-use std::path::Path;
 
 type HmacSha256 = Hmac<Sha256>;
+const WATCH_CHECKPOINT_REF_PREFIX: &str = "watch_checkpoint:";
+const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WatchCheckpoint {
@@ -170,10 +171,21 @@ pub async fn read_watch_checkpoint(
     consumer_id: &str,
     signing_key: &[u8],
 ) -> Result<Option<WatchCheckpoint>> {
-    let path = storage.watch_checkpoint_path(watch_stream_id, consumer_id)?;
-    let Some(checkpoint) = read_json_optional::<WatchCheckpoint>(&path).await? else {
+    require_safe_component(watch_stream_id, "watch_stream_id")?;
+    require_safe_component(consumer_id, "consumer_id")?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(ref_value) = store
+        .read_ref(&watch_checkpoint_ref_name(watch_stream_id, consumer_id)?)
+        .await?
+    else {
         return Ok(None);
     };
+    let bytes = store
+        .get_blob(GetBlob {
+            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+        })
+        .await?;
+    let checkpoint: WatchCheckpoint = serde_json::from_slice(&bytes)?;
     checkpoint.verify(signing_key)?;
     if checkpoint.watch_stream_id != watch_stream_id || checkpoint.consumer_id != consumer_id {
         return Err(anyhow!("watch checkpoint path scope mismatch"));
@@ -238,16 +250,41 @@ async fn validate_write_authority(
 }
 
 async fn write_watch_checkpoint(storage: &Storage, checkpoint: &WatchCheckpoint) -> Result<()> {
-    let path =
-        storage.watch_checkpoint_path(&checkpoint.watch_stream_id, &checkpoint.consumer_id)?;
-    write_json_atomically(&path, checkpoint).await
+    let ref_name = watch_checkpoint_ref_name(&checkpoint.watch_stream_id, &checkpoint.consumer_id)?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: ref_name.clone(),
+            bytes: serde_json::to_vec(checkpoint)?,
+            region_id: "local".to_string(),
+            mutation_id: format!(
+                "watch-checkpoint:{}:{}",
+                checkpoint.watch_stream_id, checkpoint.consumer_id
+            ),
+        })
+        .await?;
+    store
+        .compare_and_swap_ref(CompareAndSwapRef {
+            ref_name,
+            expected_generation: None,
+            expected_target: None,
+            require_absent: false,
+            require_present: false,
+            fence: None,
+            authz_revision: None,
+            source_watch_cursor: None,
+            new_target: encode_core_object_ref_target(&object_ref)?,
+            transaction_id: None,
+        })
+        .await?;
+    Ok(())
 }
 
 fn validate_update(update: &WatchCheckpointUpdate) -> Result<()> {
-    require_nonempty(&update.watch_stream_id, "watch_stream_id")?;
-    require_nonempty(&update.partition_family, "partition_family")?;
+    require_safe_component(&update.watch_stream_id, "watch_stream_id")?;
+    require_safe_component(&update.partition_family, "partition_family")?;
     validate_hex32(&update.partition_id, "partition_id")?;
-    require_nonempty(&update.consumer_id, "consumer_id")?;
+    require_safe_component(&update.consumer_id, "consumer_id")?;
     validate_hex32(&update.source_manifest_hash, "source_manifest_hash")?;
     require_nonempty(&update.updated_by_node, "updated_by_node")?;
     if update.generation == 0 {
@@ -292,32 +329,6 @@ fn sign_checkpoint_hash(signing_key: &[u8], hash: &str, scope_parts: &[&str]) ->
     Ok(base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
 }
 
-async fn write_json_atomically(path: &Path, value: &impl Serialize) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let tmp = path.with_extension(format!("json.tmp-{}", uuid::Uuid::new_v4().simple()));
-    tokio::fs::write(&tmp, serde_json::to_vec_pretty(value)?)
-        .await
-        .with_context(|| format!("write temporary watch checkpoint {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, path)
-        .await
-        .with_context(|| format!("publish watch checkpoint {}", path.display()))?;
-    Ok(())
-}
-
-async fn read_json_optional<T>(path: &Path) -> Result<Option<T>>
-where
-    T: DeserializeOwned,
-{
-    let bytes = match tokio::fs::read(path).await {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
-    };
-    Ok(Some(serde_json::from_slice(&bytes)?))
-}
-
 fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
     if value.len() != 64 || !value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(anyhow!("{field} must be hex32"));
@@ -330,6 +341,44 @@ fn require_nonempty(value: &str, field: &'static str) -> Result<()> {
         return Err(anyhow!("{field} must not be empty"));
     }
     Ok(())
+}
+
+fn require_safe_component(value: &str, field: &'static str) -> Result<()> {
+    require_nonempty(value, field)?;
+    if value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains(':')
+        || value.chars().any(char::is_control)
+    {
+        return Err(anyhow!("{field} is not a safe component"));
+    }
+    Ok(())
+}
+
+fn watch_checkpoint_ref_name(watch_stream_id: &str, consumer_id: &str) -> Result<String> {
+    require_safe_component(watch_stream_id, "watch_stream_id")?;
+    require_safe_component(consumer_id, "consumer_id")?;
+    Ok(format!(
+        "{WATCH_CHECKPOINT_REF_PREFIX}stream:{watch_stream_id}:consumer:{consumer_id}"
+    ))
+}
+
+fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
+    Ok(format!(
+        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
+    ))
+}
+
+fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
+    let encoded = target
+        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
+        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
+    Ok(serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded)?,
+    )?)
 }
 
 #[cfg(test)]
@@ -355,10 +404,10 @@ mod tests {
         assert_eq!(first.cursor, 40);
         assert_eq!(first.generation, 1);
         assert!(first.checkpoint_hash.as_deref().unwrap().len() == 64);
-        let path = storage
-            .watch_checkpoint_path("object-prefix", "full-text-builder")
-            .unwrap();
-        assert!(path.ends_with("_anvil/watch/checkpoints/object-prefix/full-text-builder.json"));
+        assert_eq!(
+            watch_checkpoint_ref_name("object-prefix", "full-text-builder").unwrap(),
+            "watch_checkpoint:stream:object-prefix:consumer:full-text-builder"
+        );
 
         let second_update = update(75, 2);
         let second_authority = authority(&storage, &second_update).await;
@@ -428,13 +477,41 @@ mod tests {
         checkpoint_watch_consumer(&storage, first, first_authority, KEY)
             .await
             .unwrap();
-        let path = storage
-            .watch_checkpoint_path("object-prefix", "full-text-builder")
-            .unwrap();
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        let ref_name = watch_checkpoint_ref_name("object-prefix", "full-text-builder").unwrap();
+        let ref_value = store.read_ref(&ref_name).await.unwrap().unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(
+            &store
+                .get_blob(GetBlob {
+                    object_ref: decode_core_object_ref_target(&ref_value.target).unwrap(),
+                })
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         value["cursor"] = serde_json::json!(41);
-        tokio::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap())
+        let object_ref = store
+            .put_blob(PutBlob {
+                logical_name: ref_name.clone(),
+                bytes: serde_json::to_vec(&value).unwrap(),
+                region_id: "local".to_string(),
+                mutation_id: "tamper-watch-checkpoint-test".to_string(),
+            })
+            .await
+            .unwrap();
+        store
+            .compare_and_swap_ref(CompareAndSwapRef {
+                ref_name,
+                expected_generation: None,
+                expected_target: None,
+                require_absent: false,
+                require_present: true,
+                fence: None,
+                authz_revision: None,
+                source_watch_cursor: None,
+                new_target: encode_core_object_ref_target(&object_ref).unwrap(),
+                transaction_id: None,
+            })
             .await
             .unwrap();
         assert!(
@@ -442,16 +519,8 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(
-            storage
-                .watch_checkpoint_path("../escape", "consumer")
-                .is_err()
-        );
-        assert!(
-            storage
-                .watch_checkpoint_path("stream", "../escape")
-                .is_err()
-        );
+        assert!(watch_checkpoint_ref_name("../escape", "consumer").is_err());
+        assert!(watch_checkpoint_ref_name("stream", "../escape").is_err());
         let mut invalid = update(1, 1);
         invalid.source_manifest_hash = "not-hex".to_string();
         let invalid_authority = WatchCheckpointWriteAuthority {

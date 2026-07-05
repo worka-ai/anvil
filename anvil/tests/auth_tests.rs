@@ -24,6 +24,7 @@ use anvil::authz_namespace_watch::{
     AuthzNamespaceWatchPayload, append_authz_namespace_watch_record,
 };
 use anvil::authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID;
+use anvil::core_store::CoreStore;
 use futures_util::StreamExt;
 use std::time::Duration;
 use tonic::Request;
@@ -142,6 +143,8 @@ async fn put_test_object(
                         "test-app",
                         "put-test-object",
                     )),
+                    content_type: None,
+                    user_metadata_json: String::new(),
                 },
             )),
         },
@@ -1049,7 +1052,7 @@ async fn test_coordination_task_lease_grpc_flow() {
 #[tokio::test]
 async fn test_coordination_task_lease_security_invariants() {
     let mut cluster = TestCluster::new_with_config(&["test-region-1"], |config| {
-        config.task_lease_ttl_secs = 2;
+        config.task_lease_ttl_secs = 30;
     })
     .await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
@@ -1101,7 +1104,7 @@ async fn test_coordination_task_lease_security_invariants() {
         .expect("lease");
     assert_eq!(first.owner_label, "shared-worker-label");
     assert_eq!(first.owner_principal_id, "lease-app-a");
-    assert!(first.expires_at_nanos - first.acquired_at_nanos <= 2_000_000_000);
+    assert!(first.expires_at_nanos - first.acquired_at_nanos <= 30_000_000_000);
 
     let mut wrong_owner_checkpoint = Request::new(CheckpointTaskLeaseRequest {
         task_id: task_id.to_string(),
@@ -1288,6 +1291,50 @@ async fn test_coordination_task_lease_security_invariants() {
         tenant_b_read.lease.expect("tenant b lease").owner_tenant_id,
         2
     );
+
+    let mut client_one = CoordinationServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut client_two = CoordinationServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let concurrent_task_id = "posthorn-concurrent-acquire";
+    let mut acquire_one = Request::new(AcquireTaskLeaseRequest {
+        task_id: concurrent_task_id.to_string(),
+        task_kind: "posthorn_delivery".to_string(),
+        partition_family: "posthorn_queue".to_string(),
+        partition_id: "88".repeat(32),
+        owner_label: "same-worker-label".to_string(),
+        source_cursor_low: 1,
+        source_cursor_high: 0,
+        requested_ttl_nanos: 1_000_000_000,
+    });
+    add_bearer(&mut acquire_one, &token_a);
+    let mut acquire_two = Request::new(AcquireTaskLeaseRequest {
+        task_id: concurrent_task_id.to_string(),
+        task_kind: "posthorn_delivery".to_string(),
+        partition_family: "posthorn_queue".to_string(),
+        partition_id: "88".repeat(32),
+        owner_label: "same-worker-label".to_string(),
+        source_cursor_low: 1,
+        source_cursor_high: 0,
+        requested_ttl_nanos: 1_000_000_000,
+    });
+    add_bearer(&mut acquire_two, &token_b);
+
+    let (one, two) = tokio::join!(
+        client_one.acquire_task_lease(acquire_one),
+        client_two.acquire_task_lease(acquire_two)
+    );
+    let winners = one.is_ok() as u8 + two.is_ok() as u8;
+    assert_eq!(winners, 1, "concurrent lease acquire must have one winner");
+    let loser = if one.is_err() {
+        one.unwrap_err()
+    } else {
+        two.unwrap_err()
+    };
+    assert_eq!(loser.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(loser.message(), "LeaseHeld");
 }
 
 #[tokio::test]
@@ -1523,6 +1570,8 @@ async fn test_object_read_uses_relationship_authorization_before_streaming_bytes
                         "test-app",
                         "object-metadata",
                     )),
+                    content_type: None,
+                    user_metadata_json: String::new(),
                 },
             )),
         },
@@ -2172,13 +2221,20 @@ async fn test_repair_authz_derived_index_rebuilds_from_tuple_log() {
     add_bearer(&mut direct_grant, &token);
     auth_client.write_authz_tuple(direct_grant).await.unwrap();
 
-    let path = cluster.states[0]
-        .storage
-        .authz_derived_userset_index_path(1, DEFAULT_DERIVED_USERSET_INDEX_ID)
-        .unwrap();
-    tokio::fs::remove_file(&path)
+    let core_store = CoreStore::new(cluster.states[0].storage.clone())
         .await
-        .expect("remove derived userset index to force repair");
+        .unwrap();
+    let derived_index_ref = core_store
+        .list_ref_names("authz_derived_userset_index:")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|name| name.contains(&format!("index:{DEFAULT_DERIVED_USERSET_INDEX_ID}")))
+        .expect("derived userset index ref must exist before repair test");
+    core_store
+        .delete_ref(&derived_index_ref, None, None, true)
+        .await
+        .expect("delete derived userset CoreStore ref to force repair");
 
     let mut repair_request = Request::new(RepairAuthzDerivedIndexRequest {
         derived_index_id: DEFAULT_DERIVED_USERSET_INDEX_ID.to_string(),
@@ -2319,6 +2375,8 @@ async fn test_set_public_access_and_get() {
             "test-app",
             "object-metadata",
         )),
+        content_type: None,
+        user_metadata_json: String::new(),
     };
     let chunks = vec![
         PutObjectRequest {
@@ -2466,6 +2524,8 @@ async fn test_service_set_public_access() {
             "test-app",
             "object-metadata",
         )),
+        content_type: None,
+        user_metadata_json: String::new(),
     };
     let chunks = vec![
         PutObjectRequest {

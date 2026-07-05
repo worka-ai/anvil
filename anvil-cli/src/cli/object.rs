@@ -92,6 +92,8 @@ pub async fn handle_object_command(command: &ObjectCommands, ctx: &Context) -> a
                 bucket_name: bucket,
                 object_key: key,
                 mutation_context: Some(mutation_context),
+                content_type: None,
+                user_metadata_json: String::new(),
             };
             let file_chunks = tokio::fs::read(src).await?;
             let chunks = vec![

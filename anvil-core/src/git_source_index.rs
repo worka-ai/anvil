@@ -1,14 +1,19 @@
-use crate::formats::{
-    BinaryEnvelopeHeader, BinaryFileFooter, COMMON_FOOTER_LEN, COMMON_HEADER_LEN, FileFamily,
-    Hash32,
-    git::{GitHashAlgorithm, GitSourceRecord},
-    hash32,
+use crate::{
+    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    formats::{
+        BinaryEnvelopeHeader, BinaryFileFooter, COMMON_FOOTER_LEN, COMMON_HEADER_LEN, FileFamily,
+        Hash32,
+        git::{GitHashAlgorithm, GitSourceRecord},
+        hash32,
+    },
+    storage::Storage,
 };
-use crate::storage::Storage;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use tokio::io::AsyncWriteExt;
+
+const GIT_SOURCE_INDEX_REF_PREFIX: &str = "git_source_index:";
+const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GitSourceIndexHeader {
@@ -41,26 +46,24 @@ pub struct GitSourceIndexWrite<'a> {
 pub async fn write_git_source_index(
     storage: &Storage,
     input: GitSourceIndexWrite<'_>,
-) -> Result<PathBuf> {
+) -> Result<String> {
     let mut records = input.records.to_vec();
     ensure_record_algorithms(input.hash_algorithm, &records)?;
     records.sort_by(compare_git_source_records);
     let body = encode_git_source_body(&records);
-    let path = storage.git_source_index_path(
+    let source_hash = hex::encode(input.source_hash);
+    let ref_name = git_source_index_ref_name(
         input.tenant_id,
         input.repository_id,
         input.generation,
-        &hex::encode(input.source_hash),
+        &source_hash,
     )?;
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
 
     let header = GitSourceIndexHeader {
         tenant_id: input.tenant_id.to_string(),
         repository_id: input.repository_id.to_string(),
         generation: input.generation,
-        source_hash: hex::encode(input.source_hash),
+        source_hash,
         hash_algorithm: hash_algorithm_name(input.hash_algorithm).to_string(),
         key_order: "repository_commit_tree_path_object".to_string(),
         codec: "none".to_string(),
@@ -78,26 +81,80 @@ pub async fn write_git_source_index(
         last_hash,
     );
 
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&path)
-        .await
-        .with_context(|| format!("create git source index {}", path.display()))?;
-    file.write_all(&encoded_header).await?;
-    file.write_all(&body).await?;
-    file.write_all(&footer.encode()).await?;
-    file.sync_data().await?;
-    Ok(path)
+    let mut bytes = Vec::with_capacity(encoded_header.len() + body.len() + COMMON_FOOTER_LEN);
+    bytes.extend_from_slice(&encoded_header);
+    bytes.extend_from_slice(&body);
+    bytes.extend_from_slice(&footer.encode());
+    let store = CoreStore::new(storage.clone()).await?;
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: ref_name.clone(),
+            bytes,
+            region_id: "local".to_string(),
+            mutation_id: format!(
+                "git-source-index:{}:{}:{}",
+                input.tenant_id, input.repository_id, input.generation
+            ),
+        })
+        .await?;
+    store
+        .compare_and_swap_ref(CompareAndSwapRef {
+            ref_name: ref_name.clone(),
+            expected_generation: None,
+            expected_target: None,
+            require_absent: true,
+            require_present: false,
+            fence: None,
+            authz_revision: None,
+            source_watch_cursor: None,
+            new_target: encode_core_object_ref_target(&object_ref)?,
+            transaction_id: None,
+        })
+        .await?;
+    Ok(ref_name)
 }
 
-pub async fn read_git_source_index(path: impl Into<PathBuf>) -> Result<DecodedGitSourceIndex> {
-    let path = path.into();
-    let bytes = tokio::fs::read(&path)
-        .await
-        .with_context(|| format!("read git source index {}", path.display()))?;
+pub async fn read_git_source_index(
+    storage: &Storage,
+    index_ref: &str,
+) -> Result<DecodedGitSourceIndex> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let ref_value = store
+        .read_ref(index_ref)
+        .await?
+        .ok_or_else(|| anyhow!("git source index ref is missing"))?;
+    let bytes = store
+        .get_blob(GetBlob {
+            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+        })
+        .await?;
     decode_git_source_index(&bytes)
+}
+
+pub async fn read_git_source_index_bytes(storage: &Storage, index_ref: &str) -> Result<Vec<u8>> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let ref_value = store
+        .read_ref(index_ref)
+        .await?
+        .ok_or_else(|| anyhow!("git source index ref is missing"))?;
+    store
+        .get_blob(GetBlob {
+            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+        })
+        .await
+}
+
+pub async fn latest_git_source_index_ref(
+    storage: &Storage,
+    tenant_id: i64,
+    repository_id: &str,
+) -> Result<Option<String>> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let mut refs = store
+        .list_ref_names(&git_source_index_ref_prefix(tenant_id, repository_id)?)
+        .await?;
+    refs.sort_by_key(|value| generation_from_ref(value).unwrap_or(0));
+    Ok(refs.pop())
 }
 
 pub fn decode_git_source_index(bytes: &[u8]) -> Result<DecodedGitSourceIndex> {
@@ -217,6 +274,73 @@ fn record_hash_bounds(records: &[GitSourceRecord]) -> (Hash32, Hash32) {
     (first, last)
 }
 
+fn git_source_index_ref_prefix(tenant_id: i64, repository_id: &str) -> Result<String> {
+    require_safe_component(repository_id, "git repository id")?;
+    Ok(format!(
+        "{GIT_SOURCE_INDEX_REF_PREFIX}tenant:{tenant_id}:repository:{repository_id}:"
+    ))
+}
+
+fn git_source_index_ref_name(
+    tenant_id: i64,
+    repository_id: &str,
+    generation: u64,
+    source_hash: &str,
+) -> Result<String> {
+    validate_hex32(source_hash, "git source hash")?;
+    Ok(format!(
+        "{}generation:{generation:020}:source:{source_hash}",
+        git_source_index_ref_prefix(tenant_id, repository_id)?
+    ))
+}
+
+fn generation_from_ref(ref_name: &str) -> Option<u64> {
+    ref_name
+        .rsplit_once(":generation:")?
+        .1
+        .split(':')
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
+    if value.len() != 64 || !value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow!("{field} must be hex32"));
+    }
+    Ok(())
+}
+
+fn require_safe_component(value: &str, field: &'static str) -> Result<()> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains(':')
+        || value.chars().any(char::is_control)
+    {
+        return Err(anyhow!("{field} is not a safe component"));
+    }
+    Ok(())
+}
+
+fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
+    Ok(format!(
+        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
+    ))
+}
+
+fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
+    let encoded = target
+        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
+        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
+    Ok(serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded)?,
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,7 +370,7 @@ mod tests {
             record(1, "src/main.rs", 1),
         ];
 
-        let path = write_git_source_index(
+        let index_ref = write_git_source_index(
             &storage,
             GitSourceIndexWrite {
                 tenant_id: 5,
@@ -259,13 +383,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".angit"))
-        );
+        assert!(index_ref.starts_with("git_source_index:tenant:5:repository:repo-alpha:"));
 
-        let decoded = read_git_source_index(path).await.unwrap();
+        let decoded = read_git_source_index(&storage, &index_ref).await.unwrap();
         assert_eq!(decoded.header.repository_id, "repo-alpha");
         assert_eq!(decoded.header.hash_algorithm, "sha1");
         assert_eq!(decoded.records.len(), 3);
@@ -276,7 +396,7 @@ mod tests {
     async fn git_source_index_footer_protects_body() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let path = write_git_source_index(
+        let index_ref = write_git_source_index(
             &storage,
             GitSourceIndexWrite {
                 tenant_id: 5,
@@ -289,7 +409,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut bytes = tokio::fs::read(path).await.unwrap();
+        let mut bytes = read_git_source_index_bytes(&storage, &index_ref)
+            .await
+            .unwrap();
         bytes[COMMON_HEADER_LEN + 1] ^= 1;
         assert!(decode_git_source_index(&bytes).is_err());
     }

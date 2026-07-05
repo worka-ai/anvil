@@ -118,6 +118,14 @@ pub struct Config {
     #[arg(long, env, default_value_t = 64 * 1024 * 1024)]
     pub personaldb_snapshot_payload_bytes_threshold: u64,
 
+    /// Enables the deterministic vector embedding provider used only by test harnesses.
+    #[arg(skip)]
+    pub allow_test_only_embedding_provider: bool,
+
+    /// JSON object defining named production vector embedding providers.
+    #[arg(long, env, default_value = "")]
+    pub vector_embedding_providers_json: String,
+
     /// Uncompacted object metadata journal frames allowed before scheduling compaction.
     #[arg(long, env, default_value_t = 4096)]
     pub object_metadata_compaction_frame_threshold: u64,

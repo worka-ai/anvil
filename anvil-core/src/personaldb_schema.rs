@@ -1,10 +1,17 @@
 use crate::{
-    anvil_personaldb_sqlite_changeset::DecodedSqliteChangesetChange, formats::hash32,
+    anvil_personaldb_sqlite_changeset::DecodedSqliteChangesetChange,
+    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    formats::hash32,
     storage::Storage,
 };
 use anyhow::{Context, Result, anyhow};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rusqlite::Connection;
 use std::collections::BTreeSet;
+
+const PERSONALDB_SCHEMA_REF_PREFIX: &str = "personaldb_schema_sql:";
+const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
 pub async fn write_personaldb_schema_sql(
     storage: &Storage,
@@ -14,17 +21,30 @@ pub async fn write_personaldb_schema_sql(
     schema_hash: &str,
 ) -> Result<()> {
     validate_schema_sql(schema_sql, schema_hash)?;
-    let path = storage.personaldb_schema_sql_path(tenant_id, database_id)?;
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let tmp = path.with_extension(format!("sql.tmp-{}", uuid::Uuid::new_v4().simple()));
-    tokio::fs::write(&tmp, schema_sql)
-        .await
-        .with_context(|| format!("write temporary PersonalDB schema {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, &path)
-        .await
-        .with_context(|| format!("publish PersonalDB schema {}", path.display()))?;
+    let ref_name = personaldb_schema_ref_name(tenant_id, database_id)?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: ref_name.clone(),
+            bytes: schema_sql.as_bytes().to_vec(),
+            region_id: "local".to_string(),
+            mutation_id: format!("personaldb-schema:{tenant_id}:{database_id}:{schema_hash}"),
+        })
+        .await?;
+    store
+        .compare_and_swap_ref(CompareAndSwapRef {
+            ref_name,
+            expected_generation: None,
+            expected_target: None,
+            require_absent: false,
+            require_present: false,
+            fence: None,
+            authz_revision: None,
+            source_watch_cursor: None,
+            new_target: encode_core_object_ref_target(&object_ref)?,
+            transaction_id: None,
+        })
+        .await?;
     Ok(())
 }
 
@@ -34,18 +54,62 @@ pub async fn read_personaldb_schema_sql(
     database_id: &str,
     schema_hash: &str,
 ) -> Result<Option<String>> {
-    let path = storage.personaldb_schema_sql_path(tenant_id, database_id)?;
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(ref_value) = store
+        .read_ref(&personaldb_schema_ref_name(tenant_id, database_id)?)
+        .await?
+    else {
+        return Ok(None);
     };
+    let bytes = store
+        .get_blob(GetBlob {
+            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+        })
+        .await?;
     if hex::encode(hash32(&bytes)) != schema_hash {
         return Err(anyhow!("PersonalDB schema hash mismatch"));
     }
     let schema_sql = String::from_utf8(bytes).context("PersonalDB schema must be UTF-8")?;
     validate_schema_sql(&schema_sql, schema_hash)?;
     Ok(Some(schema_sql))
+}
+
+fn personaldb_schema_ref_name(tenant_id: i64, database_id: &str) -> Result<String> {
+    if tenant_id < 0 {
+        return Err(anyhow!("PersonalDB tenant id must be nonnegative"));
+    }
+    validate_safe_component(database_id, "database_id")?;
+    Ok(format!(
+        "{PERSONALDB_SCHEMA_REF_PREFIX}tenant:{tenant_id}:database:{database_id}"
+    ))
+}
+
+fn validate_safe_component(value: &str, field: &'static str) -> Result<()> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains(':')
+        || value.chars().any(char::is_control)
+    {
+        return Err(anyhow!("{field} is not a safe component"));
+    }
+    Ok(())
+}
+
+fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
+    Ok(format!(
+        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
+    ))
+}
+
+fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
+    let encoded = target
+        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
+        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
+    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
 }
 
 pub fn validate_schema_sql(schema_sql: &str, schema_hash: &str) -> Result<()> {

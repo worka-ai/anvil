@@ -1033,7 +1033,7 @@ fn s3_remote_bucket_response(
             s3_error(
                 "ServiceUnavailable",
                 &format!(
-                    "Bucket is in region {region}; cross-region proxying is required by policy but is not implemented"
+                    "Bucket is in region {region}; cross-region proxying is required by policy but no eligible proxy target is available"
                 ),
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
             ),
@@ -2619,7 +2619,6 @@ mod list_bucket_pagination_tests {
             storage_class: None,
             user_meta: None,
             shard_map: None,
-            inline_payload: None,
             checksum: None,
             link: None,
         }
@@ -2723,6 +2722,8 @@ async fn get_object(
         Err(response) => return response,
     };
 
+    let response_bucket = bucket.clone();
+    let response_key = key.clone();
     match state
         .object_manager
         .get_object_with_link_mode_for_tenant(
@@ -2777,9 +2778,17 @@ async fn get_object(
                 );
             }
             builder
-                .body(Body::from_stream(
-                    body_stream.map(|r| r.map_err(|e| axum::Error::new(e))),
-                ))
+                .body(Body::from_stream(body_stream.map(move |r| {
+                    r.map_err(|e| {
+                        tracing::warn!(
+                            bucket = %response_bucket,
+                            key = %response_key,
+                            error = %e,
+                            "S3 object body stream failed"
+                        );
+                        axum::Error::new(e)
+                    })
+                })))
                 .unwrap()
         }
         Err(status) => match status.code() {
@@ -3470,12 +3479,12 @@ async fn copy_object(
         Err(response) => return response,
     };
 
-    let (source_object, source_stream) = match state
+    let source_object = match state
         .object_manager
-        .get_object(
+        .head_object(
             Some(claims.clone()),
-            source_bucket,
-            source_key,
+            &source_bucket,
+            &source_key,
             source_version_id,
         )
         .await
@@ -3498,16 +3507,13 @@ async fn copy_object(
 
     match state
         .object_manager
-        .put_object(
-            claims.tenant_id,
+        .copy_object(
+            claims,
+            &source_bucket,
+            &source_key,
+            source_version_id,
             &destination_bucket,
             &destination_key,
-            &claims.scopes,
-            source_stream,
-            ObjectWriteOptions {
-                content_type: source_object.content_type,
-                user_metadata: source_object.user_meta,
-            },
         )
         .await
     {
@@ -4765,7 +4771,7 @@ mod tests {
         );
         let xml = response_xml(response).await;
         assert!(xml.contains("<Code>ServiceUnavailable</Code>"));
-        assert!(xml.contains("not implemented"));
+        assert!(xml.contains("no eligible proxy target is available"));
     }
 
     #[tokio::test]

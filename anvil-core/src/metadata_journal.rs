@@ -1,3 +1,7 @@
+use crate::core_store::{
+    CompareAndSwapRef, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
+    CoreObjectRef, CoreStore, GetBlob, PutBlob, ReadStream, is_stream_head_mismatch,
+};
 use crate::formats::{
     BinaryEnvelopeHeader, BinaryFileFooter, COMMON_FOOTER_LEN, COMMON_HEADER_LEN, FileFamily,
     FormatError, Hash32, JournalFrame, JournalRecordKind, hash32,
@@ -5,16 +9,23 @@ use crate::formats::{
     validate_journal_chain,
 };
 use crate::object_links;
-use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
+use crate::partition_fence::{PartitionWritePermit, partition_write_ref_precondition};
 use crate::persistence::{Bucket, Object, ObjectVersion, ObjectVersionsPage};
 use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use sha2::Digest;
 use sha2::Sha256;
-use std::path::{Path, PathBuf};
-use tokio::io::AsyncWriteExt;
+
+const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
+const MANIFEST_SEGMENT_REF_PREFIX: &str = "coreref:";
+const METADATA_SEGMENT_REF_PREFIX: &str = "metadata_segment:";
+const DIRECTORY_SEGMENT_REF_PREFIX: &str = "directory_segment:";
+const METADATA_MANIFEST_REF_PREFIX: &str = "metadata_manifest:";
+const CURRENT_OBJECT_REF_PREFIX: &str = "object_current:";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -46,18 +57,6 @@ impl ObjectJournalMutation {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct MetadataJournalHeader<'a> {
-    tenant_id: String,
-    bucket_id: String,
-    partition_family: &'static str,
-    partition_id: String,
-    fence_token: u64,
-    first_sequence: u64,
-    created_at: &'a str,
-    codec: &'static str,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ObjectVersionBody {
     #[serde(default)]
@@ -84,8 +83,6 @@ struct ObjectVersionBody {
     user_meta: Option<serde_json::Value>,
     #[serde(default)]
     shard_map: Option<serde_json::Value>,
-    #[serde(default)]
-    inline_payload: Option<Vec<u8>>,
     #[serde(default)]
     checksum: Option<Vec<u8>>,
     #[serde(default)]
@@ -141,8 +138,8 @@ async fn append_object_mutation(
     bucket: &Bucket,
     object: &Object,
     mutation: ObjectJournalMutation,
-) -> Result<PathBuf> {
-    append_object_mutation_inner(storage, bucket, object, mutation, 0).await
+) -> Result<()> {
+    append_object_mutation_inner(storage, bucket, object, mutation, 0, None).await
 }
 
 pub(crate) async fn append_object_mutation_with_permit(
@@ -152,10 +149,19 @@ pub(crate) async fn append_object_mutation_with_permit(
     mutation: ObjectJournalMutation,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
-) -> Result<PathBuf> {
+) -> Result<()> {
     require_object_metadata_permit(bucket, permit)?;
-    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
-    append_object_mutation_inner(storage, bucket, object, mutation, permit.fence_token).await
+    let partition_precondition =
+        partition_write_ref_precondition(storage, permit, partition_owner_signing_key).await?;
+    append_object_mutation_inner(
+        storage,
+        bucket,
+        object,
+        mutation,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
 }
 
 async fn append_object_mutation_inner(
@@ -164,15 +170,48 @@ async fn append_object_mutation_inner(
     object: &Object,
     mutation: ObjectJournalMutation,
     fence_token: u64,
-) -> Result<PathBuf> {
-    let path = storage.metadata_journal_path(bucket.tenant_id, bucket.id);
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+    partition_precondition: Option<CoreMutationPrecondition>,
+) -> Result<()> {
+    const MAX_STREAM_HEAD_RETRIES: usize = 64;
+
+    for attempt in 0..MAX_STREAM_HEAD_RETRIES {
+        let result = append_object_mutation_inner_once(
+            storage,
+            bucket,
+            object,
+            mutation,
+            fence_token,
+            partition_precondition.clone(),
+        )
+        .await;
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if is_stream_head_mismatch(&error) && attempt + 1 < MAX_STREAM_HEAD_RETRIES =>
+            {
+                tokio::task::yield_now().await;
+            }
+            Err(error) => return Err(error),
+        }
     }
 
-    ensure_journal_header(&path, bucket, fence_token).await?;
-    let existing = tokio::fs::read(&path).await?;
-    let (header_len, frames) = decode_journal_file(&existing)?;
+    unreachable!("metadata journal stream-head retry loop always returns")
+}
+
+async fn append_object_mutation_inner_once(
+    storage: &Storage,
+    bucket: &Bucket,
+    object: &Object,
+    mutation: ObjectJournalMutation,
+    fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
+) -> Result<()> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
+    let raw_stream_head = core_store.raw_stream_head(&stream_id).await?;
+    let frames = read_raw_metadata_journal_frames_from_store(&core_store, &stream_id)
+        .await
+        .unwrap_or_default();
     let previous_hash = frames
         .last()
         .map(|frame| frame.record_hash)
@@ -203,7 +242,6 @@ async fn append_object_mutation_inner(
         storage_class: object.storage_class,
         user_meta: object.user_meta.clone(),
         shard_map: object.shard_map.clone(),
-        inline_payload: object.inline_payload.clone(),
         checksum: object.checksum.clone(),
         link: object.link.clone(),
         delete_marker: mutation.is_delete_marker(),
@@ -261,26 +299,65 @@ async fn append_object_mutation_inner(
     updated_frames.push(directory_frame.clone());
     validate_journal_chain(&updated_frames)?;
 
-    let mut file = tokio::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
+    let partition_id = hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id));
+    let mut preconditions = partition_precondition.into_iter().collect::<Vec<_>>();
+    preconditions.push(CoreMutationPrecondition::StreamHead {
+        stream_id: stream_id.clone(),
+        expected_last_sequence: raw_stream_head.0,
+        expected_last_event_hash: raw_stream_head.1,
+    });
+    core_store
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id: format!(
+                "object-metadata:{}:{}",
+                object.mutation_id,
+                mutation.event_name()
+            ),
+            scope_partition: partition_id.clone(),
+            committed_by_principal: object_metadata_partition_principal(bucket),
+            preconditions,
+            operations: vec![
+                CoreMutationOperation::StreamAppend {
+                    partition_id: partition_id.clone(),
+                    stream_id: stream_id.clone(),
+                    record_kind: "object_metadata".to_string(),
+                    payload: object_frame.encode(),
+                    idempotency_key: Some(format!(
+                        "object-metadata:{}:{}:object",
+                        object.mutation_id,
+                        mutation.event_name()
+                    )),
+                },
+                CoreMutationOperation::StreamAppend {
+                    partition_id: partition_id.clone(),
+                    stream_id: stream_id.clone(),
+                    record_kind: "object_metadata".to_string(),
+                    payload: directory_frame.encode(),
+                    idempotency_key: Some(format!(
+                        "object-metadata:{}:{}:directory",
+                        object.mutation_id,
+                        mutation.event_name()
+                    )),
+                },
+                CoreMutationOperation::RefUpdate {
+                    partition_id,
+                    ref_name: current_object_ref_name(bucket, &object.key),
+                    new_target: current_object_ref_target(&stream_id, &directory_frame),
+                },
+            ],
+        })
         .await?;
-    file.write_all(&object_frame.encode()).await?;
-    file.write_all(&directory_frame.encode()).await?;
-    file.sync_data().await?;
-
-    debug_assert!(header_len <= existing.len());
-    Ok(path)
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedObjectMetadataSegments {
     pub generation: u64,
-    pub metadata_path: PathBuf,
-    pub directory_path: PathBuf,
+    pub metadata_ref: String,
+    pub directory_ref: String,
     pub metadata_record_count: usize,
     pub directory_record_count: usize,
-    pub manifest_path: PathBuf,
+    pub manifest_ref: String,
     pub manifest_hash: String,
 }
 
@@ -355,7 +432,7 @@ pub struct ManifestSegmentRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WrittenSegment {
     family: FileFamily,
-    path: PathBuf,
+    ref_name: String,
     record_count: u64,
     file_hash: String,
 }
@@ -379,7 +456,7 @@ async fn seal_object_journal_segments(
     bucket: &Bucket,
     manifest_signing_key: &[u8],
 ) -> Result<SealedObjectMetadataSegments> {
-    seal_object_journal_segments_inner(storage, bucket, manifest_signing_key, 0).await
+    seal_object_journal_segments_inner(storage, bucket, manifest_signing_key, 0, None).await
 }
 
 pub(crate) async fn seal_object_journal_segments_with_permit(
@@ -390,9 +467,16 @@ pub(crate) async fn seal_object_journal_segments_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<SealedObjectMetadataSegments> {
     require_object_metadata_permit(bucket, permit)?;
-    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
-    seal_object_journal_segments_inner(storage, bucket, manifest_signing_key, permit.fence_token)
-        .await
+    let partition_precondition =
+        partition_write_ref_precondition(storage, permit, partition_owner_signing_key).await?;
+    seal_object_journal_segments_inner(
+        storage,
+        bucket,
+        manifest_signing_key,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
 }
 
 async fn seal_object_journal_segments_inner(
@@ -400,12 +484,9 @@ async fn seal_object_journal_segments_inner(
     bucket: &Bucket,
     manifest_signing_key: &[u8],
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<SealedObjectMetadataSegments> {
-    let journal_path = storage.metadata_journal_path(bucket.tenant_id, bucket.id);
-    let journal_bytes = tokio::fs::read(&journal_path)
-        .await
-        .with_context(|| format!("read metadata journal {}", journal_path.display()))?;
-    let (_, frames) = decode_journal_file(&journal_bytes)?;
+    let frames = read_all_metadata_journal_frames(storage, bucket).await?;
     let generation = frames
         .last()
         .map(|frame| frame.partition_sequence)
@@ -435,11 +516,10 @@ async fn seal_object_journal_segments_inner(
         .map(|(key, value)| SegmentRecord::new(key, value))
         .collect::<Vec<_>>();
 
-    let metadata_path = storage.metadata_segment_path(bucket.tenant_id, bucket.id, generation);
-    let directory_path = storage.directory_segment_path(bucket.tenant_id, bucket.id, generation);
-
     let metadata_segment = write_segment_file(
-        &metadata_path,
+        storage,
+        bucket,
+        generation,
         FileFamily::MetadataSegment,
         segment_header(
             bucket,
@@ -451,32 +531,33 @@ async fn seal_object_journal_segments_inner(
     )
     .await?;
     let directory_segment = write_segment_file(
-        &directory_path,
+        storage,
+        bucket,
+        generation,
         FileFamily::DirectorySegment,
         segment_header(bucket, generation, "directory", "tenant_bucket_prefix_key"),
         &directory_records,
     )
     .await?;
-    let manifest_path = storage.metadata_manifest_path(bucket.tenant_id, bucket.id);
-    let manifest = write_partition_manifest(
+    let (manifest, manifest_ref) = write_partition_manifest(
         storage,
         bucket,
         generation,
         &frames,
         &[metadata_segment, directory_segment],
         manifest_signing_key,
-        &manifest_path,
         fence_token,
+        partition_precondition,
     )
     .await?;
 
     Ok(SealedObjectMetadataSegments {
         generation,
-        metadata_path,
-        directory_path,
+        metadata_ref: manifest.segments[0].path.clone(),
+        directory_ref: manifest.segments[1].path.clone(),
         metadata_record_count: metadata_records.len(),
         directory_record_count: directory_records.len(),
-        manifest_path,
+        manifest_ref,
         manifest_hash: manifest
             .manifest_hash
             .clone()
@@ -524,11 +605,9 @@ pub async fn recover_object_metadata_partition(
     bucket: &Bucket,
     manifest_signing_key: &[u8],
 ) -> Result<RecoveredObjectMetadataPartition> {
-    let manifest_path = storage.metadata_manifest_path(bucket.tenant_id, bucket.id);
-    let manifest_bytes = tokio::fs::read(&manifest_path)
-        .await
-        .with_context(|| format!("read partition manifest {}", manifest_path.display()))?;
-    let manifest = decode_partition_manifest(&manifest_bytes, manifest_signing_key)?;
+    let manifest = read_latest_partition_manifest(storage, bucket, manifest_signing_key)
+        .await?
+        .ok_or_else(|| anyhow!("object metadata partition manifest is missing"))?;
     let expected_partition_id =
         hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id));
     if manifest.partition_family != "object_metadata" {
@@ -542,10 +621,7 @@ pub async fn recover_object_metadata_partition(
     let mut directory_latest = std::collections::BTreeMap::<Vec<u8>, SegmentRecord>::new();
     for segment in &manifest.segments {
         let family = file_family_from_manifest_name(&segment.family)?;
-        let segment_path = storage.resolve_relative_storage_path(&segment.path)?;
-        let bytes = tokio::fs::read(&segment_path)
-            .await
-            .with_context(|| format!("read partition segment {}", segment_path.display()))?;
+        let bytes = read_manifest_segment(storage, segment).await?;
         let (body, footer) = decode_segment_file_with_footer(&bytes, family)?;
         if hex::encode(footer.file_hash) != segment.file_hash {
             return Err(anyhow!("partition segment file hash mismatch"));
@@ -571,11 +647,7 @@ pub async fn recover_object_metadata_partition(
     }
 
     if let Some(active_journal) = &manifest.active_journal {
-        let journal_path = storage.resolve_relative_storage_path(&active_journal.path)?;
-        let journal_bytes = tokio::fs::read(&journal_path)
-            .await
-            .with_context(|| format!("read active journal {}", journal_path.display()))?;
-        let (_, frames) = decode_journal_file(&journal_bytes)?;
+        let frames = read_manifest_journal_ref_frames(storage, active_journal).await?;
         let first = frames
             .first()
             .ok_or_else(|| anyhow!("active journal manifest entry points at an empty journal"))?;
@@ -623,11 +695,9 @@ async fn recover_object_directory_partition(
     PartitionManifest,
     std::collections::BTreeMap<Vec<u8>, DirectoryEntryBody>,
 )> {
-    let manifest_path = storage.metadata_manifest_path(bucket.tenant_id, bucket.id);
-    let manifest_bytes = tokio::fs::read(&manifest_path)
-        .await
-        .with_context(|| format!("read partition manifest {}", manifest_path.display()))?;
-    let manifest = decode_partition_manifest(&manifest_bytes, manifest_signing_key)?;
+    let manifest = read_latest_partition_manifest(storage, bucket, manifest_signing_key)
+        .await?
+        .ok_or_else(|| anyhow!("object metadata partition manifest is missing"))?;
     let expected_partition_id =
         hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id));
     if manifest.partition_family != "object_metadata" {
@@ -643,10 +713,7 @@ async fn recover_object_directory_partition(
         if family != FileFamily::DirectorySegment {
             continue;
         }
-        let segment_path = storage.resolve_relative_storage_path(&segment.path)?;
-        let bytes = tokio::fs::read(&segment_path)
-            .await
-            .with_context(|| format!("read directory segment {}", segment_path.display()))?;
+        let bytes = read_manifest_segment(storage, segment).await?;
         let (body, footer) = decode_segment_file_with_footer(&bytes, FileFamily::DirectorySegment)?;
         if hex::encode(footer.file_hash) != segment.file_hash {
             return Err(anyhow!("directory segment file hash mismatch"));
@@ -661,11 +728,7 @@ async fn recover_object_directory_partition(
     }
 
     if let Some(active_journal) = &manifest.active_journal {
-        let journal_path = storage.resolve_relative_storage_path(&active_journal.path)?;
-        let journal_bytes = tokio::fs::read(&journal_path)
-            .await
-            .with_context(|| format!("read active journal {}", journal_path.display()))?;
-        let (_, frames) = decode_journal_file(&journal_bytes)?;
+        let frames = read_manifest_journal_ref_frames(storage, active_journal).await?;
         let first = frames
             .first()
             .ok_or_else(|| anyhow!("active journal manifest entry points at an empty journal"))?;
@@ -708,13 +771,56 @@ pub async fn next_object_id(
 pub async fn read_current_object(
     storage: &Storage,
     bucket: &Bucket,
-    manifest_signing_key: &[u8],
+    _manifest_signing_key: &[u8],
     object_key: &str,
 ) -> Result<Option<Object>> {
-    Ok(read_current_objects(storage, bucket, manifest_signing_key)
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let Some(current_ref) = core_store
+        .read_ref(&current_object_ref_name(bucket, object_key))
+        .await?
+    else {
+        return Ok(None);
+    };
+    let (stream_id, sequence, expected_frame_hash) =
+        parse_current_object_ref_target(&current_ref.target)?;
+    let Some(record) = core_store
+        .read_stream(ReadStream {
+            stream_id: stream_id.clone(),
+            after_sequence: sequence.saturating_sub(1),
+            limit: 1,
+        })
         .await?
         .into_iter()
-        .find(|object| object.key == object_key))
+        .next()
+    else {
+        return Err(anyhow!(
+            "current object ref points at missing metadata stream record"
+        ));
+    };
+    if record.stream_id != stream_id || record.sequence != sequence {
+        return Err(anyhow!("current object ref stream cursor mismatch"));
+    }
+    let frame = JournalFrame::decode(&record.payload)?;
+    if frame.record_kind != JournalRecordKind::DirectoryEntry {
+        return Err(anyhow!(
+            "current object ref target is not a directory metadata frame"
+        ));
+    }
+    if hex::encode(frame.record_hash) != expected_frame_hash {
+        return Err(anyhow!("current object ref target frame hash mismatch"));
+    }
+    let body: DirectoryEntryBody = serde_json::from_slice(&frame.body)?;
+    if body.tenant_id != bucket.tenant_id
+        || body.bucket_id != bucket.id
+        || body.bucket_name != bucket.name
+        || body.object_key != object_key
+    {
+        return Err(anyhow!("current object ref target scope mismatch"));
+    }
+    if body.delete_marker || body.deleted_at.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(object_from_directory_body(&body)?))
 }
 
 pub async fn read_object_version(
@@ -829,35 +935,22 @@ pub(crate) async fn read_current_directory_objects(
     let mut directory_records = std::collections::BTreeMap::<Vec<u8>, DirectoryEntryBody>::new();
     let mut compacted_through_sequence = 0u64;
 
-    let manifest_path = storage.metadata_manifest_path(bucket.tenant_id, bucket.id);
-    if tokio::fs::metadata(&manifest_path).await.is_ok() {
+    if partition_manifest_exists(storage, bucket).await? {
         let (manifest, recovered_directory) =
             recover_object_directory_partition(storage, bucket, manifest_signing_key)
                 .await
-                .with_context(|| {
-                    format!(
-                        "recover object directory partition from {}",
-                        manifest_path.display()
-                    )
-                })?;
+                .context("recover object directory partition from CoreStore manifest")?;
         compacted_through_sequence = manifest.compacted_through_sequence;
         directory_records.extend(recovered_directory);
     }
 
-    let journal_path = storage.metadata_journal_path(bucket.tenant_id, bucket.id);
-    if tokio::fs::metadata(&journal_path).await.is_ok() {
-        let journal_bytes = tokio::fs::read(&journal_path)
-            .await
-            .with_context(|| format!("read metadata journal {}", journal_path.display()))?;
-        let (_, frames) = decode_journal_file(&journal_bytes)?;
-        for frame in frames {
-            if frame.partition_sequence <= compacted_through_sequence {
-                continue;
-            }
-            if frame.record_kind == JournalRecordKind::DirectoryEntry {
-                let body: DirectoryEntryBody = serde_json::from_slice(&frame.body)?;
-                directory_records.insert(directory_segment_key(&body), body);
-            }
+    for frame in read_all_metadata_journal_frames(storage, bucket).await? {
+        if frame.partition_sequence <= compacted_through_sequence {
+            continue;
+        }
+        if frame.record_kind == JournalRecordKind::DirectoryEntry {
+            let body: DirectoryEntryBody = serde_json::from_slice(&frame.body)?;
+            directory_records.insert(directory_segment_key(&body), body);
         }
     }
 
@@ -948,7 +1041,8 @@ pub async fn rebuild_directory_index_from_metadata_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<SealedObjectMetadataSegments> {
     require_object_metadata_permit(bucket, permit)?;
-    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
+    let partition_precondition =
+        partition_write_ref_precondition(storage, permit, partition_owner_signing_key).await?;
     let body_records =
         read_object_version_bodies_from_metadata_only(storage, bucket, manifest_signing_key)
             .await?;
@@ -975,10 +1069,10 @@ pub async fn rebuild_directory_index_from_metadata_with_permit(
         .map(|(key, body)| Ok(SegmentRecord::new(key, serde_json::to_vec(&body)?)))
         .collect::<Result<Vec<_>>>()?;
 
-    let metadata_path = storage.metadata_segment_path(bucket.tenant_id, bucket.id, generation);
-    let directory_path = storage.directory_segment_path(bucket.tenant_id, bucket.id, generation);
     let metadata_segment = write_segment_file(
-        &metadata_path,
+        storage,
+        bucket,
+        generation,
         FileFamily::MetadataSegment,
         segment_header(
             bucket,
@@ -990,32 +1084,33 @@ pub async fn rebuild_directory_index_from_metadata_with_permit(
     )
     .await?;
     let directory_segment = write_segment_file(
-        &directory_path,
+        storage,
+        bucket,
+        generation,
         FileFamily::DirectorySegment,
         segment_header(bucket, generation, "directory", "tenant_bucket_prefix_key"),
         &directory_records,
     )
     .await?;
-    let manifest_path = storage.metadata_manifest_path(bucket.tenant_id, bucket.id);
-    let manifest = write_partition_manifest(
+    let (manifest, manifest_ref) = write_partition_manifest(
         storage,
         bucket,
         generation,
         &frames,
         &[metadata_segment, directory_segment],
         manifest_signing_key,
-        &manifest_path,
         permit.fence_token,
+        Some(partition_precondition),
     )
     .await?;
 
     Ok(SealedObjectMetadataSegments {
         generation,
-        metadata_path,
-        directory_path,
+        metadata_ref: manifest.segments[0].path.clone(),
+        directory_ref: manifest.segments[1].path.clone(),
         metadata_record_count: metadata_records.len(),
         directory_record_count: directory_records.len(),
-        manifest_path,
+        manifest_ref,
         manifest_hash: manifest
             .manifest_hash
             .clone()
@@ -1175,16 +1270,10 @@ async fn read_object_version_bodies_inner(
     let mut order = 0usize;
     let mut compacted_through_sequence = 0u64;
 
-    let manifest_path = storage.metadata_manifest_path(bucket.tenant_id, bucket.id);
-    if tokio::fs::metadata(&manifest_path).await.is_ok() {
+    if partition_manifest_exists(storage, bucket).await? {
         let recovered = recover_object_metadata_partition(storage, bucket, manifest_signing_key)
             .await
-            .with_context(|| {
-                format!(
-                    "recover object metadata partition from {}",
-                    manifest_path.display()
-                )
-            })?;
+            .context("recover object metadata partition from CoreStore manifest")?;
         compacted_through_sequence = recovered.manifest.compacted_through_sequence;
         if let Some(max_sequence) = max_sequence {
             if compacted_through_sequence > max_sequence {
@@ -1200,27 +1289,20 @@ async fn read_object_version_bodies_inner(
         }
     }
 
-    let journal_path = storage.metadata_journal_path(bucket.tenant_id, bucket.id);
-    if tokio::fs::metadata(&journal_path).await.is_ok() {
-        let journal_bytes = tokio::fs::read(&journal_path)
-            .await
-            .with_context(|| format!("read metadata journal {}", journal_path.display()))?;
-        let (_, frames) = decode_journal_file(&journal_bytes)?;
-        for frame in frames {
-            if frame.partition_sequence <= compacted_through_sequence {
-                continue;
-            }
-            if max_sequence.is_some_and(|max_sequence| frame.partition_sequence > max_sequence) {
-                continue;
-            }
-            if matches!(
-                frame.record_kind,
-                JournalRecordKind::ObjectVersion | JournalRecordKind::DeleteMarker
-            ) {
-                let body: ObjectVersionBody = serde_json::from_slice(&frame.body)?;
-                body_records.push((order, body));
-                order += 1;
-            }
+    for frame in read_all_metadata_journal_frames(storage, bucket).await? {
+        if frame.partition_sequence <= compacted_through_sequence {
+            continue;
+        }
+        if max_sequence.is_some_and(|max_sequence| frame.partition_sequence > max_sequence) {
+            continue;
+        }
+        if matches!(
+            frame.record_kind,
+            JournalRecordKind::ObjectVersion | JournalRecordKind::DeleteMarker
+        ) {
+            let body: ObjectVersionBody = serde_json::from_slice(&frame.body)?;
+            body_records.push((order, body));
+            order += 1;
         }
     }
     Ok(body_records)
@@ -1235,12 +1317,9 @@ async fn read_object_version_bodies_from_metadata_only(
     let mut order = 0usize;
     let mut compacted_through_sequence = 0u64;
 
-    let manifest_path = storage.metadata_manifest_path(bucket.tenant_id, bucket.id);
-    if tokio::fs::metadata(&manifest_path).await.is_ok() {
-        let manifest_bytes = tokio::fs::read(&manifest_path)
-            .await
-            .with_context(|| format!("read partition manifest {}", manifest_path.display()))?;
-        let manifest = decode_partition_manifest(&manifest_bytes, manifest_signing_key)?;
+    if let Some(manifest) =
+        read_latest_partition_manifest(storage, bucket, manifest_signing_key).await?
+    {
         let expected_partition_id =
             hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id));
         if manifest.partition_family != "object_metadata" {
@@ -1255,10 +1334,7 @@ async fn read_object_version_bodies_from_metadata_only(
             if family != FileFamily::MetadataSegment {
                 continue;
             }
-            let segment_path = storage.resolve_relative_storage_path(&segment.path)?;
-            let bytes = tokio::fs::read(&segment_path)
-                .await
-                .with_context(|| format!("read metadata segment {}", segment_path.display()))?;
+            let bytes = read_manifest_segment(storage, segment).await?;
             let (body, footer) =
                 decode_segment_file_with_footer(&bytes, FileFamily::MetadataSegment)?;
             if hex::encode(footer.file_hash) != segment.file_hash {
@@ -1275,24 +1351,17 @@ async fn read_object_version_bodies_from_metadata_only(
         }
     }
 
-    let journal_path = storage.metadata_journal_path(bucket.tenant_id, bucket.id);
-    if tokio::fs::metadata(&journal_path).await.is_ok() {
-        let journal_bytes = tokio::fs::read(&journal_path)
-            .await
-            .with_context(|| format!("read metadata journal {}", journal_path.display()))?;
-        let (_, frames) = decode_journal_file(&journal_bytes)?;
-        for frame in frames {
-            if frame.partition_sequence <= compacted_through_sequence {
-                continue;
-            }
-            if matches!(
-                frame.record_kind,
-                JournalRecordKind::ObjectVersion | JournalRecordKind::DeleteMarker
-            ) {
-                let body: ObjectVersionBody = serde_json::from_slice(&frame.body)?;
-                body_records.push((order, body));
-                order += 1;
-            }
+    for frame in read_all_metadata_journal_frames(storage, bucket).await? {
+        if frame.partition_sequence <= compacted_through_sequence {
+            continue;
+        }
+        if matches!(
+            frame.record_kind,
+            JournalRecordKind::ObjectVersion | JournalRecordKind::DeleteMarker
+        ) {
+            let body: ObjectVersionBody = serde_json::from_slice(&frame.body)?;
+            body_records.push((order, body));
+            order += 1;
         }
     }
     Ok(body_records)
@@ -1306,35 +1375,22 @@ async fn current_directory_entries_from_index(
     let mut directory_records = std::collections::BTreeMap::<Vec<u8>, DirectoryEntryBody>::new();
     let mut compacted_through_sequence = 0u64;
 
-    let manifest_path = storage.metadata_manifest_path(bucket.tenant_id, bucket.id);
-    if tokio::fs::metadata(&manifest_path).await.is_ok() {
+    if partition_manifest_exists(storage, bucket).await? {
         let (manifest, recovered_directory) =
             recover_object_directory_partition(storage, bucket, manifest_signing_key)
                 .await
-                .with_context(|| {
-                    format!(
-                        "recover object directory partition from {}",
-                        manifest_path.display()
-                    )
-                })?;
+                .context("recover object directory partition from CoreStore manifest")?;
         compacted_through_sequence = manifest.compacted_through_sequence;
         directory_records.extend(recovered_directory);
     }
 
-    let journal_path = storage.metadata_journal_path(bucket.tenant_id, bucket.id);
-    if tokio::fs::metadata(&journal_path).await.is_ok() {
-        let journal_bytes = tokio::fs::read(&journal_path)
-            .await
-            .with_context(|| format!("read metadata journal {}", journal_path.display()))?;
-        let (_, frames) = decode_journal_file(&journal_bytes)?;
-        for frame in frames {
-            if frame.partition_sequence <= compacted_through_sequence {
-                continue;
-            }
-            if frame.record_kind == JournalRecordKind::DirectoryEntry {
-                let body: DirectoryEntryBody = serde_json::from_slice(&frame.body)?;
-                directory_records.insert(directory_segment_key(&body), body);
-            }
+    for frame in read_all_metadata_journal_frames(storage, bucket).await? {
+        if frame.partition_sequence <= compacted_through_sequence {
+            continue;
+        }
+        if frame.record_kind == JournalRecordKind::DirectoryEntry {
+            let body: DirectoryEntryBody = serde_json::from_slice(&frame.body)?;
+            directory_records.insert(directory_segment_key(&body), body);
         }
     }
     Ok(directory_records)
@@ -1417,11 +1473,12 @@ async fn read_all_metadata_journal_frames(
     storage: &Storage,
     bucket: &Bucket,
 ) -> Result<Vec<JournalFrame>> {
-    let journal_path = storage.metadata_journal_path(bucket.tenant_id, bucket.id);
-    let journal_bytes = tokio::fs::read(&journal_path)
-        .await
-        .with_context(|| format!("read metadata journal {}", journal_path.display()))?;
-    Ok(decode_journal_file(&journal_bytes)?.1)
+    let core_store = CoreStore::new(storage.clone()).await?;
+    read_metadata_journal_frames_from_store(
+        &core_store,
+        &object_metadata_stream_id(bucket.tenant_id, bucket.id),
+    )
+    .await
 }
 
 fn object_versions_by_key(
@@ -1470,14 +1527,13 @@ fn version_sorts_after_marker(
 }
 
 async fn write_segment_file(
-    path: &Path,
+    storage: &Storage,
+    bucket: &Bucket,
+    generation: u64,
     family: FileFamily,
     header: SegmentHeader,
     records: &[SegmentRecord],
 ) -> Result<WrittenSegment> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
     let header_json = serde_json::to_vec(&header)?;
     let envelope = BinaryEnvelopeHeader::new(family, 0, 0, header_json);
     let encoded_header = envelope.encode();
@@ -1490,21 +1546,58 @@ async fn write_segment_file(
         first_record_hash,
         last_record_hash,
     );
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
+    let file_hash = hex::encode(footer.file_hash);
+    let ref_name = metadata_segment_ref_name(bucket, generation, family, &file_hash)?;
+    let mut bytes = Vec::with_capacity(encoded_header.len() + body.len() + COMMON_FOOTER_LEN);
+    bytes.extend_from_slice(&encoded_header);
+    bytes.extend_from_slice(&body);
+    bytes.extend_from_slice(&footer.encode());
+
+    let store = CoreStore::new(storage.clone()).await?;
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: ref_name.clone(),
+            bytes,
+            region_id: "local".to_string(),
+            mutation_id: format!(
+                "metadata-segment:{}:{}:{}",
+                bucket.tenant_id, bucket.id, generation
+            ),
+        })
         .await?;
-    file.write_all(&encoded_header).await?;
-    file.write_all(&body).await?;
-    file.write_all(&footer.encode()).await?;
-    file.sync_data().await?;
+    let new_target = encode_core_object_ref_target(&object_ref)?;
+    match store
+        .compare_and_swap_ref(CompareAndSwapRef {
+            ref_name: ref_name.clone(),
+            expected_generation: None,
+            expected_target: None,
+            require_absent: true,
+            require_present: false,
+            fence: None,
+            authz_revision: None,
+            source_watch_cursor: None,
+            new_target: new_target.clone(),
+            transaction_id: None,
+        })
+        .await
+    {
+        Ok(_) => {}
+        Err(error) if error.to_string().contains("must be absent") => {
+            let existing = store
+                .read_ref(&ref_name)
+                .await?
+                .ok_or_else(|| anyhow!("metadata segment ref disappeared after CAS conflict"))?;
+            if existing.target != new_target {
+                return Err(error);
+            }
+        }
+        Err(error) => return Err(error),
+    }
     Ok(WrittenSegment {
         family,
-        path: path.to_path_buf(),
+        ref_name,
         record_count: records.len() as u64,
-        file_hash: hex::encode(footer.file_hash),
+        file_hash,
     })
 }
 
@@ -1515,22 +1608,21 @@ async fn write_partition_manifest(
     frames: &[JournalFrame],
     segments: &[WrittenSegment],
     manifest_signing_key: &[u8],
-    manifest_path: &Path,
     fence_token: u64,
-) -> Result<PartitionManifest> {
+    partition_precondition: Option<CoreMutationPrecondition>,
+) -> Result<(PartitionManifest, String)> {
     if manifest_signing_key.is_empty() {
         return Err(anyhow!("partition manifest signing key must not be empty"));
-    }
-    if let Some(parent) = manifest_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
     }
     let last_record_hash = frames
         .last()
         .map(|frame| hex::encode(frame.record_hash))
         .ok_or_else(|| anyhow!("partition manifest requires at least one journal frame"))?;
     let journal_ref = ManifestJournalRef {
-        path: storage
-            .relative_storage_path(&storage.metadata_journal_path(bucket.tenant_id, bucket.id))?,
+        path: format!(
+            "corestream:{}",
+            object_metadata_stream_id(bucket.tenant_id, bucket.id)
+        ),
         first_sequence: frames
             .first()
             .map(|frame| frame.partition_sequence)
@@ -1543,7 +1635,7 @@ async fn write_partition_manifest(
         .map(|segment| {
             Ok(ManifestSegmentRef {
                 family: file_family_name(segment.family).to_string(),
-                path: storage.relative_storage_path(&segment.path)?,
+                path: format!("{MANIFEST_SEGMENT_REF_PREFIX}{}", segment.ref_name),
                 generation,
                 record_count: segment.record_count,
                 file_hash: segment.file_hash.clone(),
@@ -1567,18 +1659,57 @@ async fn write_partition_manifest(
     };
     let manifest_hash = compute_manifest_hash(&manifest)?;
     let manifest_signature = sign_manifest(&manifest_hash, &manifest, manifest_signing_key)?;
-    manifest.manifest_hash = Some(manifest_hash);
+    manifest.manifest_hash = Some(manifest_hash.clone());
     manifest.manifest_signature = Some(manifest_signature);
     let encoded = serde_json::to_vec_pretty(&manifest)?;
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(manifest_path)
+    let manifest_ref = metadata_manifest_ref_name(bucket)?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: manifest_ref.clone(),
+            bytes: encoded,
+            region_id: "local".to_string(),
+            mutation_id: format!(
+                "metadata-manifest:{}:{}:{}",
+                bucket.tenant_id, bucket.id, generation
+            ),
+        })
         .await?;
-    file.write_all(&encoded).await?;
-    file.sync_data().await?;
-    Ok(manifest)
+    let new_target = encode_core_object_ref_target(&object_ref)?;
+    if let Some(precondition) = partition_precondition {
+        store
+            .commit_mutation_batch(CoreMutationBatch {
+                transaction_id: format!(
+                    "metadata-manifest:{}:{}:{}:{}",
+                    bucket.tenant_id, bucket.id, generation, manifest_hash
+                ),
+                scope_partition: manifest.partition_id.clone(),
+                committed_by_principal: object_metadata_partition_principal(bucket),
+                preconditions: vec![precondition],
+                operations: vec![CoreMutationOperation::RefUpdate {
+                    partition_id: manifest.partition_id.clone(),
+                    ref_name: manifest_ref.clone(),
+                    new_target,
+                }],
+            })
+            .await?;
+    } else {
+        store
+            .compare_and_swap_ref(CompareAndSwapRef {
+                ref_name: manifest_ref.clone(),
+                expected_generation: None,
+                expected_target: None,
+                require_absent: false,
+                require_present: false,
+                fence: None,
+                authz_revision: None,
+                source_watch_cursor: None,
+                new_target,
+                transaction_id: None,
+            })
+            .await?;
+    }
+    Ok((manifest, manifest_ref))
 }
 
 pub fn decode_partition_manifest(
@@ -1588,6 +1719,68 @@ pub fn decode_partition_manifest(
     let manifest: PartitionManifest = serde_json::from_slice(input)?;
     verify_partition_manifest(&manifest, manifest_signing_key)?;
     Ok(manifest)
+}
+
+pub(crate) async fn read_latest_partition_manifest(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+) -> Result<Option<PartitionManifest>> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(ref_value) = store.read_ref(&metadata_manifest_ref_name(bucket)?).await? else {
+        return Ok(None);
+    };
+    let bytes = store
+        .get_blob(GetBlob {
+            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+        })
+        .await?;
+    Ok(Some(decode_partition_manifest(
+        &bytes,
+        manifest_signing_key,
+    )?))
+}
+
+async fn partition_manifest_exists(storage: &Storage, bucket: &Bucket) -> Result<bool> {
+    Ok(CoreStore::new(storage.clone())
+        .await?
+        .read_ref(&metadata_manifest_ref_name(bucket)?)
+        .await?
+        .is_some())
+}
+
+async fn read_manifest_segment(storage: &Storage, segment: &ManifestSegmentRef) -> Result<Vec<u8>> {
+    let ref_name = segment
+        .path
+        .strip_prefix(MANIFEST_SEGMENT_REF_PREFIX)
+        .ok_or_else(|| anyhow!("partition segment manifest entry is not a CoreStore ref"))?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let ref_value = store
+        .read_ref(ref_name)
+        .await?
+        .ok_or_else(|| anyhow!("partition segment ref is missing"))?;
+    store
+        .get_blob(GetBlob {
+            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+        })
+        .await
+}
+
+#[cfg(test)]
+async fn read_core_ref_uri_payload(storage: &Storage, ref_uri: &str) -> Result<Vec<u8>> {
+    let ref_name = ref_uri
+        .strip_prefix(MANIFEST_SEGMENT_REF_PREFIX)
+        .unwrap_or(ref_uri);
+    let store = CoreStore::new(storage.clone()).await?;
+    let ref_value = store
+        .read_ref(ref_name)
+        .await?
+        .ok_or_else(|| anyhow!("CoreStore ref is missing"))?;
+    store
+        .get_blob(GetBlob {
+            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+        })
+        .await
 }
 
 pub fn verify_partition_manifest(
@@ -1642,6 +1835,7 @@ fn file_family_name(family: FileFamily) -> &'static str {
         FileFamily::PersonalDbLogSegment => "personaldb_log_segment",
         FileFamily::PersonalDbRowIndex => "personaldb_row_index",
         FileFamily::GitSourceIndex => "git_source_index",
+        FileFamily::TypedFieldSegment => "typed_field_segment",
     }
 }
 
@@ -1689,7 +1883,6 @@ fn object_from_body(body: &ObjectVersionBody) -> Result<Object> {
         storage_class: body.storage_class,
         user_meta: body.user_meta.clone(),
         shard_map: body.shard_map.clone(),
-        inline_payload: body.inline_payload.clone(),
         checksum: body.checksum.clone(),
         link: body.link.clone(),
     })
@@ -1721,7 +1914,6 @@ fn object_from_directory_body(body: &DirectoryEntryBody) -> Result<Object> {
         storage_class: body.storage_class,
         user_meta: body.user_meta.clone(),
         shard_map: body.shard_map.clone(),
-        inline_payload: None,
         checksum: None,
         link: body.link.clone(),
     })
@@ -1778,16 +1970,52 @@ fn directory_segment_key(body: &DirectoryEntryBody) -> Vec<u8> {
     .into_bytes()
 }
 
-pub fn decode_journal_file(input: &[u8]) -> Result<(usize, Vec<JournalFrame>)> {
-    let header = BinaryEnvelopeHeader::decode(input)?;
-    if header.family != FileFamily::MetadataJournal {
-        return Err(anyhow!("not a metadata journal file"));
+fn metadata_segment_ref_name(
+    bucket: &Bucket,
+    generation: u64,
+    family: FileFamily,
+    file_hash: &str,
+) -> Result<String> {
+    validate_hex32(file_hash, "metadata segment file hash")?;
+    let prefix = match family {
+        FileFamily::MetadataSegment => METADATA_SEGMENT_REF_PREFIX,
+        FileFamily::DirectorySegment => DIRECTORY_SEGMENT_REF_PREFIX,
+        _ => return Err(anyhow!("unsupported object metadata segment family")),
+    };
+    Ok(format!(
+        "{prefix}tenant:{}:bucket:{}:generation:{generation:020}:hash:{file_hash}",
+        bucket.tenant_id, bucket.id
+    ))
+}
+
+fn metadata_manifest_ref_name(bucket: &Bucket) -> Result<String> {
+    Ok(format!(
+        "{METADATA_MANIFEST_REF_PREFIX}tenant:{}:bucket:{}",
+        bucket.tenant_id, bucket.id
+    ))
+}
+
+fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
+    if value.len() != 64 || !value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow!("{field} must be hex32"));
     }
-    let header_len = COMMON_HEADER_LEN
-        .checked_add(header.header_json.len())
-        .ok_or_else(|| anyhow!("metadata journal header length overflow"))?;
-    let frames = decode_frames(&input[header_len..])?;
-    Ok((header_len, frames))
+    Ok(())
+}
+
+fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
+    Ok(format!(
+        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
+    ))
+}
+
+fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
+    let encoded = target
+        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
+        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
+    Ok(serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded)?,
+    )?)
 }
 
 pub async fn active_object_journal_stats(
@@ -1796,27 +2024,13 @@ pub async fn active_object_journal_stats(
     manifest_signing_key: &[u8],
 ) -> Result<ActiveObjectJournalStats> {
     let mut compacted_through_sequence = 0;
-    let manifest_path = storage.metadata_manifest_path(bucket.tenant_id, bucket.id);
-    if tokio::fs::metadata(&manifest_path).await.is_ok() {
-        let manifest_bytes = tokio::fs::read(&manifest_path)
-            .await
-            .with_context(|| format!("read partition manifest {}", manifest_path.display()))?;
-        compacted_through_sequence =
-            decode_partition_manifest(&manifest_bytes, manifest_signing_key)?
-                .compacted_through_sequence;
+    if let Some(manifest) =
+        read_latest_partition_manifest(storage, bucket, manifest_signing_key).await?
+    {
+        compacted_through_sequence = manifest.compacted_through_sequence;
     }
 
-    let journal_path = storage.metadata_journal_path(bucket.tenant_id, bucket.id);
-    if tokio::fs::metadata(&journal_path).await.is_err() {
-        return Ok(ActiveObjectJournalStats {
-            compacted_through_sequence,
-            ..ActiveObjectJournalStats::default()
-        });
-    }
-    let journal_bytes = tokio::fs::read(&journal_path)
-        .await
-        .with_context(|| format!("read metadata journal {}", journal_path.display()))?;
-    let (_, frames) = decode_journal_file(&journal_bytes)?;
+    let frames = read_all_metadata_journal_frames(storage, bucket).await?;
     let mut stats = ActiveObjectJournalStats {
         last_sequence: frames
             .last()
@@ -1852,12 +2066,9 @@ pub async fn object_metadata_source_checkpoint_hash(
     hasher.update(&max_sequence.to_le_bytes());
 
     let mut compacted_through_sequence = 0u64;
-    let manifest_path = storage.metadata_manifest_path(bucket.tenant_id, bucket.id);
-    if tokio::fs::metadata(&manifest_path).await.is_ok() {
-        let manifest_bytes = tokio::fs::read(&manifest_path)
-            .await
-            .with_context(|| format!("read partition manifest {}", manifest_path.display()))?;
-        let manifest = decode_partition_manifest(&manifest_bytes, manifest_signing_key)?;
+    if let Some(manifest) =
+        read_latest_partition_manifest(storage, bucket, manifest_signing_key).await?
+    {
         compacted_through_sequence = manifest.compacted_through_sequence;
         if compacted_through_sequence > max_sequence {
             return Err(anyhow!(
@@ -1869,81 +2080,124 @@ pub async fn object_metadata_source_checkpoint_hash(
         hasher.update(&[0; 32]);
     }
 
-    let journal_path = storage.metadata_journal_path(bucket.tenant_id, bucket.id);
-    if tokio::fs::metadata(&journal_path).await.is_ok() {
-        let journal_bytes = tokio::fs::read(&journal_path)
-            .await
-            .with_context(|| format!("read metadata journal {}", journal_path.display()))?;
-        let (_, frames) = decode_journal_file(&journal_bytes)?;
-        for frame in frames {
-            if frame.partition_sequence <= compacted_through_sequence
-                || frame.partition_sequence > max_sequence
-            {
-                continue;
-            }
-            hasher.update(&frame.partition_sequence.to_le_bytes());
-            hasher.update(&frame.record_hash);
+    for frame in read_all_metadata_journal_frames(storage, bucket).await? {
+        if frame.partition_sequence <= compacted_through_sequence
+            || frame.partition_sequence > max_sequence
+        {
+            continue;
         }
+        hasher.update(&frame.partition_sequence.to_le_bytes());
+        hasher.update(&frame.record_hash);
     }
 
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-fn decode_frames(mut input: &[u8]) -> Result<Vec<JournalFrame>> {
+async fn read_manifest_journal_ref_frames(
+    storage: &Storage,
+    journal_ref: &ManifestJournalRef,
+) -> Result<Vec<JournalFrame>> {
+    let stream_id = journal_ref
+        .path
+        .strip_prefix("corestream:")
+        .ok_or_else(|| anyhow!("object metadata manifest journal ref must use corestream:"))?;
+    let core_store = CoreStore::new(storage.clone()).await?;
+    read_metadata_journal_frames_from_store(&core_store, stream_id).await
+}
+
+async fn read_metadata_journal_frames_from_store(
+    core_store: &CoreStore,
+    stream_id: &str,
+) -> Result<Vec<JournalFrame>> {
+    let records = core_store
+        .read_stream(ReadStream {
+            stream_id: stream_id.to_string(),
+            after_sequence: 0,
+            limit: 0,
+        })
+        .await?;
     let mut frames = Vec::new();
-    while !input.is_empty() {
-        if input.len() < 4 {
-            return Err(FormatError::TooShort {
-                context: "journal frame length",
-                needed: 4,
-                actual: input.len(),
-            }
-            .into());
+    for record in records {
+        if record.record_kind != "object_metadata" {
+            continue;
         }
-        let frame_len = u32::from_le_bytes(input[0..4].try_into().unwrap()) as usize;
-        let frame_end = 4usize
-            .checked_add(frame_len)
-            .ok_or_else(|| anyhow!("journal frame length overflow"))?;
-        if input.len() < frame_end {
-            return Err(FormatError::TooShort {
-                context: "journal frame",
-                needed: frame_end,
-                actual: input.len(),
-            }
-            .into());
-        }
-        frames.push(JournalFrame::decode(&input[..frame_end])?);
-        input = &input[frame_end..];
+        frames.push(JournalFrame::decode(&record.payload)?);
     }
     validate_journal_chain(&frames)?;
     Ok(frames)
 }
 
-async fn ensure_journal_header(path: &Path, bucket: &Bucket, fence_token: u64) -> Result<()> {
-    if tokio::fs::try_exists(path).await? {
-        return Ok(());
+async fn read_raw_metadata_journal_frames_from_store(
+    core_store: &CoreStore,
+    stream_id: &str,
+) -> Result<Vec<JournalFrame>> {
+    let records = core_store.read_raw_stream(stream_id).await?;
+    let mut frames = Vec::new();
+    for record in records {
+        if record.record_kind != "object_metadata" {
+            continue;
+        }
+        frames.push(JournalFrame::decode(&record.payload)?);
     }
-    let created_at = bucket.created_at.to_rfc3339();
-    let header_json = serde_json::to_vec(&MetadataJournalHeader {
-        tenant_id: bucket.tenant_id.to_string(),
-        bucket_id: bucket.id.to_string(),
-        partition_family: "object_metadata",
-        partition_id: hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id)),
-        fence_token,
-        first_sequence: 1,
-        created_at: &created_at,
-        codec: "none",
-    })?;
-    let header = BinaryEnvelopeHeader::new(FileFamily::MetadataJournal, 0, 0, header_json);
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .await
-        .with_context(|| format!("create metadata journal {}", path.display()))?;
-    file.write_all(&header.encode()).await?;
-    file.sync_data().await?;
-    Ok(())
+    validate_journal_chain(&frames)?;
+    Ok(frames)
+}
+
+fn object_metadata_stream_id(tenant_id: i64, bucket_id: i64) -> String {
+    format!("object_metadata:tenant:{tenant_id}:bucket:{bucket_id}")
+}
+
+fn object_metadata_partition_principal(bucket: &Bucket) -> String {
+    format!(
+        "partition-owner:object_metadata:{}:{}",
+        bucket.tenant_id, bucket.id
+    )
+}
+
+fn current_object_ref_name(bucket: &Bucket, object_key: &str) -> String {
+    let key_hash = hex::encode(hash32(object_key.as_bytes()));
+    format!(
+        "{CURRENT_OBJECT_REF_PREFIX}tenant:{}:bucket:{}:key:{key_hash}",
+        bucket.tenant_id, bucket.id
+    )
+}
+
+fn current_object_ref_target(stream_id: &str, frame: &JournalFrame) -> String {
+    format!(
+        "corestream:{stream_id}:sequence:{}:hash:{}",
+        frame.partition_sequence,
+        hex::encode(frame.record_hash)
+    )
+}
+
+fn parse_current_object_ref_target(target: &str) -> Result<(String, u64, String)> {
+    let rest = target
+        .strip_prefix("corestream:")
+        .ok_or_else(|| anyhow!("current object ref target must use corestream scheme"))?;
+    let (stream_id, rest) = rest
+        .split_once(":sequence:")
+        .ok_or_else(|| anyhow!("current object ref target is missing sequence"))?;
+    let (sequence, frame_hash) = rest
+        .split_once(":hash:")
+        .ok_or_else(|| anyhow!("current object ref target is missing hash"))?;
+    validate_hex32(frame_hash, "current object ref frame hash")?;
+    Ok((
+        stream_id.to_string(),
+        sequence.parse()?,
+        frame_hash.to_string(),
+    ))
+}
+
+#[cfg(test)]
+pub(crate) async fn read_object_metadata_frame_fences_for_test(
+    storage: &Storage,
+    bucket: &Bucket,
+) -> Result<Vec<u64>> {
+    Ok(read_all_metadata_journal_frames(storage, bucket)
+        .await?
+        .into_iter()
+        .map(|frame| frame.fence_token)
+        .collect())
 }
 
 pub fn object_metadata_partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
@@ -2029,7 +2283,6 @@ mod tests {
             storage_class: None,
             user_meta: None,
             shard_map: None,
-            inline_payload: None,
             checksum: None,
             link: None,
         }
@@ -2073,11 +2326,10 @@ mod tests {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let bucket = sample_bucket();
-        let mut first = sample_object(1, "docs/a.txt", false);
-        first.inline_payload = Some(b"alpha payload".to_vec());
+        let first = sample_object(1, "docs/a.txt", false);
         let second = sample_object(2, "docs/b.txt", true);
 
-        let path = append_object_mutation(&storage, &bucket, &first, ObjectJournalMutation::Put)
+        append_object_mutation(&storage, &bucket, &first, ObjectJournalMutation::Put)
             .await
             .unwrap();
         append_object_mutation(
@@ -2089,12 +2341,9 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            path,
-            storage.metadata_journal_path(bucket.tenant_id, bucket.id)
-        );
-        let bytes = tokio::fs::read(&path).await.unwrap();
-        let (_, frames) = decode_journal_file(&bytes).unwrap();
+        let frames = read_all_metadata_journal_frames(&storage, &bucket)
+            .await
+            .unwrap();
         assert_eq!(frames.len(), 4);
         assert_eq!(frames[0].record_kind, JournalRecordKind::ObjectVersion);
         assert_eq!(frames[1].record_kind, JournalRecordKind::DirectoryEntry);
@@ -2109,10 +2358,7 @@ mod tests {
             .unwrap();
         assert_eq!(current.len(), 1);
         assert_eq!(current[0].key, first.key);
-        assert_eq!(
-            current[0].inline_payload.as_deref(),
-            Some(&b"alpha payload"[..])
-        );
+        assert_eq!(current[0].content_hash, first.content_hash);
 
         let current_through_directory_frame =
             read_current_objects_through_sequence(&storage, &bucket, b"unused without manifest", 2)
@@ -2120,8 +2366,8 @@ mod tests {
                 .unwrap();
         assert_eq!(current_through_directory_frame.len(), 1);
         assert_eq!(
-            current_through_directory_frame[0].inline_payload.as_deref(),
-            Some(&b"alpha payload"[..])
+            current_through_directory_frame[0].content_hash,
+            first.content_hash
         );
     }
 
@@ -2133,7 +2379,7 @@ mod tests {
         let permit = ready_object_metadata_permit(&storage, &bucket, "node-a").await;
         let object = sample_object(1, "docs/fenced.txt", false);
 
-        let path = append_object_mutation_with_permit(
+        append_object_mutation_with_permit(
             &storage,
             &bucket,
             &object,
@@ -2143,7 +2389,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let (_, frames) = decode_journal_file(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        let frames = read_all_metadata_journal_frames(&storage, &bucket)
+            .await
+            .unwrap();
         assert_eq!(frames.len(), 2);
         assert!(
             frames
@@ -2161,11 +2409,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let manifest = decode_partition_manifest(
-            &tokio::fs::read(sealed.manifest_path).await.unwrap(),
-            manifest_key,
-        )
-        .unwrap();
+        assert_eq!(sealed.generation, 2);
+        let manifest = read_latest_partition_manifest(&storage, &bucket, manifest_key)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(manifest.fence_token, permit.fence_token);
     }
 
@@ -2200,6 +2448,207 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn object_metadata_corestore_batch_rejects_stale_partition_precondition() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let bucket = sample_bucket();
+        let stale_permit = ready_object_metadata_permit(&storage, &bucket, "node-a").await;
+        let stale_precondition = crate::partition_fence::partition_write_ref_precondition(
+            &storage,
+            &stale_permit,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap();
+        let fresh_permit = ready_object_metadata_permit(&storage, &bucket, "node-b").await;
+        assert_eq!(fresh_permit.fence_token, stale_permit.fence_token + 1);
+
+        let rejected = append_object_mutation_inner(
+            &storage,
+            &bucket,
+            &sample_object(1, "docs/stale-precondition.txt", false),
+            ObjectJournalMutation::Put,
+            stale_permit.fence_token,
+            Some(stale_precondition),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            rejected.to_string().contains("target mismatch")
+                || rejected.to_string().contains("generation mismatch"),
+            "unexpected error: {rejected:?}"
+        );
+
+        append_object_mutation_with_permit(
+            &storage,
+            &bucket,
+            &sample_object(2, "docs/fresh-precondition.txt", false),
+            ObjectJournalMutation::Put,
+            &fresh_permit,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn object_metadata_mutation_updates_current_object_coreref_in_same_batch() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let bucket = sample_bucket();
+        let permit = ready_object_metadata_permit(&storage, &bucket, "node-a").await;
+        let key = "docs/current-ref.txt";
+        let first = sample_object(1, key, false);
+
+        append_object_mutation_with_permit(
+            &storage,
+            &bucket,
+            &first,
+            ObjectJournalMutation::Put,
+            &permit,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap();
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        let ref_name = current_object_ref_name(&bucket, key);
+        let first_ref = store
+            .read_ref(&ref_name)
+            .await
+            .unwrap()
+            .expect("current object ref is published");
+        assert_eq!(first_ref.generation, 1);
+        assert!(first_ref.target.contains("sequence:2"));
+
+        let second = sample_object(2, key, true);
+        append_object_mutation_with_permit(
+            &storage,
+            &bucket,
+            &second,
+            ObjectJournalMutation::DeleteMarker,
+            &permit,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap();
+        let second_ref = store
+            .read_ref(&ref_name)
+            .await
+            .unwrap()
+            .expect("current object ref is updated");
+        assert_eq!(second_ref.generation, 2);
+        assert_ne!(second_ref.target, first_ref.target);
+        assert!(second_ref.target.contains("sequence:4"));
+    }
+
+    #[tokio::test]
+    async fn read_current_object_uses_current_object_coreref() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let bucket = sample_bucket();
+        let permit = ready_object_metadata_permit(&storage, &bucket, "node-a").await;
+        let key = "docs/ref-driven-read.txt";
+        let first = sample_object(1, key, false);
+        let second = sample_object(2, key, false);
+
+        append_object_mutation_with_permit(
+            &storage,
+            &bucket,
+            &first,
+            ObjectJournalMutation::Put,
+            &permit,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap();
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        let ref_name = current_object_ref_name(&bucket, key);
+        let first_ref = store.read_ref(&ref_name).await.unwrap().unwrap();
+
+        append_object_mutation_with_permit(
+            &storage,
+            &bucket,
+            &second,
+            ObjectJournalMutation::Put,
+            &permit,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_current_object(&storage, &bucket, PARTITION_OWNER_KEY, key)
+                .await
+                .unwrap()
+                .unwrap()
+                .content_hash,
+            second.content_hash
+        );
+
+        let latest_ref = store.read_ref(&ref_name).await.unwrap().unwrap();
+        store
+            .compare_and_swap_ref(CompareAndSwapRef {
+                ref_name,
+                expected_generation: Some(latest_ref.generation),
+                expected_target: Some(latest_ref.target),
+                require_absent: false,
+                require_present: true,
+                fence: None,
+                authz_revision: None,
+                source_watch_cursor: None,
+                new_target: first_ref.target,
+                transaction_id: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_current_object(&storage, &bucket, PARTITION_OWNER_KEY, key)
+                .await
+                .unwrap()
+                .unwrap()
+                .content_hash,
+            first.content_hash
+        );
+    }
+
+    #[tokio::test]
+    async fn read_current_object_returns_none_for_current_delete_marker_ref() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let bucket = sample_bucket();
+        let permit = ready_object_metadata_permit(&storage, &bucket, "node-a").await;
+        let key = "docs/deleted-current.txt";
+
+        append_object_mutation_with_permit(
+            &storage,
+            &bucket,
+            &sample_object(1, key, false),
+            ObjectJournalMutation::Put,
+            &permit,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap();
+        append_object_mutation_with_permit(
+            &storage,
+            &bucket,
+            &sample_object(2, key, true),
+            ObjectJournalMutation::DeleteMarker,
+            &permit,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            read_current_object(&storage, &bucket, PARTITION_OWNER_KEY, key)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2324,12 +2773,14 @@ mod tests {
         assert_eq!(sealed.metadata_record_count, 3);
         assert_eq!(sealed.directory_record_count, 2);
         assert_eq!(
-            sealed.manifest_path,
-            storage.metadata_manifest_path(bucket.tenant_id, bucket.id)
+            sealed.manifest_ref,
+            metadata_manifest_ref_name(&bucket).unwrap()
         );
 
-        let manifest_bytes = tokio::fs::read(&sealed.manifest_path).await.unwrap();
-        let manifest = decode_partition_manifest(&manifest_bytes, signing_key).unwrap();
+        let manifest = read_latest_partition_manifest(&storage, &bucket, signing_key)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(manifest.generation, sealed.generation);
         assert_eq!(
             manifest.manifest_hash.as_deref(),
@@ -2352,8 +2803,8 @@ mod tests {
         assert_eq!(recovered.metadata_records.len(), 3);
         assert_eq!(recovered.directory_records.len(), 2);
         assert!(
-            storage
-                .resolve_relative_storage_path("../escape.anseg")
+            read_core_ref_uri_payload(&storage, "../escape.anseg")
+                .await
                 .is_err()
         );
         let current = read_current_objects(&storage, &bucket, signing_key)
@@ -2391,7 +2842,9 @@ mod tests {
             first.version_id
         );
 
-        let metadata_bytes = tokio::fs::read(&sealed.metadata_path).await.unwrap();
+        let metadata_bytes = read_core_ref_uri_payload(&storage, &sealed.metadata_ref)
+            .await
+            .unwrap();
         let metadata_body =
             decode_segment_file(&metadata_bytes, FileFamily::MetadataSegment).unwrap();
         let metadata_records = metadata_body.data_blocks[0]
@@ -2404,7 +2857,9 @@ mod tests {
                 .all(|pair| pair[0].key <= pair[1].key)
         );
 
-        let directory_bytes = tokio::fs::read(&sealed.directory_path).await.unwrap();
+        let directory_bytes = read_core_ref_uri_payload(&storage, &sealed.directory_ref)
+            .await
+            .unwrap();
         let directory_body =
             decode_segment_file(&directory_bytes, FileFamily::DirectorySegment).unwrap();
         let directory_records = directory_body.data_blocks[0]
@@ -2415,10 +2870,38 @@ mod tests {
             serde_json::from_slice(&directory_records[0].value).unwrap();
         assert_eq!(latest_a.version_id, second.version_id.to_string());
 
-        let mut corrupted_metadata = tokio::fs::read(&sealed.metadata_path).await.unwrap();
+        let mut corrupted_metadata = read_core_ref_uri_payload(&storage, &sealed.metadata_ref)
+            .await
+            .unwrap();
         let body_byte = corrupted_metadata.len() - COMMON_FOOTER_LEN - 1;
         corrupted_metadata[body_byte] ^= 1;
-        tokio::fs::write(&sealed.metadata_path, corrupted_metadata)
+        let ref_name = sealed
+            .metadata_ref
+            .strip_prefix(MANIFEST_SEGMENT_REF_PREFIX)
+            .unwrap();
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        let object_ref = store
+            .put_blob(PutBlob {
+                logical_name: ref_name.to_string(),
+                bytes: corrupted_metadata,
+                region_id: "local".to_string(),
+                mutation_id: "corrupt-metadata-segment-test".to_string(),
+            })
+            .await
+            .unwrap();
+        store
+            .compare_and_swap_ref(CompareAndSwapRef {
+                ref_name: ref_name.to_string(),
+                expected_generation: None,
+                expected_target: None,
+                require_absent: false,
+                require_present: true,
+                fence: None,
+                authz_revision: None,
+                source_watch_cursor: None,
+                new_target: encode_core_object_ref_target(&object_ref).unwrap(),
+                transaction_id: None,
+            })
             .await
             .unwrap();
         assert!(
@@ -2507,18 +2990,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decode_journal_file_rejects_corrupted_appended_frame() {
+    async fn object_metadata_stream_rejects_corrupted_appended_frame() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let bucket = sample_bucket();
         let object = sample_object(1, "docs/a.txt", false);
-        let path = append_object_mutation(&storage, &bucket, &object, ObjectJournalMutation::Put)
+        append_object_mutation(&storage, &bucket, &object, ObjectJournalMutation::Put)
             .await
             .unwrap();
 
-        let mut bytes = tokio::fs::read(&path).await.unwrap();
-        let last = bytes.len() - 33;
-        bytes[last] ^= 1;
-        assert!(decode_journal_file(&bytes).is_err());
+        let stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
+        let mut hasher = Sha256::new();
+        hasher.update(stream_id.as_bytes());
+        let file_name = format!("{}.jsonl", hex::encode(hasher.finalize()));
+        for index in 1..=3 {
+            let stream_path = storage
+                .core_store_replica_path(&format!("local-control-node-{index}"))
+                .join("streams")
+                .join("data")
+                .join(&file_name);
+            let mut bytes = tokio::fs::read(&stream_path).await.unwrap();
+            let last = bytes.len() - 33;
+            bytes[last] ^= 1;
+            tokio::fs::write(&stream_path, bytes).await.unwrap();
+        }
+        assert!(
+            read_all_metadata_journal_frames(&storage, &bucket)
+                .await
+                .is_err()
+        );
     }
 }

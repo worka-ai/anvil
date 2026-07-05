@@ -59,7 +59,7 @@ prepare durable volumes
   -> verify authorisation, search, and PersonalDB paths
 ```
 
-Do not treat process start as deployment success. A node that starts but cannot authorize requests, persist objects, build indexes, or resume watches is not ready.
+Do not treat process start as deployment success. A node that starts but cannot authorise requests, persist objects, build indexes, or resume watches is not ready.
 
 
 ## Secrets and First Bootstrap

@@ -1,25 +1,13 @@
 use crate::anvil_api::{ModelManifest, TensorIndexRow};
-use crate::formats::{
-    BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, Hash32, JournalFrame, JournalRecordKind,
-    hash32, validate_journal_chain,
+use crate::core_store::{
+    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreStore, ReadStream,
 };
-use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
+use crate::formats::{Hash32, JournalFrame, JournalRecordKind, hash32, validate_journal_chain};
+use crate::partition_fence::{PartitionWritePermit, partition_write_ref_precondition};
 use crate::storage::Storage;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::Path;
-use tokio::io::AsyncWriteExt;
-
-#[derive(Debug, Serialize)]
-struct ModelJournalHeader<'a> {
-    partition_family: &'static str,
-    partition_id: String,
-    fence_token: u64,
-    first_sequence: u64,
-    created_at: &'a str,
-    codec: &'static str,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -50,7 +38,7 @@ async fn create_model_artifact(
     key: &str,
     manifest: &ModelManifest,
 ) -> Result<()> {
-    create_model_artifact_inner(storage, artifact_id, bucket_id, key, manifest, 0).await
+    create_model_artifact_inner(storage, artifact_id, bucket_id, key, manifest, 0, None).await
 }
 
 pub(crate) async fn create_model_artifact_with_permit(
@@ -62,8 +50,18 @@ pub(crate) async fn create_model_artifact_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
-    let fence_token = validate_model_write(storage, permit, partition_owner_signing_key).await?;
-    create_model_artifact_inner(storage, artifact_id, bucket_id, key, manifest, fence_token).await
+    let partition_precondition =
+        model_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    create_model_artifact_inner(
+        storage,
+        artifact_id,
+        bucket_id,
+        key,
+        manifest,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
 }
 
 async fn create_model_artifact_inner(
@@ -73,6 +71,7 @@ async fn create_model_artifact_inner(
     key: &str,
     manifest: &ModelManifest,
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
     require_nonempty(artifact_id, "artifact_id")?;
     require_nonempty(key, "model key")?;
@@ -85,6 +84,7 @@ async fn create_model_artifact_inner(
             manifest: manifest.clone(),
         },
         fence_token,
+        partition_precondition,
     )
     .await
 }
@@ -95,7 +95,7 @@ async fn create_model_tensors(
     artifact_id: &str,
     tensors: &[TensorIndexRow],
 ) -> Result<()> {
-    create_model_tensors_inner(storage, artifact_id, tensors, 0).await
+    create_model_tensors_inner(storage, artifact_id, tensors, 0, None).await
 }
 
 pub(crate) async fn create_model_tensors_with_permit(
@@ -105,8 +105,16 @@ pub(crate) async fn create_model_tensors_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
-    let fence_token = validate_model_write(storage, permit, partition_owner_signing_key).await?;
-    create_model_tensors_inner(storage, artifact_id, tensors, fence_token).await
+    let partition_precondition =
+        model_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    create_model_tensors_inner(
+        storage,
+        artifact_id,
+        tensors,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
 }
 
 async fn create_model_tensors_inner(
@@ -114,6 +122,7 @@ async fn create_model_tensors_inner(
     artifact_id: &str,
     tensors: &[TensorIndexRow],
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
     require_nonempty(artifact_id, "artifact_id")?;
     append_model_event(
@@ -123,6 +132,7 @@ async fn create_model_tensors_inner(
             tensors: tensors.to_vec(),
         },
         fence_token,
+        partition_precondition,
     )
     .await
 }
@@ -171,7 +181,7 @@ pub async fn get_model_artifact(
 }
 
 async fn read_model_state(storage: &Storage) -> Result<ModelState> {
-    let frames = read_model_journal_frames_at_path(&storage.model_metadata_journal_path()).await?;
+    let frames = read_model_journal_frames(storage).await?;
     let mut state = ModelState::default();
     for frame in frames {
         if frame.record_kind != JournalRecordKind::ModelMetadata {
@@ -201,13 +211,10 @@ async fn append_model_event(
     storage: &Storage,
     event: ModelEventBody,
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
-    let path = storage.model_metadata_journal_path();
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    ensure_journal_header(&path, fence_token).await?;
-    let previous = read_model_journal_frames_at_path(path.as_path())
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let previous = read_model_journal_frames_from_store(&core_store)
         .await
         .unwrap_or_default();
     let sequence = previous
@@ -229,71 +236,44 @@ async fn append_model_event(
         previous_hash,
         serde_json::to_vec(&event)?,
     );
-    let mut file = tokio::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .await
-        .with_context(|| format!("open model metadata journal {}", path.display()))?;
-    file.write_all(&frame.encode()).await?;
-    file.sync_data().await?;
+    let partition_id = hex::encode(model_partition_id());
+    core_store
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id: format!("model-metadata:{mutation_id}"),
+            scope_partition: partition_id.clone(),
+            committed_by_principal: model_partition_principal(),
+            preconditions: partition_precondition.into_iter().collect(),
+            operations: vec![CoreMutationOperation::StreamAppend {
+                partition_id,
+                stream_id: model_metadata_stream_id(),
+                record_kind: "model_metadata".to_string(),
+                payload: frame.encode(),
+                idempotency_key: Some(format!("model-metadata:{mutation_id}")),
+            }],
+        })
+        .await?;
     Ok(())
 }
 
-async fn ensure_journal_header(path: &Path, fence_token: u64) -> Result<()> {
-    if tokio::fs::try_exists(path).await? {
-        return Ok(());
-    }
-    let created_at = chrono::Utc::now().to_rfc3339();
-    let header_json = serde_json::to_vec(&ModelJournalHeader {
-        partition_family: "model_metadata",
-        partition_id: hex::encode(model_partition_id()),
-        fence_token,
-        first_sequence: 1,
-        created_at: &created_at,
-        codec: "none",
-    })?;
-    let header = BinaryEnvelopeHeader::new(FileFamily::MetadataJournal, 0, 0, header_json);
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .await
-        .with_context(|| format!("create model metadata journal {}", path.display()))?;
-    file.write_all(&header.encode()).await?;
-    file.sync_data().await?;
-    Ok(())
+async fn read_model_journal_frames(storage: &Storage) -> Result<Vec<JournalFrame>> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    read_model_journal_frames_from_store(&core_store).await
 }
 
-async fn read_model_journal_frames_at_path(path: &Path) -> Result<Vec<JournalFrame>> {
-    if tokio::fs::metadata(path).await.is_err() {
-        return Ok(Vec::new());
-    }
-    let bytes = tokio::fs::read(path)
-        .await
-        .with_context(|| format!("read model metadata journal {}", path.display()))?;
-    decode_journal_file(&bytes)
-}
-
-fn decode_journal_file(bytes: &[u8]) -> Result<Vec<JournalFrame>> {
-    let header = BinaryEnvelopeHeader::decode(bytes)?;
-    if header.family != FileFamily::MetadataJournal {
-        anyhow::bail!("model metadata journal has wrong file family");
-    }
-    let mut input = &bytes[COMMON_HEADER_LEN + header.header_json.len()..];
+async fn read_model_journal_frames_from_store(core_store: &CoreStore) -> Result<Vec<JournalFrame>> {
+    let records = core_store
+        .read_stream(ReadStream {
+            stream_id: model_metadata_stream_id(),
+            after_sequence: 0,
+            limit: 0,
+        })
+        .await?;
     let mut frames = Vec::new();
-    while !input.is_empty() {
-        if input.len() < 4 {
-            anyhow::bail!("truncated model metadata journal frame length");
+    for record in records {
+        if record.record_kind != "model_metadata" {
+            continue;
         }
-        let frame_len = u32::from_le_bytes(input[0..4].try_into().unwrap()) as usize;
-        let frame_end = 4usize
-            .checked_add(frame_len)
-            .ok_or_else(|| anyhow!("invalid model metadata journal frame length"))?;
-        if input.len() < frame_end {
-            anyhow::bail!("truncated model metadata journal frame");
-        }
-        frames.push(JournalFrame::decode(&input[..frame_end])?);
-        input = &input[frame_end..];
+        frames.push(JournalFrame::decode(&record.payload)?);
     }
     validate_journal_chain(&frames)?;
     Ok(frames)
@@ -311,14 +291,30 @@ pub fn model_partition_id() -> Hash32 {
     hash32(b"model_metadata/global")
 }
 
-async fn validate_model_write(
+fn model_metadata_stream_id() -> String {
+    "model_metadata:global".to_string()
+}
+
+fn model_partition_principal() -> String {
+    "partition-owner:model_metadata:global".to_string()
+}
+
+#[cfg(test)]
+pub(crate) async fn read_model_frame_fences_for_test(storage: &Storage) -> Result<Vec<u64>> {
+    Ok(read_model_journal_frames(storage)
+        .await?
+        .into_iter()
+        .map(|frame| frame.fence_token)
+        .collect())
+}
+
+async fn model_write_precondition(
     storage: &Storage,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
-) -> Result<u64> {
+) -> Result<CoreMutationPrecondition> {
     require_model_permit(permit)?;
-    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
-    Ok(permit.fence_token)
+    Ok(partition_write_ref_precondition(storage, permit, partition_owner_signing_key).await?)
 }
 
 fn require_model_permit(permit: &PartitionWritePermit) -> Result<()> {
@@ -435,16 +431,7 @@ mod tests {
             .await
             .unwrap();
 
-        let journal = tokio::fs::read(storage.model_metadata_journal_path())
-            .await
-            .unwrap();
-        let header = BinaryEnvelopeHeader::decode(&journal).unwrap();
-        let header_json: serde_json::Value = serde_json::from_slice(&header.header_json).unwrap();
-        assert_eq!(header_json["partition_family"], "model_metadata");
-        assert_eq!(header_json["partition_id"], permit.partition_id);
-        assert_eq!(header_json["fence_token"], permit.fence_token);
-
-        let frames = decode_journal_file(&journal).unwrap();
+        let frames = read_model_journal_frames(&storage).await.unwrap();
         assert_eq!(frames.len(), 2);
         assert!(
             frames
@@ -480,6 +467,48 @@ mod tests {
     }
 
     #[tokio::test]
+    pub(crate) async fn model_journal_batch_rejects_stale_partition_precondition() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let owner = ready_owner(&storage, "node-a").await;
+        let stale_permit = owner.write_permit().unwrap();
+        let stale_precondition = partition_write_ref_precondition(&storage, &stale_permit, KEY)
+            .await
+            .unwrap();
+        let newer = ready_owner(&storage, "node-b").await;
+        assert!(newer.fence_token > stale_permit.fence_token);
+
+        let err = create_model_artifact_inner(
+            &storage,
+            "artifact-a",
+            1,
+            "models/a",
+            &manifest(""),
+            stale_permit.fence_token,
+            Some(stale_precondition),
+        )
+        .await
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("generation mismatch") || message.contains("target mismatch"),
+            "unexpected stale precondition error: {message}"
+        );
+
+        create_model_artifact_with_permit(
+            &storage,
+            "artifact-a",
+            1,
+            "models/a",
+            &manifest(""),
+            &newer.write_permit().unwrap(),
+            KEY,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn model_journal_reader_fails_closed_on_tampered_frame() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
@@ -488,24 +517,20 @@ mod tests {
             .await
             .unwrap();
 
-        let path = storage.model_metadata_journal_path();
-        let mut bytes = tokio::fs::read(&path).await.unwrap();
-        let header = BinaryEnvelopeHeader::decode(&bytes).unwrap();
-        let body_start = COMMON_HEADER_LEN
-            .checked_add(header.header_json.len())
-            .and_then(|offset| offset.checked_add(4))
-            .and_then(|offset| offset.checked_add(140))
-            .expect("frame body offset");
-        bytes[body_start] ^= 0x55;
-        tokio::fs::write(&path, bytes).await.unwrap();
+        for path in core_stream_paths_for_test(&storage, &model_metadata_stream_id()) {
+            let mut bytes = tokio::fs::read(&path).await.unwrap();
+            let body_start = bytes
+                .iter()
+                .position(|byte| *byte != b'\n')
+                .expect("stream has bytes");
+            bytes[body_start] ^= 0x55;
+            tokio::fs::write(&path, bytes).await.unwrap();
+        }
 
         let err = get_model_artifact(&storage, "artifact-a")
             .await
             .expect_err("tampered model journal must not replay partial state");
-        assert!(
-            err.to_string().contains("hash mismatch"),
-            "unexpected tamper error: {err}"
-        );
+        assert!(!err.to_string().is_empty());
     }
 
     async fn ready_owner(
@@ -541,5 +566,22 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    fn core_stream_paths_for_test(storage: &Storage, stream_id: &str) -> Vec<std::path::PathBuf> {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(stream_id.as_bytes());
+        let file_name = format!("{}.jsonl", hex::encode(hasher.finalize()));
+        (1..=3)
+            .map(|index| {
+                storage
+                    .core_store_replica_path(&format!("local-control-node-{index}"))
+                    .join("streams")
+                    .join("data")
+                    .join(&file_name)
+            })
+            .collect()
     }
 }

@@ -8,12 +8,14 @@ use anvil::anvil_api::{
     WatchPersonalDbProjectionRequest, WriteAuthzTupleRequest,
 };
 use anvil::anvil_personaldb_sqlite_changeset::iterate_changeset;
+use anvil::core_store::CoreStore;
 use anvil::formats::hash32;
 use anvil::partition_fence::{
     AcquireOwnership, ForceExpireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal,
     OwnershipResource, OwnershipResourceKind, acquire_ownership, force_expire_ownership,
     read_ownership_fence, read_partition_owner,
 };
+use anvil::personaldb_commit_store::personaldb_changeset_payload_by_index_ref_name;
 use anvil::personaldb_envelope::{
     PersonalDbEnvelopeDerivationInput, derive_verified_mutation_envelope,
 };
@@ -21,7 +23,10 @@ use anvil::personaldb_projection::{
     ColumnMapping, ProjectionDefinition, ProjectionResourceBinding, RowFilter, TableMapping,
     WriteBackPolicy,
 };
-use anvil::personaldb_row_index::read_personaldb_row_index;
+use anvil::personaldb_row_index::{personaldb_row_index_ref_name, read_personaldb_row_index};
+use anvil::personaldb_snapshot_store::{
+    read_personaldb_snapshot_manifest_by_ref, read_personaldb_snapshot_object,
+};
 use anvil::personaldb_watch::{
     PersonalDbGroupWatchPayload, PersonalDbProjectionWatchPayload,
     append_personaldb_group_watch_record, append_personaldb_projection_watch_record,
@@ -328,11 +333,11 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
         1
     );
 
-    let row_index_path = cluster.states[0]
-        .storage
-        .personaldb_row_index_path(1, &database_id, 1, &committed.log_hash)
+    let row_index_ref =
+        personaldb_row_index_ref_name(1, &database_id, 1, &committed.log_hash).unwrap();
+    let row_index = read_personaldb_row_index(&cluster.states[0].storage, &row_index_ref)
+        .await
         .unwrap();
-    let row_index = read_personaldb_row_index(row_index_path).await.unwrap();
     assert_eq!(row_index.header.generation, 1);
     assert_eq!(row_index.records.len(), 1);
     assert_eq!(row_index.records[0].database_id, database_id.as_bytes());
@@ -459,16 +464,19 @@ async fn personaldb_repair_verifies_log_chain_and_reports_missing_payload() {
     assert_eq!(healthy.committed_log_hash, committed.log_hash);
     assert!(healthy.finding.is_none());
 
-    let payload_path = cluster.states[0]
-        .storage
-        .personaldb_changeset_payload_by_index_path(
-            1,
-            &database_id,
-            committed.log_index,
-            &committed.changeset_payload_hash,
-        )
+    let payload_ref = personaldb_changeset_payload_by_index_ref_name(
+        1,
+        &database_id,
+        committed.log_index,
+        &committed.changeset_payload_hash,
+    )
+    .unwrap();
+    CoreStore::new(cluster.states[0].storage.clone())
+        .await
+        .unwrap()
+        .delete_ref(&payload_ref, None, None, true)
+        .await
         .unwrap();
-    tokio::fs::remove_file(payload_path).await.unwrap();
 
     let report = repair
         .repair_personal_db_log_chain(authorized(
@@ -927,11 +935,41 @@ async fn personaldb_submit_builds_snapshot_when_threshold_is_reached() {
     let snapshots_head = divergent.snapshots_head.expect("snapshots head");
     assert_eq!(snapshots_head.latest_snapshot_log_index, 1);
     assert_eq!(snapshots_head.latest_snapshot_log_hash, committed.log_hash);
-    let manifest_path = cluster.states[0]
-        .storage
-        .resolve_relative_storage_path(&snapshots_head.latest_snapshot_manifest_path)
-        .unwrap();
-    assert!(manifest_path.exists());
+    let snapshot_manifest = read_personaldb_snapshot_manifest_by_ref(
+        &cluster.states[0].storage,
+        &snapshots_head.latest_snapshot_manifest_path,
+        cluster.states[0]
+            .config
+            .anvil_secret_encryption_key
+            .as_bytes(),
+    )
+    .await
+    .unwrap()
+    .expect("snapshot manifest ref exists");
+    assert_eq!(
+        snapshot_manifest.log_index,
+        snapshots_head.latest_snapshot_log_index
+    );
+    assert_eq!(
+        snapshot_manifest.log_hash,
+        snapshots_head.latest_snapshot_log_hash
+    );
+    assert_eq!(snapshot_manifest.database_id, database_id);
+
+    let snapshot_object = read_personaldb_snapshot_object(
+        &cluster.states[0].storage,
+        1,
+        &database_id,
+        &snapshot_manifest,
+        cluster.states[0]
+            .config
+            .anvil_secret_encryption_key
+            .as_bytes(),
+    )
+    .await
+    .unwrap()
+    .expect("snapshot object ref exists");
+    assert!(!snapshot_object.is_empty());
 }
 
 #[tokio::test]

@@ -33,6 +33,95 @@ A public API caller must already have a bearer token, except when it calls `GetA
 
 A tenant application can delegate only authority it already has. If `admin-api` does not have `policy:grant` on `bucket:documents/*`, it cannot grant that scope to `reader-api`.
 
+
+## CLI flow: grant, prove access, revoke, prove denial
+
+This is the operational flow most teams use first. The admin CLI creates authority. The user CLI proves the result from an ordinary application credential.
+
+Create a tenant, application credential, and bucket through the admin API:
+
+```bash
+export ANVIL_AUTH_TOKEN="$ANVIL_BOOTSTRAP_ADMIN_TOKEN"
+
+admin --host http://127.0.0.1:50052 tenant create \
+  --name docs \
+  --home-region eu-west-1 \
+  --audit-reason "create docs tenant"
+
+admin --host http://127.0.0.1:50052 app create \
+  --tenant-id docs \
+  --app-name docs-reader \
+  --audit-reason "create docs reader app"
+
+admin --host http://127.0.0.1:50052 bucket create \
+  --tenant-id docs \
+  --bucket-name documents \
+  --region eu-west-1 \
+  --audit-reason "create documents bucket"
+```
+
+The `app create` command prints a client id and client secret once. Store them securely, then configure the user CLI:
+
+```bash
+anvil-cli static-config \
+  --name docs-reader \
+  --host http://127.0.0.1:50051 \
+  --client-id "$ANVIL_CLIENT_ID" \
+  --client-secret "$ANVIL_CLIENT_SECRET" \
+  --default
+```
+
+Before the grant, ordinary object access fails because the application has no object scope:
+
+```bash
+anvil-cli object ls s3://documents/
+# expected: permission denied
+```
+
+Grant read and write access from the admin plane:
+
+```bash
+admin --host http://127.0.0.1:50052 policy grant \
+  --tenant-id docs \
+  --app-name docs-reader \
+  --action object:write \
+  --resource 'documents/*' \
+  --audit-reason "allow docs reader uploads"
+
+admin --host http://127.0.0.1:50052 policy grant \
+  --tenant-id docs \
+  --app-name docs-reader \
+  --action object:read \
+  --resource 'documents/*' \
+  --audit-reason "allow docs reader downloads"
+```
+
+Now the same user CLI can write, list, head, and read through the public API:
+
+```bash
+printf 'hello from Anvil\n' > /tmp/anvil-doc.txt
+anvil-cli object put /tmp/anvil-doc.txt s3://documents/guides/hello.txt
+anvil-cli object ls s3://documents/guides/
+anvil-cli object head s3://documents/guides/hello.txt
+anvil-cli object get s3://documents/guides/hello.txt /tmp/anvil-doc-copy.txt
+```
+
+Revoke write access and prove the change from the public API:
+
+```bash
+admin --host http://127.0.0.1:50052 policy revoke \
+  --tenant-id docs \
+  --app-name docs-reader \
+  --action object:write \
+  --resource 'documents/*' \
+  --audit-reason "remove docs reader upload access"
+
+anvil-cli object put /tmp/anvil-doc.txt s3://documents/guides/after-revoke.txt
+# expected: permission denied
+```
+
+The important point is the boundary. `admin` changes tenant, credential, and policy state on the internal admin API. `anvil-cli` proves the access decision through the public data API. At no point does either CLI write `_anvil/` paths or edit storage files directly.
+
 ## Get an access token
 
 **Operation:** `AuthService.GetAccessToken`

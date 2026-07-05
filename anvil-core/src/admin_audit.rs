@@ -1,9 +1,12 @@
-use crate::storage::Storage;
-use anyhow::{Context, Result};
+use crate::{
+    core_store::{AppendStreamRecord, CoreStore, ReadStream},
+    storage::Storage,
+};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::io::ErrorKind;
 
 pub const ADMIN_AUDIT_EVENT_SCHEMA: &str = "anvil.admin.audit_event.v1";
+const ADMIN_AUDIT_STREAM_ID: &str = "admin_audit:global";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdminAuditEvent {
@@ -26,20 +29,18 @@ pub struct AuditEventFilter<'a> {
 }
 
 pub async fn append_audit_event(storage: &Storage, event: &AdminAuditEvent) -> Result<()> {
-    let path = storage.admin_audit_event_path(&event.created_at, &event.audit_event_id)?;
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("create admin audit directory {}", parent.display()))?;
-    }
-    let bytes = serde_json::to_vec_pretty(event)?;
-    let tmp = path.with_extension("json.tmp");
-    tokio::fs::write(&tmp, &bytes)
-        .await
-        .with_context(|| format!("write admin audit temp {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, &path)
-        .await
-        .with_context(|| format!("commit admin audit event {}", path.display()))?;
+    CoreStore::new(storage.clone())
+        .await?
+        .append_stream(AppendStreamRecord {
+            stream_id: ADMIN_AUDIT_STREAM_ID.to_string(),
+            partition_id: "global".to_string(),
+            record_kind: "admin_audit_event".to_string(),
+            payload: serde_json::to_vec(event)?,
+            fence: None,
+            transaction_id: None,
+            idempotency_key: Some(event.audit_event_id.clone()),
+        })
+        .await?;
     Ok(())
 }
 
@@ -47,37 +48,19 @@ pub async fn list_audit_events(
     storage: &Storage,
     filter: AuditEventFilter<'_>,
 ) -> Result<Vec<AdminAuditEvent>> {
-    let root = storage.admin_audit_event_root();
     let mut out = Vec::new();
-    match tokio::fs::read_dir(&root).await {
-        Ok(mut days) => {
-            while let Some(day) = days.next_entry().await? {
-                if !day.file_type().await?.is_dir() {
-                    continue;
-                }
-                let mut files = tokio::fs::read_dir(day.path()).await?;
-                while let Some(file) = files.next_entry().await? {
-                    if !file.file_type().await?.is_file() {
-                        continue;
-                    }
-                    let path = file.path();
-                    if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                        continue;
-                    }
-                    let bytes = tokio::fs::read(&path)
-                        .await
-                        .with_context(|| format!("read admin audit event {}", path.display()))?;
-                    let event: AdminAuditEvent = serde_json::from_slice(&bytes)
-                        .with_context(|| format!("decode admin audit event {}", path.display()))?;
-                    if matches_filter(&event, &filter) {
-                        out.push(event);
-                    }
-                }
-            }
-        }
-        Err(err) if err.kind() == ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err).with_context(|| format!("read admin audit root {}", root.display()));
+    for record in CoreStore::new(storage.clone())
+        .await?
+        .read_stream(ReadStream {
+            stream_id: ADMIN_AUDIT_STREAM_ID.to_string(),
+            after_sequence: 0,
+            limit: 0,
+        })
+        .await?
+    {
+        let event: AdminAuditEvent = serde_json::from_slice(&record.payload)?;
+        if matches_filter(&event, &filter) {
+            out.push(event);
         }
     }
     out.sort_by(|left, right| {

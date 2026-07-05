@@ -1,10 +1,9 @@
 use crate::{
     formats::git::GitSourceRecord,
-    git_source_index::{DecodedGitSourceIndex, read_git_source_index},
+    git_source_index::{DecodedGitSourceIndex, latest_git_source_index_ref, read_git_source_index},
     storage::Storage,
 };
-use anyhow::{Context, Result, anyhow};
-use std::path::PathBuf;
+use anyhow::{Result, anyhow};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitObjectLookup {
@@ -31,44 +30,11 @@ pub async fn read_latest_git_source_index(
     tenant_id: i64,
     repository_id: &str,
 ) -> Result<Option<DecodedGitSourceIndex>> {
-    let Some(path) = latest_git_source_index_path(storage, tenant_id, repository_id).await? else {
+    let Some(index_ref) = latest_git_source_index_ref(storage, tenant_id, repository_id).await?
+    else {
         return Ok(None);
     };
-    Ok(Some(read_git_source_index(path).await?))
-}
-
-pub async fn latest_git_source_index_path(
-    storage: &Storage,
-    tenant_id: i64,
-    repository_id: &str,
-) -> Result<Option<PathBuf>> {
-    let dir = storage.git_source_index_dir(tenant_id, repository_id)?;
-    let mut entries = match tokio::fs::read_dir(&dir).await {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).with_context(|| format!("read {}", dir.display())),
-    };
-    let mut best: Option<(u64, PathBuf)> = None;
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("angit") {
-            continue;
-        }
-        let Some(generation) = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(parse_generation)
-        else {
-            continue;
-        };
-        if best
-            .as_ref()
-            .is_none_or(|(best_generation, _)| generation > *best_generation)
-        {
-            best = Some((generation, path));
-        }
-    }
-    Ok(best.map(|(_, path)| path))
+    Ok(Some(read_git_source_index(storage, &index_ref).await?))
 }
 
 pub fn get_git_object(
@@ -169,14 +135,6 @@ fn normalize_prefix(prefix: &str) -> Result<String> {
     })
 }
 
-fn parse_generation(name: &str) -> Option<u64> {
-    name.strip_prefix("generation-")?
-        .split('-')
-        .next()?
-        .parse()
-        .ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,7 +193,7 @@ mod tests {
             record(1, "README.md", 3),
             record(2, "src/lib.rs", 4),
         ];
-        let path = write_git_source_index(
+        let index_ref = write_git_source_index(
             &storage,
             GitSourceIndexWrite {
                 tenant_id: 8,
@@ -248,7 +206,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let index = read_git_source_index(path).await.unwrap();
+        let index = read_git_source_index(&storage, &index_ref).await.unwrap();
 
         let blob = get_git_blob_by_path(&index, &[1; 20], "/src/lib.rs")
             .unwrap()

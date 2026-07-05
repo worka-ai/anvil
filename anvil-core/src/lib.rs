@@ -27,15 +27,18 @@ pub mod cluster;
 pub mod cluster_identity;
 pub mod config;
 pub mod control_journal;
+pub mod core_store;
 pub mod crypto;
 pub mod derived_index_catchup;
 pub mod derived_index_proof;
 pub mod diagnostic_store;
 pub mod directory_repair;
 pub mod discovery;
+pub mod embedding_provider;
 pub mod error_codes;
 pub mod formats;
 pub mod full_text_segment;
+pub mod gateway_store;
 pub mod git_pack;
 pub mod git_source_index;
 pub mod git_source_manifest;
@@ -89,6 +92,7 @@ pub mod storage;
 pub mod task_journal;
 pub mod task_lease;
 pub mod tasks;
+pub mod typed_field_segment;
 pub mod validation;
 pub mod vector_hnsw;
 pub mod vector_segment;
@@ -109,6 +113,7 @@ pub mod anvil_api {
 pub struct AppState {
     pub persistence: persistence::Persistence,
     pub storage: storage::Storage,
+    pub core_store: core_store::CoreStore,
     pub cluster: ClusterState,
     pub sharder: sharding::ShardManager,
     pub placer: placement::PlacementManager,
@@ -140,6 +145,7 @@ impl AppState {
         let arc_config = Arc::new(config);
         let jwt_manager = Arc::new(JwtManager::new(arc_config.jwt_secret.clone()));
         let storage = storage::Storage::new_at(&arc_config.storage_path).await?;
+        let core_store = core_store::CoreStore::new(storage.clone()).await?;
         let cluster_state = Arc::new(RwLock::new(HashMap::new()));
         let persistence = persistence::Persistence::new(&arc_config, event_publisher)?;
         if !arc_config.region.is_empty() {
@@ -162,15 +168,11 @@ impl AppState {
             bucket_manager::BucketManager::new(persistence.clone(), storage.clone());
         let object_manager = object_manager::ObjectManager::new(
             persistence.clone(),
-            placer.clone(),
-            cluster_state.clone(),
-            sharder.clone(),
             storage.clone(),
+            core_store.clone(),
             arc_config.region.clone(),
             arc_config.cross_region_routing_policy,
-            jwt_manager.clone(),
             partition_signing_key,
-            secret_keyring.clone(),
             object_watch_tx,
             observability.clone(),
         );
@@ -178,6 +180,7 @@ impl AppState {
         Ok(Self {
             persistence,
             storage,
+            core_store,
             cluster: cluster_state,
             sharder,
             placer,

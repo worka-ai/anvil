@@ -61,6 +61,8 @@ async fn test_distributed_reconstruction_on_node_failure() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+        content_type: None,
+        user_metadata_json: String::new(),
     };
     let mut chunks = vec![PutObjectRequest {
         data: Some(anvil::anvil_api::put_object_request::Data::Metadata(

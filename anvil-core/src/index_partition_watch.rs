@@ -1,16 +1,14 @@
 use crate::{
-    formats::{FileFamily, Hash32, hash32, watch::WatchRecord},
+    core_store::{AppendStreamRecord, CoreStore, ReadStream},
+    formats::{Hash32, hash32, watch::WatchRecord},
     partition_fence::{
         OWNERSHIP_EXPIRED, OWNERSHIP_NOT_FOUND, OWNERSHIP_OWNER_MISMATCH, OWNERSHIP_STALE_FENCE,
         OwnershipResource, OwnershipResourceKind, read_ownership_fence,
     },
     storage::Storage,
-    watch_log::{DecodedWatchLog, WatchLogHeader, decode_watch_log},
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use tokio::io::AsyncWriteExt;
 
 const INDEX_PARTITION_FAMILY: u16 = 7;
 const INDEX_PARTITION_RECORD_KIND: u16 = 1;
@@ -55,7 +53,7 @@ pub async fn append_index_partition_watch_record(
     payload: IndexPartitionWatchPayload,
     authority: IndexPartitionWatchWriteAuthority,
     signing_key: &[u8],
-) -> Result<PathBuf> {
+) -> Result<()> {
     validate_payload(partition_id, &payload)?;
     validate_write_authority(
         storage,
@@ -67,14 +65,10 @@ pub async fn append_index_partition_watch_record(
         signing_key,
     )
     .await?;
-    let path = storage.index_partition_watch_path(
-        tenant_id,
-        bucket_id,
-        &payload.index_id,
-        partition_id,
-    )?;
-    ensure_watch_header(tenant_id, bucket_id, &payload.index_id, partition_id, &path).await?;
-    ensure_cursor_is_monotonic(&path, cursor).await?;
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let stream_id =
+        index_partition_watch_stream_id(tenant_id, bucket_id, &payload.index_id, partition_id);
+    ensure_cursor_is_monotonic(&core_store, &stream_id, cursor).await?;
 
     let record = WatchRecord::new(
         cursor,
@@ -87,13 +81,26 @@ pub async fn append_index_partition_watch_record(
         0,
         serde_json::to_vec(&payload)?,
     );
-    let mut file = tokio::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
+    core_store
+        .append_stream(AppendStreamRecord {
+            stream_id,
+            partition_id: hex::encode(watch_partition_id(
+                tenant_id,
+                bucket_id,
+                &payload.index_id,
+                partition_id,
+            )),
+            record_kind: "index_partition_watch".to_string(),
+            payload: record.encode(),
+            fence: None,
+            transaction_id: None,
+            idempotency_key: Some(format!(
+                "index-partition-watch:{tenant_id}:{bucket_id}:{}:{partition_id}:{cursor}",
+                payload.index_id
+            )),
+        })
         .await?;
-    file.write_all(&record.encode()).await?;
-    file.sync_data().await?;
-    Ok(path)
+    Ok(())
 }
 
 pub fn index_partition_watch_resource_id(
@@ -116,11 +123,15 @@ pub async fn list_index_partition_watch_events(
     after_cursor: u128,
     limit: usize,
 ) -> Result<Vec<IndexPartitionWatchEvent>> {
-    let path = storage.index_partition_watch_path(tenant_id, bucket_id, index_id, partition_id)?;
-    let decoded = read_watch_or_empty(&path).await?;
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let records = read_watch_or_empty(
+        &core_store,
+        &index_partition_watch_stream_id(tenant_id, bucket_id, index_id, partition_id),
+    )
+    .await?;
     let expected_partition = watch_partition_id(tenant_id, bucket_id, index_id, partition_id);
     let mut events = Vec::new();
-    for record in decoded.records {
+    for record in records {
         if record.cursor <= after_cursor {
             continue;
         }
@@ -207,11 +218,14 @@ pub async fn latest_index_partition_watch_cursor(
     index_id: &str,
     partition_id: &str,
 ) -> Result<Option<u128>> {
-    let path = storage.index_partition_watch_path(tenant_id, bucket_id, index_id, partition_id)?;
-    let decoded = read_watch_or_empty(&path).await?;
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let records = read_watch_or_empty(
+        &core_store,
+        &index_partition_watch_stream_id(tenant_id, bucket_id, index_id, partition_id),
+    )
+    .await?;
     let expected_partition = watch_partition_id(tenant_id, bucket_id, index_id, partition_id);
-    Ok(decoded
-        .records
+    Ok(records
         .into_iter()
         .filter(|record| {
             record.partition_family == INDEX_PARTITION_FAMILY
@@ -222,85 +236,37 @@ pub async fn latest_index_partition_watch_cursor(
         .max())
 }
 
-async fn ensure_watch_header(
-    tenant_id: i64,
-    bucket_id: i64,
-    index_id: &str,
-    partition_id: &str,
-    path: &PathBuf,
+async fn ensure_cursor_is_monotonic(
+    core_store: &CoreStore,
+    stream_id: &str,
+    cursor: u128,
 ) -> Result<()> {
-    if tokio::fs::metadata(path).await.is_ok() {
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let header = WatchLogHeader {
-        tenant_id: tenant_id.to_string(),
-        bucket_id: bucket_id.to_string(),
-        watch_stream: "index_partition".to_string(),
-        partition_family: "index_partition".to_string(),
-        partition_id: hex::encode(watch_partition_id(
-            tenant_id,
-            bucket_id,
-            index_id,
-            partition_id,
-        )),
-        created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-        codec: "none".to_string(),
-    };
-    let envelope = crate::formats::BinaryEnvelopeHeader::new(
-        FileFamily::WatchSegment,
-        0,
-        0,
-        serde_json::to_vec(&header)?,
-    );
-    match tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .await
+    let records = read_watch_or_empty(core_store, stream_id).await?;
+    if let Some(latest) = records.iter().map(|record| record.cursor).max()
+        && cursor <= latest
     {
-        Ok(mut file) => {
-            file.write_all(&envelope.encode()).await?;
-            file.sync_data().await?;
-            Ok(())
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(err) => Err(err)
-            .with_context(|| format!("create index partition watch file {}", path.display())),
-    }
-}
-
-async fn ensure_cursor_is_monotonic(path: &PathBuf, cursor: u128) -> Result<()> {
-    let decoded = read_watch_or_empty(path).await?;
-    if let Some(latest) = decoded.records.iter().map(|record| record.cursor).max() {
-        if cursor <= latest {
-            return Err(anyhow!("index partition watch cursor must be monotonic"));
-        }
+        return Err(anyhow!("index partition watch cursor must be monotonic"));
     }
     Ok(())
 }
 
-async fn read_watch_or_empty(path: &PathBuf) -> Result<DecodedWatchLog> {
-    match tokio::fs::read(path).await {
-        Ok(bytes) => decode_watch_log(&bytes),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(DecodedWatchLog {
-            header: WatchLogHeader {
-                tenant_id: String::new(),
-                bucket_id: String::new(),
-                watch_stream: "index_partition".to_string(),
-                partition_family: "index_partition".to_string(),
-                partition_id: String::new(),
-                created_at: String::new(),
-                codec: "none".to_string(),
-            },
-            records: Vec::new(),
-        }),
-        Err(err) => {
-            Err(err).with_context(|| format!("read index partition watch file {}", path.display()))
-        }
-    }
+async fn read_watch_or_empty(core_store: &CoreStore, stream_id: &str) -> Result<Vec<WatchRecord>> {
+    let records = core_store
+        .read_stream(ReadStream {
+            stream_id: stream_id.to_string(),
+            after_sequence: 0,
+            limit: 0,
+        })
+        .await?;
+    records
+        .into_iter()
+        .filter(|record| record.record_kind == "index_partition_watch")
+        .map(|record| {
+            WatchRecord::decode(&record.payload)
+                .map(|(record, _)| record)
+                .map_err(Into::into)
+        })
+        .collect()
 }
 
 fn validate_payload(partition_id: &str, payload: &IndexPartitionWatchPayload) -> Result<()> {
@@ -335,6 +301,17 @@ fn watch_partition_id(
     )
 }
 
+fn index_partition_watch_stream_id(
+    tenant_id: i64,
+    bucket_id: i64,
+    index_id: &str,
+    partition_id: &str,
+) -> String {
+    format!(
+        "watch:index_partition:tenant:{tenant_id}:bucket:{bucket_id}:index:{index_id}:partition:{partition_id}"
+    )
+}
+
 fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
     if value.len() != 64 || !value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(anyhow!("{field} must be hex32"));
@@ -366,7 +343,7 @@ mod tests {
         let partition_id = hex::encode([5; 32]);
         let first_payload = payload(1);
         let first_authority = authority(&storage, 3, 9, &partition_id, &first_payload).await;
-        let first_path = append_index_partition_watch_record(
+        append_index_partition_watch_record(
             &storage,
             3,
             9,
@@ -382,7 +359,7 @@ mod tests {
         .unwrap();
         let second_payload = payload(2);
         let second_authority = authority(&storage, 3, 9, &partition_id, &second_payload).await;
-        let second_path = append_index_partition_watch_record(
+        append_index_partition_watch_record(
             &storage,
             3,
             9,
@@ -396,10 +373,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(first_path, second_path);
-        assert!(first_path.ends_with(format!(
-            "_anvil/watch/index/tenant-3/bucket-9/indexes/full-text-alpha/partitions/{partition_id}.anwatch"
-        )));
+        assert_eq!(
+            index_partition_watch_stream_id(3, 9, "full-text-alpha", &partition_id),
+            format!(
+                "watch:index_partition:tenant:3:bucket:9:index:full-text-alpha:partition:{partition_id}"
+            )
+        );
 
         let events = list_index_partition_watch_events(
             &storage,
@@ -487,11 +466,7 @@ mod tests {
             .await
             .is_err()
         );
-        assert!(
-            storage
-                .index_partition_watch_path(3, 9, "../index", &partition_id)
-                .is_err()
-        );
+        assert!(validate_payload("../partition", &payload(4)).is_err());
     }
 
     #[tokio::test]

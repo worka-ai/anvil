@@ -29,6 +29,7 @@ pub enum FileFamily {
     PersonalDbLogSegment = 8,
     PersonalDbRowIndex = 9,
     GitSourceIndex = 10,
+    TypedFieldSegment = 11,
 }
 
 impl FileFamily {
@@ -44,6 +45,7 @@ impl FileFamily {
             8 => Ok(Self::PersonalDbLogSegment),
             9 => Ok(Self::PersonalDbRowIndex),
             10 => Ok(Self::GitSourceIndex),
+            11 => Ok(Self::TypedFieldSegment),
             other => Err(FormatError::UnsupportedFamily(other)),
         }
     }
@@ -60,6 +62,7 @@ impl FileFamily {
             Self::PersonalDbLogSegment => b"ANVPDB1\0",
             Self::PersonalDbRowIndex => b"ANVROW1\0",
             Self::GitSourceIndex => b"ANVGIT1\0",
+            Self::TypedFieldSegment => b"ANVTYP1\0",
         }
     }
 }

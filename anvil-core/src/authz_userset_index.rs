@@ -1,14 +1,19 @@
 use crate::{
     authz_journal::{self, AuthzTupleFilter},
+    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
     formats::hash32,
     persistence::AuthzTupleRecord,
     storage::Storage,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+
+const AUTHZ_DERIVED_USERSET_INDEX_REF_PREFIX: &str = "authz_derived_userset_index:";
+const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
 pub const DEFAULT_DERIVED_USERSET_INDEX_ID: &str = "derived-userset-primary";
 
@@ -102,6 +107,42 @@ pub async fn lookup_derived_userset_index_at_revision(
         caveat_hash: caveat_hash.to_string(),
     };
     Ok(Some(index.entries.binary_search(&needle).is_ok()))
+}
+
+pub async fn list_derived_userset_objects_at_revision(
+    storage: &Storage,
+    tenant_id: i64,
+    derived_index_id: &str,
+    namespace: &str,
+    relation: &str,
+    subject_kind: &str,
+    subject_id: &str,
+    caveat_hash: &str,
+    revision: u64,
+) -> Result<Option<Vec<String>>> {
+    let Some(index) = read_derived_userset_index(storage, tenant_id, derived_index_id).await?
+    else {
+        return Ok(None);
+    };
+    if index.processed_revision != revision {
+        return Ok(None);
+    }
+
+    let objects = index
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.namespace == namespace
+                && entry.relation == relation
+                && entry.subject_kind == subject_kind
+                && entry.subject_id == subject_id
+                && entry.caveat_hash == caveat_hash
+        })
+        .map(|entry| entry.object_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(Some(objects))
 }
 
 pub async fn rebuild_derived_userset_index(
@@ -232,14 +273,17 @@ pub async fn read_derived_userset_index(
     tenant_id: i64,
     derived_index_id: &str,
 ) -> Result<Option<AuthzDerivedUsersetIndex>> {
-    let path = storage.authz_derived_userset_index_path(tenant_id, derived_index_id)?;
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    let ref_name = derived_userset_index_ref_name(tenant_id, derived_index_id)?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(ref_value) = store.read_ref(&ref_name).await? else {
+        return Ok(None);
     };
-    let index: AuthzDerivedUsersetIndex =
-        serde_json::from_slice(&bytes).with_context(|| format!("decode {}", path.display()))?;
+    let bytes = store
+        .get_blob(GetBlob {
+            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+        })
+        .await?;
+    let index: AuthzDerivedUsersetIndex = serde_json::from_slice(&bytes)?;
     validate_derived_userset_index(&index, tenant_id, derived_index_id)?;
     Ok(Some(index))
 }
@@ -249,9 +293,37 @@ pub async fn write_derived_userset_index(
     index: &AuthzDerivedUsersetIndex,
 ) -> Result<()> {
     validate_derived_userset_index(index, index.tenant_id, &index.derived_index_id)?;
-    let path =
-        storage.authz_derived_userset_index_path(index.tenant_id, &index.derived_index_id)?;
-    write_json_atomically(&path, index).await
+    let ref_name = derived_userset_index_ref_name(index.tenant_id, &index.derived_index_id)?;
+    let bytes = serde_json::to_vec_pretty(index)?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: ref_name.clone(),
+            bytes,
+            region_id: "local".to_string(),
+            mutation_id: format!(
+                "authz-derived-userset-index:{}:{}:{}",
+                index.tenant_id, index.derived_index_id, index.generation
+            ),
+        })
+        .await?;
+    let new_target = encode_core_object_ref_target(&object_ref)?;
+    let current = store.read_ref(&ref_name).await?;
+    store
+        .compare_and_swap_ref(CompareAndSwapRef {
+            ref_name,
+            expected_generation: current.as_ref().map(|value| value.generation),
+            expected_target: current.map(|value| value.target),
+            require_absent: false,
+            require_present: false,
+            fence: None,
+            authz_revision: None,
+            source_watch_cursor: None,
+            new_target,
+            transaction_id: None,
+        })
+        .await?;
+    Ok(())
 }
 
 fn build_derived_userset_index_from_records(
@@ -467,25 +539,39 @@ fn source_records_hash(records: &[AuthzTupleRecord]) -> Result<String> {
     Ok(hex::encode(hash32(&serde_json::to_vec(records)?)))
 }
 
-async fn write_json_atomically(path: &Path, value: &impl Serialize) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("create {}", parent.display()))?;
+fn derived_userset_index_ref_name(tenant_id: i64, derived_index_id: &str) -> Result<String> {
+    if tenant_id < 0 {
+        return Err(anyhow!(
+            "authorization userset index tenant id must be nonnegative"
+        ));
     }
-    let tmp = path.with_extension(format!("json.tmp-{}", uuid::Uuid::new_v4().simple()));
-    tokio::fs::write(&tmp, serde_json::to_vec_pretty(value)?)
-        .await
-        .with_context(|| {
-            format!(
-                "write temporary authorization userset index {}",
-                tmp.display()
-            )
-        })?;
-    tokio::fs::rename(&tmp, path)
-        .await
-        .with_context(|| format!("publish authorization userset index {}", path.display()))?;
-    Ok(())
+    if derived_index_id.is_empty()
+        || derived_index_id == "."
+        || derived_index_id == ".."
+        || derived_index_id.contains('/')
+        || derived_index_id.contains('\\')
+        || derived_index_id.contains(':')
+        || derived_index_id.chars().any(char::is_control)
+    {
+        return Err(anyhow!("derived_index_id is not a safe component"));
+    }
+    Ok(format!(
+        "{AUTHZ_DERIVED_USERSET_INDEX_REF_PREFIX}tenant:{tenant_id}:index:{derived_index_id}"
+    ))
+}
+
+fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
+    Ok(format!(
+        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
+    ))
+}
+
+fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
+    let encoded = target
+        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
+        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
+    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
 }
 
 #[cfg(test)]
@@ -684,6 +770,22 @@ mod tests {
             .await
             .unwrap(),
             Some(true)
+        );
+        assert_eq!(
+            list_derived_userset_objects_at_revision(
+                &storage,
+                42,
+                DEFAULT_DERIVED_USERSET_INDEX_ID,
+                "document",
+                "viewer",
+                "user",
+                "alice",
+                "",
+                2,
+            )
+            .await
+            .unwrap(),
+            Some(vec!["alpha".to_string()])
         );
         assert_eq!(
             lookup_derived_userset_index_at_revision(

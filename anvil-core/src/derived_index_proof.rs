@@ -1,13 +1,18 @@
-use crate::{formats::hash32, storage::Storage};
-use anyhow::{Context, Result, anyhow};
+use crate::{
+    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    formats::hash32,
+    storage::Storage,
+};
+use anyhow::{Result, anyhow};
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::{Hmac, Mac};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::io::ErrorKind;
-use std::path::Path;
 
 type HmacSha256 = Hmac<Sha256>;
+const DERIVED_INDEX_PROOF_REF_PREFIX: &str = "derived_index_proof:";
+const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DerivedIndexProof {
@@ -120,14 +125,24 @@ pub async fn write_derived_index_proof(
         proof_signature: None,
     }
     .seal(signing_key)?;
-    let versioned_path = storage.derived_index_proof_path(
-        &sealed.index_id,
-        sealed.generation,
-        sealed.proof_hash.as_deref().expect("sealed proof has hash"),
-    )?;
-    write_json_atomically(&versioned_path, &sealed).await?;
-    let head_path = storage.derived_index_proof_head_path(&sealed.index_id)?;
-    write_json_atomically(&head_path, &sealed).await?;
+    write_derived_index_proof_ref(
+        storage,
+        &versioned_proof_ref_name(
+            &sealed.index_id,
+            sealed.generation,
+            sealed.proof_hash.as_deref().expect("sealed proof has hash"),
+        )?,
+        &sealed,
+        true,
+    )
+    .await?;
+    write_derived_index_proof_ref(
+        storage,
+        &head_proof_ref_name(&sealed.index_id)?,
+        &sealed,
+        false,
+    )
+    .await?;
     Ok(sealed)
 }
 
@@ -136,13 +151,14 @@ pub async fn read_latest_derived_index_proof(
     index_id: &str,
     signing_key: &[u8],
 ) -> Result<Option<DerivedIndexProof>> {
-    let path = storage.derived_index_proof_head_path(index_id)?;
-    let Some(proof) = read_json_optional::<DerivedIndexProof>(&path).await? else {
+    let Some(proof) =
+        read_derived_index_proof_ref(storage, &head_proof_ref_name(index_id)?).await?
+    else {
         return Ok(None);
     };
     proof.verify(signing_key)?;
     if proof.index_id != index_id {
-        return Err(anyhow!("derived index proof path scope mismatch"));
+        return Err(anyhow!("derived index proof ref scope mismatch"));
     }
     Ok(Some(proof))
 }
@@ -229,32 +245,6 @@ fn sign_proof_hash(signing_key: &[u8], hash: &str, scope_parts: &[&str]) -> Resu
     Ok(base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
 }
 
-async fn write_json_atomically(path: &Path, value: &impl Serialize) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let tmp = path.with_extension(format!("json.tmp-{}", uuid::Uuid::new_v4().simple()));
-    tokio::fs::write(&tmp, serde_json::to_vec_pretty(value)?)
-        .await
-        .with_context(|| format!("write temporary derived index proof {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, path)
-        .await
-        .with_context(|| format!("publish derived index proof {}", path.display()))?;
-    Ok(())
-}
-
-async fn read_json_optional<T>(path: &Path) -> Result<Option<T>>
-where
-    T: DeserializeOwned,
-{
-    let bytes = match tokio::fs::read(path).await {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
-    };
-    Ok(Some(serde_json::from_slice(&bytes)?))
-}
-
 fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
     if value.len() != 64 || !value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(anyhow!("{field} must be hex32"));
@@ -275,11 +265,92 @@ fn require_safe_component(value: &str, field: &'static str) -> Result<()> {
         || value == ".."
         || value.contains('/')
         || value.contains('\\')
+        || value.contains(':')
         || value.chars().any(|ch| ch == '\0' || ch.is_control())
     {
         return Err(anyhow!("{field} is not a safe path component"));
     }
     Ok(())
+}
+
+async fn write_derived_index_proof_ref(
+    storage: &Storage,
+    ref_name: &str,
+    proof: &DerivedIndexProof,
+    require_absent: bool,
+) -> Result<()> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: ref_name.to_string(),
+            bytes: serde_json::to_vec_pretty(proof)?,
+            region_id: "local".to_string(),
+            mutation_id: format!(
+                "derived-index-proof:{}:{}",
+                proof.index_id, proof.generation
+            ),
+        })
+        .await?;
+    store
+        .compare_and_swap_ref(CompareAndSwapRef {
+            ref_name: ref_name.to_string(),
+            expected_generation: None,
+            expected_target: None,
+            require_absent,
+            require_present: false,
+            fence: None,
+            authz_revision: None,
+            source_watch_cursor: None,
+            new_target: encode_core_object_ref_target(&object_ref)?,
+            transaction_id: None,
+        })
+        .await?;
+    Ok(())
+}
+
+async fn read_derived_index_proof_ref(
+    storage: &Storage,
+    ref_name: &str,
+) -> Result<Option<DerivedIndexProof>> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(ref_value) = store.read_ref(ref_name).await? else {
+        return Ok(None);
+    };
+    let object_ref = decode_core_object_ref_target(&ref_value.target)?;
+    let bytes = store.get_blob(GetBlob { object_ref }).await?;
+    Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
+fn head_proof_ref_name(index_id: &str) -> Result<String> {
+    require_safe_component(index_id, "index_id")?;
+    Ok(format!(
+        "{DERIVED_INDEX_PROOF_REF_PREFIX}index:{index_id}:head"
+    ))
+}
+
+fn versioned_proof_ref_name(index_id: &str, generation: u64, proof_hash: &str) -> Result<String> {
+    require_safe_component(index_id, "index_id")?;
+    if generation == 0 {
+        return Err(anyhow!("derived index proof generation must be nonzero"));
+    }
+    validate_hex32(proof_hash, "proof_hash")?;
+    Ok(format!(
+        "{DERIVED_INDEX_PROOF_REF_PREFIX}index:{index_id}:generation:{generation:020}:hash:{proof_hash}"
+    ))
+}
+
+fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
+    Ok(format!(
+        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
+    ))
+}
+
+fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
+    let encoded = target
+        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
+        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
+    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
 }
 
 #[cfg(test)]
@@ -299,12 +370,14 @@ mod tests {
         assert_eq!(proof.generation, 7);
         assert_eq!(proof.source_cursor, 42);
         let proof_hash = proof.proof_hash.as_deref().unwrap();
-        let versioned = storage
-            .derived_index_proof_path("full-text-alpha", 7, proof_hash)
-            .unwrap();
-        assert!(versioned.ends_with(format!(
-            "_anvil/index/proofs/full-text-alpha/generation-00000000000000000007-{proof_hash}.json"
-        )));
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        assert!(
+            store
+                .read_ref(&versioned_proof_ref_name("full-text-alpha", 7, proof_hash).unwrap())
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
             read_latest_derived_index_proof(&storage, "full-text-alpha", KEY)
                 .await
@@ -351,13 +424,38 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let path = storage
-            .derived_index_proof_head_path("full-text-alpha")
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        let head = store
+            .read_ref(&head_proof_ref_name("full-text-alpha").unwrap())
+            .await
+            .unwrap()
             .unwrap();
+        let object_ref = decode_core_object_ref_target(&head.target).unwrap();
         let mut value: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+            serde_json::from_slice(&store.get_blob(GetBlob { object_ref }).await.unwrap()).unwrap();
         value["source_cursor"] = serde_json::json!(999);
-        tokio::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap())
+        let tampered = store
+            .put_blob(PutBlob {
+                logical_name: "derived-index-proof-tamper".to_string(),
+                bytes: serde_json::to_vec_pretty(&value).unwrap(),
+                region_id: "local".to_string(),
+                mutation_id: "derived-index-proof-tamper".to_string(),
+            })
+            .await
+            .unwrap();
+        store
+            .compare_and_swap_ref(CompareAndSwapRef {
+                ref_name: head_proof_ref_name("full-text-alpha").unwrap(),
+                expected_generation: Some(head.generation),
+                expected_target: Some(head.target),
+                require_absent: false,
+                require_present: true,
+                fence: None,
+                authz_revision: None,
+                source_watch_cursor: None,
+                new_target: encode_core_object_ref_target(&tampered).unwrap(),
+                transaction_id: None,
+            })
             .await
             .unwrap();
         assert!(
@@ -365,7 +463,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(storage.derived_index_proof_head_path("../escape").is_err());
+        assert!(head_proof_ref_name("../escape").is_err());
         let mut invalid = proof(7, 42, hex::encode([8; 32]));
         invalid.segment_hashes = Vec::new();
         assert!(

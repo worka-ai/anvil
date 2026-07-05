@@ -1,30 +1,18 @@
 use crate::authz_segment;
 use crate::authz_userset_index::{
-    DEFAULT_DERIVED_USERSET_INDEX_ID, lookup_derived_userset_index_at_revision,
+    DEFAULT_DERIVED_USERSET_INDEX_ID, list_derived_userset_objects_at_revision,
+    lookup_derived_userset_index_at_revision,
 };
-use crate::formats::{
-    BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, Hash32, JournalFrame, JournalRecordKind,
-    hash32, validate_journal_chain,
+use crate::core_store::{
+    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreStore, ReadStream,
 };
-use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
+use crate::formats::{Hash32, JournalFrame, JournalRecordKind, hash32, validate_journal_chain};
+use crate::partition_fence::{PartitionWritePermit, partition_write_ref_precondition};
 use crate::persistence::AuthzTupleRecord;
 use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
-use tokio::io::AsyncWriteExt;
-
-#[derive(Debug, Serialize)]
-struct AuthzJournalHeader<'a> {
-    tenant_id: String,
-    partition_family: &'static str,
-    partition_id: String,
-    fence_token: u64,
-    first_sequence: u64,
-    created_at: &'a str,
-    codec: &'static str,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AuthzTupleBody {
@@ -90,8 +78,15 @@ pub(crate) async fn write_authz_tuple_with_permit(
 ) -> Result<AuthzTupleRecord> {
     require_authz_permit(input.tenant_id, permit)?;
     validate_optional_caveat_hash(input.caveat_hash)?;
-    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
-    write_authz_tuple_inner(storage, input, permit.fence_token).await
+    let partition_precondition =
+        partition_write_ref_precondition(storage, permit, partition_owner_signing_key).await?;
+    write_authz_tuple_inner(
+        storage,
+        input,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
 }
 
 pub(crate) async fn write_authz_tuple_batch_with_permit(
@@ -111,14 +106,22 @@ pub(crate) async fn write_authz_tuple_batch_with_permit(
         }
         validate_optional_caveat_hash(input.caveat_hash)?;
     }
-    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
-    write_authz_tuple_batch_inner(storage, inputs, permit.fence_token).await
+    let partition_precondition =
+        partition_write_ref_precondition(storage, permit, partition_owner_signing_key).await?;
+    write_authz_tuple_batch_inner(
+        storage,
+        inputs,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
 }
 
 async fn write_authz_tuple_inner(
     storage: &Storage,
     input: AuthzTupleWrite<'_>,
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<AuthzTupleRecord> {
     validate_optional_caveat_hash(input.caveat_hash)?;
     let revision = latest_authz_revision(storage, input.tenant_id)
@@ -126,7 +129,7 @@ async fn write_authz_tuple_inner(
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("authz revision overflow"))?;
     let record = build_authz_tuple_record(input, revision, 0)?;
-    append_authz_tuple_record_inner(storage, &record, fence_token).await?;
+    append_authz_tuple_record_inner(storage, &record, fence_token, partition_precondition).await?;
     Ok(record)
 }
 
@@ -134,6 +137,7 @@ async fn write_authz_tuple_batch_inner(
     storage: &Storage,
     inputs: Vec<AuthzTupleWrite<'_>>,
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<Vec<AuthzTupleRecord>> {
     let tenant_id = inputs
         .first()
@@ -151,7 +155,14 @@ async fn write_authz_tuple_batch_inner(
             u32::try_from(idx).context("authz tuple batch ordinal overflow")?,
         )?);
     }
-    append_authz_tuple_batch_inner(storage, tenant_id, &records, fence_token).await?;
+    append_authz_tuple_batch_inner(
+        storage,
+        tenant_id,
+        &records,
+        fence_token,
+        partition_precondition,
+    )
+    .await?;
     Ok(records)
 }
 
@@ -197,7 +208,7 @@ fn build_authz_tuple_record(
 
 #[cfg(test)]
 async fn append_authz_tuple_record(storage: &Storage, record: &AuthzTupleRecord) -> Result<()> {
-    append_authz_tuple_record_inner(storage, record, 0).await
+    append_authz_tuple_record_inner(storage, record, 0, None).await
 }
 
 #[cfg(test)]
@@ -208,22 +219,26 @@ pub(crate) async fn append_authz_tuple_record_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
     require_authz_permit(record.tenant_id, permit)?;
-    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
-    append_authz_tuple_record_inner(storage, record, permit.fence_token).await
+    let partition_precondition =
+        partition_write_ref_precondition(storage, permit, partition_owner_signing_key).await?;
+    append_authz_tuple_record_inner(
+        storage,
+        record,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
 }
 
 async fn append_authz_tuple_record_inner(
     storage: &Storage,
     record: &AuthzTupleRecord,
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
-    let path = storage.authz_tuple_journal_path(record.tenant_id);
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    ensure_journal_header(&path, record.tenant_id, fence_token).await?;
-
-    let previous = read_authz_journal_frames_at_path(path.as_path())
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let stream_id = authz_tuple_stream_id(record.tenant_id);
+    let previous = read_authz_journal_frames_from_store(&core_store, &stream_id)
         .await
         .unwrap_or_default();
     let sequence = previous
@@ -245,13 +260,22 @@ async fn append_authz_tuple_record_inner(
         body,
     );
 
-    let mut file = tokio::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .await
-        .with_context(|| format!("open authz tuple journal {}", path.display()))?;
-    file.write_all(&frame.encode()).await?;
-    file.sync_data().await?;
+    let partition_id = hex::encode(authz_partition_id(record.tenant_id));
+    core_store
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id: format!("authz-tuple:{}", record.mutation_id),
+            scope_partition: partition_id.clone(),
+            committed_by_principal: authz_partition_principal(record.tenant_id),
+            preconditions: partition_precondition.into_iter().collect(),
+            operations: vec![CoreMutationOperation::StreamAppend {
+                partition_id,
+                stream_id,
+                record_kind: "authz_tuple".to_string(),
+                payload: frame.encode(),
+                idempotency_key: Some(format!("authz-tuple:{}", record.mutation_id)),
+            }],
+        })
+        .await?;
     let records = read_all_authz_tuple_records_from_journal(storage, record.tenant_id).await?;
     authz_segment::write_authz_tuple_segment_with_fence(
         storage,
@@ -268,6 +292,7 @@ async fn append_authz_tuple_batch_inner(
     tenant_id: i64,
     records: &[AuthzTupleRecord],
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
     if records.is_empty() {
         return Err(anyhow!("authz tuple batch must not be empty"));
@@ -281,13 +306,9 @@ async fn append_authz_tuple_batch_inner(
             "authz tuple batch records must target one tenant and revision"
         ));
     }
-    let path = storage.authz_tuple_journal_path(tenant_id);
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    ensure_journal_header(&path, tenant_id, fence_token).await?;
-
-    let previous = read_authz_journal_frames_at_path(path.as_path())
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let stream_id = authz_tuple_stream_id(tenant_id);
+    let previous = read_authz_journal_frames_from_store(&core_store, &stream_id)
         .await
         .unwrap_or_default();
     let sequence = previous
@@ -313,13 +334,22 @@ async fn append_authz_tuple_batch_inner(
         body,
     );
 
-    let mut file = tokio::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .await
-        .with_context(|| format!("open authz tuple journal {}", path.display()))?;
-    file.write_all(&frame.encode()).await?;
-    file.sync_data().await?;
+    let partition_id = hex::encode(authz_partition_id(tenant_id));
+    core_store
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id: format!("authz-tuple-batch:{tenant_id}:{revision}"),
+            scope_partition: partition_id.clone(),
+            committed_by_principal: authz_partition_principal(tenant_id),
+            preconditions: partition_precondition.into_iter().collect(),
+            operations: vec![CoreMutationOperation::StreamAppend {
+                partition_id,
+                stream_id,
+                record_kind: "authz_tuple_batch".to_string(),
+                payload: frame.encode(),
+                idempotency_key: Some(format!("authz-tuple-batch:{tenant_id}:{revision}")),
+            }],
+        })
+        .await?;
     let records = read_all_authz_tuple_records_from_journal(storage, tenant_id).await?;
     authz_segment::write_authz_tuple_segment_with_fence(storage, tenant_id, &records, fence_token)
         .await?;
@@ -523,6 +553,23 @@ pub async fn list_current_authz_objects_at_revision(
     caveat_hash: &str,
     revision: i64,
 ) -> Result<Vec<String>> {
+    if revision >= 0
+        && let Some(objects) = list_derived_userset_objects_at_revision(
+            storage,
+            tenant_id,
+            DEFAULT_DERIVED_USERSET_INDEX_ID,
+            namespace,
+            relation,
+            subject_kind,
+            subject_id,
+            caveat_hash,
+            revision as u64,
+        )
+        .await?
+    {
+        return Ok(objects);
+    }
+
     let filter = AuthzTupleFilter {
         namespace: Some(namespace.to_string()),
         relation: Some(relation.to_string()),
@@ -533,12 +580,38 @@ pub async fn list_current_authz_objects_at_revision(
     };
     let records =
         read_current_authz_tuples_at_revision(storage, tenant_id, filter, revision).await?;
-    Ok(records
+    let mut objects = records
         .into_iter()
         .map(|record| record.object_id)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect())
+        .collect::<BTreeSet<_>>();
+
+    let current = current_authz_view_at_revision(storage, tenant_id, revision).await?;
+    let subject = SubjectRef {
+        kind: subject_kind.to_string(),
+        id: subject_id.to_string(),
+        caveat_hash: caveat_hash.to_string(),
+    };
+    let candidates = current
+        .values()
+        .filter(|record| {
+            record.namespace == namespace
+                && record.relation == relation
+                && record.operation == "add"
+        })
+        .map(|record| UsersetRef {
+            namespace: record.namespace.clone(),
+            object_id: record.object_id.clone(),
+            relation: record.relation.clone(),
+        })
+        .collect::<BTreeSet<_>>();
+    for userset in candidates {
+        let mut visited = BTreeSet::new();
+        if resolve_userset(&current, &userset, &subject, &mut visited)? {
+            objects.insert(userset.object_id);
+        }
+    }
+
+    Ok(objects.into_iter().collect())
 }
 
 pub async fn list_current_authz_subjects_at_revision(
@@ -745,8 +818,7 @@ async fn read_all_authz_tuple_records_from_journal(
     storage: &Storage,
     tenant_id: i64,
 ) -> Result<Vec<AuthzTupleRecord>> {
-    let frames =
-        read_authz_journal_frames_at_path(&storage.authz_tuple_journal_path(tenant_id)).await?;
+    let frames = read_authz_journal_frames(storage, tenant_id).await?;
     let mut records = Vec::new();
     for frame in frames {
         match frame.record_kind {
@@ -777,6 +849,11 @@ async fn read_all_authz_tuple_records_from_journal(
     Ok(records)
 }
 
+async fn read_authz_journal_frames(storage: &Storage, tenant_id: i64) -> Result<Vec<JournalFrame>> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    read_authz_journal_frames_from_store(&core_store, &authz_tuple_stream_id(tenant_id)).await
+}
+
 fn authz_record_from_body(
     body: AuthzTupleBody,
     mutation_id: uuid::Uuid,
@@ -801,69 +878,50 @@ fn authz_record_from_body(
     })
 }
 
-async fn read_authz_journal_frames_at_path(path: &Path) -> Result<Vec<JournalFrame>> {
-    if tokio::fs::metadata(path).await.is_err() {
-        return Ok(Vec::new());
-    }
-    let bytes = tokio::fs::read(path)
-        .await
-        .with_context(|| format!("read authz tuple journal {}", path.display()))?;
-    decode_journal_file(&bytes)
-}
-
-fn decode_journal_file(bytes: &[u8]) -> Result<Vec<JournalFrame>> {
-    let header = BinaryEnvelopeHeader::decode(bytes)?;
-    if header.family != FileFamily::MetadataJournal {
-        anyhow::bail!("authz tuple journal has wrong file family");
-    }
-    let mut input = &bytes[COMMON_HEADER_LEN + header.header_json.len()..];
+async fn read_authz_journal_frames_from_store(
+    core_store: &CoreStore,
+    stream_id: &str,
+) -> Result<Vec<JournalFrame>> {
+    let records = core_store
+        .read_stream(ReadStream {
+            stream_id: stream_id.to_string(),
+            after_sequence: 0,
+            limit: 0,
+        })
+        .await?;
     let mut frames = Vec::new();
-    while !input.is_empty() {
-        if input.len() < 4 {
-            anyhow::bail!("truncated authz tuple journal frame length");
+    for record in records {
+        if record.record_kind != "authz_tuple" && record.record_kind != "authz_tuple_batch" {
+            continue;
         }
-        let frame_len = u32::from_le_bytes(input[0..4].try_into().unwrap()) as usize;
-        let frame_end = 4usize
-            .checked_add(frame_len)
-            .ok_or_else(|| anyhow::anyhow!("invalid authz tuple journal frame length"))?;
-        if input.len() < frame_end {
-            anyhow::bail!("truncated authz tuple journal frame");
-        }
-        frames.push(JournalFrame::decode(&input[..frame_end])?);
-        input = &input[frame_end..];
+        frames.push(JournalFrame::decode(&record.payload)?);
     }
     validate_journal_chain(&frames)?;
     Ok(frames)
 }
 
-async fn ensure_journal_header(path: &Path, tenant_id: i64, fence_token: u64) -> Result<()> {
-    if tokio::fs::try_exists(path).await? {
-        return Ok(());
-    }
-    let created_at = chrono::Utc::now().to_rfc3339();
-    let header_json = serde_json::to_vec(&AuthzJournalHeader {
-        tenant_id: tenant_id.to_string(),
-        partition_family: "authz_tuple",
-        partition_id: hex::encode(authz_partition_id(tenant_id)),
-        fence_token,
-        first_sequence: 1,
-        created_at: &created_at,
-        codec: "none",
-    })?;
-    let header = BinaryEnvelopeHeader::new(FileFamily::MetadataJournal, 0, 0, header_json);
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .await
-        .with_context(|| format!("create authz tuple journal {}", path.display()))?;
-    file.write_all(&header.encode()).await?;
-    file.sync_data().await?;
-    Ok(())
-}
-
 pub fn authz_partition_id(tenant_id: i64) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/authz_tuple").as_bytes())
+}
+
+fn authz_tuple_stream_id(tenant_id: i64) -> String {
+    format!("authz_tuple:tenant:{tenant_id}")
+}
+
+fn authz_partition_principal(tenant_id: i64) -> String {
+    format!("partition-owner:authz_tuple:{tenant_id}")
+}
+
+#[cfg(test)]
+pub(crate) async fn read_authz_frame_fences_for_test(
+    storage: &Storage,
+    tenant_id: i64,
+) -> Result<Vec<u64>> {
+    Ok(read_authz_journal_frames(storage, tenant_id)
+        .await?
+        .into_iter()
+        .map(|frame| frame.fence_token)
+        .collect())
 }
 
 fn require_authz_permit(tenant_id: i64, permit: &PartitionWritePermit) -> Result<()> {
@@ -1293,9 +1351,7 @@ mod tests {
         .await
         .unwrap();
 
-        let frames = read_authz_journal_frames_at_path(&storage.authz_tuple_journal_path(42))
-            .await
-            .unwrap();
+        let frames = read_authz_journal_frames(&storage, 42).await.unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].fence_token, permit.fence_token);
 
@@ -1332,6 +1388,33 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn authz_journal_batch_rejects_stale_partition_precondition() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let stale = ready_authz_permit(&storage, 42, "node-a").await;
+        let stale_precondition =
+            partition_write_ref_precondition(&storage, &stale, PARTITION_OWNER_KEY)
+                .await
+                .unwrap();
+        let fresh = ready_authz_permit(&storage, 42, "node-b").await;
+        assert_eq!(fresh.fence_token, stale.fence_token + 1);
+
+        let rejected = append_authz_tuple_record_inner(
+            &storage,
+            &record(1, "add"),
+            stale.fence_token,
+            Some(stale_precondition),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            rejected.to_string().contains("target mismatch")
+                || rejected.to_string().contains("generation mismatch"),
+            "unexpected error: {rejected:?}"
+        );
     }
 
     #[tokio::test]
@@ -1380,10 +1463,11 @@ mod tests {
                 .contains("does not target this authorization tuple partition")
         );
         assert!(
-            !tokio::fs::try_exists(storage.authz_tuple_journal_path(42))
+            read_authz_journal_frames(&storage, 42)
                 .await
-                .unwrap(),
-            "wrong-scope internal authz writes must fail before journal creation"
+                .unwrap()
+                .is_empty(),
+            "wrong-scope internal authz writes must fail before stream creation"
         );
     }
 
@@ -1413,9 +1497,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(written.revision, 1);
-        let frames = read_authz_journal_frames_at_path(&storage.authz_tuple_journal_path(42))
-            .await
-            .unwrap();
+        let frames = read_authz_journal_frames(&storage, 42).await.unwrap();
         assert_eq!(frames[0].fence_token, permit.fence_token);
     }
 }

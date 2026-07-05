@@ -1,5 +1,3 @@
-use crate::anvil_api::DeleteShardRequest;
-use crate::anvil_api::internal_anvil_service_client::InternalAnvilServiceClient;
 use crate::auth::JwtManager;
 use crate::cluster::ClusterState;
 use crate::crypto::EncryptionKeyring;
@@ -25,8 +23,6 @@ type Task = crate::persistence::TaskRecord;
 #[derive(Deserialize)]
 struct DeleteObjectPayload {
     object_id: i64,
-    content_hash: String,
-    shard_map: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -101,17 +97,15 @@ pub async fn run(
 
 async fn execute_task_with_lease(
     persistence: &Persistence,
-    cluster_state: &ClusterState,
-    jwt_manager: &Arc<JwtManager>,
+    _cluster_state: &ClusterState,
+    _jwt_manager: &Arc<JwtManager>,
     object_manager: &ObjectManager,
     task: &Task,
     keyring: &Arc<EncryptionKeyring>,
 ) -> anyhow::Result<()> {
     let lease = persistence.acquire_task_execution_lease(task).await?;
     match task.task_type {
-        TaskType::DeleteObject => {
-            handle_delete_object(persistence, cluster_state, jwt_manager, task).await?
-        }
+        TaskType::DeleteObject => handle_delete_object(persistence, task).await?,
         TaskType::DeleteBucket => handle_delete_bucket(persistence, task).await?,
         TaskType::ObjectMetadataCompaction => {
             handle_object_metadata_compaction(persistence, task).await?
@@ -541,55 +535,8 @@ async fn handle_hf_ingestion(
     result
 }
 
-async fn handle_delete_object(
-    persistence: &Persistence,
-    cluster_state: &ClusterState,
-    jwt_manager: &Arc<JwtManager>,
-    task: &Task,
-) -> Result<()> {
+async fn handle_delete_object(persistence: &Persistence, task: &Task) -> Result<()> {
     let payload: DeleteObjectPayload = serde_json::from_value(task.payload.clone())?;
-
-    if let Some(shard_map_peers) = payload.shard_map {
-        let cluster_map = cluster_state.read().await;
-        let mut futures = Vec::new();
-
-        for (i, peer_id_str) in shard_map_peers.iter().enumerate() {
-            let peer_id: libp2p::PeerId = peer_id_str.parse()?;
-            if let Some(peer_info) = cluster_map.get(&peer_id) {
-                let grpc_addr = peer_info.grpc_addr.clone();
-                let content_hash = payload.content_hash.clone();
-                let token = jwt_manager.mint_token(
-                    "internal-worker".to_string(),
-                    vec![format!("internal:delete_shard:{}/{}", content_hash, i)],
-                    0, // System-level task, no tenant
-                )?;
-
-                futures.push(async move {
-                    let endpoint =
-                        if grpc_addr.starts_with("http://") || grpc_addr.starts_with("https://") {
-                            grpc_addr
-                        } else {
-                            format!("http://{}", grpc_addr)
-                        };
-                    let mut client = InternalAnvilServiceClient::connect(endpoint)
-                        .await
-                        .map_err(|e| Status::internal(e.to_string()))?;
-                    let mut req = tonic::Request::new(DeleteShardRequest {
-                        object_hash: content_hash,
-                        shard_index: i as u32,
-                    });
-                    req.metadata_mut().insert(
-                        "authorization",
-                        format!("Bearer {}", token).parse().unwrap(),
-                    );
-                    client.delete_shard(req).await
-                });
-            }
-        }
-        // We proceed even if some shard deletions fail. The object metadata will be gone,
-        // so the shards become orphaned and can be garbage collected later.
-        let _ = futures::future::join_all(futures).await;
-    }
 
     // Finally, hard delete the object metadata.
     persistence.hard_delete_object(payload.object_id).await?;
@@ -625,9 +572,7 @@ async fn handle_delete_bucket(persistence: &Persistence, task: &Task) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        config::Config, placement::PlacementManager, sharding::ShardManager, storage::Storage,
-    };
+    use crate::{config::Config, storage::Storage};
     use chrono::Utc;
     use std::collections::HashMap;
     use tempfile::tempdir;
@@ -668,7 +613,7 @@ mod tests {
                 Some("text/plain"),
                 None,
                 None,
-                Some(b"alpha".to_vec()),
+                None,
             )
             .await
             .unwrap();
@@ -687,20 +632,19 @@ mod tests {
             updated_at: now,
         };
         let storage = Storage::new_at_sync(&config.storage_path).unwrap();
+        let core_store = crate::core_store::CoreStore::new(storage.clone())
+            .await
+            .unwrap();
         let cluster_state: ClusterState = Arc::new(RwLock::new(HashMap::new()));
         let jwt_manager = Arc::new(JwtManager::new(config.jwt_secret.clone()));
         let (watch_tx, _watch_rx) = broadcast::channel(16);
         let object_manager = ObjectManager::new(
             persistence.clone(),
-            PlacementManager::default(),
-            cluster_state.clone(),
-            ShardManager::new(),
             storage.clone(),
+            core_store,
             config.region.clone(),
             config.cross_region_routing_policy,
-            jwt_manager.clone(),
             hex::decode(&config.anvil_secret_encryption_key).unwrap(),
-            Arc::new(config.secret_keyring().unwrap()),
             watch_tx,
             crate::observability::Observability::default(),
         );
@@ -717,9 +661,14 @@ mod tests {
         .unwrap();
 
         assert!(
-            tokio::fs::metadata(storage.metadata_manifest_path(1, bucket.id))
-                .await
-                .is_ok()
+            crate::metadata_journal::read_latest_partition_manifest(
+                &storage,
+                &bucket,
+                &hex::decode(&config.anvil_secret_encryption_key).unwrap()
+            )
+            .await
+            .unwrap()
+            .is_some()
         );
         let replayed = persistence
             .get_object(bucket.id, "docs/a.txt")

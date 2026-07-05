@@ -231,7 +231,7 @@ mod tests {
             ],
             &tokenizer,
         );
-        let path = write_full_text_segment(
+        let segment_ref = write_full_text_segment(
             &storage,
             FullTextSegmentWrite {
                 index_id: "query-index",
@@ -246,7 +246,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let segment = read_full_text_segment(path).await.unwrap();
+        let segment = read_full_text_segment(&storage, &segment_ref)
+            .await
+            .unwrap();
         let authorized = BTreeSet::from([allowed]);
 
         let hits = query_full_text_segment(
@@ -293,7 +295,7 @@ mod tests {
             ],
             &tokenizer,
         );
-        let path = write_full_text_segment(
+        let segment_ref = write_full_text_segment(
             &storage,
             FullTextSegmentWrite {
                 index_id: "phrase-index",
@@ -308,7 +310,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let segment = read_full_text_segment(path).await.unwrap();
+        let segment = read_full_text_segment(&storage, &segment_ref)
+            .await
+            .unwrap();
         let hits = query_full_text_segment(
             &segment,
             FullTextSegmentQuery {
@@ -357,13 +361,20 @@ mod tests {
             vector_entry(2, denied, vec![0.99, 0.0]),
             vector_entry(3, allowed, vec![0.0, 1.0]),
         ];
-        let path = write_vector_segment(
+        let segment_ref = write_vector_segment(
             &storage,
             VectorSegmentWrite {
                 index_id: "vector-query",
+                definition_hash: "blake3:test-definition",
                 generation: 1,
                 dimension: 2,
                 metric: VectorMetric::Cosine,
+                embedding_provider: "test_only",
+                embedding_model_version: None,
+                embedding_normalisation: "unit_l2",
+                embedding_chunking_hash: "blake3:test-chunking",
+                extractor_definition_hash: "blake3:test-extractor",
+                embedding_provenance_hash: "blake3:test-provenance",
                 embedding_model: "embedding-v1",
                 modality: VectorModality::Text,
                 hnsw_m: 32,
@@ -376,7 +387,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let segment = read_vector_segment(path).await.unwrap();
+        let segment = read_vector_segment(&storage, &segment_ref).await.unwrap();
         let authorized = BTreeSet::from([allowed]);
         let hits = query_vector_segment(
             &segment,
@@ -412,14 +423,21 @@ mod tests {
                 vector_entry_with_modality(1, allowed, vec![1.0, 0.0], modality),
                 vector_entry_with_modality(2, allowed, vec![0.0, 1.0], modality),
             ];
-            let path = write_vector_segment(
+            let segment_ref = write_vector_segment(
                 &storage,
                 VectorSegmentWrite {
                     index_id: &format!("vector-modality-{idx}"),
+                    definition_hash: "blake3:test-definition",
                     generation: 1,
                     dimension: 2,
                     metric: VectorMetric::Cosine,
+                    embedding_provider: "test_only",
                     embedding_model: "embedding-v1",
+                    embedding_model_version: None,
+                    embedding_normalisation: "unit_l2",
+                    embedding_chunking_hash: "blake3:test-chunking",
+                    extractor_definition_hash: "blake3:test-extractor",
+                    embedding_provenance_hash: "blake3:test-provenance",
                     modality,
                     hnsw_m: 32,
                     hnsw_ef_construction: 200,
@@ -432,7 +450,7 @@ mod tests {
             .await
             .unwrap();
 
-            let segment = read_vector_segment(path).await.unwrap();
+            let segment = read_vector_segment(&storage, &segment_ref).await.unwrap();
             let hits =
                 query_vector_segment(&segment, &[1.0, 0.0], VectorMetric::Cosine, None, 1).unwrap();
             assert_eq!(segment.header.modality, modality.as_name());
@@ -455,6 +473,9 @@ mod tests {
         modality: VectorModality,
     ) -> VectorSegmentEntry {
         VectorSegmentEntry {
+            source_id_binary: vec![vector_id as u8],
+            source_generation: vector_id,
+            labels: Vec::new(),
             record: VectorRecord {
                 vector_id,
                 object_version_id: [vector_id as u8; 16],

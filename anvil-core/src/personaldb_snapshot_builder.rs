@@ -1,15 +1,21 @@
 use crate::{
     anvil_personaldb_sqlite_changeset::apply_changeset_to_snapshot_builder,
     formats::{Hash32, hash32, personaldb::PersonalDbLogRecord},
-    personaldb_commit_store::read_personaldb_changeset_payload_by_index,
+    personaldb_commit_store::{
+        read_personaldb_changeset_payload_by_index, read_personaldb_changeset_payload_ref,
+    },
     personaldb_control::PersonalDbSnapshotManifest,
     personaldb_heads::{
         PersonalDbCommittedHead, PersonalDbSnapshotsHead, read_personaldb_committed_head,
         read_personaldb_group_manifest, read_personaldb_snapshots_head,
         write_personaldb_snapshots_head,
     },
-    personaldb_segment::read_personaldb_log_segment,
-    personaldb_snapshot_store::{read_personaldb_snapshot_object, write_personaldb_snapshot},
+    personaldb_segment::{list_personaldb_log_segment_refs, read_personaldb_log_segment},
+    personaldb_snapshot_store::{
+        personaldb_snapshot_manifest_ref_name, personaldb_snapshot_object_ref_name,
+        read_personaldb_snapshot_manifest_by_ref, read_personaldb_snapshot_object,
+        write_personaldb_snapshot,
+    },
     storage::Storage,
 };
 use anyhow::{Context, Result, anyhow};
@@ -165,7 +171,7 @@ async fn build_snapshot(
     let compressed_sqlite_bytes = zstd::stream::encode_all(Cursor::new(&sqlite_bytes), 3)?;
     let snapshot_object_hash = hash32(&compressed_sqlite_bytes);
     let state_hash = hex::encode(uncompressed_state_hash);
-    let object_path = storage.personaldb_snapshot_object_path(
+    let snapshot_object_key = personaldb_snapshot_object_ref_name(
         request.tenant_id,
         request.database_id,
         committed_head.log_index,
@@ -179,7 +185,7 @@ async fn build_snapshot(
         log_hash: committed_head.log_hash.clone(),
         state_hash,
         schema_hash: committed_head.schema_hash.clone(),
-        snapshot_object_key: storage.relative_storage_path(&object_path)?,
+        snapshot_object_key,
         snapshot_object_hash: hex::encode(snapshot_object_hash),
         source_segment_start: new_records
             .first()
@@ -218,16 +224,13 @@ async fn restore_snapshot_database(
     snapshot_head: &PersonalDbSnapshotsHead,
     target_path: &PathBuf,
 ) -> Result<()> {
-    let manifest_path =
-        storage.resolve_relative_storage_path(&snapshot_head.latest_snapshot_manifest_path)?;
-    let manifest_bytes = tokio::fs::read(&manifest_path).await.with_context(|| {
-        format!(
-            "read personaldb snapshot manifest {}",
-            manifest_path.display()
-        )
-    })?;
-    let manifest: PersonalDbSnapshotManifest = serde_json::from_slice(&manifest_bytes)?;
-    manifest.verify(signing_key)?;
+    let manifest = read_personaldb_snapshot_manifest_by_ref(
+        storage,
+        &snapshot_head.latest_snapshot_manifest_path,
+        signing_key,
+    )
+    .await?
+    .ok_or_else(|| anyhow!("personaldb snapshot manifest missing"))?;
     if manifest.tenant_id != request.tenant_id.to_string()
         || manifest.database_id != request.database_id
         || manifest.log_index != snapshot_head.latest_snapshot_log_index
@@ -257,7 +260,7 @@ async fn publish_snapshots_head(
     signing_key: &[u8],
     manifest: &PersonalDbSnapshotManifest,
 ) -> Result<()> {
-    let manifest_path = storage.personaldb_snapshot_manifest_path(
+    let manifest_ref = personaldb_snapshot_manifest_ref_name(
         request.tenant_id,
         request.database_id,
         manifest.log_index,
@@ -269,7 +272,7 @@ async fn publish_snapshots_head(
         database_id: request.database_id.to_string(),
         latest_snapshot_log_index: manifest.log_index,
         latest_snapshot_log_hash: manifest.log_hash.clone(),
-        latest_snapshot_manifest_path: storage.relative_storage_path(&manifest_path)?,
+        latest_snapshot_manifest_path: manifest_ref,
         retained_snapshot_count: 1,
         updated_at: chrono::Utc::now().to_rfc3339(),
         updated_by_node: request.created_by_node.to_string(),
@@ -299,30 +302,10 @@ async fn read_canonical_records(
         .tenant_id
         .parse::<i64>()
         .context("personaldb committed head tenant id must be numeric")?;
-    let dir = storage.personaldb_log_segment_dir(tenant_id, database_id)?;
-    let mut entries = match tokio::fs::read_dir(&dir).await {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err).with_context(|| format!("read {}", dir.display())),
-    };
-    let mut paths = Vec::new();
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some("pdbseg") {
-            paths.push(path);
-        }
-    }
-    paths.sort_by_key(|path| {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.split('-').next())
-            .and_then(|start| start.parse::<u64>().ok())
-            .unwrap_or(u64::MAX)
-    });
-
+    let segment_refs = list_personaldb_log_segment_refs(storage, tenant_id, database_id).await?;
     let mut records = Vec::new();
-    for path in paths {
-        let segment = read_personaldb_log_segment(path).await?;
+    for segment_ref in segment_refs {
+        let segment = read_personaldb_log_segment(storage, &segment_ref).await?;
         for record in segment.records {
             if record.log_index <= committed_head.log_index {
                 records.push(record);
@@ -359,15 +342,14 @@ async fn load_changeset_bytes(
     record: &PersonalDbLogRecord,
 ) -> Result<Vec<u8>> {
     if !record.payload_ref.is_empty() {
-        let relative = std::str::from_utf8(&record.payload_ref)?;
-        let path = storage.resolve_relative_storage_path(relative)?;
-        let bytes = tokio::fs::read(&path)
-            .await
-            .with_context(|| format!("read personaldb changeset payload {}", path.display()))?;
-        if hash32(&bytes) != record.changeset_payload_hash {
-            return Err(anyhow!("personaldb changeset payload hash mismatch"));
-        }
-        return Ok(bytes);
+        let payload_ref = std::str::from_utf8(&record.payload_ref)?;
+        return read_personaldb_changeset_payload_ref(
+            storage,
+            payload_ref,
+            record.changeset_payload_hash,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("personaldb changeset payload is missing"));
     }
     read_personaldb_changeset_payload_by_index(
         storage,
@@ -491,7 +473,12 @@ mod tests {
         assert_eq!(built.manifest.source_segment_start, 1);
         assert_eq!(built.manifest.source_segment_end, 2);
         assert_eq!(built.manifest.schema_hash, fixture.schema_hash);
-        assert!(built.manifest.snapshot_object_key.ends_with(".sqlite.zst"));
+        assert!(
+            built
+                .manifest
+                .snapshot_object_key
+                .starts_with("personaldb_snapshot_object:tenant:9:database:db-snapshot:")
+        );
         assert_eq!(
             built.manifest.snapshot_object_hash,
             hex::encode(hash32(&built.compressed_sqlite_bytes))
@@ -520,19 +507,7 @@ mod tests {
         assert_eq!(snapshots_head.latest_snapshot_log_index, 2);
         assert_eq!(
             snapshots_head.latest_snapshot_manifest_path,
-            fixture
-                .storage
-                .relative_storage_path(
-                    &fixture
-                        .storage
-                        .personaldb_snapshot_manifest_path(
-                            9,
-                            "db-snapshot",
-                            2,
-                            &built.manifest.state_hash,
-                        )
-                        .unwrap()
-                )
+            personaldb_snapshot_manifest_ref_name(9, "db-snapshot", 2, &built.manifest.state_hash)
                 .unwrap()
         );
     }
@@ -607,10 +582,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                let payload_ref = storage
-                    .relative_storage_path(&payload_paths.by_index_path)
-                    .unwrap()
-                    .into_bytes();
+                let payload_ref = payload_paths.by_index_ref.clone().into_bytes();
                 let provisional_record = PersonalDbLogRecord::new(
                     log_index,
                     1,
@@ -646,7 +618,7 @@ mod tests {
                 }
                 .seal(KEY)
                 .unwrap();
-                let certificate_path = write_personaldb_commit_certificate(
+                let certificate_ref = write_personaldb_commit_certificate(
                     &storage,
                     9,
                     "db-snapshot",
@@ -666,17 +638,14 @@ mod tests {
                     [8; 32],
                     certificate_hash,
                     payload_ref,
-                    storage
-                        .relative_storage_path(&certificate_path)
-                        .unwrap()
-                        .into_bytes(),
+                    certificate_ref.into_bytes(),
                     Vec::new(),
                 );
                 previous = record.entry_hash;
                 records.push(record);
             }
 
-            let segment_path = write_personaldb_log_segment(
+            let segment_ref = write_personaldb_log_segment(
                 &storage,
                 PersonalDbLogSegmentWrite {
                     tenant_id: 9,
@@ -694,7 +663,7 @@ mod tests {
                 database_id: "db-snapshot".to_string(),
                 log_index: record_count,
                 log_hash: hex::encode(records.last().unwrap().entry_hash),
-                segment_path: storage.relative_storage_path(&segment_path).unwrap(),
+                segment_path: segment_ref,
                 row_index_generation: record_count,
                 policy_epoch: 1,
                 membership_epoch: 1,
