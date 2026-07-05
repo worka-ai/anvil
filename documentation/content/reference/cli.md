@@ -5,80 +5,128 @@ description: Command-line tasks for Anvil users, administrators, and release ope
 
 # CLI
 
-**What this page gives you:** a reference for the command families exposed by Anvil's user CLI and network admin CLI, and the safety model behind them.
+**What this page gives you:** a reference for Anvil's two command-line surfaces, when to use each one, and the safety model behind user operations and administrative operations.
 
-Anvil ships two command-line surfaces:
+Anvil ships two CLIs.
 
-- `anvil-cli` is the application/client CLI. It talks to the public native API with application credentials.
-- `admin` is the administrative CLI. It talks to the internal admin API and never writes directly to the storage directory.
+| CLI | Audience | Endpoint | Storage access |
+| --- | --- | --- | --- |
+| `anvil-cli` | Application developers, scripts, data import jobs, and ordinary authorised users. | Public native API on `API_LISTEN_ADDR`. | Never direct. |
+| `admin` | Operators, provisioners, and trusted automation. | Internal admin API on `ADMIN_LISTEN_ADDR`. | Never direct. |
 
-## User-Oriented Commands
+The split is deliberate. `anvil-cli` can only do what its application credentials and bearer token allow. `admin` can mutate control-plane state, but it still goes through the server, authorisation, request context, and audit logging. Neither CLI should mount or edit `STORAGE_PATH` directly.
 
-| Task | Command family | Why it exists |
-| --- | --- | --- |
-| Configure a profile | `anvil-cli configure` or `anvil-cli static-config` | Stores endpoint and credential settings. |
-| Get a token | `anvil-cli auth get-token` | Verifies credentials and obtains a bearer token. |
-| Manage buckets | `anvil-cli bucket ...` | Creates, lists, or deletes bucket boundaries where authorised. |
-| Manage objects | `anvil-cli object ...` | Puts, gets, heads, lists, and deletes objects. |
-| Delegated auth | `anvil-cli auth ...` | Performs permitted auth operations. |
-| Ingestion keys | `anvil-cli hf key ...` | Manages credentials for source/model ingestion workflows. |
-| Ingestion jobs | `anvil-cli hf ingest ...` | Starts and inspects ingestion into buckets. |
+## User CLI: `anvil-cli`
 
-## Network Admin Commands
-
-`admin` is a network client for the admin API. It needs an admin endpoint and a bearer token. It does not need `STORAGE_PATH` and must not be given `ANVIL_SECRET_ENCRYPTION_KEY`.
+Global options:
 
 ```bash
-export ANVIL_AUTH_TOKEN="$ANVIL_BOOTSTRAP_ADMIN_TOKEN"
-admin --host http://127.0.0.1:50052 tenant create \
-  --name default \
-  --audit-reason "initial tenant"
+anvil-cli --profile production <command>
+anvil-cli --config ./anvil-cli.toml <command>
 ```
 
-| Task | Command family | Safety note |
-| --- | --- | --- |
-| Generate server encryption keys | `admin key generate-secret-encryption-key` | Local helper only. Store the printed key securely. |
-| Create tenants | `admin tenant create ...` | Creates administrative boundaries. |
-| Create or rotate apps | `admin app create ...`, `admin app rotate-secret ...` | Creates or changes credentials. |
-| Grant or revoke policy | `admin policy grant ...`, `admin policy revoke ...` | Changes what callers can do. Review carefully. |
-| Rotate secret envelopes | `admin secret-encryption-key rotate ...` | Re-encrypts server-side secret envelopes after a key change. |
-| Create buckets | `admin bucket create ...` | Creates buckets for a tenant through the admin API. |
-| Set public access | `admin bucket public-access set ...` | Can expose data if misused. |
-| Manage regions/cells/nodes | `admin region ...`, `admin cell ...`, `admin node ...` | Changes placement and lifecycle records. |
-| Manage object links | `admin link ...` | Creates symlink-like object aliases. |
-| Manage host aliases | `admin host-alias ...` | Controls virtual-host routing. |
-| Repair and inspect | `admin routing ...`, `admin repair ...`, `admin diagnostics ...`, `admin audit ...` | Operator diagnostics and repair actions. |
+### Configuration
 
-Every mutating admin command requires `--audit-reason`. Use a concrete reason that explains why the change was made; it is written to the audit log.
+| Command | Purpose |
+| --- | --- |
+| `anvil-cli configure` | Interactive profile setup. |
+| `anvil-cli static-config` | Non-interactive profile setup for scripts and CI. |
 
-## Secret Key Generation
-
-Generate a server encryption key with:
-
-```bash
-admin key generate-secret-encryption-key
-```
-
-The command prints one 64-character hex key to stdout and a warning to stderr. Create it once for a storage cluster, put it in a secret manager, and keep it secure. Losing it makes encrypted records unrecoverable. If it leaks, configure a new active key and run `admin secret-encryption-key rotate`.
-
-## Profile Setup Example
+Example:
 
 ```bash
 anvil-cli static-config \
   --name production \
-  --host https://anvil.example.com \
+  --host https://storage.example.com \
   --client-id "$ANVIL_CLIENT_ID" \
   --client-secret "$ANVIL_CLIENT_SECRET" \
   --default
 ```
 
-This configures the application CLI. It does not grant permissions by itself.
+This stores connection information. It does not grant permissions.
 
-## Admin Bootstrap Example
+### Authentication and delegated policy
+
+| Command | Purpose |
+| --- | --- |
+| `anvil-cli auth get-token` | Request a bearer token for the active profile. |
+| `anvil-cli auth grant <app> <action> <resource>` | Grant a scope when the caller is already allowed to grant it. |
+| `anvil-cli auth revoke <app> <action> <resource>` | Revoke a scope when the caller is already allowed to revoke it. |
+
+Delegated grants are bounded. If the caller cannot grant `object:read` on `bucket:documents/*`, this command cannot create that authority.
+
+### Buckets
+
+| Command | Purpose |
+| --- | --- |
+| `anvil-cli bucket create <name> <region>` | Create a bucket in a region. |
+| `anvil-cli bucket rm <name>` | Remove an empty bucket. |
+| `anvil-cli bucket ls` | List buckets visible to the caller. |
+| `anvil-cli bucket set-public <name> --allow <true|false>` | Toggle public bucket reads when authorised. |
+
+### Objects
+
+Anvil object commands use S3-style paths because they are familiar and compact:
+
+```text
+s3://bucket/key/prefix/object.ext
+```
+
+| Command | Purpose |
+| --- | --- |
+| `anvil-cli object put <local> <s3://bucket/key>` | Upload bytes and metadata. |
+| `anvil-cli object get <s3://bucket/key> [local]` | Download bytes or print to stdout. |
+| `anvil-cli object head <s3://bucket/key>` | Read metadata for one object version. |
+| `anvil-cli object ls <s3://bucket/prefix>` | List visible objects under a prefix. |
+| `anvil-cli object rm <s3://bucket/key>` | Delete an object head. |
+
+Reserved `_anvil/` paths are rejected even if a token has broad object scopes.
+
+### Hugging Face artefact ingestion
+
+| Command | Purpose |
+| --- | --- |
+| `anvil-cli hf key add` | Store an ingestion token in Anvil. |
+| `anvil-cli hf key ls` | List stored ingestion keys. |
+| `anvil-cli hf key rm` | Remove a stored ingestion key. |
+| `anvil-cli hf ingest start` | Start a model/source ingestion job. |
+| `anvil-cli hf ingest status` | Inspect ingestion progress. |
+| `anvil-cli hf ingest cancel` | Cancel a running ingestion job. |
+
+Ingestion state, fetched artefacts, indexes, diagnostics, and completion records are persisted through CoreStore.
+
+## Admin CLI: `admin`
+
+`admin` is a network client for the admin API. It needs an admin endpoint and a bearer token. It does not need `STORAGE_PATH` and must not be given `ANVIL_SECRET_ENCRYPTION_KEY`.
+
+Set the token explicitly for bootstrap or automation:
 
 ```bash
 export ANVIL_AUTH_TOKEN="$ANVIL_BOOTSTRAP_ADMIN_TOKEN"
+```
 
+Every mutating admin command requires `--audit-reason`. Use a concrete sentence. The server writes it to the admin audit stream.
+
+Most mutating commands also accept:
+
+| Flag | Meaning |
+| --- | --- |
+| `--request-id` | Caller-supplied request id. Defaults to a generated id. |
+| `--idempotency-key` | Retry key for safe replay. Defaults to a generated id. |
+| `--expected-generation` | Required for update/delete lifecycle commands; create commands default to generation `0`. |
+| `--audit-reason` | Required reason stored in the audit log. |
+
+### Local key helper
+
+```bash
+admin key generate-secret-encryption-key
+```
+
+This command is local. It prints a 32-byte hex key suitable for `ANVIL_SECRET_ENCRYPTION_KEY`. Generate one once for a storage cluster, store it securely, and rotate if leaked.
+
+### Tenant and application provisioning
+
+```bash
 admin --host http://127.0.0.1:50052 tenant create \
   --name acme \
   --home-region eu-west-1 \
@@ -86,32 +134,107 @@ admin --host http://127.0.0.1:50052 tenant create \
 
 admin --host http://127.0.0.1:50052 app create \
   --tenant-id acme \
-  --app-name ingest-worker \
-  --audit-reason "create ingest app"
+  --app-name docs-writer \
+  --audit-reason "create docs writer credential"
 
-admin --host http://127.0.0.1:50052 policy grant \
+admin --host http://127.0.0.1:50052 app rotate-secret \
   --tenant-id acme \
-  --app-name ingest-worker \
-  --action object:write \
-  --resource 'raw-events/*' \
-  --audit-reason "allow ingest writes"
+  --app-name docs-writer \
+  --expected-generation 1 \
+  --audit-reason "rotate docs writer secret"
 ```
 
-After bootstrap, remove `ANVIL_BOOTSTRAP_ADMIN_TOKEN` and use minted admin tokens or application credentials with explicit admin scopes.
+`app create` prints the client id and client secret once. Store them in a secret manager.
 
-## Scripting Rules
+### Policy grants and revocation
 
-When using the CLI in automation:
+```bash
+admin --host http://127.0.0.1:50052 policy grant \
+  --tenant-id acme \
+  --app-name docs-writer \
+  --action object:write \
+  --resource 'documents/*' \
+  --audit-reason "allow document uploads"
 
-- use idempotency keys where supported;
-- capture request ids;
-- avoid wildcard grants unless creating a deliberate cluster admin;
-- prefer least-privilege credentials;
-- fail closed on authorisation errors;
-- do not probe reserved namespaces;
-- keep admin traffic on the internal admin endpoint;
-- keep `ANVIL_SECRET_ENCRYPTION_KEY` out of CLI environments.
+admin --host http://127.0.0.1:50052 policy revoke \
+  --tenant-id acme \
+  --app-name docs-writer \
+  --action object:write \
+  --resource 'documents/*' \
+  --audit-reason "remove document upload access"
+```
 
-## What You Can Do After This Page
+Policy scopes are coarse API gates. Relationship authorisation still decides object-level permissions where a path uses relationship checks.
 
-You should be able to choose the correct command family, understand whether a command is ordinary client work or privileged administration, and bootstrap a deployment without direct filesystem writes.
+### Server-side secret envelope rotation
+
+```bash
+admin --host http://127.0.0.1:50052 secret-encryption-key rotate \
+  --dry-run \
+  --audit-reason "dry-run secret encryption key rotation"
+
+admin --host http://127.0.0.1:50052 secret-encryption-key rotate \
+  --audit-reason "rotate secret encryption key"
+```
+
+The server performs the re-encryption. The CLI does not read or write encrypted storage files.
+
+### Bucket and public access operations
+
+```bash
+admin --host http://127.0.0.1:50052 bucket create \
+  --tenant-id acme \
+  --bucket-name documents \
+  --region eu-west-1 \
+  --audit-reason "create documents bucket"
+
+admin --host http://127.0.0.1:50052 bucket public-access set \
+  --tenant-id acme \
+  --bucket-name public-assets \
+  --allow true \
+  --expected-generation 1 \
+  --audit-reason "publish public assets"
+```
+
+### Mesh lifecycle
+
+| Command family | Purpose |
+| --- | --- |
+| `admin region create|activate|set-read-only|drain|remove|list` | Manage region descriptors and region lifecycle. |
+| `admin cell register|activate|drain|remove|list` | Manage cells inside regions. |
+| `admin node register|activate|drain|force-offline|remove|list` | Manage nodes and their capabilities. |
+| `admin link create|update|delete|read|list` | Manage symlink-like object links. |
+| `admin host-alias create|activate|suspend|delete|read|list` | Manage custom host aliases. |
+| `admin routing list|repair` | Inspect and repair routing projections. |
+| `admin repair run` | Run repair backends. |
+| `admin diagnostics list` | List diagnostics. |
+| `admin audit list` | List administrative audit events. |
+
+Example node registration:
+
+```bash
+admin --host http://127.0.0.1:50052 node register \
+  --node-id node-a \
+  --region eu-west-1 \
+  --cell-id cell-a \
+  --libp2p-peer-id 12D3KooW... \
+  --public-api-addr https://node-a.storage.example.com \
+  --public-cluster-addr /ip4/10.0.0.10/udp/7000/quic-v1 \
+  --capability object,index,gateway,admin \
+  --audit-reason "register first node"
+```
+
+## Scripting rules
+
+- Prefer least-privilege credentials.
+- Use idempotency keys for automation.
+- Capture request ids in logs.
+- Put admin traffic on an internal network.
+- Keep `ANVIL_SECRET_ENCRYPTION_KEY` out of CLI environments.
+- Treat wildcard grants as exceptional.
+- Do not use public APIs to probe `_anvil/` paths.
+- Verify denied paths as well as successful paths during deployment smoke tests.
+
+## What you can do after this page
+
+You should be able to choose the correct CLI, understand which endpoint it talks to, bootstrap a tenant, create credentials, grant and revoke access, and prove access changes through ordinary object commands.

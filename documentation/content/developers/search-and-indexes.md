@@ -86,7 +86,7 @@ ranking:
   freshness_weight = 0.10
 ```
 
-Let Anvil combine and authorize the result set. Do not fetch text results, fetch vector results, merge in memory, and hope consistency and permissions still hold.
+Let Anvil combine and authorise the result set. Do not fetch text results, fetch vector results, merge in memory, and hope consistency and permissions still hold.
 
 ## Consistency choices
 

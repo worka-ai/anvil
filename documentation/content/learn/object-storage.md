@@ -117,4 +117,4 @@ Those features are valuable because they share one identity model and one mutati
 
 ## What you can do after this page
 
-You should be able to explain buckets, keys, object bodies, metadata, versions, checksums, and range reads. Next, learn how to design keys and metadata so applications can list, filter, authorize, and watch data efficiently.
+You should be able to explain buckets, keys, object bodies, metadata, versions, checksums, and range reads. Next, learn how to design keys and metadata so applications can list, filter, authorise, and watch data efficiently.
