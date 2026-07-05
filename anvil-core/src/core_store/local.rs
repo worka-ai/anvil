@@ -1471,10 +1471,12 @@ impl CoreStore {
     }
 
     async fn transaction_is_committed(&self, transaction_id: &str) -> Result<bool> {
-        Ok(self
-            .read_transaction_unlocked(transaction_id)
-            .await?
-            .is_some_and(|transaction| transaction.state == CoreTransactionState::Committed))
+        match self.read_transaction_unlocked(transaction_id).await {
+            Ok(Some(transaction)) => Ok(transaction.state == CoreTransactionState::Committed),
+            Ok(None) => Ok(false),
+            Err(error) if is_quorum_visibility_gap(&error) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     async fn core_ref_is_visible(&self, value: &CoreRefValue) -> Result<bool> {
@@ -2132,6 +2134,12 @@ fn strip_sha256_prefix(hash: &str) -> Result<&str> {
 
 fn logical_file_name(value: &str) -> String {
     sha256_hex(value.as_bytes())
+}
+
+fn is_quorum_visibility_gap(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("did not reach read quorum"))
 }
 
 fn local_control_node_id(index: usize) -> String {
