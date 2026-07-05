@@ -447,33 +447,43 @@ pub async fn renew_ownership(
     signing_key: &[u8],
 ) -> Result<OwnershipFenceOutcome> {
     validate_renew_ownership(&request)?;
-    let Some((ref_value, mut record)) = read_ownership_fence_state(
-        storage,
-        request.owner.tenant_id,
-        &request.resource,
-        signing_key,
-    )
-    .await?
-    else {
-        return Err(anyhow!("{OWNERSHIP_NOT_FOUND}: ownership fence is absent"));
-    };
-    require_current_owner_and_fence(&record, &request.owner, request.current_fence)?;
-    if !record.is_active_unexpired(request.now_nanos) {
-        return Err(anyhow!(
-            "{OWNERSHIP_EXPIRED}: ownership fence is not active"
-        ));
+    for _ in 0..OWNERSHIP_LOCK_RETRY_ATTEMPTS {
+        let Some((ref_value, mut record)) = read_ownership_fence_state(
+            storage,
+            request.owner.tenant_id,
+            &request.resource,
+            signing_key,
+        )
+        .await?
+        else {
+            return Err(anyhow!("{OWNERSHIP_NOT_FOUND}: ownership fence is absent"));
+        };
+        require_current_owner_and_fence(&record, &request.owner, request.current_fence)?;
+        if !record.is_active_unexpired(request.now_nanos) {
+            return Err(anyhow!(
+                "{OWNERSHIP_EXPIRED}: ownership fence is not active"
+            ));
+        }
+        record.lease_expires_at_nanos = request.now_nanos.saturating_add(request.ttl_nanos);
+        record.last_heartbeat_at_nanos = request.now_nanos;
+        record.last_operation = Some("renew".to_string());
+        record.last_idempotency_key = None;
+        record.last_actor = Some(request.owner.clone());
+        record = record.seal(signing_key)?;
+        match write_ownership_fence_state(storage, &record, Some(&ref_value)).await {
+            Ok(()) => {
+                return Ok(OwnershipFenceOutcome {
+                    record,
+                    idempotent_replay: false,
+                });
+            }
+            Err(err) if is_core_ref_cas_conflict(&err) => continue,
+            Err(err) => return Err(err),
+        }
     }
-    record.lease_expires_at_nanos = request.now_nanos.saturating_add(request.ttl_nanos);
-    record.last_heartbeat_at_nanos = request.now_nanos;
-    record.last_operation = Some("renew".to_string());
-    record.last_idempotency_key = None;
-    record.last_actor = Some(request.owner);
-    record = record.seal(signing_key)?;
-    write_ownership_fence_state(storage, &record, Some(&ref_value)).await?;
-    Ok(OwnershipFenceOutcome {
-        record,
-        idempotent_replay: false,
-    })
+    Err(anyhow!(
+        "{OWNERSHIP_CAS_CONFLICT}: ownership fence renew CAS retries exhausted"
+    ))
 }
 
 pub async fn transfer_ownership(
