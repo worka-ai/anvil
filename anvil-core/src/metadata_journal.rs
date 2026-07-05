@@ -1,6 +1,6 @@
 use crate::core_store::{
     CompareAndSwapRef, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CoreObjectRef, CoreStore, GetBlob, PutBlob, ReadStream,
+    CoreObjectRef, CoreStore, GetBlob, PutBlob, ReadStream, is_stream_head_mismatch,
 };
 use crate::formats::{
     BinaryEnvelopeHeader, BinaryFileFooter, COMMON_FOOTER_LEN, COMMON_HEADER_LEN, FileFamily,
@@ -165,6 +165,40 @@ pub(crate) async fn append_object_mutation_with_permit(
 }
 
 async fn append_object_mutation_inner(
+    storage: &Storage,
+    bucket: &Bucket,
+    object: &Object,
+    mutation: ObjectJournalMutation,
+    fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
+) -> Result<()> {
+    const MAX_STREAM_HEAD_RETRIES: usize = 64;
+
+    for attempt in 0..MAX_STREAM_HEAD_RETRIES {
+        let result = append_object_mutation_inner_once(
+            storage,
+            bucket,
+            object,
+            mutation,
+            fence_token,
+            partition_precondition.clone(),
+        )
+        .await;
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if is_stream_head_mismatch(&error) && attempt + 1 < MAX_STREAM_HEAD_RETRIES =>
+            {
+                tokio::task::yield_now().await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("metadata journal stream-head retry loop always returns")
+}
+
+async fn append_object_mutation_inner_once(
     storage: &Storage,
     bucket: &Bucket,
     object: &Object,

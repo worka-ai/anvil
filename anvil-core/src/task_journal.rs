@@ -1,5 +1,6 @@
 use crate::core_store::{
     CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreStore, ReadStream,
+    is_stream_head_mismatch,
 };
 use crate::formats::{Hash32, JournalFrame, JournalRecordKind, hash32, validate_journal_chain};
 use crate::partition_fence::{PartitionWritePermit, partition_write_ref_precondition};
@@ -395,54 +396,73 @@ async fn append_task_event(
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
+    const MAX_STREAM_HEAD_RETRIES: usize = 64;
+
     let core_store = CoreStore::new(storage.clone()).await?;
     let stream_id = task_queue_stream_id();
-    let raw_stream_head = core_store.raw_stream_head(&stream_id).await?;
-    let previous = read_raw_task_journal_frames_from_store(&core_store)
-        .await
-        .unwrap_or_default();
-    let sequence = previous
-        .last()
-        .map(|frame| frame.partition_sequence + 1)
-        .unwrap_or(1);
-    let previous_hash = previous
-        .last()
-        .map(|frame| frame.record_hash)
-        .unwrap_or([0; 32]);
     let mutation_id = uuid::Uuid::new_v4();
-    let key_hash = event_key_hash(&event);
-    let frame = JournalFrame::new(
-        JournalRecordKind::TaskQueue,
-        sequence,
-        fence_token,
-        *mutation_id.as_bytes(),
-        key_hash,
-        previous_hash,
-        serde_json::to_vec(&event)?,
-    );
     let partition_id = hex::encode(task_queue_partition_id());
-    let mut preconditions = partition_precondition.into_iter().collect::<Vec<_>>();
-    preconditions.push(CoreMutationPrecondition::StreamHead {
-        stream_id: stream_id.clone(),
-        expected_last_sequence: raw_stream_head.0,
-        expected_last_event_hash: raw_stream_head.1,
-    });
-    core_store
-        .commit_mutation_batch(CoreMutationBatch {
-            transaction_id: format!("task-queue:{mutation_id}"),
-            scope_partition: partition_id.clone(),
-            committed_by_principal: task_queue_partition_principal(),
-            preconditions,
-            operations: vec![CoreMutationOperation::StreamAppend {
-                partition_id,
-                stream_id,
-                record_kind: "task_queue".to_string(),
-                payload: frame.encode(),
-                idempotency_key: Some(format!("task-queue:{mutation_id}")),
-            }],
-        })
-        .await?;
-    Ok(())
+    let key_hash = event_key_hash(&event);
+    let body = serde_json::to_vec(&event)?;
+
+    for attempt in 0..MAX_STREAM_HEAD_RETRIES {
+        let raw_stream_head = core_store.raw_stream_head(&stream_id).await?;
+        let previous = read_raw_task_journal_frames_from_store(&core_store)
+            .await
+            .unwrap_or_default();
+        let sequence = previous
+            .last()
+            .map(|frame| frame.partition_sequence + 1)
+            .unwrap_or(1);
+        let previous_hash = previous
+            .last()
+            .map(|frame| frame.record_hash)
+            .unwrap_or([0; 32]);
+        let frame = JournalFrame::new(
+            JournalRecordKind::TaskQueue,
+            sequence,
+            fence_token,
+            *mutation_id.as_bytes(),
+            key_hash,
+            previous_hash,
+            body.clone(),
+        );
+        let mut preconditions = partition_precondition
+            .clone()
+            .into_iter()
+            .collect::<Vec<_>>();
+        preconditions.push(CoreMutationPrecondition::StreamHead {
+            stream_id: stream_id.clone(),
+            expected_last_sequence: raw_stream_head.0,
+            expected_last_event_hash: raw_stream_head.1,
+        });
+        let result = core_store
+            .commit_mutation_batch(CoreMutationBatch {
+                transaction_id: format!("task-queue:{mutation_id}"),
+                scope_partition: partition_id.clone(),
+                committed_by_principal: task_queue_partition_principal(),
+                preconditions,
+                operations: vec![CoreMutationOperation::StreamAppend {
+                    partition_id: partition_id.clone(),
+                    stream_id: stream_id.clone(),
+                    record_kind: "task_queue".to_string(),
+                    payload: frame.encode(),
+                    idempotency_key: Some(format!("task-queue:{mutation_id}")),
+                }],
+            })
+            .await;
+        match result {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if is_stream_head_mismatch(&error) && attempt + 1 < MAX_STREAM_HEAD_RETRIES =>
+            {
+                tokio::task::yield_now().await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("task journal stream-head retry loop always returns")
 }
 
 async fn read_task_journal_frames(storage: &Storage) -> Result<Vec<JournalFrame>> {

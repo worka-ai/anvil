@@ -27,6 +27,27 @@ const LOCAL_CONTROL_REPLICA_COUNT: usize = 5;
 const LOCAL_CONTROL_WRITE_QUORUM: usize = 3;
 const LOCAL_CONTROL_READ_QUORUM: usize = 3;
 const LOCAL_CONTROL_NODE_ID_PREFIX: &str = "local-control-node";
+
+#[derive(Debug, thiserror::Error)]
+pub enum CoreStoreCommitError {
+    #[error(
+        "CoreStore stream {stream_id} head mismatch: expected {expected_last_sequence}/{expected_last_event_hash}, got {actual_sequence}/{actual_event_hash}"
+    )]
+    StreamHeadMismatch {
+        stream_id: String,
+        expected_last_sequence: u64,
+        expected_last_event_hash: String,
+        actual_sequence: u64,
+        actual_event_hash: String,
+    },
+}
+
+pub fn is_stream_head_mismatch(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<CoreStoreCommitError>().is_some())
+}
+
 const ZERO_HASH: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 const MAX_CORE_FENCE_TTL_MS: u64 = 120_000;
 const CORE_STREAM_SEGMENT_MAGIC: &[u8; 8] = b"ANSEG001";
@@ -1570,9 +1591,14 @@ impl CoreStore {
                     if actual_sequence != *expected_last_sequence
                         || actual_hash != *expected_last_event_hash
                     {
-                        bail!(
-                            "CoreStore stream {stream_id} head mismatch: expected {expected_last_sequence}/{expected_last_event_hash}, got {actual_sequence}/{actual_hash}"
-                        );
+                        return Err(CoreStoreCommitError::StreamHeadMismatch {
+                            stream_id: stream_id.clone(),
+                            expected_last_sequence: *expected_last_sequence,
+                            expected_last_event_hash: expected_last_event_hash.clone(),
+                            actual_sequence,
+                            actual_event_hash: actual_hash,
+                        }
+                        .into());
                     }
                 }
             }

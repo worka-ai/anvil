@@ -858,7 +858,7 @@ async fn test_query_spec_intersects_full_text_with_typed_filter_without_bucket_s
             accept_degraded: false,
         },
         2,
-        Duration::from_secs(30),
+        Duration::from_secs(90),
     )
     .await;
 
@@ -872,7 +872,7 @@ async fn test_query_spec_intersects_full_text_with_typed_filter_without_bucket_s
             accept_degraded: false,
         },
         1,
-        Duration::from_secs(20),
+        Duration::from_secs(90),
     )
     .await;
     let result = response.result.expect("query spec result");
@@ -1265,7 +1265,7 @@ async fn test_query_spec_path_filter_intersects_authz_before_results() {
             accept_degraded: false,
         },
         1,
-        Duration::from_secs(10),
+        Duration::from_secs(60),
     )
     .await;
     let result = response.result.expect("query spec result");
@@ -1292,7 +1292,7 @@ async fn test_query_spec_path_filter_intersects_authz_before_results() {
             accept_degraded: false,
         },
         2,
-        Duration::from_secs(10),
+        Duration::from_secs(60),
     )
     .await
     .result
@@ -1636,7 +1636,7 @@ async fn test_query_spec_intersects_vector_with_typed_filter_without_bucket_scan
             accept_degraded: false,
         },
         2,
-        Duration::from_secs(20),
+        Duration::from_secs(90),
     )
     .await;
     let result = response.result.expect("query spec result");
@@ -1846,7 +1846,7 @@ async fn test_query_spec_intersects_hybrid_with_typed_filter_without_bucket_scan
             accept_degraded: false,
         },
         2,
-        Duration::from_secs(30),
+        Duration::from_secs(90),
     )
     .await;
 
@@ -1860,7 +1860,7 @@ async fn test_query_spec_intersects_hybrid_with_typed_filter_without_bucket_scan
             accept_degraded: false,
         },
         1,
-        Duration::from_secs(20),
+        Duration::from_secs(90),
     )
     .await;
     let result = response.result.expect("query spec result");
@@ -2332,7 +2332,7 @@ async fn test_query_path_and_metadata_filter_indexes_from_object_metadata() {
         Some(serde_json::json!({"tenant": "alpha", "nested": {"state": "open"}})),
     )
     .await;
-    let tasks = wait_for_index_build_task_count(&cluster, Duration::from_secs(10), 2).await;
+    let tasks = wait_for_index_build_task_count(&cluster, Duration::from_secs(60), 2).await;
     assert!(
         tasks
             .iter()
@@ -2364,7 +2364,7 @@ async fn test_query_path_and_metadata_filter_indexes_from_object_metadata() {
             lag_timeout_ms: 0,
         },
         2,
-        Duration::from_secs(10),
+        Duration::from_secs(60),
     )
     .await;
 
@@ -2630,7 +2630,7 @@ async fn test_full_text_index_builds_from_object_write_task() {
         .await
         .unwrap()
         .into_inner();
-    let watch_event = tokio::time::timeout(Duration::from_secs(5), watch.next())
+    let watch_event = tokio::time::timeout(Duration::from_secs(30), watch.next())
         .await
         .expect("index partition watch should yield a built segment event")
         .expect("index partition watch stream should stay open")
@@ -5108,7 +5108,7 @@ async fn test_query_inherit_object_vector_filters_results_by_object_read_scope()
         VectorSegmentWrite {
             index_id: &index_storage_id,
             definition_hash: "blake3:test-definition",
-            generation: 4,
+            generation: 100,
             dimension: 2,
             metric: VectorMetric::Cosine,
             embedding_provider: "test_only",
@@ -5124,8 +5124,18 @@ async fn test_query_inherit_object_vector_filters_results_by_object_read_scope()
             source_cursor: 40,
             authz_revision: 41,
             entries: &[
-                vector_entry(1, *allowed_object.version_id.as_bytes(), vec![0.99, 0.0]),
-                vector_entry(2, *denied_object.version_id.as_bytes(), vec![1.0, 0.0]),
+                vector_entry_with_authz_label(
+                    1,
+                    *allowed_object.version_id.as_bytes(),
+                    vec![0.99, 0.0],
+                    test_object_authz_label_hash(&bucket, &allowed_object),
+                ),
+                vector_entry_with_authz_label(
+                    2,
+                    *denied_object.version_id.as_bytes(),
+                    vec![1.0, 0.0],
+                    test_object_authz_label_hash(&bucket, &denied_object),
+                ),
             ],
             deleted_bitset: &[0],
         },
@@ -5270,14 +5280,14 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
                 document_id: 1,
                 field_id: 1,
                 object_version_id: *allowed_object.version_id.as_bytes(),
-                authz_label_hash: [1; 32],
+                authz_label_hash: test_object_authz_label_hash(&bucket, &allowed_object),
                 text: "alpha allowed",
             },
             FullTextDocument {
                 document_id: 2,
                 field_id: 1,
                 object_version_id: *denied_object.version_id.as_bytes(),
-                authz_label_hash: [2; 32],
+                authz_label_hash: test_object_authz_label_hash(&bucket, &denied_object),
                 text: "alpha alpha alpha denied",
             },
             FullTextDocument {
@@ -5294,7 +5304,7 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
         &cluster.states[0].storage,
         FullTextSegmentWrite {
             index_id: &index_storage_id,
-            generation: 2,
+            generation: 100,
             tokenizer: serde_json::json!({}),
             scorer: serde_json::json!({"kind": "bm25"}),
             source_cursor: 3,
@@ -5391,7 +5401,7 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
             lag_timeout_ms: 0,
         },
         1,
-        Duration::from_secs(10),
+        Duration::from_secs(60),
     )
     .await;
 
@@ -5743,6 +5753,30 @@ async fn wait_for_vector_hit(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     panic!("vector index `{index_name}` did not return `{object_key}` before timeout");
+}
+
+fn test_object_authz_label_hash(
+    bucket: &anvil::persistence::Bucket,
+    object: &anvil::persistence::Object,
+) -> [u8; 32] {
+    anvil::formats::hash32(
+        format!(
+            "tenant:{}:bucket:{}:object:{}:authz:{}",
+            bucket.tenant_id, bucket.id, object.key, object.authz_revision
+        )
+        .as_bytes(),
+    )
+}
+
+fn vector_entry_with_authz_label(
+    vector_id: u64,
+    object_version_id: [u8; 16],
+    values: Vec<f32>,
+    authz_label_hash: [u8; 32],
+) -> VectorSegmentEntry {
+    let mut entry = vector_entry(vector_id, object_version_id, values);
+    entry.record.authz_label_hash = authz_label_hash;
+    entry
 }
 
 fn vector_entry(

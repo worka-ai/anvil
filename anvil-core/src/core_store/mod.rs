@@ -11,5 +11,5 @@ mod local;
 mod types;
 
 pub use encoding::*;
-pub use local::CoreStore;
+pub use local::{CoreStore, CoreStoreCommitError, is_stream_head_mismatch};
 pub use types::*;
