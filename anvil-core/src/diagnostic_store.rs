@@ -1,13 +1,17 @@
-use crate::{formats::hash32, storage::Storage};
-use anyhow::{Context, Result, anyhow};
+use crate::{
+    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    formats::hash32,
+    storage::Storage,
+};
+use anyhow::{Result, anyhow};
 use base64::Engine;
 use hmac::{Hmac, Mac};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::io::ErrorKind;
-use std::path::Path;
 
 type HmacSha256 = Hmac<Sha256>;
+const DIAGNOSTIC_REF_PREFIX: &str = "diagnostic:";
+const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiagnosticSeverity {
@@ -126,13 +130,7 @@ pub async fn write_diagnostic_object(
         diagnostic_signature: None,
     }
     .seal(signing_key)?;
-    let path = storage.diagnostic_object_path(
-        &sealed.scope_kind,
-        &sealed.scope_id,
-        &sealed.source,
-        &sealed.diagnostic_id,
-    )?;
-    write_json_atomically(&path, &sealed).await?;
+    write_diagnostic_ref(storage, &sealed).await?;
     Ok(sealed)
 }
 
@@ -144,8 +142,12 @@ pub async fn read_diagnostic_object(
     diagnostic_id: &str,
     signing_key: &[u8],
 ) -> Result<Option<DiagnosticObject>> {
-    let path = storage.diagnostic_object_path(scope_kind, scope_id, source, diagnostic_id)?;
-    let Some(diagnostic) = read_json_optional::<DiagnosticObject>(&path).await? else {
+    let Some(diagnostic) = read_diagnostic_ref(
+        storage,
+        &diagnostic_ref_name(scope_kind, scope_id, source, diagnostic_id)?,
+    )
+    .await?
+    else {
         return Ok(None);
     };
     diagnostic.verify(signing_key)?;
@@ -167,22 +169,15 @@ pub async fn list_diagnostic_objects(
     min_severity: Option<DiagnosticSeverity>,
     signing_key: &[u8],
 ) -> Result<Vec<DiagnosticObject>> {
-    let dir = storage.diagnostic_source_dir(scope_kind, scope_id, source)?;
-    let mut entries = match tokio::fs::read_dir(&dir).await {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err).with_context(|| format!("read {}", dir.display())),
-    };
     let mut diagnostics = Vec::new();
-    while let Some(entry) = entries.next_entry().await? {
-        if entry.file_type().await?.is_dir() {
+    let store = CoreStore::new(storage.clone()).await?;
+    for ref_name in store
+        .list_ref_names(&diagnostic_ref_prefix(scope_kind, scope_id, source)?)
+        .await?
+    {
+        let Some(diagnostic) = read_diagnostic_ref_with_store(&store, &ref_name).await? else {
             continue;
-        }
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
-        let diagnostic: DiagnosticObject = serde_json::from_slice(&tokio::fs::read(&path).await?)?;
+        };
         diagnostic.verify(signing_key)?;
         if diagnostic.scope_kind != scope_kind
             || diagnostic.scope_id != scope_id
@@ -204,6 +199,62 @@ pub async fn list_diagnostic_objects(
             .then(left.diagnostic_id.cmp(&right.diagnostic_id))
     });
     Ok(diagnostics)
+}
+
+async fn write_diagnostic_ref(storage: &Storage, diagnostic: &DiagnosticObject) -> Result<()> {
+    let ref_name = diagnostic_ref_name(
+        &diagnostic.scope_kind,
+        &diagnostic.scope_id,
+        &diagnostic.source,
+        &diagnostic.diagnostic_id,
+    )?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: ref_name.clone(),
+            bytes: serde_json::to_vec(diagnostic)?,
+            region_id: "local".to_string(),
+            mutation_id: format!("diagnostic:{}", diagnostic.diagnostic_id),
+        })
+        .await?;
+    store
+        .compare_and_swap_ref(CompareAndSwapRef {
+            ref_name,
+            expected_generation: None,
+            expected_target: None,
+            require_absent: false,
+            require_present: false,
+            fence: None,
+            authz_revision: None,
+            source_watch_cursor: None,
+            new_target: encode_core_object_ref_target(&object_ref)?,
+            transaction_id: None,
+        })
+        .await?;
+    Ok(())
+}
+
+async fn read_diagnostic_ref(
+    storage: &Storage,
+    ref_name: &str,
+) -> Result<Option<DiagnosticObject>> {
+    let store = CoreStore::new(storage.clone()).await?;
+    read_diagnostic_ref_with_store(&store, ref_name).await
+}
+
+async fn read_diagnostic_ref_with_store(
+    store: &CoreStore,
+    ref_name: &str,
+) -> Result<Option<DiagnosticObject>> {
+    let Some(ref_value) = store.read_ref(ref_name).await? else {
+        return Ok(None);
+    };
+    let bytes = store
+        .get_blob(GetBlob {
+            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+        })
+        .await?;
+    Ok(Some(serde_json::from_slice(&bytes)?))
 }
 
 fn validate_write(diagnostic: &DiagnosticWrite) -> Result<()> {
@@ -269,32 +320,6 @@ fn sign_diagnostic_hash(signing_key: &[u8], hash: &str, scope_parts: &[&str]) ->
     Ok(base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
 }
 
-async fn write_json_atomically(path: &Path, value: &impl Serialize) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let tmp = path.with_extension(format!("json.tmp-{}", uuid::Uuid::new_v4().simple()));
-    tokio::fs::write(&tmp, serde_json::to_vec_pretty(value)?)
-        .await
-        .with_context(|| format!("write temporary diagnostic object {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, path)
-        .await
-        .with_context(|| format!("publish diagnostic object {}", path.display()))?;
-    Ok(())
-}
-
-async fn read_json_optional<T>(path: &Path) -> Result<Option<T>>
-where
-    T: DeserializeOwned,
-{
-    let bytes = match tokio::fs::read(path).await {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
-    };
-    Ok(Some(serde_json::from_slice(&bytes)?))
-}
-
 fn validate_optional_hash(value: &str, field: &'static str) -> Result<()> {
     if value.len() != 64 || !value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(anyhow!("{field} must be hex32"));
@@ -315,11 +340,50 @@ fn require_safe_component(value: &str, field: &'static str) -> Result<()> {
         || value == ".."
         || value.contains('/')
         || value.contains('\\')
+        || value.contains(':')
         || value.chars().any(|ch| ch == '\0' || ch.is_control())
     {
         return Err(anyhow!("{field} is not a safe path component"));
     }
     Ok(())
+}
+
+fn diagnostic_ref_prefix(scope_kind: &str, scope_id: &str, source: &str) -> Result<String> {
+    require_safe_component(scope_kind, "scope_kind")?;
+    require_safe_component(scope_id, "scope_id")?;
+    require_safe_component(source, "source")?;
+    Ok(format!(
+        "{DIAGNOSTIC_REF_PREFIX}scope:{scope_kind}:id:{scope_id}:source:{source}:"
+    ))
+}
+
+fn diagnostic_ref_name(
+    scope_kind: &str,
+    scope_id: &str,
+    source: &str,
+    diagnostic_id: &str,
+) -> Result<String> {
+    require_safe_component(diagnostic_id, "diagnostic_id")?;
+    Ok(format!(
+        "{}diagnostic:{diagnostic_id}",
+        diagnostic_ref_prefix(scope_kind, scope_id, source)?
+    ))
+}
+
+fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
+    Ok(format!(
+        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
+    ))
+}
+
+fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
+    let encoded = target
+        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
+        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
+    Ok(serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded)?,
+    )?)
 }
 
 #[cfg(test)]
@@ -330,7 +394,7 @@ mod tests {
     const KEY: &[u8] = b"diagnostic object signing key";
 
     #[tokio::test]
-    async fn diagnostic_objects_write_read_and_list_from_internal_paths() {
+    async fn diagnostic_objects_write_read_and_list_from_core_store_refs() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let first = write_diagnostic_object(
@@ -347,11 +411,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let path = storage
-            .diagnostic_object_path("bucket", "tenant-1-bucket-2", "full-text", "diag-001")
-            .unwrap();
-        assert!(
-            path.ends_with("_anvil/diagnostics/bucket/tenant-1-bucket-2/full-text/diag-001.json")
+        assert_eq!(
+            diagnostic_ref_name("bucket", "tenant-1-bucket-2", "full-text", "diag-001").unwrap(),
+            "diagnostic:scope:bucket:id:tenant-1-bucket-2:source:full-text:diagnostic:diag-001"
         );
 
         assert_eq!(
@@ -407,13 +469,42 @@ mod tests {
         )
         .await
         .unwrap();
-        let path = storage
-            .diagnostic_object_path("bucket", "tenant-1-bucket-2", "full-text", "diag-001")
-            .unwrap();
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        let ref_name =
+            diagnostic_ref_name("bucket", "tenant-1-bucket-2", "full-text", "diag-001").unwrap();
+        let ref_value = store.read_ref(&ref_name).await.unwrap().unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(
+            &store
+                .get_blob(GetBlob {
+                    object_ref: decode_core_object_ref_target(&ref_value.target).unwrap(),
+                })
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         value["message"] = serde_json::json!("changed");
-        tokio::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap())
+        let object_ref = store
+            .put_blob(PutBlob {
+                logical_name: ref_name.clone(),
+                bytes: serde_json::to_vec(&value).unwrap(),
+                region_id: "local".to_string(),
+                mutation_id: "tamper-diagnostic-test".to_string(),
+            })
+            .await
+            .unwrap();
+        store
+            .compare_and_swap_ref(CompareAndSwapRef {
+                ref_name,
+                expected_generation: None,
+                expected_target: None,
+                require_absent: false,
+                require_present: true,
+                fence: None,
+                authz_revision: None,
+                source_watch_cursor: None,
+                new_target: encode_core_object_ref_target(&object_ref).unwrap(),
+                transaction_id: None,
+            })
             .await
             .unwrap();
         assert!(
@@ -434,16 +525,8 @@ mod tests {
     async fn diagnostic_objects_reject_unsafe_paths_and_invalid_payloads() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        assert!(
-            storage
-                .diagnostic_object_path("../bucket", "tenant", "source", "diag")
-                .is_err()
-        );
-        assert!(
-            storage
-                .diagnostic_object_path("bucket", "tenant", "../source", "diag")
-                .is_err()
-        );
+        assert!(diagnostic_ref_name("../bucket", "tenant", "source", "diag").is_err());
+        assert!(diagnostic_ref_name("bucket", "tenant", "../source", "diag").is_err());
         let mut invalid = diagnostic("diag-001", 10, DiagnosticSeverity::Info);
         invalid.message.clear();
         assert!(

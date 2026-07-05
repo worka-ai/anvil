@@ -1,27 +1,39 @@
 use crate::anvil_api::index_service_server::IndexService;
 use crate::anvil_api::*;
 use crate::{
-    AppState, access_control, auth, bucket_journal,
+    AppState, access_control, auth, authz_journal,
+    authz_scope::{DEFAULT_AUTHZ_REALM_ID, encode_realm_namespace},
+    bucket_journal,
+    config::Config,
     error_codes::AnvilErrorCode,
     formats::{
         full_text::{Bm25Config, FullTextIndexDefinition, FullTextQueryError},
+        hash32,
         vector::VectorMetric,
     },
     full_text_segment, index_journal, index_partition_watch,
     permissions::AnvilAction,
     search_query,
     services::watch_envelope::{self, WatchEnvelopeParts},
-    validation, vector_segment,
+    typed_field_segment, validation, vector_segment,
 };
 use base64::Engine;
-use futures_util::StreamExt;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::BTreeMap;
+use sha2::Sha256;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+
+type HmacSha256 = Hmac<Sha256>;
+
+const INDEX_PAGE_TOKEN_VERSION: u8 = 1;
+const INDEX_PAGE_TOKEN_DOMAIN: &[u8] = b"anvil-index-page-token-v1";
+const INDEX_PAGE_TOKEN_TTL_SECONDS: i64 = 15 * 60;
+const QUERY_PERMISSION_PREFIX_OBJECT_CAP: i32 = 10_000;
 
 #[tonic::async_trait]
 impl IndexService for AppState {
@@ -55,7 +67,7 @@ impl IndexService for AppState {
         let extractor = parse_json_field("extractor_json", &req.extractor_json)?;
         let build_policy = parse_json_field("build_policy_json", &req.build_policy_json)?;
         validate_authorization_mode(&req.authorization_mode)?;
-        validate_index_definition_shape(kind, &build_policy)?;
+        validate_index_definition_shape(kind, &build_policy, &extractor, &self.config)?;
 
         let index = self
             .persistence
@@ -111,7 +123,7 @@ impl IndexService for AppState {
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Index definition not found"))?;
-        validate_index_definition_shape(&existing.kind, &build_policy)?;
+        validate_index_definition_shape(&existing.kind, &build_policy, &extractor, &self.config)?;
 
         let index = self
             .persistence
@@ -273,6 +285,87 @@ impl IndexService for AppState {
             "hybrid" => self.query_hybrid_index(&claims, &bucket, &index, req).await,
             _ => Err(Status::failed_precondition("IndexDoesNotSupportQuery")),
         }
+    }
+
+    async fn query_spec(
+        &self,
+        request: Request<QuerySpecRequest>,
+    ) -> Result<Response<QuerySpecResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        let spec = AnvilQuerySpec::parse(&req.query_spec_json)?;
+        let bucket_name = spec.scope.bucket_name.trim();
+        if bucket_name.is_empty() {
+            return Err(Status::invalid_argument(
+                "QuerySpec scope.bucket_name is required",
+            ));
+        }
+        if let Some(storage_tenant) = spec.scope.anvil_storage_tenant_id.as_deref()
+            && !storage_tenant.is_empty()
+            && storage_tenant != claims.tenant_id.to_string()
+        {
+            return Err(Status::permission_denied(
+                "QuerySpec storage tenant does not match authenticated tenant",
+            ));
+        }
+        if !auth::is_authorized(AnvilAction::IndexRead, bucket_name, &claims.scopes) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+        let bucket = self.get_index_bucket(claims.tenant_id, bucket_name).await?;
+        let plan = self
+            .plan_query_spec(&claims, &bucket, &spec, req.accept_degraded)
+            .await?;
+        let response = if plan.typed_filter_index.is_some() {
+            self.execute_composite_query_spec(
+                &claims,
+                &bucket,
+                &plan,
+                &req.page_token,
+                req.lag_timeout_ms,
+            )
+            .await?
+        } else {
+            let query_req =
+                plan.single_query_request(&bucket.name, &req.page_token, req.lag_timeout_ms)?;
+            match plan.index.kind.as_str() {
+                "path" | "metadata_filter" => {
+                    self.query_metadata_backed_index(&claims, &bucket, &plan.index, query_req)
+                        .await?
+                }
+                "typed_json" => {
+                    self.query_typed_json_index(&claims, &bucket, &plan.index, query_req)
+                        .await?
+                }
+                "full_text" => {
+                    self.query_full_text_index(&claims, &bucket, &plan.index, query_req)
+                        .await?
+                }
+                "vector" => {
+                    self.query_vector_index(&claims, &bucket, &plan.index, query_req)
+                        .await?
+                }
+                "hybrid" => {
+                    self.query_hybrid_index(&claims, &bucket, &plan.index, query_req)
+                        .await?
+                }
+                _ => return Err(Status::failed_precondition("IndexDoesNotSupportQuerySpec")),
+            }
+            .into_inner()
+        };
+        if spec.consistency.allow_stale_index == Some(false) && !response.is_caught_up {
+            return Err(Status::failed_precondition("IndexLagging"));
+        }
+
+        Ok(Response::new(QuerySpecResponse {
+            result: Some(response),
+            canonical_query_hash: plan.canonical_query_hash,
+            plan_json: plan.plan_json,
+            diagnostics: plan.diagnostics,
+        }))
     }
 
     async fn watch_index_definition(
@@ -550,6 +643,303 @@ impl AppState {
         Ok(event)
     }
 
+    async fn plan_query_spec(
+        &self,
+        claims: &auth::Claims,
+        bucket: &crate::persistence::Bucket,
+        spec: &AnvilQuerySpec,
+        accept_degraded: bool,
+    ) -> Result<QuerySpecPlan, Status> {
+        let shape = spec.shape()?;
+        if shape.can_relation.as_deref().unwrap_or("read") != "read" {
+            return Err(Status::failed_precondition(
+                "QuerySpec only supports read authorisation relation for index results",
+            ));
+        }
+        let latest_authz_revision = self
+            .persistence
+            .latest_authz_revision(claims.tenant_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .max(0) as u64;
+        if let Some(min_authz_revision) = shape.min_authz_revision
+            && latest_authz_revision < min_authz_revision
+        {
+            return Err(Status::failed_precondition("AuthzRevisionLagging"));
+        }
+        let indexes = self
+            .persistence
+            .list_index_definitions(claims.tenant_id, bucket.id, false)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let selected = select_query_spec_indexes(&indexes, &shape, accept_degraded)?;
+        if selected.primary.authorization_mode == "inherit_object" && shape.can_relation.is_none() {
+            return Err(Status::failed_precondition(
+                "QuerySpec requires an explicit can predicate for protected resources",
+            ));
+        }
+
+        let plan_json = serde_json::json!({
+            "schema": "anvil.query.plan.v1",
+            "planner": if selected.typed_filter.is_some() {
+                "primitive-index-intersection"
+            } else {
+                "primitive-index-single-stage"
+            },
+            "selected_index": {
+                "name": selected.primary.name,
+                "kind": selected.primary.kind,
+                "version": selected.primary.version,
+                "authorization_mode": selected.primary.authorization_mode,
+            },
+            "filter_index": selected.typed_filter.as_ref().map(|index| serde_json::json!({
+                "name": index.name,
+                "kind": index.kind,
+                "version": index.version,
+                "authorization_mode": index.authorization_mode,
+            })),
+            "source_kind": shape.source_kind,
+            "path_prefix": shape.path_prefix,
+            "typed_predicate_count": shape.typed_predicates.len(),
+            "typed_order_count": shape.typed_order.len(),
+            "uses_full_text": shape.query_text.is_some(),
+            "uses_vector": shape.query_vector.is_some(),
+            "authz_relation": shape.can_relation,
+            "authz_revision": latest_authz_revision,
+            "degraded": false,
+        })
+        .to_string();
+
+        Ok(QuerySpecPlan {
+            index: selected.primary,
+            typed_filter_index: selected.typed_filter,
+            canonical_query_hash: stable_json_hash(&spec.canonical_json()?),
+            plan_json,
+            diagnostics: Vec::new(),
+            query_text: shape.query_text.unwrap_or_default(),
+            query_vector: shape.query_vector.unwrap_or_default(),
+            phrase: shape.phrase,
+            path_prefix: shape.path_prefix.unwrap_or_default(),
+            typed_predicates: shape.typed_predicates,
+            typed_order: shape.typed_order,
+            limit: shape.limit,
+            require_caught_up_to_watch_cursor: shape
+                .min_source_cursor
+                .map(|cursor| cursor.to_string())
+                .unwrap_or_default(),
+        })
+    }
+
+    fn index_page_token_signing_key(&self) -> Result<Vec<u8>, Status> {
+        hex::decode(&self.config.anvil_secret_encryption_key)
+            .map_err(|_| Status::internal("Invalid index page token signing key"))
+    }
+
+    async fn execute_composite_query_spec(
+        &self,
+        claims: &auth::Claims,
+        bucket: &crate::persistence::Bucket,
+        plan: &QuerySpecPlan,
+        page_token: &str,
+        lag_timeout_ms: u64,
+    ) -> Result<QueryIndexResponse, Status> {
+        let typed_filter_index = plan
+            .typed_filter_index
+            .as_ref()
+            .ok_or_else(|| Status::internal("composite QuerySpec missing typed filter index"))?;
+        let overfetch_limit = query_spec_overfetch_limit(plan.limit);
+        let primary_req = QueryIndexRequest {
+            bucket_name: bucket.name.clone(),
+            index_name: plan.index.name.clone(),
+            query_text: plan.query_text.clone(),
+            query_vector: plan.query_vector.clone(),
+            limit: overfetch_limit,
+            phrase: plan.phrase,
+            path_prefix: plan.path_prefix.clone(),
+            metadata_filters_json: String::new(),
+            typed_predicates_json: String::new(),
+            typed_order_json: String::new(),
+            page_token: String::new(),
+            require_caught_up_to_watch_cursor: plan.require_caught_up_to_watch_cursor.clone(),
+            lag_timeout_ms,
+        };
+        let primary = match plan.index.kind.as_str() {
+            "full_text" => {
+                self.query_full_text_index(claims, bucket, &plan.index, primary_req)
+                    .await?
+            }
+            "vector" => {
+                self.query_vector_index(claims, bucket, &plan.index, primary_req)
+                    .await?
+            }
+            "hybrid" => {
+                self.query_hybrid_index(claims, bucket, &plan.index, primary_req)
+                    .await?
+            }
+            _ => {
+                return Err(Status::failed_precondition(
+                    "QuerySpec composite primary index must be full_text, vector or hybrid",
+                ));
+            }
+        }
+        .into_inner();
+
+        let typed_req = QueryIndexRequest {
+            bucket_name: bucket.name.clone(),
+            index_name: typed_filter_index.name.clone(),
+            query_text: String::new(),
+            query_vector: Vec::new(),
+            limit: overfetch_limit,
+            phrase: false,
+            path_prefix: plan.path_prefix.clone(),
+            metadata_filters_json: String::new(),
+            typed_predicates_json: serde_json::to_string(&plan.typed_predicates)
+                .map_err(|e| Status::internal(e.to_string()))?,
+            typed_order_json: serde_json::to_string(&plan.typed_order)
+                .map_err(|e| Status::internal(e.to_string()))?,
+            page_token: String::new(),
+            require_caught_up_to_watch_cursor: plan.require_caught_up_to_watch_cursor.clone(),
+            lag_timeout_ms,
+        };
+        let typed = self
+            .query_typed_json_index(claims, bucket, typed_filter_index, typed_req)
+            .await?
+            .into_inner();
+
+        let mut typed_by_version = BTreeMap::new();
+        for hit in typed.hits {
+            let typed_values = typed_values_from_query_hit(&hit)?;
+            typed_by_version.insert(hit.object_version_id.clone(), typed_values);
+        }
+
+        let mut hits = Vec::new();
+        for mut hit in primary.hits {
+            let Some(typed_values) = typed_by_version.get(&hit.object_version_id) else {
+                continue;
+            };
+            hit.metadata_json = merge_composite_metadata(&hit.metadata_json, typed_values)?;
+            hits.push(hit);
+        }
+
+        if plan.typed_order.is_empty() {
+            hits.sort_by(|left, right| {
+                compare_score_hits(
+                    left.score,
+                    &left.object_version_id,
+                    right.score,
+                    &right.object_version_id,
+                )
+            });
+        } else {
+            hits.sort_by(|left, right| compare_query_spec_hits_by_typed_order(left, right, plan));
+        }
+
+        let authz_revision = primary.authz_revision.max(typed.authz_revision);
+        let index_generation = primary.index_generation.max(typed.index_generation);
+        let index_name = composite_query_spec_index_name(&plan.index, typed_filter_index);
+        let predicate_hash = composite_query_spec_predicate_hash(
+            plan,
+            primary.index_generation,
+            typed.index_generation,
+        );
+        let order_hash = composite_query_spec_order_hash(plan);
+        let signing_key = self.index_page_token_signing_key()?;
+        let index_definition_version =
+            composite_index_definition_version(&plan.index, typed_filter_index);
+        let binding = IndexPageTokenBinding::with_index_inputs(
+            &self.config,
+            claims,
+            "query_spec_composite",
+            &bucket.name,
+            &index_name,
+            index_generation,
+            index_definition_version,
+            vec![
+                IndexPageTokenInput {
+                    index_id: plan.index.name.clone(),
+                    definition_hash: stable_string_hash(&format!(
+                        "{}:{}",
+                        plan.index.name,
+                        plan.index.version.max(0)
+                    )),
+                    generation: primary.index_generation,
+                },
+                IndexPageTokenInput {
+                    index_id: typed_filter_index.name.clone(),
+                    definition_hash: stable_string_hash(&format!(
+                        "{}:{}",
+                        typed_filter_index.name,
+                        typed_filter_index.version.max(0)
+                    )),
+                    generation: typed.index_generation,
+                },
+            ],
+            authz_revision,
+            predicate_hash.clone(),
+            order_hash.clone(),
+        );
+        let token = IndexPageToken::decode(page_token, &signing_key)?;
+        if let Some(token) = &token {
+            token.validate(&binding)?;
+        }
+        if let Some(token) = token.as_ref() {
+            hits = hits
+                .into_iter()
+                .filter(|hit| query_spec_hit_after_cursor(hit, token, plan).unwrap_or(false))
+                .collect();
+        }
+
+        let requested_limit = query_limit(plan.limit);
+        let has_more = hits.len() > requested_limit;
+        if has_more {
+            hits.truncate(requested_limit);
+        }
+        let next_page_token = if has_more {
+            hits.last()
+                .map(|hit| {
+                    let last_sort_values = query_spec_hit_sort_values(hit, plan)?;
+                    IndexPageToken::for_cursor(
+                        &binding,
+                        hit.object_version_id.clone(),
+                        last_sort_values,
+                    )
+                    .encode(&signing_key)
+                })
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        Ok(QueryIndexResponse {
+            hits,
+            index_kind: primary.index_kind,
+            index_generation,
+            authz_revision,
+            scoring_recipe_json: serde_json::json!({
+                "kind": "query_spec_composite",
+                "planner": "primitive-index-intersection",
+                "primary_index": plan.index.name,
+                "typed_filter_index": typed_filter_index.name,
+                "overfetch_limit": overfetch_limit,
+                "primary_scoring": serde_json::from_str::<JsonValue>(&primary.scoring_recipe_json)
+                    .unwrap_or(JsonValue::String(primary.scoring_recipe_json)),
+            })
+            .to_string(),
+            next_page_token,
+            source_watch_cursor_high: primary
+                .source_watch_cursor_high
+                .max(typed.source_watch_cursor_high),
+            index_watch_cursor_applied: primary
+                .index_watch_cursor_applied
+                .min(typed.index_watch_cursor_applied),
+            is_caught_up: primary.is_caught_up && typed.is_caught_up,
+            lag_record_count_hint: primary
+                .lag_record_count_hint
+                .max(typed.lag_record_count_hint),
+        })
+    }
+
     async fn query_full_text_index(
         &self,
         claims: &auth::Claims,
@@ -576,6 +966,18 @@ impl AppState {
         else {
             return Err(Status::failed_precondition("IndexUnavailable"));
         };
+        let requested_limit = query_limit(req.limit);
+        let index_kind = index_kind_value_from_str(&index.kind)?;
+        let authz_revision = self
+            .persistence
+            .latest_authz_revision(claims.tenant_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .max(0) as u64;
+        let authz_revision = authz_revision.max(segment.header.authz_revision);
+        let permission_filter = self
+            .query_permission_filter(claims, bucket, &index.authorization_mode, authz_revision)
+            .await?;
         let search_hits = search_query::query_full_text_segment(
             &segment,
             search_query::FullTextSegmentQuery {
@@ -584,14 +986,33 @@ impl AppState {
                 positions_enabled: definition.positions_enabled,
                 phrase: req.phrase,
                 bm25: Bm25Config::default(),
-                authorized_labels: None,
-                limit: internal_candidate_limit_for_request(&req, &index.authorization_mode),
+                authorized_labels: permission_filter
+                    .as_ref()
+                    .map(|filter| &filter.authorized_labels),
+                limit: segment.postings.len().max(1),
             },
         )
         .map_err(full_text_query_status)?;
-        let requested_limit = query_limit(req.limit);
-        let index_kind = index_kind_value_from_str(&index.kind)?;
-        let mut hits = Vec::with_capacity(search_hits.len().min(requested_limit));
+        let predicate_hash = score_based_predicate_hash("full_text", &req);
+        let order_hash = score_order_hash();
+        let signing_key = self.index_page_token_signing_key()?;
+        let binding = IndexPageTokenBinding::single_index(
+            &self.config,
+            claims,
+            "full_text",
+            &bucket.name,
+            &index.name,
+            segment.header.generation,
+            index.version.max(0) as u64,
+            authz_revision,
+            predicate_hash.clone(),
+            order_hash.clone(),
+        );
+        let page_token = IndexPageToken::decode(req.page_token.as_str(), &signing_key)?;
+        if let Some(token) = &page_token {
+            token.validate(&binding)?;
+        }
+        let mut candidates = Vec::with_capacity(search_hits.len());
         for hit in search_hits {
             let object_ref = match self
                 .object_ref_for_query_hit(bucket.id, hit.object_version_id)
@@ -610,17 +1031,18 @@ impl AppState {
                     &index.authorization_mode,
                     &bucket.name,
                     &object_ref.object_key,
-                    segment.header.authz_revision,
+                    authz_revision,
                 )
                 .await?
             {
                 continue;
             }
-            hits.push(IndexQueryHit {
+            let object_version_id = object_ref.object_version_id.clone();
+            candidates.push(IndexQueryHit {
                 kind: index_kind,
                 score: hit.score,
                 object_key: object_ref.object_key,
-                object_version_id: object_ref.object_version_id,
+                object_version_id,
                 document_id: hit.document_id,
                 field_id: u32::from(hit.field_id),
                 vector_id: 0,
@@ -634,19 +1056,53 @@ impl AppState {
                 })
                 .to_string(),
             });
-            if hits.len() >= requested_limit {
-                break;
-            }
         }
+        candidates.sort_by(|left, right| {
+            compare_score_hits(
+                left.score,
+                &left.object_version_id,
+                right.score,
+                &right.object_version_id,
+            )
+        });
+        if let Some(token) = page_token.as_ref() {
+            let mut filtered = Vec::new();
+            for hit in candidates {
+                if score_after_cursor(hit.score, &hit.object_version_id, token)? {
+                    filtered.push(hit);
+                }
+            }
+            candidates = filtered;
+        }
+        let has_more = candidates.len() > requested_limit;
+        if has_more {
+            candidates.truncate(requested_limit);
+        }
+        let next_page_token = if has_more {
+            candidates
+                .last()
+                .map(|hit| {
+                    IndexPageToken::for_cursor(
+                        &binding,
+                        hit.object_version_id.clone(),
+                        score_sort_values(hit.score, &hit.object_version_id),
+                    )
+                    .encode(&signing_key)
+                })
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         Ok(Response::new(QueryIndexResponse {
-            hits,
+            hits: candidates,
             index_kind,
             index_generation: segment.header.generation,
-            authz_revision: segment.header.authz_revision,
+            authz_revision,
             scoring_recipe_json: serde_json::json!({"kind": "bm25", "k1": 1.2, "b": 0.75})
                 .to_string(),
-            next_page_token: String::new(),
+            next_page_token,
             source_watch_cursor_high: 0,
             index_watch_cursor_applied: 0,
             is_caught_up: true,
@@ -679,23 +1135,103 @@ impl AppState {
         let filters = QueryFilters::from_request(&req)?;
         let requested_limit = query_limit(req.limit);
         let index_kind = index_kind_value_from_str(&index.kind)?;
-        let objects = self
+        let latest_cursor = self
             .persistence
-            .list_current_directory_objects(bucket)
+            .latest_object_watch_cursor(claims.tenant_id, bucket.id)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()))?
+            .max(0) as u64;
+        let required_cursor = if !req.require_caught_up_to_watch_cursor.trim().is_empty() {
+            let required_cursor = req
+                .require_caught_up_to_watch_cursor
+                .parse::<u64>()
+                .map_err(|_| {
+                    Status::invalid_argument("Invalid require_caught_up_to_watch_cursor")
+                })?;
+            if latest_cursor < required_cursor {
+                return Err(Status::failed_precondition("IndexLagging"));
+            }
+            Some(required_cursor)
+        } else {
+            None
+        };
+        let index_storage_id =
+            index_journal::index_storage_id(bucket.tenant_id, bucket.id, index.id);
+        let segment =
+            typed_field_segment::read_latest_typed_field_segment(&self.storage, &index_storage_id)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+        let Some(segment) = segment else {
+            if latest_cursor == 0 {
+                return Ok(Response::new(QueryIndexResponse {
+                    hits: Vec::new(),
+                    index_kind,
+                    index_generation: 0,
+                    authz_revision: 0,
+                    scoring_recipe_json: serde_json::json!({
+                        "kind": index.kind.as_str(),
+                        "score": "constant",
+                        "source": "corestore_typed_field_segment",
+                    })
+                    .to_string(),
+                    next_page_token: String::new(),
+                    source_watch_cursor_high: 0,
+                    index_watch_cursor_applied: 0,
+                    is_caught_up: true,
+                    lag_record_count_hint: 0,
+                }));
+            }
+            return Err(Status::failed_precondition("IndexUnavailable"));
+        };
+        if segment.header.source_kind != "object_metadata" {
+            return Err(Status::failed_precondition(
+                "MetadataBackedIndexSourceKindMismatch",
+            ));
+        }
+        if required_cursor.is_some_and(|cursor| segment.header.source_cursor < cursor) {
+            return Err(Status::failed_precondition("IndexLagging"));
+        }
         let latest_authz_revision = self
             .persistence
             .latest_authz_revision(claims.tenant_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        let mut hits = Vec::with_capacity(requested_limit);
-        for object in objects {
-            if validation::is_reserved_internal_key(&object.key) {
+        let authz_revision = latest_authz_revision.max(0) as u64;
+        let permission_filter = self
+            .query_permission_filter(claims, bucket, &index.authorization_mode, authz_revision)
+            .await?;
+        let predicate_hash = metadata_backed_predicate_hash(&index.kind, &req);
+        let order_hash = stable_string_hash("object_key:asc,source_identity:asc");
+        let signing_key = self.index_page_token_signing_key()?;
+        let binding = IndexPageTokenBinding::single_index(
+            &self.config,
+            claims,
+            "metadata_backed",
+            &bucket.name,
+            &index.name,
+            segment.header.generation,
+            index.version.max(0) as u64,
+            authz_revision,
+            predicate_hash.clone(),
+            order_hash.clone(),
+        );
+        let page_token = IndexPageToken::decode(req.page_token.as_str(), &signing_key)?;
+        if let Some(token) = &page_token {
+            token.validate(&binding)?;
+        }
+
+        let mut rows = Vec::new();
+        for row in segment.rows {
+            if validation::is_reserved_internal_key(&row.object_key) {
                 continue;
             }
-            let object_ref = QueryObjectRef::from_object(&object);
+            let object_ref = QueryObjectRef::from_typed_field_row(&row)?;
             if !filters.matches(&object_ref)? {
+                continue;
+            }
+            if let Some(permission_filter) = permission_filter.as_ref()
+                && !permission_filter.allows_object_key(&object_ref.object_key)
+            {
                 continue;
             }
             if !self
@@ -704,13 +1240,54 @@ impl AppState {
                     &index.authorization_mode,
                     &bucket.name,
                     &object_ref.object_key,
-                    u64::try_from(object_ref.authz_revision)
-                        .map_err(|_| Status::internal("Invalid authz revision"))?,
+                    authz_revision,
                 )
                 .await?
             {
                 continue;
             }
+            rows.push((row.source_identity.clone(), object_ref));
+        }
+
+        rows.sort_by(|(left_source, left), (right_source, right)| {
+            left.object_key
+                .cmp(&right.object_key)
+                .then(left_source.cmp(right_source))
+        });
+        if let Some(token) = page_token.as_ref() {
+            rows.retain(|(source_identity, object_ref)| {
+                object_key_after_cursor(
+                    &object_ref.object_key,
+                    source_identity,
+                    &token.last_sort_values,
+                    &token.last_source_identity,
+                )
+            });
+        }
+
+        let has_more = rows.len() > requested_limit;
+        if has_more {
+            rows.truncate(requested_limit);
+        }
+        let next_page_token = if has_more {
+            rows.last()
+                .map(|(source_identity, object_ref)| {
+                    let mut sort_values = BTreeMap::new();
+                    sort_values.insert(
+                        "object_key".to_string(),
+                        JsonValue::String(object_ref.object_key.clone()),
+                    );
+                    IndexPageToken::for_cursor(&binding, source_identity.clone(), sort_values)
+                        .encode(&signing_key)
+                })
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let mut hits = Vec::with_capacity(rows.len());
+        for (_, object_ref) in rows {
             let metadata_json = serde_json::json!({
                 "bucket_name": bucket.name,
                 "user_metadata": object_ref.user_meta.clone(),
@@ -731,27 +1308,24 @@ impl AppState {
                 source_len: 0,
                 metadata_json,
             });
-            if hits.len() >= requested_limit {
-                break;
-            }
         }
 
         Ok(Response::new(QueryIndexResponse {
             hits,
             index_kind,
-            index_generation: index.version.max(0) as u64,
-            authz_revision: latest_authz_revision.max(0) as u64,
+            index_generation: segment.header.generation,
+            authz_revision: authz_revision,
             scoring_recipe_json: serde_json::json!({
                 "kind": index.kind.as_str(),
                 "score": "constant",
-                "source": "object_metadata_directory",
+                "source": "corestore_typed_field_segment",
             })
             .to_string(),
-            next_page_token: String::new(),
-            source_watch_cursor_high: 0,
-            index_watch_cursor_applied: 0,
-            is_caught_up: true,
-            lag_record_count_hint: 0,
+            next_page_token,
+            source_watch_cursor_high: latest_cursor,
+            index_watch_cursor_applied: segment.header.source_cursor,
+            is_caught_up: segment.header.source_cursor >= latest_cursor,
+            lag_record_count_hint: latest_cursor.saturating_sub(segment.header.source_cursor),
         }))
     }
 
@@ -770,27 +1344,38 @@ impl AppState {
         let definition = TypedJsonIndexDefinition::from_index(index)?;
         let predicates = TypedPredicate::parse_list(&req.typed_predicates_json)?;
         let order = TypedOrder::parse_list(&req.typed_order_json, &definition.default_order)?;
-        let page_token = TypedPageToken::decode(req.page_token.as_str())?;
         let predicate_hash = stable_json_hash(&req.typed_predicates_json);
         let order_hash = stable_json_hash(&serde_json::to_string(&order).unwrap_or_default());
-        if let Some(token) = &page_token {
-            token.validate(
-                claims.tenant_id,
-                &bucket.name,
-                &index.name,
-                index.version as u64,
-                &predicate_hash,
-                &order_hash,
-            )?;
-        }
-
-        let latest_cursor = self
+        let requested_limit = query_limit(req.limit);
+        let authz_revision = self
             .persistence
-            .latest_object_watch_cursor(claims.tenant_id, bucket.id)
+            .latest_authz_revision(claims.tenant_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .max(0) as u64;
-        if !req.require_caught_up_to_watch_cursor.trim().is_empty() {
+        let permission_filter = self
+            .query_permission_filter(claims, bucket, &index.authorization_mode, authz_revision)
+            .await?;
+
+        let latest_cursor = if definition.source_kind == "append_record" {
+            u64::try_from(
+                crate::append_journal::append_record_source_cursor(
+                    &self.storage,
+                    claims.tenant_id,
+                    bucket.id,
+                )
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?,
+            )
+            .unwrap_or(u64::MAX)
+        } else {
+            self.persistence
+                .latest_object_watch_cursor(claims.tenant_id, bucket.id)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .max(0) as u64
+        };
+        let required_cursor = if !req.require_caught_up_to_watch_cursor.trim().is_empty() {
             let required_cursor = req
                 .require_caught_up_to_watch_cursor
                 .parse::<u64>()
@@ -800,37 +1385,88 @@ impl AppState {
             if latest_cursor < required_cursor {
                 return Err(Status::failed_precondition("IndexLagging"));
             }
+            Some(required_cursor)
+        } else {
+            None
+        };
+
+        let index_storage_id =
+            index_journal::index_storage_id(bucket.tenant_id, bucket.id, index.id);
+        let segment =
+            typed_field_segment::read_latest_typed_field_segment(&self.storage, &index_storage_id)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::failed_precondition("TypedJsonIndexNotMaterialised"))?;
+        if segment.header.source_kind != definition.source_kind {
+            return Err(Status::failed_precondition(
+                "TypedJsonIndexSourceKindMismatch",
+            ));
+        }
+        let expected_fields = definition
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        if segment
+            .header
+            .field_names
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            != expected_fields
+        {
+            return Err(Status::failed_precondition(
+                "TypedJsonIndexFieldSetMismatch",
+            ));
+        }
+        if required_cursor.is_some_and(|cursor| segment.header.source_cursor < cursor) {
+            return Err(Status::failed_precondition("IndexLagging"));
+        }
+        let signing_key = self.index_page_token_signing_key()?;
+        let binding = IndexPageTokenBinding::single_index(
+            &self.config,
+            claims,
+            "typed_json",
+            &bucket.name,
+            &index.name,
+            segment.header.generation,
+            index.version.max(0) as u64,
+            authz_revision,
+            predicate_hash.clone(),
+            order_hash.clone(),
+        );
+        let page_token = IndexPageToken::decode(req.page_token.as_str(), &signing_key)?;
+        if let Some(token) = &page_token {
+            token.validate(&binding)?;
         }
 
-        let mut rows = match definition.source_kind.as_str() {
-            "object_current" => {
-                self.query_typed_json_object_rows(
+        let mut rows = Vec::new();
+        for row in segment.rows {
+            if !req.path_prefix.trim().is_empty() && !row.object_key.starts_with(&req.path_prefix) {
+                continue;
+            }
+            if let Some(permission_filter) = permission_filter.as_ref()
+                && !permission_filter.allows_object_key(&row.object_key)
+            {
+                continue;
+            }
+            if !self
+                .query_hit_visible(
                     claims,
-                    bucket,
-                    index,
-                    &definition,
-                    &predicates,
-                    &req.path_prefix,
+                    &index.authorization_mode,
+                    &bucket.name,
+                    &row.object_key,
+                    row.authz_revision,
                 )
                 .await?
+            {
+                continue;
             }
-            "append_record" => {
-                self.query_typed_json_append_rows(
-                    claims,
-                    bucket,
-                    index,
-                    &definition,
-                    &predicates,
-                    &req.path_prefix,
-                )
-                .await?
+            let row = TypedIndexRow::from_segment_row(row);
+            if predicates.iter().all(|predicate| predicate.matches(&row)) {
+                rows.push(row);
             }
-            _ => {
-                return Err(Status::failed_precondition(
-                    "UnsupportedTypedJsonSourceKind",
-                ));
-            }
-        };
+        }
 
         rows.sort_by(|left, right| compare_typed_rows(left, right, &order));
         if let Some(token) = page_token.as_ref() {
@@ -848,7 +1484,6 @@ impl AppState {
                 .collect();
         }
 
-        let requested_limit = query_limit(req.limit);
         let has_more = rows.len() > requested_limit;
         if has_more {
             rows.truncate(requested_limit);
@@ -856,17 +1491,12 @@ impl AppState {
         let next_page_token = if has_more {
             rows.last()
                 .map(|row| {
-                    TypedPageToken {
-                        tenant_id: claims.tenant_id,
-                        bucket_name: bucket.name.clone(),
-                        index_name: index.name.clone(),
-                        index_generation: index.version as u64,
-                        predicate_hash: predicate_hash.clone(),
-                        order_hash: order_hash.clone(),
-                        last_source_identity: row.source_identity.clone(),
-                        last_sort_values: row.values.clone(),
-                    }
-                    .encode()
+                    IndexPageToken::for_cursor(
+                        &binding,
+                        row.source_identity.clone(),
+                        row.values.clone(),
+                    )
+                    .encode(&signing_key)
                 })
                 .transpose()?
                 .unwrap_or_default()
@@ -899,13 +1529,8 @@ impl AppState {
         Ok(Response::new(QueryIndexResponse {
             hits,
             index_kind,
-            index_generation: index.version.max(0) as u64,
-            authz_revision: self
-                .persistence
-                .latest_authz_revision(claims.tenant_id)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-                .max(0) as u64,
+            index_generation: segment.header.generation,
+            authz_revision,
             scoring_recipe_json: serde_json::json!({
                 "kind": "typed_json",
                 "score": "constant",
@@ -914,9 +1539,9 @@ impl AppState {
             .to_string(),
             next_page_token,
             source_watch_cursor_high: latest_cursor,
-            index_watch_cursor_applied: latest_cursor,
-            is_caught_up: true,
-            lag_record_count_hint: 0,
+            index_watch_cursor_applied: segment.header.source_cursor,
+            is_caught_up: segment.header.source_cursor >= latest_cursor,
+            lag_record_count_hint: latest_cursor.saturating_sub(segment.header.source_cursor),
         }))
     }
 
@@ -942,7 +1567,15 @@ impl AppState {
         let mut generation = 0;
         let mut text_generation = 0;
         let mut vector_generation = 0;
-        let mut authz_revision = 0;
+        let mut authz_revision = self
+            .persistence
+            .latest_authz_revision(claims.tenant_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .max(0) as u64;
+        let permission_filter = self
+            .query_permission_filter(claims, bucket, &index.authorization_mode, authz_revision)
+            .await?;
         let has_text = !req.query_text.trim().is_empty();
         let has_vector = !req.query_vector.is_empty();
 
@@ -966,7 +1599,9 @@ impl AppState {
                     positions_enabled: definition.positions_enabled,
                     phrase: req.phrase,
                     bm25: Bm25Config::default(),
-                    authorized_labels: None,
+                    authorized_labels: permission_filter
+                        .as_ref()
+                        .map(|filter| &filter.authorized_labels),
                     limit: internal_limit,
                 },
             )
@@ -1001,7 +1636,9 @@ impl AppState {
                 &segment,
                 &req.query_vector,
                 metric,
-                None,
+                permission_filter
+                    .as_ref()
+                    .map(|filter| &filter.authorized_labels),
                 internal_limit,
             )
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -1072,6 +1709,61 @@ impl AppState {
                         .cmp(&right.item.object_version_id)
                 })
         });
+        let predicate_hash = score_based_predicate_hash("hybrid", &req);
+        let order_hash = score_order_hash();
+        let signing_key = self.index_page_token_signing_key()?;
+        let binding = IndexPageTokenBinding::single_index(
+            &self.config,
+            claims,
+            "hybrid",
+            &bucket.name,
+            &index.name,
+            generation,
+            index.version.max(0) as u64,
+            authz_revision,
+            predicate_hash.clone(),
+            order_hash.clone(),
+        );
+        let page_token = IndexPageToken::decode(req.page_token.as_str(), &signing_key)?;
+        if let Some(token) = &page_token {
+            token.validate(&binding)?;
+        }
+        if let Some(token) = page_token.as_ref() {
+            let mut filtered = Vec::new();
+            for candidate in candidates {
+                if score_after_cursor(
+                    candidate.item.score,
+                    &candidate.object_ref.object_version_id,
+                    token,
+                )? {
+                    filtered.push(candidate);
+                }
+            }
+            candidates = filtered;
+        }
+        let has_more = candidates.len() > requested_limit;
+        if has_more {
+            candidates.truncate(requested_limit);
+        }
+        let next_page_token = if has_more {
+            candidates
+                .last()
+                .map(|candidate| {
+                    IndexPageToken::for_cursor(
+                        &binding,
+                        candidate.object_ref.object_version_id.clone(),
+                        score_sort_values(
+                            candidate.item.score,
+                            &candidate.object_ref.object_version_id,
+                        ),
+                    )
+                    .encode(&signing_key)
+                })
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         let index_kind = index_kind_value_from_str(&index.kind)?;
         let mut hits = Vec::with_capacity(candidates.len().min(requested_limit));
@@ -1099,9 +1791,6 @@ impl AppState {
                 })
                 .to_string(),
             });
-            if hits.len() >= requested_limit {
-                break;
-            }
         }
 
         Ok(Response::new(QueryIndexResponse {
@@ -1121,7 +1810,7 @@ impl AppState {
                 }
             })
             .to_string(),
-            next_page_token: String::new(),
+            next_page_token,
             source_watch_cursor_high: 0,
             index_watch_cursor_applied: 0,
             is_caught_up: true,
@@ -1159,17 +1848,48 @@ impl AppState {
         }
         let metric = VectorMetric::from_name(&segment.header.metric)
             .map_err(|e| Status::internal(e.to_string()))?;
+        let requested_limit = query_limit(req.limit);
+        let index_kind = index_kind_value_from_str(&index.kind)?;
+        let authz_revision = self
+            .persistence
+            .latest_authz_revision(claims.tenant_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .max(0) as u64;
+        let authz_revision = authz_revision.max(segment.header.authz_revision);
+        let permission_filter = self
+            .query_permission_filter(claims, bucket, &index.authorization_mode, authz_revision)
+            .await?;
+        let predicate_hash = score_based_predicate_hash("vector", &req);
+        let order_hash = score_order_hash();
+        let signing_key = self.index_page_token_signing_key()?;
+        let binding = IndexPageTokenBinding::single_index(
+            &self.config,
+            claims,
+            "vector",
+            &bucket.name,
+            &index.name,
+            segment.header.generation,
+            index.version.max(0) as u64,
+            authz_revision,
+            predicate_hash.clone(),
+            order_hash.clone(),
+        );
+        let page_token = IndexPageToken::decode(req.page_token.as_str(), &signing_key)?;
+        if let Some(token) = &page_token {
+            token.validate(&binding)?;
+        }
         let search_hits = search_query::query_vector_segment(
             &segment,
             &req.query_vector,
             metric,
-            None,
-            internal_candidate_limit_for_request(&req, &index.authorization_mode),
+            permission_filter
+                .as_ref()
+                .map(|filter| &filter.authorized_labels),
+            segment.entries.len(),
         )
         .map_err(|e| Status::internal(e.to_string()))?;
-        let requested_limit = query_limit(req.limit);
-        let index_kind = index_kind_value_from_str(&index.kind)?;
-        let mut hits = Vec::with_capacity(search_hits.len().min(requested_limit));
+        let mut candidates = Vec::with_capacity(search_hits.len());
         for hit in search_hits {
             let object_ref = match self
                 .object_ref_for_query_hit(bucket.id, hit.object_version_id)
@@ -1188,17 +1908,18 @@ impl AppState {
                     &index.authorization_mode,
                     &bucket.name,
                     &object_ref.object_key,
-                    segment.header.authz_revision,
+                    authz_revision,
                 )
                 .await?
             {
                 continue;
             }
-            hits.push(IndexQueryHit {
+            let object_version_id = object_ref.object_version_id.clone();
+            candidates.push(IndexQueryHit {
                 kind: index_kind,
                 score: hit.score,
                 object_key: object_ref.object_key,
-                object_version_id: object_ref.object_version_id,
+                object_version_id,
                 document_id: 0,
                 field_id: 0,
                 vector_id: hit.vector_id,
@@ -1212,23 +1933,58 @@ impl AppState {
                 })
                 .to_string(),
             });
-            if hits.len() >= requested_limit {
-                break;
+        }
+        candidates.sort_by(|left, right| {
+            compare_score_hits(
+                left.score,
+                &left.object_version_id,
+                right.score,
+                &right.object_version_id,
+            )
+        });
+        if let Some(token) = page_token.as_ref() {
+            let mut filtered = Vec::new();
+            for hit in candidates {
+                if score_after_cursor(hit.score, &hit.object_version_id, token)? {
+                    filtered.push(hit);
+                }
             }
+            candidates = filtered;
         }
 
+        let has_more = candidates.len() > requested_limit;
+        if has_more {
+            candidates.truncate(requested_limit);
+        }
+        let next_page_token = if has_more {
+            candidates
+                .last()
+                .map(|hit| {
+                    IndexPageToken::for_cursor(
+                        &binding,
+                        hit.object_version_id.clone(),
+                        score_sort_values(hit.score, &hit.object_version_id),
+                    )
+                    .encode(&signing_key)
+                })
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
         Ok(Response::new(QueryIndexResponse {
-            hits,
+            hits: candidates,
             index_kind,
             index_generation: segment.header.generation,
-            authz_revision: segment.header.authz_revision,
+            authz_revision,
             scoring_recipe_json: serde_json::json!({
                 "kind": "vector",
                 "metric": segment.header.metric,
                 "max_candidate_multiplier": 20
             })
             .to_string(),
-            next_page_token: String::new(),
+            next_page_token,
             source_watch_cursor_high: 0,
             index_watch_cursor_applied: 0,
             is_caught_up: true,
@@ -1291,140 +2047,660 @@ impl AppState {
         }
     }
 
-    async fn query_typed_json_object_rows(
+    async fn query_permission_filter(
         &self,
         claims: &auth::Claims,
         bucket: &crate::persistence::Bucket,
-        index: &crate::persistence::IndexDefinition,
-        definition: &TypedJsonIndexDefinition,
-        predicates: &[TypedPredicate],
-        path_prefix: &str,
-    ) -> Result<Vec<TypedIndexRow>, Status> {
-        let objects = self
-            .persistence
-            .list_current_directory_objects(bucket)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let mut rows = Vec::new();
-        for object in objects {
-            if validation::is_reserved_internal_key(&object.key) {
-                continue;
-            }
-            if !path_prefix.trim().is_empty() && !object.key.starts_with(path_prefix) {
-                continue;
-            }
-            if !self
-                .query_hit_visible(
-                    claims,
-                    &index.authorization_mode,
-                    &bucket.name,
-                    &object.key,
-                    object_authz_revision(&object)?,
-                )
-                .await?
+        authorization_mode: &str,
+        authz_revision: u64,
+    ) -> Result<Option<QueryPermissionFilter>, Status> {
+        if authorization_mode != "inherit_object" {
+            return Ok(None);
+        }
+        if auth::is_authorized(
+            AnvilAction::ObjectRead,
+            &format!("{}/", bucket.name),
+            &claims.scopes,
+        ) {
+            return Ok(None);
+        }
+
+        let mut object_keys = BTreeSet::new();
+        let mut object_key_prefixes = BTreeSet::new();
+        let mut grants_bucket_read = false;
+        for scope in &claims.scopes {
+            collect_object_scope(
+                scope,
+                &bucket.name,
+                &mut object_keys,
+                &mut object_key_prefixes,
+                &mut grants_bucket_read,
+            );
+        }
+        if grants_bucket_read {
+            return Ok(None);
+        }
+
+        let revision = i64::try_from(authz_revision)
+            .map_err(|_| Status::internal("Invalid authz revision"))?;
+        let direct_objects = authz_journal::list_current_authz_objects_at_revision(
+            &self.storage,
+            claims.tenant_id,
+            &encode_realm_namespace(DEFAULT_AUTHZ_REALM_ID, "object"),
+            "reader",
+            access_control::APP_SUBJECT_KIND,
+            &claims.sub,
+            "",
+            revision,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+        let bucket_prefix = format!("{}/", bucket.name);
+        for object_id in direct_objects {
+            if let Some(key) = object_id.strip_prefix(&bucket_prefix)
+                && !key.is_empty()
             {
-                continue;
-            }
-            let json = self
-                .load_object_json(
-                    Some(claims.clone()),
-                    &bucket.name,
-                    &object.key,
-                    object.version_id,
-                )
-                .await?;
-            let row = TypedIndexRow::from_object(definition, object, &json)?;
-            if predicates.iter().all(|predicate| predicate.matches(&row)) {
-                rows.push(row);
+                object_keys.insert(key.to_string());
             }
         }
-        Ok(rows)
-    }
 
-    async fn query_typed_json_append_rows(
-        &self,
-        claims: &auth::Claims,
-        bucket: &crate::persistence::Bucket,
-        index: &crate::persistence::IndexDefinition,
-        definition: &TypedJsonIndexDefinition,
-        predicates: &[TypedPredicate],
-        path_prefix: &str,
-    ) -> Result<Vec<TypedIndexRow>, Status> {
-        let records = self
-            .persistence
-            .list_append_stream_records_for_bucket(claims.tenant_id, bucket.id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let mut rows = Vec::new();
-        for (stream, record) in records {
-            if !path_prefix.trim().is_empty() && !stream.stream_key.starts_with(path_prefix) {
+        let mut existing_keys = BTreeSet::new();
+        let mut authorized_labels = BTreeSet::new();
+        for key in &object_keys {
+            let Some(object) = self
+                .persistence
+                .get_object(bucket.id, key)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+            else {
                 continue;
-            }
-            if !self
-                .query_hit_visible(
-                    claims,
-                    &index.authorization_mode,
-                    &bucket.name,
-                    &stream.stream_key,
-                    self.persistence
-                        .latest_authz_revision(claims.tenant_id)
-                        .await
-                        .map_err(|e| Status::internal(e.to_string()))?
-                        .max(0) as u64,
+            };
+            existing_keys.insert(key.clone());
+            authorized_labels.insert(query_object_authz_label_hash(bucket, &object));
+        }
+        for prefix in &object_key_prefixes {
+            let (objects, _) = self
+                .persistence
+                .list_objects(
+                    bucket.id,
+                    prefix,
+                    "",
+                    QUERY_PERMISSION_PREFIX_OBJECT_CAP.saturating_add(1),
+                    "",
                 )
-                .await?
-            {
-                continue;
-            }
-            let payload = self
-                .storage
-                .retrieve_whole_object(&record.payload_hash)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
-            if payload.len() > 16 * 1024 * 1024 {
+            if objects.len() > QUERY_PERMISSION_PREFIX_OBJECT_CAP as usize {
                 return Err(Status::failed_precondition(
-                    "TypedJsonAppendRecordTooLargeForInlineQuery",
+                    "AuthzPermissionSetTooLargeForPrefixScope",
                 ));
             }
-            let json = serde_json::from_slice(&payload).map_err(|e| {
-                Status::failed_precondition(format!("TypedJsonAppendRecordInvalid: {e}"))
-            })?;
-            let row = TypedIndexRow::from_append_record(definition, stream, record, &json)?;
-            if predicates.iter().all(|predicate| predicate.matches(&row)) {
-                rows.push(row);
+            for object in objects {
+                existing_keys.insert(object.key.clone());
+                authorized_labels.insert(query_object_authz_label_hash(bucket, &object));
             }
         }
-        Ok(rows)
+
+        Ok(Some(QueryPermissionFilter {
+            object_keys: existing_keys,
+            authorized_labels,
+        }))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AnvilQuerySpec {
+    schema: String,
+    scope: AnvilQueryScope,
+    #[serde(default = "default_query_source_kind")]
+    source_kind: String,
+    #[serde(rename = "where", default)]
+    predicates: AnvilQueryWhere,
+    #[serde(default)]
+    order_by: Vec<AnvilQueryOrder>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    consistency: AnvilQueryConsistency,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AnvilQueryScope {
+    #[serde(default)]
+    mesh_id: Option<String>,
+    #[serde(default)]
+    anvil_storage_tenant_id: Option<String>,
+    #[serde(default)]
+    authz_scope: Option<JsonValue>,
+    bucket_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AnvilQueryWhere {
+    #[serde(default)]
+    all: Vec<JsonValue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AnvilQueryOrder {
+    field: String,
+    #[serde(default = "default_ascending")]
+    direction: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AnvilQueryConsistency {
+    #[serde(default)]
+    min_source_cursor: Option<JsonValue>,
+    #[serde(default)]
+    min_authz_revision: Option<JsonValue>,
+    #[serde(default)]
+    allow_stale_index: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct QuerySpecShape {
+    source_kind: String,
+    path_prefix: Option<String>,
+    typed_predicates: Vec<JsonValue>,
+    typed_order: Vec<TypedOrder>,
+    query_text: Option<String>,
+    query_vector: Option<Vec<f32>>,
+    phrase: bool,
+    can_relation: Option<String>,
+    min_source_cursor: Option<u64>,
+    min_authz_revision: Option<u64>,
+    limit: u32,
+}
+
+#[derive(Debug, Clone)]
+struct QuerySpecPlan {
+    index: crate::persistence::IndexDefinition,
+    typed_filter_index: Option<crate::persistence::IndexDefinition>,
+    canonical_query_hash: String,
+    plan_json: String,
+    diagnostics: Vec<String>,
+    query_text: String,
+    query_vector: Vec<f32>,
+    phrase: bool,
+    path_prefix: String,
+    typed_predicates: Vec<JsonValue>,
+    typed_order: Vec<TypedOrder>,
+    limit: u32,
+    require_caught_up_to_watch_cursor: String,
+}
+
+#[derive(Debug, Clone)]
+struct QuerySpecIndexSelection {
+    primary: crate::persistence::IndexDefinition,
+    typed_filter: Option<crate::persistence::IndexDefinition>,
+}
+
+impl QuerySpecPlan {
+    fn single_query_request(
+        &self,
+        bucket_name: &str,
+        page_token: &str,
+        lag_timeout_ms: u64,
+    ) -> Result<QueryIndexRequest, Status> {
+        Ok(QueryIndexRequest {
+            bucket_name: bucket_name.to_string(),
+            index_name: self.index.name.clone(),
+            query_text: self.query_text.clone(),
+            query_vector: self.query_vector.clone(),
+            limit: self.limit,
+            phrase: self.phrase,
+            path_prefix: self.path_prefix.clone(),
+            metadata_filters_json: String::new(),
+            typed_predicates_json: serde_json::to_string(&self.typed_predicates)
+                .map_err(|e| Status::internal(e.to_string()))?,
+            typed_order_json: serde_json::to_string(&self.typed_order)
+                .map_err(|e| Status::internal(e.to_string()))?,
+            page_token: page_token.to_string(),
+            require_caught_up_to_watch_cursor: self.require_caught_up_to_watch_cursor.clone(),
+            lag_timeout_ms,
+        })
+    }
+}
+
+fn default_query_source_kind() -> String {
+    "object_current".to_string()
+}
+
+impl AnvilQuerySpec {
+    fn parse(raw: &str) -> Result<Self, Status> {
+        let spec: Self = serde_json::from_str(raw)
+            .map_err(|e| Status::invalid_argument(format!("Invalid QuerySpec JSON: {e}")))?;
+        if spec.schema != "anvil.query.spec.v1" {
+            return Err(Status::invalid_argument("Invalid QuerySpec schema"));
+        }
+        if let Some(mesh_id) = spec.scope.mesh_id.as_deref()
+            && mesh_id.trim().is_empty()
+        {
+            return Err(Status::invalid_argument("QuerySpec scope.mesh_id is empty"));
+        }
+        if let Some(authz_scope) = spec.scope.authz_scope.as_ref()
+            && !authz_scope.is_object()
+        {
+            return Err(Status::invalid_argument(
+                "QuerySpec scope.authz_scope must be an object",
+            ));
+        }
+        Ok(spec)
     }
 
-    async fn load_object_json(
-        &self,
-        claims: Option<auth::Claims>,
-        bucket_name: &str,
-        object_key: &str,
-        version_id: uuid::Uuid,
-    ) -> Result<JsonValue, Status> {
-        let (_object, mut stream) = self
-            .object_manager
-            .get_object(
-                claims,
-                bucket_name.to_string(),
-                object_key.to_string(),
-                Some(version_id),
-            )
-            .await?;
-        let mut bytes = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            bytes.extend_from_slice(&chunk?);
-            if bytes.len() > 16 * 1024 * 1024 {
-                return Err(Status::failed_precondition(
-                    "TypedJsonObjectTooLargeForInlineQuery",
-                ));
-            }
-        }
-        serde_json::from_slice(&bytes)
-            .map_err(|e| Status::failed_precondition(format!("TypedJsonObjectInvalid: {e}")))
+    fn canonical_json(&self) -> Result<String, Status> {
+        serde_json::to_string(
+            &serde_json::to_value(self)
+                .map_err(|e| Status::internal(format!("Serialize QuerySpec: {e}")))?,
+        )
+        .map_err(|e| Status::internal(format!("Canonicalize QuerySpec: {e}")))
     }
+
+    fn shape(&self) -> Result<QuerySpecShape, Status> {
+        let mut path_prefix = None;
+        let mut typed_predicates = Vec::new();
+        let mut query_text = None;
+        let mut query_vector = None;
+        let mut phrase = false;
+        let mut can_relation = None;
+
+        for predicate in &self.predicates.all {
+            if let Some(value) = predicate.get("path_prefix").and_then(JsonValue::as_str) {
+                path_prefix = Some(value.to_string());
+                continue;
+            }
+            if let Some(field) = predicate.get("field").and_then(JsonValue::as_str) {
+                let op = predicate
+                    .get("op")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| {
+                        Status::invalid_argument("QuerySpec field predicate requires op")
+                    })?;
+                let value = predicate
+                    .get("value")
+                    .or_else(|| predicate.get("values"))
+                    .cloned()
+                    .unwrap_or(JsonValue::Null);
+                let values = match value {
+                    JsonValue::Array(values) if op.eq_ignore_ascii_case("in") => values,
+                    other => vec![other],
+                };
+                typed_predicates.push(serde_json::json!({
+                    "field": field,
+                    "op": op,
+                    "values": values,
+                }));
+                continue;
+            }
+            if let Some(full_text) = predicate.get("full_text") {
+                let query = full_text
+                    .get("query")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| {
+                        Status::invalid_argument("QuerySpec full_text predicate requires query")
+                    })?;
+                query_text = Some(query.to_string());
+                phrase = full_text
+                    .get("phrase")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                continue;
+            }
+            if let Some(vector) = predicate.get("vector") {
+                let near = vector
+                    .get("near")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| {
+                        Status::invalid_argument(
+                            "QuerySpec vector.near must be an inline numeric vector",
+                        )
+                    })?;
+                let mut values = Vec::with_capacity(near.len());
+                for value in near {
+                    let Some(value) = value.as_f64() else {
+                        return Err(Status::invalid_argument(
+                            "QuerySpec vector.near values must be numeric",
+                        ));
+                    };
+                    values.push(value as f32);
+                }
+                query_vector = Some(values);
+                continue;
+            }
+            if let Some(can) = predicate.get("can") {
+                let relation =
+                    can.get("relation")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| {
+                            Status::invalid_argument("QuerySpec can predicate requires relation")
+                        })?;
+                can_relation = Some(relation.to_string());
+                continue;
+            }
+            return Err(Status::invalid_argument("Unsupported QuerySpec predicate"));
+        }
+
+        let typed_order = self
+            .order_by
+            .iter()
+            .map(|order| {
+                let direction = order.direction.to_ascii_lowercase();
+                if direction != "asc" && direction != "desc" {
+                    return Err(Status::invalid_argument(
+                        "QuerySpec order_by direction must be asc or desc",
+                    ));
+                }
+                Ok(TypedOrder {
+                    field: order.field.clone(),
+                    direction,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(QuerySpecShape {
+            source_kind: self.source_kind.clone(),
+            path_prefix,
+            typed_predicates,
+            typed_order,
+            query_text,
+            query_vector,
+            phrase,
+            can_relation,
+            min_source_cursor: parse_optional_u64_json(
+                self.consistency.min_source_cursor.as_ref(),
+                "min_source_cursor",
+            )?,
+            min_authz_revision: parse_optional_u64_json(
+                self.consistency.min_authz_revision.as_ref(),
+                "min_authz_revision",
+            )?,
+            limit: self.limit.unwrap_or(100),
+        })
+    }
+}
+
+fn parse_optional_u64_json(value: Option<&JsonValue>, label: &str) -> Result<Option<u64>, Status> {
+    match value {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::Number(number)) => number
+            .as_u64()
+            .ok_or_else(|| Status::invalid_argument(format!("QuerySpec {label} must be u64")))
+            .map(Some),
+        Some(JsonValue::String(value)) => value
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| Status::invalid_argument(format!("QuerySpec {label} must be u64"))),
+        _ => Err(Status::invalid_argument(format!(
+            "QuerySpec {label} must be a string or integer"
+        ))),
+    }
+}
+
+fn select_query_spec_indexes(
+    indexes: &[crate::persistence::IndexDefinition],
+    shape: &QuerySpecShape,
+    accept_degraded: bool,
+) -> Result<QuerySpecIndexSelection, Status> {
+    let needs_typed = !shape.typed_predicates.is_empty() || !shape.typed_order.is_empty();
+    let needs_text = shape.query_text.is_some();
+    let needs_vector = shape.query_vector.is_some();
+    let needs_path_only =
+        shape.path_prefix.is_some() && !needs_typed && !needs_text && !needs_vector;
+
+    let typed_filter = if needs_typed {
+        Some(
+            indexes
+                .iter()
+                .filter(|index| index.enabled && index.kind == "typed_json")
+                .find(|index| typed_json_index_covers(index, shape).unwrap_or(false))
+                .cloned()
+                .ok_or_else(|| {
+                    Status::failed_precondition(
+                        "QuerySpec has no typed_json index covering predicates",
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+
+    if needs_text && needs_vector {
+        let primary = indexes
+            .iter()
+            .find(|index| index.enabled && index.kind == "hybrid")
+            .cloned()
+            .ok_or_else(|| {
+                Status::failed_precondition("QuerySpec text+vector plan requires a hybrid index")
+            })?;
+        return Ok(QuerySpecIndexSelection {
+            primary,
+            typed_filter,
+        });
+    }
+    if let Some(typed_filter) = typed_filter.clone()
+        && !needs_text
+        && !needs_vector
+    {
+        return Ok(QuerySpecIndexSelection {
+            primary: typed_filter,
+            typed_filter: None,
+        });
+    }
+    if needs_text {
+        let primary = indexes
+            .iter()
+            .find(|index| index.enabled && index.kind == "full_text")
+            .cloned()
+            .ok_or_else(|| Status::failed_precondition("QuerySpec has no full_text index"))?;
+        return Ok(QuerySpecIndexSelection {
+            primary,
+            typed_filter,
+        });
+    }
+    if needs_vector {
+        let primary = indexes
+            .iter()
+            .find(|index| index.enabled && index.kind == "vector")
+            .cloned()
+            .ok_or_else(|| Status::failed_precondition("QuerySpec has no vector index"))?;
+        return Ok(QuerySpecIndexSelection {
+            primary,
+            typed_filter,
+        });
+    }
+    if needs_path_only {
+        let primary = indexes
+            .iter()
+            .find(|index| index.enabled && matches!(index.kind.as_str(), "path" | "typed_json"))
+            .cloned()
+            .ok_or_else(|| Status::failed_precondition("QuerySpec has no path-capable index"))?;
+        return Ok(QuerySpecIndexSelection {
+            primary,
+            typed_filter: None,
+        });
+    }
+    if accept_degraded {
+        let primary = indexes
+            .iter()
+            .find(|index| index.enabled && index.kind == "path")
+            .cloned()
+            .ok_or_else(|| {
+                Status::failed_precondition("QuerySpec has no bounded primitive index")
+            })?;
+        return Ok(QuerySpecIndexSelection {
+            primary,
+            typed_filter: None,
+        });
+    }
+    Err(Status::failed_precondition(
+        "QuerySpec requires at least one bounded primitive predicate",
+    ))
+}
+
+fn typed_json_index_covers(
+    index: &crate::persistence::IndexDefinition,
+    shape: &QuerySpecShape,
+) -> Result<bool, Status> {
+    let definition = TypedJsonIndexDefinition::from_index(index)?;
+    if definition.source_kind != shape.source_kind {
+        return Ok(false);
+    }
+    let fields = definition
+        .fields
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    for predicate in &shape.typed_predicates {
+        let Some(field) = predicate.get("field").and_then(JsonValue::as_str) else {
+            return Ok(false);
+        };
+        if !fields.contains(field) {
+            return Ok(false);
+        }
+    }
+    for order in &shape.typed_order {
+        if !fields.contains(order.field.as_str()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn query_spec_overfetch_limit(requested: u32) -> u32 {
+    requested.saturating_mul(10).clamp(100, 1000)
+}
+
+fn composite_query_spec_index_name(
+    primary: &crate::persistence::IndexDefinition,
+    typed_filter: &crate::persistence::IndexDefinition,
+) -> String {
+    format!("{}+{}", primary.name, typed_filter.name)
+}
+
+fn composite_index_definition_version(
+    primary: &crate::persistence::IndexDefinition,
+    typed_filter: &crate::persistence::IndexDefinition,
+) -> u64 {
+    let primary = u64::try_from(primary.version).unwrap_or(0);
+    let typed_filter = u64::try_from(typed_filter.version).unwrap_or(0);
+    primary.max(typed_filter)
+}
+
+fn composite_query_spec_predicate_hash(
+    plan: &QuerySpecPlan,
+    primary_generation: u64,
+    typed_generation: u64,
+) -> String {
+    let shape = serde_json::json!({
+        "canonical_query_hash": plan.canonical_query_hash,
+        "primary_index": plan.index.name,
+        "primary_generation": primary_generation,
+        "typed_filter_index": plan.typed_filter_index.as_ref().map(|index| index.name.as_str()),
+        "typed_generation": typed_generation,
+    });
+    blake3::hash(shape.to_string().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+fn composite_query_spec_order_hash(plan: &QuerySpecPlan) -> String {
+    if plan.typed_order.is_empty() {
+        score_order_hash()
+    } else {
+        stable_json_hash(&serde_json::to_string(&plan.typed_order).unwrap_or_default())
+    }
+}
+
+fn typed_values_from_query_hit(hit: &IndexQueryHit) -> Result<BTreeMap<String, JsonValue>, Status> {
+    let metadata: JsonValue = serde_json::from_str(&hit.metadata_json)
+        .map_err(|e| Status::internal(format!("Invalid query hit metadata_json: {e}")))?;
+    let Some(values) = metadata.get("typed_values").and_then(JsonValue::as_object) else {
+        return Err(Status::internal(
+            "typed query hit metadata is missing typed_values",
+        ));
+    };
+    Ok(values
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect())
+}
+
+fn merge_composite_metadata(
+    primary_metadata_json: &str,
+    typed_values: &BTreeMap<String, JsonValue>,
+) -> Result<String, Status> {
+    let primary = serde_json::from_str::<JsonValue>(primary_metadata_json)
+        .unwrap_or_else(|_| JsonValue::String(primary_metadata_json.to_string()));
+    serde_json::to_string(&serde_json::json!({
+        "primary": primary,
+        "typed_values": typed_values,
+    }))
+    .map_err(|e| Status::internal(format!("Serialize composite metadata: {e}")))
+}
+
+fn compare_query_spec_hits_by_typed_order(
+    left: &IndexQueryHit,
+    right: &IndexQueryHit,
+    plan: &QuerySpecPlan,
+) -> std::cmp::Ordering {
+    let left_values = typed_values_from_query_hit(left).unwrap_or_default();
+    let right_values = typed_values_from_query_hit(right).unwrap_or_default();
+    for term in &plan.typed_order {
+        let ordering = compare_json_values(
+            left_values.get(&term.field).unwrap_or(&JsonValue::Null),
+            right_values.get(&term.field).unwrap_or(&JsonValue::Null),
+        );
+        let ordering = if term.direction == "desc" {
+            ordering.reverse()
+        } else {
+            ordering
+        };
+        if !ordering.is_eq() {
+            return ordering;
+        }
+    }
+    left.object_version_id.cmp(&right.object_version_id)
+}
+
+fn query_spec_hit_sort_values(
+    hit: &IndexQueryHit,
+    plan: &QuerySpecPlan,
+) -> Result<BTreeMap<String, JsonValue>, Status> {
+    if plan.typed_order.is_empty() {
+        Ok(score_sort_values(hit.score, &hit.object_version_id))
+    } else {
+        typed_values_from_query_hit(hit)
+    }
+}
+
+fn query_spec_hit_after_cursor(
+    hit: &IndexQueryHit,
+    token: &IndexPageToken,
+    plan: &QuerySpecPlan,
+) -> Result<bool, Status> {
+    if plan.typed_order.is_empty() {
+        return score_after_cursor(hit.score, &hit.object_version_id, token);
+    }
+    let values = typed_values_from_query_hit(hit)?;
+    for term in &plan.typed_order {
+        let ordering = compare_json_values(
+            values.get(&term.field).unwrap_or(&JsonValue::Null),
+            token
+                .last_sort_values
+                .get(&term.field)
+                .unwrap_or(&JsonValue::Null),
+        );
+        let ordering = if term.direction == "desc" {
+            ordering.reverse()
+        } else {
+            ordering
+        };
+        if !ordering.is_eq() {
+            return Ok(ordering.is_gt());
+        }
+    }
+    Ok(hit.object_version_id > token.last_source_identity)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1437,15 +2713,86 @@ struct QueryObjectRef {
 }
 
 impl QueryObjectRef {
-    fn from_object(object: &crate::persistence::Object) -> Self {
-        Self {
-            object_version_id: object.version_id.to_string(),
-            object_key: object.key.clone(),
-            user_meta: object.user_meta.clone(),
-            created_at_nanos: object.created_at.timestamp_nanos_opt().unwrap_or(0),
-            authz_revision: object.authz_revision,
-        }
+    fn from_typed_field_row(
+        row: &typed_field_segment::TypedFieldSegmentRow,
+    ) -> Result<Self, Status> {
+        let user_meta = JsonValue::Object(
+            row.values
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        );
+        Ok(Self {
+            object_version_id: row.object_version_id.clone(),
+            object_key: row.object_key.clone(),
+            user_meta: Some(user_meta),
+            created_at_nanos: 0,
+            authz_revision: i64::try_from(row.authz_revision)
+                .map_err(|_| Status::internal("Invalid authz revision"))?,
+        })
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct QueryPermissionFilter {
+    object_keys: BTreeSet<String>,
+    authorized_labels: BTreeSet<[u8; 32]>,
+}
+
+impl QueryPermissionFilter {
+    fn allows_object_key(&self, object_key: &str) -> bool {
+        self.object_keys.contains(object_key)
+    }
+}
+
+fn collect_object_scope(
+    scope: &str,
+    bucket_name: &str,
+    object_keys: &mut BTreeSet<String>,
+    object_key_prefixes: &mut BTreeSet<String>,
+    grants_bucket_read: &mut bool,
+) {
+    let Some((action, resource)) = scope.split_once('|') else {
+        return;
+    };
+    if !matches!(action, "object:read" | "object:*" | "*") {
+        return;
+    }
+    if resource == "*" {
+        *grants_bucket_read = true;
+        return;
+    }
+    let bucket_prefix = format!("{bucket_name}/");
+    let Some(key_pattern) = resource.strip_prefix(&bucket_prefix) else {
+        return;
+    };
+    if key_pattern.is_empty() {
+        *grants_bucket_read = true;
+        return;
+    }
+    if key_pattern.ends_with('*') {
+        let prefix = key_pattern.trim_end_matches('*');
+        if prefix.is_empty() {
+            *grants_bucket_read = true;
+        } else {
+            object_key_prefixes.insert(prefix.to_string());
+        }
+        return;
+    }
+    object_keys.insert(key_pattern.to_string());
+}
+
+fn query_object_authz_label_hash(
+    bucket: &crate::persistence::Bucket,
+    object: &crate::persistence::Object,
+) -> [u8; 32] {
+    hash32(
+        format!(
+            "tenant:{}:bucket:{}:object:{}:authz:{}",
+            bucket.tenant_id, bucket.id, object.key, object.authz_revision
+        )
+        .as_bytes(),
+    )
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1508,8 +2855,6 @@ struct TypedJsonIndexDefinition {
 #[derive(Debug, Clone)]
 struct TypedFieldDefinition {
     name: String,
-    extractor: String,
-    required: bool,
 }
 
 impl TypedJsonIndexDefinition {
@@ -1535,14 +2880,7 @@ impl TypedJsonIndexDefinition {
                 .or_else(|| json_optional_string_field(value, "json_pointer"))
                 .ok_or_else(|| Status::invalid_argument("typed_json field requires extractor"))?;
             validate_typed_extractor(&source_kind, &extractor)?;
-            fields.push(TypedFieldDefinition {
-                name,
-                extractor,
-                required: value
-                    .get("required")
-                    .and_then(JsonValue::as_bool)
-                    .unwrap_or(false),
-            });
+            fields.push(TypedFieldDefinition { name });
         }
         let default_order = index
             .build_policy
@@ -1567,107 +2905,13 @@ struct TypedIndexRow {
 }
 
 impl TypedIndexRow {
-    fn from_object(
-        definition: &TypedJsonIndexDefinition,
-        object: crate::persistence::Object,
-        json: &JsonValue,
-    ) -> Result<Self, Status> {
-        let mut values = BTreeMap::new();
-        for field in &definition.fields {
-            let value = match field.extractor.as_str() {
-                "object_key" => JsonValue::String(object.key.clone()),
-                "object_content_type" => object
-                    .content_type
-                    .clone()
-                    .map(JsonValue::String)
-                    .unwrap_or(JsonValue::Null),
-                "created_at" => JsonValue::String(object.created_at.to_rfc3339()),
-                extractor if extractor.starts_with("object_body_json_pointer:") => json
-                    .pointer(extractor.trim_start_matches("object_body_json_pointer:"))
-                    .cloned()
-                    .unwrap_or(JsonValue::Null),
-                extractor if extractor.starts_with("object_user_metadata_json_pointer:") => object
-                    .user_meta
-                    .as_ref()
-                    .and_then(|metadata| {
-                        metadata.pointer(
-                            extractor.trim_start_matches("object_user_metadata_json_pointer:"),
-                        )
-                    })
-                    .cloned()
-                    .unwrap_or(JsonValue::Null),
-                pointer if pointer.starts_with('/') => {
-                    json.pointer(pointer).cloned().unwrap_or(JsonValue::Null)
-                }
-                _ => JsonValue::Null,
-            };
-            if value.is_null() && field.required {
-                return Err(Status::failed_precondition(format!(
-                    "TypedJsonRequiredFieldMissing:{}",
-                    field.name
-                )));
-            }
-            values.insert(field.name.clone(), value);
+    fn from_segment_row(row: typed_field_segment::TypedFieldSegmentRow) -> Self {
+        Self {
+            object_key: row.object_key,
+            object_version_id: row.object_version_id,
+            source_identity: row.source_identity,
+            values: row.values,
         }
-        Ok(Self {
-            object_key: object.key.clone(),
-            object_version_id: object.version_id.to_string(),
-            source_identity: format!("{}#{}", object.key, object.version_id),
-            values,
-        })
-    }
-
-    fn from_append_record(
-        definition: &TypedJsonIndexDefinition,
-        stream: crate::persistence::AppendStream,
-        record: crate::persistence::AppendStreamRecord,
-        json: &JsonValue,
-    ) -> Result<Self, Status> {
-        let mut values = BTreeMap::new();
-        for field in &definition.fields {
-            let value = match field.extractor.as_str() {
-                "append_stream_key" => JsonValue::String(stream.stream_key.clone()),
-                "append_record_sequence" => JsonValue::Number(record.record_sequence.into()),
-                "append_content_type" => record
-                    .content_type
-                    .clone()
-                    .map(JsonValue::String)
-                    .unwrap_or(JsonValue::Null),
-                "created_at" => JsonValue::String(record.created_at.to_rfc3339()),
-                extractor if extractor.starts_with("append_payload_json_pointer:") => json
-                    .pointer(extractor.trim_start_matches("append_payload_json_pointer:"))
-                    .cloned()
-                    .unwrap_or(JsonValue::Null),
-                extractor if extractor.starts_with("append_user_metadata_json_pointer:") => record
-                    .user_meta
-                    .as_ref()
-                    .and_then(|metadata| {
-                        metadata.pointer(
-                            extractor.trim_start_matches("append_user_metadata_json_pointer:"),
-                        )
-                    })
-                    .cloned()
-                    .unwrap_or(JsonValue::Null),
-                pointer if pointer.starts_with('/') => {
-                    json.pointer(pointer).cloned().unwrap_or(JsonValue::Null)
-                }
-                _ => JsonValue::Null,
-            };
-            if value.is_null() && field.required {
-                return Err(Status::failed_precondition(format!(
-                    "TypedJsonRequiredFieldMissing:{}",
-                    field.name
-                )));
-            }
-            values.insert(field.name.clone(), value);
-        }
-        let source_identity = format!("{}#{}", stream.stream_key, record.record_sequence);
-        Ok(Self {
-            object_key: stream.stream_key,
-            object_version_id: record.record_sequence.to_string(),
-            source_identity,
-            values,
-        })
     }
 }
 
@@ -1786,57 +3030,266 @@ impl TypedOrder {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct TypedPageToken {
+struct IndexPageToken {
+    version: u8,
+    token_kind: String,
+    mesh_id: String,
+    anvil_storage_tenant_id: String,
+    authz_realm_id: String,
     tenant_id: i64,
     bucket_name: String,
     index_name: String,
     index_generation: u64,
+    index_definition_version: u64,
+    index_inputs: Vec<IndexPageTokenInput>,
+    authz_revision: u64,
+    caller_principal_hash: String,
+    query_hash: String,
     predicate_hash: String,
     order_hash: String,
     last_source_identity: String,
     #[serde(default)]
     last_sort_values: BTreeMap<String, JsonValue>,
+    expires_at: String,
+    signature: String,
 }
 
-impl TypedPageToken {
-    fn decode(raw: &str) -> Result<Option<Self>, Status> {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct IndexPageTokenInput {
+    index_id: String,
+    definition_hash: String,
+    generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct IndexPageTokenBinding {
+    token_kind: String,
+    mesh_id: String,
+    anvil_storage_tenant_id: String,
+    authz_realm_id: String,
+    tenant_id: i64,
+    bucket_name: String,
+    index_name: String,
+    index_generation: u64,
+    index_definition_version: u64,
+    index_inputs: Vec<IndexPageTokenInput>,
+    authz_revision: u64,
+    caller_principal_hash: String,
+    query_hash: String,
+    predicate_hash: String,
+    order_hash: String,
+}
+
+impl IndexPageToken {
+    fn for_cursor(
+        binding: &IndexPageTokenBinding,
+        last_source_identity: String,
+        last_sort_values: BTreeMap<String, JsonValue>,
+    ) -> Self {
+        Self {
+            version: INDEX_PAGE_TOKEN_VERSION,
+            token_kind: binding.token_kind.clone(),
+            mesh_id: binding.mesh_id.clone(),
+            anvil_storage_tenant_id: binding.anvil_storage_tenant_id.clone(),
+            authz_realm_id: binding.authz_realm_id.clone(),
+            tenant_id: binding.tenant_id,
+            bucket_name: binding.bucket_name.clone(),
+            index_name: binding.index_name.clone(),
+            index_generation: binding.index_generation,
+            index_definition_version: binding.index_definition_version,
+            index_inputs: binding.index_inputs.clone(),
+            authz_revision: binding.authz_revision,
+            caller_principal_hash: binding.caller_principal_hash.clone(),
+            query_hash: binding.query_hash.clone(),
+            predicate_hash: binding.predicate_hash.clone(),
+            order_hash: binding.order_hash.clone(),
+            last_source_identity,
+            last_sort_values,
+            expires_at: (chrono::Utc::now()
+                + chrono::Duration::seconds(INDEX_PAGE_TOKEN_TTL_SECONDS))
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            signature: String::new(),
+        }
+    }
+
+    fn decode(raw: &str, signing_key: &[u8]) -> Result<Option<Self>, Status> {
         if raw.trim().is_empty() {
             return Ok(None);
         }
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(raw)
             .map_err(|_| Status::invalid_argument("InvalidPageToken"))?;
-        serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|_| Status::invalid_argument("InvalidPageToken"))
+        let token: Self = serde_json::from_slice(&bytes)
+            .map_err(|_| Status::invalid_argument("InvalidPageToken"))?;
+        if token.version != INDEX_PAGE_TOKEN_VERSION {
+            return Err(Status::invalid_argument("InvalidPageToken"));
+        }
+        let expected = token.sign(signing_key)?;
+        if !constant_time_eq::constant_time_eq(token.signature.as_bytes(), expected.as_bytes()) {
+            return Err(Status::invalid_argument("InvalidPageToken"));
+        }
+        Ok(Some(token))
     }
 
-    fn encode(&self) -> Result<String, Status> {
-        let bytes = serde_json::to_vec(self)
+    fn encode(mut self, signing_key: &[u8]) -> Result<String, Status> {
+        self.signature = self.sign(signing_key)?;
+        let bytes = serde_json::to_vec(&self)
             .map_err(|e| Status::internal(format!("Serialize page token: {e}")))?;
         Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
     }
 
-    fn validate(
-        &self,
-        tenant_id: i64,
-        bucket_name: &str,
-        index_name: &str,
-        index_generation: u64,
-        predicate_hash: &str,
-        order_hash: &str,
-    ) -> Result<(), Status> {
-        if self.tenant_id != tenant_id
-            || self.bucket_name != bucket_name
-            || self.index_name != index_name
-            || self.index_generation != index_generation
-            || self.predicate_hash != predicate_hash
-            || self.order_hash != order_hash
+    fn validate(&self, binding: &IndexPageTokenBinding) -> Result<(), Status> {
+        let expires_at = chrono::DateTime::parse_from_rfc3339(&self.expires_at)
+            .map_err(|_| Status::invalid_argument("InvalidPageToken"))?
+            .with_timezone(&chrono::Utc);
+        if expires_at <= chrono::Utc::now() {
+            return Err(Status::invalid_argument("PageTokenExpired"));
+        }
+        if self.token_kind != binding.token_kind
+            || self.mesh_id != binding.mesh_id
+            || self.anvil_storage_tenant_id != binding.anvil_storage_tenant_id
+            || self.authz_realm_id != binding.authz_realm_id
+            || self.tenant_id != binding.tenant_id
+            || self.bucket_name != binding.bucket_name
+            || self.index_name != binding.index_name
+            || self.index_generation != binding.index_generation
+            || self.index_definition_version != binding.index_definition_version
+            || self.index_inputs != binding.index_inputs
+            || self.authz_revision != binding.authz_revision
+            || self.caller_principal_hash != binding.caller_principal_hash
+            || self.query_hash != binding.query_hash
+            || self.predicate_hash != binding.predicate_hash
+            || self.order_hash != binding.order_hash
         {
             return Err(Status::invalid_argument("InvalidPageToken"));
         }
         Ok(())
     }
+
+    fn sign(&self, signing_key: &[u8]) -> Result<String, Status> {
+        let mut mac = HmacSha256::new_from_slice(signing_key)
+            .map_err(|_| Status::internal("Invalid index page token signing key"))?;
+        mac.update(INDEX_PAGE_TOKEN_DOMAIN);
+        mac.update(&[self.version]);
+        update_mac_part(&mut mac, self.token_kind.as_bytes());
+        update_mac_part(&mut mac, self.mesh_id.as_bytes());
+        update_mac_part(&mut mac, self.anvil_storage_tenant_id.as_bytes());
+        update_mac_part(&mut mac, self.authz_realm_id.as_bytes());
+        mac.update(&self.tenant_id.to_le_bytes());
+        update_mac_part(&mut mac, self.bucket_name.as_bytes());
+        update_mac_part(&mut mac, self.index_name.as_bytes());
+        mac.update(&self.index_generation.to_le_bytes());
+        mac.update(&self.index_definition_version.to_le_bytes());
+        let index_inputs = serde_json::to_vec(&self.index_inputs)
+            .map_err(|_| Status::internal("Failed to encode index page token index inputs"))?;
+        update_mac_part(&mut mac, &index_inputs);
+        mac.update(&self.authz_revision.to_le_bytes());
+        update_mac_part(&mut mac, self.caller_principal_hash.as_bytes());
+        update_mac_part(&mut mac, self.query_hash.as_bytes());
+        update_mac_part(&mut mac, self.predicate_hash.as_bytes());
+        update_mac_part(&mut mac, self.order_hash.as_bytes());
+        update_mac_part(&mut mac, self.last_source_identity.as_bytes());
+        let sort_values = serde_json::to_vec(&self.last_sort_values)
+            .map_err(|_| Status::internal("Failed to encode index page token sort values"))?;
+        update_mac_part(&mut mac, &sort_values);
+        update_mac_part(&mut mac, self.expires_at.as_bytes());
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
+    }
+}
+
+impl IndexPageTokenBinding {
+    fn single_index(
+        config: &Config,
+        claims: &auth::Claims,
+        token_kind: &str,
+        bucket_name: &str,
+        index_name: &str,
+        index_generation: u64,
+        index_definition_version: u64,
+        authz_revision: u64,
+        predicate_hash: String,
+        order_hash: String,
+    ) -> Self {
+        let index_inputs = vec![IndexPageTokenInput {
+            index_id: index_name.to_string(),
+            definition_hash: stable_string_hash(&format!(
+                "{index_name}:{index_definition_version}"
+            )),
+            generation: index_generation,
+        }];
+        Self::with_index_inputs(
+            config,
+            claims,
+            token_kind,
+            bucket_name,
+            index_name,
+            index_generation,
+            index_definition_version,
+            index_inputs,
+            authz_revision,
+            predicate_hash,
+            order_hash,
+        )
+    }
+
+    fn with_index_inputs(
+        config: &Config,
+        claims: &auth::Claims,
+        token_kind: &str,
+        bucket_name: &str,
+        index_name: &str,
+        index_generation: u64,
+        index_definition_version: u64,
+        index_inputs: Vec<IndexPageTokenInput>,
+        authz_revision: u64,
+        predicate_hash: String,
+        order_hash: String,
+    ) -> Self {
+        let anvil_storage_tenant_id = claims.tenant_id.to_string();
+        let authz_realm_id = DEFAULT_AUTHZ_REALM_ID.to_string();
+        let caller_principal_hash = stable_string_hash(&claims.sub);
+        let query_hash = stable_string_hash(
+            &serde_json::json!({
+                "token_kind": token_kind,
+                "mesh_id": config.mesh_id,
+                "anvil_storage_tenant_id": anvil_storage_tenant_id,
+                "authz_realm_id": authz_realm_id,
+                "tenant_id": claims.tenant_id,
+                "bucket_name": bucket_name,
+                "index_name": index_name,
+                "index_generation": index_generation,
+                "index_definition_version": index_definition_version,
+                "index_inputs": index_inputs,
+                "authz_revision": authz_revision,
+                "caller_principal_hash": caller_principal_hash,
+                "predicate_hash": predicate_hash,
+                "order_hash": order_hash,
+            })
+            .to_string(),
+        );
+        Self {
+            token_kind: token_kind.to_string(),
+            mesh_id: config.mesh_id.clone(),
+            anvil_storage_tenant_id,
+            authz_realm_id,
+            tenant_id: claims.tenant_id,
+            bucket_name: bucket_name.to_string(),
+            index_name: index_name.to_string(),
+            index_generation,
+            index_definition_version,
+            index_inputs,
+            authz_revision,
+            caller_principal_hash,
+            query_hash,
+            predicate_hash,
+            order_hash,
+        }
+    }
+}
+
+fn update_mac_part(mac: &mut HmacSha256, value: &[u8]) {
+    mac.update(&(value.len() as u64).to_le_bytes());
+    mac.update(value);
 }
 
 fn compare_typed_rows(
@@ -1967,8 +3420,108 @@ fn stable_json_hash(raw: &str) -> String {
         .to_string()
 }
 
-fn object_authz_revision(object: &crate::persistence::Object) -> Result<u64, Status> {
-    u64::try_from(object.authz_revision).map_err(|_| Status::internal("Invalid authz revision"))
+fn stable_string_hash(value: &str) -> String {
+    blake3::hash(value.as_bytes()).to_hex().to_string()
+}
+
+fn metadata_backed_predicate_hash(index_kind: &str, req: &QueryIndexRequest) -> String {
+    let shape = serde_json::json!({
+        "index_kind": index_kind,
+        "path_prefix": req.path_prefix,
+        "metadata_filters_hash": stable_json_hash(&req.metadata_filters_json),
+    });
+    blake3::hash(shape.to_string().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+fn score_based_predicate_hash(index_kind: &str, req: &QueryIndexRequest) -> String {
+    let query_vector_bits = req
+        .query_vector
+        .iter()
+        .map(|value| value.to_bits())
+        .collect::<Vec<_>>();
+    let shape = serde_json::json!({
+        "index_kind": index_kind,
+        "query_text": req.query_text,
+        "query_vector_bits": query_vector_bits,
+        "phrase": req.phrase,
+        "path_prefix": req.path_prefix,
+        "metadata_filters_hash": stable_json_hash(&req.metadata_filters_json),
+        "typed_predicates_hash": stable_json_hash(&req.typed_predicates_json),
+    });
+    blake3::hash(shape.to_string().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+fn score_order_hash() -> String {
+    stable_string_hash("score:desc,object_version_id:asc")
+}
+
+fn score_sort_values(score: f32, object_version_id: &str) -> BTreeMap<String, JsonValue> {
+    let mut values = BTreeMap::new();
+    values.insert(
+        "score".to_string(),
+        serde_json::Number::from_f64(f64::from(score))
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null),
+    );
+    values.insert(
+        "object_version_id".to_string(),
+        JsonValue::String(object_version_id.to_string()),
+    );
+    values
+}
+
+fn score_after_cursor(
+    score: f32,
+    object_version_id: &str,
+    token: &IndexPageToken,
+) -> Result<bool, Status> {
+    let cursor_score = token
+        .last_sort_values
+        .get("score")
+        .and_then(JsonValue::as_f64)
+        .ok_or_else(|| Status::invalid_argument("InvalidPageToken"))? as f32;
+    let cursor_object_version_id = token
+        .last_sort_values
+        .get("object_version_id")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| Status::invalid_argument("InvalidPageToken"))?;
+    Ok(score
+        .partial_cmp(&cursor_score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .is_lt()
+        || (score == cursor_score && object_version_id > cursor_object_version_id))
+}
+
+fn compare_score_hits(
+    left_score: f32,
+    left_object_version_id: &str,
+    right_score: f32,
+    right_object_version_id: &str,
+) -> std::cmp::Ordering {
+    right_score
+        .partial_cmp(&left_score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| left_object_version_id.cmp(right_object_version_id))
+}
+
+fn object_key_after_cursor(
+    object_key: &str,
+    source_identity: &str,
+    cursor_values: &BTreeMap<String, JsonValue>,
+    cursor_source_identity: &str,
+) -> bool {
+    let cursor_key = cursor_values
+        .get("object_key")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    object_key
+        .cmp(cursor_key)
+        .then(source_identity.cmp(cursor_source_identity))
+        .is_gt()
 }
 
 fn parse_metadata_filters(value: &str) -> Result<Vec<MetadataFilter>, Status> {
@@ -2174,15 +3727,22 @@ fn validate_authorization_mode(value: &str) -> Result<(), Status> {
     }
 }
 
-fn validate_index_definition_shape(kind: &str, build_policy: &JsonValue) -> Result<(), Status> {
+fn validate_index_definition_shape(
+    kind: &str,
+    build_policy: &JsonValue,
+    extractor: &JsonValue,
+    config: &Config,
+) -> Result<(), Status> {
     match kind {
         "full_text" => {
             crate::formats::full_text::FullTextIndexDefinition::from_json(build_policy)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
         }
         "vector" => {
-            crate::formats::vector::VectorIndexDefinition::from_json(build_policy)
+            let definition = crate::formats::vector::VectorIndexDefinition::from_json(build_policy)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            validate_no_external_vector_extractor(extractor)?;
+            validate_vector_embedding_provider(&definition, config)?;
         }
         "hybrid" => {
             let full_text = build_policy.get("full_text").ok_or_else(|| {
@@ -2193,8 +3753,10 @@ fn validate_index_definition_shape(kind: &str, build_policy: &JsonValue) -> Resu
                 .ok_or_else(|| Status::invalid_argument("Hybrid index requires vector policy"))?;
             crate::formats::full_text::FullTextIndexDefinition::from_json(full_text)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
-            crate::formats::vector::VectorIndexDefinition::from_json(vector)
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            let vector_definition =
+                crate::formats::vector::VectorIndexDefinition::from_json(vector)
+                    .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            validate_vector_embedding_provider(&vector_definition, config)?;
         }
         "typed_json" => {
             let index = crate::persistence::IndexDefinition {
@@ -2215,6 +3777,49 @@ fn validate_index_definition_shape(kind: &str, build_policy: &JsonValue) -> Resu
             TypedJsonIndexDefinition::from_index(&index)?;
         }
         _ => {}
+    }
+    Ok(())
+}
+
+fn validate_no_external_vector_extractor(extractor: &JsonValue) -> Result<(), Status> {
+    if extractor.is_null() {
+        return Ok(());
+    }
+    if extractor.as_object().is_some_and(serde_json::Map::is_empty) {
+        return Ok(());
+    }
+    Err(Status::invalid_argument(
+        "Vector index extractor must be declared inside build_policy_json",
+    ))
+}
+
+fn validate_vector_embedding_provider(
+    definition: &crate::formats::vector::VectorIndexDefinition,
+    config: &Config,
+) -> Result<(), Status> {
+    if definition.embedding_provider == crate::embedding_provider::TEST_ONLY_EMBEDDING_PROVIDER
+        && !config.allow_test_only_embedding_provider
+    {
+        return Err(Status::invalid_argument(
+            "test_only embedding provider is disabled for this server",
+        ));
+    }
+    let extractor_kind = definition
+        .extractor
+        .get("kind")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("object_body_utf8");
+    if matches!(extractor_kind, "object_body_utf8" | "utf8" | "body")
+        && definition.embedding_provider != crate::embedding_provider::TEST_ONLY_EMBEDDING_PROVIDER
+    {
+        let providers = crate::embedding_provider::EmbeddingProviderRegistry::from_config(config)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if !providers.has_provider(&definition.embedding_provider) {
+            return Err(Status::invalid_argument(format!(
+                "embedding provider `{}` is not configured",
+                definition.embedding_provider
+            )));
+        }
     }
     Ok(())
 }
@@ -2527,5 +4132,171 @@ mod tests {
 
         assert_eq!(candidates[0].item.score, 1.0);
         assert_eq!(candidates[0].item.freshness_score, 0.0);
+    }
+
+    #[test]
+    fn index_page_token_binds_principal_mesh_authz_and_index_inputs() {
+        let config = Config {
+            mesh_id: "mesh-test".to_string(),
+            ..Config::default()
+        };
+        let claims = auth::Claims {
+            sub: "principal-a".to_string(),
+            exp: 0,
+            scopes: vec!["*|*".to_string()],
+            tenant_id: 42,
+            jti: Some("token-a".to_string()),
+        };
+        let binding = IndexPageTokenBinding::single_index(
+            &config,
+            &claims,
+            "typed_json",
+            "bucket-a",
+            "idx-a",
+            7,
+            3,
+            11,
+            "predicate-a".to_string(),
+            "order-a".to_string(),
+        );
+        let signing_key = b"page-token-test-key";
+        let encoded = IndexPageToken::for_cursor(
+            &binding,
+            "source-a".to_string(),
+            BTreeMap::from([("field".to_string(), JsonValue::String("v".to_string()))]),
+        )
+        .encode(signing_key)
+        .unwrap();
+        let decoded = IndexPageToken::decode(&encoded, signing_key)
+            .unwrap()
+            .expect("decoded token");
+        decoded.validate(&binding).unwrap();
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&decoded.expires_at)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+                > chrono::Utc::now(),
+            "RFC 0006 page tokens must carry an authenticated expiry"
+        );
+
+        let mut other_principal = claims.clone();
+        other_principal.sub = "principal-b".to_string();
+        let other_principal_binding = IndexPageTokenBinding::single_index(
+            &config,
+            &other_principal,
+            "typed_json",
+            "bucket-a",
+            "idx-a",
+            7,
+            3,
+            11,
+            "predicate-a".to_string(),
+            "order-a".to_string(),
+        );
+        assert!(decoded.validate(&other_principal_binding).is_err());
+
+        let mut other_mesh = config.clone();
+        other_mesh.mesh_id = "mesh-other".to_string();
+        let other_mesh_binding = IndexPageTokenBinding::single_index(
+            &other_mesh,
+            &claims,
+            "typed_json",
+            "bucket-a",
+            "idx-a",
+            7,
+            3,
+            11,
+            "predicate-a".to_string(),
+            "order-a".to_string(),
+        );
+        assert!(decoded.validate(&other_mesh_binding).is_err());
+
+        let other_generation_binding = IndexPageTokenBinding::single_index(
+            &config,
+            &claims,
+            "typed_json",
+            "bucket-a",
+            "idx-a",
+            8,
+            3,
+            11,
+            "predicate-a".to_string(),
+            "order-a".to_string(),
+        );
+        assert!(decoded.validate(&other_generation_binding).is_err());
+
+        let expired = IndexPageToken {
+            expires_at: (chrono::Utc::now() - chrono::Duration::seconds(1))
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            ..IndexPageToken::for_cursor(
+                &binding,
+                "source-a".to_string(),
+                BTreeMap::from([("field".to_string(), JsonValue::String("v".to_string()))]),
+            )
+        }
+        .encode(signing_key)
+        .unwrap();
+        let decoded_expired = IndexPageToken::decode(&expired, signing_key)
+            .unwrap()
+            .expect("decoded expired token");
+        let expired_err = decoded_expired.validate(&binding).unwrap_err();
+        assert_eq!(expired_err.message(), "PageTokenExpired");
+    }
+
+    #[test]
+    fn vector_definition_rejects_external_extractor() {
+        let err = validate_index_definition_shape(
+            "vector",
+            &test_vector_definition("configured_provider", 4),
+            &serde_json::json!({"kind": "object_body_utf8"}),
+            &test_config(true),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("build_policy_json"));
+    }
+
+    #[test]
+    fn vector_text_extractor_allows_test_only_only_when_enabled() {
+        let policy = test_vector_definition("test_only", 4);
+        let extractor = serde_json::json!({});
+
+        assert!(
+            validate_index_definition_shape("vector", &policy, &extractor, &test_config(true))
+                .is_ok()
+        );
+        let err =
+            validate_index_definition_shape("vector", &policy, &extractor, &test_config(false))
+                .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("disabled"));
+    }
+
+    fn test_config(allow_test_only: bool) -> Config {
+        Config {
+            allow_test_only_embedding_provider: allow_test_only,
+            ..Config::default()
+        }
+    }
+
+    fn test_vector_definition(provider: &str, dimension: u16) -> serde_json::Value {
+        serde_json::json!({
+            "schema": crate::formats::vector::VECTOR_INDEX_SCHEMA,
+            "source": {"kind": "object_current", "prefix": "docs/"},
+            "extractor": {"kind": "object_body_utf8"},
+            "embedding": {
+                "provider": provider,
+                "model": "test-text-embedding",
+                "dimension": dimension,
+                "modality": "text",
+                "normalisation": "unit_l2",
+                "chunking": {"strategy": "whole_object"}
+            },
+            "ann": {
+                "algorithm": "hnsw",
+                "metric": "cosine"
+            }
+        })
     }
 }

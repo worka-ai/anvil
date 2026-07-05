@@ -1,26 +1,12 @@
-use crate::formats::{
-    BinaryEnvelopeHeader, COMMON_HEADER_LEN, FileFamily, Hash32, JournalFrame, JournalRecordKind,
-    hash32, validate_journal_chain,
+use crate::core_store::{
+    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreStore, ReadStream,
 };
-use crate::partition_fence::{PartitionWritePermit, validate_partition_write};
+use crate::formats::{Hash32, JournalFrame, JournalRecordKind, hash32, validate_journal_chain};
+use crate::partition_fence::{PartitionWritePermit, partition_write_ref_precondition};
 use crate::persistence::IndexDiagnostic;
 use crate::storage::Storage;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
-use tokio::io::AsyncWriteExt;
-
-#[derive(Debug, Serialize)]
-struct IndexDiagnosticJournalHeader<'a> {
-    tenant_id: String,
-    bucket_id: String,
-    partition_family: &'static str,
-    partition_id: String,
-    fence_token: u64,
-    first_sequence: u64,
-    created_at: &'a str,
-    codec: &'static str,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct IndexDiagnosticBody {
@@ -32,7 +18,7 @@ async fn write_index_diagnostic(
     storage: &Storage,
     diagnostic: IndexDiagnostic,
 ) -> Result<IndexDiagnostic> {
-    write_index_diagnostic_inner(storage, diagnostic, 0).await
+    write_index_diagnostic_inner(storage, diagnostic, 0, None).await
 }
 
 pub(crate) async fn write_index_diagnostic_with_permit(
@@ -42,14 +28,22 @@ pub(crate) async fn write_index_diagnostic_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<IndexDiagnostic> {
     require_index_diagnostic_permit(diagnostic.tenant_id, diagnostic.bucket_id, permit)?;
-    validate_partition_write(storage, permit, partition_owner_signing_key).await?;
-    write_index_diagnostic_inner(storage, diagnostic, permit.fence_token).await
+    let partition_precondition =
+        partition_write_ref_precondition(storage, permit, partition_owner_signing_key).await?;
+    write_index_diagnostic_inner(
+        storage,
+        diagnostic,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
 }
 
 async fn write_index_diagnostic_inner(
     storage: &Storage,
     mut diagnostic: IndexDiagnostic,
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<IndexDiagnostic> {
     let cursor = read_index_diagnostics(
         storage,
@@ -68,7 +62,7 @@ async fn write_index_diagnostic_inner(
     .checked_add(1)
     .ok_or_else(|| anyhow!("index diagnostic cursor overflow"))?;
     diagnostic.id = cursor;
-    append_diagnostic(storage, &diagnostic, fence_token).await?;
+    append_diagnostic(storage, &diagnostic, fence_token, partition_precondition).await?;
     Ok(diagnostic)
 }
 
@@ -81,8 +75,10 @@ pub async fn read_index_diagnostics(
     after_cursor: i64,
     limit: usize,
 ) -> Result<Vec<IndexDiagnostic>> {
-    let frames = read_index_diagnostic_frames_at_path(
-        &storage.index_diagnostic_journal_path(tenant_id, bucket_id),
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let frames = read_index_diagnostic_frames(
+        &core_store,
+        &index_diagnostic_stream_id(tenant_id, bucket_id),
     )
     .await?;
     let mut diagnostics = Vec::new();
@@ -114,19 +110,11 @@ async fn append_diagnostic(
     storage: &Storage,
     diagnostic: &IndexDiagnostic,
     fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
-    let path = storage.index_diagnostic_journal_path(diagnostic.tenant_id, diagnostic.bucket_id);
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    ensure_journal_header(
-        &path,
-        diagnostic.tenant_id,
-        diagnostic.bucket_id,
-        fence_token,
-    )
-    .await?;
-    let previous = read_index_diagnostic_frames_at_path(path.as_path())
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let stream_id = index_diagnostic_stream_id(diagnostic.tenant_id, diagnostic.bucket_id);
+    let previous = read_index_diagnostic_frames(&core_store, &stream_id)
         .await
         .unwrap_or_default();
     let sequence = previous
@@ -149,78 +137,54 @@ async fn append_diagnostic(
             diagnostic: diagnostic.clone(),
         })?,
     );
-    let mut file = tokio::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .await
-        .with_context(|| format!("open index diagnostic journal {}", path.display()))?;
-    file.write_all(&frame.encode()).await?;
-    file.sync_data().await?;
+    let partition_id = hex::encode(index_diagnostic_partition_id(
+        diagnostic.tenant_id,
+        diagnostic.bucket_id,
+    ));
+    core_store
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id: format!(
+                "index-diagnostic:{}:{}:{mutation_id}",
+                diagnostic.tenant_id, diagnostic.bucket_id,
+            ),
+            scope_partition: partition_id.clone(),
+            committed_by_principal: index_diagnostic_partition_principal(
+                diagnostic.tenant_id,
+                diagnostic.bucket_id,
+            ),
+            preconditions: partition_precondition.into_iter().collect(),
+            operations: vec![CoreMutationOperation::StreamAppend {
+                partition_id,
+                stream_id,
+                record_kind: "index_diagnostic".to_string(),
+                payload: frame.encode(),
+                idempotency_key: Some(format!(
+                    "index-diagnostic:{}:{}:{mutation_id}",
+                    diagnostic.tenant_id, diagnostic.bucket_id
+                )),
+            }],
+        })
+        .await?;
     Ok(())
 }
 
-async fn ensure_journal_header(
-    path: &Path,
-    tenant_id: i64,
-    bucket_id: i64,
-    fence_token: u64,
-) -> Result<()> {
-    if tokio::fs::try_exists(path).await? {
-        return Ok(());
-    }
-    let created_at = chrono::Utc::now().to_rfc3339();
-    let header_json = serde_json::to_vec(&IndexDiagnosticJournalHeader {
-        tenant_id: tenant_id.to_string(),
-        bucket_id: bucket_id.to_string(),
-        partition_family: "index_diagnostic",
-        partition_id: hex::encode(index_diagnostic_partition_id(tenant_id, bucket_id)),
-        fence_token,
-        first_sequence: 1,
-        created_at: &created_at,
-        codec: "none",
-    })?;
-    let header = BinaryEnvelopeHeader::new(FileFamily::MetadataJournal, 0, 0, header_json);
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .await
-        .with_context(|| format!("create index diagnostic journal {}", path.display()))?;
-    file.write_all(&header.encode()).await?;
-    file.sync_data().await?;
-    Ok(())
-}
-
-async fn read_index_diagnostic_frames_at_path(path: &Path) -> Result<Vec<JournalFrame>> {
-    if tokio::fs::metadata(path).await.is_err() {
-        return Ok(Vec::new());
-    }
-    let bytes = tokio::fs::read(path)
-        .await
-        .with_context(|| format!("read index diagnostic journal {}", path.display()))?;
-    decode_journal_file(&bytes)
-}
-
-fn decode_journal_file(bytes: &[u8]) -> Result<Vec<JournalFrame>> {
-    let header = BinaryEnvelopeHeader::decode(bytes)?;
-    if header.family != FileFamily::MetadataJournal {
-        anyhow::bail!("index diagnostic journal has wrong file family");
-    }
-    let mut input = &bytes[COMMON_HEADER_LEN + header.header_json.len()..];
+async fn read_index_diagnostic_frames(
+    core_store: &CoreStore,
+    stream_id: &str,
+) -> Result<Vec<JournalFrame>> {
+    let records = core_store
+        .read_stream(ReadStream {
+            stream_id: stream_id.to_string(),
+            after_sequence: 0,
+            limit: 0,
+        })
+        .await?;
     let mut frames = Vec::new();
-    while !input.is_empty() {
-        if input.len() < 4 {
-            anyhow::bail!("truncated index diagnostic journal frame length");
+    for record in records {
+        if record.record_kind != "index_diagnostic" {
+            continue;
         }
-        let frame_len = u32::from_le_bytes(input[0..4].try_into().unwrap()) as usize;
-        let frame_end = 4usize
-            .checked_add(frame_len)
-            .ok_or_else(|| anyhow!("invalid index diagnostic journal frame length"))?;
-        if input.len() < frame_end {
-            anyhow::bail!("truncated index diagnostic journal frame");
-        }
-        frames.push(JournalFrame::decode(&input[..frame_end])?);
-        input = &input[frame_end..];
+        frames.push(JournalFrame::decode(&record.payload)?);
     }
     validate_journal_chain(&frames)?;
     Ok(frames)
@@ -228,6 +192,31 @@ fn decode_journal_file(bytes: &[u8]) -> Result<Vec<JournalFrame>> {
 
 pub fn index_diagnostic_partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/bucket/{bucket_id}/index_diagnostic").as_bytes())
+}
+
+fn index_diagnostic_stream_id(tenant_id: i64, bucket_id: i64) -> String {
+    format!("index_diagnostic:tenant:{tenant_id}:bucket:{bucket_id}")
+}
+
+fn index_diagnostic_partition_principal(tenant_id: i64, bucket_id: i64) -> String {
+    format!("partition-owner:index_diagnostic:{tenant_id}:{bucket_id}")
+}
+
+#[cfg(test)]
+pub(crate) async fn read_index_diagnostic_frame_fences_for_test(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+) -> Result<Vec<u64>> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    Ok(read_index_diagnostic_frames(
+        &core_store,
+        &index_diagnostic_stream_id(tenant_id, bucket_id),
+    )
+    .await?
+    .into_iter()
+    .map(|frame| frame.fence_token)
+    .collect())
 }
 
 fn require_index_diagnostic_permit(
@@ -358,10 +347,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(written.id, 1);
-        let frames =
-            read_index_diagnostic_frames_at_path(&storage.index_diagnostic_journal_path(42, 7))
-                .await
-                .unwrap();
+        let core_store = CoreStore::new(storage.clone()).await.unwrap();
+        let frames = read_index_diagnostic_frames(&core_store, &index_diagnostic_stream_id(42, 7))
+            .await
+            .unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].fence_token, permit.fence_token);
     }
@@ -383,6 +372,42 @@ mod tests {
         .await
         .unwrap_err();
         assert!(rejected.to_string().contains("PartitionNotOwned"));
+
+        write_index_diagnostic_with_permit(
+            &storage,
+            diagnostic("a", "warning"),
+            &fresh,
+            PARTITION_OWNER_KEY,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn index_diagnostic_batch_rejects_stale_partition_precondition() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let stale = ready_diagnostic_permit(&storage, "node-a").await;
+        let stale_precondition =
+            partition_write_ref_precondition(&storage, &stale, PARTITION_OWNER_KEY)
+                .await
+                .unwrap();
+        let fresh = ready_diagnostic_permit(&storage, "node-b").await;
+        assert_eq!(fresh.fence_token, stale.fence_token + 1);
+
+        let rejected = write_index_diagnostic_inner(
+            &storage,
+            diagnostic("a", "warning"),
+            stale.fence_token,
+            Some(stale_precondition),
+        )
+        .await
+        .unwrap_err();
+        let message = rejected.to_string();
+        assert!(
+            message.contains("generation mismatch") || message.contains("target mismatch"),
+            "unexpected stale precondition error: {message}"
+        );
 
         write_index_diagnostic_with_permit(
             &storage,

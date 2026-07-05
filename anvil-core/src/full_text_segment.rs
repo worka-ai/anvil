@@ -1,14 +1,23 @@
-use crate::formats::{
-    BinaryEnvelopeHeader, BinaryFileFooter, COMMON_FOOTER_LEN, COMMON_HEADER_LEN, FileFamily,
-    Hash32,
-    full_text::{BuiltFullTextPostings, FullTextBodyHeader, Posting, TermEntry, decode_postings},
-    hash32,
+use crate::{
+    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    formats::{
+        BinaryEnvelopeHeader, BinaryFileFooter, COMMON_FOOTER_LEN, COMMON_HEADER_LEN, FileFamily,
+        Hash32,
+        full_text::{
+            BuiltFullTextPostings, FullTextBodyHeader, Posting, TermEntry, decode_postings,
+        },
+        hash32,
+    },
+    storage::Storage,
 };
-use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
-use std::{convert::TryInto, path::PathBuf};
-use tokio::io::AsyncWriteExt;
+use std::convert::TryInto;
+
+const FULL_TEXT_SEGMENT_REF_PREFIX: &str = "full_text_segment:";
+const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
 const FULL_TEXT_POSTINGS_BLOCK_MAGIC: &[u8; 8] = b"ANVFTSPB";
 const FULL_TEXT_POSTINGS_BLOCK_VERSION: u16 = 1;
@@ -67,7 +76,7 @@ pub struct FullTextSegmentWrite<'a> {
 pub async fn write_full_text_segment(
     storage: &Storage,
     input: FullTextSegmentWrite<'_>,
-) -> Result<PathBuf> {
+) -> Result<String> {
     let encoded_terms = encode_terms(&input.built_postings.terms);
     let encoded_postings_block = encode_postings_block(
         &input.built_postings.postings,
@@ -77,14 +86,8 @@ pub async fn write_full_text_segment(
         .context("compress full text postings block")?;
     let body = encode_full_text_body(&encoded_terms, &postings_bytes, input.document_table)?;
     let segment_hash = hash32(&body);
-    let path = storage.full_text_segment_path(
-        input.index_id,
-        input.generation,
-        &hex::encode(segment_hash),
-    )?;
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+    let ref_name =
+        full_text_segment_ref_name(input.index_id, input.generation, &hex::encode(segment_hash))?;
 
     let header = FullTextSegmentHeader {
         index_id: input.index_id.to_string(),
@@ -112,58 +115,101 @@ pub async fn write_full_text_segment(
         last_hash,
     );
 
-    let tmp_path = path.with_file_name(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("full-text-segment"),
-        uuid::Uuid::new_v4()
-    ));
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .truncate(true)
-        .open(&tmp_path)
-        .await
-        .with_context(|| format!("create temporary full text segment {}", tmp_path.display()))?;
-    file.write_all(&encoded_header).await?;
-    file.write_all(&body).await?;
-    file.write_all(&footer.encode()).await?;
-    file.sync_data().await?;
-    drop(file);
-    tokio::fs::rename(&tmp_path, &path).await.with_context(|| {
-        format!(
-            "publish full text segment {} to {}",
-            tmp_path.display(),
-            path.display()
-        )
-    })?;
-    Ok(path)
+    let mut bytes = Vec::with_capacity(encoded_header.len() + body.len() + COMMON_FOOTER_LEN);
+    bytes.extend_from_slice(&encoded_header);
+    bytes.extend_from_slice(&body);
+    bytes.extend_from_slice(&footer.encode());
+
+    let store = CoreStore::new(storage.clone()).await?;
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: ref_name.clone(),
+            bytes,
+            region_id: "local".to_string(),
+            mutation_id: format!("full-text-segment:{}:{}", input.index_id, input.generation),
+        })
+        .await?;
+    store
+        .compare_and_swap_ref(CompareAndSwapRef {
+            ref_name: ref_name.clone(),
+            expected_generation: None,
+            expected_target: None,
+            require_absent: true,
+            require_present: false,
+            fence: None,
+            authz_revision: None,
+            source_watch_cursor: None,
+            new_target: encode_core_object_ref_target(&object_ref)?,
+            transaction_id: None,
+        })
+        .await?;
+    Ok(ref_name)
 }
 
-pub async fn read_full_text_segment(path: impl Into<PathBuf>) -> Result<DecodedFullTextSegment> {
-    let path = path.into();
-    let bytes = tokio::fs::read(&path)
-        .await
-        .with_context(|| format!("read full text segment {}", path.display()))?;
+pub async fn read_full_text_segment(
+    storage: &Storage,
+    segment_ref: &str,
+) -> Result<DecodedFullTextSegment> {
+    let bytes = read_full_text_segment_bytes(storage, segment_ref).await?;
     decode_full_text_segment(&bytes)
+}
+
+pub async fn read_full_text_segment_bytes(storage: &Storage, segment_ref: &str) -> Result<Vec<u8>> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let ref_value = store
+        .read_ref(segment_ref)
+        .await?
+        .ok_or_else(|| anyhow!("full text segment ref is missing"))?;
+    store
+        .get_blob(GetBlob {
+            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+        })
+        .await
 }
 
 pub async fn read_latest_full_text_segment(
     storage: &Storage,
     index_id: &str,
 ) -> Result<Option<DecodedFullTextSegment>> {
-    let Some(path) = latest_full_text_segment_path(storage, index_id).await? else {
+    let Some(segment_ref) = latest_full_text_segment_ref(storage, index_id).await? else {
         return Ok(None);
     };
-    Ok(Some(read_full_text_segment(path).await?))
+    Ok(Some(read_full_text_segment(storage, &segment_ref).await?))
 }
 
-pub async fn latest_full_text_segment_path(
+pub async fn latest_full_text_segment_ref(
     storage: &Storage,
     index_id: &str,
-) -> Result<Option<PathBuf>> {
-    latest_segment_path(storage.full_text_segment_dir(index_id)?, ".anfts").await
+) -> Result<Option<String>> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let mut refs = store
+        .list_ref_names(&full_text_segment_ref_prefix(index_id)?)
+        .await?;
+    refs.sort_by_key(|value| generation_from_ref(value).unwrap_or(0));
+    Ok(refs.pop())
+}
+
+pub(crate) async fn full_text_segment_hash_exists(
+    storage: &Storage,
+    index_id: &str,
+    generation: u64,
+    expected_segment_hash: &str,
+) -> Result<bool> {
+    validate_hex32(expected_segment_hash, "full text expected segment hash")?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let refs = store
+        .list_ref_names(&full_text_segment_ref_prefix(index_id)?)
+        .await?;
+    for segment_ref in refs {
+        if generation_from_ref(&segment_ref) != Some(generation) {
+            continue;
+        }
+        let bytes = read_full_text_segment_bytes(storage, &segment_ref).await?;
+        if blake3::hash(&bytes).to_hex().as_str() == expected_segment_hash {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub fn decode_full_text_segment(bytes: &[u8]) -> Result<DecodedFullTextSegment> {
@@ -495,34 +541,66 @@ fn term_hash_bounds(terms: &[TermEntry]) -> (Hash32, Hash32) {
     (first, last)
 }
 
-async fn latest_segment_path(dir: PathBuf, suffix: &str) -> Result<Option<PathBuf>> {
-    let mut entries = match tokio::fs::read_dir(&dir).await {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
-    let mut latest: Option<(u64, PathBuf)> = None;
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !name.ends_with(suffix) {
-            continue;
-        }
-        let Some(generation) = name
-            .strip_prefix("generation-")
-            .and_then(|rest| rest.split('-').next())
-            .and_then(|value| value.parse::<u64>().ok())
-        else {
-            continue;
-        };
-        match latest {
-            Some((current, _)) if generation <= current => {}
-            _ => latest = Some((generation, path)),
-        }
+fn full_text_segment_ref_prefix(index_id: &str) -> Result<String> {
+    require_safe_component(index_id, "full text index id")?;
+    Ok(format!("{FULL_TEXT_SEGMENT_REF_PREFIX}index:{index_id}:"))
+}
+
+fn full_text_segment_ref_name(
+    index_id: &str,
+    generation: u64,
+    segment_hash: &str,
+) -> Result<String> {
+    validate_hex32(segment_hash, "full text segment hash")?;
+    Ok(format!(
+        "{}generation:{generation:020}:hash:{segment_hash}",
+        full_text_segment_ref_prefix(index_id)?
+    ))
+}
+
+fn generation_from_ref(ref_name: &str) -> Option<u64> {
+    ref_name
+        .rsplit_once(":generation:")?
+        .1
+        .split(':')
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn require_safe_component(value: &str, field: &'static str) -> Result<()> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains(':')
+        || value.chars().any(char::is_control)
+    {
+        return Err(anyhow!("{field} is not a safe component"));
     }
-    Ok(latest.map(|(_, path)| path))
+    Ok(())
+}
+
+fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
+    if value.len() != 64 || !value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow!("{field} must be hex32"));
+    }
+    Ok(())
+}
+
+fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
+    Ok(format!(
+        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
+    ))
+}
+
+fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
+    let encoded = target
+        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
+        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
+    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
 }
 
 #[cfg(test)]
@@ -557,7 +635,7 @@ mod tests {
         );
         let document_table = br#"{"documents":[1,2]}"#;
 
-        let path = write_full_text_segment(
+        let segment_ref = write_full_text_segment(
             &storage,
             FullTextSegmentWrite {
                 index_id: "index-alpha",
@@ -572,13 +650,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".anfts"))
-        );
+        assert!(segment_ref.starts_with(FULL_TEXT_SEGMENT_REF_PREFIX));
 
-        let decoded = read_full_text_segment(path).await.unwrap();
+        let decoded = read_full_text_segment(&storage, &segment_ref)
+            .await
+            .unwrap();
         assert_eq!(decoded.header.index_id, "index-alpha");
         assert_eq!(decoded.header.source_cursor, 44);
         assert_eq!(decoded.header.authz_revision, 7);
@@ -619,7 +695,7 @@ mod tests {
             .collect::<Vec<_>>();
         let built = build_full_text_postings(&documents, &config);
 
-        let path = write_full_text_segment(
+        let segment_ref = write_full_text_segment(
             &storage,
             FullTextSegmentWrite {
                 index_id: "index-shared",
@@ -635,7 +711,9 @@ mod tests {
         .await
         .unwrap();
 
-        let decoded = read_full_text_segment(path).await.unwrap();
+        let decoded = read_full_text_segment(&storage, &segment_ref)
+            .await
+            .unwrap();
         assert_eq!(decoded.postings.len(), 260);
         assert_eq!(decoded.postings, built.postings);
         assert_eq!(decoded.postings_bytes, built.postings_bytes);
@@ -696,7 +774,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let built = build_full_text_postings(&[], &TokenizerConfig::default());
-        let path = write_full_text_segment(
+        let segment_ref = write_full_text_segment(
             &storage,
             FullTextSegmentWrite {
                 index_id: "index-alpha",
@@ -711,7 +789,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut bytes = tokio::fs::read(path).await.unwrap();
+        let mut bytes = read_full_text_segment_bytes(&storage, &segment_ref)
+            .await
+            .unwrap();
         bytes[COMMON_HEADER_LEN + 1] ^= 1;
         assert!(decode_full_text_segment(&bytes).is_err());
     }
@@ -744,7 +824,7 @@ mod tests {
             .unwrap();
         assert_eq!(latest.header.generation, 3);
         assert!(
-            latest_full_text_segment_path(&storage, "../escape")
+            latest_full_text_segment_ref(&storage, "../escape")
                 .await
                 .is_err()
         );
