@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 
 const CORE_REF_LOCK_RETRY_ATTEMPTS: usize = 12_000;
 const CORE_REF_LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
+const CORE_CONTROL_READ_RETRY_ATTEMPTS: usize = 400;
 const LOCAL_ERASURE_PROFILE_ID: &str = "rs_4_2_local_v1";
 const LOCAL_DATA_SHARDS: usize = 4;
 const LOCAL_PARITY_SHARDS: usize = 2;
@@ -1836,50 +1837,56 @@ impl CoreStore {
     }
 
     async fn read_ref_from_quorum(&self, ref_name: &str) -> Result<Option<CoreRefValue>> {
-        let mut votes: BTreeMap<String, (CoreRefValue, usize)> = BTreeMap::new();
-        let mut found = 0usize;
-        for node_id in local_control_node_ids() {
-            let path = self.ref_replica_path(&node_id, ref_name);
-            let bytes = match fs::read(&path).await {
-                Ok(bytes) => bytes,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => {
-                    return Err(err).with_context(|| {
-                        format!("read CoreStore ref replica {node_id}/{ref_name}")
-                    });
+        for attempt in 0..CORE_CONTROL_READ_RETRY_ATTEMPTS {
+            let mut votes: BTreeMap<String, (CoreRefValue, usize)> = BTreeMap::new();
+            let mut found = 0usize;
+            for node_id in local_control_node_ids() {
+                let path = self.ref_replica_path(&node_id, ref_name);
+                let bytes = match fs::read(&path).await {
+                    Ok(bytes) => bytes,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => {
+                        return Err(err).with_context(|| {
+                            format!("read CoreStore ref replica {node_id}/{ref_name}")
+                        });
+                    }
+                };
+                let value: CoreRefValue = serde_json::from_slice(&bytes)?;
+                if value.schema != CORE_REF_SCHEMA {
+                    bail!("CoreStore ref replica {node_id}/{ref_name} has invalid schema");
                 }
-            };
-            let value: CoreRefValue = serde_json::from_slice(&bytes)?;
-            if value.schema != CORE_REF_SCHEMA {
-                bail!("CoreStore ref replica {node_id}/{ref_name} has invalid schema");
+                if value.ref_name != ref_name {
+                    bail!("CoreStore ref replica {node_id}/{ref_name} scope mismatch");
+                }
+                found += 1;
+                let hash = sha256_hex(&bytes);
+                let entry = votes.entry(hash).or_insert((value, 0));
+                entry.1 += 1;
             }
-            if value.ref_name != ref_name {
-                bail!("CoreStore ref replica {node_id}/{ref_name} scope mismatch");
-            }
-            found += 1;
-            let hash = sha256_hex(&bytes);
-            let entry = votes.entry(hash).or_insert((value, 0));
-            entry.1 += 1;
-        }
 
-        if found == 0 {
-            return Ok(None);
+            if found == 0 {
+                return Ok(None);
+            }
+            let Some((_, (value, count))) = votes.iter().max_by_key(|(_, (_, count))| *count)
+            else {
+                return Ok(None);
+            };
+            if *count >= LOCAL_CONTROL_READ_QUORUM {
+                if self.core_ref_is_visible(value).await? {
+                    return Ok(Some(value.clone()));
+                }
+                return Ok(None);
+            }
+            if attempt + 1 == CORE_CONTROL_READ_RETRY_ATTEMPTS {
+                bail!(
+                    "CoreStore ref {ref_name} did not reach read quorum: {} matching replicas, {} required",
+                    count,
+                    LOCAL_CONTROL_READ_QUORUM
+                );
+            }
+            tokio::time::sleep(CORE_REF_LOCK_RETRY_DELAY).await;
         }
-        let Some((_, (value, count))) = votes.iter().max_by_key(|(_, (_, count))| *count) else {
-            return Ok(None);
-        };
-        if *count < LOCAL_CONTROL_READ_QUORUM {
-            bail!(
-                "CoreStore ref {ref_name} did not reach read quorum: {} matching replicas, {} required",
-                count,
-                LOCAL_CONTROL_READ_QUORUM
-            );
-        }
-        if self.core_ref_is_visible(value).await? {
-            Ok(Some(value.clone()))
-        } else {
-            Ok(None)
-        }
+        unreachable!("CoreStore control read retry loop must return")
     }
 
     async fn write_ref_to_quorum(&self, value: &CoreRefValue) -> Result<()> {
@@ -2108,37 +2115,44 @@ impl CoreStore {
     where
         F: FnMut(&Self, &str) -> PathBuf,
     {
-        let mut votes: BTreeMap<String, (Vec<u8>, usize)> = BTreeMap::new();
-        let mut found = 0usize;
-        for node_id in local_control_node_ids() {
-            let path = replica_path(self, &node_id);
-            let bytes = match fs::read(&path).await {
-                Ok(bytes) => bytes,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => {
-                    return Err(err).with_context(|| format!("read {label} replica {node_id}"));
-                }
-            };
-            found += 1;
-            let hash = sha256_hex(&bytes);
-            let entry = votes.entry(hash).or_insert((bytes, 0));
-            entry.1 += 1;
-        }
+        for attempt in 0..CORE_CONTROL_READ_RETRY_ATTEMPTS {
+            let mut votes: BTreeMap<String, (Vec<u8>, usize)> = BTreeMap::new();
+            let mut found = 0usize;
+            for node_id in local_control_node_ids() {
+                let path = replica_path(self, &node_id);
+                let bytes = match fs::read(&path).await {
+                    Ok(bytes) => bytes,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => {
+                        return Err(err).with_context(|| format!("read {label} replica {node_id}"));
+                    }
+                };
+                found += 1;
+                let hash = sha256_hex(&bytes);
+                let entry = votes.entry(hash).or_insert((bytes, 0));
+                entry.1 += 1;
+            }
 
-        if found == 0 {
-            return Ok(None);
+            if found == 0 {
+                return Ok(None);
+            }
+            let Some((_, (bytes, count))) = votes.iter().max_by_key(|(_, (_, count))| *count)
+            else {
+                return Ok(None);
+            };
+            if *count >= LOCAL_CONTROL_READ_QUORUM {
+                return Ok(Some(bytes.clone()));
+            }
+            if attempt + 1 == CORE_CONTROL_READ_RETRY_ATTEMPTS {
+                bail!(
+                    "{label} did not reach read quorum: {} matching replicas, {} required",
+                    count,
+                    LOCAL_CONTROL_READ_QUORUM
+                );
+            }
+            tokio::time::sleep(CORE_REF_LOCK_RETRY_DELAY).await;
         }
-        let Some((_, (bytes, count))) = votes.iter().max_by_key(|(_, (_, count))| *count) else {
-            return Ok(None);
-        };
-        if *count < LOCAL_CONTROL_READ_QUORUM {
-            bail!(
-                "{label} did not reach read quorum: {} matching replicas, {} required",
-                count,
-                LOCAL_CONTROL_READ_QUORUM
-            );
-        }
-        Ok(Some(bytes.clone()))
+        unreachable!("CoreStore control read retry loop must return")
     }
 
     async fn write_bytes_to_quorum<F>(
