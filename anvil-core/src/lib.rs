@@ -8,7 +8,6 @@ use tokio::sync::{Mutex, RwLock, broadcast};
 
 // The modules we've created
 pub mod access_control;
-pub mod admin_auth;
 pub mod anvil_personaldb_sqlite_changeset;
 pub mod auth;
 pub mod authz_derived_lag_watch;
@@ -89,9 +88,11 @@ pub mod search_query;
 pub mod services;
 pub mod sharding;
 pub mod storage;
+pub mod system_realm;
 pub mod task_journal;
 pub mod task_lease;
 pub mod tasks;
+pub mod tenant_audit;
 pub mod typed_field_segment;
 pub mod validation;
 pub mod vector_hnsw;
@@ -176,6 +177,13 @@ impl AppState {
             object_watch_tx,
             observability.clone(),
         );
+        system_realm::ensure_bootstrapped(
+            &arc_config,
+            &persistence,
+            &storage,
+            secret_keyring.as_ref(),
+        )
+        .await?;
 
         Ok(Self {
             persistence,

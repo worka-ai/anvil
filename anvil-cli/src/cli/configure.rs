@@ -11,7 +11,7 @@ pub fn handle_configure_command(
 ) -> anyhow::Result<()> {
     let mut config: Config = match &config_path {
         Some(path) => confy::load_path(path).unwrap_or_default(),
-        None => confy::load("anvil-cli", None)?,
+        None => confy::load("anvil", None)?,
     };
 
     let profile_name = match name {
@@ -61,7 +61,7 @@ pub fn handle_configure_command(
 
     match &config_path {
         Some(path) => confy::store_path(path, &config)?,
-        None => confy::store("anvil-cli", None, &config)?,
+        None => confy::store("anvil", None, &config)?,
     };
 
     println!("Profile '{}' saved.", profile_name);
@@ -79,7 +79,7 @@ pub fn handle_static_config_command(
 ) -> anyhow::Result<()> {
     let mut config: Config = match &config_path {
         Some(path) => confy::load_path(path).unwrap_or_default(),
-        None => confy::load("anvil-cli", None)?,
+        None => confy::load("anvil", None)?,
     };
 
     let profile = Profile {
@@ -97,7 +97,7 @@ pub fn handle_static_config_command(
 
     match &config_path {
         Some(path) => confy::store_path(path, &config)?,
-        None => confy::store("anvil-cli", None, &config)?,
+        None => confy::store("anvil", None, &config)?,
     };
 
     println!("Profile '{}' saved.", name);

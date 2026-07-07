@@ -79,8 +79,26 @@ pub async fn put_schema_revision(
         reason: reason.to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-    write_schema_record(storage, tenant_id, &record).await?;
-    Ok(record)
+    match write_schema_record(storage, tenant_id, &record).await {
+        Ok(()) => Ok(record),
+        Err(err) => {
+            // Concurrent bootstrap/schema writers may race on the same deterministic
+            // revision ref. If the winner wrote the identical schema digest, the
+            // operation is idempotent; otherwise surface the conflict.
+            if let Some(existing) = find_schema_by_digest(
+                storage,
+                tenant_id,
+                schema_id,
+                &record.schema_ref.schema_digest,
+            )
+            .await?
+            {
+                Ok(existing)
+            } else {
+                Err(err)
+            }
+        }
+    }
 }
 
 pub async fn read_schema_revision(

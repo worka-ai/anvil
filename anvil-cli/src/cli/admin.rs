@@ -51,11 +51,6 @@ pub enum AdminCommands {
         #[clap(subcommand)]
         command: NodeCommands,
     },
-    /// Manage object links
-    Link {
-        #[clap(subcommand)]
-        command: LinkCommands,
-    },
     /// Manage custom host aliases
     HostAlias {
         #[clap(subcommand)]
@@ -369,81 +364,6 @@ pub enum NodeCommands {
 }
 
 #[derive(Subcommand)]
-pub enum LinkCommands {
-    /// Create a symlink-like object link
-    Create {
-        #[clap(flatten)]
-        context: MutationOptions,
-        #[clap(long)]
-        tenant_id: String,
-        #[clap(long)]
-        bucket_name: String,
-        #[clap(long)]
-        link_key: String,
-        #[clap(long)]
-        target_key: String,
-        #[clap(long)]
-        target_version: Option<String>,
-        #[clap(long, value_enum, default_value_t = ObjectLinkResolutionArg::Follow)]
-        resolution: ObjectLinkResolutionArg,
-        #[clap(long, action = clap::ArgAction::SetTrue)]
-        allow_dangling: bool,
-    },
-    /// Update an existing object link
-    Update {
-        #[clap(flatten)]
-        context: MutationOptions,
-        #[clap(long)]
-        tenant_id: String,
-        #[clap(long)]
-        bucket_name: String,
-        #[clap(long)]
-        link_key: String,
-        #[clap(long)]
-        target_key: String,
-        #[clap(long)]
-        target_version: Option<String>,
-        #[clap(long, value_enum, default_value_t = ObjectLinkResolutionArg::Follow)]
-        resolution: ObjectLinkResolutionArg,
-        #[clap(long, action = clap::ArgAction::SetTrue)]
-        allow_dangling: bool,
-    },
-    /// Delete an object link entry without deleting its target
-    Delete {
-        #[clap(flatten)]
-        context: MutationOptions,
-        #[clap(long)]
-        tenant_id: String,
-        #[clap(long)]
-        bucket_name: String,
-        #[clap(long)]
-        link_key: String,
-    },
-    /// Read object link metadata
-    Read {
-        #[clap(long)]
-        request_id: Option<String>,
-        #[clap(long)]
-        tenant_id: String,
-        #[clap(long)]
-        bucket_name: String,
-        #[clap(long)]
-        link_key: String,
-    },
-    /// List object links in a bucket
-    List {
-        #[clap(long)]
-        tenant_id: String,
-        #[clap(long)]
-        bucket_name: String,
-        #[clap(long)]
-        prefix: Option<String>,
-        #[clap(flatten)]
-        page: PageOptions,
-    },
-}
-
-#[derive(Subcommand)]
 pub enum HostAliasCommands {
     /// Create a custom host alias in pending verification state
     Create {
@@ -678,22 +598,6 @@ impl NodeCapabilityArg {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default, ValueEnum)]
-pub enum ObjectLinkResolutionArg {
-    #[default]
-    Follow,
-    Redirect,
-}
-
-impl ObjectLinkResolutionArg {
-    fn to_proto(self) -> i32 {
-        match self {
-            Self::Follow => 1,
-            Self::Redirect => 2,
-        }
-    }
-}
-
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum RoutingRecordFamilyArg {
     TenantName,
@@ -830,9 +734,6 @@ pub async fn handle_admin_command(command: &AdminCommands, ctx: &Context) -> any
         }
         AdminCommands::Node { command } => {
             handle_node_command(command, &mut client, &token).await?
-        }
-        AdminCommands::Link { command } => {
-            handle_link_command(command, &mut client, &token).await?
         }
         AdminCommands::HostAlias { command } => {
             handle_host_alias_command(command, &mut client, &token).await?
@@ -1469,147 +1370,6 @@ async fn handle_node_command(
     Ok(())
 }
 
-async fn handle_link_command(
-    command: &LinkCommands,
-    client: &mut AdminServiceClient<tonic::transport::Channel>,
-    token: &str,
-) -> anyhow::Result<()> {
-    match command {
-        LinkCommands::Create {
-            context,
-            tenant_id,
-            bucket_name,
-            link_key,
-            target_key,
-            target_version,
-            resolution,
-            allow_dangling,
-        } => {
-            let admin_context = context.to_create_context()?;
-            print_rpc_response(
-                "object_link",
-                Some(&admin_context),
-                None,
-                client.create_object_link(with_auth(
-                    api::CreateObjectLinkRequest {
-                        context: Some(admin_context.clone()),
-                        tenant_id: tenant_id.clone(),
-                        bucket_name: bucket_name.clone(),
-                        link_key: link_key.clone(),
-                        target_key: target_key.clone(),
-                        target_version: target_version.clone().unwrap_or_default(),
-                        resolution: resolution.to_proto(),
-                        allow_dangling: *allow_dangling,
-                    },
-                    token,
-                )?),
-            )
-            .await?;
-        }
-        LinkCommands::Update {
-            context,
-            tenant_id,
-            bucket_name,
-            link_key,
-            target_key,
-            target_version,
-            resolution,
-            allow_dangling,
-        } => {
-            let admin_context = context.to_update_context()?;
-            print_rpc_response(
-                "object_link",
-                Some(&admin_context),
-                None,
-                client.update_object_link(with_auth(
-                    api::UpdateObjectLinkRequest {
-                        context: Some(admin_context.clone()),
-                        tenant_id: tenant_id.clone(),
-                        bucket_name: bucket_name.clone(),
-                        link_key: link_key.clone(),
-                        target_key: target_key.clone(),
-                        target_version: target_version.clone().unwrap_or_default(),
-                        resolution: resolution.to_proto(),
-                        allow_dangling: *allow_dangling,
-                    },
-                    token,
-                )?),
-            )
-            .await?;
-        }
-        LinkCommands::Delete {
-            context,
-            tenant_id,
-            bucket_name,
-            link_key,
-        } => {
-            let admin_context = context.to_update_context()?;
-            print_rpc_response(
-                "object_link",
-                Some(&admin_context),
-                None,
-                client.delete_object_link(with_auth(
-                    api::DeleteObjectLinkRequest {
-                        context: Some(admin_context.clone()),
-                        tenant_id: tenant_id.clone(),
-                        bucket_name: bucket_name.clone(),
-                        link_key: link_key.clone(),
-                    },
-                    token,
-                )?),
-            )
-            .await?;
-        }
-        LinkCommands::Read {
-            request_id,
-            tenant_id,
-            bucket_name,
-            link_key,
-        } => {
-            let request_id = request_id_or_cli(request_id);
-            print_rpc_response(
-                "object_link",
-                None,
-                Some(&request_id),
-                client.read_object_link(with_auth(
-                    api::ReadObjectLinkRequest {
-                        request_id: request_id.clone(),
-                        tenant_id: tenant_id.clone(),
-                        bucket_name: bucket_name.clone(),
-                        link_key: link_key.clone(),
-                    },
-                    token,
-                )?),
-            )
-            .await?;
-        }
-        LinkCommands::List {
-            tenant_id,
-            bucket_name,
-            prefix,
-            page,
-        } => {
-            print_rpc_response(
-                "object_links",
-                None,
-                None,
-                client.list_object_links(with_auth(
-                    api::ListObjectLinksRequest {
-                        tenant_id: tenant_id.clone(),
-                        bucket_name: bucket_name.clone(),
-                        prefix: prefix.clone().unwrap_or_default(),
-                        page: page.to_page_request(),
-                    },
-                    token,
-                )?),
-            )
-            .await?;
-        }
-    }
-
-    Ok(())
-}
-
 async fn handle_host_alias_command(
     command: &HostAliasCommands,
     client: &mut AdminServiceClient<tonic::transport::Channel>,
@@ -1630,7 +1390,7 @@ async fn handle_host_alias_command(
                 Some(&admin_context),
                 None,
                 client.create_host_alias(with_auth(
-                    api::CreateHostAliasRequest {
+                    api::CreateHostAliasAdminRequest {
                         context: Some(admin_context.clone()),
                         hostname: hostname.clone(),
                         tenant_id: tenant_id.clone(),
@@ -1682,7 +1442,7 @@ async fn handle_host_alias_command(
                 Some(&admin_context),
                 None,
                 client.delete_host_alias(with_auth(
-                    api::DeleteHostAliasRequest {
+                    api::DeleteHostAliasAdminRequest {
                         context: Some(admin_context.clone()),
                         hostname: hostname.clone(),
                     },
@@ -2119,6 +1879,8 @@ mod tests {
             api_listen_addr: public_addr.to_string(),
             admin_listen_addr: admin_addr.to_string(),
             mesh_id: "mesh-cli-test".to_string(),
+            bootstrap_system_admin_subject_kind: "app".to_string(),
+            bootstrap_system_admin_subject_id: "cli-admin-principal".to_string(),
             region: "eu-west-1".to_string(),
             cell_id: "cell-a".to_string(),
             public_region_base_domain: "eu-west-1.anvil-storage.test".to_string(),
@@ -2190,11 +1952,7 @@ mod tests {
     fn admin_token(node: &AdminCliNode) -> String {
         node.state
             .jwt_manager
-            .mint_token(
-                "cli-admin-principal".to_string(),
-                vec!["anvil_admin:*|anvil_admin:cluster:mesh-cli-test".to_string()],
-                0,
-            )
+            .mint_token("cli-admin-principal".to_string(), Vec::new(), 0)
             .unwrap()
     }
 
@@ -2381,60 +2139,6 @@ mod tests {
         assert_eq!(NodeCapabilityArg::Personaldb.to_proto(), 3);
         assert_eq!(NodeCapabilityArg::Gateway.to_proto(), 4);
         assert_eq!(NodeCapabilityArg::Admin.to_proto(), 5);
-    }
-
-    #[test]
-    fn object_link_resolution_maps_to_proto_values() {
-        assert_eq!(ObjectLinkResolutionArg::Follow.to_proto(), 1);
-        assert_eq!(ObjectLinkResolutionArg::Redirect.to_proto(), 2);
-    }
-
-    #[test]
-    fn link_create_parses_required_context_and_target() {
-        let cli = TestAdminCli::try_parse_from([
-            "admin",
-            "link",
-            "create",
-            "--audit-reason",
-            "publish latest",
-            "--expected-generation",
-            "0",
-            "--tenant-id",
-            "tenant-a",
-            "--bucket-name",
-            "releases",
-            "--link-key",
-            "latest.exe",
-            "--target-key",
-            "my-app-v1.exe",
-            "--resolution",
-            "redirect",
-        ])
-        .unwrap();
-
-        let AdminCommands::Link {
-            command:
-                LinkCommands::Create {
-                    context,
-                    tenant_id,
-                    bucket_name,
-                    link_key,
-                    target_key,
-                    resolution,
-                    ..
-                },
-        } = cli.command
-        else {
-            panic!("expected link create command");
-        };
-
-        assert_eq!(context.audit_reason, "publish latest");
-        assert_eq!(context.expected_generation, Some(0));
-        assert_eq!(tenant_id, "tenant-a");
-        assert_eq!(bucket_name, "releases");
-        assert_eq!(link_key, "latest.exe");
-        assert_eq!(target_key, "my-app-v1.exe");
-        assert_eq!(resolution.to_proto(), 2);
     }
 
     #[test]

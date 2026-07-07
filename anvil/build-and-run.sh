@@ -6,8 +6,8 @@ set -e
 TARGET="x86_64-unknown-linux-gnu"
 
 echo "--- Building Anvil release binaries for ${TARGET} ---"
-cargo build --release -p anvil-server --bin anvil --target ${TARGET}
-cargo build --release -p anvil-storage-cli --bin admin --target ${TARGET}
+cargo build --release -p anvil-server --bin anvil-server --target ${TARGET}
+cargo build --release -p anvil-storage-cli --bin anvil --bin anvil-admin --target ${TARGET}
 
 # The docker-compose.yml file is now configured to look for release binaries.
 # We update its BINARY_PATH argument to ensure it finds the cross-compiled ones.

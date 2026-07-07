@@ -19,7 +19,7 @@ fn docker_admin(compose_file: &std::path::Path, args: &[&str]) {
         "exec",
         "-T",
         "anvil1",
-        "admin",
+        "anvil-admin",
     ];
     command_args.extend_from_slice(args);
     run("docker", &command_args);
@@ -33,7 +33,7 @@ fn docker_admin_output(compose_file: &std::path::Path, args: &[&str]) -> std::pr
         "exec",
         "-T",
         "anvil1",
-        "admin",
+        "anvil-admin",
     ];
     command_args.extend_from_slice(args);
     Command::new("docker")

@@ -1,7 +1,4 @@
-use crate::{
-    AppState,
-    auth::{AuthenticatedBearerToken, Claims},
-};
+use crate::{AppState, auth::AuthenticatedBearerToken};
 use axum::{http::HeaderMap, http::HeaderValue, response::Response};
 use http::Uri;
 use tonic::{Request, Status};
@@ -25,56 +22,62 @@ pub fn auth_interceptor<T>(mut req: Request<T>, state: &AppState) -> Result<Requ
     };
     tracing::info!("[auth_interceptor] path={} auth_present={}", uri, has_auth);
     // A list of public routes that do not require authentication.
-    const PUBLIC_ROUTES: &[&str] = &["/anvil.AuthService/GetAccessToken"];
-    if PUBLIC_ROUTES.contains(&uri.as_str()) {
-        // This is a public route, so we don't need to check for a token.
+    const PUBLIC_ROUTES: &[&str] = &[
+        "/anvil.AuthService/GetAccessToken",
+        "/anvil.ObjectService/GetObject",
+    ];
+    if PUBLIC_ROUTES.contains(&uri.as_str()) && !has_auth {
+        // Public routes may be called anonymously. If a bearer token is
+        // supplied we still authenticate it below so service methods can apply
+        // tenant-scoped permissions instead of falling back to anonymous reads.
         return Ok(req);
     }
 
-    match req.metadata().get("authorization") {
-        Some(t) => {
-            let token = t
-                .to_str()
-                .map_err(|_| Status::unauthenticated("Invalid token format"))?;
-            let token = token
-                .strip_prefix("Bearer ")
-                .ok_or_else(|| Status::unauthenticated("Invalid token format"))?;
+    authenticate_bearer(&mut req, state)?;
+    Ok(req)
+}
 
-            let bearer_token = token.to_string();
-            if state
-                .config
-                .anvil_bootstrap_admin_token
-                .as_deref()
-                .is_some_and(|bootstrap| !bootstrap.is_empty() && bootstrap == bearer_token)
-            {
-                req.extensions_mut().insert(Claims {
-                    sub: "bootstrap-admin".to_string(),
-                    exp: usize::MAX,
-                    scopes: vec![format!(
-                        "anvil_admin:*|anvil_admin:cluster:{}",
-                        state.config.mesh_id
-                    )],
-                    tenant_id: 0,
-                    jti: None,
-                });
-                req.extensions_mut()
-                    .insert(AuthenticatedBearerToken(bearer_token));
-                return Ok(req);
-            }
-
-            let claims = state
-                .jwt_manager
-                .verify_token(&bearer_token)
-                .map_err(|_| Status::unauthenticated("Unauthorised, invalid token"))?;
-
-            req.extensions_mut().insert(claims);
-            req.extensions_mut()
-                .insert(AuthenticatedBearerToken(bearer_token));
-
-            Ok(req)
-        }
-        None => Ok(req),
+/// Admin-plane authentication boundary. This only authenticates and rejects
+/// credentials that are clearly data-plane-only; method code still performs the
+/// Zanzibar system-realm relation check for the specific admin operation.
+pub fn admin_auth_interceptor<T>(
+    mut req: Request<T>,
+    state: &AppState,
+) -> Result<Request<T>, Status> {
+    let authenticated = authenticate_bearer(&mut req, state)?;
+    if authenticated.tenant_id != crate::system_realm::SYSTEM_STORAGE_TENANT_ID {
+        return Err(Status::permission_denied(
+            "Tenant data-plane credentials are not accepted on the admin listener",
+        ));
     }
+    Ok(req)
+}
+
+fn authenticate_bearer<T>(
+    req: &mut Request<T>,
+    state: &AppState,
+) -> Result<crate::auth::Claims, Status> {
+    let token = req
+        .metadata()
+        .get("authorization")
+        .ok_or_else(|| Status::unauthenticated("Missing bearer token"))?
+        .to_str()
+        .map_err(|_| Status::unauthenticated("Invalid token format"))?;
+    let token = token
+        .strip_prefix("Bearer ")
+        .ok_or_else(|| Status::unauthenticated("Invalid token format"))?;
+
+    let bearer_token = token.to_string();
+    let claims = state
+        .jwt_manager
+        .verify_token(&bearer_token)
+        .map_err(|_| Status::unauthenticated("Unauthorised, invalid token"))?;
+
+    req.extensions_mut().insert(claims.clone());
+    req.extensions_mut()
+        .insert(AuthenticatedBearerToken(bearer_token));
+
+    Ok(claims)
 }
 
 // This runs on the raw HTTP request before Tonic handles it.

@@ -30,6 +30,9 @@ enum ControlEventBody {
         app_id: i64,
         client_secret_encrypted: Vec<u8>,
     },
+    AppDelete {
+        app_id: i64,
+    },
     AppPolicyGrant {
         app_id: i64,
         resource: String,
@@ -65,6 +68,13 @@ struct StoredControlPolicy {
     app_id: i64,
     resource: String,
     action: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredAppPolicy {
+    pub app_id: i64,
+    pub resource: String,
+    pub action: String,
 }
 
 impl ControlState {
@@ -122,6 +132,18 @@ impl ControlState {
             .iter()
             .filter(|policy| policy.app_id == app_id)
             .map(|policy| format!("{}|{}", policy.action, policy.resource))
+            .collect()
+    }
+
+    pub fn policy_records_for_app(&self, app_id: i64) -> Vec<StoredAppPolicy> {
+        self.app_policies
+            .iter()
+            .filter(|policy| policy.app_id == app_id)
+            .map(|policy| StoredAppPolicy {
+                app_id: policy.app_id,
+                resource: policy.resource.clone(),
+                action: policy.action.clone(),
+            })
             .collect()
     }
 
@@ -379,6 +401,43 @@ async fn update_app_secret_inner(
     .await
 }
 
+pub(crate) async fn delete_app_with_permit(
+    storage: &Storage,
+    app_id: i64,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<()> {
+    let partition_precondition =
+        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    delete_app_inner(
+        storage,
+        app_id,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
+}
+
+async fn delete_app_inner(
+    storage: &Storage,
+    app_id: i64,
+    fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
+) -> Result<()> {
+    let state = read_control_state(storage).await?;
+    if !state.apps.contains_key(&app_id) {
+        return Err(anyhow!("app not found"));
+    }
+    append_control_event(
+        storage,
+        ControlEventBody::AppDelete { app_id },
+        app_id_key_hash(app_id),
+        fence_token,
+        partition_precondition,
+    )
+    .await
+}
+
 #[cfg(test)]
 async fn grant_policy(storage: &Storage, app_id: i64, resource: &str, action: &str) -> Result<()> {
     grant_policy_inner(storage, app_id, resource, action, 0, None).await
@@ -588,6 +647,10 @@ fn apply_event(state: &mut ControlState, event: ControlEventBody) {
             if let Some(app) = state.apps.get_mut(&app_id) {
                 app.client_secret_encrypted = client_secret_encrypted;
             }
+        }
+        ControlEventBody::AppDelete { app_id } => {
+            state.apps.remove(&app_id);
+            state.app_policies.retain(|policy| policy.app_id != app_id);
         }
         ControlEventBody::AppPolicyGrant {
             app_id,

@@ -1,6 +1,16 @@
-pub mod admin;
+pub mod app;
+pub mod audit;
 pub mod auth;
+pub mod authz;
 pub mod bucket;
 pub mod configure;
+pub mod diagnostics;
 pub mod hf;
+pub mod host_alias;
+pub mod index;
+pub mod lease;
 pub mod object;
+pub mod personaldb;
+pub mod repair;
+pub mod stream;
+pub mod watch;

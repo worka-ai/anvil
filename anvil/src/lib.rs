@@ -18,6 +18,7 @@ pub async fn run(
     admin_listener: tokio::net::TcpListener,
     config: anvil_core::config::Config,
 ) -> Result<()> {
+    config.validate_admin_listener_bind()?;
     let (tx, rx) = tokio::sync::mpsc::channel(100);
     let state = AppState::new(config, Some(tx)).await?;
     let swarm = anvil_core::cluster::create_swarm(state.config.clone()).await?;
@@ -77,10 +78,15 @@ pub async fn start_node_with_admin_listener(
     }
 
     let grpc_axum = anvil_core::services::create_axum_router(grpc_router);
+    let admin_auth_state = state.clone();
+    let admin_auth_interceptor =
+        anvil_core::services::AuthInterceptorFn::new(move |req: tonic::Request<()>| {
+            middleware::admin_auth_interceptor(req, &admin_auth_state)
+        });
     let admin_axum = admin_listener.as_ref().map(|_| {
         anvil_core::services::create_axum_router(anvil_core::services::create_admin_grpc_router(
             state.clone(),
-            auth_interceptor.clone(),
+            admin_auth_interceptor.clone(),
         ))
     });
     let s3_app = s3_gateway::app(state.clone());

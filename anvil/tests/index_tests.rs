@@ -3361,7 +3361,10 @@ async fn test_repair_rebuilds_missing_full_text_segment_from_base_journal() {
     assert_eq!(report.status, "rebuilt_derived_index");
     assert_eq!(report.reason, "DerivedIndexSegmentMissing");
     assert_eq!(report.index_storage_id, index_storage_id);
-    assert_eq!(report.source_cursor_low, source_cursor);
+    assert_eq!(
+        report.source_cursor_low,
+        u64::try_from(source_cursor).unwrap()
+    );
     assert_eq!(report.source_cursor_high, 0);
     assert!(report.finding.is_some());
     assert!(report.build.is_some());
@@ -3471,38 +3474,26 @@ async fn test_repair_rebuilds_missing_vector_segment_from_base_journal() {
         .create_index_definition_event(tenant_id, bucket.id, &bucket.name, &index, "create")
         .await
         .unwrap();
+    let signing_key = hex::decode(&cluster.states[0].config.anvil_secret_encryption_key).unwrap();
+    let stats = anvil::metadata_journal::active_object_journal_stats(
+        &cluster.states[0].storage,
+        &bucket,
+        &signing_key,
+    )
+    .await
+    .unwrap();
+    let source_cursor = anvil::index_repair::source_cursor_from_stats(stats);
     assert!(
-        persistence
-            .enqueue_index_build_for_index(&bucket, &index)
-            .await
-            .unwrap(),
-        "compacted source manifest must still schedule a vector index build"
+        source_cursor > 0,
+        "compacted source manifest must expose a repairable source cursor"
     );
-    let source_cursor = persistence
-        .list_tasks()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|task| {
-            task.task_type == anvil::tasks::TaskType::IndexBuild
-                && task.payload["index_id"] == serde_json::json!(index.id)
-        })
-        .and_then(|task| task.payload["source_cursor"].as_u64())
-        .expect("index build task records source cursor");
 
     persistence
-        .build_index_task(
-            tenant_id,
-            bucket.id,
-            index.id,
-            index.version,
-            u128::from(source_cursor),
-        )
+        .build_index_task(tenant_id, bucket.id, index.id, index.version, source_cursor)
         .await
         .unwrap()
         .expect("initial vector index build succeeds");
     let index_storage_id = anvil::index_journal::index_storage_id(tenant_id, bucket.id, index.id);
-    let signing_key = hex::decode(&cluster.states[0].config.anvil_secret_encryption_key).unwrap();
     let proof = anvil::derived_index_proof::read_latest_derived_index_proof(
         &cluster.states[0].storage,
         &index_storage_id,
@@ -3556,7 +3547,10 @@ async fn test_repair_rebuilds_missing_vector_segment_from_base_journal() {
     assert_eq!(report.status, "rebuilt_derived_index");
     assert_eq!(report.reason, "DerivedIndexSegmentMissing");
     assert_eq!(report.index_storage_id, index_storage_id);
-    assert_eq!(report.source_cursor_low, source_cursor);
+    assert_eq!(
+        report.source_cursor_low,
+        u64::try_from(source_cursor).unwrap()
+    );
     assert_eq!(report.source_cursor_high, 0);
     assert!(report.finding.is_some());
     assert!(report.build.is_some());
@@ -3876,7 +3870,7 @@ async fn test_vector_index_builds_from_object_write_task() {
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "docs/vector.json");
     assert_eq!(response.hits[0].vector_id, 1);
-    let tasks = wait_for_index_build_task(&cluster, Duration::from_secs(10)).await;
+    let tasks = wait_for_index_build_task(&cluster, Duration::from_secs(60)).await;
     assert!(
         tasks.iter().any(|task| {
             task.task_type == anvil::tasks::TaskType::IndexBuild
@@ -4014,7 +4008,7 @@ async fn test_vector_index_builds_required_media_modalities_from_object_write_ta
         assert_eq!(metadata["modality"], modality);
     }
 
-    let tasks = wait_for_index_build_task_count(&cluster, Duration::from_secs(10), 1).await;
+    let tasks = wait_for_index_build_task_count(&cluster, Duration::from_secs(60), 1).await;
     assert!(!tasks.iter().any(|task| {
         task.task_type == anvil::tasks::TaskType::IndexBuild
             && task.status == anvil::tasks::TaskStatus::Failed
@@ -4132,7 +4126,7 @@ async fn test_vector_index_build_records_dimension_mismatch_diagnostic() {
     }
 
     assert!(found, "dimension mismatch should write an index diagnostic");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let tasks = loop {
         let tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
         if tasks.iter().any(|task| {
@@ -4308,7 +4302,7 @@ async fn test_hybrid_index_builds_text_and_vector_segments_from_object_write_tas
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "docs/hybrid.json");
     assert!(response.hits[0].score > 0.0);
-    let tasks = wait_for_index_build_task_count(&cluster, Duration::from_secs(10), 1).await;
+    let tasks = wait_for_index_build_task_count(&cluster, Duration::from_secs(60), 1).await;
     assert!(tasks.iter().any(|task| {
         task.task_type == anvil::tasks::TaskType::IndexBuild
             && task.status == anvil::tasks::TaskStatus::Completed

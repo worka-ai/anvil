@@ -10,6 +10,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let config = Config::parse();
+    config.validate_admin_listener_bind()?;
 
     let addr = config
         .api_listen_addr

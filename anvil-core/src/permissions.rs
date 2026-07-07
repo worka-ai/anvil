@@ -16,6 +16,7 @@ pub enum AnvilAction {
     HfIngestionAll,  // Matches hf_ingestion:*
     PolicyAll,       // Matches policy:*
     AuthzAll,        // Matches authz:*
+    AppAll,          // Matches app:*
     IndexAll,        // Matches index:*
     PersonalDbAll,   // Matches personaldb:*
     GitSourceAll,    // Matches git_source:*
@@ -48,8 +49,15 @@ pub enum AnvilAction {
     HfIngestionDelete,
 
     // Policy actions
+    PolicyRead,
     PolicyGrant,
     PolicyRevoke,
+
+    // Application credential actions
+    AppCreate,
+    AppRead,
+    AppRotateSecret,
+    AppDelete,
 
     // Relationship authorization actions
     AuthzTupleWrite,
@@ -105,6 +113,7 @@ impl fmt::Display for AnvilAction {
             AnvilAction::HfIngestionAll => "hf_ingestion:*",
             AnvilAction::PolicyAll => "policy:*",
             AnvilAction::AuthzAll => "authz:*",
+            AnvilAction::AppAll => "app:*",
             AnvilAction::IndexAll => "index:*",
             AnvilAction::PersonalDbAll => "personaldb:*",
             AnvilAction::GitSourceAll => "git_source:*",
@@ -137,8 +146,15 @@ impl fmt::Display for AnvilAction {
             AnvilAction::HfIngestionDelete => "hf_ingestion:delete",
 
             // Policy actions
+            AnvilAction::PolicyRead => "policy:read",
             AnvilAction::PolicyGrant => "policy:grant",
             AnvilAction::PolicyRevoke => "policy:revoke",
+
+            // Application credential actions
+            AnvilAction::AppCreate => "app:create",
+            AnvilAction::AppRead => "app:read",
+            AnvilAction::AppRotateSecret => "app:rotate_secret",
+            AnvilAction::AppDelete => "app:delete",
 
             // Relationship authorization actions
             AnvilAction::AuthzTupleWrite => "authz:tuple_write",
@@ -199,6 +215,7 @@ impl FromStr for AnvilAction {
             "hf_ingestion:*" => Ok(AnvilAction::HfIngestionAll),
             "policy:*" => Ok(AnvilAction::PolicyAll),
             "authz:*" => Ok(AnvilAction::AuthzAll),
+            "app:*" => Ok(AnvilAction::AppAll),
             "index:*" => Ok(AnvilAction::IndexAll),
             "personaldb:*" => Ok(AnvilAction::PersonalDbAll),
             "git_source:*" => Ok(AnvilAction::GitSourceAll),
@@ -231,8 +248,15 @@ impl FromStr for AnvilAction {
             "hf_ingestion:delete" => Ok(AnvilAction::HfIngestionDelete),
 
             // Policy actions
+            "policy:read" => Ok(AnvilAction::PolicyRead),
             "policy:grant" => Ok(AnvilAction::PolicyGrant),
             "policy:revoke" => Ok(AnvilAction::PolicyRevoke),
+
+            // Application credential actions
+            "app:create" => Ok(AnvilAction::AppCreate),
+            "app:read" => Ok(AnvilAction::AppRead),
+            "app:rotate_secret" => Ok(AnvilAction::AppRotateSecret),
+            "app:delete" => Ok(AnvilAction::AppDelete),
 
             // Relationship authorization actions
             "authz:tuple_write" => Ok(AnvilAction::AuthzTupleWrite),

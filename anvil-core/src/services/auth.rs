@@ -83,7 +83,19 @@ impl AuthService for AppState {
                 .collect()
         };
 
-        if approved_scopes.is_empty() {
+        let has_system_admin_relation = if approved_scopes.is_empty() {
+            crate::system_realm::principal_has_any_admin_relation(
+                &self.storage,
+                &self.config.mesh_id,
+                app_details.id,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+        } else {
+            false
+        };
+
+        if approved_scopes.is_empty() && !has_system_admin_relation {
             return Err(Status::permission_denied("App has no assigned policies"));
         }
 
@@ -106,6 +118,161 @@ impl AuthService for AppState {
         }))
     }
 
+    async fn create_application_credential(
+        &self,
+        request: Request<CreateApplicationCredentialRequest>,
+    ) -> Result<Response<ApplicationSecretResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        require_app_management_scope(&claims, AnvilAction::AppCreate)?;
+        validate_public_app_request(&req.app_name, &req.request_id, &req.idempotency_key)?;
+
+        let client_id = format!("app_{}", uuid::Uuid::new_v4().simple());
+        let client_secret = format!("secret_{}", uuid::Uuid::new_v4().simple());
+        let encrypted_secret = self
+            .secret_keyring
+            .encrypt(client_secret.as_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let app = self
+            .persistence
+            .create_app(
+                claims.tenant_id,
+                &req.app_name,
+                &client_id,
+                &encrypted_secret,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let audit_event_id = crate::services::audit::record_tenant_audit_event(
+            self,
+            &claims,
+            &req.request_id,
+            format!("app:{}", app.name),
+            "app.create",
+            serde_json::json!({ "app_id": app.id, "client_id": client_id }),
+        )
+        .await?;
+
+        Ok(Response::new(ApplicationSecretResponse {
+            request_id: req.request_id,
+            tenant_id: claims.tenant_id.to_string(),
+            app_name: app.name,
+            client_id,
+            client_secret,
+            audit_event_id,
+            app_id: app.id.to_string(),
+        }))
+    }
+
+    async fn rotate_application_credential_secret(
+        &self,
+        request: Request<RotateApplicationCredentialSecretRequest>,
+    ) -> Result<Response<ApplicationSecretResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        require_app_management_scope(&claims, AnvilAction::AppRotateSecret)?;
+        validate_public_app_request(&req.app_name, &req.request_id, &req.idempotency_key)?;
+        let app = app_in_claims_tenant(self, claims.tenant_id, &req.app_name).await?;
+
+        let client_secret = format!("secret_{}", uuid::Uuid::new_v4().simple());
+        let encrypted_secret = self
+            .secret_keyring
+            .encrypt(client_secret.as_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        self.persistence
+            .update_app_secret(app.id, &encrypted_secret)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let audit_event_id = crate::services::audit::record_tenant_audit_event(
+            self,
+            &claims,
+            &req.request_id,
+            format!("app:{}", app.name),
+            "app.rotate_secret",
+            serde_json::json!({ "app_id": app.id, "client_id": app.client_id }),
+        )
+        .await?;
+
+        Ok(Response::new(ApplicationSecretResponse {
+            request_id: req.request_id,
+            tenant_id: claims.tenant_id.to_string(),
+            app_name: app.name,
+            client_id: app.client_id,
+            client_secret,
+            audit_event_id,
+            app_id: app.id.to_string(),
+        }))
+    }
+
+    async fn delete_application_credential(
+        &self,
+        request: Request<DeleteApplicationCredentialRequest>,
+    ) -> Result<Response<DeleteApplicationCredentialResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        require_app_management_scope(&claims, AnvilAction::AppDelete)?;
+        validate_public_app_request(&req.app_name, &req.request_id, &req.idempotency_key)?;
+        let app = app_in_claims_tenant(self, claims.tenant_id, &req.app_name).await?;
+
+        self.persistence
+            .delete_app(app.id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        crate::services::audit::record_tenant_audit_event(
+            self,
+            &claims,
+            &req.request_id,
+            format!("app:{}", app.name),
+            "app.delete",
+            serde_json::json!({ "app_id": app.id }),
+        )
+        .await?;
+
+        Ok(Response::new(DeleteApplicationCredentialResponse {
+            request_id: req.request_id,
+            app_id: app.id.to_string(),
+        }))
+    }
+
+    async fn list_applications(
+        &self,
+        request: Request<ListApplicationsRequest>,
+    ) -> Result<Response<ListApplicationsResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let _ = request.into_inner();
+        require_app_management_scope(&claims, AnvilAction::AppRead)?;
+        let applications = self
+            .persistence
+            .list_apps_for_tenant(claims.tenant_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .into_iter()
+            .map(|app| ApplicationDescriptor {
+                tenant_id: claims.tenant_id.to_string(),
+                app_id: app.id.to_string(),
+                app_name: app.name,
+                client_id: app.client_id,
+            })
+            .collect();
+        Ok(Response::new(ListApplicationsResponse { applications }))
+    }
+
     async fn grant_access(
         &self,
         request: Request<GrantAccessRequest>,
@@ -121,17 +288,39 @@ impl AuthService for AppState {
                 "Permission denied to grant access to this resource",
             ));
         }
+        let delegated_action = req
+            .action
+            .parse::<AnvilAction>()
+            .map_err(|_| Status::invalid_argument("Invalid delegated action"))?;
+        validate_public_delegation_resource(claims, &req.resource)?;
+        if matches!(delegated_action, AnvilAction::All)
+            || req.action.trim().ends_with(":*")
+            || req.resource.trim() == "*"
+        {
+            return Err(Status::permission_denied(
+                "Public policy delegation cannot grant wildcard authority",
+            ));
+        }
+        if !auth::is_authorized(delegated_action, &req.resource, &claims.scopes) {
+            return Err(Status::permission_denied(
+                "Caller cannot delegate permissions it does not already hold",
+            ));
+        }
 
-        let app = self
-            .persistence
-            .get_app_by_name(&req.grantee_app_id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Grantee app not found"))?;
+        let app = app_in_claims_tenant(self, claims.tenant_id, &req.grantee_app_id).await?;
         self.persistence
             .grant_policy(app.id, &req.resource, &req.action)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        crate::services::audit::record_tenant_audit_event(
+            self,
+            claims,
+            "policy-grant",
+            &req.resource,
+            "policy.grant",
+            serde_json::json!({ "grantee_app_id": app.id, "action": req.action }),
+        )
+        .await?;
 
         Ok(Response::new(GrantAccessResponse {}))
     }
@@ -146,25 +335,72 @@ impl AuthService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.get_ref();
 
+        validate_public_delegation_resource(claims, &req.resource)?;
         if !auth::is_authorized(AnvilAction::PolicyRevoke, &req.resource, &claims.scopes) {
             return Err(Status::permission_denied(
                 "Permission denied to revoke access to this resource",
             ));
         }
 
-        let app = self
-            .persistence
-            .get_app_by_name(&req.grantee_app_id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Grantee app not found"))?;
+        let app = app_in_claims_tenant(self, claims.tenant_id, &req.grantee_app_id).await?;
 
         self.persistence
             .revoke_policy(app.id, &req.resource, &req.action)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        crate::services::audit::record_tenant_audit_event(
+            self,
+            claims,
+            "policy-revoke",
+            &req.resource,
+            "policy.revoke",
+            serde_json::json!({ "grantee_app_id": app.id, "action": req.action }),
+        )
+        .await?;
 
         Ok(Response::new(RevokeAccessResponse {}))
+    }
+
+    async fn list_access_grants(
+        &self,
+        request: Request<ListAccessGrantsRequest>,
+    ) -> Result<Response<ListAccessGrantsResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        require_app_management_scope(&claims, AnvilAction::PolicyRead)?;
+        let app = app_in_claims_tenant(self, claims.tenant_id, &req.app).await?;
+        let grants = self
+            .persistence
+            .list_policies_for_app(app.id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .into_iter()
+            .filter(|grant| {
+                auth::is_authorized(AnvilAction::PolicyRead, &grant.resource, &claims.scopes)
+                    || auth::is_authorized(
+                        AnvilAction::PolicyGrant,
+                        &grant.resource,
+                        &claims.scopes,
+                    )
+                    || auth::is_authorized(
+                        AnvilAction::PolicyRevoke,
+                        &grant.resource,
+                        &claims.scopes,
+                    )
+            })
+            .map(|grant| AccessGrantRecord {
+                app_id: app.id.to_string(),
+                app_name: app.name.clone(),
+                action: grant.action,
+                resource: grant.resource,
+            })
+            .collect();
+
+        Ok(Response::new(ListAccessGrantsResponse { grants }))
     }
 
     async fn set_public_access(
@@ -1811,6 +2047,86 @@ fn mutation_id_from_record_hash(record_hash: &str) -> [u8; 16] {
         mutation_id[..len].copy_from_slice(&bytes[..len]);
     }
     mutation_id
+}
+
+async fn app_in_claims_tenant(
+    state: &AppState,
+    tenant_id: i64,
+    app_name: &str,
+) -> Result<crate::persistence::App, Status> {
+    state
+        .persistence
+        .list_apps_for_tenant(tenant_id)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .into_iter()
+        .find(|app| app.name == app_name)
+        .ok_or_else(|| Status::not_found("Grantee app not found"))
+}
+
+fn validate_public_delegation_resource(
+    claims: &auth::Claims,
+    resource: &str,
+) -> Result<(), Status> {
+    let resource = resource.trim();
+    if resource.is_empty() {
+        return Err(Status::invalid_argument("resource is required"));
+    }
+    if resource == "*"
+        || resource.starts_with("system:")
+        || resource.starts_with("anvil_mesh:")
+        || resource.starts_with("_anvil/")
+        || resource.contains("/_anvil/")
+    {
+        return Err(Status::permission_denied(
+            "Public policy delegation cannot grant system, reserved, or wildcard authority",
+        ));
+    }
+    if let Some(rest) = resource.strip_prefix("tenant:") {
+        let tenant_id = rest.split(['/', ':']).next().unwrap_or_default();
+        if tenant_id != claims.tenant_id.to_string() {
+            return Err(Status::permission_denied(
+                "Public policy delegation cannot grant cross-tenant authority",
+            ));
+        }
+    }
+    if let Some(rest) = resource.strip_prefix("tenant-") {
+        let tenant_id = rest.split(['/', ':']).next().unwrap_or_default();
+        if tenant_id != claims.tenant_id.to_string() {
+            return Err(Status::permission_denied(
+                "Public policy delegation cannot grant cross-tenant authority",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_app_management_scope(claims: &auth::Claims, action: AnvilAction) -> Result<(), Status> {
+    if !auth::is_authorized(
+        action,
+        &format!("tenant:{}", claims.tenant_id),
+        &claims.scopes,
+    ) {
+        return Err(Status::permission_denied("Permission denied"));
+    }
+    Ok(())
+}
+
+fn validate_public_app_request(
+    app_name: &str,
+    request_id: &str,
+    idempotency_key: &str,
+) -> Result<(), Status> {
+    if app_name.trim().is_empty() {
+        return Err(Status::invalid_argument("app_name is required"));
+    }
+    if request_id.trim().is_empty() {
+        return Err(Status::invalid_argument("request_id is required"));
+    }
+    if idempotency_key.trim().is_empty() {
+        return Err(Status::invalid_argument("idempotency_key is required"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

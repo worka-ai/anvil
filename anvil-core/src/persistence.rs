@@ -2201,6 +2201,26 @@ impl Persistence {
         .await
     }
 
+    pub async fn delete_app(&self, app_id: i64) -> Result<()> {
+        let permit = self.control_write_permit().await?;
+        control_journal::delete_app_with_permit(
+            &self.storage,
+            app_id,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub(crate) async fn list_policies_for_app(
+        &self,
+        app_id: i64,
+    ) -> Result<Vec<control_journal::StoredAppPolicy>> {
+        Ok(control_journal::read_control_state(&self.storage)
+            .await?
+            .policy_records_for_app(app_id))
+    }
+
     pub async fn grant_policy(&self, app_id: i64, resource: &str, action: &str) -> Result<()> {
         let permit = self.control_write_permit().await?;
         control_journal::grant_policy_with_permit(

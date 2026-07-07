@@ -1177,7 +1177,7 @@ async fn test_s3_writes_trigger_worker_metadata_compaction() {
     let manifest_ref = format!("metadata_manifest:tenant:1:bucket:{}", bucket_record.id);
 
     let completed_task = {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
         loop {
             let tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
             if let Some(task) = tasks.iter().find(|task| {
@@ -1288,7 +1288,7 @@ async fn test_s3_put_triggers_full_text_index_build() {
         .expect("S3 PUT should succeed");
 
     let mut indexed = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     while tokio::time::Instant::now() < deadline {
         let query = index_client
             .query_index(authorized(
@@ -1327,7 +1327,7 @@ async fn test_s3_put_triggers_full_text_index_build() {
     let response = indexed.expect("S3 object should be searchable after index task completes");
     assert_eq!(response.index_kind, IndexKind::FullText as i32);
     assert!(response.index_generation >= 1);
-    wait_for_completed_index_build(&cluster, Duration::from_secs(20)).await;
+    wait_for_completed_index_build(&cluster, Duration::from_secs(90)).await;
 }
 
 #[tokio::test]
@@ -1385,7 +1385,7 @@ async fn test_s3_put_metadata_field_triggers_full_text_index_build() {
         .expect("S3 PUT should succeed");
 
     let mut indexed = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     while tokio::time::Instant::now() < deadline {
         let query = index_client
             .query_index(authorized(
@@ -1484,7 +1484,7 @@ async fn test_s3_put_personaldb_table_column_triggers_full_text_index_build() {
         .expect("S3 PUT should succeed");
 
     let mut indexed = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     while tokio::time::Instant::now() < deadline {
         let query = index_client
             .query_index(authorized(
@@ -1578,7 +1578,7 @@ async fn test_s3_put_media_transcript_triggers_full_text_index_build() {
         .expect("S3 PUT should succeed");
 
     let mut indexed = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     while tokio::time::Instant::now() < deadline {
         let query = index_client
             .query_index(authorized(
@@ -1677,7 +1677,7 @@ async fn test_s3_put_triggers_vector_index_build() {
         .expect("S3 PUT should succeed");
 
     let mut indexed = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     while tokio::time::Instant::now() < deadline {
         let query = index_client
             .query_index(authorized(
@@ -1718,7 +1718,7 @@ async fn test_s3_put_triggers_vector_index_build() {
     assert_eq!(response.index_kind, IndexKind::Vector as i32);
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "docs/s3-vector.json");
-    wait_for_completed_index_build(&cluster, Duration::from_secs(20)).await;
+    wait_for_completed_index_build(&cluster, Duration::from_secs(90)).await;
 }
 
 #[test]

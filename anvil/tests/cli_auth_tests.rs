@@ -18,7 +18,7 @@ fn cargo_path() -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
-// This verifies that anvil-cli can obtain an access token using a configured
+// This verifies that anvil can obtain an access token using a configured
 // profile and then use that token for an authenticated CLI operation. Subprocess
 // calls use tokio::process so the in-process test server is not starved while
 // the CLI waits for a gRPC response.
@@ -45,7 +45,7 @@ async fn test_cli_auth_and_hf_key_add() {
         "-p",
         "anvil-storage-cli",
         "--bin",
-        "anvil-cli",
+        "anvil",
         "--",
         "--config",
         config_path.to_str().unwrap(),
@@ -77,7 +77,7 @@ async fn test_cli_auth_and_hf_key_add() {
         "-p",
         "anvil-storage-cli",
         "--bin",
-        "anvil-cli",
+        "anvil",
         "--",
         "--config",
         config_path.to_str().unwrap(),
@@ -108,7 +108,7 @@ async fn test_cli_auth_and_hf_key_add() {
         "-p",
         "anvil-storage-cli",
         "--bin",
-        "anvil-cli",
+        "anvil",
         "--",
         "--config",
         config_path.to_str().unwrap(),
@@ -126,7 +126,7 @@ async fn test_cli_auth_and_hf_key_add() {
     let cli_output = cli_cmd.output().await.unwrap();
     assert!(
         cli_output.status.success(),
-        "anvil-cli hf key add failed: {}",
+        "anvil hf key add failed: {}",
         String::from_utf8_lossy(&cli_output.stderr)
     );
 }

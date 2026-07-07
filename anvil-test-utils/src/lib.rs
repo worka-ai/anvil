@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use anvil::anvil_api::GetAccessTokenRequest;
@@ -13,10 +13,29 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::Credentials;
 use futures_util::StreamExt;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tracing_subscriber::{self, EnvFilter};
 
 static INIT_LOGGER: Once = Once::new();
+static TEST_CLUSTER_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn test_cluster_limit() -> usize {
+    std::env::var("ANVIL_TEST_CLUSTER_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2)
+}
+
+async fn acquire_test_cluster_permit() -> OwnedSemaphorePermit {
+    TEST_CLUSTER_SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(test_cluster_limit())))
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("test cluster semaphore is not closed")
+}
 
 #[allow(dead_code)]
 pub async fn get_auth_token(_admin_state_path: &str, grpc_addr: &str) -> String {
@@ -49,6 +68,7 @@ pub struct TestCluster {
     pub admin_state_path: String,
     pub config: Arc<anvil_core::config::Config>,
     pub storage_path: PathBuf,
+    _cluster_permit: OwnedSemaphorePermit,
 }
 
 impl TestCluster {
@@ -80,6 +100,8 @@ impl TestCluster {
         regions: &[&str],
         configure: impl FnOnce(&mut anvil_core::config::Config),
     ) -> Self {
+        let cluster_permit = acquire_test_cluster_permit().await;
+
         INIT_LOGGER.call_once(|| {
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(EnvFilter::new(
@@ -101,6 +123,8 @@ impl TestCluster {
             public_api_addr: "127.0.0.1:0".to_string(),
             api_listen_addr: "127.0.0.1:0".to_string(),
             region: "".to_string(),
+            bootstrap_system_admin_subject_kind: "app".to_string(),
+            bootstrap_system_admin_subject_id: "admin-principal".to_string(),
             bootstrap_addrs: vec![],
             init_cluster: false,
             enable_mdns: false,
@@ -183,6 +207,7 @@ impl TestCluster {
             admin_state_path: admin_state_path.to_string_lossy().into_owned(),
             config,
             storage_path,
+            _cluster_permit: cluster_permit,
         }
     }
 
@@ -325,14 +350,7 @@ impl TestCluster {
     pub fn admin_token(&self) -> String {
         self.states[0]
             .jwt_manager
-            .mint_token(
-                "admin-principal".to_string(),
-                vec![format!(
-                    "anvil_admin:*|anvil_admin:cluster:{}",
-                    self.states[0].config.mesh_id
-                )],
-                0,
-            )
+            .mint_token("admin-principal".to_string(), Vec::new(), 0)
             .unwrap()
     }
 

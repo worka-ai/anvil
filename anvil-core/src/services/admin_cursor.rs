@@ -1,5 +1,5 @@
-use crate::admin_auth::AdminPrincipal;
 use crate::anvil_api::PageRequest;
+use crate::system_realm::AdminPrincipal;
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -234,6 +234,8 @@ mod tests {
             principal_id: id.to_string(),
             tenant_id: 7,
             authenticated_methods: vec!["bearer".to_string()],
+            checked_relation: None,
+            checked_object: None,
         }
     }
 
@@ -242,7 +244,7 @@ mod tests {
         let principal = test_principal("admin-a");
         let filters = [("tenant_id", "7"), ("bucket_name", "photos")];
         let binding = AdminCursorBinding {
-            scope: "admin.list_object_links.v1",
+            scope: "admin.list_host_aliases.v1",
             filters: &filters,
             principal: &principal,
             limit: 25,

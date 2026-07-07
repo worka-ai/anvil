@@ -20,7 +20,7 @@ name = "anvil"
 path = "src/lib.rs"
 
 [[bin]]
-name = "anvil"
+name = "anvil-server"
 path = "src/main.rs"
 
 [features]

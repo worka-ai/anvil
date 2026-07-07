@@ -26,6 +26,8 @@ pub enum AuthCommands {
         action: String,
         resource: String,
     },
+    /// List grants for an app in the authenticated tenant
+    ListGrants { app: String },
 }
 
 pub async fn handle_auth_command(command: &AuthCommands, ctx: &Context) -> anyhow::Result<()> {
@@ -48,11 +50,8 @@ pub async fn handle_auth_command(command: &AuthCommands, ctx: &Context) -> anyho
                 ),
             };
 
-            let host = ctx.profile.host.clone();
-            eprintln!("[anvil-cli] get-token: sending RPC to {}", host);
-
             // Build channel on current runtime and perform unary call with a timeout
-            let endpoint = Endpoint::from_shared(host)?
+            let endpoint = Endpoint::from_shared(ctx.profile.host.clone())?
                 .connect_timeout(Duration::from_secs(5))
                 .tcp_nodelay(true);
             let channel = endpoint.connect().await?;
@@ -70,7 +69,6 @@ pub async fn handle_auth_command(command: &AuthCommands, ctx: &Context) -> anyho
             let token = resp.into_inner().access_token;
             // Explicitly drop client before printing/exiting to tear down h2 cleanly
             drop(c);
-            eprintln!("[anvil-cli] get-token: RPC completed, printing token");
             println!("{}", token);
         }
         AuthCommands::Grant {
@@ -81,7 +79,7 @@ pub async fn handle_auth_command(command: &AuthCommands, ctx: &Context) -> anyho
             let token = ctx.get_bearer_token().await?;
             let mut request = tonic::Request::new(api::GrantAccessRequest {
                 grantee_app_id: app.clone(),
-                action: action.clone(),
+                action: normalise_delegated_action(action, resource)?,
                 resource: resource.clone(),
             });
             request.metadata_mut().insert(
@@ -99,7 +97,7 @@ pub async fn handle_auth_command(command: &AuthCommands, ctx: &Context) -> anyho
             let token = ctx.get_bearer_token().await?;
             let mut request = tonic::Request::new(api::RevokeAccessRequest {
                 grantee_app_id: app.clone(),
-                action: action.clone(),
+                action: normalise_delegated_action(action, resource)?,
                 resource: resource.clone(),
             });
             request.metadata_mut().insert(
@@ -109,7 +107,72 @@ pub async fn handle_auth_command(command: &AuthCommands, ctx: &Context) -> anyho
             client.revoke_access(request).await?;
             println!("Permission revoked.");
         }
+        AuthCommands::ListGrants { app } => {
+            let token = ctx.get_bearer_token().await?;
+            let mut request =
+                tonic::Request::new(api::ListAccessGrantsRequest { app: app.clone() });
+            request.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", token).parse().unwrap(),
+            );
+            let response = client.list_access_grants(request).await?.into_inner();
+            for grant in response.grants {
+                println!("{}\t{}\t{}", grant.app_name, grant.action, grant.resource);
+            }
+        }
     }
 
     Ok(())
+}
+
+fn normalise_delegated_action(action: &str, resource: &str) -> anyhow::Result<String> {
+    let action = action.trim();
+    if action.contains(':') {
+        return Ok(action.to_string());
+    }
+
+    let family = if resource.starts_with("bucket:") {
+        "bucket"
+    } else if resource.starts_with("object:") {
+        "object"
+    } else if resource.starts_with("index:") {
+        "index"
+    } else if resource.starts_with("personaldb:") {
+        "personaldb"
+    } else if resource.starts_with("authz:") {
+        "authz"
+    } else if resource.starts_with("app:") || resource.starts_with("tenant:") {
+        "app"
+    } else {
+        anyhow::bail!(
+            "delegated action must be fully qualified, for example object:read or bucket:read"
+        );
+    };
+
+    Ok(format!("{family}:{action}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalise_delegated_action;
+
+    #[test]
+    fn normalise_delegated_action_keeps_qualified_actions() {
+        assert_eq!(
+            normalise_delegated_action("object:read", "bucket:docs").unwrap(),
+            "object:read"
+        );
+    }
+
+    #[test]
+    fn normalise_delegated_action_qualifies_resource_family() {
+        assert_eq!(
+            normalise_delegated_action("read", "bucket:docs").unwrap(),
+            "bucket:read"
+        );
+        assert_eq!(
+            normalise_delegated_action("read", "object:docs/report.pdf").unwrap(),
+            "object:read"
+        );
+    }
 }

@@ -1,5 +1,6 @@
 pub mod admin;
 pub(crate) mod admin_cursor;
+pub mod audit;
 pub mod auth;
 pub mod bucket;
 pub mod coordination;
@@ -13,8 +14,8 @@ pub mod repair;
 pub(crate) mod watch_envelope;
 
 use crate::anvil_api::{
-    admin_service_server::AdminServiceServer, auth_service_server::AuthServiceServer,
-    bucket_service_server::BucketServiceServer,
+    admin_service_server::AdminServiceServer, audit_service_server::AuditServiceServer,
+    auth_service_server::AuthServiceServer, bucket_service_server::BucketServiceServer,
     coordination_service_server::CoordinationServiceServer,
     git_source_service_server::GitSourceServiceServer,
     hf_ingestion_service_server::HfIngestionServiceServer,
@@ -84,6 +85,10 @@ pub fn create_grpc_router(state: AppState, auth_interceptor: AuthInterceptorFn) 
         auth_closure.clone(),
     ))
     .add_service(RepairServiceServer::with_interceptor(
+        state.clone(),
+        auth_closure.clone(),
+    ))
+    .add_service(AuditServiceServer::with_interceptor(
         state.clone(),
         auth_closure.clone(),
     ))

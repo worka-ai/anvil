@@ -4296,6 +4296,8 @@ mod tests {
             region: "us-east-1".to_string(),
             storage_path: storage_path.to_string_lossy().to_string(),
             cross_region_routing_policy: policy,
+            bootstrap_system_admin_subject_kind: "app".to_string(),
+            bootstrap_system_admin_subject_id: "admin-principal".to_string(),
             ..anvil_core::config::Config::default()
         }
     }

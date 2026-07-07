@@ -165,7 +165,7 @@ fn action_covers_required(token_action: &AnvilAction, required_action: &AnvilAct
         ),
         AnvilAction::PolicyAll => matches!(
             required_action,
-            AnvilAction::PolicyGrant | AnvilAction::PolicyRevoke
+            AnvilAction::PolicyRead | AnvilAction::PolicyGrant | AnvilAction::PolicyRevoke
         ),
         AnvilAction::AuthzAll => matches!(
             required_action,
@@ -175,6 +175,13 @@ fn action_covers_required(token_action: &AnvilAction, required_action: &AnvilAct
                 | AnvilAction::AuthzWatch
                 | AnvilAction::AuthzSchemaRead
                 | AnvilAction::AuthzSchemaWrite
+        ),
+        AnvilAction::AppAll => matches!(
+            required_action,
+            AnvilAction::AppCreate
+                | AnvilAction::AppRead
+                | AnvilAction::AppRotateSecret
+                | AnvilAction::AppDelete
         ),
         AnvilAction::IndexAll => matches!(
             required_action,

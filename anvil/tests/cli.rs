@@ -10,15 +10,9 @@ static CLI_PATH: OnceLock<String> = OnceLock::new();
 fn get_cli_path() -> &'static str {
     CLI_PATH.get_or_init(|| {
         let status = Command::new("cargo")
-            .args(&[
-                "build",
-                "--package",
-                "anvil-storage-cli",
-                "--bin",
-                "anvil-cli",
-            ])
+            .args(&["build", "--package", "anvil-storage-cli", "--bin", "anvil"])
             .status()
-            .expect("Failed to build anvil-cli");
+            .expect("Failed to build anvil");
         assert!(status.success());
 
         let metadata_output = Command::new("cargo")
@@ -28,7 +22,7 @@ fn get_cli_path() -> &'static str {
             .expect("Failed to get cargo metadata");
         let metadata: serde_json::Value = serde_json::from_slice(&metadata_output.stdout).unwrap();
         let target_dir = metadata["target_directory"].as_str().unwrap();
-        format!("{}/debug/anvil-cli", target_dir)
+        format!("{}/debug/anvil", target_dir)
     })
 }
 
@@ -49,7 +43,7 @@ async fn run_cli(args: &[&str], config_dir: &std::path::Path) -> std::process::O
             .args(&all_args)
             .env("HOME", &config_dir_path)
             .output()
-            .expect("Failed to run anvil-cli");
+            .expect("Failed to run anvil");
 
         println!("CLI command finished: {:?}", all_args);
         println!("  Status: {}", output.status);

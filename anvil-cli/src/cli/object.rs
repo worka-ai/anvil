@@ -20,6 +20,49 @@ pub enum ObjectCommands {
     Ls { path: String },
     /// Show object metadata
     Head { path: String },
+    /// Manage object links.
+    Link {
+        #[clap(subcommand)]
+        command: ObjectLinkCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ObjectLinkCommands {
+    /// Create a link inside a bucket.
+    Create {
+        link: String,
+        target: String,
+        #[clap(long, action = clap::ArgAction::SetTrue)]
+        allow_dangling: bool,
+        #[clap(long, default_value = "follow")]
+        resolution: String,
+    },
+    /// Update an existing link.
+    Update {
+        link: String,
+        target: String,
+        #[clap(long)]
+        expected_generation: u64,
+        #[clap(long, action = clap::ArgAction::SetTrue)]
+        allow_dangling: bool,
+        #[clap(long, default_value = "follow")]
+        resolution: String,
+    },
+    /// Delete a link.
+    Delete {
+        link: String,
+        #[clap(long)]
+        expected_generation: u64,
+    },
+    /// Read link metadata.
+    Read { link: String },
+    /// List links in a bucket.
+    List {
+        path: String,
+        #[clap(long, default_value_t = 100)]
+        limit: u32,
+    },
 }
 
 fn parse_s3_path(path: &str) -> anyhow::Result<(String, String)> {
@@ -32,12 +75,12 @@ fn parse_s3_path(path: &str) -> anyhow::Result<(String, String)> {
 }
 
 #[derive(Debug, Deserialize)]
-struct NativeTokenClaims {
-    sub: String,
-    tenant_id: i64,
+pub(crate) struct NativeTokenClaims {
+    pub(crate) sub: String,
+    pub(crate) tenant_id: i64,
 }
 
-fn decode_native_token_claims(token: &str) -> anyhow::Result<NativeTokenClaims> {
+pub(crate) fn decode_native_token_claims(token: &str) -> anyhow::Result<NativeTokenClaims> {
     let payload = token
         .split('.')
         .nth(1)
@@ -46,7 +89,7 @@ fn decode_native_token_claims(token: &str) -> anyhow::Result<NativeTokenClaims> 
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-async fn native_mutation_context(
+pub(crate) async fn native_mutation_context(
     ctx: &Context,
     token: &str,
     bucket_name: &str,
@@ -222,7 +265,172 @@ pub async fn handle_object_command(command: &ObjectCommands, ctx: &Context) -> a
                 obj.etag, obj.size, obj.last_modified
             );
         }
+        ObjectCommands::Link { command } => {
+            handle_object_link_command(command, ctx, &mut client, &token).await?;
+        }
     }
 
     Ok(())
+}
+
+async fn handle_object_link_command(
+    command: &ObjectLinkCommands,
+    ctx: &Context,
+    client: &mut ObjectServiceClient<tonic::transport::Channel>,
+    token: &str,
+) -> anyhow::Result<()> {
+    match command {
+        ObjectLinkCommands::Create {
+            link,
+            target,
+            allow_dangling,
+            resolution,
+        } => {
+            let (bucket, link_key) = parse_s3_path(link)?;
+            let (target_bucket, target_key) = parse_s3_path(target)?;
+            anyhow::ensure!(
+                bucket == target_bucket,
+                "cross-bucket object links are not supported by the public CLI"
+            );
+            let mut request = tonic::Request::new(api::CreateObjectLinkRequest {
+                context: Some(public_link_context("link-create", 0)),
+                tenant_id: String::new(),
+                bucket_name: bucket,
+                link_key,
+                target_key,
+                target_version: String::new(),
+                resolution: parse_link_resolution(resolution)?,
+                allow_dangling: *allow_dangling,
+            });
+            request.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", token).parse().unwrap(),
+            );
+            print_link(client.create_object_link(request).await?.into_inner().link);
+        }
+        ObjectLinkCommands::Update {
+            link,
+            target,
+            expected_generation,
+            allow_dangling,
+            resolution,
+        } => {
+            let (bucket, link_key) = parse_s3_path(link)?;
+            let (target_bucket, target_key) = parse_s3_path(target)?;
+            anyhow::ensure!(
+                bucket == target_bucket,
+                "cross-bucket object links are not supported by the public CLI"
+            );
+            let mut request = tonic::Request::new(api::UpdateObjectLinkRequest {
+                context: Some(public_link_context("link-update", *expected_generation)),
+                tenant_id: String::new(),
+                bucket_name: bucket,
+                link_key,
+                target_key,
+                target_version: String::new(),
+                resolution: parse_link_resolution(resolution)?,
+                allow_dangling: *allow_dangling,
+            });
+            request.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", token).parse().unwrap(),
+            );
+            print_link(client.update_object_link(request).await?.into_inner().link);
+        }
+        ObjectLinkCommands::Delete {
+            link,
+            expected_generation,
+        } => {
+            let (bucket, link_key) = parse_s3_path(link)?;
+            let mut request = tonic::Request::new(api::DeleteObjectLinkRequest {
+                context: Some(public_link_context("link-delete", *expected_generation)),
+                tenant_id: String::new(),
+                bucket_name: bucket,
+                link_key,
+            });
+            request.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", token).parse().unwrap(),
+            );
+            let response = client.delete_object_link(request).await?.into_inner();
+            println!(
+                "Deleted {} at generation {}",
+                response.resource_id, response.generation
+            );
+        }
+        ObjectLinkCommands::Read { link } => {
+            let (bucket, link_key) = parse_s3_path(link)?;
+            let mut request = tonic::Request::new(api::ReadObjectLinkRequest {
+                request_id: format!("link-read-{}", uuid::Uuid::new_v4()),
+                tenant_id: String::new(),
+                bucket_name: bucket,
+                link_key,
+            });
+            request.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", token).parse().unwrap(),
+            );
+            print_link(client.read_object_link(request).await?.into_inner().link);
+        }
+        ObjectLinkCommands::List { path, limit } => {
+            let (bucket, prefix) = parse_s3_path(path)?;
+            let mut request = tonic::Request::new(api::ListObjectLinksRequest {
+                tenant_id: String::new(),
+                bucket_name: bucket,
+                prefix,
+                page: Some(api::PageRequest {
+                    cursor: String::new(),
+                    limit: *limit,
+                }),
+            });
+            request.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", token).parse().unwrap(),
+            );
+            let response = client.list_object_links(request).await?.into_inner();
+            for link in response.links {
+                println!(
+                    "{} -> {} (generation {})",
+                    link.link_key, link.target_key, link.generation
+                );
+            }
+        }
+    }
+
+    let _ = ctx;
+    Ok(())
+}
+
+fn public_link_context(tag: &str, expected_generation: u64) -> api::PublicMutationContext {
+    api::PublicMutationContext {
+        request_id: format!("{tag}-{}", uuid::Uuid::new_v4()),
+        idempotency_key: uuid::Uuid::new_v4().to_string(),
+        expected_generation,
+    }
+}
+
+fn parse_link_resolution(value: &str) -> anyhow::Result<i32> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "follow" => Ok(api::ObjectLinkResolution::Follow as i32),
+        "redirect" => Ok(api::ObjectLinkResolution::Redirect as i32),
+        other => Err(anyhow::anyhow!(
+            "invalid link resolution '{other}', expected follow or redirect"
+        )),
+    }
+}
+
+fn print_link(link: Option<api::ObjectLinkDescriptor>) {
+    if let Some(link) = link {
+        println!(
+            "{} -> {}{} (generation {})",
+            link.link_key,
+            link.target_key,
+            if link.target_version.is_empty() {
+                String::new()
+            } else {
+                format!("@{}", link.target_version)
+            },
+            link.generation
+        );
+    }
 }

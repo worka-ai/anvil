@@ -41,6 +41,8 @@ async fn spawn_admin_node() -> AdminNode {
         api_listen_addr: public_addr.to_string(),
         admin_listen_addr: admin_addr.to_string(),
         mesh_id: "mesh-test".to_string(),
+        bootstrap_system_admin_subject_kind: "app".to_string(),
+        bootstrap_system_admin_subject_id: "admin-principal".to_string(),
         region: "eu-west-1".to_string(),
         cell_id: "cell-a".to_string(),
         public_region_base_domain: "eu-west-1.anvil-storage.test".to_string(),
@@ -91,11 +93,7 @@ async fn spawn_admin_node() -> AdminNode {
 fn admin_token(node: &AdminNode) -> String {
     node.state
         .jwt_manager
-        .mint_token(
-            "admin-principal".to_string(),
-            vec!["anvil_admin:*|anvil_admin:cluster:mesh-test".to_string()],
-            0,
-        )
+        .mint_token("admin-principal".to_string(), Vec::new(), 0)
         .unwrap()
 }
 
@@ -275,6 +273,207 @@ async fn prepare_active_region_dependencies(
         .node
         .unwrap();
     assert_eq!(node.state, 2);
+}
+
+#[tokio::test]
+async fn admin_authorisation_uses_zanzibar_system_realm() {
+    let node = spawn_admin_node().await;
+    let admin_token = admin_token(&node);
+    let claims = node.state.jwt_manager.verify_token(&admin_token).unwrap();
+    assert!(
+        claims.scopes.is_empty(),
+        "admin token should not carry data-plane scopes"
+    );
+
+    let allowed = anvil::system_realm::check_admin_relation(
+        &node.state.storage,
+        &node.state.config.mesh_id,
+        &claims,
+        anvil::system_realm::SystemAdminRelation::ManageRegions,
+    )
+    .await
+    .unwrap();
+    assert!(
+        allowed,
+        "bootstrap-created system realm tuple must authorize admin"
+    );
+
+    let mut admin_client = AdminServiceClient::connect(node.admin_url.clone())
+        .await
+        .unwrap();
+    let response = admin_client
+        .list_regions(with_auth(
+            tonic::Request::new(ListRegionsRequest { page: None }),
+            &admin_token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.regions.is_empty());
+}
+
+#[test]
+fn admin_rpc_relation_mapping_is_complete() {
+    let mapping = anvil::services::admin::admin_rpc_relation_mapping();
+    let names: std::collections::HashSet<_> = mapping.iter().map(|(name, _)| *name).collect();
+    assert_eq!(
+        names.len(),
+        mapping.len(),
+        "admin RPC mapping must not contain duplicates"
+    );
+
+    let expected = [
+        "CreateTenant",
+        "CreateApplication",
+        "RotateApplicationSecret",
+        "GrantApplicationPolicy",
+        "RevokeApplicationPolicy",
+        "RotateSecretEncryptionKey",
+        "CreateBucketAdmin",
+        "SetBucketPublicAccessAdmin",
+        "CreateHostAlias",
+        "ActivateHostAlias",
+        "SuspendHostAlias",
+        "DeleteHostAlias",
+        "ReadHostAlias",
+        "ListHostAliases",
+        "CreateRegion",
+        "ActivateRegion",
+        "SetRegionReadOnly",
+        "DrainRegion",
+        "RemoveRegion",
+        "ListRegions",
+        "RegisterCell",
+        "ActivateCell",
+        "DrainCell",
+        "RemoveCell",
+        "ListCells",
+        "RegisterNode",
+        "ActivateNode",
+        "DrainNode",
+        "ForceOfflineNode",
+        "RemoveNode",
+        "ListNodes",
+        "ListRoutingRecords",
+        "RepairRoutingRecord",
+        "RunRepair",
+        "ListDiagnostics",
+        "ListAuditEvents",
+    ];
+    for name in expected {
+        assert!(
+            names.contains(name),
+            "missing admin RPC relation mapping for {name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn admin_without_required_relation_is_denied() {
+    let node = spawn_admin_node().await;
+    let non_admin_token = non_admin_token(&node);
+    let mut admin_client = AdminServiceClient::connect(node.admin_url.clone())
+        .await
+        .unwrap();
+    let denied = admin_client
+        .list_regions(with_auth(
+            tonic::Request::new(ListRegionsRequest { page: None }),
+            &non_admin_token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn admin_with_required_relation_is_allowed() {
+    let node = spawn_admin_node().await;
+    let admin_token = admin_token(&node);
+    let mut admin_client = AdminServiceClient::connect(node.admin_url.clone())
+        .await
+        .unwrap();
+    admin_client
+        .list_regions(with_auth(
+            tonic::Request::new(ListRegionsRequest { page: None }),
+            &admin_token,
+        ))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn tenant_data_plane_credential_does_not_grant_admin() {
+    let node = spawn_admin_node().await;
+    let token = non_admin_token(&node);
+    let mut admin_client = AdminServiceClient::connect(node.admin_url.clone())
+        .await
+        .unwrap();
+    let denied = admin_client
+        .list_regions(with_auth(
+            tonic::Request::new(ListRegionsRequest { page: None }),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn admin_interceptor_rejects_missing_auth() {
+    let node = spawn_admin_node().await;
+    let mut admin_client = AdminServiceClient::connect(node.admin_url.clone())
+        .await
+        .unwrap();
+    let err = admin_client
+        .list_regions(tonic::Request::new(ListRegionsRequest { page: None }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Unauthenticated);
+}
+
+#[tokio::test]
+async fn admin_interceptor_rejects_public_data_plane_only_credential() {
+    let node = spawn_admin_node().await;
+    let token = non_admin_token(&node);
+    let mut admin_client = AdminServiceClient::connect(node.admin_url.clone())
+        .await
+        .unwrap();
+    let err = admin_client
+        .list_regions(with_auth(
+            tonic::Request::new(ListRegionsRequest { page: None }),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied);
+}
+
+#[test]
+fn public_admin_bind_requires_explicit_unsafe_opt_in() {
+    for addr in ["0.0.0.0:50052", "[::]:50052", "192.168.1.10:50052"] {
+        let config = anvil::config::Config {
+            admin_listen_addr: addr.to_string(),
+            allow_public_admin_listener: false,
+            ..Default::default()
+        };
+        assert!(config.validate_admin_listener_bind().is_err(), "{addr}");
+    }
+
+    for addr in ["127.0.0.1:50052", "[::1]:50052"] {
+        let config = anvil::config::Config {
+            admin_listen_addr: addr.to_string(),
+            allow_public_admin_listener: false,
+            ..Default::default()
+        };
+        config.validate_admin_listener_bind().unwrap();
+    }
+
+    let config = anvil::config::Config {
+        admin_listen_addr: "0.0.0.0:50052".to_string(),
+        allow_public_admin_listener: true,
+        ..Default::default()
+    };
+    config.validate_admin_listener_bind().unwrap();
 }
 
 #[tokio::test]
@@ -1432,7 +1631,7 @@ async fn admin_host_aliases_are_generation_checked_and_lifecycle_managed() {
 
     let native_hostname = client
         .create_host_alias(with_auth(
-            tonic::Request::new(CreateHostAliasRequest {
+            tonic::Request::new(CreateHostAliasAdminRequest {
                 context: Some(context("alias-native-hostname", 0)),
                 hostname: "releases.tenant-alias.eu-west-1.anvil-storage.test".to_string(),
                 tenant_id: "tenant-alias".to_string(),
@@ -1448,7 +1647,7 @@ async fn admin_host_aliases_are_generation_checked_and_lifecycle_managed() {
 
     let created = client
         .create_host_alias(with_auth(
-            tonic::Request::new(CreateHostAliasRequest {
+            tonic::Request::new(CreateHostAliasAdminRequest {
                 context: Some(context("alias-create", 0)),
                 hostname: "CDN.Example.Com.".to_string(),
                 tenant_id: "tenant-alias".to_string(),
@@ -1583,7 +1782,7 @@ async fn admin_host_aliases_are_generation_checked_and_lifecycle_managed() {
 
     let deleted = client
         .delete_host_alias(with_auth(
-            tonic::Request::new(DeleteHostAliasRequest {
+            tonic::Request::new(DeleteHostAliasAdminRequest {
                 context: Some(context("alias-delete", suspended.generation)),
                 hostname: "cdn.example.com".to_string(),
             }),
@@ -1594,285 +1793,6 @@ async fn admin_host_aliases_are_generation_checked_and_lifecycle_managed() {
         .into_inner();
     assert_eq!(deleted.resource_id, "cdn.example.com");
     assert_eq!(deleted.generation, suspended.generation + 1);
-}
-
-#[tokio::test]
-async fn admin_object_links_are_cas_checked_metadata_entries() {
-    let node = spawn_admin_node().await;
-    let token = admin_token(&node);
-    let denied_token = non_admin_token(&node);
-    let tenant = node
-        .state
-        .persistence
-        .create_tenant("tenant-links", "unused")
-        .await
-        .unwrap();
-    let bucket = node
-        .state
-        .persistence
-        .create_bucket(tenant.id, "releases", "eu-west-1")
-        .await
-        .unwrap();
-    let target_v1 = node
-        .state
-        .persistence
-        .create_object(
-            tenant.id,
-            bucket.id,
-            "versions/app-v1.bin",
-            "hash-v1",
-            8,
-            "etag-v1",
-            Some("application/octet-stream"),
-            None,
-            None,
-            Some(b"v1-bytes".to_vec()),
-        )
-        .await
-        .unwrap();
-    let target_v2 = node
-        .state
-        .persistence
-        .create_object(
-            tenant.id,
-            bucket.id,
-            "versions/app-v2.bin",
-            "hash-v2",
-            8,
-            "etag-v2",
-            Some("application/octet-stream"),
-            None,
-            None,
-            Some(b"v2-bytes".to_vec()),
-        )
-        .await
-        .unwrap();
-
-    let mut client = AdminServiceClient::connect(node.admin_url.clone())
-        .await
-        .unwrap();
-
-    let created = client
-        .create_object_link(with_auth(
-            tonic::Request::new(CreateObjectLinkRequest {
-                context: Some(context("create-link", 0)),
-                tenant_id: "tenant-links".to_string(),
-                bucket_name: "releases".to_string(),
-                link_key: "latest.bin".to_string(),
-                target_key: "versions/app-v1.bin".to_string(),
-                target_version: String::new(),
-                resolution: 1,
-                allow_dangling: false,
-            }),
-            &token,
-        ))
-        .await
-        .unwrap()
-        .into_inner()
-        .link
-        .unwrap();
-    assert_eq!(created.generation, 1);
-    assert_eq!(created.target_key, "versions/app-v1.bin");
-    assert_eq!(created.created_by, "principal:admin-principal");
-
-    let duplicate_create = client
-        .create_object_link(with_auth(
-            tonic::Request::new(CreateObjectLinkRequest {
-                context: Some(context("create-link-stale", 0)),
-                tenant_id: "tenant-links".to_string(),
-                bucket_name: "releases".to_string(),
-                link_key: "latest.bin".to_string(),
-                target_key: "versions/app-v1.bin".to_string(),
-                target_version: String::new(),
-                resolution: 1,
-                allow_dangling: false,
-            }),
-            &token,
-        ))
-        .await
-        .unwrap_err();
-    assert_eq!(duplicate_create.code(), Code::AlreadyExists);
-
-    let denied_read = client
-        .read_object_link(with_auth(
-            tonic::Request::new(ReadObjectLinkRequest {
-                request_id: "req-denied-read-link".to_string(),
-                tenant_id: "tenant-links".to_string(),
-                bucket_name: "releases".to_string(),
-                link_key: "latest.bin".to_string(),
-            }),
-            &denied_token,
-        ))
-        .await
-        .unwrap_err();
-    assert_eq!(denied_read.code(), Code::PermissionDenied);
-
-    let read = client
-        .read_object_link(with_auth(
-            tonic::Request::new(ReadObjectLinkRequest {
-                request_id: "req-read-link".to_string(),
-                tenant_id: "tenant-links".to_string(),
-                bucket_name: "releases".to_string(),
-                link_key: "latest.bin".to_string(),
-            }),
-            &token,
-        ))
-        .await
-        .unwrap()
-        .into_inner()
-        .link
-        .unwrap();
-    assert_eq!(read.generation, created.generation);
-    assert_eq!(read.target_key, "versions/app-v1.bin");
-
-    let listed = client
-        .list_object_links(with_auth(
-            tonic::Request::new(ListObjectLinksRequest {
-                tenant_id: "tenant-links".to_string(),
-                bucket_name: "releases".to_string(),
-                prefix: "latest".to_string(),
-                page: Some(PageRequest {
-                    cursor: String::new(),
-                    limit: 10,
-                }),
-            }),
-            &token,
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(listed.links.len(), 1);
-    assert_eq!(listed.links[0].link_key, "latest.bin");
-
-    let link_entry = node
-        .state
-        .persistence
-        .get_object(bucket.id, "latest.bin")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(link_entry.size, 0);
-    assert!(link_entry.shard_map.is_none());
-
-    let stale_update = client
-        .update_object_link(with_auth(
-            tonic::Request::new(UpdateObjectLinkRequest {
-                context: Some(context("update-link-stale", created.generation + 1)),
-                tenant_id: "tenant-links".to_string(),
-                bucket_name: "releases".to_string(),
-                link_key: "latest.bin".to_string(),
-                target_key: "versions/app-v2.bin".to_string(),
-                target_version: String::new(),
-                resolution: 1,
-                allow_dangling: false,
-            }),
-            &token,
-        ))
-        .await
-        .unwrap_err();
-    assert_eq!(stale_update.code(), Code::Aborted);
-
-    let updated = client
-        .update_object_link(with_auth(
-            tonic::Request::new(UpdateObjectLinkRequest {
-                context: Some(context("update-link", created.generation)),
-                tenant_id: "tenant-links".to_string(),
-                bucket_name: "releases".to_string(),
-                link_key: "latest.bin".to_string(),
-                target_key: "versions/app-v2.bin".to_string(),
-                target_version: String::new(),
-                resolution: 1,
-                allow_dangling: false,
-            }),
-            &token,
-        ))
-        .await
-        .unwrap()
-        .into_inner()
-        .link
-        .unwrap();
-    assert_eq!(updated.generation, created.generation + 1);
-    assert_eq!(updated.target_key, "versions/app-v2.bin");
-
-    let updated_entry = node
-        .state
-        .persistence
-        .get_object(bucket.id, "latest.bin")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(updated_entry.size, 0);
-    assert!(updated_entry.shard_map.is_none());
-
-    let stale_delete = client
-        .delete_object_link(with_auth(
-            tonic::Request::new(DeleteObjectLinkRequest {
-                context: Some(context("delete-link-stale", created.generation)),
-                tenant_id: "tenant-links".to_string(),
-                bucket_name: "releases".to_string(),
-                link_key: "latest.bin".to_string(),
-            }),
-            &token,
-        ))
-        .await
-        .unwrap_err();
-    assert_eq!(stale_delete.code(), Code::Aborted);
-
-    let deleted = client
-        .delete_object_link(with_auth(
-            tonic::Request::new(DeleteObjectLinkRequest {
-                context: Some(context("delete-link", updated.generation)),
-                tenant_id: "tenant-links".to_string(),
-                bucket_name: "releases".to_string(),
-                link_key: "latest.bin".to_string(),
-            }),
-            &token,
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(deleted.generation, updated.generation + 1);
-
-    let deleted_read = client
-        .read_object_link(with_auth(
-            tonic::Request::new(ReadObjectLinkRequest {
-                request_id: "req-read-deleted-link".to_string(),
-                tenant_id: "tenant-links".to_string(),
-                bucket_name: "releases".to_string(),
-                link_key: "latest.bin".to_string(),
-            }),
-            &token,
-        ))
-        .await
-        .unwrap_err();
-    assert_eq!(deleted_read.code(), Code::NotFound);
-
-    assert!(
-        node.state
-            .persistence
-            .get_object(bucket.id, "latest.bin")
-            .await
-            .unwrap()
-            .is_none()
-    );
-    let stored_v1 = node
-        .state
-        .persistence
-        .get_object(bucket.id, "versions/app-v1.bin")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(stored_v1.content_hash, target_v1.content_hash);
-    assert_eq!(stored_v1.shard_map, target_v1.shard_map);
-    let stored_v2 = node
-        .state
-        .persistence
-        .get_object(bucket.id, "versions/app-v2.bin")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(stored_v2.content_hash, target_v2.content_hash);
-    assert_eq!(stored_v2.shard_map, target_v2.shard_map);
 }
 
 #[tokio::test]
@@ -1940,41 +1860,6 @@ async fn admin_mutations_are_returned_by_durable_audit_listing() {
         .unwrap()
         .into_inner();
 
-    node.state
-        .persistence
-        .create_object(
-            tenant_id,
-            bucket.bucket_id,
-            "versions/app-v1.bin",
-            "hash-v1",
-            8,
-            "etag-v1",
-            Some("application/octet-stream"),
-            None,
-            None,
-            Some(b"v1-bytes".to_vec()),
-        )
-        .await
-        .unwrap();
-
-    let link_response = client
-        .create_object_link(with_auth(
-            tonic::Request::new(CreateObjectLinkRequest {
-                context: Some(context("audit-create-link", 0)),
-                tenant_id: tenant.tenant_id.clone(),
-                bucket_name: bucket.name.clone(),
-                link_key: "latest.bin".to_string(),
-                target_key: "versions/app-v1.bin".to_string(),
-                target_version: String::new(),
-                resolution: 1,
-                allow_dangling: false,
-            }),
-            &token,
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-
     let region_response = client
         .create_region(with_auth(
             tonic::Request::new(CreateRegionRequest {
@@ -2019,7 +1904,7 @@ async fn admin_mutations_are_returned_by_durable_audit_listing() {
 
     let host_alias_response = client
         .create_host_alias(with_auth(
-            tonic::Request::new(CreateHostAliasRequest {
+            tonic::Request::new(CreateHostAliasAdminRequest {
                 context: Some(context("audit-create-host-alias", 0)),
                 hostname: "Audit.Example.Com.".to_string(),
                 tenant_id: tenant.tenant_id.clone(),
@@ -2163,12 +2048,18 @@ async fn admin_mutations_are_returned_by_durable_audit_listing() {
         tenant_details["idempotency_key"],
         "idem-audit-create-tenant"
     );
+    assert_eq!(tenant_details["authorised_relation"], "manage_tenants");
+    assert_eq!(
+        tenant_details["authorised_object"],
+        "realm__system__anvil_mesh:mesh-test"
+    );
 
     let app_event = find_event("admin.app.create");
     assert_eq!(app_event.audit_event_id, app_response.audit_event_id);
     let app_details = details(app_event);
     assert_eq!(app_details["tenant_id"], tenant_id);
     assert_eq!(app_details["app_name"], "publisher");
+    assert_eq!(app_details["authorised_relation"], "manage_apps");
 
     let bucket_event = find_event("admin.bucket.create");
     assert_eq!(bucket_event.audit_event_id, bucket_response.audit_event_id);
@@ -2188,16 +2079,6 @@ async fn admin_mutations_are_returned_by_durable_audit_listing() {
     let public_bucket_details = details(public_bucket_event);
     assert_eq!(public_bucket_details["allow_public_read"], true);
     assert_eq!(public_bucket_details["expected_generation"], 1);
-
-    let link_event = find_event("admin.object_link.create");
-    assert_eq!(link_event.audit_event_id, link_response.audit_event_id);
-    assert_eq!(
-        link_event.resource_id,
-        format!("tenant:{tenant_id}:bucket:release-assets:link:latest.bin")
-    );
-    let link_details = details(link_event);
-    assert_eq!(link_details["target_key"], "versions/app-v1.bin");
-    assert_eq!(link_details["resolution"], "follow");
 
     let region_event = find_event("admin.region.create");
     assert_eq!(region_event.audit_event_id, region_response.audit_event_id);

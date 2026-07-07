@@ -12,10 +12,6 @@ pub struct Config {
     #[arg(long, env)]
     pub jwt_secret: String,
 
-    /// Optional fixed bearer token accepted for first administrative bootstrap.
-    #[arg(long, env)]
-    pub anvil_bootstrap_admin_token: Option<String>,
-
     /// Active hex-encoded 32-byte key used for server-side secret encryption.
     #[arg(long, env)]
     pub anvil_secret_encryption_key: String,
@@ -48,9 +44,29 @@ pub struct Config {
     #[arg(long, env, default_value = "127.0.0.1:50052")]
     pub admin_listen_addr: String,
 
+    /// Explicitly allow binding the private admin plane to a non-loopback address.
+    #[arg(long, env, default_value_t = false)]
+    pub allow_public_admin_listener: bool,
+
     /// Stable mesh identifier for administrative and lifecycle records.
     #[arg(long, env, default_value = "default")]
     pub mesh_id: String,
+
+    /// First-boot system-realm admin app name. Used only when the system realm is absent.
+    #[arg(long, env, default_value = "")]
+    pub bootstrap_system_admin_app_name: String,
+
+    /// File path where the first-boot admin app credential JSON is written.
+    #[arg(long, env, default_value = "")]
+    pub bootstrap_system_admin_credential_output_path: String,
+
+    /// Existing first-boot admin subject kind. Used instead of creating an app.
+    #[arg(long, env, default_value = "")]
+    pub bootstrap_system_admin_subject_kind: String,
+
+    /// Existing first-boot admin subject id. Used instead of creating an app.
+    #[arg(long, env, default_value = "")]
+    pub bootstrap_system_admin_subject_id: String,
 
     /// The current region this node is operating in.
     #[arg(long, env)]
@@ -175,6 +191,17 @@ impl Config {
         )
     }
 
+    pub fn validate_admin_listener_bind(&self) -> Result<()> {
+        let addr: std::net::SocketAddr = self.admin_listen_addr.parse()?;
+        if !self.allow_public_admin_listener && !addr.ip().is_loopback() {
+            anyhow::bail!(
+                "ADMIN_LISTEN_ADDR={} is not loopback; set ALLOW_PUBLIC_ADMIN_LISTENER=true only when the admin port is protected by private networking",
+                self.admin_listen_addr
+            );
+        }
+        Ok(())
+    }
+
     pub fn with_persisted_identity(mut self) -> Result<Self> {
         let node_id_path = self.resolved_node_id_path();
         let cluster_keypair_path = self.resolved_cluster_keypair_path();
@@ -265,5 +292,38 @@ mod tests {
         );
         assert!(Path::new(&first.node_id_path).exists());
         assert!(Path::new(&first.cluster_keypair_path).exists());
+    }
+
+    #[test]
+    fn admin_listener_rejects_public_bind_without_explicit_opt_in() {
+        for addr in ["0.0.0.0:50052", "[::]:50052", "192.168.1.10:50052"] {
+            let config = Config {
+                admin_listen_addr: addr.to_string(),
+                allow_public_admin_listener: false,
+                ..Config::default()
+            };
+
+            assert!(config.validate_admin_listener_bind().is_err(), "{addr}");
+        }
+    }
+
+    #[test]
+    fn admin_listener_allows_loopback_or_explicit_public_opt_in() {
+        for addr in ["127.0.0.1:50052", "[::1]:50052"] {
+            let config = Config {
+                admin_listen_addr: addr.to_string(),
+                allow_public_admin_listener: false,
+                ..Config::default()
+            };
+
+            config.validate_admin_listener_bind().unwrap();
+        }
+
+        let config = Config {
+            admin_listen_addr: "0.0.0.0:50052".to_string(),
+            allow_public_admin_listener: true,
+            ..Config::default()
+        };
+        config.validate_admin_listener_bind().unwrap();
     }
 }

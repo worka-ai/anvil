@@ -38,7 +38,7 @@ impl RepairService for AppState {
                 req.rebuild,
             )
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(repair_error_status)?;
         let (source_cursor_low, source_cursor_high) = split_u128(report.source_cursor);
         let build = report
             .build
@@ -88,7 +88,7 @@ impl RepairService for AppState {
             .persistence
             .repair_directory_index(claims.tenant_id, &req.bucket_name, req.rebuild)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(repair_error_status)?;
         let (source_cursor_low, source_cursor_high) = split_u128(report.source_cursor);
         Ok(Response::new(RepairDirectoryIndexResponse {
             status: directory_repair::status_name(&report.status).to_string(),
@@ -248,6 +248,15 @@ fn repair_subject_record(subject: &RepairSubjectRef) -> RepairSubjectRecord {
         has_cursor: subject.cursor.is_some(),
         expected_hash: subject.expected_hash.clone().unwrap_or_default(),
         actual_hash: subject.actual_hash.clone().unwrap_or_default(),
+    }
+}
+
+fn repair_error_status(error: anyhow::Error) -> Status {
+    let message = error.to_string();
+    if message.contains("bucket not found") || message.contains("index definition not found") {
+        Status::not_found(message)
+    } else {
+        Status::internal(message)
     }
 }
 

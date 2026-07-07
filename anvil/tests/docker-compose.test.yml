@@ -15,20 +15,23 @@ services:
       - RUST_LOG=info
       - REGION=docker-test
       - JWT_SECRET=docker-test-secret
-      - ANVIL_BOOTSTRAP_ADMIN_TOKEN=docker-bootstrap-admin-token
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - ANVIL_SECRET_ENCRYPTION_KEY_ID=docker-test-primary
-      - ANVIL_CLUSTER_SECRET=docker-cluster-secret
+      - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
       - ADMIN_LISTEN_ADDR=0.0.0.0:50052
+      - ALLOW_PUBLIC_ADMIN_LISTENER=true
+      - BOOTSTRAP_SYSTEM_ADMIN_APP_NAME=docker-admin
+      - BOOTSTRAP_SYSTEM_ADMIN_CREDENTIAL_OUTPUT_PATH=/var/lib/anvil/bootstrap/admin.json
+      - ANVIL_BOOTSTRAP_CREDENTIAL_FILE=/var/lib/anvil/bootstrap/admin.json
+      - ANVIL_PUBLIC_ENDPOINT=http://127.0.0.1:50051
       - ANVIL_ADMIN_ENDPOINT=http://127.0.0.1:50052
-      - ANVIL_AUTH_TOKEN=docker-bootstrap-admin-token
       - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7443/quic-v1
       - PUBLIC_CLUSTER_ADDRS=/dns4/anvil1/udp/7443/quic-v1
       - PUBLIC_API_ADDR=http://anvil1:50051
       - ENABLE_MDNS=false
       - STORAGE_PATH=/var/lib/anvil
-    command: ["anvil", "--init-cluster"]
+    command: ["anvil-server", "--init-cluster"]
     ports:
       - "${ANVIL_TEST_API1_PORT:-55051}:50051"
     volumes:
@@ -50,14 +53,17 @@ services:
       - RUST_LOG=info
       - REGION=docker-test
       - JWT_SECRET=docker-test-secret
-      - ANVIL_BOOTSTRAP_ADMIN_TOKEN=docker-bootstrap-admin-token
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - ANVIL_SECRET_ENCRYPTION_KEY_ID=docker-test-primary
-      - ANVIL_CLUSTER_SECRET=docker-cluster-secret
+      - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
       - ADMIN_LISTEN_ADDR=0.0.0.0:50052
+      - ALLOW_PUBLIC_ADMIN_LISTENER=true
+      - BOOTSTRAP_SYSTEM_ADMIN_APP_NAME=docker-admin
+      - BOOTSTRAP_SYSTEM_ADMIN_CREDENTIAL_OUTPUT_PATH=/var/lib/anvil/bootstrap/admin.json
+      - ANVIL_BOOTSTRAP_CREDENTIAL_FILE=/var/lib/anvil/bootstrap/admin.json
+      - ANVIL_PUBLIC_ENDPOINT=http://127.0.0.1:50051
       - ANVIL_ADMIN_ENDPOINT=http://127.0.0.1:50052
-      - ANVIL_AUTH_TOKEN=docker-bootstrap-admin-token
       - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7444/quic-v1
       - PUBLIC_CLUSTER_ADDRS=/dns4/anvil2/udp/7444/quic-v1
       - PUBLIC_API_ADDR=http://anvil2:50051
@@ -80,14 +86,17 @@ services:
       - RUST_LOG=info
       - REGION=docker-test
       - JWT_SECRET=docker-test-secret
-      - ANVIL_BOOTSTRAP_ADMIN_TOKEN=docker-bootstrap-admin-token
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - ANVIL_SECRET_ENCRYPTION_KEY_ID=docker-test-primary
-      - ANVIL_CLUSTER_SECRET=docker-cluster-secret
+      - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
       - ADMIN_LISTEN_ADDR=0.0.0.0:50052
+      - ALLOW_PUBLIC_ADMIN_LISTENER=true
+      - BOOTSTRAP_SYSTEM_ADMIN_APP_NAME=docker-admin
+      - BOOTSTRAP_SYSTEM_ADMIN_CREDENTIAL_OUTPUT_PATH=/var/lib/anvil/bootstrap/admin.json
+      - ANVIL_BOOTSTRAP_CREDENTIAL_FILE=/var/lib/anvil/bootstrap/admin.json
+      - ANVIL_PUBLIC_ENDPOINT=http://127.0.0.1:50051
       - ANVIL_ADMIN_ENDPOINT=http://127.0.0.1:50052
-      - ANVIL_AUTH_TOKEN=docker-bootstrap-admin-token
       - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7445/quic-v1
       - PUBLIC_CLUSTER_ADDRS=/dns4/anvil3/udp/7445/quic-v1
       - PUBLIC_API_ADDR=http://anvil3:50051

@@ -1,6 +1,5 @@
 use super::admin_cursor::{self, AdminCursorBinding};
 use crate::admin_audit::{self, AdminAuditEvent, AuditEventFilter};
-use crate::admin_auth::{self, AdminPrincipal, AnvilAdminCapability};
 use crate::anvil_api::admin_service_server::AdminService;
 use crate::anvil_api::*;
 use crate::mesh_lifecycle::{
@@ -8,13 +7,13 @@ use crate::mesh_lifecycle::{
     LifecycleState as CoreLifecycleState, NodeCapability as CoreNodeCapability,
     NodeDrainDescriptor, RegisterCellDescriptor, RegisterNodeDescriptor,
 };
-use crate::object_links;
 use crate::persistence;
 use crate::repair_finding::{RepairFinding, RepairSubjectRef};
 use crate::routing::{
     self, HostAliasDescriptor as CoreHostAliasDescriptor, HostAliasState as CoreHostAliasState,
     RoutingConfig,
 };
+use crate::system_realm::{AdminPrincipal, SystemAdminRelation};
 use crate::{
     AppState, auth, authz_repair, directory_repair, index_repair, mesh_control_stream,
     mesh_directory, persistence::Bucket, personaldb_repair,
@@ -23,13 +22,66 @@ use chrono::Utc;
 use serde_json::json;
 use tonic::{Request, Response, Status};
 
+pub fn admin_rpc_relation_mapping() -> &'static [(&'static str, SystemAdminRelation)] {
+    &[
+        ("CreateTenant", SystemAdminRelation::ManageTenants),
+        ("CreateApplication", SystemAdminRelation::ManageApps),
+        ("RotateApplicationSecret", SystemAdminRelation::ManageApps),
+        (
+            "GrantApplicationPolicy",
+            SystemAdminRelation::ManagePolicies,
+        ),
+        (
+            "RevokeApplicationPolicy",
+            SystemAdminRelation::ManagePolicies,
+        ),
+        (
+            "RotateSecretEncryptionKey",
+            SystemAdminRelation::ManageSecretEncryptionKeys,
+        ),
+        ("CreateBucketAdmin", SystemAdminRelation::ManageBuckets),
+        (
+            "SetBucketPublicAccessAdmin",
+            SystemAdminRelation::ManageBuckets,
+        ),
+        ("CreateHostAlias", SystemAdminRelation::ManageHostAliases),
+        ("ActivateHostAlias", SystemAdminRelation::ManageHostAliases),
+        ("SuspendHostAlias", SystemAdminRelation::ManageHostAliases),
+        ("DeleteHostAlias", SystemAdminRelation::ManageHostAliases),
+        ("ReadHostAlias", SystemAdminRelation::ManageHostAliases),
+        ("ListHostAliases", SystemAdminRelation::ManageHostAliases),
+        ("CreateRegion", SystemAdminRelation::ManageRegions),
+        ("ActivateRegion", SystemAdminRelation::ManageRegions),
+        ("SetRegionReadOnly", SystemAdminRelation::ManageRegions),
+        ("DrainRegion", SystemAdminRelation::ManageRegions),
+        ("RemoveRegion", SystemAdminRelation::ManageRegions),
+        ("ListRegions", SystemAdminRelation::ManageRegions),
+        ("RegisterCell", SystemAdminRelation::ManageRegions),
+        ("ActivateCell", SystemAdminRelation::ManageRegions),
+        ("DrainCell", SystemAdminRelation::ManageRegions),
+        ("RemoveCell", SystemAdminRelation::ManageRegions),
+        ("ListCells", SystemAdminRelation::ManageRegions),
+        ("RegisterNode", SystemAdminRelation::ManageNodes),
+        ("ActivateNode", SystemAdminRelation::ManageNodes),
+        ("DrainNode", SystemAdminRelation::ManageNodes),
+        ("ForceOfflineNode", SystemAdminRelation::ManageNodes),
+        ("RemoveNode", SystemAdminRelation::ManageNodes),
+        ("ListNodes", SystemAdminRelation::ManageNodes),
+        ("ListRoutingRecords", SystemAdminRelation::ManageRouting),
+        ("RepairRoutingRecord", SystemAdminRelation::ManageRouting),
+        ("RunRepair", SystemAdminRelation::RunRepair),
+        ("ListDiagnostics", SystemAdminRelation::ViewDiagnostics),
+        ("ListAuditEvents", SystemAdminRelation::ViewAuditLog),
+    ]
+}
+
 #[tonic::async_trait]
 impl AdminService for AppState {
     async fn create_tenant(
         &self,
         request: Request<CreateTenantRequest>,
     ) -> Result<Response<TenantAdminResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageTenants)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageTenants).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), true)?;
         let home_region = if req.home_region.trim().is_empty() {
@@ -71,7 +123,7 @@ impl AdminService for AppState {
         &self,
         request: Request<CreateApplicationRequest>,
     ) -> Result<Response<ApplicationSecretResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageApps)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageApps).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), true)?;
         let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
@@ -113,7 +165,7 @@ impl AdminService for AppState {
         &self,
         request: Request<RotateApplicationSecretRequest>,
     ) -> Result<Response<ApplicationSecretResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageApps)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageApps).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
@@ -161,7 +213,7 @@ impl AdminService for AppState {
         &self,
         request: Request<GrantApplicationPolicyRequest>,
     ) -> Result<Response<ApplicationPolicyResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManagePolicies)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManagePolicies).await?;
         let req = request.into_inner();
         let context = require_admin_action_context(req.context.as_ref())?;
         let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
@@ -202,7 +254,7 @@ impl AdminService for AppState {
         &self,
         request: Request<RevokeApplicationPolicyRequest>,
     ) -> Result<Response<ApplicationPolicyResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManagePolicies)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManagePolicies).await?;
         let req = request.into_inner();
         let context = require_admin_action_context(req.context.as_ref())?;
         let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
@@ -246,8 +298,9 @@ impl AdminService for AppState {
         let principal = require_admin(
             &request,
             self,
-            AnvilAdminCapability::ManageSecretEncryptionKeys,
-        )?;
+            SystemAdminRelation::ManageSecretEncryptionKeys,
+        )
+        .await?;
         let req = request.into_inner();
         let context = require_admin_action_context(req.context.as_ref())?;
         let mut stats = SecretEncryptionRotationStats::default();
@@ -291,7 +344,7 @@ impl AdminService for AppState {
         &self,
         request: Request<CreateBucketAdminRequest>,
     ) -> Result<Response<BucketAdminResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageBuckets)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageBuckets).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), true)?;
         let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
@@ -326,7 +379,7 @@ impl AdminService for AppState {
         &self,
         request: Request<SetBucketPublicAccessAdminRequest>,
     ) -> Result<Response<BucketAdminResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageBuckets)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageBuckets).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
@@ -364,279 +417,12 @@ impl AdminService for AppState {
         }))
     }
 
-    async fn create_object_link(
-        &self,
-        request: Request<CreateObjectLinkRequest>,
-    ) -> Result<Response<ObjectLinkResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageLinks)?;
-        let req = request.into_inner();
-        let context = require_mutation_context(req.context.as_ref(), true)?;
-        let request_id = context.request_id.clone();
-        let idempotency_key = context.idempotency_key.clone();
-        let bucket = resolve_link_bucket(self, &req.tenant_id, &req.bucket_name).await?;
-        let resolution = object_link_resolution_from_proto(req.resolution)?;
-        let target_version = parse_optional_uuid("target_version", req.target_version)?;
-        let mutation = self
-            .persistence
-            .put_object_link(object_links::PutObjectLinkRequest {
-                tenant_id: bucket.tenant_id,
-                bucket_id: bucket.id,
-                link_key: req.link_key,
-                target_key: req.target_key,
-                target_version,
-                resolution,
-                expected_generation: None,
-                create_only: true,
-                allow_dangling: req.allow_dangling,
-                idempotency_key,
-                created_by: principal_label(&principal),
-            })
-            .await
-            .map_err(object_link_status)?;
-        let audit_event_id = record_admin_audit_event(
-            self,
-            &principal,
-            context,
-            "admin.object_link.create",
-            &object_link_resource_id(
-                bucket.tenant_id,
-                &bucket.name,
-                &mutation.descriptor.link_key,
-            ),
-            json!({
-                "resource_kind": "object_link",
-                "tenant_id": bucket.tenant_id,
-                "bucket_id": bucket.id,
-                "bucket_name": &bucket.name,
-                "link_key": &mutation.descriptor.link_key,
-                "target_key": &mutation.descriptor.target_key,
-                "target_version": &mutation.descriptor.target_version,
-                "resolution": mutation.descriptor.resolution,
-                "allow_dangling": req.allow_dangling,
-                "generation": mutation.descriptor.generation,
-                "created_by": &mutation.descriptor.created_by,
-            }),
-        )
-        .await?;
-
-        Ok(Response::new(ObjectLinkResponse {
-            request_id,
-            link: Some(object_link_descriptor_to_proto(mutation.descriptor)),
-            audit_event_id,
-        }))
-    }
-
-    async fn update_object_link(
-        &self,
-        request: Request<UpdateObjectLinkRequest>,
-    ) -> Result<Response<ObjectLinkResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageLinks)?;
-        let req = request.into_inner();
-        let context = require_mutation_context(req.context.as_ref(), false)?;
-        let request_id = context.request_id.clone();
-        let idempotency_key = context.idempotency_key.clone();
-        let expected_generation = context.expected_generation;
-        let bucket = resolve_link_bucket(self, &req.tenant_id, &req.bucket_name).await?;
-        let resolution = object_link_resolution_from_proto(req.resolution)?;
-        let target_version = parse_optional_uuid("target_version", req.target_version)?;
-        let mutation = self
-            .persistence
-            .put_object_link(object_links::PutObjectLinkRequest {
-                tenant_id: bucket.tenant_id,
-                bucket_id: bucket.id,
-                link_key: req.link_key,
-                target_key: req.target_key,
-                target_version,
-                resolution,
-                expected_generation: Some(expected_generation),
-                create_only: false,
-                allow_dangling: req.allow_dangling,
-                idempotency_key,
-                created_by: principal_label(&principal),
-            })
-            .await
-            .map_err(object_link_status)?;
-        let audit_event_id = record_admin_audit_event(
-            self,
-            &principal,
-            context,
-            "admin.object_link.update",
-            &object_link_resource_id(
-                bucket.tenant_id,
-                &bucket.name,
-                &mutation.descriptor.link_key,
-            ),
-            json!({
-                "resource_kind": "object_link",
-                "tenant_id": bucket.tenant_id,
-                "bucket_id": bucket.id,
-                "bucket_name": &bucket.name,
-                "link_key": &mutation.descriptor.link_key,
-                "target_key": &mutation.descriptor.target_key,
-                "target_version": &mutation.descriptor.target_version,
-                "resolution": mutation.descriptor.resolution,
-                "allow_dangling": req.allow_dangling,
-                "previous_generation": expected_generation,
-                "generation": mutation.descriptor.generation,
-                "created_by": &mutation.descriptor.created_by,
-            }),
-        )
-        .await?;
-
-        Ok(Response::new(ObjectLinkResponse {
-            request_id,
-            link: Some(object_link_descriptor_to_proto(mutation.descriptor)),
-            audit_event_id,
-        }))
-    }
-
-    async fn delete_object_link(
-        &self,
-        request: Request<DeleteObjectLinkRequest>,
-    ) -> Result<Response<AdminMutationResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageLinks)?;
-        let req = request.into_inner();
-        let context = require_mutation_context(req.context.as_ref(), false)?;
-        let request_id = context.request_id.clone();
-        let idempotency_key = context.idempotency_key.clone();
-        let expected_generation = context.expected_generation;
-        let bucket = resolve_link_bucket(self, &req.tenant_id, &req.bucket_name).await?;
-        let deleted = self
-            .persistence
-            .delete_object_link(object_links::DeleteObjectLinkRequest {
-                tenant_id: bucket.tenant_id,
-                bucket_id: bucket.id,
-                link_key: req.link_key,
-                expected_generation,
-                idempotency_key,
-            })
-            .await
-            .map_err(object_link_status)?;
-        let audit_event_id = record_admin_audit_event(
-            self,
-            &principal,
-            context,
-            "admin.object_link.delete",
-            &object_link_resource_id(bucket.tenant_id, &bucket.name, &deleted.link_key),
-            json!({
-                "resource_kind": "object_link",
-                "tenant_id": bucket.tenant_id,
-                "bucket_id": bucket.id,
-                "bucket_name": &bucket.name,
-                "link_key": &deleted.link_key,
-                "previous_generation": expected_generation,
-                "generation": deleted.generation,
-            }),
-        )
-        .await?;
-
-        Ok(Response::new(AdminMutationResponse {
-            request_id,
-            resource_id: deleted.link_key,
-            generation: deleted.generation,
-            audit_event_id,
-            idempotent_replay: false,
-        }))
-    }
-
-    async fn read_object_link(
-        &self,
-        request: Request<ReadObjectLinkRequest>,
-    ) -> Result<Response<ObjectLinkResponse>, Status> {
-        require_admin(&request, self, AnvilAdminCapability::ManageLinks)?;
-        let req = request.into_inner();
-        let bucket = resolve_link_bucket(self, &req.tenant_id, &req.bucket_name).await?;
-        let descriptor = self
-            .persistence
-            .get_object_link(bucket.id, &req.link_key)
-            .await
-            .map_err(object_link_status)?
-            .ok_or_else(|| Status::not_found("Object link not found"))?;
-
-        Ok(Response::new(ObjectLinkResponse {
-            request_id: req.request_id,
-            link: Some(object_link_descriptor_to_proto(descriptor)),
-            audit_event_id: String::new(),
-        }))
-    }
-
-    async fn list_object_links(
-        &self,
-        request: Request<ListObjectLinksRequest>,
-    ) -> Result<Response<ListObjectLinksResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageLinks)?;
-        let req = request.into_inner();
-        let bucket = resolve_link_bucket(self, &req.tenant_id, &req.bucket_name).await?;
-        let page = req.page.as_ref();
-        let limit = page_limit(page);
-        let links = self
-            .persistence
-            .list_object_links(bucket.id, none_if_empty(&req.prefix))
-            .await
-            .map_err(object_link_status)?;
-        let revision = admin_cursor::collection_revision(
-            links
-                .iter()
-                .map(|link| (link.link_key.as_str(), link.generation)),
-        );
-        let tenant_id_filter = bucket.tenant_id.to_string();
-        let filters = [
-            ("tenant_id", tenant_id_filter.as_str()),
-            ("bucket_name", bucket.name.as_str()),
-            ("prefix", req.prefix.as_str()),
-        ];
-        let binding = AdminCursorBinding {
-            scope: "admin.list_object_links.v1",
-            filters: &filters,
-            principal: &principal,
-            limit,
-            revision: &revision,
-            sort: "link_key.asc",
-        };
-        let cursor =
-            admin_cursor::decode_page_cursor(page, &binding, self.config.jwt_secret.as_bytes())?;
-        let mut links = links
-            .into_iter()
-            .filter(|link| {
-                cursor
-                    .as_deref()
-                    .is_none_or(|cursor| link.link_key.as_str() > cursor)
-            })
-            .take(limit + 1)
-            .collect::<Vec<_>>();
-        let has_more = links.len() > limit;
-        if has_more {
-            links.truncate(limit);
-        }
-        let next_cursor = if has_more {
-            links.last().map_or(Ok(String::new()), |link| {
-                admin_cursor::encode_next_cursor(
-                    &link.link_key,
-                    &binding,
-                    self.config.jwt_secret.as_bytes(),
-                )
-            })?
-        } else {
-            String::new()
-        };
-
-        Ok(Response::new(ListObjectLinksResponse {
-            page: Some(PageResponse {
-                next_cursor,
-                has_more,
-            }),
-            links: links
-                .into_iter()
-                .map(object_link_descriptor_to_proto)
-                .collect(),
-        }))
-    }
-
     async fn create_host_alias(
         &self,
-        request: Request<CreateHostAliasRequest>,
+        request: Request<CreateHostAliasAdminRequest>,
     ) -> Result<Response<HostAliasResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageHostAliases)?;
+        let principal =
+            require_admin(&request, self, SystemAdminRelation::ManageHostAliases).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), true)?;
         let request_id = context.request_id.clone();
@@ -676,7 +462,8 @@ impl AdminService for AppState {
         &self,
         request: Request<ActivateHostAliasRequest>,
     ) -> Result<Response<HostAliasResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageHostAliases)?;
+        let principal =
+            require_admin(&request, self, SystemAdminRelation::ManageHostAliases).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let host_alias = self
@@ -709,7 +496,8 @@ impl AdminService for AppState {
         &self,
         request: Request<SuspendHostAliasRequest>,
     ) -> Result<Response<HostAliasResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageHostAliases)?;
+        let principal =
+            require_admin(&request, self, SystemAdminRelation::ManageHostAliases).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let host_alias = self
@@ -740,9 +528,10 @@ impl AdminService for AppState {
 
     async fn delete_host_alias(
         &self,
-        request: Request<DeleteHostAliasRequest>,
+        request: Request<DeleteHostAliasAdminRequest>,
     ) -> Result<Response<AdminMutationResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageHostAliases)?;
+        let principal =
+            require_admin(&request, self, SystemAdminRelation::ManageHostAliases).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let host_alias = self
@@ -777,7 +566,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ReadHostAliasRequest>,
     ) -> Result<Response<HostAliasResponse>, Status> {
-        require_admin(&request, self, AnvilAdminCapability::ManageHostAliases)?;
+        require_admin(&request, self, SystemAdminRelation::ManageHostAliases).await?;
         let req = request.into_inner();
         let host_alias = self
             .persistence
@@ -797,7 +586,8 @@ impl AdminService for AppState {
         &self,
         request: Request<ListHostAliasesRequest>,
     ) -> Result<Response<ListHostAliasesResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageHostAliases)?;
+        let principal =
+            require_admin(&request, self, SystemAdminRelation::ManageHostAliases).await?;
         let req = request.into_inner();
         let page = req.page.as_ref();
         let limit = page_limit(page);
@@ -864,7 +654,7 @@ impl AdminService for AppState {
         &self,
         request: Request<CreateRegionRequest>,
     ) -> Result<Response<RegionResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), true)?;
         let region = self
@@ -899,7 +689,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ActivateRegionRequest>,
     ) -> Result<Response<RegionResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let checkpoint =
@@ -932,7 +722,7 @@ impl AdminService for AppState {
         &self,
         request: Request<SetRegionReadOnlyRequest>,
     ) -> Result<Response<RegionResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let region = self
@@ -964,7 +754,7 @@ impl AdminService for AppState {
         &self,
         request: Request<DrainRegionRequest>,
     ) -> Result<Response<DrainOperationResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let default_disposition =
@@ -1062,7 +852,7 @@ impl AdminService for AppState {
         &self,
         request: Request<RemoveRegionRequest>,
     ) -> Result<Response<AdminMutationResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let region = self
@@ -1096,7 +886,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ListRegionsRequest>,
     ) -> Result<Response<ListRegionsResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let page = req.page.as_ref();
         let limit = page_limit(page);
@@ -1159,7 +949,7 @@ impl AdminService for AppState {
         &self,
         request: Request<RegisterCellRequest>,
     ) -> Result<Response<CellResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), true)?;
         let cell = self
@@ -1192,7 +982,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ActivateCellRequest>,
     ) -> Result<Response<CellResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let cell = self
@@ -1225,7 +1015,7 @@ impl AdminService for AppState {
         &self,
         request: Request<DrainCellRequest>,
     ) -> Result<Response<DrainOperationResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let cell = self
@@ -1260,7 +1050,7 @@ impl AdminService for AppState {
         &self,
         request: Request<RemoveCellRequest>,
     ) -> Result<Response<AdminMutationResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let cell = self
@@ -1295,7 +1085,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ListCellsRequest>,
     ) -> Result<Response<ListCellsResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let region_filter = none_if_empty(&req.region);
         let page = req.page.as_ref();
@@ -1368,7 +1158,7 @@ impl AdminService for AppState {
         &self,
         request: Request<RegisterNodeRequest>,
     ) -> Result<Response<NodeResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageNodes)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageNodes).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), true)?;
         let capabilities = req
@@ -1410,7 +1200,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ActivateNodeRequest>,
     ) -> Result<Response<NodeResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageNodes)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageNodes).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let node = self
@@ -1443,7 +1233,7 @@ impl AdminService for AppState {
         &self,
         request: Request<DrainNodeRequest>,
     ) -> Result<Response<DrainOperationResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageNodes)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageNodes).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let node = self
@@ -1483,7 +1273,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ForceOfflineNodeRequest>,
     ) -> Result<Response<NodeResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageNodes)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageNodes).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let node = self
@@ -1516,7 +1306,7 @@ impl AdminService for AppState {
         &self,
         request: Request<RemoveNodeRequest>,
     ) -> Result<Response<AdminMutationResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageNodes)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageNodes).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let node = self
@@ -1551,7 +1341,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ListNodesRequest>,
     ) -> Result<Response<ListNodesResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageNodes)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageNodes).await?;
         let req = request.into_inner();
         let page = req.page.as_ref();
         let limit = page_limit(page);
@@ -1618,7 +1408,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ListRoutingRecordsRequest>,
     ) -> Result<Response<ListRoutingRecordsResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRouting)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRouting).await?;
         let req = request.into_inner();
         let family = routing_record_family_from_proto(req.family)?;
         let page = req.page.as_ref();
@@ -1685,7 +1475,7 @@ impl AdminService for AppState {
         &self,
         request: Request<RepairRoutingRecordRequest>,
     ) -> Result<Response<AdminMutationResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRouting)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRouting).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let family = routing_record_family_from_proto(req.family)?
@@ -1726,7 +1516,7 @@ impl AdminService for AppState {
         &self,
         request: Request<RunRepairRequest>,
     ) -> Result<Response<RepairTaskResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::RunRepair)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::RunRepair).await?;
         let req = request.into_inner();
         let context = require_admin_action_context(req.context.as_ref())?;
         let request_id = context.request_id.clone();
@@ -1767,7 +1557,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ListDiagnosticsRequest>,
     ) -> Result<Response<DiagnosticsResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ViewDiagnostics)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ViewDiagnostics).await?;
         let req = request.into_inner();
         let request_id = require_request_id(&req.request_id)?.to_string();
         let page = req.page.as_ref();
@@ -1902,7 +1692,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ListAuditEventsRequest>,
     ) -> Result<Response<AuditEventsResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ViewAuditLog)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ViewAuditLog).await?;
         let req = request.into_inner();
         let request_id = require_request_id(&req.request_id)?.to_string();
         let page = req.page.as_ref();
@@ -1979,22 +1769,37 @@ impl AdminService for AppState {
     }
 }
 
-fn require_admin<T>(
+async fn require_admin<T>(
     request: &Request<T>,
     state: &AppState,
-    capability: AnvilAdminCapability,
+    capability: SystemAdminRelation,
 ) -> Result<AdminPrincipal, Status> {
     let claims = request
         .extensions()
         .get::<auth::Claims>()
-        .ok_or_else(|| Status::unauthenticated("Missing admin bearer token"))?;
-    if !admin_auth::has_admin_capability(claims, capability, &state.config.mesh_id) {
+        .ok_or_else(|| Status::unauthenticated("Missing authenticated admin principal"))?;
+    let allowed = crate::system_realm::check_admin_relation(
+        &state.storage,
+        &state.config.mesh_id,
+        claims,
+        capability,
+    )
+    .await
+    .map_err(|err| Status::internal(err.to_string()))?;
+    if !allowed {
         return Err(Status::permission_denied(format!(
-            "Missing anvil_admin capability {}",
+            "Missing system realm admin relation {}",
             capability.as_str()
         )));
     }
-    Ok(AdminPrincipal::from(claims))
+    let mut principal = AdminPrincipal::from(claims);
+    principal.checked_relation = Some(capability);
+    principal.checked_object = Some(format!(
+        "{}:{}",
+        crate::system_realm::system_namespace(),
+        crate::system_realm::system_mesh_object_id(&state.config.mesh_id)
+    ));
+    Ok(principal)
 }
 
 fn require_mutation_context(
@@ -2802,7 +2607,7 @@ async fn record_admin_audit_event(
         action: action.to_string(),
         audit_reason: context.audit_reason.clone(),
         created_at: Utc::now().to_rfc3339(),
-        details_json: admin_audit_details_json(context, details)?,
+        details_json: admin_audit_details_json(principal, context, details)?,
     };
     admin_audit::append_audit_event(&state.storage, &event)
         .await
@@ -2829,7 +2634,7 @@ async fn record_admin_audit_event_with_suffix(
         action: action.to_string(),
         audit_reason: context.audit_reason.clone(),
         created_at: Utc::now().to_rfc3339(),
-        details_json: admin_audit_details_json(context, details)?,
+        details_json: admin_audit_details_json(principal, context, details)?,
     };
     admin_audit::append_audit_event(&state.storage, &event)
         .await
@@ -2851,9 +2656,17 @@ fn safe_audit_id_suffix(value: &str) -> String {
 }
 
 fn admin_audit_details_json(
+    principal: &AdminPrincipal,
     context: &AdminRequestContext,
     details: serde_json::Value,
 ) -> Result<String, Status> {
+    let relation = principal
+        .checked_relation
+        .ok_or_else(|| Status::internal("Admin audit missing Zanzibar relation"))?;
+    let object = principal
+        .checked_object
+        .as_ref()
+        .ok_or_else(|| Status::internal("Admin audit missing Zanzibar object"))?;
     let mut details = match details {
         serde_json::Value::Object(map) => map,
         other => {
@@ -2870,6 +2683,8 @@ fn admin_audit_details_json(
         "expected_generation".to_string(),
         json!(context.expected_generation),
     );
+    details.insert("authorised_relation".to_string(), json!(relation.as_str()));
+    details.insert("authorised_object".to_string(), json!(object));
     serde_json::to_string(&serde_json::Value::Object(details))
         .map_err(|_| Status::internal("Failed to encode admin audit details"))
 }
@@ -2980,13 +2795,6 @@ async fn rotate_hf_secret_envelopes(
         }
     }
     Ok(())
-}
-
-fn object_link_resource_id(tenant_id: i64, bucket_name: &str, link_key: &str) -> String {
-    format!(
-        "{}:link:{link_key}",
-        bucket_resource_id(tenant_id, bucket_name)
-    )
 }
 
 fn cell_resource_id(region: &str, cell_id: &str) -> String {
@@ -3165,10 +2973,6 @@ fn audit_event_to_proto(event: AdminAuditEvent) -> AuditEventRecord {
     }
 }
 
-fn principal_label(principal: &AdminPrincipal) -> String {
-    format!("principal:{}", principal.principal_id)
-}
-
 fn generated_client_id() -> String {
     format!("app_{}", uuid::Uuid::new_v4().simple())
 }
@@ -3195,20 +2999,6 @@ fn bucket_to_proto(bucket: Bucket) -> crate::anvil_api::Bucket {
         deleted: false,
         bucket_id: bucket.id,
     }
-}
-
-async fn resolve_link_bucket(
-    state: &AppState,
-    tenant_ref: &str,
-    bucket_name: &str,
-) -> Result<persistence::Bucket, Status> {
-    let tenant_id = resolve_tenant_id(state, tenant_ref).await?;
-    state
-        .persistence
-        .get_bucket_by_name(tenant_id, bucket_name)
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?
-        .ok_or_else(|| Status::not_found("Bucket not found"))
 }
 
 async fn resolve_tenant_id(state: &AppState, tenant_ref: &str) -> Result<i64, Status> {
@@ -3283,54 +3073,12 @@ fn base_domain_from_region_suffix(
         .to_string())
 }
 
-fn parse_optional_uuid(
-    field_name: &'static str,
-    value: String,
-) -> Result<Option<uuid::Uuid>, Status> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Ok(None);
-    }
-    value
-        .parse::<uuid::Uuid>()
-        .map(Some)
-        .map_err(|_| Status::invalid_argument(format!("Invalid {field_name}")))
-}
-
 fn page_limit(page: Option<&PageRequest>) -> usize {
     let requested = page.map(|page| page.limit).unwrap_or(100);
     if requested == 0 {
         100
     } else {
         requested.clamp(1, 1000) as usize
-    }
-}
-
-fn object_link_status(err: object_links::ObjectLinkError) -> Status {
-    match err {
-        object_links::ObjectLinkError::InvalidLinkKey
-        | object_links::ObjectLinkError::InvalidTargetKey
-        | object_links::ObjectLinkError::MissingExpectedGeneration => {
-            Status::invalid_argument(err.to_string())
-        }
-        object_links::ObjectLinkError::AlreadyExists => Status::already_exists(err.to_string()),
-        object_links::ObjectLinkError::BucketNotFound | object_links::ObjectLinkError::NotFound => {
-            Status::not_found(err.to_string())
-        }
-        object_links::ObjectLinkError::BucketTenantMismatch => {
-            Status::not_found("Bucket not found")
-        }
-        object_links::ObjectLinkError::GenerationConflict { .. } => {
-            Status::aborted(err.to_string())
-        }
-        object_links::ObjectLinkError::ExistingObjectIsNotLink
-        | object_links::ObjectLinkError::DanglingObjectLink
-        | object_links::ObjectLinkError::TargetNotBlob
-        | object_links::ObjectLinkError::LinkLoop
-        | object_links::ObjectLinkError::LinkDepthExceeded => {
-            Status::failed_precondition(err.to_string())
-        }
-        object_links::ObjectLinkError::Internal(_) => Status::internal(err.to_string()),
     }
 }
 
@@ -3428,48 +3176,10 @@ fn host_alias_state_to_proto(value: CoreHostAliasState) -> i32 {
     }
 }
 
-fn object_link_resolution_from_proto(
-    value: i32,
-) -> Result<object_links::ObjectLinkResolution, Status> {
-    match value {
-        1 => Ok(object_links::ObjectLinkResolution::Follow),
-        2 => Ok(object_links::ObjectLinkResolution::Redirect),
-        _ => Err(Status::invalid_argument("Invalid object link resolution")),
-    }
-}
-
-fn object_link_resolution_to_proto(value: object_links::ObjectLinkResolution) -> i32 {
-    match value {
-        object_links::ObjectLinkResolution::Follow => 1,
-        object_links::ObjectLinkResolution::Redirect => 2,
-    }
-}
-
-fn object_link_descriptor_to_proto(
-    value: object_links::ObjectLinkDescriptor,
-) -> crate::anvil_api::ObjectLinkDescriptor {
-    crate::anvil_api::ObjectLinkDescriptor {
-        schema: value.schema,
-        tenant_id: value.tenant_id,
-        bucket_name: value.bucket_name,
-        link_key: value.link_key,
-        target_key: value.target_key,
-        target_version: value.target_version.unwrap_or_default(),
-        resolution: object_link_resolution_to_proto(value.resolution),
-        created_at: value
-            .created_at
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        updated_at: value
-            .updated_at
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        created_by: value.created_by,
-        generation: value.generation,
-    }
-}
-
 fn host_alias_descriptor_to_proto(
     value: CoreHostAliasDescriptor,
 ) -> crate::anvil_api::HostAliasDescriptor {
+    let verification_challenge = host_alias_verification_challenge(&value);
     crate::anvil_api::HostAliasDescriptor {
         schema: value.schema,
         hostname: value.hostname,
@@ -3481,7 +3191,22 @@ fn host_alias_descriptor_to_proto(
         created_at: value.created_at,
         updated_at: value.updated_at,
         generation: value.generation,
+        verification_challenge,
     }
+}
+
+fn host_alias_verification_challenge(value: &CoreHostAliasDescriptor) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(value.hostname.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(value.tenant_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(value.bucket_name.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(value.region.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(value.prefix.as_bytes());
+    format!("anvil-host-alias={}", hasher.finalize().to_hex())
 }
 
 fn node_descriptor_to_proto(value: mesh_lifecycle::NodeDescriptor) -> NodeDescriptor {

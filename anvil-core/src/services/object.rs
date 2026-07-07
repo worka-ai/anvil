@@ -1,8 +1,14 @@
 use crate::anvil_api::object_service_server::ObjectService;
 use crate::anvil_api::*;
+use crate::mesh_lifecycle::{CreateHostAliasDescriptor, LifecycleError};
 use crate::native_idempotency::{self, NativeIdempotencyTarget};
+use crate::object_links;
 use crate::object_manager::ObjectWriteOptions;
 use crate::permissions::AnvilAction;
+use crate::routing::{
+    self, HostAliasDescriptor as CoreHostAliasDescriptor, HostAliasState as CoreHostAliasState,
+    RoutingConfig,
+};
 use crate::{
     AppState, auth, authz_journal, bucket_journal,
     services::watch_envelope::{self, WatchEnvelopeParts},
@@ -1655,6 +1661,740 @@ impl ObjectService for AppState {
         complete_native_mutation(self, &attempt, &target, &response).await?;
         Ok(Response::new(response))
     }
+
+    async fn create_object_link(
+        &self,
+        request: Request<CreateObjectLinkRequest>,
+    ) -> Result<Response<ObjectLinkResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        validate_public_tenant_locator(&claims, &req.tenant_id)?;
+        let context = public_link_context(req.context.as_ref(), true)?;
+        require_object_link_scope(
+            &claims,
+            &req.bucket_name,
+            &req.link_key,
+            AnvilAction::ObjectWrite,
+        )?;
+        let bucket = public_link_bucket(self, &claims, &req.bucket_name).await?;
+        let resolution = object_link_resolution_from_proto(req.resolution)?;
+        let target_version = parse_optional_uuid("target_version", req.target_version)?;
+        let mutation = self
+            .persistence
+            .put_object_link(object_links::PutObjectLinkRequest {
+                tenant_id: bucket.tenant_id,
+                bucket_id: bucket.id,
+                link_key: req.link_key,
+                target_key: req.target_key,
+                target_version,
+                resolution,
+                expected_generation: None,
+                create_only: true,
+                allow_dangling: req.allow_dangling,
+                idempotency_key: context.idempotency_key.clone(),
+                created_by: format!("app:{}", claims.sub),
+            })
+            .await
+            .map_err(object_link_status)?;
+        let audit_event_id = crate::services::audit::record_tenant_audit_event(
+            self,
+            &claims,
+            &context.request_id,
+            format!("{}/{}", bucket.name, mutation.descriptor.link_key),
+            "object_link.create",
+            serde_json::json!({
+                "target_key": mutation.descriptor.target_key.clone(),
+                "generation": mutation.descriptor.generation
+            }),
+        )
+        .await?;
+
+        Ok(Response::new(ObjectLinkResponse {
+            request_id: context.request_id.clone(),
+            link: Some(object_link_descriptor_to_proto(mutation.descriptor)),
+            audit_event_id,
+        }))
+    }
+
+    async fn update_object_link(
+        &self,
+        request: Request<UpdateObjectLinkRequest>,
+    ) -> Result<Response<ObjectLinkResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        validate_public_tenant_locator(&claims, &req.tenant_id)?;
+        let context = public_link_context(req.context.as_ref(), false)?;
+        require_object_link_scope(
+            &claims,
+            &req.bucket_name,
+            &req.link_key,
+            AnvilAction::ObjectWrite,
+        )?;
+        let bucket = public_link_bucket(self, &claims, &req.bucket_name).await?;
+        let resolution = object_link_resolution_from_proto(req.resolution)?;
+        let target_version = parse_optional_uuid("target_version", req.target_version)?;
+        let mutation = self
+            .persistence
+            .put_object_link(object_links::PutObjectLinkRequest {
+                tenant_id: bucket.tenant_id,
+                bucket_id: bucket.id,
+                link_key: req.link_key,
+                target_key: req.target_key,
+                target_version,
+                resolution,
+                expected_generation: Some(context.expected_generation),
+                create_only: false,
+                allow_dangling: req.allow_dangling,
+                idempotency_key: context.idempotency_key.clone(),
+                created_by: format!("app:{}", claims.sub),
+            })
+            .await
+            .map_err(object_link_status)?;
+        let audit_event_id = crate::services::audit::record_tenant_audit_event(
+            self,
+            &claims,
+            &context.request_id,
+            format!("{}/{}", bucket.name, mutation.descriptor.link_key),
+            "object_link.update",
+            serde_json::json!({
+                "target_key": mutation.descriptor.target_key.clone(),
+                "generation": mutation.descriptor.generation
+            }),
+        )
+        .await?;
+
+        Ok(Response::new(ObjectLinkResponse {
+            request_id: context.request_id.clone(),
+            link: Some(object_link_descriptor_to_proto(mutation.descriptor)),
+            audit_event_id,
+        }))
+    }
+
+    async fn delete_object_link(
+        &self,
+        request: Request<DeleteObjectLinkRequest>,
+    ) -> Result<Response<MutationResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        validate_public_tenant_locator(&claims, &req.tenant_id)?;
+        let context = public_link_context(req.context.as_ref(), false)?;
+        require_object_link_scope(
+            &claims,
+            &req.bucket_name,
+            &req.link_key,
+            AnvilAction::ObjectDelete,
+        )?;
+        let bucket = public_link_bucket(self, &claims, &req.bucket_name).await?;
+        let deleted = self
+            .persistence
+            .delete_object_link(object_links::DeleteObjectLinkRequest {
+                tenant_id: bucket.tenant_id,
+                bucket_id: bucket.id,
+                link_key: req.link_key,
+                expected_generation: context.expected_generation,
+                idempotency_key: context.idempotency_key.clone(),
+            })
+            .await
+            .map_err(object_link_status)?;
+        let audit_event_id = crate::services::audit::record_tenant_audit_event(
+            self,
+            &claims,
+            &context.request_id,
+            format!("{}/{}", bucket.name, deleted.link_key),
+            "object_link.delete",
+            serde_json::json!({ "generation": deleted.generation }),
+        )
+        .await?;
+
+        Ok(Response::new(MutationResponse {
+            request_id: context.request_id.clone(),
+            resource_id: deleted.link_key,
+            generation: deleted.generation,
+            audit_event_id,
+            idempotent_replay: false,
+        }))
+    }
+
+    async fn read_object_link(
+        &self,
+        request: Request<ReadObjectLinkRequest>,
+    ) -> Result<Response<ObjectLinkResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        validate_public_tenant_locator(&claims, &req.tenant_id)?;
+        require_object_link_scope(
+            &claims,
+            &req.bucket_name,
+            &req.link_key,
+            AnvilAction::ObjectRead,
+        )?;
+        let bucket = public_link_bucket(self, &claims, &req.bucket_name).await?;
+        let descriptor = self
+            .persistence
+            .get_object_link(bucket.id, &req.link_key)
+            .await
+            .map_err(object_link_status)?
+            .ok_or_else(|| Status::not_found("Object link not found"))?;
+
+        Ok(Response::new(ObjectLinkResponse {
+            request_id: req.request_id,
+            link: Some(object_link_descriptor_to_proto(descriptor)),
+            audit_event_id: String::new(),
+        }))
+    }
+
+    async fn list_object_links(
+        &self,
+        request: Request<ListObjectLinksRequest>,
+    ) -> Result<Response<ListObjectLinksResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        validate_public_tenant_locator(&claims, &req.tenant_id)?;
+        let bucket = public_link_bucket(self, &claims, &req.bucket_name).await?;
+        if !auth::is_authorized(
+            AnvilAction::ObjectList,
+            &format!("{}/{}", bucket.name, req.prefix),
+            &claims.scopes,
+        ) {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+        let mut links = self
+            .persistence
+            .list_object_links(bucket.id, none_if_empty(&req.prefix))
+            .await
+            .map_err(object_link_status)?;
+        links.retain(|link| {
+            auth::is_authorized(
+                AnvilAction::ObjectRead,
+                &format!("{}/{}", bucket.name, link.link_key),
+                &claims.scopes,
+            )
+        });
+        links.sort_by(|a, b| a.link_key.cmp(&b.link_key));
+        let limit = page_limit(req.page.as_ref());
+        let has_more = links.len() > limit;
+        if has_more {
+            links.truncate(limit);
+        }
+
+        Ok(Response::new(ListObjectLinksResponse {
+            page: Some(PageResponse {
+                next_cursor: String::new(),
+                has_more,
+            }),
+            links: links
+                .into_iter()
+                .map(object_link_descriptor_to_proto)
+                .collect(),
+        }))
+    }
+
+    async fn create_host_alias(
+        &self,
+        request: Request<CreateHostAliasRequest>,
+    ) -> Result<Response<HostAliasResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        validate_public_tenant_locator(&claims, &req.tenant_id)?;
+        let context = public_link_context(req.context.as_ref(), true)?;
+        let bucket = public_host_alias_bucket(self, &claims, &req.bucket_name).await?;
+        require_bucket_scope(&claims, &bucket.name, AnvilAction::BucketWrite)?;
+
+        let region = if req.region.trim().is_empty() {
+            bucket.region.clone()
+        } else {
+            req.region
+        };
+        let routing_config = public_routing_config_for_region(self, &region).await?;
+        let host_alias = self
+            .persistence
+            .create_host_alias_descriptor(
+                &routing_config,
+                CreateHostAliasDescriptor {
+                    hostname: req.hostname,
+                    tenant_id: claims.tenant_id.to_string(),
+                    bucket_name: bucket.name,
+                    region,
+                    prefix: req.prefix,
+                },
+            )
+            .await
+            .map_err(lifecycle_status)?;
+        let audit_event_id = crate::services::audit::record_tenant_audit_event(
+            self,
+            &claims,
+            &context.request_id,
+            format!("host_alias:{}", host_alias.hostname),
+            "host_alias.create",
+            serde_json::json!({
+                "bucket_name": host_alias.bucket_name.clone(),
+                "region": host_alias.region.clone(),
+                "prefix": host_alias.prefix.clone()
+            }),
+        )
+        .await?;
+
+        Ok(Response::new(HostAliasResponse {
+            request_id: context.request_id.clone(),
+            host_alias: Some(host_alias_descriptor_to_proto(host_alias)),
+            audit_event_id,
+        }))
+    }
+
+    async fn verify_host_alias(
+        &self,
+        request: Request<VerifyHostAliasRequest>,
+    ) -> Result<Response<HostAliasResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        let context = public_link_context(req.context.as_ref(), false)?;
+        let current = public_host_alias_descriptor(self, &claims, &req.hostname).await?;
+        require_bucket_scope(&claims, &current.bucket_name, AnvilAction::BucketWrite)?;
+        let expected_challenge = host_alias_verification_challenge(&current);
+        if req.observed_challenge.trim() != expected_challenge {
+            return Err(Status::failed_precondition(
+                "Host alias verification challenge did not match",
+            ));
+        }
+        let host_alias = self
+            .persistence
+            .transition_host_alias_descriptor(
+                &current.hostname,
+                context.expected_generation,
+                CoreHostAliasState::Active,
+            )
+            .await
+            .map_err(lifecycle_status)?;
+        let audit_event_id = crate::services::audit::record_tenant_audit_event(
+            self,
+            &claims,
+            &context.request_id,
+            format!("host_alias:{}", host_alias.hostname),
+            "host_alias.verify",
+            serde_json::json!({ "generation": host_alias.generation }),
+        )
+        .await?;
+
+        Ok(Response::new(HostAliasResponse {
+            request_id: context.request_id.clone(),
+            host_alias: Some(host_alias_descriptor_to_proto(host_alias)),
+            audit_event_id,
+        }))
+    }
+
+    async fn delete_host_alias(
+        &self,
+        request: Request<DeleteHostAliasRequest>,
+    ) -> Result<Response<MutationResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        let context = public_link_context(req.context.as_ref(), false)?;
+        let current = public_host_alias_descriptor(self, &claims, &req.hostname).await?;
+        require_bucket_scope(&claims, &current.bucket_name, AnvilAction::BucketWrite)?;
+        let host_alias = self
+            .persistence
+            .transition_host_alias_descriptor(
+                &current.hostname,
+                context.expected_generation,
+                CoreHostAliasState::Deleted,
+            )
+            .await
+            .map_err(lifecycle_status)?;
+        let audit_event_id = crate::services::audit::record_tenant_audit_event(
+            self,
+            &claims,
+            &context.request_id,
+            format!("host_alias:{}", host_alias.hostname),
+            "host_alias.delete",
+            serde_json::json!({ "generation": host_alias.generation }),
+        )
+        .await?;
+
+        Ok(Response::new(MutationResponse {
+            request_id: context.request_id.clone(),
+            resource_id: host_alias.hostname,
+            generation: host_alias.generation,
+            audit_event_id,
+            idempotent_replay: false,
+        }))
+    }
+
+    async fn read_host_alias(
+        &self,
+        request: Request<ReadHostAliasRequest>,
+    ) -> Result<Response<HostAliasResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        let host_alias = public_host_alias_descriptor(self, &claims, &req.hostname).await?;
+        require_bucket_scope(&claims, &host_alias.bucket_name, AnvilAction::BucketRead)?;
+
+        Ok(Response::new(HostAliasResponse {
+            request_id: req.request_id,
+            host_alias: Some(host_alias_descriptor_to_proto(host_alias)),
+            audit_event_id: String::new(),
+        }))
+    }
+
+    async fn list_host_aliases(
+        &self,
+        request: Request<ListHostAliasesRequest>,
+    ) -> Result<Response<ListHostAliasesResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        let tenant_id = claims.tenant_id.to_string();
+        let mut host_aliases = self
+            .persistence
+            .list_host_alias_descriptors(none_if_empty(&req.region))
+            .await
+            .map_err(lifecycle_status)?
+            .into_iter()
+            .filter(|alias| alias.tenant_id == tenant_id)
+            .filter(|alias| {
+                auth::is_authorized(AnvilAction::BucketRead, &alias.bucket_name, &claims.scopes)
+            })
+            .collect::<Vec<_>>();
+        host_aliases.sort_by(|left, right| left.hostname.cmp(&right.hostname));
+        let limit = page_limit(req.page.as_ref());
+        let has_more = host_aliases.len() > limit;
+        if has_more {
+            host_aliases.truncate(limit);
+        }
+
+        Ok(Response::new(ListHostAliasesResponse {
+            page: Some(PageResponse {
+                next_cursor: String::new(),
+                has_more,
+            }),
+            host_aliases: host_aliases
+                .into_iter()
+                .map(host_alias_descriptor_to_proto)
+                .collect(),
+        }))
+    }
+}
+
+fn public_link_context(
+    context: Option<&PublicMutationContext>,
+    create: bool,
+) -> Result<&PublicMutationContext, Status> {
+    let context = context.ok_or_else(|| Status::invalid_argument("Missing mutation context"))?;
+    if context.request_id.trim().is_empty() {
+        return Err(Status::invalid_argument("request_id is required"));
+    }
+    if context.idempotency_key.trim().is_empty() {
+        return Err(Status::invalid_argument("idempotency_key is required"));
+    }
+    if !create && context.expected_generation == 0 {
+        return Err(Status::invalid_argument("expected_generation is required"));
+    }
+    Ok(context)
+}
+
+fn validate_public_tenant_locator(claims: &auth::Claims, tenant_id: &str) -> Result<(), Status> {
+    let tenant_id = tenant_id.trim();
+    if tenant_id.is_empty() || tenant_id == claims.tenant_id.to_string() {
+        return Ok(());
+    }
+    Err(Status::permission_denied(
+        "Request tenant_id does not match authenticated tenant",
+    ))
+}
+
+async fn public_link_bucket(
+    state: &AppState,
+    claims: &auth::Claims,
+    bucket_name: &str,
+) -> Result<crate::persistence::Bucket, Status> {
+    if bucket_name.trim().is_empty() {
+        return Err(Status::invalid_argument("bucket_name is required"));
+    }
+    state
+        .persistence
+        .get_bucket_by_name(claims.tenant_id, bucket_name)
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?
+        .ok_or_else(|| Status::not_found("Bucket not found"))
+}
+
+fn require_object_link_scope(
+    claims: &auth::Claims,
+    bucket_name: &str,
+    link_key: &str,
+    action: AnvilAction,
+) -> Result<(), Status> {
+    if crate::validation::is_reserved_internal_key(link_key) {
+        return Err(Status::permission_denied("UnauthorizedReservedNamespace"));
+    }
+    if !auth::is_authorized(action, &format!("{bucket_name}/{link_key}"), &claims.scopes) {
+        return Err(Status::permission_denied("Permission denied"));
+    }
+    Ok(())
+}
+
+async fn public_host_alias_bucket(
+    state: &AppState,
+    claims: &auth::Claims,
+    bucket_name: &str,
+) -> Result<crate::persistence::Bucket, Status> {
+    public_link_bucket(state, claims, bucket_name).await
+}
+
+async fn public_host_alias_descriptor(
+    state: &AppState,
+    claims: &auth::Claims,
+    hostname: &str,
+) -> Result<CoreHostAliasDescriptor, Status> {
+    let descriptor = state
+        .persistence
+        .get_host_alias_descriptor(hostname)
+        .await
+        .map_err(lifecycle_status)?
+        .ok_or_else(|| Status::not_found("Host alias not found"))?;
+    if descriptor.tenant_id != claims.tenant_id.to_string() {
+        return Err(Status::not_found("Host alias not found"));
+    }
+    Ok(descriptor)
+}
+
+fn require_bucket_scope(
+    claims: &auth::Claims,
+    bucket_name: &str,
+    action: AnvilAction,
+) -> Result<(), Status> {
+    if !auth::is_authorized(action, bucket_name, &claims.scopes) {
+        return Err(Status::permission_denied("Permission denied"));
+    }
+    Ok(())
+}
+
+async fn public_routing_config_for_region(
+    state: &AppState,
+    region_name: &str,
+) -> Result<RoutingConfig, Status> {
+    let region_name = region_name.trim();
+    if region_name.is_empty() {
+        return Err(Status::invalid_argument("region is required"));
+    }
+    let region = state
+        .persistence
+        .list_region_descriptors()
+        .await
+        .map_err(lifecycle_status)?
+        .into_iter()
+        .find(|region| region.region == region_name)
+        .ok_or_else(|| Status::not_found("Region not found"))?;
+    let base_domain =
+        public_base_domain_from_region_suffix(&region.region, &region.virtual_host_suffix)?;
+    RoutingConfig::new(base_domain).map_err(|err| Status::invalid_argument(err.to_string()))
+}
+
+fn public_base_domain_from_region_suffix(
+    region: &str,
+    virtual_host_suffix: &str,
+) -> Result<String, Status> {
+    let suffix = routing::normalize_alias_hostname(virtual_host_suffix)
+        .map_err(|err| Status::invalid_argument(err.to_string()))?;
+    let region_prefix = format!(
+        "{}.",
+        region.trim().trim_end_matches('.').to_ascii_lowercase()
+    );
+    Ok(suffix
+        .strip_prefix(&region_prefix)
+        .unwrap_or(&suffix)
+        .to_string())
+}
+
+fn parse_optional_uuid(
+    field_name: &'static str,
+    value: String,
+) -> Result<Option<uuid::Uuid>, Status> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value
+        .parse::<uuid::Uuid>()
+        .map(Some)
+        .map_err(|_| Status::invalid_argument(format!("Invalid {field_name}")))
+}
+
+fn page_limit(page: Option<&PageRequest>) -> usize {
+    let requested = page.map(|page| page.limit).unwrap_or(100);
+    if requested == 0 {
+        100
+    } else {
+        requested.clamp(1, 1000) as usize
+    }
+}
+
+fn object_link_status(err: object_links::ObjectLinkError) -> Status {
+    match err {
+        object_links::ObjectLinkError::InvalidLinkKey
+        | object_links::ObjectLinkError::InvalidTargetKey
+        | object_links::ObjectLinkError::MissingExpectedGeneration => {
+            Status::invalid_argument(err.to_string())
+        }
+        object_links::ObjectLinkError::AlreadyExists => Status::already_exists(err.to_string()),
+        object_links::ObjectLinkError::BucketNotFound | object_links::ObjectLinkError::NotFound => {
+            Status::not_found(err.to_string())
+        }
+        object_links::ObjectLinkError::BucketTenantMismatch => {
+            Status::not_found("Bucket not found")
+        }
+        object_links::ObjectLinkError::GenerationConflict { .. } => {
+            Status::aborted(err.to_string())
+        }
+        object_links::ObjectLinkError::ExistingObjectIsNotLink
+        | object_links::ObjectLinkError::DanglingObjectLink
+        | object_links::ObjectLinkError::TargetNotBlob
+        | object_links::ObjectLinkError::LinkLoop
+        | object_links::ObjectLinkError::LinkDepthExceeded => {
+            Status::failed_precondition(err.to_string())
+        }
+        object_links::ObjectLinkError::Internal(_) => Status::internal(err.to_string()),
+    }
+}
+
+fn object_link_resolution_from_proto(
+    value: i32,
+) -> Result<object_links::ObjectLinkResolution, Status> {
+    match value {
+        1 => Ok(object_links::ObjectLinkResolution::Follow),
+        2 => Ok(object_links::ObjectLinkResolution::Redirect),
+        _ => Err(Status::invalid_argument("Invalid object link resolution")),
+    }
+}
+
+fn object_link_resolution_to_proto(value: object_links::ObjectLinkResolution) -> i32 {
+    match value {
+        object_links::ObjectLinkResolution::Follow => 1,
+        object_links::ObjectLinkResolution::Redirect => 2,
+    }
+}
+
+fn object_link_descriptor_to_proto(
+    value: object_links::ObjectLinkDescriptor,
+) -> crate::anvil_api::ObjectLinkDescriptor {
+    crate::anvil_api::ObjectLinkDescriptor {
+        schema: value.schema,
+        tenant_id: value.tenant_id,
+        bucket_name: value.bucket_name,
+        link_key: value.link_key,
+        target_key: value.target_key,
+        target_version: value.target_version.unwrap_or_default(),
+        resolution: object_link_resolution_to_proto(value.resolution),
+        created_at: value
+            .created_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        updated_at: value
+            .updated_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        created_by: value.created_by,
+        generation: value.generation,
+    }
+}
+
+fn lifecycle_status(err: LifecycleError) -> Status {
+    match err {
+        LifecycleError::InvalidArgument(message) => Status::invalid_argument(message),
+        LifecycleError::AlreadyExists { .. } => Status::already_exists(err.to_string()),
+        LifecycleError::NotFound { .. } => Status::not_found(err.to_string()),
+        LifecycleError::GenerationConflict { .. } => Status::aborted(err.to_string()),
+        LifecycleError::LifecycleTransitionDenied { .. }
+        | LifecycleError::ActivationCheckpointNotReached { .. } => {
+            Status::failed_precondition(err.to_string())
+        }
+        LifecycleError::Io(_) | LifecycleError::Json(_) | LifecycleError::Other(_) => {
+            Status::internal(err.to_string())
+        }
+    }
+}
+
+fn host_alias_state_to_proto(value: CoreHostAliasState) -> i32 {
+    match value {
+        CoreHostAliasState::PendingVerification => 1,
+        CoreHostAliasState::Active => 2,
+        CoreHostAliasState::Suspended => 3,
+        CoreHostAliasState::Deleted => 4,
+    }
+}
+
+fn host_alias_descriptor_to_proto(
+    value: CoreHostAliasDescriptor,
+) -> crate::anvil_api::HostAliasDescriptor {
+    let verification_challenge = host_alias_verification_challenge(&value);
+    crate::anvil_api::HostAliasDescriptor {
+        schema: value.schema,
+        hostname: value.hostname,
+        tenant_id: value.tenant_id,
+        bucket_name: value.bucket_name,
+        region: value.region,
+        prefix: value.prefix,
+        state: host_alias_state_to_proto(value.state),
+        created_at: value.created_at,
+        updated_at: value.updated_at,
+        generation: value.generation,
+        verification_challenge,
+    }
+}
+
+fn host_alias_verification_challenge(value: &CoreHostAliasDescriptor) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(value.hostname.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(value.tenant_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(value.bucket_name.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(value.region.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(value.prefix.as_bytes());
+    format!("anvil-host-alias={}", hasher.finalize().to_hex())
+}
+
+fn none_if_empty(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() { None } else { Some(value) }
 }
 
 struct NativeMutationAttempt<'a> {

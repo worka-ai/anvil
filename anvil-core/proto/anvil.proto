@@ -12,16 +12,11 @@ service AdminService {
   rpc CreateBucketAdmin(CreateBucketAdminRequest) returns (BucketAdminResponse);
   rpc SetBucketPublicAccessAdmin(SetBucketPublicAccessAdminRequest) returns (BucketAdminResponse);
 
-  rpc CreateObjectLink(CreateObjectLinkRequest) returns (ObjectLinkResponse);
-  rpc UpdateObjectLink(UpdateObjectLinkRequest) returns (ObjectLinkResponse);
-  rpc DeleteObjectLink(DeleteObjectLinkRequest) returns (AdminMutationResponse);
-  rpc ReadObjectLink(ReadObjectLinkRequest) returns (ObjectLinkResponse);
-  rpc ListObjectLinks(ListObjectLinksRequest) returns (ListObjectLinksResponse);
 
-  rpc CreateHostAlias(CreateHostAliasRequest) returns (HostAliasResponse);
+  rpc CreateHostAlias(CreateHostAliasAdminRequest) returns (HostAliasResponse);
   rpc ActivateHostAlias(ActivateHostAliasRequest) returns (HostAliasResponse);
   rpc SuspendHostAlias(SuspendHostAliasRequest) returns (HostAliasResponse);
-  rpc DeleteHostAlias(DeleteHostAliasRequest) returns (AdminMutationResponse);
+  rpc DeleteHostAlias(DeleteHostAliasAdminRequest) returns (AdminMutationResponse);
   rpc ReadHostAlias(ReadHostAliasRequest) returns (HostAliasResponse);
   rpc ListHostAliases(ListHostAliasesRequest) returns (ListHostAliasesResponse);
 
@@ -60,6 +55,12 @@ message AdminRequestContext {
   uint64 expected_generation = 4;
 }
 
+message PublicMutationContext {
+  string request_id = 1;
+  string idempotency_key = 2;
+  uint64 expected_generation = 3;
+}
+
 message AdminPrincipal {
   string principal_id = 1;
   string tenant_id = 2;
@@ -67,6 +68,14 @@ message AdminPrincipal {
 }
 
 message AdminMutationResponse {
+  string request_id = 1;
+  string resource_id = 2;
+  uint64 generation = 3;
+  string audit_event_id = 4;
+  bool idempotent_replay = 5;
+}
+
+message MutationResponse {
   string request_id = 1;
   string resource_id = 2;
   uint64 generation = 3;
@@ -227,6 +236,7 @@ message HostAliasDescriptor {
   string created_at = 8;
   string updated_at = 9;
   uint64 generation = 10;
+  string verification_challenge = 11;
 }
 
 message TenantAdminDescriptor {
@@ -332,7 +342,7 @@ message BucketAdminResponse {
 }
 
 message CreateObjectLinkRequest {
-  AdminRequestContext context = 1;
+  PublicMutationContext context = 1;
   string tenant_id = 2;
   string bucket_name = 3;
   string link_key = 4;
@@ -343,7 +353,7 @@ message CreateObjectLinkRequest {
 }
 
 message UpdateObjectLinkRequest {
-  AdminRequestContext context = 1;
+  PublicMutationContext context = 1;
   string tenant_id = 2;
   string bucket_name = 3;
   string link_key = 4;
@@ -354,7 +364,7 @@ message UpdateObjectLinkRequest {
 }
 
 message DeleteObjectLinkRequest {
-  AdminRequestContext context = 1;
+  PublicMutationContext context = 1;
   string tenant_id = 2;
   string bucket_name = 3;
   string link_key = 4;
@@ -374,13 +384,28 @@ message ListObjectLinksRequest {
   PageRequest page = 4;
 }
 
-message CreateHostAliasRequest {
+message CreateHostAliasAdminRequest {
   AdminRequestContext context = 1;
   string hostname = 2;
   string tenant_id = 3;
   string bucket_name = 4;
   string region = 5;
   string prefix = 6;
+}
+
+message CreateHostAliasRequest {
+  PublicMutationContext context = 1;
+  string hostname = 2;
+  string tenant_id = 3;
+  string bucket_name = 4;
+  string region = 5;
+  string prefix = 6;
+}
+
+message VerifyHostAliasRequest {
+  PublicMutationContext context = 1;
+  string hostname = 2;
+  string observed_challenge = 3;
 }
 
 message ActivateHostAliasRequest {
@@ -394,6 +419,11 @@ message SuspendHostAliasRequest {
 }
 
 message DeleteHostAliasRequest {
+  PublicMutationContext context = 1;
+  string hostname = 2;
+}
+
+message DeleteHostAliasAdminRequest {
   AdminRequestContext context = 1;
   string hostname = 2;
 }
@@ -1220,6 +1250,16 @@ service ObjectService {
   rpc ComposeObject(ComposeObjectRequest) returns (ComposeObjectResponse);
   rpc PatchJsonObject(PatchJsonObjectRequest) returns (PatchJsonObjectResponse);
   rpc CompareAndSwapManifest(CompareAndSwapManifestRequest) returns (CompareAndSwapManifestResponse);
+  rpc CreateObjectLink(CreateObjectLinkRequest) returns (ObjectLinkResponse);
+  rpc UpdateObjectLink(UpdateObjectLinkRequest) returns (ObjectLinkResponse);
+  rpc DeleteObjectLink(DeleteObjectLinkRequest) returns (MutationResponse);
+  rpc ReadObjectLink(ReadObjectLinkRequest) returns (ObjectLinkResponse);
+  rpc ListObjectLinks(ListObjectLinksRequest) returns (ListObjectLinksResponse);
+  rpc CreateHostAlias(CreateHostAliasRequest) returns (HostAliasResponse);
+  rpc VerifyHostAlias(VerifyHostAliasRequest) returns (HostAliasResponse);
+  rpc DeleteHostAlias(DeleteHostAliasRequest) returns (MutationResponse);
+  rpc ReadHostAlias(ReadHostAliasRequest) returns (HostAliasResponse);
+  rpc ListHostAliases(ListHostAliasesRequest) returns (ListHostAliasesResponse);
   rpc WatchPrefix(WatchPrefixRequest) returns (stream WatchPrefixResponse);
   rpc CreateAppendStream(CreateAppendStreamRequest) returns (CreateAppendStreamResponse);
   rpc AppendStreamRecord(AppendStreamRecordRequest) returns (AppendStreamRecordResponse);
@@ -1809,8 +1849,13 @@ message ProxyResponseChunk {
 
 service AuthService {
   rpc GetAccessToken(GetAccessTokenRequest) returns (GetAccessTokenResponse);
+  rpc CreateApplicationCredential(CreateApplicationCredentialRequest) returns (ApplicationSecretResponse);
+  rpc RotateApplicationCredentialSecret(RotateApplicationCredentialSecretRequest) returns (ApplicationSecretResponse);
+  rpc DeleteApplicationCredential(DeleteApplicationCredentialRequest) returns (DeleteApplicationCredentialResponse);
+  rpc ListApplications(ListApplicationsRequest) returns (ListApplicationsResponse);
   rpc GrantAccess(GrantAccessRequest) returns (GrantAccessResponse);
   rpc RevokeAccess(RevokeAccessRequest) returns (RevokeAccessResponse);
+  rpc ListAccessGrants(ListAccessGrantsRequest) returns (ListAccessGrantsResponse);
   rpc SetPublicAccess(SetPublicAccessRequest) returns (SetPublicAccessResponse);
   rpc WriteAuthzTuple(WriteAuthzTupleRequest) returns (WriteAuthzTupleResponse);
   rpc WriteAuthzTuples(WriteAuthzTuplesRequest) returns (WriteAuthzTuplesResponse);
@@ -1827,6 +1872,10 @@ service AuthService {
   rpc WatchAuthzTupleLog(WatchAuthzTupleLogRequest) returns (stream WatchAuthzTupleLogResponse);
   rpc WatchAuthzNamespace(WatchAuthzNamespaceRequest) returns (stream WatchAuthzNamespaceResponse);
   rpc WatchAuthzDerivedLag(WatchAuthzDerivedLagRequest) returns (stream WatchAuthzDerivedLagResponse);
+}
+
+service AuditService {
+  rpc ListTenantAuditEvents(ListAuditEventsRequest) returns (AuditEventsResponse);
 }
 
 service CoordinationService {
@@ -1927,6 +1976,42 @@ message GetAccessTokenResponse {
   int64 expires_in = 2;
 }
 
+message CreateApplicationCredentialRequest {
+  string app_name = 1;
+  string request_id = 2;
+  string idempotency_key = 3;
+}
+
+message RotateApplicationCredentialSecretRequest {
+  string app_name = 1;
+  string request_id = 2;
+  string idempotency_key = 3;
+}
+
+message DeleteApplicationCredentialRequest {
+  string app_name = 1;
+  string request_id = 2;
+  string idempotency_key = 3;
+}
+
+message DeleteApplicationCredentialResponse {
+  string request_id = 1;
+  string app_id = 2;
+}
+
+message ListApplicationsRequest {}
+
+message ApplicationDescriptor {
+  string tenant_id = 1;
+  string app_id = 2;
+  string app_name = 3;
+  string client_id = 4;
+}
+
+message ListApplicationsResponse {
+  repeated ApplicationDescriptor applications = 1;
+}
+
 message GrantAccessRequest {
   string grantee_app_id = 1;
   string resource = 2;
@@ -1942,6 +2027,21 @@ message RevokeAccessRequest {
 }
 
 message RevokeAccessResponse {}
+
+message AccessGrantRecord {
+  string app_id = 1;
+  string app_name = 2;
+  string action = 3;
+  string resource = 4;
+}
+
+message ListAccessGrantsRequest {
+  string app = 1;
+}
+
+message ListAccessGrantsResponse {
+  repeated AccessGrantRecord grants = 1;
+}
 
 message SetPublicAccessRequest {
   string bucket = 1;
