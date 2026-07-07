@@ -9,6 +9,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -729,19 +730,20 @@ impl CoreStore {
         validate_logical_id(&request.logical_file_id, "logical file id")?;
         validate_logical_id(&request.mutation_id, "logical file mutation id")?;
         let profile = local_erasure_profile(&request.pipeline_policy.erasure_profile_id)?;
-        if request.pipeline_policy.compression != "none" {
-            bail!("CoreStore logical file compression policy is not implemented for local backend");
-        }
         if request.pipeline_policy.encryption != "none" {
             bail!("CoreStore logical file encryption policy is not implemented for local backend");
         }
 
         let source = std::mem::take(&mut request.source);
+        let plaintext_hash = format!("sha256:{}", sha256_hex(&source));
+        let plaintext_len = source.len() as u64;
+        let (stored_source, compression) =
+            encode_logical_file_source(&request.pipeline_policy.compression, source)?;
         let object_ref = self
             .put_blob_with_profile(
                 PutBlob {
                     logical_name: request.logical_file_id.clone(),
-                    bytes: source,
+                    bytes: stored_source,
                     boundary_values: request.boundary_values.clone(),
                     region_id: request.region_id.clone(),
                     mutation_id: request.mutation_id.clone(),
@@ -750,7 +752,13 @@ impl CoreStore {
             )
             .await?;
         let object_manifest = self.read_object_manifest(&object_ref).await?;
-        logical_file_manifest_from_object_manifest(&request, &object_manifest)
+        logical_file_manifest_from_object_manifest(
+            &request,
+            &object_manifest,
+            plaintext_hash,
+            plaintext_len,
+            compression,
+        )
     }
 
     pub async fn write_logical_file_ref(
@@ -767,6 +775,9 @@ impl CoreStore {
             &[("operation", "read_logical_range")],
         );
         self.verify_logical_file_manifest(&request.manifest).await?;
+        if request.manifest.compression.algorithm != "none" {
+            return self.read_compressed_logical_range(request).await;
+        }
         let object_ref = object_ref_from_logical_file_manifest(&request.manifest)?;
         let mut out = Vec::new();
         for range in request.ranges {
@@ -788,6 +799,51 @@ impl CoreStore {
         Ok(out)
     }
 
+    async fn read_compressed_logical_range(
+        &self,
+        request: ReadLogicalRangeRequest,
+    ) -> Result<Vec<u8>> {
+        let plaintext = self.read_logical_file_plaintext(&request.manifest).await?;
+        let mut out = Vec::new();
+        for range in request.ranges {
+            if range.start > range.end_exclusive || range.end_exclusive > plaintext.len() as u64 {
+                bail!("CoreStore logical range exceeds logical file size");
+            }
+            if let Some(expected_boundary) = request.expected_boundary.as_ref() {
+                ensure_range_is_inside_expected_boundary(
+                    &request.manifest,
+                    &range,
+                    expected_boundary,
+                )?;
+            }
+            let start = usize::try_from(range.start)
+                .map_err(|_| anyhow!("CoreStore logical range start exceeds usize"))?;
+            let end = usize::try_from(range.end_exclusive)
+                .map_err(|_| anyhow!("CoreStore logical range end exceeds usize"))?;
+            out.extend_from_slice(&plaintext[start..end]);
+        }
+        Ok(out)
+    }
+
+    async fn read_logical_file_plaintext(
+        &self,
+        manifest: &CoreLogicalFileManifest,
+    ) -> Result<Vec<u8>> {
+        validate_logical_file_manifest_shape(manifest)?;
+        let object_ref = object_ref_from_logical_file_manifest(manifest)?;
+        let stored = self.get_blob(GetBlob { object_ref }).await?;
+        let plaintext = decode_logical_file_source(&manifest.compression.algorithm, stored)?;
+        let actual_hash = format!("sha256:{}", sha256_hex(&plaintext));
+        if actual_hash != manifest.content_hash {
+            bail!(
+                "CoreStore logical file content hash mismatch: expected {}, got {}",
+                manifest.content_hash,
+                actual_hash
+            );
+        }
+        Ok(plaintext)
+    }
+
     pub async fn verify_logical_file_manifest(
         &self,
         manifest: &CoreLogicalFileManifest,
@@ -796,17 +852,7 @@ impl CoreStore {
             "anvil_core_store_op",
             &[("operation", "verify_logical_file_manifest")],
         );
-        validate_logical_file_manifest_shape(manifest)?;
-        let object_ref = object_ref_from_logical_file_manifest(manifest)?;
-        let bytes = self.get_blob(GetBlob { object_ref }).await?;
-        let actual_hash = format!("sha256:{}", sha256_hex(&bytes));
-        if actual_hash != manifest.content_hash {
-            bail!(
-                "CoreStore logical file content hash mismatch: expected {}, got {}",
-                manifest.content_hash,
-                actual_hash
-            );
-        }
+        let _plaintext = self.read_logical_file_plaintext(manifest).await?;
         Ok(CoreLogicalFileVerificationReport {
             verified: true,
             logical_file_id: manifest.logical_file_id.clone(),
@@ -4160,6 +4206,9 @@ fn required_data_shard_indices_for_range(
 fn logical_file_manifest_from_object_manifest(
     request: &WriteLogicalFileRequest,
     object_manifest: &CoreObjectManifest,
+    plaintext_hash: String,
+    plaintext_len: u64,
+    compression: CoreCompressionDescriptor,
 ) -> Result<CoreLogicalFileManifest> {
     validate_manifest_for_object_ref(
         object_manifest,
@@ -4200,7 +4249,7 @@ fn logical_file_manifest_from_object_manifest(
         vec![CoreLogicalRange {
             range_id: "full".to_string(),
             byte_start: 0,
-            byte_end: object_manifest.logical_size,
+            byte_end: plaintext_len,
             writer_record_kind: request.writer_family.clone(),
             boundary_values: request.boundary_values.clone(),
             writer_statistics: Vec::new(),
@@ -4215,7 +4264,7 @@ fn logical_file_manifest_from_object_manifest(
                 if hint.byte_start > hint.byte_end {
                     bail!("CoreStore logical range hint start must be <= end");
                 }
-                if hint.byte_end > object_manifest.logical_size {
+                if hint.byte_end > plaintext_len {
                     bail!("CoreStore logical range hint exceeds logical file size");
                 }
                 Ok(CoreLogicalRange {
@@ -4237,17 +4286,17 @@ fn logical_file_manifest_from_object_manifest(
         logical_file_id: request.logical_file_id.clone(),
         writer_family: request.writer_family.clone(),
         writer_generation: request.generation,
-        logical_size: object_manifest.logical_size,
-        content_hash: object_manifest.object_hash.clone(),
+        logical_size: plaintext_len,
+        content_hash: plaintext_hash.clone(),
         boundary_schema_generation,
         ranges,
         blocks: vec![CoreLogicalBlockRef {
             block_id,
             logical_offset: 0,
-            logical_length: object_manifest.logical_size,
+            logical_length: plaintext_len,
             compressed_length: object_manifest.logical_size,
             encrypted_length: object_manifest.logical_size,
-            content_hash: object_manifest.object_hash.clone(),
+            content_hash: plaintext_hash.clone(),
             erasure_set_id: "local-erasure-set".to_string(),
             shards: object_manifest
                 .placements
@@ -4267,31 +4316,20 @@ fn logical_file_manifest_from_object_manifest(
             codec_id: profile.codec_id.to_string(),
             data_shards,
             parity_shards,
-            plaintext_block_len: object_manifest.logical_size,
+            plaintext_block_len: plaintext_len,
             shard_payload_len,
             padding_len: shard_payload_len
                 .saturating_mul(u64::from(data_shards))
                 .saturating_sub(object_manifest.logical_size),
             block_encoded_hash: object_manifest.object_hash.clone(),
         }],
-        compression: CoreCompressionDescriptor {
-            algorithm: "none".to_string(),
-            level: 0,
-            uncompressed_length: object_manifest.logical_size,
-            compressed_length: object_manifest.logical_size,
-            dictionary_id: String::new(),
-            descriptor_hash: descriptor_hash(&[
-                "compression",
-                "none",
-                &object_manifest.logical_size.to_string(),
-            ]),
-        },
+        compression,
         encryption: CoreEncryptionDescriptor {
             algorithm: object_manifest.encoding.encryption.clone(),
             key_id: String::new(),
             nonce: Vec::new(),
             aad_hash: String::new(),
-            plaintext_hash: object_manifest.object_hash.clone(),
+            plaintext_hash,
             ciphertext_hash: object_manifest.object_hash.clone(),
             descriptor_hash: descriptor_hash(&[
                 "encryption",
@@ -4325,6 +4363,24 @@ fn validate_logical_file_manifest_shape(manifest: &CoreLogicalFileManifest) -> R
     if manifest.blocks.is_empty() {
         bail!("CoreStore logical file manifest must contain at least one block");
     }
+    match manifest.compression.algorithm.as_str() {
+        "none" => {
+            if manifest.compression.level != 0
+                || manifest.compression.uncompressed_length != manifest.logical_size
+                || manifest.compression.compressed_length != manifest.logical_size
+            {
+                bail!("CoreStore none compression descriptor does not match logical size");
+            }
+        }
+        "zstd" => {
+            if manifest.compression.level == 0
+                || manifest.compression.uncompressed_length != manifest.logical_size
+            {
+                bail!("CoreStore zstd compression descriptor is invalid");
+            }
+        }
+        other => bail!("CoreStore unsupported logical file compression descriptor {other}"),
+    }
     for block in &manifest.blocks {
         if block.data_shards != manifest.data_shards
             || block.parity_shards != manifest.parity_shards
@@ -4333,6 +4389,11 @@ fn validate_logical_file_manifest_shape(manifest: &CoreLogicalFileManifest) -> R
         }
         if block.codec_id != profile.codec_id {
             bail!("CoreStore logical file block codec id does not match erasure profile");
+        }
+        if manifest.blocks.len() == 1
+            && block.compressed_length != manifest.compression.compressed_length
+        {
+            bail!("CoreStore logical file block compressed length does not match descriptor");
         }
         if block.shards.len() < profile.minimum_read_shards {
             bail!("CoreStore logical file block does not contain enough shard receipts");
@@ -4375,6 +4436,66 @@ fn ensure_range_is_inside_expected_boundary(
         bail!("CoreStore logical range is outside expected boundary values");
     }
     Ok(())
+}
+
+fn encode_logical_file_source(
+    compression: &str,
+    source: Vec<u8>,
+) -> Result<(Vec<u8>, CoreCompressionDescriptor)> {
+    let uncompressed_length = source.len() as u64;
+    let uncompressed_hash = format!("sha256:{}", sha256_hex(&source));
+    match compression {
+        "none" => Ok((
+            source,
+            CoreCompressionDescriptor {
+                algorithm: "none".to_string(),
+                level: 0,
+                uncompressed_length,
+                compressed_length: uncompressed_length,
+                dictionary_id: String::new(),
+                descriptor_hash: descriptor_hash(&[
+                    "compression",
+                    "none",
+                    &uncompressed_length.to_string(),
+                    &uncompressed_hash,
+                ]),
+            },
+        )),
+        "zstd" => {
+            let level = 3;
+            let compressed = zstd::stream::encode_all(Cursor::new(&source), level)?;
+            let compressed_length = compressed.len() as u64;
+            let compressed_hash = format!("sha256:{}", sha256_hex(&compressed));
+            Ok((
+                compressed,
+                CoreCompressionDescriptor {
+                    algorithm: "zstd".to_string(),
+                    level: level as u32,
+                    uncompressed_length,
+                    compressed_length,
+                    dictionary_id: String::new(),
+                    descriptor_hash: descriptor_hash(&[
+                        "compression",
+                        "zstd",
+                        &level.to_string(),
+                        &uncompressed_length.to_string(),
+                        &compressed_length.to_string(),
+                        &uncompressed_hash,
+                        &compressed_hash,
+                    ]),
+                },
+            ))
+        }
+        other => bail!("CoreStore unsupported logical file compression policy {other}"),
+    }
+}
+
+fn decode_logical_file_source(compression: &str, stored: Vec<u8>) -> Result<Vec<u8>> {
+    match compression {
+        "none" => Ok(stored),
+        "zstd" => Ok(zstd::stream::decode_all(Cursor::new(stored))?),
+        other => bail!("CoreStore unsupported logical file compression descriptor {other}"),
+    }
 }
 
 fn descriptor_hash(parts: &[&str]) -> String {
@@ -6627,6 +6748,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(slice, payload[6..16].to_vec());
+    }
+
+    #[tokio::test]
+    async fn core_store_logical_file_api_supports_zstd_compression() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        let payload =
+            b"alpha alpha alpha alpha beta beta beta beta gamma gamma gamma gamma".repeat(64);
+        let manifest = store
+            .write_logical_file(WriteLogicalFileRequest {
+                writer_family: "full_text".to_string(),
+                generation: 9,
+                logical_file_id: "index/full-text/compressed/segment-9".to_string(),
+                source: payload.clone(),
+                range_hints: vec![CoreLogicalRangeHint {
+                    range_id: "beta-window".to_string(),
+                    byte_start: 12,
+                    byte_end: 32,
+                    writer_record_kind: "postings".to_string(),
+                    boundary_values: Vec::new(),
+                    writer_statistics: Vec::new(),
+                    prefetch_next_range_ids: Vec::new(),
+                }],
+                pipeline_policy: CorePipelinePolicy {
+                    compression: "zstd".to_string(),
+                    ..Default::default()
+                },
+                trace_context: CoreTraceContext::default(),
+                boundary_values: Vec::new(),
+                mutation_id: "logical-file-zstd-mut-1".to_string(),
+                region_id: "local".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(manifest.logical_size, payload.len() as u64);
+        assert_eq!(
+            manifest.content_hash,
+            format!("sha256:{}", sha256_hex(&payload))
+        );
+        assert_eq!(manifest.compression.algorithm, "zstd");
+        assert_eq!(
+            manifest.compression.uncompressed_length,
+            payload.len() as u64
+        );
+        assert!(manifest.compression.compressed_length < payload.len() as u64);
+        assert_eq!(manifest.blocks[0].logical_length, payload.len() as u64);
+        assert_eq!(
+            manifest.blocks[0].compressed_length,
+            manifest.compression.compressed_length
+        );
+        assert_ne!(manifest.blocks[0].block_encoded_hash, manifest.content_hash);
+
+        store.verify_logical_file_manifest(&manifest).await.unwrap();
+        let slice = store
+            .read_logical_range(ReadLogicalRangeRequest {
+                manifest,
+                ranges: vec![CoreByteRange {
+                    start: 12,
+                    end_exclusive: 32,
+                }],
+                authz_scope: AuthzScopeRef {
+                    anvil_storage_tenant_id: "local".to_string(),
+                    authz_realm_id: "system".to_string(),
+                },
+                expected_boundary: None,
+                prefetch_policy: CorePrefetchPolicy::default(),
+                trace_context: CoreTraceContext::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(slice, payload[12..32].to_vec());
     }
 
     #[test]

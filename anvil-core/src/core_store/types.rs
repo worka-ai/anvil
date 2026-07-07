@@ -211,13 +211,20 @@ pub struct CoreLogicalFileVerificationReport {
 pub fn core_object_ref_from_logical_file_manifest(
     manifest: &CoreLogicalFileManifest,
 ) -> CoreObjectRef {
-    let manifest_hash = manifest
-        .content_hash
-        .strip_prefix("sha256:")
+    let storage_hash = manifest
+        .blocks
+        .first()
+        .map(|block| block.block_encoded_hash.as_str())
         .unwrap_or(&manifest.content_hash);
+    let manifest_hash = storage_hash.strip_prefix("sha256:").unwrap_or(storage_hash);
+    let logical_size = manifest
+        .blocks
+        .first()
+        .map(|block| block.encrypted_length)
+        .unwrap_or(manifest.logical_size);
     CoreObjectRef {
-        hash: manifest.content_hash.clone(),
-        logical_size: manifest.logical_size,
+        hash: storage_hash.to_string(),
+        logical_size,
         manifest_ref: format!(
             "core-manifest-sha256:{manifest_hash}:profile:{}",
             manifest.erasure_profile_id
