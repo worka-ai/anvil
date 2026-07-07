@@ -75,9 +75,13 @@ pub struct CoreObjectEncoding {
 pub struct CoreObjectPlacement {
     pub shard_index: u16,
     pub node_id: String,
+    pub region_id: String,
+    pub cell_id: String,
     pub shard_hash: String,
     pub stored_size: u64,
     pub generation: u64,
+    pub placement_epoch: u64,
+    pub fsync_sequence: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

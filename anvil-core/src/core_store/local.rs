@@ -22,6 +22,8 @@ const CORE_REF_LOCK_RETRY_ATTEMPTS: usize = 12_000;
 const CORE_REF_LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
 const CORE_CONTROL_READ_RETRY_ATTEMPTS: usize = 400;
 const LOCAL_ERASURE_PROFILE_ID: &str = "ec-4-2";
+const LOCAL_PLACEMENT_EPOCH: u64 = 1;
+const LOCAL_SHARD_FSYNC_SEQUENCE: u64 = 1;
 const LOCAL_DATA_SHARDS: usize = 4;
 const LOCAL_PARITY_SHARDS: usize = 2;
 const LOCAL_NODE_ID_PREFIX: &str = "local-node";
@@ -380,7 +382,7 @@ impl CoreStore {
                     payload_stored_hash: format!("sha256:{shard_hash}"),
                     compression: "none".to_string(),
                     encryption: "none".to_string(),
-                    placement_epoch: 1,
+                    placement_epoch: LOCAL_PLACEMENT_EPOCH,
                     boundary_summary_hash: boundary_summary_hash(boundary_values)?,
                     writer_family: "object_blob".to_string(),
                     created_by_mutation_id: mutation_id.to_string(),
@@ -480,6 +482,7 @@ impl CoreStore {
                     block_id: &expected_block_id,
                     shard_index: placement.shard_index,
                     erasure_profile_id: LOCAL_ERASURE_PROFILE_ID,
+                    placement_epoch: placement.placement_epoch,
                     payload_hash: &placement.shard_hash,
                     payload_len: placement.stored_size,
                 },
@@ -589,6 +592,7 @@ impl CoreStore {
                     block_id: &expected_block_id,
                     shard_index: placement.shard_index,
                     erasure_profile_id: LOCAL_ERASURE_PROFILE_ID,
+                    placement_epoch: placement.placement_epoch,
                     payload_hash: &placement.shard_hash,
                     payload_len: placement.stored_size,
                 },
@@ -3252,6 +3256,7 @@ impl CoreStore {
                         block_id: &expected_block_id,
                         shard_index,
                         erasure_profile_id: LOCAL_ERASURE_PROFILE_ID,
+                        placement_epoch: LOCAL_PLACEMENT_EPOCH,
                         payload_hash: &expected_payload_hash,
                         payload_len: 0,
                     },
@@ -3267,9 +3272,13 @@ impl CoreStore {
                 placements.push(CoreObjectPlacement {
                     shard_index,
                     node_id: node_id.clone(),
+                    region_id: "local".to_string(),
+                    cell_id: format!("local-cell-{}", (usize::from(shard_index) % 3) + 1),
                     shard_hash: format!("sha256:{shard_hash}"),
                     stored_size: shard_payload.len() as u64,
                     generation: 1,
+                    placement_epoch: LOCAL_PLACEMENT_EPOCH,
+                    fsync_sequence: LOCAL_SHARD_FSYNC_SEQUENCE,
                 });
             }
         }
@@ -3722,6 +3731,7 @@ struct BlockShardExpectation<'a> {
     block_id: &'a str,
     shard_index: u16,
     erasure_profile_id: &'a str,
+    placement_epoch: u64,
     payload_hash: &'a str,
     payload_len: u64,
 }
@@ -3763,6 +3773,7 @@ async fn read_block_shard_file(
         "erasure_profile_id",
         expectation.erasure_profile_id,
     )?;
+    expect_cbor_u64(&header, "placement_epoch", expectation.placement_epoch)?;
     expect_cbor_text(&header, "payload_stored_hash", expectation.payload_hash)?;
     expect_cbor_text(&header, "payload_plain_hash", expectation.payload_hash)?;
     if expectation.payload_len > 0 {
@@ -6380,6 +6391,13 @@ mod tests {
             LOCAL_DATA_SHARDS + LOCAL_PARITY_SHARDS
         );
         for placement in &manifest.placements {
+            assert_eq!(placement.region_id, "local");
+            assert!(
+                placement.cell_id.starts_with("local-cell-"),
+                "placements must carry a cell failure-domain identity"
+            );
+            assert_eq!(placement.placement_epoch, LOCAL_PLACEMENT_EPOCH);
+            assert_eq!(placement.fsync_sequence, LOCAL_SHARD_FSYNC_SEQUENCE);
             let shard_hash = strip_sha256_prefix(&placement.shard_hash).unwrap();
             let path = store.shard_path(
                 &placement.node_id,
@@ -6408,6 +6426,7 @@ mod tests {
                     block_id: &expected_block_id,
                     shard_index: placement.shard_index,
                     erasure_profile_id: LOCAL_ERASURE_PROFILE_ID,
+                    placement_epoch: placement.placement_epoch,
                     payload_hash: &placement.shard_hash,
                     payload_len: placement.stored_size,
                 },
@@ -6416,6 +6435,23 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(payload.len() as u64, placement.stored_size);
+            assert!(
+                read_block_shard_file(
+                    &path,
+                    BlockShardExpectation {
+                        block_id: &expected_block_id,
+                        shard_index: placement.shard_index,
+                        erasure_profile_id: LOCAL_ERASURE_PROFILE_ID,
+                        placement_epoch: placement.placement_epoch + 1,
+                        payload_hash: &placement.shard_hash,
+                        payload_len: placement.stored_size,
+                    },
+                    "test_read_block_shard_stale_epoch",
+                )
+                .await
+                .is_err(),
+                "block shard validation must reject stale placement epochs"
+            );
         }
 
         for placement in manifest.placements.iter().take(LOCAL_PARITY_SHARDS) {
