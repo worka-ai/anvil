@@ -3002,7 +3002,7 @@ mod tests {
         let stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
         let mut hasher = Sha256::new();
         hasher.update(stream_id.as_bytes());
-        let file_name = format!("{}.jsonl", hex::encode(hasher.finalize()));
+        let file_name = format!("{}.anstream", hex::encode(hasher.finalize()));
         for index in 1..=3 {
             let stream_path = storage
                 .core_store_replica_path(&format!("local-control-node-{index}"))

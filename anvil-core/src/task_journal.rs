@@ -1160,7 +1160,7 @@ mod tests {
 
         let mut hasher = Sha256::new();
         hasher.update(stream_id.as_bytes());
-        let file_name = format!("{}.jsonl", hex::encode(hasher.finalize()));
+        let file_name = format!("{}.anstream", hex::encode(hasher.finalize()));
         (1..=3)
             .map(|index| {
                 storage

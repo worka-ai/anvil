@@ -52,7 +52,9 @@ pub fn is_stream_head_mismatch(error: &anyhow::Error) -> bool {
 const ZERO_HASH: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 const MAX_CORE_FENCE_TTL_MS: u64 = 120_000;
 const CORE_STREAM_SEGMENT_MAGIC: &[u8; 8] = b"ANSEG001";
+const CORE_ACTIVE_STREAM_MAGIC: &[u8; 8] = b"ANASTR1\0";
 const CORE_STREAM_SEGMENT_VERSION: u16 = 1;
+const CORE_ACTIVE_STREAM_VERSION: u16 = 1;
 const CORE_STREAM_SEGMENT_HEADER_SCHEMA: &str = "anvil.core.stream_segment_header.v1";
 const CORE_STREAM_RECORD_HEADER_SCHEMA: &str = "anvil.core.stream_record_header.v1";
 const CORE_STREAM_SEGMENT_TRAILER_SCHEMA: &str = "anvil.core.stream_segment_trailer.v1";
@@ -1884,27 +1886,11 @@ impl CoreStore {
         else {
             return Ok(Vec::new());
         };
-        let mut records = Vec::new();
-        for (line_index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
-            if line.is_empty() {
-                continue;
-            }
-            let stored: StoredStreamRecord = serde_json::from_slice(line)
-                .with_context(|| format!("decode stream {stream_id} line {}", line_index + 1))?;
-            let record = StreamRecord::from(stored);
-            verify_stream_record(records.last(), &record)?;
-            records.push(record);
-        }
-        Ok(records)
+        decode_active_stream_records(stream_id, &bytes)
     }
 
     async fn write_stream_records(&self, stream_id: &str, records: &[StreamRecord]) -> Result<()> {
-        let mut bytes = Vec::new();
-        for record in records {
-            let stored = StoredStreamRecord::from(record);
-            bytes.extend_from_slice(&serde_json::to_vec(&stored)?);
-            bytes.push(b'\n');
-        }
+        let bytes = encode_active_stream_records(stream_id, records)?;
         self.write_bytes_to_quorum(
             &format!("CoreStore stream {stream_id}"),
             &bytes,
@@ -2147,7 +2133,7 @@ impl CoreStore {
             .core_store_replica_path(node_id)
             .join("streams")
             .join("data")
-            .join(format!("{}.jsonl", logical_file_name(stream_id)))
+            .join(format!("{}.anstream", logical_file_name(stream_id)))
     }
 
     fn stream_names_replica_dir(&self, node_id: &str) -> PathBuf {
@@ -2180,7 +2166,6 @@ impl CoreStore {
         self.ref_names_replica_dir(node_id)
             .join(format!("{}.json", logical_file_name(ref_name)))
     }
-
 
     async fn read_bytes_from_quorum<F>(
         &self,
@@ -2801,6 +2786,78 @@ fn verify_stream_record(previous: Option<&StreamRecord>, record: &StreamRecord) 
         bail!("CoreStore stream {} event hash mismatch", record.stream_id);
     }
     Ok(())
+}
+
+fn encode_active_stream_records(stream_id: &str, records: &[StreamRecord]) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(CORE_ACTIVE_STREAM_MAGIC);
+    bytes.extend_from_slice(&CORE_ACTIVE_STREAM_VERSION.to_le_bytes());
+    write_u32_le(&mut bytes, stream_id.len())?;
+    bytes.extend_from_slice(stream_id.as_bytes());
+    bytes.extend_from_slice(&(records.len() as u64).to_le_bytes());
+
+    for record in records {
+        if record.stream_id != stream_id {
+            bail!("CoreStore active stream record stream_id mismatch");
+        }
+        let stored = StoredStreamRecord::from(record);
+        let record_json = serde_json::to_vec(&stored)?;
+        write_u32_le(&mut bytes, record_json.len())?;
+        bytes.extend_from_slice(&record_json);
+        bytes.extend_from_slice(&crc32c(&record_json).to_le_bytes());
+    }
+
+    let stream_hash = Sha256::digest(&bytes);
+    bytes.extend_from_slice(&stream_hash);
+    Ok(bytes)
+}
+
+fn decode_active_stream_records(stream_id: &str, bytes: &[u8]) -> Result<Vec<StreamRecord>> {
+    let mut offset = 0usize;
+    let magic = read_exact(bytes, &mut offset, CORE_ACTIVE_STREAM_MAGIC.len())?;
+    if magic != CORE_ACTIVE_STREAM_MAGIC {
+        bail!("CoreStore active stream has invalid magic");
+    }
+    let version = read_u16_le(bytes, &mut offset)?;
+    if version != CORE_ACTIVE_STREAM_VERSION {
+        bail!("CoreStore active stream has unsupported version {version}");
+    }
+    let encoded_stream_id_len = read_u32_le(bytes, &mut offset)? as usize;
+    let encoded_stream_id = read_exact(bytes, &mut offset, encoded_stream_id_len)?;
+    if encoded_stream_id != stream_id.as_bytes() {
+        bail!("CoreStore active stream id mismatch");
+    }
+
+    let record_count = read_u64_le(bytes, &mut offset)?;
+    let mut records = Vec::with_capacity(record_count as usize);
+    for _ in 0..record_count {
+        let record_json_len = read_u32_le(bytes, &mut offset)? as usize;
+        let record_json = read_exact(bytes, &mut offset, record_json_len)?;
+        let expected_crc = read_u32_le(bytes, &mut offset)?;
+        let actual_crc = crc32c(record_json);
+        if actual_crc != expected_crc {
+            bail!("CoreStore active stream record checksum mismatch");
+        }
+        let stored: StoredStreamRecord = serde_json::from_slice(record_json)?;
+        let record = StreamRecord::from(stored);
+        if record.stream_id != stream_id {
+            bail!("CoreStore active stream record scope mismatch");
+        }
+        verify_stream_record(records.last(), &record)?;
+        records.push(record);
+    }
+
+    let stream_hash_start = offset;
+    let stream_hash = read_exact(bytes, &mut offset, 32)?;
+    if offset != bytes.len() {
+        bail!("CoreStore active stream has trailing bytes");
+    }
+    let actual_stream_hash = Sha256::digest(&bytes[..stream_hash_start]);
+    let actual_stream_hash: &[u8] = actual_stream_hash.as_ref();
+    if stream_hash != actual_stream_hash {
+        bail!("CoreStore active stream hash mismatch");
+    }
+    Ok(records)
 }
 
 fn encode_stream_segment(
