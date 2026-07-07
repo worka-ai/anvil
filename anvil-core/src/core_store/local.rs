@@ -6,7 +6,6 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
 use hmac::{Hmac, Mac};
-use reed_solomon_erasure::galois_8::ReedSolomon;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -577,8 +576,12 @@ impl CoreStore {
                 data_shards
             );
         }
-        let reed_solomon = ReedSolomon::new(data_shards, parity_shards)?;
-        reed_solomon.reconstruct_data(&mut shards)?;
+        let profile = local_erasure_profile_for_counts(
+            &manifest.encoding.profile_id,
+            data_shards,
+            parity_shards,
+        )?;
+        reconstruct_data_shards(&mut shards, profile)?;
         let mut data = Vec::with_capacity(
             data_shards.saturating_mul(
                 shards
@@ -3937,9 +3940,172 @@ fn encode_erasure_shards(bytes: &[u8], profile: LocalErasureProfile) -> Result<V
         let end = usize::min(start + shard_len, bytes.len());
         shard[..end - start].copy_from_slice(&bytes[start..end]);
     }
-    let reed_solomon = ReedSolomon::new(profile.data_shards, profile.parity_shards)?;
-    reed_solomon.encode(&mut shards)?;
+    for parity_row in 0..profile.parity_shards {
+        let parity_index = profile.data_shards + parity_row;
+        for byte_index in 0..shard_len {
+            let mut acc = 0u8;
+            for data_index in 0..profile.data_shards {
+                let coefficient = gf_pow((data_index + 1) as u8, parity_row as u32);
+                acc ^= gf_mul(coefficient, shards[data_index][byte_index]);
+            }
+            shards[parity_index][byte_index] = acc;
+        }
+    }
     Ok(shards)
+}
+
+fn reconstruct_data_shards(
+    shards: &mut [Option<Vec<u8>>],
+    profile: LocalErasureProfile,
+) -> Result<()> {
+    let total_shards = profile.total_shards();
+    if shards.len() != total_shards {
+        bail!(
+            "CoreStore erasure reconstruction expected {} shards for {}, got {}",
+            total_shards,
+            profile.id,
+            shards.len()
+        );
+    }
+    let shard_len = shards
+        .iter()
+        .find_map(|shard| shard.as_ref().map(Vec::len))
+        .ok_or_else(|| anyhow!("CoreStore erasure reconstruction has no shards"))?;
+    for shard in shards.iter().flatten() {
+        if shard.len() != shard_len {
+            bail!("CoreStore erasure reconstruction shard lengths differ");
+        }
+    }
+    if shards.iter().filter(|shard| shard.is_some()).count() < profile.minimum_read_shards {
+        bail!(
+            "CoreStore erasure reconstruction has fewer than {} readable shards for {}",
+            profile.minimum_read_shards,
+            profile.id
+        );
+    }
+    if shards.iter().take(profile.data_shards).all(Option::is_some) {
+        return Ok(());
+    }
+
+    let selected = shards
+        .iter()
+        .enumerate()
+        .filter_map(|(index, shard)| shard.as_ref().map(|payload| (index, payload.clone())))
+        .take(profile.data_shards)
+        .collect::<Vec<_>>();
+    if selected.len() < profile.data_shards {
+        bail!("CoreStore erasure reconstruction cannot select enough shards");
+    }
+
+    let matrix = selected
+        .iter()
+        .map(|(shard_index, _)| erasure_coding_row(*shard_index, profile.data_shards))
+        .collect::<Vec<_>>();
+    let inverse = invert_gf256_matrix(&matrix)?;
+    for data_index in 0..profile.data_shards {
+        if shards[data_index].is_some() {
+            continue;
+        }
+        let mut reconstructed = vec![0u8; shard_len];
+        for (source_row, (_, source_payload)) in selected.iter().enumerate() {
+            let coefficient = inverse[data_index][source_row];
+            if coefficient == 0 {
+                continue;
+            }
+            for byte_index in 0..shard_len {
+                reconstructed[byte_index] ^= gf_mul(coefficient, source_payload[byte_index]);
+            }
+        }
+        shards[data_index] = Some(reconstructed);
+    }
+
+    Ok(())
+}
+
+fn erasure_coding_row(shard_index: usize, data_shards: usize) -> Vec<u8> {
+    if shard_index < data_shards {
+        let mut row = vec![0u8; data_shards];
+        row[shard_index] = 1;
+        return row;
+    }
+    let parity_row = shard_index - data_shards;
+    (0..data_shards)
+        .map(|data_index| gf_pow((data_index + 1) as u8, parity_row as u32))
+        .collect()
+}
+
+fn invert_gf256_matrix(matrix: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+    let n = matrix.len();
+    if n == 0 {
+        bail!("CoreStore cannot invert an empty erasure matrix");
+    }
+    if matrix.iter().any(|row| row.len() != n) {
+        bail!("CoreStore erasure matrix must be square");
+    }
+
+    let mut augmented = vec![vec![0u8; n * 2]; n];
+    for row in 0..n {
+        augmented[row][..n].copy_from_slice(&matrix[row]);
+        augmented[row][n + row] = 1;
+    }
+
+    for col in 0..n {
+        let pivot = (col..n)
+            .find(|row| augmented[*row][col] != 0)
+            .ok_or_else(|| anyhow!("CoreStore erasure matrix is singular"))?;
+        if pivot != col {
+            augmented.swap(pivot, col);
+        }
+        let inv_pivot = gf_inv(augmented[col][col])?;
+        for value in &mut augmented[col] {
+            *value = gf_mul(*value, inv_pivot);
+        }
+        for row in 0..n {
+            if row == col {
+                continue;
+            }
+            let factor = augmented[row][col];
+            if factor == 0 {
+                continue;
+            }
+            for idx in 0..(n * 2) {
+                augmented[row][idx] ^= gf_mul(factor, augmented[col][idx]);
+            }
+        }
+    }
+
+    Ok(augmented.into_iter().map(|row| row[n..].to_vec()).collect())
+}
+
+fn gf_pow(value: u8, exponent: u32) -> u8 {
+    let mut acc = 1u8;
+    for _ in 0..exponent {
+        acc = gf_mul(acc, value);
+    }
+    acc
+}
+
+fn gf_inv(value: u8) -> Result<u8> {
+    if value == 0 {
+        bail!("CoreStore cannot invert zero in GF(2^8)");
+    }
+    Ok(gf_pow(value, 254))
+}
+
+fn gf_mul(mut lhs: u8, mut rhs: u8) -> u8 {
+    let mut acc = 0u8;
+    for _ in 0..8 {
+        if rhs & 1 != 0 {
+            acc ^= lhs;
+        }
+        let carry = lhs & 0x80 != 0;
+        lhs <<= 1;
+        if carry {
+            lhs ^= 0x1d;
+        }
+        rhs >>= 1;
+    }
+    acc
 }
 
 fn required_data_shard_indices_for_range(
@@ -6364,6 +6530,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(slice, payload[6..16].to_vec());
+    }
+
+    #[test]
+    fn core_store_erasure_codec_matches_rfc_golden_vectors() {
+        let ec_4_2_payload =
+            hex::decode(concat!("00010203", "10111213", "20212223", "30313233")).unwrap();
+        let ec_4_2 = encode_erasure_shards(&ec_4_2_payload, LOCAL_EC_4_2_PROFILE).unwrap();
+        assert_eq!(hex::encode(&ec_4_2[0]), "00010203");
+        assert_eq!(hex::encode(&ec_4_2[1]), "10111213");
+        assert_eq!(hex::encode(&ec_4_2[2]), "20212223");
+        assert_eq!(hex::encode(&ec_4_2[3]), "30313233");
+        assert_eq!(hex::encode(&ec_4_2[4]), "00000000");
+        assert_eq!(hex::encode(&ec_4_2[5]), "8084888c");
+
+        let ec_8_3_payload = hex::decode(concat!(
+            "00010203", "10111213", "20212223", "30313233", "40414243", "50515253", "60616263",
+            "70717273"
+        ))
+        .unwrap();
+        let ec_8_3 = encode_erasure_shards(&ec_8_3_payload, LOCAL_EC_8_3_PROFILE).unwrap();
+        assert_eq!(hex::encode(&ec_8_3[0]), "00010203");
+        assert_eq!(hex::encode(&ec_8_3[1]), "10111213");
+        assert_eq!(hex::encode(&ec_8_3[2]), "20212223");
+        assert_eq!(hex::encode(&ec_8_3[3]), "30313233");
+        assert_eq!(hex::encode(&ec_8_3[4]), "40414243");
+        assert_eq!(hex::encode(&ec_8_3[5]), "50515253");
+        assert_eq!(hex::encode(&ec_8_3[6]), "60616263");
+        assert_eq!(hex::encode(&ec_8_3[7]), "70717273");
+        assert_eq!(hex::encode(&ec_8_3[8]), "00000000");
+        assert_eq!(hex::encode(&ec_8_3[9]), "bab2aaa2");
+        assert_eq!(hex::encode(&ec_8_3[10]), "2565a5e5");
+
+        let replicated =
+            encode_erasure_shards(b"replicated profile payload", LOCAL_REPLICATED_3_PROFILE)
+                .unwrap();
+        assert_eq!(replicated[0], replicated[1]);
+        assert_eq!(replicated[0], replicated[2]);
+    }
+
+    #[test]
+    fn core_store_erasure_codec_recovers_every_allowed_missing_shard_set() {
+        for profile in [
+            LOCAL_EC_4_2_PROFILE,
+            LOCAL_EC_8_3_PROFILE,
+            LOCAL_REPLICATED_3_PROFILE,
+        ] {
+            let payload_len = profile.data_shards * 17 + 5;
+            let payload = (0..payload_len)
+                .map(|index| (index.wrapping_mul(37) % 251) as u8)
+                .collect::<Vec<_>>();
+            let original = encode_erasure_shards(&payload, profile).unwrap();
+            let missing_sets = shard_missing_sets(profile.total_shards(), profile.parity_shards);
+
+            for missing in missing_sets {
+                let mut shards = original
+                    .iter()
+                    .cloned()
+                    .map(Some)
+                    .collect::<Vec<Option<Vec<u8>>>>();
+                for index in &missing {
+                    shards[*index] = None;
+                }
+                reconstruct_data_shards(&mut shards, profile).unwrap_or_else(|error| {
+                    panic!(
+                        "profile {} failed to recover missing {:?}: {error}",
+                        profile.id, missing
+                    )
+                });
+                for shard_index in 0..profile.data_shards {
+                    assert_eq!(
+                        shards[shard_index].as_ref().unwrap(),
+                        &original[shard_index],
+                        "profile {} recovered wrong data shard {} with missing {:?}",
+                        profile.id,
+                        shard_index,
+                        missing
+                    );
+                }
+            }
+        }
+    }
+
+    fn shard_missing_sets(total_shards: usize, max_missing: usize) -> Vec<Vec<usize>> {
+        fn visit(
+            total_shards: usize,
+            remaining: usize,
+            start: usize,
+            current: &mut Vec<usize>,
+            out: &mut Vec<Vec<usize>>,
+        ) {
+            out.push(current.clone());
+            if remaining == 0 {
+                return;
+            }
+            for index in start..total_shards {
+                current.push(index);
+                visit(total_shards, remaining - 1, index + 1, current, out);
+                current.pop();
+            }
+        }
+
+        let mut out = Vec::new();
+        visit(total_shards, max_missing, 0, &mut Vec::new(), &mut out);
+        out
     }
 
     #[tokio::test]
