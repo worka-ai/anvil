@@ -52,6 +52,14 @@ pub fn is_stream_head_mismatch(error: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<CoreStoreCommitError>().is_some())
 }
 
+fn is_incomplete_core_frame_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("CoreStore frame ended unexpectedly")
+    })
+}
+
 const ZERO_HASH: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 const MAX_CORE_FENCE_TTL_MS: u64 = 120_000;
 const CORE_STREAM_SEGMENT_MAGIC: &[u8; 8] = b"ANSEG001";
@@ -1203,13 +1211,18 @@ impl CoreStore {
             expires_at_ms: now_ms.saturating_add(input.ttl_ms as i64),
             updated_at: now_rfc3339(),
         };
+        let record_bytes = serde_json::to_vec(&record)?;
+        let record_hash = sha256_hex(&record_bytes);
         let object_ref = self
             .put_blob(PutBlob {
                 logical_name: ref_name.clone(),
-                bytes: serde_json::to_vec(&record)?,
+                bytes: record_bytes,
                 boundary_values: Vec::new(),
                 region_id: "local".to_string(),
-                mutation_id: format!("core-fence:{}:{next_token}", input.fence_name),
+                mutation_id: format!(
+                    "core-fence:{}:{}:{}",
+                    input.fence_name, next_token, record_hash
+                ),
             })
             .await?;
         self.compare_and_swap_ref(CompareAndSwapRef {
@@ -1873,12 +1886,26 @@ impl CoreStore {
         &self,
     ) -> Result<Vec<(CoreWalAdmissionRecord, Vec<u8>)>> {
         let path = self.active_wal_path();
-        let bytes = match fs::read(&path).await {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
-        };
-        decode_wal_records(&bytes)
+        for attempt in 0..CORE_CONTROL_READ_RETRY_ATTEMPTS {
+            let bytes = match fs::read(&path).await {
+                Ok(bytes) => bytes,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+            };
+            match decode_wal_records(&bytes)
+                .with_context(|| format!("decode CoreStore admission WAL {}", path.display()))
+            {
+                Ok(records) => return Ok(records),
+                Err(error)
+                    if is_incomplete_core_frame_error(&error)
+                        && attempt + 1 < CORE_CONTROL_READ_RETRY_ATTEMPTS =>
+                {
+                    tokio::time::sleep(CORE_REF_LOCK_RETRY_DELAY).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("CoreStore WAL decode retry loop must return")
     }
 
     async fn read_core_wal_finalisation_keys(&self) -> Result<BTreeSet<CoreWalRecordKey>> {
@@ -1908,6 +1935,7 @@ impl CoreStore {
         admission: &CoreWalAdmissionRecord,
         state: &str,
     ) -> Result<()> {
+        let _transaction_guard = self.acquire_stream_lock(CORE_TRANSACTION_STREAM_ID).await?;
         let admission_key = CoreWalRecordKey::from(admission);
         for record in self
             .read_all_stream_records(CORE_TRANSACTION_STREAM_ID)
@@ -2080,6 +2108,7 @@ impl CoreStore {
     }
 
     async fn recover_core_wal(&self) -> Result<()> {
+        let _recovery_guard = self.acquire_named_lock("wal", "recovery").await?;
         let _guard = self.write_lock.lock().await;
         let records = self.read_core_wal_records_with_payload().await?;
         if records.is_empty() {
@@ -2087,22 +2116,45 @@ impl CoreStore {
         }
         let finalised = self.read_core_wal_finalisation_keys().await?;
         for (record, payload) in records {
-            if finalised.contains(&CoreWalRecordKey::from(&record)) {
+            let record_key = CoreWalRecordKey::from(&record);
+            if finalised.contains(&record_key) {
                 continue;
             }
-            let state = self
+            let state = match self
                 .replay_core_wal_record_unlocked(&record, &payload)
                 .await
-                .with_context(|| {
-                    format!(
-                        "replay CoreStore WAL mutation {} sequence {}",
-                        record.mutation_id, record.sequence
-                    )
-                })?;
-            self.mark_core_wal_finalised_unlocked(&record, state)
-                .await?;
+            {
+                Ok(state) => state,
+                Err(error) => {
+                    if self.wait_for_core_wal_finalisation(&record_key).await? {
+                        continue;
+                    }
+                    return Err(error).with_context(|| {
+                        format!(
+                            "replay CoreStore WAL mutation {} sequence {}",
+                            record.mutation_id, record.sequence
+                        )
+                    });
+                }
+            };
+            if let Err(error) = self.mark_core_wal_finalised_unlocked(&record, state).await {
+                if self.wait_for_core_wal_finalisation(&record_key).await? {
+                    continue;
+                }
+                return Err(error);
+            }
         }
         Ok(())
+    }
+
+    async fn wait_for_core_wal_finalisation(&self, key: &CoreWalRecordKey) -> Result<bool> {
+        for _ in 0..CORE_CONTROL_READ_RETRY_ATTEMPTS {
+            if self.read_core_wal_finalisation_keys().await?.contains(key) {
+                return Ok(true);
+            }
+            tokio::time::sleep(CORE_REF_LOCK_RETRY_DELAY).await;
+        }
+        Ok(false)
     }
 
     async fn replay_core_wal_record_unlocked(
@@ -2257,38 +2309,14 @@ impl CoreStore {
         if fs::metadata(&path).await.is_ok() {
             return Ok(());
         }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
         let header = encode_wal_file_header(CORE_WAL_NODE_ID, CORE_WAL_EPOCH, 1)?;
-        let started_at = Instant::now();
-        let mut file = fs::File::create(&path).await?;
-        crate::perf::record_io_duration(
-            "core_store",
-            "wal_header_create",
-            &path,
-            0,
-            started_at.elapsed(),
-        );
-        let started_at = Instant::now();
-        file.write_all(&header).await?;
-        crate::perf::record_io_duration(
-            "core_store",
-            "wal_header_write",
-            &path,
-            header.len() as u64,
-            started_at.elapsed(),
-        );
-        let started_at = Instant::now();
-        file.sync_all().await?;
-        crate::perf::record_io_duration(
-            "core_store",
-            "wal_header_sync",
-            &path,
-            header.len() as u64,
-            started_at.elapsed(),
-        );
-        sync_parent_dir(&path, "wal_header_sync_parent_dir").await?;
+        match write_file_atomic(&path, &header).await {
+            Ok(()) => {}
+            Err(error) if fs::metadata(&path).await.is_ok() => {
+                drop(error);
+            }
+            Err(error) => return Err(error),
+        }
         Ok(())
     }
 
@@ -2971,12 +2999,12 @@ impl CoreStore {
             bail!("CoreStore only persists committed transactions through commit_transaction");
         }
         validate_logical_id(&transaction.transaction_id, "transaction id")?;
-        let _transaction_guard = self.acquire_stream_lock(CORE_TRANSACTION_STREAM_ID).await?;
         let _guard = self.write_lock.lock().await;
         self.write_transaction_unlocked(&transaction).await
     }
 
     async fn write_transaction_unlocked(&self, transaction: &CoreTransaction) -> Result<()> {
+        let _transaction_guard = self.acquire_stream_lock(CORE_TRANSACTION_STREAM_ID).await?;
         if let Some(existing) = self
             .read_transaction_unlocked(&transaction.transaction_id)
             .await?
@@ -3494,16 +3522,30 @@ impl CoreStore {
     }
 
     async fn read_all_stream_records(&self, stream_id: &str) -> Result<Vec<StreamRecord>> {
-        let Some(bytes) = self
-            .read_bytes_from_quorum(
-                &format!("CoreStore stream {stream_id}"),
-                |store, node_id| store.stream_replica_path(node_id, stream_id),
-            )
-            .await?
-        else {
-            return Ok(Vec::new());
-        };
-        decode_active_stream_records(stream_id, &bytes)
+        for attempt in 0..CORE_CONTROL_READ_RETRY_ATTEMPTS {
+            let Some(bytes) = self
+                .read_bytes_from_quorum(
+                    &format!("CoreStore stream {stream_id}"),
+                    |store, node_id| store.stream_replica_path(node_id, stream_id),
+                )
+                .await?
+            else {
+                return Ok(Vec::new());
+            };
+            match decode_active_stream_records(stream_id, &bytes)
+                .with_context(|| format!("decode CoreStore active stream {stream_id}"))
+            {
+                Ok(records) => return Ok(records),
+                Err(error)
+                    if is_incomplete_core_frame_error(&error)
+                        && attempt + 1 < CORE_CONTROL_READ_RETRY_ATTEMPTS =>
+                {
+                    tokio::time::sleep(CORE_REF_LOCK_RETRY_DELAY).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("CoreStore stream decode retry loop must return")
     }
 
     async fn read_stream_records_after(
@@ -3512,16 +3554,30 @@ impl CoreStore {
         after_sequence: u64,
         limit: usize,
     ) -> Result<Vec<StreamRecord>> {
-        let Some(bytes) = self
-            .read_bytes_from_quorum(
-                &format!("CoreStore stream {stream_id}"),
-                |store, node_id| store.stream_replica_path(node_id, stream_id),
-            )
-            .await?
-        else {
-            return Ok(Vec::new());
-        };
-        decode_active_stream_records_page(stream_id, &bytes, after_sequence, limit)
+        for attempt in 0..CORE_CONTROL_READ_RETRY_ATTEMPTS {
+            let Some(bytes) = self
+                .read_bytes_from_quorum(
+                    &format!("CoreStore stream {stream_id}"),
+                    |store, node_id| store.stream_replica_path(node_id, stream_id),
+                )
+                .await?
+            else {
+                return Ok(Vec::new());
+            };
+            match decode_active_stream_records_page(stream_id, &bytes, after_sequence, limit)
+                .with_context(|| format!("decode CoreStore active stream page {stream_id}"))
+            {
+                Ok(records) => return Ok(records),
+                Err(error)
+                    if is_incomplete_core_frame_error(&error)
+                        && attempt + 1 < CORE_CONTROL_READ_RETRY_ATTEMPTS =>
+                {
+                    tokio::time::sleep(CORE_REF_LOCK_RETRY_DELAY).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("CoreStore stream page decode retry loop must return")
     }
 
     async fn write_stream_records(&self, stream_id: &str, records: &[StreamRecord]) -> Result<()> {
@@ -5553,14 +5609,27 @@ fn decode_wal_file(bytes: &[u8]) -> Result<(u64, Vec<(CoreWalAdmissionRecord, Ve
     let mut records = Vec::new();
     while offset < bytes.len() {
         let frame_start = offset;
+        if bytes.len().saturating_sub(offset) < CORE_WAL_FRAME_MAGIC.len() {
+            break;
+        }
         let frame_magic = read_exact(bytes, &mut offset, CORE_WAL_FRAME_MAGIC.len())?;
         if frame_magic != CORE_WAL_FRAME_MAGIC {
             bail!("CoreStore WAL frame has invalid magic");
+        }
+        if bytes.len().saturating_sub(offset) < 12 {
+            break;
         }
         let header_len = read_u32_le(bytes, &mut offset)? as usize;
         let payload_len = read_u64_le(bytes, &mut offset)? as usize;
         if payload_len > CORE_WAL_MAX_INLINE_PAYLOAD_BYTES {
             bail!("CoreStore WAL frame payload exceeds inline limit");
+        }
+        let required_tail = header_len
+            .checked_add(payload_len)
+            .and_then(|value| value.checked_add(4))
+            .ok_or_else(|| anyhow!("CoreStore WAL frame length overflow"))?;
+        if bytes.len().saturating_sub(offset) < required_tail {
+            break;
         }
         let header_json = read_exact(bytes, &mut offset, header_len)?;
         let payload = read_exact(bytes, &mut offset, payload_len)?;
@@ -5795,7 +5864,14 @@ async fn sum_files_with_extension(root: &PathBuf, extensions: &[&str]) -> Result
 
         while let Some(entry) = entries.next_entry().await? {
             let entry_path = entry.path();
-            let metadata = entry.metadata().await?;
+            let metadata = match entry.metadata().await {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("read metadata for {}", entry_path.display()));
+                }
+            };
             if metadata.is_dir() {
                 pending.push(entry_path);
                 continue;

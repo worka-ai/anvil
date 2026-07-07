@@ -140,7 +140,7 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
             name: "task_lease",
             source_files: &["anvil-core/src/task_lease.rs"],
             required_terms: &["TaskLease", "TaskLeaseOwner", "fence_token"],
-            corestore_terms: &["CoreStore", ".put_blob", ".compare_and_swap_ref"],
+            corestore_terms: &["CoreStore", ".write_logical_file", ".compare_and_swap_ref"],
         },
         DurableFeatureFamily {
             name: "authz_schema",
@@ -410,6 +410,48 @@ fn rfc_0006_local_storage_guard_prevents_authoritative_feature_file_writes() {
     assert!(
         violations.is_empty(),
         "authoritative durable feature code must not write local files outside CoreStore-owned staging/cache/shard/scratch paths:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn rfc_0007_feature_state_uses_logical_files_not_raw_object_payload_writes() {
+    let source_root = workspace_root().join("anvil-core/src");
+    let mut files = Vec::new();
+    collect_rs_files(&source_root, &mut files);
+
+    let allowed_put_blob_files = BTreeSet::from([
+        // CoreStore owns the raw object payload writer and uses it to assemble
+        // object, stream, transaction, ref and logical-file primitives.
+        "anvil-core/src/core_store/local.rs",
+        // Object payload ingestion is the only feature writer allowed to call
+        // the raw blob primitive directly. All format-aware feature files must
+        // publish through write_logical_file.
+        "anvil-core/src/object_manager.rs",
+        "anvil-core/src/persistence.rs",
+    ]);
+
+    let mut violations = Vec::new();
+    for path in files {
+        let relative = path
+            .strip_prefix(workspace_root())
+            .expect("source path is under workspace")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let source = production_source(&relative);
+        if allowed_put_blob_files.contains(relative.as_str()) {
+            continue;
+        }
+        for (line_index, line) in source.lines().enumerate() {
+            if line.contains(".put_blob(") {
+                violations.push(format!("{}:{}: {}", relative, line_index + 1, line.trim()));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "format-aware feature persistence must use CoreStore logical files instead of raw object payload writes:\n{}",
         violations.join("\n")
     );
 }

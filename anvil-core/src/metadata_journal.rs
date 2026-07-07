@@ -1,6 +1,7 @@
 use crate::core_store::{
     CompareAndSwapRef, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CoreObjectRef, CoreStore, GetBlob, PutBlob, ReadStream, is_stream_head_mismatch,
+    CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob, ReadStream,
+    WriteLogicalFileRequest, is_stream_head_mismatch,
 };
 use crate::formats::{
     BinaryEnvelopeHeader, BinaryFileFooter, COMMON_FOOTER_LEN, COMMON_HEADER_LEN, FileFamily,
@@ -1555,15 +1556,20 @@ async fn write_segment_file(
 
     let store = CoreStore::new(storage.clone()).await?;
     let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.clone(),
-            bytes,
+        .write_logical_file_ref(WriteLogicalFileRequest {
+            writer_family: "object_metadata".to_string(),
+            generation,
+            logical_file_id: ref_name.clone(),
+            source: bytes,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!(
                 "metadata-segment:{}:{}:{}",
                 bucket.tenant_id, bucket.id, generation
             ),
+            region_id: "local".to_string(),
         })
         .await?;
     let new_target = encode_core_object_ref_target(&object_ref)?;
@@ -1666,15 +1672,20 @@ async fn write_partition_manifest(
     let manifest_ref = metadata_manifest_ref_name(bucket)?;
     let store = CoreStore::new(storage.clone()).await?;
     let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: manifest_ref.clone(),
-            bytes: encoded,
+        .write_logical_file_ref(WriteLogicalFileRequest {
+            writer_family: "object_metadata".to_string(),
+            generation,
+            logical_file_id: manifest_ref.clone(),
+            source: encoded,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!(
                 "metadata-manifest:{}:{}:{}",
                 bucket.tenant_id, bucket.id, generation
             ),
+            region_id: "local".to_string(),
         })
         .await?;
     let new_target = encode_core_object_ref_target(&object_ref)?;
@@ -2244,6 +2255,7 @@ fn directory_key_hash(bucket: &Bucket, object: &Object) -> Hash32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core_store::PutBlob;
     use crate::partition_fence::{
         PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
     };

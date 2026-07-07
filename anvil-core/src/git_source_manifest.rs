@@ -1,5 +1,8 @@
 use crate::{
-    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    core_store::{
+        CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
+        WriteLogicalFileRequest,
+    },
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
@@ -32,15 +35,20 @@ pub async fn write_git_source_repository_manifest(
     let ref_name = manifest_ref_name(manifest.tenant_id, &manifest.repository_id)?;
     let store = CoreStore::new(storage.clone()).await?;
     let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.clone(),
-            bytes: serde_json::to_vec(manifest)?,
+        .write_logical_file_ref(WriteLogicalFileRequest {
+            writer_family: "git_source".to_string(),
+            generation: manifest.generation,
+            logical_file_id: ref_name.clone(),
+            source: serde_json::to_vec(manifest)?,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!(
                 "git-source-manifest:{}:{}",
                 manifest.tenant_id, manifest.repository_id
             ),
+            region_id: "local".to_string(),
         })
         .await?;
     store

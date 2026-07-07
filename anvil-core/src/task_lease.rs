@@ -1,5 +1,8 @@
 use crate::{
-    core_store::{CompareAndSwapRef, CoreObjectRef, CoreRefValue, CoreStore, GetBlob, PutBlob},
+    core_store::{
+        CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreRefValue, CoreStore,
+        CoreTraceContext, GetBlob, WriteLogicalFileRequest,
+    },
     formats::hash32,
     storage::Storage,
 };
@@ -146,13 +149,18 @@ pub async fn acquire_task_lease(
 ) -> Result<TaskLease> {
     validate_acquire_request(&request)?;
     for _ in 0..LOCK_RETRY_ATTEMPTS {
-        let existing = read_task_lease_state(
+        let existing = match read_task_lease_state(
             storage,
             request.owner.tenant_id,
             &request.task_id,
             signing_key,
         )
-        .await?;
+        .await
+        {
+            Ok(existing) => existing,
+            Err(err) if is_core_ref_cas_conflict(&err) => continue,
+            Err(err) => return Err(err),
+        };
         let existing_lease = existing.as_ref().map(|(_, lease)| lease);
         let active_same_owner = existing_lease.is_some_and(|lease| {
             lease.expires_at_nanos > request.now_nanos
@@ -474,15 +482,25 @@ async fn write_task_lease_state(
     let ref_name = task_lease_ref_name(lease.owner.tenant_id, &lease.task_id)?;
     let store = CoreStore::new(storage.clone()).await?;
     let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.clone(),
-            bytes: serde_json::to_vec_pretty(lease)?,
+        .write_logical_file_ref(WriteLogicalFileRequest {
+            writer_family: "task_lease".to_string(),
+            generation: lease.lease_epoch,
+            logical_file_id: ref_name.clone(),
+            source: serde_json::to_vec_pretty(lease)?,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!(
-                "task-lease:{}:{}:{}",
-                lease.owner.tenant_id, lease.task_id, lease.lease_epoch
+                "task-lease:{}:{}:{}:{}:{}:{}",
+                lease.owner.tenant_id,
+                lease.task_id,
+                lease.lease_epoch,
+                lease.owner.principal_id,
+                lease.owner.actor_instance_id,
+                lease.lease_hash.as_deref().unwrap_or("unsealed")
             ),
+            region_id: "local".to_string(),
         })
         .await?;
     store
@@ -544,12 +562,15 @@ fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
 }
 
 fn is_core_ref_cas_conflict(err: &anyhow::Error) -> bool {
-    let message = err.to_string();
-    message.contains("generation mismatch")
-        || message.contains("target mismatch")
-        || message.contains("must be absent")
-        || message.contains("must be present")
-        || message.contains("CAS lock was not acquired")
+    err.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("generation mismatch")
+            || message.contains("target mismatch")
+            || message.contains("must be absent")
+            || message.contains("must be present")
+            || message.contains("CAS lock was not acquired")
+            || message.contains("CoreStore stream idempotency conflict")
+    })
 }
 
 fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
@@ -569,6 +590,7 @@ fn require_nonempty(value: &str, field: &'static str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core_store::PutBlob;
     use tempfile::tempdir;
 
     const KEY: &[u8] = b"task lease signing key";

@@ -1,6 +1,9 @@
 use crate::{
     anvil_api::NativeMutationContext,
-    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    core_store::{
+        CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
+        WriteLogicalFileRequest,
+    },
     storage::Storage,
 };
 use base64::Engine;
@@ -126,12 +129,17 @@ where
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
     let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.clone(),
-            bytes,
+        .write_logical_file_ref(WriteLogicalFileRequest {
+            writer_family: "idempotency".to_string(),
+            generation: 1,
+            logical_file_id: ref_name.clone(),
+            source: bytes,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!("native-idempotency:{}", context.request_id),
+            region_id: "local".to_string(),
         })
         .await
         .map_err(|e| Status::internal(e.to_string()))?;

@@ -1,5 +1,8 @@
 use crate::{
-    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    core_store::{
+        CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
+        WriteLogicalFileRequest,
+    },
     formats::hash32,
     partition_fence::{
         OWNERSHIP_EXPIRED, OWNERSHIP_NOT_FOUND, OWNERSHIP_OWNER_MISMATCH, OWNERSHIP_STALE_FENCE,
@@ -253,15 +256,20 @@ async fn write_watch_checkpoint(storage: &Storage, checkpoint: &WatchCheckpoint)
     let ref_name = watch_checkpoint_ref_name(&checkpoint.watch_stream_id, &checkpoint.consumer_id)?;
     let store = CoreStore::new(storage.clone()).await?;
     let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.clone(),
-            bytes: serde_json::to_vec(checkpoint)?,
+        .write_logical_file_ref(WriteLogicalFileRequest {
+            writer_family: "watch_checkpoint".to_string(),
+            generation: checkpoint.generation,
+            logical_file_id: ref_name.clone(),
+            source: serde_json::to_vec(checkpoint)?,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!(
                 "watch-checkpoint:{}:{}",
                 checkpoint.watch_stream_id, checkpoint.consumer_id
             ),
+            region_id: "local".to_string(),
         })
         .await?;
     store
@@ -385,6 +393,7 @@ fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core_store::PutBlob;
     use crate::partition_fence::{
         AcquireOwnership, ForceExpireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal,
         OwnershipResource, OwnershipResourceKind, acquire_ownership, force_expire_ownership,

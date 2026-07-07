@@ -3,9 +3,12 @@ use crate::{
     auth, authz_journal, authz_realm_schema,
     authz_scope::encode_realm_namespace,
     config::Config,
-    core_store::{AcquireFence, CompareAndSwapRef, CoreStore},
+    core_store::{
+        AcquireFence, CompareAndSwapRef, CorePipelinePolicy, CoreStore, CoreTraceContext,
+        WriteLogicalFileRequest,
+    },
     crypto::EncryptionKeyring,
-    persistence::{App, Persistence},
+    persistence::{App, AuthzTupleBatchMutation, Persistence},
     storage::Storage,
 };
 use anyhow::{Context, Result, anyhow};
@@ -120,9 +123,15 @@ pub async fn ensure_bootstrapped(
     let (subject_kind, subject_id) =
         resolve_bootstrap_subject(config, persistence, secret_keyring).await?;
 
-    install_system_schema(storage).await?;
-    write_system_relation_tuples(persistence, &mesh_id, &subject_kind, &subject_id).await?;
-    write_bootstrap_marker(storage, &mesh_id).await
+    install_system_schema(storage)
+        .await
+        .context("install system authz schema")?;
+    write_system_relation_tuples(persistence, &mesh_id, &subject_kind, &subject_id)
+        .await
+        .context("write system relation tuples")?;
+    write_bootstrap_marker(storage, &mesh_id)
+        .await
+        .context("write system bootstrap marker")
 }
 
 pub async fn check_admin_relation(
@@ -481,55 +490,50 @@ async fn write_system_relation_tuples(
     subject_id: &str,
 ) -> Result<()> {
     let namespace = system_namespace();
-    persistence
-        .write_authz_tuple(
-            SYSTEM_STORAGE_TENANT_ID,
-            &namespace,
-            mesh_id,
-            "owner",
-            subject_kind,
-            subject_id,
-            "",
-            "add",
-            "system-realm-bootstrap",
-            "grant initial system owner",
-        )
-        .await?;
+    let mut mutations = vec![AuthzTupleBatchMutation {
+        namespace: namespace.clone(),
+        object_id: mesh_id.to_string(),
+        relation: "owner".to_string(),
+        subject_kind: subject_kind.to_string(),
+        subject_id: subject_id.to_string(),
+        caveat_hash: String::new(),
+        operation: "add".to_string(),
+        reason: "grant initial system owner".to_string(),
+    }];
 
     let owner_userset = format!("{namespace}/{mesh_id}#owner");
     let admin_userset = format!("{namespace}/{mesh_id}#admin");
-    persistence
-        .write_authz_tuple(
-            SYSTEM_STORAGE_TENANT_ID,
-            &namespace,
-            mesh_id,
-            "admin",
-            "userset",
-            &owner_userset,
-            "",
-            "add",
-            "system-realm-bootstrap",
-            "owner implies admin",
-        )
-        .await?;
+    mutations.push(AuthzTupleBatchMutation {
+        namespace: namespace.clone(),
+        object_id: mesh_id.to_string(),
+        relation: "admin".to_string(),
+        subject_kind: "userset".to_string(),
+        subject_id: owner_userset.clone(),
+        caveat_hash: String::new(),
+        operation: "add".to_string(),
+        reason: "owner implies admin".to_string(),
+    });
     for relation in all_admin_relations() {
         for userset in [&owner_userset, &admin_userset] {
-            persistence
-                .write_authz_tuple(
-                    SYSTEM_STORAGE_TENANT_ID,
-                    &namespace,
-                    mesh_id,
-                    relation.as_str(),
-                    "userset",
-                    userset,
-                    "",
-                    "add",
-                    "system-realm-bootstrap",
-                    "system admin relation inheritance",
-                )
-                .await?;
+            mutations.push(AuthzTupleBatchMutation {
+                namespace: namespace.clone(),
+                object_id: mesh_id.to_string(),
+                relation: relation.as_str().to_string(),
+                subject_kind: "userset".to_string(),
+                subject_id: userset.to_string(),
+                caveat_hash: String::new(),
+                operation: "add".to_string(),
+                reason: "system admin relation inheritance".to_string(),
+            });
         }
     }
+    persistence
+        .write_authz_tuple_batch(
+            SYSTEM_STORAGE_TENANT_ID,
+            mutations,
+            "system-realm-bootstrap",
+        )
+        .await?;
     Ok(())
 }
 
@@ -542,12 +546,17 @@ async fn write_bootstrap_marker(storage: &Storage, mesh_id: &str) -> Result<()> 
         completed_at: chrono::Utc::now().to_rfc3339(),
     };
     let object_ref = store
-        .put_blob(crate::core_store::PutBlob {
-            logical_name: bootstrap_marker_ref(mesh_id),
-            bytes: serde_json::to_vec_pretty(&marker)?,
+        .write_logical_file_ref(WriteLogicalFileRequest {
+            writer_family: "system_realm".to_string(),
+            generation: 1,
+            logical_file_id: bootstrap_marker_ref(mesh_id),
+            source: serde_json::to_vec_pretty(&marker)?,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!("system-realm-bootstrap:{}", uuid::Uuid::new_v4().simple()),
+            region_id: "local".to_string(),
         })
         .await?;
     match store

@@ -295,8 +295,8 @@ async fn write_namespace_schema_ref(
             trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
             mutation_id: format!(
-                "authz-namespace-schema:{}:{}:{}",
-                record.tenant_id, record.namespace, record.schema_version
+                "authz-namespace-schema:{}:{}:{}:{}",
+                record.tenant_id, record.namespace, record.schema_version, record.record_hash
             ),
             region_id: "local".to_string(),
         })

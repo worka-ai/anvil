@@ -1,5 +1,8 @@
 use crate::{
-    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    core_store::{
+        CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
+        WriteLogicalFileRequest,
+    },
     formats::hash32,
     storage::Storage,
 };
@@ -281,15 +284,20 @@ async fn write_derived_index_proof_ref(
 ) -> Result<()> {
     let store = CoreStore::new(storage.clone()).await?;
     let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.to_string(),
-            bytes: serde_json::to_vec_pretty(proof)?,
+        .write_logical_file_ref(WriteLogicalFileRequest {
+            writer_family: "derived_index".to_string(),
+            generation: proof.generation,
+            logical_file_id: ref_name.to_string(),
+            source: serde_json::to_vec_pretty(proof)?,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!(
                 "derived-index-proof:{}:{}",
                 proof.index_id, proof.generation
             ),
+            region_id: "local".to_string(),
         })
         .await?;
     store
@@ -357,6 +365,7 @@ fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core_store::PutBlob;
     use tempfile::tempdir;
 
     const KEY: &[u8] = b"derived index proof signing key";

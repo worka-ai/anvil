@@ -1,5 +1,8 @@
 use crate::{
-    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    core_store::{
+        CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
+        WriteLogicalFileRequest,
+    },
     formats::{
         BinaryEnvelopeHeader, BinaryFileFooter, COMMON_FOOTER_LEN, COMMON_HEADER_LEN, FileFamily,
         Hash32,
@@ -87,15 +90,20 @@ pub async fn write_git_source_index(
     bytes.extend_from_slice(&footer.encode());
     let store = CoreStore::new(storage.clone()).await?;
     let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.clone(),
-            bytes,
+        .write_logical_file_ref(WriteLogicalFileRequest {
+            writer_family: "git_source".to_string(),
+            generation: input.generation,
+            logical_file_id: ref_name.clone(),
+            source: bytes,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!(
                 "git-source-index:{}:{}:{}",
                 input.tenant_id, input.repository_id, input.generation
             ),
+            region_id: "local".to_string(),
         })
         .await?;
     store

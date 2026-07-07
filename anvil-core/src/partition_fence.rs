@@ -1,7 +1,7 @@
 use crate::{
     core_store::{
-        CompareAndSwapRef, CoreMutationPrecondition, CoreObjectRef, CoreRefValue, CoreStore,
-        GetBlob, PutBlob,
+        CompareAndSwapRef, CoreMutationPrecondition, CoreObjectRef, CorePipelinePolicy,
+        CoreRefValue, CoreStore, CoreTraceContext, GetBlob, WriteLogicalFileRequest,
     },
     error_codes::AnvilErrorCode,
     formats::{JournalFrame, hash32},
@@ -372,13 +372,18 @@ pub async fn acquire_ownership(
 ) -> Result<OwnershipFenceOutcome> {
     validate_acquire_ownership(&request)?;
     for _ in 0..OWNERSHIP_LOCK_RETRY_ATTEMPTS {
-        let existing = read_ownership_fence_state(
+        let existing = match read_ownership_fence_state(
             storage,
             request.owner.tenant_id,
             &request.resource,
             signing_key,
         )
-        .await?;
+        .await
+        {
+            Ok(existing) => existing,
+            Err(err) if is_core_ref_cas_conflict(&err) => continue,
+            Err(err) => return Err(err),
+        };
         let existing_record = existing.as_ref().map(|(_, record)| record);
         if let Some(existing) = existing_record {
             if ownership_idempotency_matches(
@@ -1007,17 +1012,25 @@ async fn write_ownership_fence_state(
     let ref_name = ownership_fence_ref_name(record.owner.tenant_id, &record.resource)?;
     let store = CoreStore::new(storage.clone()).await?;
     let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.clone(),
-            bytes: serde_json::to_vec_pretty(record)?,
+        .write_logical_file_ref(WriteLogicalFileRequest {
+            writer_family: "ownership_fence".to_string(),
+            generation: record.generation,
+            logical_file_id: ref_name.clone(),
+            source: serde_json::to_vec_pretty(record)?,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!(
-                "ownership-fence:{}:{}:{}",
+                "ownership-fence:{}:{}:{}:{}:{}:{}",
                 record.owner.tenant_id,
                 record.resource.resource_kind.as_str(),
-                record.generation
+                record.generation,
+                record.owner.principal_id,
+                record.owner.actor_instance_id,
+                record.ownership_hash.as_deref().unwrap_or("unsealed")
             ),
+            region_id: "local".to_string(),
         })
         .await?;
     store
@@ -1088,15 +1101,24 @@ async fn write_partition_owner_state(
     let ref_name = partition_owner_ref_name(&owner.partition_family, &owner.partition_id)?;
     let store = CoreStore::new(storage.clone()).await?;
     let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.clone(),
-            bytes: serde_json::to_vec_pretty(owner)?,
+        .write_logical_file_ref(WriteLogicalFileRequest {
+            writer_family: "partition_owner".to_string(),
+            generation: owner.recovery_epoch,
+            logical_file_id: ref_name.clone(),
+            source: serde_json::to_vec_pretty(owner)?,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!(
-                "partition-owner:{}:{}:{}",
-                owner.partition_family, owner.partition_id, owner.recovery_epoch
+                "partition-owner:{}:{}:{}:{}:{}",
+                owner.partition_family,
+                owner.partition_id,
+                owner.recovery_epoch,
+                owner.owner_node_id,
+                owner.owner_hash.as_deref().unwrap_or("unsealed")
             ),
+            region_id: "local".to_string(),
         })
         .await?;
     store
@@ -1180,12 +1202,15 @@ fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
 }
 
 fn is_core_ref_cas_conflict(err: &anyhow::Error) -> bool {
-    let message = err.to_string();
-    message.contains("generation mismatch")
-        || message.contains("target mismatch")
-        || message.contains("must be absent")
-        || message.contains("must be present")
-        || message.contains("CAS lock was not acquired")
+    err.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("generation mismatch")
+            || message.contains("target mismatch")
+            || message.contains("must be absent")
+            || message.contains("must be present")
+            || message.contains("CAS lock was not acquired")
+            || message.contains("CoreStore stream idempotency conflict")
+    })
 }
 
 fn validate_acquire_ownership(request: &AcquireOwnership) -> Result<()> {
@@ -1436,6 +1461,7 @@ fn require_nonempty(value: &str, field: &'static str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core_store::PutBlob;
     use crate::formats::JournalRecordKind;
     use tempfile::tempdir;
 

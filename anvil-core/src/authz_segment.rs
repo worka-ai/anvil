@@ -95,6 +95,7 @@ async fn write_authz_tuple_segment_inner(
         first_hash,
         last_hash,
     );
+    let file_hash = hex::encode(footer.file_hash);
 
     let mut bytes = Vec::with_capacity(encoded_header.len() + body.len() + COMMON_FOOTER_LEN);
     bytes.extend_from_slice(&encoded_header);
@@ -112,12 +113,12 @@ async fn write_authz_tuple_segment_inner(
             pipeline_policy: CorePipelinePolicy::default(),
             trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            mutation_id: format!("authz-tuple-segment:{tenant_id}:{generation}"),
+            mutation_id: format!("authz-tuple-segment:{tenant_id}:{generation}:{file_hash}"),
             region_id: "local".to_string(),
         })
         .await?;
     let object_ref = core_object_ref_from_logical_file_manifest(&manifest);
-    store
+    match store
         .compare_and_swap_ref(CompareAndSwapRef {
             ref_name: ref_name.clone(),
             expected_generation: None,
@@ -130,7 +131,16 @@ async fn write_authz_tuple_segment_inner(
             new_target: encode_core_object_ref_target(&object_ref)?,
             transaction_id: None,
         })
-        .await?;
+        .await
+    {
+        Ok(_) => {}
+        Err(error) => {
+            if store.read_ref(&ref_name).await?.is_some() {
+                return Ok(ref_name);
+            }
+            return Err(error);
+        }
+    }
     Ok(ref_name)
 }
 
