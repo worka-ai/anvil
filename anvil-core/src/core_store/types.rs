@@ -39,6 +39,7 @@ pub struct CoreObjectManifest {
     pub region_id: String,
     pub object_hash: String,
     pub logical_size: u64,
+    pub boundary_values: Vec<CoreBoundaryValue>,
     pub encoding: CoreObjectEncoding,
     pub placements: Vec<CoreObjectPlacement>,
     pub created_at: String,

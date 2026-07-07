@@ -203,6 +203,11 @@ struct CoreWalFinalisationRecord {
     wal_epoch: u64,
     wal_sequence: u64,
     mutation_id: String,
+    operation_family: String,
+    writer_family: String,
+    target: serde_json::Value,
+    boundary_values: Vec<CoreBoundaryValue>,
+    landed_bytes: Vec<CoreWalLandedByte>,
     state: String,
     finalised_at_unix_nanos: u64,
 }
@@ -1656,6 +1661,11 @@ impl CoreStore {
             wal_epoch: admission.wal_epoch,
             wal_sequence: admission.sequence,
             mutation_id: admission.mutation_id.clone(),
+            operation_family: admission.operation_family.clone(),
+            writer_family: admission.writer_family.clone(),
+            target: admission.target.clone(),
+            boundary_values: admission.boundary_values.clone(),
+            landed_bytes: admission.landed_bytes.clone(),
             state: state.to_string(),
             finalised_at_unix_nanos: unix_timestamp_nanos(),
         };
@@ -3025,12 +3035,16 @@ impl CoreStore {
             );
         }
 
+        let boundary_values = self
+            .object_boundary_values_from_finalisation_records(object_ref)
+            .await?;
         Ok(CoreObjectManifest {
             schema: CORE_OBJECT_MANIFEST_SCHEMA.to_string(),
             mesh_id: "local-mesh".to_string(),
             region_id: "local".to_string(),
             object_hash: object_ref.hash.clone(),
             logical_size: object_ref.logical_size,
+            boundary_values,
             encoding: CoreObjectEncoding {
                 profile_id: LOCAL_ERASURE_PROFILE_ID.to_string(),
                 data_shards: LOCAL_DATA_SHARDS as u16,
@@ -3046,6 +3060,36 @@ impl CoreStore {
             created_at: "reconstructed-from-shards".to_string(),
             mutation_id: format!("reconstructed:{}", object_ref.hash),
         })
+    }
+
+    async fn object_boundary_values_from_finalisation_records(
+        &self,
+        object_ref: &CoreObjectRef,
+    ) -> Result<Vec<CoreBoundaryValue>> {
+        let mut values = Vec::new();
+        for record in self
+            .read_all_stream_records(CORE_TRANSACTION_STREAM_ID)
+            .await?
+        {
+            if record.record_kind != CORE_WAL_FINALISATION_RECORD_KIND {
+                continue;
+            }
+            let finalisation: CoreWalFinalisationRecord = serde_json::from_slice(&record.payload)?;
+            if finalisation.schema != CORE_WAL_FINALISATION_SCHEMA {
+                bail!("CoreStore WAL finalisation record has invalid schema");
+            }
+            if finalisation.operation_family != "object.put" || finalisation.state != "committed" {
+                continue;
+            }
+            if finalisation
+                .landed_bytes
+                .iter()
+                .any(|landed| landed.sha256 == object_ref.hash)
+            {
+                values = finalisation.boundary_values;
+            }
+        }
+        Ok(values)
     }
 
     async fn verify_embedded_manifest_readable(&self, manifest: &CoreObjectManifest) -> Result<()> {
@@ -4927,6 +4971,35 @@ mod tests {
             wal_records[0].0.boundary_values[0].value,
             "8e4b4477-99d8-4f4b-89db-876d2c7f0c6a"
         );
+    }
+
+    #[tokio::test]
+    async fn core_store_object_manifest_includes_boundary_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        let boundary_value = CoreBoundaryValue {
+            schema_generation: 2,
+            name: "customer_tenant".to_string(),
+            value_type: "uuid".to_string(),
+            value: "8e4b4477-99d8-4f4b-89db-876d2c7f0c6a".to_string(),
+            categories: vec!["security_realm".to_string()],
+            source_kind: "user_metadata_json_pointer".to_string(),
+            required: true,
+        };
+        let object_ref = store
+            .put_blob(PutBlob {
+                logical_name: "tenant:t/bucket:b/object:bounded".to_string(),
+                bytes: b"bounded manifest".to_vec(),
+                boundary_values: vec![boundary_value.clone()],
+                region_id: "local".to_string(),
+                mutation_id: "bounded-manifest".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let manifest = store.read_object_manifest(&object_ref).await.unwrap();
+        assert_eq!(manifest.boundary_values, vec![boundary_value]);
     }
 
     #[tokio::test]
