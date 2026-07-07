@@ -86,6 +86,7 @@ async fn proxy_get_or_head(
                     header.bucket_name.clone(),
                     header.object_key.clone(),
                     version_id,
+                    None,
                     ObjectLinkReadMode::Follow,
                 )
                 .await?,

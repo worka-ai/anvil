@@ -129,13 +129,17 @@ impl ObjectService for AppState {
         let claims = request.extensions().get::<auth::Claims>().cloned();
         let req = request.into_inner();
 
-        let (object, mut data_stream) = self
+        let (object, mut data_stream, mut logical_offset) = self
             .object_manager
             .get_object(
                 claims,
                 req.bucket_name,
                 req.object_key,
                 parse_optional_version_id(req.version_id.as_deref())?,
+                req.range.map(|range| crate::core_store::CoreByteRange {
+                    start: range.start,
+                    end_exclusive: range.end_exclusive,
+                }),
             )
             .await?;
 
@@ -151,6 +155,8 @@ impl ObjectService for AppState {
             if tx
                 .send(Ok(GetObjectResponse {
                     data: Some(get_object_response::Data::Metadata(info)),
+                    logical_offset: 0,
+                    trace_id: String::new(),
                 }))
                 .await
                 .is_err()
@@ -169,12 +175,15 @@ impl ObjectService for AppState {
                 if tx
                     .send(Ok(GetObjectResponse {
                         data: Some(get_object_response::Data::Chunk(chunk.to_vec())),
+                        logical_offset,
+                        trace_id: String::new(),
                     }))
                     .await
                     .is_err()
                 {
                     break; // Client disconnected
                 }
+                logical_offset = logical_offset.saturating_add(chunk.len() as u64);
             }
         });
 

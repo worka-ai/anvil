@@ -353,13 +353,14 @@ impl AppState {
             tenant_id,
             jti: None,
         };
-        let (_object, stream) = self
+        let (_object, stream, _range_start) = self
             .object_manager
             .get_object(
                 Some(internal_claims),
                 manifest.bucket_name.clone(),
                 manifest.object_key.clone(),
                 Some(version_id),
+                None,
             )
             .await?;
         let pack_bytes = collect_object_stream(stream).await?;

@@ -161,6 +161,7 @@ pub async fn handle_object_command(command: &ObjectCommands, ctx: &Context) -> a
                 bucket_name: bucket,
                 object_key: key,
                 version_id: None,
+                range: None,
             });
             request.metadata_mut().insert(
                 "authorization",

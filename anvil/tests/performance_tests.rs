@@ -416,6 +416,7 @@ async fn performance_native_api_smoke() {
                         bucket_name: bucket_name.clone(),
                         object_key: "queue/item-00.json".to_string(),
                         version_id: None,
+                        range: None,
                     },
                     &token,
                 ))

@@ -2732,6 +2732,7 @@ async fn get_object(
             bucket,
             key,
             version_id,
+            None,
             ObjectLinkReadMode::Follow,
         )
         .await
@@ -2741,6 +2742,7 @@ async fn get_object(
                 object,
                 stream,
                 followed_link,
+                range_start: _,
             } = result;
             if let Some(response) =
                 evaluate_object_preconditions(req.headers(), &object.etag, object.created_at)

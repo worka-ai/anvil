@@ -1628,6 +1628,7 @@ async fn test_object_read_uses_relationship_authorization_before_streaming_bytes
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         version_id: None,
+        range: None,
     });
     add_bearer(&mut denied_get, &reader_token);
     let denied = object_client.get_object(denied_get).await.unwrap_err();
@@ -1648,6 +1649,7 @@ async fn test_object_read_uses_relationship_authorization_before_streaming_bytes
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         version_id: None,
+        range: None,
     });
     add_bearer(&mut allowed_get, &reader_token);
     let mut stream = object_client
@@ -3329,6 +3331,7 @@ async fn test_set_public_access_and_get() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         version_id: None,
+        range: None,
     });
     let _res = object_client.get_object(get_req).await.unwrap();
 
@@ -3348,6 +3351,7 @@ async fn test_set_public_access_and_get() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         version_id: None,
+        range: None,
     });
     let res_2 = object_client.get_object(get_req_2).await;
     assert!(res_2.is_err());

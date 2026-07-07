@@ -25,6 +25,18 @@ pub struct GetBlob {
     pub object_ref: CoreObjectRef,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreByteRange {
+    pub start: u64,
+    pub end_exclusive: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetBlobRange {
+    pub object_ref: CoreObjectRef,
+    pub range: CoreByteRange,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoreObjectRef {
     pub hash: String,

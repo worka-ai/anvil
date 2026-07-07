@@ -492,6 +492,97 @@ impl CoreStore {
         Ok(data)
     }
 
+    pub async fn get_blob_range(&self, input: GetBlobRange) -> Result<Vec<u8>> {
+        let _perf_guard =
+            crate::perf::guard("anvil_core_store_op", &[("operation", "get_blob_range")]);
+        if input.range.start > input.range.end_exclusive {
+            bail!("CoreStore range start must be <= end_exclusive");
+        }
+        if input.range.end_exclusive > input.object_ref.logical_size {
+            bail!("CoreStore range end_exclusive exceeds logical object size");
+        }
+        if input.range.start == input.range.end_exclusive {
+            return Ok(Vec::new());
+        }
+
+        let expected_hash = strip_sha256_prefix(&input.object_ref.hash)?;
+        let manifest = self.read_object_manifest(&input.object_ref).await?;
+        validate_manifest_for_object_ref(&manifest, &input.object_ref, expected_hash)?;
+
+        let data_shards = usize::from(manifest.encoding.data_shards);
+        let shard_len = input
+            .object_ref
+            .logical_size
+            .div_ceil(data_shards as u64)
+            .max(1);
+        let mut out = Vec::with_capacity(
+            usize::try_from(input.range.end_exclusive - input.range.start).unwrap_or(usize::MAX),
+        );
+
+        for shard_index in 0..data_shards {
+            let shard_logical_start = shard_index as u64 * shard_len;
+            let shard_logical_end =
+                (shard_logical_start + shard_len).min(input.object_ref.logical_size);
+            let overlap_start = input.range.start.max(shard_logical_start);
+            let overlap_end = input.range.end_exclusive.min(shard_logical_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+
+            let Some(placement) = manifest
+                .placements
+                .iter()
+                .find(|placement| usize::from(placement.shard_index) == shard_index)
+            else {
+                return self.get_blob_range_via_full_reconstruction(input).await;
+            };
+            let shard_hash = strip_sha256_prefix(&placement.shard_hash)?;
+            let shard_path = self.shard_path(
+                &placement.node_id,
+                expected_hash,
+                placement.shard_index,
+                shard_hash,
+            );
+            let shard_bytes =
+                match read_file(&shard_path, "core_store", "read_blob_range_shard").await {
+                    Ok(bytes) => bytes,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        return self.get_blob_range_via_full_reconstruction(input).await;
+                    }
+                    Err(err) => {
+                        return Err(err).with_context(|| {
+                            format!("read CoreStore range shard {}", shard_path.display())
+                        });
+                    }
+                };
+            if sha256_hex(&shard_bytes) != shard_hash
+                || shard_bytes.len() as u64 != placement.stored_size
+            {
+                return self.get_blob_range_via_full_reconstruction(input).await;
+            }
+            let shard_offset = usize::try_from(overlap_start - shard_logical_start)
+                .map_err(|_| anyhow!("CoreStore range offset exceeds usize"))?;
+            let shard_end = usize::try_from(overlap_end - shard_logical_start)
+                .map_err(|_| anyhow!("CoreStore range end exceeds usize"))?;
+            out.extend_from_slice(&shard_bytes[shard_offset..shard_end]);
+        }
+
+        Ok(out)
+    }
+
+    async fn get_blob_range_via_full_reconstruction(&self, input: GetBlobRange) -> Result<Vec<u8>> {
+        let full = self
+            .get_blob(GetBlob {
+                object_ref: input.object_ref,
+            })
+            .await?;
+        let start = usize::try_from(input.range.start)
+            .map_err(|_| anyhow!("CoreStore range start exceeds usize"))?;
+        let end = usize::try_from(input.range.end_exclusive)
+            .map_err(|_| anyhow!("CoreStore range end exceeds usize"))?;
+        Ok(full[start..end].to_vec())
+    }
+
     pub async fn put_boundary_schema(
         &self,
         input: PutBoundarySchema,
@@ -739,8 +830,9 @@ impl CoreStore {
         {
             if existing.payload_hash != payload_hash {
                 bail!(
-                    "CoreStore stream idempotency conflict for stream {}",
-                    stream_id
+                    "CoreStore stream idempotency conflict for stream {stream_id}: idempotency_key_hash={idempotency_key_hash}, existing_record_kind={}, existing_payload_hash={}, new_payload_hash={payload_hash}",
+                    existing.record_kind,
+                    existing.payload_hash
                 );
             }
             return Ok(Some(StreamAppendReceipt {
@@ -1655,6 +1747,35 @@ impl CoreStore {
         admission: &CoreWalAdmissionRecord,
         state: &str,
     ) -> Result<()> {
+        let admission_key = CoreWalRecordKey::from(admission);
+        for record in self
+            .read_all_stream_records(CORE_TRANSACTION_STREAM_ID)
+            .await?
+        {
+            if record.record_kind != CORE_WAL_FINALISATION_RECORD_KIND {
+                continue;
+            }
+            let existing: CoreWalFinalisationRecord = serde_json::from_slice(&record.payload)?;
+            let existing_key = CoreWalRecordKey {
+                node_id: existing.node_id.clone(),
+                wal_epoch: existing.wal_epoch,
+                wal_sequence: existing.wal_sequence,
+            };
+            if existing_key != admission_key {
+                continue;
+            }
+            if existing.mutation_id == admission.mutation_id && existing.state == state {
+                return Ok(());
+            }
+            bail!(
+                "CoreStore WAL finalisation conflict for sequence {}: existing mutation/state {}/{}, new mutation/state {}/{}",
+                admission.sequence,
+                existing.mutation_id,
+                existing.state,
+                admission.mutation_id,
+                state
+            );
+        }
         let finalisation = CoreWalFinalisationRecord {
             schema: CORE_WAL_FINALISATION_SCHEMA.to_string(),
             node_id: admission.node_id.clone(),
@@ -1677,11 +1798,12 @@ impl CoreStore {
             fence: None,
             transaction_id: None,
             idempotency_key: Some(format!(
-                "{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}",
                 CORE_WAL_FINALISATION_RECORD_KIND,
                 admission.node_id,
                 admission.wal_epoch,
-                admission.sequence
+                admission.sequence,
+                admission.mutation_id
             )),
         })
         .await?;
@@ -2688,6 +2810,24 @@ impl CoreStore {
     }
 
     async fn write_transaction_unlocked(&self, transaction: &CoreTransaction) -> Result<()> {
+        if let Some(existing) = self
+            .read_transaction_unlocked(&transaction.transaction_id)
+            .await?
+        {
+            if existing.state == transaction.state
+                && existing.preconditions_hash == transaction.preconditions_hash
+                && existing.operations_hash == transaction.operations_hash
+                && existing.visible_updates == transaction.visible_updates
+                && existing.finalisation_error == transaction.finalisation_error
+                && existing.committed_by_principal == transaction.committed_by_principal
+            {
+                return Ok(());
+            }
+            bail!(
+                "CoreStore transaction {} idempotency conflict",
+                transaction.transaction_id
+            );
+        }
         let bytes = serde_json::to_vec(&transaction)?;
         self.append_stream_unlocked(AppendStreamRecord {
             stream_id: CORE_TRANSACTION_STREAM_ID.to_string(),
@@ -3379,6 +3519,68 @@ fn encode_erasure_shards(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
     let reed_solomon = ReedSolomon::new(LOCAL_DATA_SHARDS, LOCAL_PARITY_SHARDS)?;
     reed_solomon.encode(&mut shards)?;
     Ok(shards)
+}
+
+fn validate_manifest_for_object_ref(
+    manifest: &CoreObjectManifest,
+    object_ref: &CoreObjectRef,
+    expected_hash: &str,
+) -> Result<()> {
+    if manifest.object_hash != object_ref.hash {
+        bail!(
+            "CoreStore manifest hash mismatch: ref {}, manifest {}",
+            object_ref.hash,
+            manifest.object_hash
+        );
+    }
+    if strip_sha256_prefix(&manifest.object_hash)? != expected_hash {
+        bail!("CoreStore manifest hash does not match requested object hash");
+    }
+    if manifest.logical_size != object_ref.logical_size {
+        bail!(
+            "CoreStore manifest size mismatch: ref {}, manifest {}",
+            object_ref.logical_size,
+            manifest.logical_size
+        );
+    }
+    if manifest.encoding.profile_id != LOCAL_ERASURE_PROFILE_ID {
+        bail!(
+            "CoreStore unsupported erasure profile {}",
+            manifest.encoding.profile_id
+        );
+    }
+
+    let data_shards = usize::from(manifest.encoding.data_shards);
+    let parity_shards = usize::from(manifest.encoding.parity_shards);
+    let minimum_read_shards = usize::from(manifest.encoding.minimum_read_shards);
+    let minimum_write_ack_shards = usize::from(manifest.encoding.minimum_write_ack_shards);
+    if data_shards == 0 || parity_shards == 0 {
+        bail!("CoreStore erasure profile must include data and parity shards");
+    }
+    if minimum_read_shards != data_shards {
+        bail!(
+            "CoreStore unsupported minimum_read_shards {}; expected {}",
+            minimum_read_shards,
+            data_shards
+        );
+    }
+    if minimum_write_ack_shards > data_shards + parity_shards {
+        bail!(
+            "CoreStore minimum_write_ack_shards {} exceeds total shard count {}",
+            minimum_write_ack_shards,
+            data_shards + parity_shards
+        );
+    }
+    if manifest.encoding.placement_scope != "region" {
+        bail!(
+            "CoreStore unsupported placement_scope {}",
+            manifest.encoding.placement_scope
+        );
+    }
+    if manifest.encoding.repair_priority.is_empty() {
+        bail!("CoreStore repair_priority must not be empty");
+    }
+    Ok(())
 }
 
 fn strip_sha256_prefix(hash: &str) -> Result<&str> {
@@ -4762,6 +4964,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn core_store_range_read_does_not_require_unrelated_data_shards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        let payload = b"aaaabbbbccccdddd".to_vec();
+        let object_ref = store
+            .put_blob(PutBlob {
+                logical_name: "tenant:t/bucket:b/object:range".to_string(),
+                bytes: payload.clone(),
+                boundary_values: Vec::new(),
+                region_id: "local".to_string(),
+                mutation_id: "mut-range-1".to_string(),
+            })
+            .await
+            .unwrap();
+        let manifest = store.read_object_manifest(&object_ref).await.unwrap();
+        let object_hash = object_ref.hash.strip_prefix("sha256:").unwrap();
+
+        for placement in manifest
+            .placements
+            .iter()
+            .filter(|placement| (1..LOCAL_DATA_SHARDS as u16).contains(&placement.shard_index))
+        {
+            let shard_hash = placement.shard_hash.strip_prefix("sha256:").unwrap();
+            let shard_path = store.shard_path(
+                &placement.node_id,
+                object_hash,
+                placement.shard_index,
+                shard_hash,
+            );
+            fs::write(&shard_path, vec![0xee; placement.stored_size as usize])
+                .await
+                .unwrap();
+        }
+
+        let range = store
+            .get_blob_range(GetBlobRange {
+                object_ref: object_ref.clone(),
+                range: CoreByteRange {
+                    start: 1,
+                    end_exclusive: 3,
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(range, b"aa");
+        assert!(
+            store.get_blob(GetBlob { object_ref }).await.is_err(),
+            "a full read must fail after unrelated data shards are corrupted; the range read above proves it did not materialise the full object"
+        );
+    }
+
+    #[tokio::test]
     async fn core_store_boundary_schema_round_trips_through_corestore() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = Storage::new_at(tmp.path()).await.unwrap();
@@ -5422,6 +5677,41 @@ mod tests {
             "a fully finalised WAL prefix must be checkpointed out of the active WAL"
         );
         assert_eq!(store.next_core_wal_sequence().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn core_store_wal_finalisation_is_idempotent_for_same_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        let record = test_wal_record("same-finalisation", unix_timestamp_nanos(), 1);
+
+        store
+            .mark_core_wal_finalised_unlocked(&record, "committed")
+            .await
+            .unwrap();
+        store
+            .mark_core_wal_finalised_unlocked(&record, "committed")
+            .await
+            .unwrap();
+
+        let finalisations = store
+            .read_all_stream_records(CORE_TRANSACTION_STREAM_ID)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.record_kind == CORE_WAL_FINALISATION_RECORD_KIND)
+            .count();
+        assert_eq!(finalisations, 1);
+
+        let conflicting = test_wal_record("different-finalisation", unix_timestamp_nanos(), 1);
+        assert!(
+            store
+                .mark_core_wal_finalised_unlocked(&conflicting, "committed")
+                .await
+                .is_err(),
+            "same WAL node/epoch/sequence with a different mutation must fail closed"
+        );
     }
 
     #[tokio::test]

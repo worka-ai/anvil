@@ -264,6 +264,7 @@ async fn get_object_bytes_for_test(
                 bucket_name: bucket_name.to_string(),
                 object_key: object_key.to_string(),
                 version_id,
+                range: None,
             },
             token,
         ))
@@ -293,6 +294,7 @@ async fn get_object_metadata_and_bytes_for_test(
                 bucket_name: bucket_name.to_string(),
                 object_key: object_key.to_string(),
                 version_id,
+                range: None,
             },
             token,
         ))
@@ -355,6 +357,7 @@ async fn native_object_routes_apply_cross_region_policy_before_local_metadata() 
                 bucket_name: "remote-bucket".to_string(),
                 object_key: "any.txt".to_string(),
                 version_id: None,
+                range: None,
             },
             &token,
         ))
@@ -1559,6 +1562,7 @@ async fn test_utf8_object_keys_with_spaces_round_trip() {
         bucket_name,
         object_key,
         version_id: None,
+        range: None,
     });
     get_req.metadata_mut().insert(
         "authorization",
@@ -1794,6 +1798,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         bucket_name: bucket_name.clone(),
         object_key: reserved_key.clone(),
         version_id: None,
+        range: None,
     });
     get_req.metadata_mut().insert(
         "authorization",
@@ -1891,6 +1896,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
             bucket_name: bucket_name.clone(),
             object_key: key.clone(),
             version_id: None,
+            range: None,
         });
         get_req.metadata_mut().insert(
             "authorization",
@@ -2349,6 +2355,7 @@ async fn test_object_payloads_are_corestore_backed_and_readable() {
         bucket_name: bucket_name.clone(),
         object_key: inline_key,
         version_id: Some(inline_put.version_id),
+        range: None,
     });
     get_req.metadata_mut().insert(
         "authorization",
@@ -2371,6 +2378,7 @@ async fn test_object_payloads_are_corestore_backed_and_readable() {
         bucket_name,
         object_key: external_key,
         version_id: Some(external_put.version_id),
+        range: None,
     });
     external_get_req.metadata_mut().insert(
         "authorization",
@@ -2600,6 +2608,7 @@ async fn test_copy_object_creates_independent_destination_version() {
         bucket_name: bucket_name.clone(),
         object_key: destination_key.clone(),
         version_id: Some(copy_res.version_id),
+        range: None,
     });
     get_req.metadata_mut().insert(
         "authorization",
@@ -2691,6 +2700,7 @@ async fn test_private_object_read_denied_before_payload_load() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         version_id: None,
+        range: None,
     });
     denied_req.metadata_mut().insert(
         "authorization",
@@ -2707,6 +2717,7 @@ async fn test_private_object_read_denied_before_payload_load() {
         bucket_name: bucket_name.clone(),
         object_key: "private/not-created.bin".to_string(),
         version_id: None,
+        range: None,
     });
     denied_missing_req.metadata_mut().insert(
         "authorization",
@@ -2739,6 +2750,7 @@ async fn test_private_object_read_denied_before_payload_load() {
         bucket_name,
         object_key,
         version_id: None,
+        range: None,
     });
     allowed_req.metadata_mut().insert(
         "authorization",
@@ -3170,6 +3182,7 @@ async fn test_grpc_object_metadata_round_trips_through_get_head_and_list() {
                 bucket_name,
                 object_key,
                 version_id: None,
+                range: None,
             },
             &token,
         ))
@@ -3603,6 +3616,7 @@ async fn test_multipart_upload_completes_ordered_parts() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         version_id: Some(complete_res.version_id),
+        range: None,
     });
     get_req.metadata_mut().insert(
         "authorization",
@@ -3786,6 +3800,7 @@ async fn test_compose_object_concatenates_sources_in_order() {
         bucket_name: bucket_name.clone(),
         object_key: "composed.txt".to_string(),
         version_id: Some(compose_res.version_id),
+        range: None,
     });
     get_req.metadata_mut().insert(
         "authorization",
@@ -3900,6 +3915,7 @@ async fn test_patch_json_object_writes_new_merged_version() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         version_id: Some(patch_res.version_id),
+        range: None,
     });
     get_req.metadata_mut().insert(
         "authorization",

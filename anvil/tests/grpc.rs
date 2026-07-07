@@ -146,6 +146,7 @@ async fn test_distributed_put_and_get() {
         bucket_name,
         object_key,
         version_id: Some(response.version_id),
+        range: None,
     };
     let mut get_object_req = tonic::Request::new(get_request);
     get_object_req.metadata_mut().insert(

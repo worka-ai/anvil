@@ -108,6 +108,7 @@ async fn test_distributed_reconstruction_on_node_failure() {
                 bucket_name: bucket_name.clone(),
                 object_key: object_key.clone(),
                 version_id: None,
+                range: None,
             });
             get_req.metadata_mut().insert(
                 "authorization",

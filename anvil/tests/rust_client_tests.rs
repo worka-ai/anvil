@@ -86,6 +86,7 @@ async fn rust_client_calls_live_native_api() {
             bucket_name,
             object_key,
             version_id: Some(stored.version_id),
+            range: None,
         })
         .await
         .expect("rust client should stream an object download")

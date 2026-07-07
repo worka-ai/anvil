@@ -1,8 +1,8 @@
 use crate::{
     access_control, auth, bucket_journal,
     core_store::{
-        CoreBoundarySchema, CoreBoundarySource, CoreBoundaryValue, CoreObjectRef, CoreStore,
-        GetBlob, PutBlob,
+        CoreBoundarySchema, CoreBoundarySource, CoreBoundaryValue, CoreByteRange, CoreObjectRef,
+        CoreStore, GetBlob, GetBlobRange, PutBlob,
     },
     error_codes::AnvilErrorCode,
     metadata_journal, object_links,
@@ -90,6 +90,7 @@ pub struct ObjectReadResult {
     pub object: Object,
     pub stream: Pin<Box<dyn Stream<Item = Result<Vec<u8>, Status>> + Send + 'static>>,
     pub followed_link: Option<object_links::FollowedObjectLink>,
+    pub range_start: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -906,10 +907,12 @@ impl ObjectManager {
         bucket_name: String,
         object_key: String,
         version_id: Option<uuid::Uuid>,
+        range: Option<CoreByteRange>,
     ) -> Result<
         (
             Object,
             Pin<Box<dyn Stream<Item = Result<Vec<u8>, Status>> + Send + 'static>>,
+            u64,
         ),
         Status,
     > {
@@ -919,10 +922,11 @@ impl ObjectManager {
                 bucket_name,
                 object_key,
                 version_id,
+                range,
                 ObjectLinkReadMode::Follow,
             )
             .await?;
-        Ok((result.object, result.stream))
+        Ok((result.object, result.stream, result.range_start))
     }
 
     pub async fn get_object_with_link_mode(
@@ -931,6 +935,7 @@ impl ObjectManager {
         bucket_name: String,
         object_key: String,
         version_id: Option<uuid::Uuid>,
+        range: Option<CoreByteRange>,
         link_mode: ObjectLinkReadMode,
     ) -> Result<ObjectReadResult, Status> {
         self.get_object_with_link_mode_for_tenant(
@@ -939,6 +944,7 @@ impl ObjectManager {
             bucket_name,
             object_key,
             version_id,
+            range,
             link_mode,
         )
         .await
@@ -951,6 +957,7 @@ impl ObjectManager {
         bucket_name: String,
         object_key: String,
         version_id: Option<uuid::Uuid>,
+        range: Option<CoreByteRange>,
         link_mode: ObjectLinkReadMode,
     ) -> Result<ObjectReadResult, Status> {
         let _latency = self
@@ -1025,6 +1032,7 @@ impl ObjectManager {
         let (tx, rx) = mpsc::channel(4);
         let app_state = self.clone();
         let object_clone = object.clone();
+        let range_start = range.map(|range| range.start).unwrap_or(0);
 
         tokio::spawn(async move {
             let Some(object_ref) = object_clone
@@ -1040,7 +1048,16 @@ impl ObjectManager {
                 return;
             };
 
-            match app_state.core_store.get_blob(GetBlob { object_ref }).await {
+            let read_result = if let Some(range) = range {
+                app_state
+                    .core_store
+                    .get_blob_range(GetBlobRange { object_ref, range })
+                    .await
+            } else {
+                app_state.core_store.get_blob(GetBlob { object_ref }).await
+            };
+
+            match read_result {
                 Ok(full_data) => {
                     for chunk in full_data.chunks(1024 * 64) {
                         if tx.send(Ok(chunk.to_vec())).await.is_err() {
@@ -1058,6 +1075,7 @@ impl ObjectManager {
             object,
             stream: Box::pin(ReceiverStream::new(rx)),
             followed_link,
+            range_start,
         })
     }
 
@@ -1648,13 +1666,14 @@ impl ObjectManager {
                     let Some(source) = state.sources.next() else {
                         return Ok(None);
                     };
-                    let (_object, stream) = state
+                    let (_object, stream, _range_start) = state
                         .manager
                         .get_object(
                             Some(state.claims.clone()),
                             source.bucket_name,
                             source.object_key,
                             source.version_id,
+                            None,
                         )
                         .await?;
                     state.current = Some(stream);
@@ -1681,12 +1700,13 @@ impl ObjectManager {
         base_version_id: Option<uuid::Uuid>,
         merge_patch_json: &str,
     ) -> Result<Object, Status> {
-        let (_source_object, source_stream) = self
+        let (_source_object, source_stream, _range_start) = self
             .get_object(
                 Some(claims.clone()),
                 bucket_name.to_string(),
                 object_key.to_string(),
                 base_version_id,
+                None,
             )
             .await?;
 

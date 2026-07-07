@@ -148,6 +148,7 @@ async fn internal_proxy_put_and_get_preserve_original_principal_authority() {
                 bucket_name: "proxy-bucket".to_string(),
                 object_key: "via-proxy.txt".to_string(),
                 version_id: None,
+                range: None,
             }),
             &cluster.token,
         ))

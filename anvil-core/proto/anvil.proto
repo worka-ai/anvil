@@ -1313,6 +1313,7 @@ message GetObjectRequest {
     string bucket_name = 1;
     string object_key = 2;
     optional string version_id = 3;
+    optional ByteRange range = 4;
 }
 
 message GetObjectResponse {
@@ -1320,6 +1321,8 @@ message GetObjectResponse {
         ObjectInfo metadata = 1;
         bytes chunk = 2;
     }
+    uint64 logical_offset = 3;
+    string trace_id = 4;
 }
 
 message ObjectInfo {
@@ -1327,6 +1330,11 @@ message ObjectInfo {
     int64 content_length = 2;
     string version_id = 3;
     string user_metadata_json = 4;
+}
+
+message ByteRange {
+    uint64 start = 1;
+    uint64 end_exclusive = 2;
 }
 
 
