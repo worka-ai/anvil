@@ -54,10 +54,12 @@ const ZERO_HASH: &str = "sha256:000000000000000000000000000000000000000000000000
 const MAX_CORE_FENCE_TTL_MS: u64 = 120_000;
 const CORE_STREAM_SEGMENT_MAGIC: &[u8; 8] = b"ANSEG001";
 const CORE_ACTIVE_STREAM_MAGIC: &[u8; 8] = b"ANASTR1\0";
+const CORE_BLOCK_SHARD_MAGIC: &[u8; 8] = b"ANBLK\n\0\0";
 const CORE_WAL_FILE_MAGIC: &[u8; 6] = b"ANWAL\n";
 const CORE_WAL_FRAME_MAGIC: &[u8; 4] = b"AWF1";
 const CORE_STREAM_SEGMENT_VERSION: u16 = 1;
 const CORE_ACTIVE_STREAM_VERSION: u16 = 1;
+const CORE_BLOCK_SHARD_VERSION: u16 = 1;
 const CORE_WAL_VERSION: u16 = 1;
 const CORE_WAL_EPOCH: u64 = 1;
 const CORE_WAL_MAX_INLINE_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -72,6 +74,7 @@ const CORE_WAL_NODE_ID: &str = "local-node";
 const CORE_STREAM_SEGMENT_HEADER_SCHEMA: &str = "anvil.core.stream_segment_header.v1";
 const CORE_STREAM_RECORD_HEADER_SCHEMA: &str = "anvil.core.stream_record_header.v1";
 const CORE_STREAM_SEGMENT_TRAILER_SCHEMA: &str = "anvil.core.stream_segment_trailer.v1";
+const CORE_BLOCK_SHARD_HEADER_SCHEMA: &str = "anvil.core.block_shard.v1";
 const CORE_WAL_RECORD_SCHEMA: &str = "anvil.core.wal_record.v1";
 const CORE_WAL_FINALISATION_SCHEMA: &str = "anvil.core.wal_finalisation.v1";
 const CORE_WAL_FINALISATION_RECORD_KIND: &str = "core_wal.finalisation";
@@ -335,7 +338,12 @@ impl CoreStore {
         let materialised_bytes = self.read_landed_bytes(&landed).await?;
         let hash = strip_sha256_prefix(&landed.sha256)?.to_string();
         let object_ref = self
-            .materialise_object_blob_bytes(&hash, &materialised_bytes)
+            .materialise_object_blob_bytes(
+                &hash,
+                &materialised_bytes,
+                &admission.boundary_values,
+                &admission.mutation_id,
+            )
             .await?;
         self.mark_core_wal_finalised_unlocked(&admission, "committed")
             .await?;
@@ -346,6 +354,8 @@ impl CoreStore {
         &self,
         hash: &str,
         materialised_bytes: &[u8],
+        boundary_values: &[CoreBoundaryValue],
+        mutation_id: &str,
     ) -> Result<CoreObjectRef> {
         if sha256_hex(materialised_bytes) != hash {
             bail!("CoreStore object materialisation hash mismatch");
@@ -356,10 +366,31 @@ impl CoreStore {
             let node_id = format!("{LOCAL_NODE_ID_PREFIX}-{}", shard_index + 1);
             let shard_hash = sha256_hex(shard);
             let shard_path = self.shard_path(&node_id, hash, shard_index as u16, &shard_hash);
+            let logical_offset = shard_index as u64 * shard.len() as u64;
+            let shard_file = encode_block_shard_file(
+                BlockShardHeaderInput {
+                    block_id: format!("sha256:{hash}"),
+                    erasure_set_id: "local-erasure-set".to_string(),
+                    shard_index: shard_index as u16,
+                    erasure_profile_id: LOCAL_ERASURE_PROFILE_ID.to_string(),
+                    logical_file_id: format!("sha256:{hash}"),
+                    logical_offset,
+                    logical_length: shard.len() as u64,
+                    payload_plain_hash: format!("sha256:{shard_hash}"),
+                    payload_stored_hash: format!("sha256:{shard_hash}"),
+                    compression: "none".to_string(),
+                    encryption: "none".to_string(),
+                    placement_epoch: 1,
+                    boundary_summary_hash: boundary_summary_hash(boundary_values)?,
+                    writer_family: "object_blob".to_string(),
+                    created_by_mutation_id: mutation_id.to_string(),
+                },
+                shard,
+            )?;
             if let Some(parent) = shard_path.parent() {
                 fs::create_dir_all(parent).await?;
             }
-            write_file_atomic(&shard_path, shard).await?;
+            write_file_atomic(&shard_path, &shard_file).await?;
         }
 
         Ok(CoreObjectRef {
@@ -442,21 +473,27 @@ impl CoreStore {
                 placement.shard_index,
                 shard_hash,
             );
-            let shard_bytes = match read_file(&shard_path, "core_store", "read_blob_shard").await {
+            let expected_block_id = format!("sha256:{expected_hash}");
+            let shard_bytes = match read_block_shard_file(
+                &shard_path,
+                BlockShardExpectation {
+                    block_id: &expected_block_id,
+                    shard_index: placement.shard_index,
+                    erasure_profile_id: LOCAL_ERASURE_PROFILE_ID,
+                    payload_hash: &placement.shard_hash,
+                    payload_len: placement.stored_size,
+                },
+                "read_blob_shard",
+            )
+            .await
+            {
                 Ok(bytes) => bytes,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) if is_not_found_error(&err) => continue,
                 Err(err) => {
                     return Err(err)
                         .with_context(|| format!("read CoreStore shard {}", shard_path.display()));
                 }
             };
-            let actual_hash = sha256_hex(&shard_bytes);
-            if actual_hash != shard_hash {
-                continue;
-            }
-            if shard_bytes.len() as u64 != placement.stored_size {
-                continue;
-            }
             shards[index] = Some(shard_bytes);
         }
         let present = shards.iter().filter(|shard| shard.is_some()).count();
@@ -506,7 +543,9 @@ impl CoreStore {
         }
 
         let expected_hash = strip_sha256_prefix(&input.object_ref.hash)?;
-        let manifest = self.read_object_manifest(&input.object_ref).await?;
+        let manifest = self
+            .read_object_manifest_for_range(&input.object_ref, &input.range)
+            .await?;
         validate_manifest_for_object_ref(&manifest, &input.object_ref, expected_hash)?;
 
         let data_shards = usize::from(manifest.encoding.data_shards);
@@ -543,23 +582,30 @@ impl CoreStore {
                 placement.shard_index,
                 shard_hash,
             );
-            let shard_bytes =
-                match read_file(&shard_path, "core_store", "read_blob_range_shard").await {
-                    Ok(bytes) => bytes,
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        return self.get_blob_range_via_full_reconstruction(input).await;
-                    }
-                    Err(err) => {
-                        return Err(err).with_context(|| {
-                            format!("read CoreStore range shard {}", shard_path.display())
-                        });
-                    }
-                };
-            if sha256_hex(&shard_bytes) != shard_hash
-                || shard_bytes.len() as u64 != placement.stored_size
+            let expected_block_id = format!("sha256:{expected_hash}");
+            let shard_bytes = match read_block_shard_file(
+                &shard_path,
+                BlockShardExpectation {
+                    block_id: &expected_block_id,
+                    shard_index: placement.shard_index,
+                    erasure_profile_id: LOCAL_ERASURE_PROFILE_ID,
+                    payload_hash: &placement.shard_hash,
+                    payload_len: placement.stored_size,
+                },
+                "read_blob_range_shard",
+            )
+            .await
             {
-                return self.get_blob_range_via_full_reconstruction(input).await;
-            }
+                Ok(bytes) => bytes,
+                Err(err) if is_not_found_error(&err) => {
+                    return self.get_blob_range_via_full_reconstruction(input).await;
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("read CoreStore range shard {}", shard_path.display())
+                    });
+                }
+            };
             let shard_offset = usize::try_from(overlap_start - shard_logical_start)
                 .map_err(|_| anyhow!("CoreStore range offset exceeds usize"))?;
             let shard_end = usize::try_from(overlap_end - shard_logical_start)
@@ -1964,8 +2010,13 @@ impl CoreStore {
                         bail!("CoreStore WAL object.put landed hash mismatch");
                     }
                 }
-                self.materialise_object_blob_bytes(&hash, &materialised_bytes)
-                    .await?;
+                self.materialise_object_blob_bytes(
+                    &hash,
+                    &materialised_bytes,
+                    &record.boundary_values,
+                    &record.mutation_id,
+                )
+                .await?;
                 Ok("committed")
             }
             "stream.append" => {
@@ -3113,10 +3164,47 @@ impl CoreStore {
             .await
     }
 
+    async fn read_object_manifest_for_range(
+        &self,
+        object_ref: &CoreObjectRef,
+        range: &CoreByteRange,
+    ) -> Result<CoreObjectManifest> {
+        let manifest_hash = decode_manifest_ref(&object_ref.manifest_ref)?;
+        let object_hash = strip_sha256_prefix(&object_ref.hash)?;
+        if object_hash != manifest_hash {
+            bail!("CoreStore object manifest ref/hash mismatch");
+        }
+        let required_indices = required_data_shard_indices_for_range(
+            object_ref.logical_size,
+            LOCAL_DATA_SHARDS,
+            range,
+        )?;
+        self.reconstruct_object_manifest_from_shards_with_required_indices(
+            object_ref,
+            manifest_hash,
+            Some(&required_indices),
+        )
+        .await
+    }
+
     async fn reconstruct_object_manifest_from_shards(
         &self,
         object_ref: &CoreObjectRef,
         object_hash: &str,
+    ) -> Result<CoreObjectManifest> {
+        self.reconstruct_object_manifest_from_shards_with_required_indices(
+            object_ref,
+            object_hash,
+            None,
+        )
+        .await
+    }
+
+    async fn reconstruct_object_manifest_from_shards_with_required_indices(
+        &self,
+        object_ref: &CoreObjectRef,
+        object_hash: &str,
+        required_indices: Option<&BTreeSet<u16>>,
     ) -> Result<CoreObjectManifest> {
         let mut placements = Vec::with_capacity(LOCAL_DATA_SHARDS + LOCAL_PARITY_SHARDS);
         let mut stripe_size = 0u64;
@@ -3156,14 +3244,31 @@ impl CoreStore {
                 let Some((shard_index, shard_hash)) = parse_shard_file_name(&file_name) else {
                     continue;
                 };
-                let metadata = entry.metadata().await?;
-                stripe_size =
-                    stripe_size.max(metadata.len().saturating_mul(LOCAL_DATA_SHARDS as u64));
+                let expected_block_id = format!("sha256:{object_hash}");
+                let expected_payload_hash = format!("sha256:{shard_hash}");
+                let shard_payload = match read_block_shard_file(
+                    &entry.path(),
+                    BlockShardExpectation {
+                        block_id: &expected_block_id,
+                        shard_index,
+                        erasure_profile_id: LOCAL_ERASURE_PROFILE_ID,
+                        payload_hash: &expected_payload_hash,
+                        payload_len: 0,
+                    },
+                    "read_manifest_shard_header",
+                )
+                .await
+                {
+                    Ok(payload) => payload,
+                    Err(_) => continue,
+                };
+                stripe_size = stripe_size
+                    .max((shard_payload.len() as u64).saturating_mul(LOCAL_DATA_SHARDS as u64));
                 placements.push(CoreObjectPlacement {
                     shard_index,
                     node_id: node_id.clone(),
                     shard_hash: format!("sha256:{shard_hash}"),
-                    stored_size: metadata.len(),
+                    stored_size: shard_payload.len() as u64,
                     generation: 1,
                 });
             }
@@ -3171,7 +3276,23 @@ impl CoreStore {
 
         placements.sort_by_key(|placement| placement.shard_index);
         placements.dedup_by_key(|placement| placement.shard_index);
-        if placements.len() < LOCAL_DATA_SHARDS {
+        if let Some(required_indices) = required_indices {
+            let present = placements
+                .iter()
+                .map(|placement| placement.shard_index)
+                .collect::<BTreeSet<_>>();
+            let missing = required_indices
+                .difference(&present)
+                .copied()
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                bail!(
+                    "CoreStore manifest {} is missing required range shards {:?}",
+                    object_ref.manifest_ref,
+                    missing
+                );
+            }
+        } else if placements.len() < LOCAL_DATA_SHARDS {
             bail!(
                 "CoreStore manifest {} has only {} shard placements; {} data shards required",
                 object_ref.manifest_ref,
@@ -3542,6 +3663,395 @@ fn encode_erasure_shards(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
     let reed_solomon = ReedSolomon::new(LOCAL_DATA_SHARDS, LOCAL_PARITY_SHARDS)?;
     reed_solomon.encode(&mut shards)?;
     Ok(shards)
+}
+
+fn required_data_shard_indices_for_range(
+    logical_size: u64,
+    data_shards: usize,
+    range: &CoreByteRange,
+) -> Result<BTreeSet<u16>> {
+    if data_shards == 0 {
+        bail!("CoreStore range read requires at least one data shard");
+    }
+    if range.start > range.end_exclusive {
+        bail!("CoreStore range start must be <= end_exclusive");
+    }
+    if range.end_exclusive > logical_size {
+        bail!("CoreStore range end_exclusive exceeds logical object size");
+    }
+
+    let shard_len = logical_size.div_ceil(data_shards as u64).max(1);
+    let mut indices = BTreeSet::new();
+    for shard_index in 0..data_shards {
+        let shard_start = shard_index as u64 * shard_len;
+        let shard_end = (shard_start + shard_len).min(logical_size);
+        if range.start.max(shard_start) < range.end_exclusive.min(shard_end) {
+            indices.insert(shard_index as u16);
+        }
+    }
+    Ok(indices)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MinimalCborValue {
+    Text(String),
+    U64(u64),
+}
+
+#[derive(Debug, Clone)]
+struct BlockShardHeaderInput {
+    block_id: String,
+    erasure_set_id: String,
+    shard_index: u16,
+    erasure_profile_id: String,
+    logical_file_id: String,
+    logical_offset: u64,
+    logical_length: u64,
+    payload_plain_hash: String,
+    payload_stored_hash: String,
+    compression: String,
+    encryption: String,
+    placement_epoch: u64,
+    boundary_summary_hash: String,
+    writer_family: String,
+    created_by_mutation_id: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BlockShardExpectation<'a> {
+    block_id: &'a str,
+    shard_index: u16,
+    erasure_profile_id: &'a str,
+    payload_hash: &'a str,
+    payload_len: u64,
+}
+
+fn encode_block_shard_file(header: BlockShardHeaderInput, payload: &[u8]) -> Result<Vec<u8>> {
+    let header_cbor = encode_minimal_cbor_map(&block_shard_header_map(header)?);
+    let mut out = Vec::with_capacity(
+        CORE_BLOCK_SHARD_MAGIC.len() + 2 + 4 + header_cbor.len() + 8 + payload.len() + 4 + 32,
+    );
+    out.extend_from_slice(CORE_BLOCK_SHARD_MAGIC);
+    out.extend_from_slice(&CORE_BLOCK_SHARD_VERSION.to_le_bytes());
+    write_u32_le(&mut out, header_cbor.len())?;
+    out.extend_from_slice(&header_cbor);
+    out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    out.extend_from_slice(payload);
+    let mut crc_input = Vec::with_capacity(header_cbor.len() + payload.len());
+    crc_input.extend_from_slice(&header_cbor);
+    crc_input.extend_from_slice(payload);
+    out.extend_from_slice(&crc32c(&crc_input).to_le_bytes());
+    let file_hash = Sha256::digest(&out);
+    out.extend_from_slice(file_hash.as_ref());
+    Ok(out)
+}
+
+async fn read_block_shard_file(
+    path: &PathBuf,
+    expectation: BlockShardExpectation<'_>,
+    operation: &'static str,
+) -> Result<Vec<u8>> {
+    let bytes = read_file(path, "core_store", operation)
+        .await
+        .with_context(|| format!("read CoreStore block shard {}", path.display()))?;
+    let (header, payload) = decode_block_shard_file(&bytes)?;
+    expect_cbor_text(&header, "schema", CORE_BLOCK_SHARD_HEADER_SCHEMA)?;
+    expect_cbor_text(&header, "block_id", expectation.block_id)?;
+    expect_cbor_u64(&header, "shard_index", u64::from(expectation.shard_index))?;
+    expect_cbor_text(
+        &header,
+        "erasure_profile_id",
+        expectation.erasure_profile_id,
+    )?;
+    expect_cbor_text(&header, "payload_stored_hash", expectation.payload_hash)?;
+    expect_cbor_text(&header, "payload_plain_hash", expectation.payload_hash)?;
+    if expectation.payload_len > 0 {
+        expect_cbor_u64(&header, "logical_length", expectation.payload_len)?;
+    }
+    let actual_hash = format!("sha256:{}", sha256_hex(&payload));
+    if actual_hash != expectation.payload_hash {
+        bail!(
+            "CoreStore block shard payload hash mismatch: expected {}, got {}",
+            expectation.payload_hash,
+            actual_hash
+        );
+    }
+    if expectation.payload_len > 0 && payload.len() as u64 != expectation.payload_len {
+        bail!("CoreStore block shard payload length mismatch");
+    }
+    Ok(payload)
+}
+
+fn decode_block_shard_file(bytes: &[u8]) -> Result<(BTreeMap<String, MinimalCborValue>, Vec<u8>)> {
+    let mut offset = 0usize;
+    let magic = read_exact(bytes, &mut offset, CORE_BLOCK_SHARD_MAGIC.len())?;
+    if magic != CORE_BLOCK_SHARD_MAGIC {
+        bail!("CoreStore block shard has invalid magic");
+    }
+    let version = read_u16_le(bytes, &mut offset)?;
+    if version != CORE_BLOCK_SHARD_VERSION {
+        bail!("CoreStore block shard has unsupported version {version}");
+    }
+    let header_len = read_u32_le(bytes, &mut offset)? as usize;
+    let header_cbor = read_exact(bytes, &mut offset, header_len)?;
+    let header = decode_minimal_cbor_map(header_cbor)?;
+    if encode_minimal_cbor_map(&header) != header_cbor {
+        bail!("CoreStore block shard header is not canonical CBOR");
+    }
+    let payload_len = read_u64_le(bytes, &mut offset)? as usize;
+    let payload = read_exact(bytes, &mut offset, payload_len)?.to_vec();
+    let expected_crc = read_u32_le(bytes, &mut offset)?;
+    let mut crc_input = Vec::with_capacity(header_cbor.len() + payload.len());
+    crc_input.extend_from_slice(header_cbor);
+    crc_input.extend_from_slice(&payload);
+    if crc32c(&crc_input) != expected_crc {
+        bail!("CoreStore block shard checksum mismatch");
+    }
+    let file_hash_start = offset;
+    let expected_file_hash = read_exact(bytes, &mut offset, 32)?;
+    if offset != bytes.len() {
+        bail!("CoreStore block shard has trailing bytes");
+    }
+    let actual_file_hash = Sha256::digest(&bytes[..file_hash_start]);
+    let actual_file_hash: &[u8] = actual_file_hash.as_ref();
+    if expected_file_hash != actual_file_hash {
+        bail!("CoreStore block shard file hash mismatch");
+    }
+    Ok((header, payload))
+}
+
+fn block_shard_header_map(
+    header: BlockShardHeaderInput,
+) -> Result<BTreeMap<String, MinimalCborValue>> {
+    let mut map = BTreeMap::new();
+    map.insert(
+        "schema".to_string(),
+        MinimalCborValue::Text(CORE_BLOCK_SHARD_HEADER_SCHEMA.to_string()),
+    );
+    map.insert(
+        "block_id".to_string(),
+        MinimalCborValue::Text(header.block_id),
+    );
+    map.insert(
+        "erasure_set_id".to_string(),
+        MinimalCborValue::Text(header.erasure_set_id),
+    );
+    map.insert(
+        "shard_index".to_string(),
+        MinimalCborValue::U64(u64::from(header.shard_index)),
+    );
+    map.insert(
+        "erasure_profile_id".to_string(),
+        MinimalCborValue::Text(header.erasure_profile_id),
+    );
+    map.insert(
+        "logical_file_id".to_string(),
+        MinimalCborValue::Text(header.logical_file_id),
+    );
+    map.insert(
+        "logical_offset".to_string(),
+        MinimalCborValue::U64(header.logical_offset),
+    );
+    map.insert(
+        "logical_length".to_string(),
+        MinimalCborValue::U64(header.logical_length),
+    );
+    map.insert(
+        "payload_plain_hash".to_string(),
+        MinimalCborValue::Text(header.payload_plain_hash),
+    );
+    map.insert(
+        "payload_stored_hash".to_string(),
+        MinimalCborValue::Text(header.payload_stored_hash),
+    );
+    map.insert(
+        "compression".to_string(),
+        MinimalCborValue::Text(header.compression),
+    );
+    map.insert(
+        "encryption".to_string(),
+        MinimalCborValue::Text(header.encryption),
+    );
+    map.insert(
+        "placement_epoch".to_string(),
+        MinimalCborValue::U64(header.placement_epoch),
+    );
+    map.insert(
+        "boundary_summary_hash".to_string(),
+        MinimalCborValue::Text(header.boundary_summary_hash),
+    );
+    map.insert(
+        "writer_family".to_string(),
+        MinimalCborValue::Text(header.writer_family),
+    );
+    map.insert(
+        "created_by_mutation_id".to_string(),
+        MinimalCborValue::Text(header.created_by_mutation_id),
+    );
+    Ok(map)
+}
+
+fn boundary_summary_hash(boundary_values: &[CoreBoundaryValue]) -> Result<String> {
+    Ok(format!(
+        "sha256:{}",
+        sha256_hex(&serde_json::to_vec(boundary_values)?)
+    ))
+}
+
+fn expect_cbor_text(
+    header: &BTreeMap<String, MinimalCborValue>,
+    key: &str,
+    expected: &str,
+) -> Result<()> {
+    match header.get(key) {
+        Some(MinimalCborValue::Text(actual)) if actual == expected => Ok(()),
+        Some(MinimalCborValue::Text(actual)) => {
+            bail!("CoreStore block shard header {key} mismatch: expected {expected}, got {actual}")
+        }
+        _ => bail!("CoreStore block shard header missing text field {key}"),
+    }
+}
+
+fn expect_cbor_u64(
+    header: &BTreeMap<String, MinimalCborValue>,
+    key: &str,
+    expected: u64,
+) -> Result<()> {
+    match header.get(key) {
+        Some(MinimalCborValue::U64(actual)) if *actual == expected => Ok(()),
+        Some(MinimalCborValue::U64(actual)) => {
+            bail!("CoreStore block shard header {key} mismatch: expected {expected}, got {actual}")
+        }
+        _ => bail!("CoreStore block shard header missing u64 field {key}"),
+    }
+}
+
+fn encode_minimal_cbor_map(map: &BTreeMap<String, MinimalCborValue>) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_cbor_type_len(&mut out, 5, map.len() as u64);
+    for (key, value) in map {
+        push_cbor_text(&mut out, key);
+        match value {
+            MinimalCborValue::Text(value) => push_cbor_text(&mut out, value),
+            MinimalCborValue::U64(value) => push_cbor_type_len(&mut out, 0, *value),
+        }
+    }
+    out
+}
+
+fn decode_minimal_cbor_map(bytes: &[u8]) -> Result<BTreeMap<String, MinimalCborValue>> {
+    let mut offset = 0usize;
+    let (major, len) = read_cbor_type_len(bytes, &mut offset)?;
+    if major != 5 {
+        bail!("CoreStore block shard header CBOR is not a map");
+    }
+    let mut previous_key = None::<String>;
+    let mut map = BTreeMap::new();
+    for _ in 0..len {
+        let key = read_cbor_text(bytes, &mut offset)?;
+        if previous_key
+            .as_ref()
+            .is_some_and(|previous| previous >= &key)
+        {
+            bail!("CoreStore block shard header CBOR map keys are not canonical");
+        }
+        previous_key = Some(key.clone());
+        let (major, value_len) = read_cbor_type_len(bytes, &mut offset)?;
+        let value = match major {
+            0 => MinimalCborValue::U64(value_len),
+            3 => {
+                let raw = read_exact(bytes, &mut offset, value_len as usize)?;
+                MinimalCborValue::Text(std::str::from_utf8(raw)?.to_string())
+            }
+            _ => bail!("CoreStore block shard header CBOR has unsupported value type"),
+        };
+        map.insert(key, value);
+    }
+    if offset != bytes.len() {
+        bail!("CoreStore block shard header CBOR has trailing bytes");
+    }
+    Ok(map)
+}
+
+fn push_cbor_text(out: &mut Vec<u8>, value: &str) {
+    push_cbor_type_len(out, 3, value.len() as u64);
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn push_cbor_type_len(out: &mut Vec<u8>, major: u8, value: u64) {
+    let prefix = major << 5;
+    match value {
+        0..=23 => out.push(prefix | value as u8),
+        24..=0xff => {
+            out.push(prefix | 24);
+            out.push(value as u8);
+        }
+        0x100..=0xffff => {
+            out.push(prefix | 25);
+            out.extend_from_slice(&(value as u16).to_be_bytes());
+        }
+        0x1_0000..=0xffff_ffff => {
+            out.push(prefix | 26);
+            out.extend_from_slice(&(value as u32).to_be_bytes());
+        }
+        _ => {
+            out.push(prefix | 27);
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+}
+
+fn read_cbor_text(bytes: &[u8], offset: &mut usize) -> Result<String> {
+    let (major, len) = read_cbor_type_len(bytes, offset)?;
+    if major != 3 {
+        bail!("CoreStore block shard header CBOR key is not text");
+    }
+    let raw = read_exact(bytes, offset, len as usize)?;
+    Ok(std::str::from_utf8(raw)?.to_string())
+}
+
+fn read_cbor_type_len(bytes: &[u8], offset: &mut usize) -> Result<(u8, u64)> {
+    let first = *read_exact(bytes, offset, 1)?
+        .first()
+        .ok_or_else(|| anyhow!("CoreStore CBOR ended unexpectedly"))?;
+    let major = first >> 5;
+    let additional = first & 0x1f;
+    let value = match additional {
+        value @ 0..=23 => u64::from(value),
+        24 => {
+            let value = u64::from(*read_exact(bytes, offset, 1)?.first().unwrap());
+            if value < 24 {
+                bail!("CoreStore CBOR length is not canonical");
+            }
+            value
+        }
+        25 => {
+            let raw = read_exact(bytes, offset, 2)?;
+            let value = u64::from(u16::from_be_bytes(raw.try_into()?));
+            if value <= 0xff {
+                bail!("CoreStore CBOR length is not canonical");
+            }
+            value
+        }
+        26 => {
+            let raw = read_exact(bytes, offset, 4)?;
+            let value = u64::from(u32::from_be_bytes(raw.try_into()?));
+            if value <= 0xffff {
+                bail!("CoreStore CBOR length is not canonical");
+            }
+            value
+        }
+        27 => {
+            let raw = read_exact(bytes, offset, 8)?;
+            let value = u64::from_be_bytes(raw.try_into()?);
+            if value <= 0xffff_ffff {
+                bail!("CoreStore CBOR length is not canonical");
+            }
+            value
+        }
+        _ => bail!("CoreStore CBOR indefinite length is not allowed"),
+    };
+    Ok((major, value))
 }
 
 fn validate_manifest_for_object_ref(
@@ -4831,6 +5341,12 @@ async fn read_file(
     result
 }
 
+fn is_not_found_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
 async fn write_file_atomic(path: &PathBuf, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         let started_at = Instant::now();
@@ -5880,6 +6396,26 @@ mod tests {
                 "replica shard must exist at {}",
                 path.display()
             );
+            let shard_file = tokio::fs::read(&path).await.unwrap();
+            assert!(
+                shard_file.starts_with(CORE_BLOCK_SHARD_MAGIC),
+                "physical shard files must use the RFC block-shard container"
+            );
+            let expected_block_id = format!("sha256:{object_hash}");
+            let payload = read_block_shard_file(
+                &path,
+                BlockShardExpectation {
+                    block_id: &expected_block_id,
+                    shard_index: placement.shard_index,
+                    erasure_profile_id: LOCAL_ERASURE_PROFILE_ID,
+                    payload_hash: &placement.shard_hash,
+                    payload_len: placement.stored_size,
+                },
+                "test_read_block_shard",
+            )
+            .await
+            .unwrap();
+            assert_eq!(payload.len() as u64, placement.stored_size);
         }
 
         for placement in manifest.placements.iter().take(LOCAL_PARITY_SHARDS) {
