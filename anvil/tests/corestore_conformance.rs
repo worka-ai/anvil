@@ -458,6 +458,17 @@ fn count_ref_sidecar_dirs(root: &Path) -> usize {
         .count()
 }
 
+fn count_stream_name_sidecar_dirs(root: &Path) -> usize {
+    let replicas = root.join("_core").join("replicas");
+    let Ok(entries) = fs::read_dir(replicas) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.path().join("streams").join("_names").exists())
+        .count()
+}
+
 #[test]
 fn rfc_0006_protected_writers_use_commit_time_partition_preconditions() {
     let protected_writers = [
@@ -749,6 +760,11 @@ async fn rfc_0006_corestore_transactions_gate_ref_stream_and_watch_visibility() 
             .unwrap()
             .len(),
         1
+    );
+    assert_eq!(
+        count_stream_name_sidecar_dirs(tmp.path()),
+        0,
+        "CoreStore stream ids must be reconstructed from stream data, not _names JSON sidecars"
     );
     assert_eq!(
         store

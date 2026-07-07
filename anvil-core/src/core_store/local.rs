@@ -88,12 +88,6 @@ struct StoredStreamRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredStreamDirectoryEntry {
-    stream_id: String,
-    updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredStreamSegmentHeader {
     schema: String,
     stream_id: String,
@@ -982,13 +976,14 @@ impl CoreStore {
     pub async fn list_stream_ids(&self, prefix: &str) -> Result<Vec<String>> {
         let mut votes: BTreeMap<String, usize> = BTreeMap::new();
         for node_id in local_control_node_ids() {
-            let dir = self.stream_names_replica_dir(&node_id);
+            let dir = self.stream_data_replica_dir(&node_id);
             let mut entries = match fs::read_dir(&dir).await {
                 Ok(entries) => entries,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => {
-                    return Err(err)
-                        .with_context(|| format!("read CoreStore stream directory {node_id}"));
+                    return Err(err).with_context(|| {
+                        format!("read CoreStore stream data directory {node_id}")
+                    });
                 }
             };
             while let Some(entry) = entries.next_entry().await? {
@@ -1005,16 +1000,20 @@ impl CoreStore {
                 if !file_type.is_file() {
                     continue;
                 }
-                let bytes = match fs::read(entry.path()).await {
+                let path = entry.path();
+                if path.extension().and_then(|value| value.to_str()) != Some("anstream") {
+                    continue;
+                }
+                let bytes = match fs::read(&path).await {
                     Ok(bytes) => bytes,
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(err) => {
-                        return Err(err).with_context(|| "read CoreStore stream name entry");
+                        return Err(err).with_context(|| "read CoreStore stream data entry");
                     }
                 };
-                let stored: StoredStreamDirectoryEntry = serde_json::from_slice(&bytes)?;
-                if stored.stream_id.starts_with(prefix) {
-                    *votes.entry(stored.stream_id).or_default() += 1;
+                let stream_id = decode_active_stream_id(&bytes)?;
+                if stream_id.starts_with(prefix) {
+                    *votes.entry(stream_id).or_default() += 1;
                 }
             }
         }
@@ -1837,20 +1836,6 @@ impl CoreStore {
             &bytes,
             |store, node_id| store.stream_replica_path(node_id, stream_id),
         )
-        .await?;
-        self.write_stream_directory_entry(stream_id).await
-    }
-
-    async fn write_stream_directory_entry(&self, stream_id: &str) -> Result<()> {
-        let bytes = serde_json::to_vec(&StoredStreamDirectoryEntry {
-            stream_id: stream_id.to_string(),
-            updated_at: now_rfc3339(),
-        })?;
-        self.write_bytes_to_quorum(
-            &format!("CoreStore stream directory entry {stream_id}"),
-            &bytes,
-            |store, node_id| store.stream_name_replica_path(node_id, stream_id),
-        )
         .await
     }
 
@@ -1945,24 +1930,16 @@ impl CoreStore {
             .join(format!("shard-{shard_index:05}-{shard_hash}.bin"))
     }
 
-    fn stream_replica_path(&self, node_id: &str, stream_id: &str) -> PathBuf {
+    fn stream_data_replica_dir(&self, node_id: &str) -> PathBuf {
         self.storage
             .core_store_replica_path(node_id)
             .join("streams")
             .join("data")
+    }
+
+    fn stream_replica_path(&self, node_id: &str, stream_id: &str) -> PathBuf {
+        self.stream_data_replica_dir(node_id)
             .join(format!("{}.anstream", logical_file_name(stream_id)))
-    }
-
-    fn stream_names_replica_dir(&self, node_id: &str) -> PathBuf {
-        self.storage
-            .core_store_replica_path(node_id)
-            .join("streams")
-            .join("_names")
-    }
-
-    fn stream_name_replica_path(&self, node_id: &str, stream_id: &str) -> PathBuf {
-        self.stream_names_replica_dir(node_id)
-            .join(format!("{}.json", logical_file_name(stream_id)))
     }
 
     async fn read_bytes_from_quorum<F>(
@@ -2585,6 +2562,23 @@ fn encode_active_stream_records(stream_id: &str, records: &[StreamRecord]) -> Re
     Ok(bytes)
 }
 
+fn decode_active_stream_id(bytes: &[u8]) -> Result<String> {
+    let mut offset = 0usize;
+    let magic = read_exact(bytes, &mut offset, CORE_ACTIVE_STREAM_MAGIC.len())?;
+    if magic != CORE_ACTIVE_STREAM_MAGIC {
+        bail!("CoreStore active stream has invalid magic");
+    }
+    let version = read_u16_le(bytes, &mut offset)?;
+    if version != CORE_ACTIVE_STREAM_VERSION {
+        bail!("CoreStore active stream has unsupported version {version}");
+    }
+    let encoded_stream_id_len = read_u32_le(bytes, &mut offset)? as usize;
+    let encoded_stream_id = read_exact(bytes, &mut offset, encoded_stream_id_len)?;
+    Ok(std::str::from_utf8(encoded_stream_id)
+        .context("decode CoreStore active stream id as utf-8")?
+        .to_string())
+}
+
 fn decode_active_stream_records(stream_id: &str, bytes: &[u8]) -> Result<Vec<StreamRecord>> {
     let mut offset = 0usize;
     let magic = read_exact(bytes, &mut offset, CORE_ACTIVE_STREAM_MAGIC.len())?;
@@ -3078,6 +3072,18 @@ mod tests {
             .await
             .expect("list stream ids");
         assert_eq!(stream_ids, vec!["object_metadata:tenant:b".to_string()]);
+        for node_id in local_control_node_ids() {
+            assert!(
+                !tmp.path()
+                    .join("_core")
+                    .join("replicas")
+                    .join(&node_id)
+                    .join("streams")
+                    .join("_names")
+                    .exists(),
+                "CoreStore stream ids must be reconstructed from stream data, not _names JSON sidecars"
+            );
+        }
     }
 
     #[tokio::test]
