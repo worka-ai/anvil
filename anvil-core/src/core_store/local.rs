@@ -850,13 +850,10 @@ impl CoreStore {
         let _perf_guard =
             crate::perf::guard("anvil_core_store_op", &[("operation", "read_stream")]);
         validate_logical_id(&input.stream_id, "stream id")?;
-        let mut records = self.read_all_stream_records(&input.stream_id).await?;
-        records = self.filter_committed_stream_records(records).await?;
-        records.retain(|record| record.sequence > input.after_sequence);
-        if input.limit > 0 && records.len() > input.limit {
-            records.truncate(input.limit);
-        }
-        Ok(records)
+        let records = self
+            .read_stream_records_after(&input.stream_id, input.after_sequence, input.limit)
+            .await?;
+        self.filter_committed_stream_records(records).await
     }
 
     pub async fn seal_stream_segment(&self, input: SealStreamSegment) -> Result<CoreSegmentRef> {
@@ -3264,6 +3261,24 @@ impl CoreStore {
         decode_active_stream_records(stream_id, &bytes)
     }
 
+    async fn read_stream_records_after(
+        &self,
+        stream_id: &str,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<StreamRecord>> {
+        let Some(bytes) = self
+            .read_bytes_from_quorum(
+                &format!("CoreStore stream {stream_id}"),
+                |store, node_id| store.stream_replica_path(node_id, stream_id),
+            )
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        decode_active_stream_records_page(stream_id, &bytes, after_sequence, limit)
+    }
+
     async fn write_stream_records(&self, stream_id: &str, records: &[StreamRecord]) -> Result<()> {
         let bytes = encode_active_stream_records(stream_id, records)?;
         self.write_bytes_to_quorum(
@@ -4336,6 +4351,50 @@ fn decode_active_stream_id(bytes: &[u8]) -> Result<String> {
 }
 
 fn decode_active_stream_records(stream_id: &str, bytes: &[u8]) -> Result<Vec<StreamRecord>> {
+    let (mut offset, record_count) = decode_active_stream_header(stream_id, bytes)?;
+    let mut records = Vec::with_capacity(record_count as usize);
+    for _ in 0..record_count {
+        let record = decode_active_stream_record(stream_id, bytes, &mut offset, records.last())?;
+        records.push(record);
+    }
+
+    let stream_hash_start = offset;
+    let stream_hash = read_exact(bytes, &mut offset, 32)?;
+    if offset != bytes.len() {
+        bail!("CoreStore active stream has trailing bytes");
+    }
+    let actual_stream_hash = Sha256::digest(&bytes[..stream_hash_start]);
+    let actual_stream_hash: &[u8] = actual_stream_hash.as_ref();
+    if stream_hash != actual_stream_hash {
+        bail!("CoreStore active stream hash mismatch");
+    }
+    Ok(records)
+}
+
+fn decode_active_stream_records_page(
+    stream_id: &str,
+    bytes: &[u8],
+    after_sequence: u64,
+    limit: usize,
+) -> Result<Vec<StreamRecord>> {
+    validate_active_stream_hash(bytes)?;
+    let (mut offset, record_count) = decode_active_stream_header(stream_id, bytes)?;
+    let mut records = Vec::with_capacity(limit.min(record_count as usize));
+    let mut previous = None;
+    for _ in 0..record_count {
+        if limit > 0 && records.len() >= limit {
+            break;
+        }
+        let record = decode_active_stream_record(stream_id, bytes, &mut offset, previous.as_ref())?;
+        previous = Some(record.clone());
+        if record.sequence > after_sequence {
+            records.push(record);
+        }
+    }
+    Ok(records)
+}
+
+fn decode_active_stream_header(stream_id: &str, bytes: &[u8]) -> Result<(usize, u64)> {
     let mut offset = 0usize;
     let magic = read_exact(bytes, &mut offset, CORE_ACTIVE_STREAM_MAGIC.len())?;
     if magic != CORE_ACTIVE_STREAM_MAGIC {
@@ -4352,35 +4411,43 @@ fn decode_active_stream_records(stream_id: &str, bytes: &[u8]) -> Result<Vec<Str
     }
 
     let record_count = read_u64_le(bytes, &mut offset)?;
-    let mut records = Vec::with_capacity(record_count as usize);
-    for _ in 0..record_count {
-        let record_json_len = read_u32_le(bytes, &mut offset)? as usize;
-        let record_json = read_exact(bytes, &mut offset, record_json_len)?;
-        let expected_crc = read_u32_le(bytes, &mut offset)?;
-        let actual_crc = crc32c(record_json);
-        if actual_crc != expected_crc {
-            bail!("CoreStore active stream record checksum mismatch");
-        }
-        let stored: StoredStreamRecord = serde_json::from_slice(record_json)?;
-        let record = StreamRecord::from(stored);
-        if record.stream_id != stream_id {
-            bail!("CoreStore active stream record scope mismatch");
-        }
-        verify_stream_record(records.last(), &record)?;
-        records.push(record);
-    }
+    Ok((offset, record_count))
+}
 
-    let stream_hash_start = offset;
-    let stream_hash = read_exact(bytes, &mut offset, 32)?;
-    if offset != bytes.len() {
-        bail!("CoreStore active stream has trailing bytes");
+fn decode_active_stream_record(
+    stream_id: &str,
+    bytes: &[u8],
+    offset: &mut usize,
+    previous: Option<&StreamRecord>,
+) -> Result<StreamRecord> {
+    let record_json_len = read_u32_le(bytes, offset)? as usize;
+    let record_json = read_exact(bytes, offset, record_json_len)?;
+    let expected_crc = read_u32_le(bytes, offset)?;
+    let actual_crc = crc32c(record_json);
+    if actual_crc != expected_crc {
+        bail!("CoreStore active stream record checksum mismatch");
     }
+    let stored: StoredStreamRecord = serde_json::from_slice(record_json)?;
+    let record = StreamRecord::from(stored);
+    if record.stream_id != stream_id {
+        bail!("CoreStore active stream record scope mismatch");
+    }
+    verify_stream_record(previous, &record)?;
+    Ok(record)
+}
+
+fn validate_active_stream_hash(bytes: &[u8]) -> Result<()> {
+    if bytes.len() < 32 {
+        bail!("CoreStore active stream is too short for hash");
+    }
+    let stream_hash_start = bytes.len() - 32;
+    let stream_hash = &bytes[stream_hash_start..];
     let actual_stream_hash = Sha256::digest(&bytes[..stream_hash_start]);
     let actual_stream_hash: &[u8] = actual_stream_hash.as_ref();
     if stream_hash != actual_stream_hash {
         bail!("CoreStore active stream hash mismatch");
     }
-    Ok(records)
+    Ok(())
 }
 
 fn encode_stream_segment(
@@ -5928,6 +5995,71 @@ mod tests {
                 "CoreStore stream ids must be reconstructed from stream data, not _names JSON sidecars"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn core_store_read_stream_page_does_not_decode_unrequested_tail_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+
+        for sequence in 1..=3 {
+            store
+                .append_stream(AppendStreamRecord {
+                    stream_id: "tenant:t/bucket:b/ranged-stream".to_string(),
+                    partition_id: "tenant:t/bucket:b".to_string(),
+                    record_kind: format!("event.{sequence}"),
+                    payload: format!(r#"{{"sequence":{sequence}}}"#).into_bytes(),
+                    fence: None,
+                    transaction_id: None,
+                    idempotency_key: Some(format!("event-{sequence}")),
+                })
+                .await
+                .unwrap();
+        }
+
+        for node_id in local_control_node_ids() {
+            let path = store.stream_replica_path(&node_id, "tenant:t/bucket:b/ranged-stream");
+            let mut bytes = fs::read(&path).await.unwrap();
+            let (mut offset, _record_count) =
+                decode_active_stream_header("tenant:t/bucket:b/ranged-stream", &bytes).unwrap();
+            for _ in 0..2 {
+                let len = read_u32_le(&bytes, &mut offset).unwrap() as usize;
+                let _ = read_exact(&bytes, &mut offset, len).unwrap();
+                let _ = read_u32_le(&bytes, &mut offset).unwrap();
+            }
+            let len = read_u32_le(&bytes, &mut offset).unwrap() as usize;
+            let _ = read_exact(&bytes, &mut offset, len).unwrap();
+            bytes[offset..offset + 4].copy_from_slice(&0u32.to_le_bytes());
+            let hash_start = bytes.len() - 32;
+            let hash = Sha256::digest(&bytes[..hash_start]);
+            bytes[hash_start..].copy_from_slice(hash.as_ref());
+            fs::write(path, bytes).await.unwrap();
+        }
+
+        let page = store
+            .read_stream(ReadStream {
+                stream_id: "tenant:t/bucket:b/ranged-stream".to_string(),
+                after_sequence: 0,
+                limit: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].record_kind, "event.1");
+        assert_eq!(page[1].record_kind, "event.2");
+
+        assert!(
+            store
+                .read_stream(ReadStream {
+                    stream_id: "tenant:t/bucket:b/ranged-stream".to_string(),
+                    after_sequence: 0,
+                    limit: 0,
+                })
+                .await
+                .is_err(),
+            "full stream reads must still validate the corrupted tail record"
+        );
     }
 
     #[tokio::test]
