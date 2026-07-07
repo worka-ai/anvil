@@ -40,7 +40,7 @@ Feature-specific formats still exist where useful, but durable truth goes throug
 Anvil is Docker-first. Set `ANVIL_IMAGE` to the image published for the release you want to run, preferably pinned by tag or digest:
 
 ```sh
-export ANVIL_IMAGE="ghcr.io/<owner>/anvil:v0.2.4"
+export ANVIL_IMAGE="ghcr.io/worka-ai/anvil:v0.2.4"
 docker pull "$ANVIL_IMAGE"
 ```
 
@@ -124,7 +124,7 @@ Anvil is licensed under the Apache 2.0 License. See `LICENSE`.
 A single-node local run is useful for learning the planes before building a larger topology. Keep the storage path on a volume, generate real secret material for anything you intend to keep, and remember that the admin listener is private even in local demos.
 
 ```sh
-export ANVIL_IMAGE="ghcr.io/anvil-storage/anvil:v0.2.4"
+export ANVIL_IMAGE="ghcr.io/worka-ai/anvil:v0.2.4"
 export ANVIL_SECRET_ENCRYPTION_KEY="$(anvil-admin key generate-secret-encryption-key)"
 
 docker run --rm \
