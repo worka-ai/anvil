@@ -56,6 +56,9 @@ const CORE_STREAM_SEGMENT_VERSION: u16 = 1;
 const CORE_STREAM_SEGMENT_HEADER_SCHEMA: &str = "anvil.core.stream_segment_header.v1";
 const CORE_STREAM_RECORD_HEADER_SCHEMA: &str = "anvil.core.stream_record_header.v1";
 const CORE_STREAM_SEGMENT_TRAILER_SCHEMA: &str = "anvil.core.stream_segment_trailer.v1";
+const CORE_TRANSACTION_STREAM_ID: &str = "core_transactions";
+const CORE_TRANSACTION_PARTITION_ID: &str = "core-control";
+const CORE_TRANSACTION_RECORD_KIND: &str = "core_transaction";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -1471,33 +1474,46 @@ impl CoreStore {
             bail!("CoreStore only persists committed transactions through commit_transaction");
         }
         validate_logical_id(&transaction.transaction_id, "transaction id")?;
+        let _transaction_guard = self.acquire_stream_lock(CORE_TRANSACTION_STREAM_ID).await?;
+        let _guard = self.write_lock.lock().await;
         self.write_transaction_unlocked(&transaction).await
     }
 
     async fn write_transaction_unlocked(&self, transaction: &CoreTransaction) -> Result<()> {
         let bytes = serde_json::to_vec(&transaction)?;
-        self.write_bytes_to_quorum(
-            &format!("CoreStore transaction {}", transaction.transaction_id),
-            &bytes,
-            |store, node_id| store.transaction_replica_path(node_id, &transaction.transaction_id),
-        )
-        .await
+        self.append_stream_unlocked(AppendStreamRecord {
+            stream_id: CORE_TRANSACTION_STREAM_ID.to_string(),
+            partition_id: CORE_TRANSACTION_PARTITION_ID.to_string(),
+            record_kind: CORE_TRANSACTION_RECORD_KIND.to_string(),
+            payload: bytes,
+            fence: None,
+            transaction_id: None,
+            idempotency_key: Some(format!(
+                "{}:{}",
+                CORE_TRANSACTION_RECORD_KIND, transaction.transaction_id
+            )),
+        })
+        .await?;
+        Ok(())
     }
 
     async fn read_transaction_unlocked(
         &self,
         transaction_id: &str,
     ) -> Result<Option<CoreTransaction>> {
-        let Some(bytes) = self
-            .read_bytes_from_quorum(
-                &format!("CoreStore transaction {transaction_id}"),
-                |store, node_id| store.transaction_replica_path(node_id, transaction_id),
-            )
-            .await?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(serde_json::from_slice(&bytes)?))
+        let records = self
+            .read_all_stream_records(CORE_TRANSACTION_STREAM_ID)
+            .await?;
+        for record in records {
+            if record.record_kind != CORE_TRANSACTION_RECORD_KIND {
+                continue;
+            }
+            let transaction: CoreTransaction = serde_json::from_slice(&record.payload)?;
+            if transaction.transaction_id == transaction_id {
+                return Ok(Some(transaction));
+            }
+        }
+        Ok(None)
     }
 
     async fn transaction_is_committed(&self, transaction_id: &str) -> Result<bool> {
@@ -2165,12 +2181,6 @@ impl CoreStore {
             .join(format!("{}.json", logical_file_name(ref_name)))
     }
 
-    fn transaction_replica_path(&self, node_id: &str, transaction_id: &str) -> PathBuf {
-        self.storage
-            .core_store_replica_path(node_id)
-            .join("transactions")
-            .join(format!("{}.json", logical_file_name(transaction_id)))
-    }
 
     async fn read_bytes_from_quorum<F>(
         &self,

@@ -436,6 +436,17 @@ fn count_manifest_sidecar_dirs(root: &Path) -> usize {
         .count()
 }
 
+fn count_transaction_sidecar_dirs(root: &Path) -> usize {
+    let replicas = root.join("_core").join("replicas");
+    let Ok(entries) = fs::read_dir(replicas) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.path().join("transactions").exists())
+        .count()
+}
+
 #[test]
 fn rfc_0006_protected_writers_use_commit_time_partition_preconditions() {
     let protected_writers = [
@@ -695,6 +706,11 @@ async fn rfc_0006_corestore_transactions_gate_ref_stream_and_watch_visibility() 
             .expect("transaction")
             .state,
         CoreTransactionState::Committed
+    );
+    assert_eq!(
+        count_transaction_sidecar_dirs(tmp.path()),
+        0,
+        "CoreStore transactions must be recorded through CoreStore stream records, not final transaction JSON sidecars"
     );
     let current = store
         .read_ref("tenant/t/bucket/b/object/alpha/current")
