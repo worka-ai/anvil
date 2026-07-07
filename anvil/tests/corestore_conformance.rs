@@ -900,13 +900,16 @@ async fn rfc_0007_coreobject_manifests_are_reconstructed_from_shard_placement() 
         let object_hash = object_ref.hash.strip_prefix("sha256:").unwrap();
         let shard_hash = placement.shard_hash.strip_prefix("sha256:").unwrap();
         let shard_path = storage
-            .core_store_replica_path(&placement.node_id)
-            .join("blobs")
+            .core_store_root_path()
+            .join("blocks")
+            .join("local-cache")
+            .join("local-erasure-set")
+            .join(&placement.node_id)
             .join("sha256")
             .join(&object_hash[0..2])
             .join(object_hash)
             .join(format!(
-                "shard-{:05}-{shard_hash}.bin",
+                "shard-{:05}-{shard_hash}.anb",
                 placement.shard_index
             ));
         fs::remove_file(shard_path).unwrap();
@@ -922,13 +925,16 @@ async fn rfc_0007_coreobject_manifests_are_reconstructed_from_shard_placement() 
     let object_hash = object_ref.hash.strip_prefix("sha256:").unwrap();
     let shard_hash = placement.shard_hash.strip_prefix("sha256:").unwrap();
     let shard_path = storage
-        .core_store_replica_path(&placement.node_id)
-        .join("blobs")
+        .core_store_root_path()
+        .join("blocks")
+        .join("local-cache")
+        .join("local-erasure-set")
+        .join(&placement.node_id)
         .join("sha256")
         .join(&object_hash[0..2])
         .join(object_hash)
         .join(format!(
-            "shard-{:05}-{shard_hash}.bin",
+            "shard-{:05}-{shard_hash}.anb",
             placement.shard_index
         ));
     fs::remove_file(shard_path).unwrap();

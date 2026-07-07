@@ -33,6 +33,7 @@ const LOCAL_CONTROL_REPLICA_COUNT: usize = 5;
 const LOCAL_CONTROL_WRITE_QUORUM: usize = 3;
 const LOCAL_CONTROL_READ_QUORUM: usize = 3;
 const LOCAL_CONTROL_NODE_ID_PREFIX: &str = "local-control-node";
+const LOCAL_ERASURE_SET_ID: &str = "local-erasure-set";
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoreStoreCommitError {
@@ -476,7 +477,7 @@ impl CoreStore {
             let shard_file = encode_block_shard_file(
                 BlockShardHeaderInput {
                     block_id: block_id.clone(),
-                    erasure_set_id: "local-erasure-set".to_string(),
+                    erasure_set_id: LOCAL_ERASURE_SET_ID.to_string(),
                     shard_index: shard_index as u16,
                     erasure_profile_id: profile.id.to_string(),
                     logical_file_id: format!("sha256:{hash}"),
@@ -4015,12 +4016,15 @@ impl CoreStore {
     ) -> PathBuf {
         let prefix = &object_hash[0..2];
         self.storage
-            .core_store_replica_path(node_id)
-            .join("blobs")
+            .core_store_root_path()
+            .join("blocks")
+            .join("local-cache")
+            .join(LOCAL_ERASURE_SET_ID)
+            .join(node_id)
             .join("sha256")
             .join(prefix)
             .join(object_hash)
-            .join(format!("shard-{shard_index:05}-{shard_hash}.bin"))
+            .join(format!("shard-{shard_index:05}-{shard_hash}.anb"))
     }
 
     fn admission_root(&self) -> PathBuf {
@@ -4510,7 +4514,7 @@ fn logical_block_ref_from_materialized_block(
         compressed_length: object_manifest.logical_size,
         encrypted_length: object_manifest.logical_size,
         content_hash: block.plaintext_hash.clone(),
-        erasure_set_id: "local-erasure-set".to_string(),
+        erasure_set_id: LOCAL_ERASURE_SET_ID.to_string(),
         shards: object_manifest
             .placements
             .iter()
@@ -8504,8 +8508,19 @@ mod tests {
                 shard_hash,
             );
             assert!(
-                path.starts_with(storage.core_store_replica_path(&placement.node_id)),
-                "shards must be placed under explicit replica node directories"
+                path.starts_with(
+                    storage
+                        .core_store_root_path()
+                        .join("blocks")
+                        .join("local-cache")
+                        .join(LOCAL_ERASURE_SET_ID)
+                        .join(&placement.node_id)
+                ),
+                "shards must be placed under the RFC CoreStore block cache"
+            );
+            assert_eq!(
+                path.extension().and_then(|value| value.to_str()),
+                Some("anb")
             );
             assert!(
                 path.exists(),
