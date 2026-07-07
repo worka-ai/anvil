@@ -129,7 +129,7 @@ pub async fn write_full_text_segment(
             mutation_id: format!("full-text-segment:{}:{}", input.index_id, input.generation),
         })
         .await?;
-    store
+    if let Err(error) = store
         .compare_and_swap_ref(CompareAndSwapRef {
             ref_name: ref_name.clone(),
             expected_generation: None,
@@ -142,7 +142,16 @@ pub async fn write_full_text_segment(
             new_target: encode_core_object_ref_target(&object_ref)?,
             transaction_id: None,
         })
-        .await?;
+        .await
+    {
+        // The ref name is derived from the deterministic segment body hash. If a
+        // concurrent builder published the same segment first, the ref is already
+        // valid and this write is complete.
+        if read_full_text_segment(storage, &ref_name).await.is_ok() {
+            return Ok(ref_name);
+        }
+        return Err(error);
+    }
     Ok(ref_name)
 }
 
