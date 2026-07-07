@@ -1171,8 +1171,14 @@ async fn rfc_0006_sealed_stream_segments_use_binary_frame_and_stream_remains_ope
         .await
         .unwrap();
     assert!(
-        segment_bytes.starts_with(b"ANSEG001"),
+        segment_bytes.starts_with(b"ANSTRM\n\0"),
         "sealed stream segment must use the RFC binary frame magic"
+    );
+    assert!(
+        segment_bytes
+            .windows(8)
+            .any(|window| window == b"ANSSIX1\0"),
+        "sealed stream segment must include the RFC sparse sequence/time index"
     );
     let decoded = store.read_stream_segment(&sealed).await.unwrap();
     assert_eq!(decoded.len(), 2);

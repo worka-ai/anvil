@@ -64,7 +64,8 @@ fn is_incomplete_core_frame_error(error: &anyhow::Error) -> bool {
 
 const ZERO_HASH: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 const MAX_CORE_FENCE_TTL_MS: u64 = 120_000;
-const CORE_STREAM_SEGMENT_MAGIC: &[u8; 8] = b"ANSEG001";
+const CORE_STREAM_SEGMENT_MAGIC: &[u8; 8] = b"ANSTRM\n\0";
+const CORE_STREAM_SPARSE_INDEX_MAGIC: &[u8; 8] = b"ANSSIX1\0";
 const CORE_ACTIVE_STREAM_MAGIC: &[u8; 8] = b"ANASTR1\0";
 const CORE_BLOCK_SHARD_MAGIC: &[u8; 8] = b"ANBLK\n\0\0";
 const CORE_WAL_FILE_MAGIC: &[u8; 6] = b"ANWAL\n";
@@ -235,6 +236,14 @@ struct StoredStreamRecordHeader {
     event_hash: String,
     transaction_id: Option<String>,
     created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamSparseIndexEntry {
+    first_sequence: u64,
+    first_timestamp_nanos: i64,
+    record_ordinal: u32,
+    byte_offset: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -6348,7 +6357,9 @@ fn encode_stream_segment(
     bytes.extend_from_slice(&header_json);
     bytes.extend_from_slice(&(records.len() as u64).to_le_bytes());
 
-    for record in records {
+    let mut index_entries = Vec::with_capacity(records.len());
+    for (ordinal, record) in records.iter().enumerate() {
+        let record_offset = bytes.len() as u64;
         let record_header = StoredStreamRecordHeader {
             schema: CORE_STREAM_RECORD_HEADER_SCHEMA.to_string(),
             stream_id: record.stream_id.clone(),
@@ -6376,7 +6387,17 @@ fn encode_stream_segment(
         checksum_bytes.extend_from_slice(&record_header_json);
         checksum_bytes.extend_from_slice(&record.payload);
         bytes.extend_from_slice(&crc32c(&checksum_bytes).to_le_bytes());
+        index_entries.push(StreamSparseIndexEntry {
+            first_sequence: record.sequence,
+            first_timestamp_nanos: parse_stream_record_timestamp_nanos(&record.created_at),
+            record_ordinal: ordinal as u32,
+            byte_offset: record_offset,
+        });
     }
+
+    let index_bytes = encode_stream_sparse_index(&index_entries)?;
+    bytes.extend_from_slice(&(index_bytes.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&index_bytes);
 
     let payload_hash = format!("sha256:{}", sha256_hex(&bytes));
     let trailer = StoredStreamSegmentTrailer {
@@ -6454,6 +6475,9 @@ fn decode_stream_segment(bytes: &[u8]) -> Result<Vec<StreamRecord>> {
         verify_stream_record(records.last(), &record)?;
         records.push(record);
     }
+    let index_len = read_u64_le(bytes, &mut offset)? as usize;
+    let index_bytes = read_exact(bytes, &mut offset, index_len)?;
+    validate_stream_sparse_index(index_bytes, &records)?;
     let trailer_len_start = offset;
     let trailer_len = read_u32_le(bytes, &mut offset)? as usize;
     let trailer_json = read_exact(bytes, &mut offset, trailer_len)?;
@@ -6496,6 +6520,92 @@ fn decode_stream_segment(bytes: &[u8]) -> Result<Vec<StreamRecord>> {
         bail!("CoreStore stream segment header last_sequence mismatch");
     }
     Ok(records)
+}
+
+fn encode_stream_sparse_index(entries: &[StreamSparseIndexEntry]) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(CORE_STREAM_SPARSE_INDEX_MAGIC);
+    write_u32_le(&mut bytes, entries.len())?;
+    for entry in entries {
+        bytes.extend_from_slice(&entry.first_sequence.to_le_bytes());
+        bytes.extend_from_slice(&entry.record_ordinal.to_le_bytes());
+        bytes.extend_from_slice(&entry.byte_offset.to_le_bytes());
+    }
+    write_u32_le(&mut bytes, entries.len())?;
+    for entry in entries {
+        bytes.extend_from_slice(&entry.first_timestamp_nanos.to_le_bytes());
+        bytes.extend_from_slice(&entry.record_ordinal.to_le_bytes());
+        bytes.extend_from_slice(&entry.byte_offset.to_le_bytes());
+    }
+    let crc = crc32c(&bytes);
+    bytes.extend_from_slice(&crc.to_le_bytes());
+    Ok(bytes)
+}
+
+fn validate_stream_sparse_index(bytes: &[u8], records: &[StreamRecord]) -> Result<()> {
+    let mut offset = 0usize;
+    let magic = read_exact(bytes, &mut offset, CORE_STREAM_SPARSE_INDEX_MAGIC.len())?;
+    if magic != CORE_STREAM_SPARSE_INDEX_MAGIC {
+        bail!("CoreStore stream sparse index has invalid magic");
+    }
+    let sequence_count = read_u32_le(bytes, &mut offset)? as usize;
+    if sequence_count != records.len() {
+        bail!("CoreStore stream sparse index sequence count mismatch");
+    }
+    let mut previous_sequence = None;
+    for ordinal in 0..sequence_count {
+        let first_sequence = read_u64_le(bytes, &mut offset)?;
+        let record_ordinal = read_u32_le(bytes, &mut offset)?;
+        let _byte_offset = read_u64_le(bytes, &mut offset)?;
+        if record_ordinal != ordinal as u32 {
+            bail!("CoreStore stream sparse index ordinal mismatch");
+        }
+        if Some(first_sequence) <= previous_sequence {
+            bail!("CoreStore stream sparse index sequence entries are not sorted");
+        }
+        if records
+            .get(ordinal)
+            .map(|record| record.sequence)
+            .unwrap_or_default()
+            != first_sequence
+        {
+            bail!("CoreStore stream sparse index sequence does not match record");
+        }
+        previous_sequence = Some(first_sequence);
+    }
+    let timestamp_count = read_u32_le(bytes, &mut offset)? as usize;
+    if timestamp_count != records.len() {
+        bail!("CoreStore stream sparse index timestamp count mismatch");
+    }
+    let mut previous_timestamp = None;
+    for ordinal in 0..timestamp_count {
+        let timestamp = read_i64_le(bytes, &mut offset)?;
+        let record_ordinal = read_u32_le(bytes, &mut offset)?;
+        let _byte_offset = read_u64_le(bytes, &mut offset)?;
+        if record_ordinal != ordinal as u32 {
+            bail!("CoreStore stream sparse timestamp ordinal mismatch");
+        }
+        if previous_timestamp.is_some_and(|previous| timestamp < previous) {
+            bail!("CoreStore stream sparse timestamp entries are not sorted");
+        }
+        previous_timestamp = Some(timestamp);
+    }
+    let expected_crc = read_u32_le(bytes, &mut offset)?;
+    if offset != bytes.len() {
+        bail!("CoreStore stream sparse index has trailing bytes");
+    }
+    let actual_crc = crc32c(&bytes[..bytes.len() - 4]);
+    if actual_crc != expected_crc {
+        bail!("CoreStore stream sparse index checksum mismatch");
+    }
+    Ok(())
+}
+
+fn parse_stream_record_timestamp_nanos(value: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .and_then(|value| value.timestamp_nanos_opt())
+        .unwrap_or_default()
 }
 
 fn write_u32_le(out: &mut Vec<u8>, value: usize) -> Result<()> {
@@ -6673,6 +6783,11 @@ fn read_u32_le(bytes: &[u8], offset: &mut usize) -> Result<u32> {
 fn read_u64_le(bytes: &[u8], offset: &mut usize) -> Result<u64> {
     let raw = read_exact(bytes, offset, 8)?;
     Ok(u64::from_le_bytes(raw.try_into()?))
+}
+
+fn read_i64_le(bytes: &[u8], offset: &mut usize) -> Result<i64> {
+    let raw = read_exact(bytes, offset, 8)?;
+    Ok(i64::from_le_bytes(raw.try_into()?))
 }
 
 fn crc32c(bytes: &[u8]) -> u32 {
