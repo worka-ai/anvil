@@ -4,7 +4,14 @@ use anyhow::Result;
 use cluster::ClusterState;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, broadcast};
+
+pub(crate) fn emit_test_timing(label: impl AsRef<str>, elapsed: Duration) {
+    if std::env::var_os("ANVIL_TEST_TIMINGS").is_some() {
+        eprintln!("[timing] {}={elapsed:?}", label.as_ref());
+    }
+}
 
 // The modules we've created
 pub mod access_control;

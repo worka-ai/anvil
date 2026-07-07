@@ -2253,6 +2253,8 @@ impl Persistence {
         name: &str,
         region: &str,
     ) -> Result<Bucket, tonic::Status> {
+        let total_start = std::time::Instant::now();
+        let step_start = std::time::Instant::now();
         crate::mesh_lifecycle::ensure_new_writable_placement(
             &self.storage,
             region,
@@ -2261,6 +2263,11 @@ impl Persistence {
         )
         .await
         .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?;
+        crate::emit_test_timing(
+            "persistence.create_bucket ensure_new_writable_placement",
+            step_start.elapsed(),
+        );
+        let step_start = std::time::Instant::now();
         if bucket_journal::read_current_bucket(&self.storage, tenant_id, name)
             .await
             .map_err(|e| tonic::Status::internal(e.to_string()))?
@@ -2270,6 +2277,11 @@ impl Persistence {
                 "A bucket with that name already exists.",
             ));
         }
+        crate::emit_test_timing(
+            "persistence.create_bucket read_current_bucket",
+            step_start.elapsed(),
+        );
+        let step_start = std::time::Instant::now();
         let bucket = Bucket {
             id: bucket_journal::next_bucket_id(&self.storage)
                 .await
@@ -2280,14 +2292,29 @@ impl Persistence {
             created_at: Utc::now(),
             is_public_read: false,
         };
+        crate::emit_test_timing(
+            "persistence.create_bucket next_bucket_id",
+            step_start.elapsed(),
+        );
+        let step_start = std::time::Instant::now();
         let tenant_permit = self
             .bucket_tenant_write_permit(tenant_id)
             .await
             .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        crate::emit_test_timing(
+            "persistence.create_bucket tenant_write_permit",
+            step_start.elapsed(),
+        );
+        let step_start = std::time::Instant::now();
         let global_permit = self
             .bucket_global_write_permit()
             .await
             .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        crate::emit_test_timing(
+            "persistence.create_bucket global_write_permit",
+            step_start.elapsed(),
+        );
+        let step_start = std::time::Instant::now();
         bucket_journal::append_bucket_mutation_with_permits(
             &self.storage,
             &bucket,
@@ -2298,9 +2325,19 @@ impl Persistence {
         )
         .await
         .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        crate::emit_test_timing(
+            "persistence.create_bucket append_bucket_mutation",
+            step_start.elapsed(),
+        );
+        let step_start = std::time::Instant::now();
         self.write_mesh_bucket_locator(&bucket)
             .await
             .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        crate::emit_test_timing(
+            "persistence.create_bucket write_mesh_bucket_locator",
+            step_start.elapsed(),
+        );
+        let step_start = std::time::Instant::now();
         self.cache
             .insert_bucket(tenant_id, name.to_string(), bucket.clone())
             .await;
@@ -2309,6 +2346,11 @@ impl Persistence {
             name: name.to_string(),
         })
         .await;
+        crate::emit_test_timing(
+            "persistence.create_bucket cache_and_publish",
+            step_start.elapsed(),
+        );
+        crate::emit_test_timing("persistence.create_bucket total", total_start.elapsed());
         Ok(bucket)
     }
 
@@ -2518,14 +2560,21 @@ impl Persistence {
         shard_map: Option<JsonValue>,
         payload: Option<Vec<u8>>,
     ) -> Result<Object> {
+        let total_start = std::time::Instant::now();
+        let step_start = std::time::Instant::now();
         let bucket = bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id)
             .await?
             .ok_or_else(|| anyhow!("bucket not found"))?;
         if bucket.tenant_id != tenant_id {
             return Err(anyhow!("bucket does not belong to tenant"));
         }
+        crate::emit_test_timing(
+            "persistence.create_object read_bucket",
+            step_start.elapsed(),
+        );
         let version_id = uuid::Uuid::new_v4();
         let mutation_id = uuid::Uuid::new_v4();
+        let step_start = std::time::Instant::now();
         let shard_map = match (shard_map, payload) {
             (Some(shard_map), _) => Some(shard_map),
             (None, Some(payload)) => {
@@ -2545,11 +2594,22 @@ impl Persistence {
             }
             (None, None) => None,
         };
+        crate::emit_test_timing("persistence.create_object shard_map", step_start.elapsed());
+        let step_start = std::time::Instant::now();
         let index_policy_snapshot = self
             .active_index_policy_snapshot_hash(tenant_id, bucket_id)
             .await?;
+        crate::emit_test_timing(
+            "persistence.create_object active_index_policy_snapshot_hash",
+            step_start.elapsed(),
+        );
+        let step_start = std::time::Instant::now();
         let user_metadata_hash = user_metadata_hash(user_meta.as_ref());
         let authz_revision = self.latest_authz_revision(tenant_id).await?;
+        crate::emit_test_timing(
+            "persistence.create_object latest_authz_revision",
+            step_start.elapsed(),
+        );
         let record_hash = object_version_record_hash(ObjectVersionRecordHashInput {
             tenant_id,
             bucket_id,
@@ -2565,6 +2625,7 @@ impl Persistence {
             authz_revision,
             delete_marker: false,
         });
+        let step_start = std::time::Instant::now();
         let object = Object {
             id: metadata_journal::next_object_id(
                 &self.storage,
@@ -2594,9 +2655,19 @@ impl Persistence {
             checksum: None,
             link: None,
         };
+        crate::emit_test_timing(
+            "persistence.create_object next_object_id",
+            step_start.elapsed(),
+        );
+        let step_start = std::time::Instant::now();
         let permit = self
             .object_metadata_write_permit(bucket.tenant_id, bucket.id)
             .await?;
+        crate::emit_test_timing(
+            "persistence.create_object object_metadata_write_permit",
+            step_start.elapsed(),
+        );
+        let step_start = std::time::Instant::now();
         metadata_journal::append_object_mutation_with_permit(
             &self.storage,
             &bucket,
@@ -2606,9 +2677,24 @@ impl Persistence {
             &self.partition_owner_signing_key,
         )
         .await?;
+        crate::emit_test_timing(
+            "persistence.create_object append_object_mutation",
+            step_start.elapsed(),
+        );
+        let step_start = std::time::Instant::now();
         self.enqueue_index_builds_for_bucket(&bucket).await?;
+        crate::emit_test_timing(
+            "persistence.create_object enqueue_index_builds_for_bucket",
+            step_start.elapsed(),
+        );
+        let step_start = std::time::Instant::now();
         self.enqueue_object_metadata_compaction_if_due(&bucket)
             .await?;
+        crate::emit_test_timing(
+            "persistence.create_object enqueue_object_metadata_compaction_if_due",
+            step_start.elapsed(),
+        );
+        crate::emit_test_timing("persistence.create_object total", total_start.elapsed());
         Ok(object)
     }
 

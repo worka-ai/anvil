@@ -106,8 +106,11 @@ async fn grant_policy(cluster: &TestCluster, app_name: &str, action: &str, resou
 }
 
 async fn wait_for_completed_index_build(cluster: &TestCluster, timeout: Duration) {
+    let wait_start = std::time::Instant::now();
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut attempts = 0_u64;
     loop {
+        attempts += 1;
         let tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
         assert!(
             !tasks.iter().any(|task| {
@@ -120,6 +123,10 @@ async fn wait_for_completed_index_build(cluster: &TestCluster, timeout: Duration
             task.task_type == anvil::tasks::TaskType::IndexBuild
                 && task.status == anvil::tasks::TaskStatus::Completed
         }) {
+            emit_test_timing(
+                format!("wait_for_completed_index_build attempts={attempts}"),
+                wait_start.elapsed(),
+            );
             return;
         }
         assert!(

@@ -37,6 +37,16 @@ async fn acquire_test_cluster_permit() -> OwnedSemaphorePermit {
         .expect("test cluster semaphore is not closed")
 }
 
+pub fn test_timing_enabled() -> bool {
+    std::env::var_os("ANVIL_TEST_TIMINGS").is_some()
+}
+
+pub fn emit_test_timing(label: impl AsRef<str>, elapsed: Duration) {
+    if test_timing_enabled() {
+        eprintln!("[timing] {}={elapsed:?}", label.as_ref());
+    }
+}
+
 #[allow(dead_code)]
 pub async fn get_auth_token(_admin_state_path: &str, grpc_addr: &str) -> String {
     let grpc_url = if grpc_addr.ends_with("/grpc") {
@@ -220,6 +230,10 @@ impl TestCluster {
         timeout: Duration,
         get_new_token: bool,
     ) {
+        let total_start = Instant::now();
+        let node_count = self.states.len();
+
+        let swarms_start = Instant::now();
         let mut swarms = Vec::new();
         for state in &self.states {
             swarms.push(
@@ -228,7 +242,12 @@ impl TestCluster {
                     .unwrap(),
             );
         }
+        emit_test_timing(
+            format!("start_and_converge swarm_create nodes={node_count}"),
+            swarms_start.elapsed(),
+        );
 
+        let swarm_listen_start = Instant::now();
         let mut listen_addrs = Vec::new();
         for swarm in &mut swarms {
             let address = loop {
@@ -242,7 +261,12 @@ impl TestCluster {
             };
             listen_addrs.push(address);
         }
+        emit_test_timing(
+            format!("start_and_converge swarm_listen nodes={node_count}"),
+            swarm_listen_start.elapsed(),
+        );
 
+        let swarm_dial_start = Instant::now();
         for i in 0..swarms.len() {
             for (j, addr) in listen_addrs.iter().enumerate() {
                 if i != j {
@@ -250,7 +274,12 @@ impl TestCluster {
                 }
             }
         }
+        emit_test_timing(
+            format!("start_and_converge swarm_dial nodes={node_count}"),
+            swarm_dial_start.elapsed(),
+        );
 
+        let node_spawn_start = Instant::now();
         for i in 0..self.states.len() {
             let mut state = self.states[i].clone();
             let swarm = swarms.remove(0);
@@ -280,13 +309,22 @@ impl TestCluster {
             });
             self.nodes.push(handle);
         }
+        emit_test_timing(
+            format!("start_and_converge node_spawn nodes={node_count}"),
+            node_spawn_start.elapsed(),
+        );
 
+        let token_start = Instant::now();
         if get_new_token {
             self.token = self.states[0]
                 .jwt_manager
                 .mint_token("test-app".to_string(), vec!["*|*".to_string()], 1)
                 .unwrap();
         }
+        emit_test_timing(
+            format!("start_and_converge token nodes={node_count}"),
+            token_start.elapsed(),
+        );
 
         let start = Instant::now();
         while start.elapsed() < timeout {
@@ -300,6 +338,11 @@ impl TestCluster {
                 }
             }
             if all_converged {
+                emit_test_timing(
+                    format!("start_and_converge convergence_poll nodes={node_count}"),
+                    start.elapsed(),
+                );
+                let port_start = Instant::now();
                 for addr_str in &self.grpc_addrs {
                     let addr: SocketAddr = addr_str.replace("http://", "").parse().unwrap();
                     if !wait_for_port(addr, Duration::from_secs(5)).await {
@@ -312,7 +355,20 @@ impl TestCluster {
                         panic!("admin gRPC port {} did not open in time", addr);
                     }
                 }
+                emit_test_timing(
+                    format!("start_and_converge port_ready nodes={node_count}"),
+                    port_start.elapsed(),
+                );
+                let stabilization_start = Instant::now();
                 tokio::time::sleep(Duration::from_secs(3)).await;
+                emit_test_timing(
+                    format!("start_and_converge stabilization_sleep nodes={node_count}"),
+                    stabilization_start.elapsed(),
+                );
+                emit_test_timing(
+                    format!("start_and_converge total nodes={node_count}"),
+                    total_start.elapsed(),
+                );
                 return;
             }
         }

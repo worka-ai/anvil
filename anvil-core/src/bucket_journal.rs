@@ -74,16 +74,28 @@ pub(crate) async fn append_bucket_mutation_with_permits(
     global_permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
+    let total_start = std::time::Instant::now();
     let tenant_scope = BucketJournalScope::Tenant(bucket.tenant_id);
     let global_scope = BucketJournalScope::Global;
     require_bucket_scope_permit(tenant_scope, tenant_permit)?;
     require_bucket_scope_permit(global_scope, global_permit)?;
+    let step_start = std::time::Instant::now();
     let tenant_precondition =
         partition_write_ref_precondition(storage, tenant_permit, partition_owner_signing_key)
             .await?;
+    crate::emit_test_timing(
+        "bucket_journal.append_bucket_mutation tenant_precondition",
+        step_start.elapsed(),
+    );
+    let step_start = std::time::Instant::now();
     let global_precondition =
         partition_write_ref_precondition(storage, global_permit, partition_owner_signing_key)
             .await?;
+    crate::emit_test_timing(
+        "bucket_journal.append_bucket_mutation global_precondition",
+        step_start.elapsed(),
+    );
+    let step_start = std::time::Instant::now();
     append_bucket_mutation_to_stream(
         storage,
         bucket,
@@ -93,6 +105,11 @@ pub(crate) async fn append_bucket_mutation_with_permits(
         Some(tenant_precondition),
     )
     .await?;
+    crate::emit_test_timing(
+        "bucket_journal.append_bucket_mutation tenant_append",
+        step_start.elapsed(),
+    );
+    let step_start = std::time::Instant::now();
     append_bucket_mutation_to_stream(
         storage,
         bucket,
@@ -101,7 +118,16 @@ pub(crate) async fn append_bucket_mutation_with_permits(
         global_permit.fence_token,
         Some(global_precondition),
     )
-    .await
+    .await?;
+    crate::emit_test_timing(
+        "bucket_journal.append_bucket_mutation global_append",
+        step_start.elapsed(),
+    );
+    crate::emit_test_timing(
+        "bucket_journal.append_bucket_mutation total",
+        total_start.elapsed(),
+    );
+    Ok(())
 }
 
 pub async fn read_public_bucket_by_name(

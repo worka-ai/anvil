@@ -190,6 +190,7 @@ impl ObjectManager {
             ?scopes,
             "put_object called"
         );
+        let total_start = std::time::Instant::now();
 
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
@@ -211,18 +212,34 @@ impl ObjectManager {
         if !authorized {
             return Err(Status::permission_denied("Permission denied"));
         }
+        let step_start = std::time::Instant::now();
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
+        crate::emit_test_timing(
+            "object_manager.put_object get_tenant_bucket",
+            step_start.elapsed(),
+        );
+        let step_start = std::time::Instant::now();
         let (temp_path, total_bytes, _legacy_hash) = self
             .storage
             .stream_to_temp_file(data_stream)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        crate::emit_test_timing(
+            "object_manager.put_object stream_to_temp_file",
+            step_start.elapsed(),
+        );
+        let step_start = std::time::Instant::now();
         let payload = tokio::fs::read(&temp_path)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         tokio::fs::remove_file(&temp_path)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        crate::emit_test_timing(
+            "object_manager.put_object read_and_remove_temp_file",
+            step_start.elapsed(),
+        );
+        let step_start = std::time::Instant::now();
         let object_ref = self
             .core_store
             .put_blob(PutBlob {
@@ -236,9 +253,14 @@ impl ObjectManager {
             })
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        crate::emit_test_timing(
+            "object_manager.put_object core_store_put_blob",
+            step_start.elapsed(),
+        );
         let content_hash = object_ref.hash.clone();
         let shard_map_json = Some(core_object_ref_to_shard_map(&object_ref));
 
+        let step_start = std::time::Instant::now();
         let object = self
             .persistence
             .create_object(
@@ -255,9 +277,19 @@ impl ObjectManager {
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        crate::emit_test_timing(
+            "object_manager.put_object persistence_create_object",
+            step_start.elapsed(),
+        );
 
+        let step_start = std::time::Instant::now();
         self.publish_object_watch_event(tenant_id, &bucket, &object, "put", false)
             .await?;
+        crate::emit_test_timing(
+            "object_manager.put_object publish_object_watch_event",
+            step_start.elapsed(),
+        );
+        crate::emit_test_timing("object_manager.put_object total", total_start.elapsed());
 
         Ok(object)
     }

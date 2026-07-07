@@ -90,9 +90,12 @@ async fn wait_for_index_build_task_count(
     timeout: Duration,
     expected_completed: usize,
 ) -> Vec<anvil::persistence::TaskRecord> {
+    let wait_start = std::time::Instant::now();
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut attempts = 0_u64;
     let mut tasks = Vec::new();
     while tokio::time::Instant::now() < deadline {
+        attempts += 1;
         tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
         let completed = tasks
             .iter()
@@ -102,6 +105,12 @@ async fn wait_for_index_build_task_count(
             })
             .count();
         if completed >= expected_completed {
+            emit_test_timing(
+                format!(
+                    "wait_for_index_build_task_count expected={expected_completed} attempts={attempts}"
+                ),
+                wait_start.elapsed(),
+            );
             return tasks;
         }
         assert!(
@@ -113,6 +122,12 @@ async fn wait_for_index_build_task_count(
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    emit_test_timing(
+        format!(
+            "wait_for_index_build_task_count timeout expected={expected_completed} attempts={attempts}"
+        ),
+        wait_start.elapsed(),
+    );
     tasks
 }
 
@@ -181,9 +196,12 @@ async fn query_index_until_hits(
     expected_hits: usize,
     timeout: Duration,
 ) -> QueryIndexResponse {
+    let wait_start = std::time::Instant::now();
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut attempts = 0_u64;
     let mut last = None;
     while tokio::time::Instant::now() < deadline {
+        attempts += 1;
         let response = match index_client
             .query_index(authorized(request.clone(), token))
             .await
@@ -196,11 +214,19 @@ async fn query_index_until_hits(
             Err(status) => panic!("query failed while waiting for index: {status:?}"),
         };
         if response.hits.len() == expected_hits && response.is_caught_up {
+            emit_test_timing(
+                format!("query_index_until_hits expected={expected_hits} attempts={attempts}"),
+                wait_start.elapsed(),
+            );
             return response;
         }
         last = Some(response);
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
+    emit_test_timing(
+        format!("query_index_until_hits timeout expected={expected_hits} attempts={attempts}"),
+        wait_start.elapsed(),
+    );
     last.unwrap_or_else(|| panic!("query did not execute before timeout"))
 }
 
@@ -211,9 +237,12 @@ async fn query_spec_until_hits(
     expected_hits: usize,
     timeout: Duration,
 ) -> anvil_api::QuerySpecResponse {
+    let wait_start = std::time::Instant::now();
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut attempts = 0_u64;
     let mut last = None;
     while tokio::time::Instant::now() < deadline {
+        attempts += 1;
         let response = match index_client
             .query_spec(authorized(request.clone(), token))
             .await
@@ -229,11 +258,19 @@ async fn query_spec_until_hits(
             panic!("query spec response omitted result");
         };
         if result.hits.len() == expected_hits && result.is_caught_up {
+            emit_test_timing(
+                format!("query_spec_until_hits expected={expected_hits} attempts={attempts}"),
+                wait_start.elapsed(),
+            );
             return response;
         }
         last = Some(response);
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
+    emit_test_timing(
+        format!("query_spec_until_hits timeout expected={expected_hits} attempts={attempts}"),
+        wait_start.elapsed(),
+    );
     last.unwrap_or_else(|| panic!("query spec did not execute before timeout"))
 }
 

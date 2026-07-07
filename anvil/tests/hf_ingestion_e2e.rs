@@ -1,6 +1,8 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use anvil_test_utils::emit_test_timing;
+
 #[allow(unused)]
 fn run(cmd: &str, args: &[&str]) {
     let status = Command::new(cmd).args(args).status().expect("run");
@@ -42,12 +44,24 @@ fn docker_admin_output(compose_file: &std::path::Path, args: &[&str]) -> std::pr
 #[allow(unused)]
 async fn wait_ready(url: &str, timeout: Duration) {
     let start = Instant::now();
+    let mut attempts = 0_u64;
     loop {
+        attempts += 1;
         if start.elapsed() > timeout {
+            emit_test_timing(
+                format!("docker_wait_ready timeout url={url} attempts={attempts}"),
+                start.elapsed(),
+            );
             panic!("timeout waiting for ready: {}", url);
         }
         match reqwest::get(url).await {
-            Ok(r) if r.status().is_success() => return,
+            Ok(r) if r.status().is_success() => {
+                emit_test_timing(
+                    format!("docker_wait_ready url={url} attempts={attempts}"),
+                    start.elapsed(),
+                );
+                return;
+            }
             _ => tokio::time::sleep(Duration::from_millis(500)).await,
         }
     }
@@ -316,8 +330,14 @@ async fn hf_ingestion_config_json() {
 
     // Poll status
     let start = Instant::now();
+    let mut attempts = 0_u64;
     loop {
+        attempts += 1;
         if start.elapsed() > Duration::from_secs(90) {
+            emit_test_timing(
+                format!("docker_hf_ingestion_status timeout attempts={attempts}"),
+                start.elapsed(),
+            );
             panic!("timeout waiting for ingestion");
         }
         let mut streq = tonic::Request::new(anvil::anvil_api::GetHfIngestionStatusRequest {
@@ -333,9 +353,17 @@ async fn hf_ingestion_config_json() {
             .unwrap()
             .into_inner();
         if status.state == "completed" {
+            emit_test_timing(
+                format!("docker_hf_ingestion_status completed attempts={attempts}"),
+                start.elapsed(),
+            );
             break;
         }
         if status.state == "failed" {
+            emit_test_timing(
+                format!("docker_hf_ingestion_status failed attempts={attempts}"),
+                start.elapsed(),
+            );
             panic!("ingestion failed: {}", status.error);
         }
         tokio::time::sleep(Duration::from_millis(500)).await;

@@ -1,6 +1,8 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use anvil_test_utils::emit_test_timing;
+
 #[allow(dead_code)]
 #[allow(unused)]
 fn run(cmd: &str, args: &[&str]) {
@@ -45,12 +47,24 @@ fn docker_admin_output(compose_file: &std::path::Path, args: &[&str]) -> std::pr
 #[allow(unused)]
 async fn wait_ready(url: &str, timeout: Duration) {
     let start = Instant::now();
+    let mut attempts = 0_u64;
     loop {
+        attempts += 1;
         if start.elapsed() > timeout {
+            emit_test_timing(
+                format!("docker_wait_ready timeout url={url} attempts={attempts}"),
+                start.elapsed(),
+            );
             panic!("timeout waiting for ready: {}", url);
         }
         match reqwest::get(url).await {
-            Ok(resp) if resp.status().is_success() => return,
+            Ok(resp) if resp.status().is_success() => {
+                emit_test_timing(
+                    format!("docker_wait_ready url={url} attempts={attempts}"),
+                    start.elapsed(),
+                );
+                return;
+            }
             _ => tokio::time::sleep(Duration::from_millis(500)).await,
         }
     }

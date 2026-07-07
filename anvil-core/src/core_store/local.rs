@@ -1364,6 +1364,8 @@ impl CoreStore {
         &self,
         batch: CoreMutationBatch,
     ) -> Result<CoreMutationBatchReceipt> {
+        let total_start = std::time::Instant::now();
+        let timing_name = batch.transaction_id.clone();
         validate_logical_id(&batch.transaction_id, "transaction id")?;
         validate_logical_id(&batch.scope_partition, "transaction scope partition")?;
         validate_logical_id(&batch.committed_by_principal, "transaction principal")?;
@@ -1372,8 +1374,19 @@ impl CoreStore {
         }
         validate_batch_partitions(&batch)?;
 
+        let step_start = std::time::Instant::now();
         let _operation_guards = self.acquire_batch_locks(&batch).await?;
+        crate::emit_test_timing(
+            format!("core_store.commit_mutation_batch acquire_batch_locks tx={timing_name}"),
+            step_start.elapsed(),
+        );
+        let step_start = std::time::Instant::now();
         let _guard = self.write_lock.lock().await;
+        crate::emit_test_timing(
+            format!("core_store.commit_mutation_batch write_lock tx={timing_name}"),
+            step_start.elapsed(),
+        );
+        let step_start = std::time::Instant::now();
         if self
             .read_transaction_unlocked(&batch.transaction_id)
             .await?
@@ -1384,13 +1397,23 @@ impl CoreStore {
                 batch.transaction_id
             );
         }
+        crate::emit_test_timing(
+            format!("core_store.commit_mutation_batch read_transaction tx={timing_name}"),
+            step_start.elapsed(),
+        );
+        let step_start = std::time::Instant::now();
         self.validate_mutation_preconditions_unlocked(
             &batch.preconditions,
             &batch.committed_by_principal,
         )
         .await?;
+        crate::emit_test_timing(
+            format!("core_store.commit_mutation_batch validate_preconditions tx={timing_name}"),
+            step_start.elapsed(),
+        );
 
         let mut visible_updates = Vec::with_capacity(batch.operations.len());
+        let step_start = std::time::Instant::now();
         for operation in &batch.operations {
             match operation {
                 CoreMutationOperation::RefUpdate {
@@ -1437,6 +1460,10 @@ impl CoreStore {
                 }
             }
         }
+        crate::emit_test_timing(
+            format!("core_store.commit_mutation_batch operations tx={timing_name}"),
+            step_start.elapsed(),
+        );
 
         let transaction = CoreTransaction {
             schema: CORE_TRANSACTION_SCHEMA.to_string(),
@@ -1456,7 +1483,16 @@ impl CoreStore {
             committed_at: now_rfc3339(),
             committed_by_principal: batch.committed_by_principal.clone(),
         };
+        let step_start = std::time::Instant::now();
         self.write_transaction_unlocked(&transaction).await?;
+        crate::emit_test_timing(
+            format!("core_store.commit_mutation_batch write_transaction tx={timing_name}"),
+            step_start.elapsed(),
+        );
+        crate::emit_test_timing(
+            format!("core_store.commit_mutation_batch total tx={timing_name}"),
+            total_start.elapsed(),
+        );
 
         Ok(CoreMutationBatchReceipt {
             transaction_id: batch.transaction_id,
