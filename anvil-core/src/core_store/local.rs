@@ -63,6 +63,8 @@ const CORE_WAL_EPOCH: u64 = 1;
 const CORE_WAL_MAX_INLINE_PAYLOAD_BYTES: usize = 64 * 1024;
 const CORE_WAL_SOFT_LIMIT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const CORE_WAL_HARD_LIMIT_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+const CORE_WAL_SOFT_LAG_SECONDS: u64 = 60;
+const CORE_WAL_HARD_LAG_SECONDS: u64 = 300;
 const CORE_LANDED_BYTES_SOFT_LIMIT_BYTES: u64 = 2 * CORE_WAL_SOFT_LIMIT_BYTES;
 const CORE_LANDED_BYTES_HARD_LIMIT_BYTES: u64 = 3 * CORE_WAL_SOFT_LIMIT_BYTES;
 const CORE_WAL_SOFT_BACKPRESSURE_DELAY: Duration = Duration::from_millis(1);
@@ -71,6 +73,8 @@ const CORE_STREAM_SEGMENT_HEADER_SCHEMA: &str = "anvil.core.stream_segment_heade
 const CORE_STREAM_RECORD_HEADER_SCHEMA: &str = "anvil.core.stream_record_header.v1";
 const CORE_STREAM_SEGMENT_TRAILER_SCHEMA: &str = "anvil.core.stream_segment_trailer.v1";
 const CORE_WAL_RECORD_SCHEMA: &str = "anvil.core.wal_record.v1";
+const CORE_WAL_FINALISATION_SCHEMA: &str = "anvil.core.wal_finalisation.v1";
+const CORE_WAL_FINALISATION_RECORD_KIND: &str = "core_wal.finalisation";
 const CORE_TRANSACTION_STREAM_ID: &str = "core_transactions";
 const CORE_TRANSACTION_PARTITION_ID: &str = "core-control";
 const CORE_TRANSACTION_RECORD_KIND: &str = "core_transaction";
@@ -81,6 +85,8 @@ type HmacSha256 = Hmac<Sha256>;
 struct CoreAdmissionCapacityLimits {
     wal_soft_limit_bytes: u64,
     wal_hard_limit_bytes: u64,
+    wal_soft_lag_seconds: u64,
+    wal_hard_lag_seconds: u64,
     landed_bytes_soft_limit_bytes: u64,
     landed_bytes_hard_limit_bytes: u64,
 }
@@ -90,6 +96,8 @@ impl CoreAdmissionCapacityLimits {
         Self {
             wal_soft_limit_bytes: CORE_WAL_SOFT_LIMIT_BYTES,
             wal_hard_limit_bytes: CORE_WAL_HARD_LIMIT_BYTES,
+            wal_soft_lag_seconds: CORE_WAL_SOFT_LAG_SECONDS,
+            wal_hard_lag_seconds: CORE_WAL_HARD_LAG_SECONDS,
             landed_bytes_soft_limit_bytes: CORE_LANDED_BYTES_SOFT_LIMIT_BYTES,
             landed_bytes_hard_limit_bytes: CORE_LANDED_BYTES_HARD_LIMIT_BYTES,
         }
@@ -188,6 +196,34 @@ struct CoreWalAdmissionRecord {
     created_at_unix_nanos: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CoreWalFinalisationRecord {
+    schema: String,
+    node_id: String,
+    wal_epoch: u64,
+    wal_sequence: u64,
+    mutation_id: String,
+    state: String,
+    finalised_at_unix_nanos: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CoreWalRecordKey {
+    node_id: String,
+    wal_epoch: u64,
+    wal_sequence: u64,
+}
+
+impl From<&CoreWalAdmissionRecord> for CoreWalRecordKey {
+    fn from(record: &CoreWalAdmissionRecord) -> Self {
+        Self {
+            node_id: record.node_id.clone(),
+            wal_epoch: record.wal_epoch,
+            wal_sequence: record.sequence,
+        }
+    }
+}
+
 enum CoreWalPayload<'a> {
     Empty,
     Inline(&'a [u8]),
@@ -272,7 +308,7 @@ impl CoreStore {
         let _perf_guard = crate::perf::guard("anvil_core_store_op", &[("operation", "put_blob")]);
         self.ensure_layout().await?;
         validate_logical_id(&input.logical_name, "blob logical name")?;
-        let landed = self
+        let admission = self
             .admit_core_mutation(
                 "object.put",
                 "object_blob",
@@ -284,11 +320,11 @@ impl CoreStore {
                 None,
                 CoreWalPayload::Landed(&input.bytes),
             )
-            .await?
-            .landed_bytes
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("CoreStore put_blob admission did not produce landed bytes"))?;
+            .await?;
+        let landed =
+            admission.landed_bytes.first().cloned().ok_or_else(|| {
+                anyhow!("CoreStore put_blob admission did not produce landed bytes")
+            })?;
         let materialised_bytes = self.read_landed_bytes(&landed).await?;
         let hash = strip_sha256_prefix(&landed.sha256)?.to_string();
         let shards = encode_erasure_shards(&materialised_bytes)?;
@@ -302,6 +338,8 @@ impl CoreStore {
             }
             write_file_atomic(&shard_path, shard).await?;
         }
+        self.mark_core_wal_finalised_unlocked(&admission, "committed")
+            .await?;
 
         Ok(CoreObjectRef {
             hash: format!("sha256:{hash}"),
@@ -448,23 +486,27 @@ impl CoreStore {
         } else {
             CoreWalPayload::Landed(&input.payload)
         };
-        self.admit_core_mutation(
-            "stream.append",
-            "stream",
-            serde_json::json!({
-                "stream_id": input.stream_id.clone(),
-                "partition_id": input.partition_id.clone(),
-                "record_kind": input.record_kind.clone(),
-            }),
-            input
-                .transaction_id
-                .clone()
-                .unwrap_or_else(|| format!("stream-append:{}", uuid::Uuid::new_v4())),
-            input.idempotency_key.clone(),
-            wal_payload,
-        )
-        .await?;
-        self.append_stream_unlocked(input).await
+        let admission = self
+            .admit_core_mutation(
+                "stream.append",
+                "stream",
+                serde_json::json!({
+                    "stream_id": input.stream_id.clone(),
+                    "partition_id": input.partition_id.clone(),
+                    "record_kind": input.record_kind.clone(),
+                }),
+                input
+                    .transaction_id
+                    .clone()
+                    .unwrap_or_else(|| format!("stream-append:{}", uuid::Uuid::new_v4())),
+                input.idempotency_key.clone(),
+                wal_payload,
+            )
+            .await?;
+        let receipt = self.append_stream_unlocked(input).await?;
+        self.mark_core_wal_finalised_unlocked(&admission, "committed")
+            .await?;
+        Ok(receipt)
     }
 
     pub(crate) async fn read_raw_stream(&self, stream_id: &str) -> Result<Vec<StreamRecord>> {
@@ -1342,8 +1384,21 @@ impl CoreStore {
             );
         }
 
+        let wal_lag_seconds = self.admission_materialisation_lag_seconds().await?;
+        if let Some(lag_seconds) = wal_lag_seconds
+            && lag_seconds > limits.wal_hard_lag_seconds
+        {
+            bail!(
+                "{}: CoreStore WAL materialisation lag hard limit exceeded: lag_seconds={}, hard={}",
+                AnvilErrorCode::ResourceExhaustedWalBacklog.as_str(),
+                lag_seconds,
+                limits.wal_hard_lag_seconds
+            );
+        }
+
         if projected_wal_bytes > limits.wal_soft_limit_bytes
             || projected_landed_bytes > limits.landed_bytes_soft_limit_bytes
+            || wal_lag_seconds.is_some_and(|lag_seconds| lag_seconds > limits.wal_soft_lag_seconds)
         {
             tokio::time::sleep(CORE_WAL_SOFT_BACKPRESSURE_DELAY).await;
         }
@@ -1371,6 +1426,98 @@ impl CoreStore {
                     self.admission_landed_bytes_root().display()
                 )
             })
+    }
+
+    async fn admission_materialisation_lag_seconds(&self) -> Result<Option<u64>> {
+        let records = self.read_core_wal_records().await?;
+        if records.is_empty() {
+            return Ok(None);
+        }
+
+        let finalised = self.read_core_wal_finalisation_keys().await?;
+        let oldest_unfinalised = records
+            .iter()
+            .filter(|record| !finalised.contains(&CoreWalRecordKey::from(*record)))
+            .map(|record| record.created_at_unix_nanos)
+            .min();
+
+        let Some(oldest_unfinalised) = oldest_unfinalised else {
+            return Ok(None);
+        };
+
+        let now = unix_timestamp_nanos();
+        let lag_nanos = now.saturating_sub(oldest_unfinalised);
+        Ok(Some(lag_nanos / 1_000_000_000))
+    }
+
+    async fn read_core_wal_records(&self) -> Result<Vec<CoreWalAdmissionRecord>> {
+        let path = self.active_wal_path();
+        let bytes = match fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+        };
+        decode_wal_records(&bytes).map(|records| {
+            records
+                .into_iter()
+                .map(|(record, _payload)| record)
+                .collect()
+        })
+    }
+
+    async fn read_core_wal_finalisation_keys(&self) -> Result<BTreeSet<CoreWalRecordKey>> {
+        let mut keys = BTreeSet::new();
+        for record in self
+            .read_all_stream_records(CORE_TRANSACTION_STREAM_ID)
+            .await?
+        {
+            if record.record_kind != CORE_WAL_FINALISATION_RECORD_KIND {
+                continue;
+            }
+            let finalisation: CoreWalFinalisationRecord = serde_json::from_slice(&record.payload)?;
+            if finalisation.schema != CORE_WAL_FINALISATION_SCHEMA {
+                bail!("CoreStore WAL finalisation record has invalid schema");
+            }
+            keys.insert(CoreWalRecordKey {
+                node_id: finalisation.node_id,
+                wal_epoch: finalisation.wal_epoch,
+                wal_sequence: finalisation.wal_sequence,
+            });
+        }
+        Ok(keys)
+    }
+
+    async fn mark_core_wal_finalised_unlocked(
+        &self,
+        admission: &CoreWalAdmissionRecord,
+        state: &str,
+    ) -> Result<()> {
+        let finalisation = CoreWalFinalisationRecord {
+            schema: CORE_WAL_FINALISATION_SCHEMA.to_string(),
+            node_id: admission.node_id.clone(),
+            wal_epoch: admission.wal_epoch,
+            wal_sequence: admission.sequence,
+            mutation_id: admission.mutation_id.clone(),
+            state: state.to_string(),
+            finalised_at_unix_nanos: unix_timestamp_nanos(),
+        };
+        self.append_stream_unlocked(AppendStreamRecord {
+            stream_id: CORE_TRANSACTION_STREAM_ID.to_string(),
+            partition_id: CORE_TRANSACTION_PARTITION_ID.to_string(),
+            record_kind: CORE_WAL_FINALISATION_RECORD_KIND.to_string(),
+            payload: serde_json::to_vec(&finalisation)?,
+            fence: None,
+            transaction_id: None,
+            idempotency_key: Some(format!(
+                "{}:{}:{}:{}",
+                CORE_WAL_FINALISATION_RECORD_KIND,
+                admission.node_id,
+                admission.wal_epoch,
+                admission.sequence
+            )),
+        })
+        .await?;
+        Ok(())
     }
 
     async fn read_landed_bytes(&self, landed: &CoreWalLandedByte) -> Result<Vec<u8>> {
@@ -1545,24 +1692,25 @@ impl CoreStore {
         if let Some(cursor) = source_watch_cursor.as_deref() {
             self.validate_source_watch_cursor_unlocked(cursor).await?;
         }
-        self.admit_core_mutation(
-            "ref.compare_and_swap",
-            "core-control",
-            serde_json::json!({
-                "ref_name": ref_name.clone(),
-                "new_target": new_target.clone(),
-                "expected_generation": expected_generation,
-                "expected_target": expected_target.clone(),
-                "require_absent": require_absent,
-                "require_present": require_present,
-            }),
-            transaction_id
-                .clone()
-                .unwrap_or_else(|| format!("ref-cas:{ref_name}:{}", uuid::Uuid::new_v4())),
-            None,
-            CoreWalPayload::Empty,
-        )
-        .await?;
+        let admission = self
+            .admit_core_mutation(
+                "ref.compare_and_swap",
+                "core-control",
+                serde_json::json!({
+                    "ref_name": ref_name.clone(),
+                    "new_target": new_target.clone(),
+                    "expected_generation": expected_generation,
+                    "expected_target": expected_target.clone(),
+                    "require_absent": require_absent,
+                    "require_present": require_present,
+                }),
+                transaction_id
+                    .clone()
+                    .unwrap_or_else(|| format!("ref-cas:{ref_name}:{}", uuid::Uuid::new_v4())),
+                None,
+                CoreWalPayload::Empty,
+            )
+            .await?;
 
         let latest_stream_generation = if current.is_none() {
             self.latest_ref_update_generation(&input.ref_name).await?
@@ -1601,6 +1749,8 @@ impl CoreStore {
             committed_at,
         };
         self.append_ref_update_unlocked(&update).await?;
+        self.mark_core_wal_finalised_unlocked(&admission, "committed")
+            .await?;
         Ok(CasRefReceipt {
             ref_name: input.ref_name,
             generation: next_generation,
@@ -1645,20 +1795,21 @@ impl CoreStore {
         }
         if current.is_some() {
             let previous = current.as_ref().expect("current checked above");
-            self.admit_core_mutation(
-                "ref.delete",
-                "core-control",
-                serde_json::json!({
-                    "ref_name": ref_name,
-                    "expected_generation": expected_generation,
-                    "expected_target": expected_target,
-                    "require_present": require_present,
-                }),
-                format!("core-ref-delete:{ref_name}:{}", previous.generation),
-                None,
-                CoreWalPayload::Empty,
-            )
-            .await?;
+            let admission = self
+                .admit_core_mutation(
+                    "ref.delete",
+                    "core-control",
+                    serde_json::json!({
+                        "ref_name": ref_name,
+                        "expected_generation": expected_generation,
+                        "expected_target": expected_target,
+                        "require_present": require_present,
+                    }),
+                    format!("core-ref-delete:{ref_name}:{}", previous.generation),
+                    None,
+                    CoreWalPayload::Empty,
+                )
+                .await?;
             let update = CoreRefUpdateRecord {
                 schema: CORE_REF_UPDATE_SCHEMA.to_string(),
                 ref_name: ref_name.to_string(),
@@ -1680,6 +1831,8 @@ impl CoreStore {
                 committed_at: now_rfc3339(),
             };
             self.append_ref_update_unlocked(&update).await?;
+            self.mark_core_wal_finalised_unlocked(&admission, "committed")
+                .await?;
         }
         Ok(current)
     }
@@ -1838,19 +1991,20 @@ impl CoreStore {
         } else {
             CoreWalPayload::Landed(&batch_payload)
         };
-        self.admit_core_mutation(
-            "mutation.batch",
-            "core-control",
-            serde_json::json!({
-                "transaction_id": batch.transaction_id.clone(),
-                "scope_partition": batch.scope_partition.clone(),
-                "operation_count": batch.operations.len(),
-            }),
-            batch.transaction_id.clone(),
-            Some(batch.transaction_id.clone()),
-            wal_payload,
-        )
-        .await?;
+        let admission = self
+            .admit_core_mutation(
+                "mutation.batch",
+                "core-control",
+                serde_json::json!({
+                    "transaction_id": batch.transaction_id.clone(),
+                    "scope_partition": batch.scope_partition.clone(),
+                    "operation_count": batch.operations.len(),
+                }),
+                batch.transaction_id.clone(),
+                Some(batch.transaction_id.clone()),
+                wal_payload,
+            )
+            .await?;
 
         let mut visible_updates = Vec::with_capacity(batch.operations.len());
         let step_start = std::time::Instant::now();
@@ -1940,6 +2094,11 @@ impl CoreStore {
         };
         let step_start = std::time::Instant::now();
         self.write_transaction_unlocked(&transaction).await?;
+        self.mark_core_wal_finalised_unlocked(
+            &admission,
+            core_transaction_state_name(transaction_state),
+        )
+        .await?;
         crate::emit_test_timing(
             format!("core_store.commit_mutation_batch write_transaction tx={timing_name}"),
             step_start.elapsed(),
@@ -2667,6 +2826,15 @@ fn receipt_from_transaction(transaction: &CoreTransaction) -> CoreMutationBatchR
             Vec::new()
         },
         finalisation_error: transaction.finalisation_error.clone(),
+    }
+}
+
+fn core_transaction_state_name(state: CoreTransactionState) -> &'static str {
+    match state {
+        CoreTransactionState::Prepared => "prepared",
+        CoreTransactionState::Committed => "committed",
+        CoreTransactionState::FinalisationFailed => "finalisation_failed",
+        CoreTransactionState::Aborted => "aborted",
     }
 }
 
@@ -3677,6 +3845,40 @@ async fn sum_files_with_extension(root: &PathBuf, extensions: &[&str]) -> Result
 mod tests {
     use super::*;
 
+    fn test_wal_record(
+        mutation_id: &str,
+        created_at_unix_nanos: u64,
+        sequence: u64,
+    ) -> CoreWalAdmissionRecord {
+        CoreWalAdmissionRecord {
+            schema: CORE_WAL_RECORD_SCHEMA.to_string(),
+            node_id: CORE_WAL_NODE_ID.to_string(),
+            wal_epoch: CORE_WAL_EPOCH,
+            sequence,
+            mutation_id: mutation_id.to_string(),
+            idempotency_key_hash: None,
+            anvil_storage_tenant_id: "local".to_string(),
+            authz_scope: serde_json::json!({"realm_id":"system","revision":null}),
+            operation_family: "test.operation".to_string(),
+            writer_family: "test_writer".to_string(),
+            target: serde_json::json!({"target":"test"}),
+            preconditions: serde_json::json!([]),
+            boundary_values: Vec::new(),
+            landed_bytes: Vec::new(),
+            created_at_unix_nanos,
+        }
+    }
+
+    async fn write_test_wal_records(store: &CoreStore, records: Vec<CoreWalAdmissionRecord>) {
+        fs::create_dir_all(store.admission_wal_dir()).await.unwrap();
+        let mut bytes = encode_wal_file_header(CORE_WAL_NODE_ID, CORE_WAL_EPOCH, 1).unwrap();
+        for record in records {
+            let header = serde_json::to_vec(&record).unwrap();
+            bytes.extend_from_slice(&encode_wal_frame(&header, &[]).unwrap());
+        }
+        fs::write(store.active_wal_path(), bytes).await.unwrap();
+    }
+
     #[tokio::test]
     async fn core_store_put_get_blob_verifies_hash() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3726,6 +3928,8 @@ mod tests {
                 CoreAdmissionCapacityLimits {
                     wal_soft_limit_bytes: 32,
                     wal_hard_limit_bytes: 40,
+                    wal_soft_lag_seconds: 60,
+                    wal_hard_lag_seconds: 300,
                     landed_bytes_soft_limit_bytes: 1024,
                     landed_bytes_hard_limit_bytes: 2048,
                 },
@@ -3760,6 +3964,8 @@ mod tests {
                 CoreAdmissionCapacityLimits {
                     wal_soft_limit_bytes: 1024,
                     wal_hard_limit_bytes: 2048,
+                    wal_soft_lag_seconds: 60,
+                    wal_hard_lag_seconds: 300,
                     landed_bytes_soft_limit_bytes: 96,
                     landed_bytes_hard_limit_bytes: 100,
                 },
@@ -3771,6 +3977,76 @@ mod tests {
             err.to_string()
                 .contains(AnvilErrorCode::ResourceExhaustedWalBacklog.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn core_store_admission_rejects_when_wal_materialisation_lag_is_too_old() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        write_test_wal_records(
+            &store,
+            vec![test_wal_record(
+                "old-lag-mutation",
+                unix_timestamp_nanos().saturating_sub(301_000_000_000),
+                1,
+            )],
+        )
+        .await;
+
+        let err = store
+            .enforce_admission_capacity_with_limits(
+                0,
+                0,
+                CoreAdmissionCapacityLimits {
+                    wal_soft_limit_bytes: 1024 * 1024,
+                    wal_hard_limit_bytes: 2 * 1024 * 1024,
+                    wal_soft_lag_seconds: 60,
+                    wal_hard_lag_seconds: 300,
+                    landed_bytes_soft_limit_bytes: 1024 * 1024,
+                    landed_bytes_hard_limit_bytes: 2 * 1024 * 1024,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains(AnvilErrorCode::ResourceExhaustedWalBacklog.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn core_store_admission_lag_ignores_finalised_wal_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        let record = test_wal_record(
+            "old-finalised-mutation",
+            unix_timestamp_nanos().saturating_sub(301_000_000_000),
+            1,
+        );
+        write_test_wal_records(&store, vec![record.clone()]).await;
+        store
+            .mark_core_wal_finalised_unlocked(&record, "committed")
+            .await
+            .unwrap();
+
+        store
+            .enforce_admission_capacity_with_limits(
+                0,
+                0,
+                CoreAdmissionCapacityLimits {
+                    wal_soft_limit_bytes: 1024 * 1024,
+                    wal_hard_limit_bytes: 2 * 1024 * 1024,
+                    wal_soft_lag_seconds: 60,
+                    wal_hard_lag_seconds: 300,
+                    landed_bytes_soft_limit_bytes: 1024 * 1024,
+                    landed_bytes_hard_limit_bytes: 2 * 1024 * 1024,
+                },
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
