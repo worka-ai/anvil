@@ -145,9 +145,8 @@ impl From<HomeHeader> for Widget {
                     children: vec![
                         HeaderLink::new("Learn", "/learn/overview/").into(),
                         HeaderLink::new("Tutorials", "/tutorials/overview/").into(),
-                        HeaderLink::new("Developers", "/developers/native-api/").into(),
-                        HeaderLink::new("Operators", "/operators/deployment/").into(),
-                        HeaderLink::new("Reference", "/reference/configuration/").into(),
+                        HeaderLink::new("Operators", "/operators/overview/").into(),
+                        HeaderLink::new("CLIs", "/reference/public-cli/").into(),
                     ],
                     ..Default::default()
                 }
@@ -230,7 +229,7 @@ impl From<HeroSection> for Widget {
                             children: vec![
                                 Cta::new("Start learning", "/learn/overview/", true).into(),
                                 Cta::new("Run the tutorials", "/tutorials/overview/", false).into(),
-                                Cta::new("Deploy Anvil", "/operators/deployment/", false).into(),
+                                Cta::new("Deploy Anvil", "/operators/overview/", false).into(),
                             ],
                             ..Default::default()
                         }
@@ -355,12 +354,12 @@ impl From<CapabilitySection> for Widget {
                 Column {
                     gap: Some(0.0),
                     children: vec![
-                        CapabilityLine::new("Store", "Buckets, keys, versions, checksums, range reads, multipart uploads, append streams, JSON patching, manifest compare-and-swap.", "/tutorials/objects/").into(),
-                        CapabilityLine::new("Find", "Directory indexes, metadata filters, full text search, vector search, hybrid ranking, source indexes, model tensor lookup.", "/tutorials/search/").into(),
+                        CapabilityLine::new("Store", "Buckets, keys, versions, checksums, range reads, multipart uploads, append streams, JSON patching, manifest compare-and-swap.", "/tutorials/buckets-and-objects/").into(),
+                        CapabilityLine::new("Find", "Directory indexes, metadata filters, full text search, vector search, hybrid ranking, source indexes, model tensor lookup.", "/tutorials/hybrid-search/").into(),
                         CapabilityLine::new("Protect", "Token scopes, public access policy, relationship tuples, caveats, permission checks, authz watches, fail-closed internal namespaces.", "/tutorials/authorisation/").into(),
                         CapabilityLine::new("React", "Bucket metadata watches, prefix watches, index definition watches, partition watches, authz watches, source watches, PersonalDB watches.", "/tutorials/watches/").into(),
                         CapabilityLine::new("Sync", "PersonalDB groups, changesets, catch-up, snapshots, projections, row metadata, projection writeback, witness certificates.", "/tutorials/personaldb/").into(),
-                        CapabilityLine::new("Operate", "Index repair, directory repair, authz derived repair, PersonalDB log-chain repair, diagnostics, release smoke tests, package publishing.", "/tutorials/operations/").into(),
+                        CapabilityLine::new("Operate", "Index repair, directory repair, authz derived repair, PersonalDB log-chain repair, diagnostics, release smoke tests, package publishing.", "/tutorials/repair-and-diagnostics/").into(),
                     ],
                     ..Default::default()
                 }
@@ -433,8 +432,8 @@ impl From<AudienceSection> for Widget {
                     children: vec![
                         AudienceLink::new("Learn the model", "Concepts from first principles.", "/learn/overview/").into(),
                         AudienceLink::new("Perform operations", "Rust client tutorials.", "/tutorials/overview/").into(),
-                        AudienceLink::new("Run production", "Deployment and operations.", "/operators/deployment/").into(),
-                        AudienceLink::new("Check exact settings", "Configuration and errors.", "/reference/configuration/").into(),
+                        AudienceLink::new("Run production", "Deployment and operations.", "/operators/overview/").into(),
+                        AudienceLink::new("Use the CLIs", "Public and admin command lines.", "/reference/public-cli/").into(),
                     ],
                     ..Default::default()
                 }
@@ -956,9 +955,8 @@ impl From<SiteFooter> for Widget {
                     children: vec![
                         InlineLink::new("Learn", "/learn/overview/").into(),
                         InlineLink::new("Tutorials", "/tutorials/overview/").into(),
-                        InlineLink::new("Developers", "/developers/native-api/").into(),
-                        InlineLink::new("Operators", "/operators/deployment/").into(),
-                        InlineLink::new("Reference", "/reference/configuration/").into(),
+                        InlineLink::new("Operators", "/operators/overview/").into(),
+                        InlineLink::new("CLIs", "/reference/public-cli/").into(),
                     ],
                     ..Default::default()
                 }

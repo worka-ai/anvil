@@ -48,16 +48,12 @@ title = "Tutorials"
 href = "/tutorials/overview/"
 
 [[site.nav]]
-title = "Developers"
-href = "/developers/native-api/"
-
-[[site.nav]]
 title = "Operators"
-href = "/operators/deployment/"
+href = "/operators/overview/"
 
 [[site.nav]]
 title = "Reference"
-href = "/reference/configuration/"
+href = "/reference/public-cli/"
 
 [[site.nav]]
 title = "Blog"
@@ -76,13 +72,6 @@ path = "/tutorials"
 source = "content/tutorials"
 template = "fission::site::documentation"
 sidebar = "site/tutorial-sidebar.toml"
-
-[[site.routes]]
-kind = "content"
-path = "/developers"
-source = "content/developers"
-template = "fission::site::documentation"
-sidebar = "site/developer-sidebar.toml"
 
 [[site.routes]]
 kind = "content"
