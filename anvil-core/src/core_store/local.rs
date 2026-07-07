@@ -1412,7 +1412,9 @@ impl CoreStore {
                 (bytes.to_vec(), Vec::new())
             }
             CoreWalPayload::Inline(bytes) | CoreWalPayload::Landed(bytes) => {
-                let landed = self.land_core_bytes(bytes, &mutation_id).await?;
+                let landed = self
+                    .land_core_bytes(bytes, &mutation_id, &boundary_values)
+                    .await?;
                 (Vec::new(), vec![landed])
             }
         };
@@ -1503,7 +1505,12 @@ impl CoreStore {
         Ok(record)
     }
 
-    async fn land_core_bytes(&self, bytes: &[u8], mutation_id: &str) -> Result<CoreWalLandedByte> {
+    async fn land_core_bytes(
+        &self,
+        bytes: &[u8],
+        mutation_id: &str,
+        boundary_values: &[CoreBoundaryValue],
+    ) -> Result<CoreWalLandedByte> {
         let hash = sha256_hex(bytes);
         let final_path = self.landed_bytes_path(&hash);
         let landing_id = format!("{mutation_id}:{hash}");
@@ -1573,6 +1580,7 @@ impl CoreStore {
             "sha256": format!("sha256:{hash}"),
             "length": bytes.len() as u64,
             "mutation_id": mutation_id,
+            "boundary_values": boundary_values,
             "created_at_unix_nanos": unix_timestamp_nanos(),
         });
         write_file_atomic(&meta_path, &serde_json::to_vec(&meta)?).await?;
@@ -5262,7 +5270,7 @@ mod tests {
     async fn core_store_wal_records_include_boundary_values() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = Storage::new_at(tmp.path()).await.unwrap();
-        let store = CoreStore::new(storage).await.unwrap();
+        let store = CoreStore::new(storage.clone()).await.unwrap();
         store
             .admit_core_mutation(
                 "object.put",
@@ -5292,6 +5300,18 @@ mod tests {
         assert_eq!(
             wal_records[0].0.boundary_values[0].value,
             "8e4b4477-99d8-4f4b-89db-876d2c7f0c6a"
+        );
+        let landed = wal_records[0].0.landed_bytes.first().unwrap();
+        let meta_path = storage
+            .resolve_relative_storage_path(&landed.relative_path)
+            .unwrap()
+            .with_extension("meta");
+        let meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(meta_path).await.unwrap()).unwrap();
+        assert_eq!(
+            meta.pointer("/boundary_values/0/name")
+                .and_then(serde_json::Value::as_str),
+            Some("customer_tenant")
         );
     }
 
