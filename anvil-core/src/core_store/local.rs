@@ -1763,6 +1763,12 @@ impl CoreStore {
                 .await?;
                 Ok("committed")
             }
+            "mutation.batch" => {
+                let payload = self.core_wal_payload_bytes(record, payload).await?;
+                let batch: CoreMutationBatch = serde_json::from_slice(&payload)?;
+                let receipt = self.recover_admitted_mutation_batch_unlocked(batch).await?;
+                Ok(core_transaction_state_name(receipt.state))
+            }
             "ref.compare_and_swap" => {
                 let ref_name = json_required_string(&record.target, "ref_name")?;
                 let new_target = json_required_string(&record.target, "new_target")?;
@@ -2438,6 +2444,122 @@ impl CoreStore {
             format!("core_store.commit_mutation_batch total tx={timing_name}"),
             total_start.elapsed(),
         );
+
+        Ok(CoreMutationBatchReceipt {
+            transaction_id: batch.transaction_id,
+            scope_partition: batch.scope_partition,
+            state: transaction_state,
+            visible_updates: transaction_visible_updates,
+            finalisation_error,
+        })
+    }
+
+    async fn recover_admitted_mutation_batch_unlocked(
+        &self,
+        batch: CoreMutationBatch,
+    ) -> Result<CoreMutationBatchReceipt> {
+        validate_logical_id(&batch.transaction_id, "transaction id")?;
+        validate_logical_id(&batch.scope_partition, "transaction scope partition")?;
+        validate_logical_id(&batch.committed_by_principal, "transaction principal")?;
+        if batch.operations.is_empty() {
+            bail!("CoreStore mutation batch must include at least one operation");
+        }
+        validate_batch_partitions(&batch)?;
+
+        if let Some(transaction) = self
+            .read_transaction_unlocked(&batch.transaction_id)
+            .await?
+        {
+            return Ok(receipt_from_transaction(&transaction));
+        }
+        self.validate_mutation_preconditions_unlocked(
+            &batch.preconditions,
+            &batch.committed_by_principal,
+        )
+        .await?;
+
+        let mut visible_updates = Vec::with_capacity(batch.operations.len());
+        let mut finalisation_error = None;
+        for operation in &batch.operations {
+            let operation_result = match operation {
+                CoreMutationOperation::RefUpdate {
+                    ref_name,
+                    new_target,
+                    ..
+                } => self
+                    .apply_ref_update_unlocked(
+                        ref_name,
+                        new_target,
+                        Some(batch.transaction_id.clone()),
+                        ref_precondition_for(&batch.preconditions, ref_name),
+                    )
+                    .await
+                    .map(|update| CoreTransactionUpdate::CoreRefUpdate {
+                        ref_name: ref_name.clone(),
+                        new_generation: update.generation,
+                    }),
+                CoreMutationOperation::StreamAppend {
+                    partition_id,
+                    stream_id,
+                    record_kind,
+                    payload,
+                    idempotency_key,
+                } => self
+                    .append_stream_unlocked(AppendStreamRecord {
+                        stream_id: stream_id.clone(),
+                        partition_id: partition_id.clone(),
+                        record_kind: record_kind.clone(),
+                        payload: payload.clone(),
+                        fence: None,
+                        transaction_id: Some(batch.transaction_id.clone()),
+                        idempotency_key: idempotency_key.clone(),
+                    })
+                    .await
+                    .map(|receipt| CoreTransactionUpdate::StreamAppend {
+                        stream_id: stream_id.clone(),
+                        visible_sequence: receipt.sequence,
+                        prepared_record_hash: receipt.event_hash,
+                    }),
+            };
+            match operation_result {
+                Ok(update) => visible_updates.push(update),
+                Err(error) => {
+                    finalisation_error = Some(format!("{error:#}"));
+                    break;
+                }
+            }
+        }
+
+        let transaction_state = if finalisation_error.is_some() {
+            CoreTransactionState::FinalisationFailed
+        } else {
+            CoreTransactionState::Committed
+        };
+        let transaction_visible_updates = if finalisation_error.is_some() {
+            Vec::new()
+        } else {
+            visible_updates.clone()
+        };
+        let transaction = CoreTransaction {
+            schema: CORE_TRANSACTION_SCHEMA.to_string(),
+            transaction_id: batch.transaction_id.clone(),
+            scope_partition: batch.scope_partition.clone(),
+            state: transaction_state,
+            preconditions_hash: format!(
+                "sha256:{}",
+                sha256_hex(&serde_json::to_vec(&batch.preconditions)?)
+            ),
+            operations_hash: format!(
+                "sha256:{}",
+                sha256_hex(&serde_json::to_vec(&batch.operations)?)
+            ),
+            prepared_refs: Vec::new(),
+            visible_updates: transaction_visible_updates.clone(),
+            finalisation_error: finalisation_error.clone(),
+            committed_at: now_rfc3339(),
+            committed_by_principal: batch.committed_by_principal.clone(),
+        };
+        self.write_transaction_unlocked(&transaction).await?;
 
         Ok(CoreMutationBatchReceipt {
             transaction_id: batch.transaction_id,
@@ -4501,6 +4623,87 @@ mod tests {
         assert!(
             decode_wal_records(&wal_bytes).unwrap().is_empty(),
             "startup recovery must checkpoint recovered ref delete WAL records"
+        );
+    }
+
+    #[tokio::test]
+    async fn core_store_recovers_unfinalised_mutation_batch_wal_on_startup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        let batch = CoreMutationBatch {
+            transaction_id: "recover-mutation-batch".to_string(),
+            scope_partition: "tenant:t/bucket:b".to_string(),
+            committed_by_principal: "principal:recovery".to_string(),
+            preconditions: vec![CoreMutationPrecondition::Ref {
+                ref_name: "tenant/t/bucket/b/object/batch-recovered/current".to_string(),
+                expected_generation: None,
+                expected_target: None,
+                require_absent: true,
+                require_present: false,
+                fence: None,
+                authz_revision: None,
+                source_watch_cursor: None,
+            }],
+            operations: vec![
+                CoreMutationOperation::RefUpdate {
+                    partition_id: "tenant:t/bucket:b".to_string(),
+                    ref_name: "tenant/t/bucket/b/object/batch-recovered/current".to_string(),
+                    new_target: "core-object-ref:sha256:cccccccc".to_string(),
+                },
+                CoreMutationOperation::StreamAppend {
+                    partition_id: "tenant:t/bucket:b".to_string(),
+                    stream_id: "object_metadata:t:b:batch-recovered".to_string(),
+                    record_kind: "object.put".to_string(),
+                    payload: br#"{"object":"batch-recovered"}"#.to_vec(),
+                    idempotency_key: Some("batch-recovered-event".to_string()),
+                },
+            ],
+        };
+        store
+            .admit_core_mutation(
+                "mutation.batch",
+                "core-control",
+                serde_json::json!({
+                    "transaction_id": batch.transaction_id.clone(),
+                    "scope_partition": batch.scope_partition.clone(),
+                    "operation_count": batch.operations.len(),
+                }),
+                batch.transaction_id.clone(),
+                Some(batch.transaction_id.clone()),
+                CoreWalPayload::Inline(&serde_json::to_vec(&batch).unwrap()),
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let recovered = CoreStore::new(storage).await.unwrap();
+        let transaction = recovered
+            .read_transaction("recover-mutation-batch")
+            .await
+            .unwrap()
+            .expect("recovered transaction");
+        assert_eq!(transaction.state, CoreTransactionState::Committed);
+        let current = recovered
+            .read_ref("tenant/t/bucket/b/object/batch-recovered/current")
+            .await
+            .unwrap()
+            .expect("recovered batch ref");
+        assert_eq!(current.target, "core-object-ref:sha256:cccccccc");
+        let records = recovered
+            .read_stream(ReadStream {
+                stream_id: "object_metadata:t:b:batch-recovered".to_string(),
+                after_sequence: 0,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].record_kind, "object.put");
+        let wal_bytes = tokio::fs::read(recovered.active_wal_path()).await.unwrap();
+        assert!(
+            decode_wal_records(&wal_bytes).unwrap().is_empty(),
+            "startup recovery must checkpoint recovered mutation batch WAL records"
         );
     }
 
