@@ -793,13 +793,13 @@ mod tests {
     }
 
     fn payload_ref(label: &str, logical_size: u64) -> CoreObjectRef {
-        CoreObjectRef {
-            hash: format!(
+        CoreObjectRef::test_unlocated(
+            format!(
                 "sha256:{}",
                 hex::encode(blake3::hash(label.as_bytes()).as_bytes())
             ),
             logical_size,
-            manifest_ref: format!("manifest:{label}"),
-        }
+            format!("manifest:{label}"),
+        )
     }
 }

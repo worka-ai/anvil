@@ -6918,13 +6918,13 @@ mod tests {
         assert!(authz_fences.iter().all(|fence| *fence > 0));
     }
     fn payload_ref(label: &str, logical_size: u64) -> crate::core_store::CoreObjectRef {
-        crate::core_store::CoreObjectRef {
-            hash: format!(
+        crate::core_store::CoreObjectRef::test_unlocated(
+            format!(
                 "sha256:{}",
                 hex::encode(blake3::hash(label.as_bytes()).as_bytes())
             ),
             logical_size,
-            manifest_ref: format!("manifest:{label}"),
-        }
+            format!("manifest:{label}"),
+        )
     }
 }

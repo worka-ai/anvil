@@ -246,6 +246,46 @@ pub fn core_object_ref_from_logical_file_manifest(
             "core-manifest-sha256:{manifest_hash}:profile:{}",
             manifest.erasure_profile_id
         ),
+        encoding: CoreObjectEncoding {
+            profile_id: manifest.erasure_profile_id.clone(),
+            data_shards: manifest.data_shards as u16,
+            parity_shards: manifest.parity_shards as u16,
+            minimum_read_shards: manifest.data_shards as u16,
+            minimum_write_ack_shards: (manifest.data_shards + manifest.parity_shards) as u16,
+            stripe_size: manifest
+                .blocks
+                .first()
+                .map(|block| {
+                    block
+                        .shard_payload_len
+                        .saturating_mul(manifest.data_shards as u64)
+                })
+                .unwrap_or(logical_size),
+            placement_scope: "region".to_string(),
+            repair_priority: "normal".to_string(),
+            encryption: manifest.encryption.algorithm.clone(),
+        },
+        placements: manifest
+            .blocks
+            .first()
+            .map(|block| {
+                block
+                    .shards
+                    .iter()
+                    .map(|shard| CoreObjectPlacement {
+                        shard_index: shard.shard_index as u16,
+                        node_id: shard.node_id.clone(),
+                        region_id: shard.region_id.clone(),
+                        cell_id: shard.cell_id.clone(),
+                        shard_hash: shard.shard_hash.clone(),
+                        stored_size: shard.stored_length,
+                        generation: shard.generation,
+                        placement_epoch: shard.placement_epoch,
+                        fsync_sequence: shard.fsync_sequence,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -254,6 +294,31 @@ pub struct CoreObjectRef {
     pub hash: String,
     pub logical_size: u64,
     pub manifest_ref: String,
+    pub encoding: CoreObjectEncoding,
+    pub placements: Vec<CoreObjectPlacement>,
+}
+
+#[cfg(test)]
+impl CoreObjectRef {
+    pub fn test_unlocated(hash: String, logical_size: u64, manifest_ref: String) -> Self {
+        Self {
+            hash,
+            logical_size,
+            manifest_ref,
+            encoding: CoreObjectEncoding {
+                profile_id: "ec-4-2".to_string(),
+                data_shards: 4,
+                parity_shards: 2,
+                minimum_read_shards: 4,
+                minimum_write_ack_shards: 6,
+                stripe_size: logical_size,
+                placement_scope: "region".to_string(),
+                repair_priority: "normal".to_string(),
+                encryption: "none".to_string(),
+            },
+            placements: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

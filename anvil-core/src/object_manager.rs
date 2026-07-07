@@ -2199,23 +2199,21 @@ fn validate_multipart_part_number(part_number: i32) -> Result<(), Status> {
 }
 
 fn core_object_ref_to_shard_map(object_ref: &CoreObjectRef) -> JsonValue {
-    serde_json::json!({
-        "schema": "anvil.core.object_ref.v1",
-        "hash": object_ref.hash,
-        "logical_size": object_ref.logical_size,
-        "manifest_ref": object_ref.manifest_ref,
-    })
+    let mut value = serde_json::to_value(object_ref).unwrap_or(JsonValue::Null);
+    if let JsonValue::Object(map) = &mut value {
+        map.insert(
+            "schema".to_string(),
+            JsonValue::String("anvil.core.object_ref.v1".to_string()),
+        );
+    }
+    value
 }
 
 fn core_object_ref_from_shard_map(value: &JsonValue) -> Option<CoreObjectRef> {
     if value.get("schema")?.as_str()? != "anvil.core.object_ref.v1" {
         return None;
     }
-    Some(CoreObjectRef {
-        hash: value.get("hash")?.as_str()?.to_string(),
-        logical_size: value.get("logical_size")?.as_u64()?,
-        manifest_ref: value.get("manifest_ref")?.as_str()?.to_string(),
-    })
+    serde_json::from_value(value.clone()).ok()
 }
 
 fn extract_object_boundary_values(

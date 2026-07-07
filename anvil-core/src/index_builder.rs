@@ -2416,11 +2416,7 @@ fn core_object_ref_from_shard_map(object: &Object) -> Option<CoreObjectRef> {
     if value.get("schema")?.as_str()? != "anvil.core.object_ref.v1" {
         return None;
     }
-    Some(CoreObjectRef {
-        hash: value.get("hash")?.as_str()?.to_string(),
-        logical_size: value.get("logical_size")?.as_u64()?,
-        manifest_ref: value.get("manifest_ref")?.as_str()?.to_string(),
-    })
+    serde_json::from_value(value.clone()).ok()
 }
 
 fn object_authz_label_hash(bucket: &Bucket, object: &Object) -> [u8; 32] {
@@ -2819,11 +2815,11 @@ mod tests {
             stream_id: stream.id,
             record_sequence: 2,
             payload_hash: format!("sha256:{}", hex::encode([4u8; 32])),
-            payload_object_ref: CoreObjectRef {
-                hash: format!("sha256:{}", hex::encode([4u8; 32])),
-                logical_size: 64,
-                manifest_ref: "manifest:event".to_string(),
-            },
+            payload_object_ref: CoreObjectRef::test_unlocated(
+                format!("sha256:{}", hex::encode([4u8; 32])),
+                64,
+                "manifest:event".to_string(),
+            ),
             payload_size: 64,
             content_type: Some("application/json".to_string()),
             user_meta: Some(serde_json::json!({"actor": "alice"})),

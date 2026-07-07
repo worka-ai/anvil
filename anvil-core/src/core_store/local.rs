@@ -28,7 +28,6 @@ const LOCAL_SHARD_FSYNC_SEQUENCE: u64 = 1;
 const LOCAL_DATA_SHARDS: usize = 4;
 #[cfg(test)]
 const LOCAL_PARITY_SHARDS: usize = 2;
-const LOCAL_MAX_SHARDS: usize = 11;
 const LOCAL_NODE_ID_PREFIX: &str = "local-node";
 const LOCAL_CONTROL_REPLICA_COUNT: usize = 5;
 const LOCAL_CONTROL_WRITE_QUORUM: usize = 3;
@@ -446,6 +445,8 @@ impl CoreStore {
         let shards = encode_erasure_shards(materialised_bytes, profile)?;
         let placements = plan_local_shard_placements(profile)?;
         let block_id = local_block_id_for_object_hash(hash);
+        let mut object_placements = Vec::with_capacity(shards.len());
+        let mut stripe_size = 0u64;
 
         for (shard_index, shard) in shards.iter().enumerate() {
             let placement = placements.get(shard_index).ok_or_else(|| {
@@ -479,12 +480,37 @@ impl CoreStore {
                 fs::create_dir_all(parent).await?;
             }
             write_file_atomic(&shard_path, &shard_file).await?;
+            stripe_size =
+                stripe_size.max((shard.len() as u64).saturating_mul(profile.data_shards as u64));
+            object_placements.push(CoreObjectPlacement {
+                shard_index: shard_index as u16,
+                node_id: placement.node_id.clone(),
+                region_id: placement.region_id.clone(),
+                cell_id: placement.cell_id.clone(),
+                shard_hash: format!("sha256:{shard_hash}"),
+                stored_size: shard.len() as u64,
+                generation: 1,
+                placement_epoch: LOCAL_PLACEMENT_EPOCH,
+                fsync_sequence: LOCAL_SHARD_FSYNC_SEQUENCE,
+            });
         }
 
         Ok(CoreObjectRef {
             hash: format!("sha256:{hash}"),
             logical_size: materialised_bytes.len() as u64,
             manifest_ref: encode_manifest_ref_with_profile(hash, profile.id),
+            encoding: CoreObjectEncoding {
+                profile_id: profile.id.to_string(),
+                data_shards: profile.data_shards as u16,
+                parity_shards: profile.parity_shards as u16,
+                minimum_read_shards: profile.minimum_read_shards as u16,
+                minimum_write_ack_shards: profile.minimum_write_ack_shards as u16,
+                stripe_size,
+                placement_scope: "region".to_string(),
+                repair_priority: "normal".to_string(),
+                encryption: "none".to_string(),
+            },
+            placements: object_placements,
         })
     }
 
@@ -3489,98 +3515,50 @@ impl CoreStore {
         object_hash: &str,
         required_indices: Option<&BTreeSet<u16>>,
     ) -> Result<CoreObjectManifest> {
-        let desired_profile =
-            local_erasure_profile(decode_manifest_ref_profile(&object_ref.manifest_ref)?)?;
-        let mut placements_by_profile: BTreeMap<String, Vec<CoreObjectPlacement>> = BTreeMap::new();
-        let mut stripe_size_by_profile: BTreeMap<String, u64> = BTreeMap::new();
-        for node_id in all_local_shard_node_ids() {
-            let prefix = &object_hash[0..2];
-            let dir = self
-                .storage
-                .core_store_replica_path(&node_id)
-                .join("blobs")
-                .join("sha256")
-                .join(prefix)
-                .join(object_hash);
-            let mut entries = match fs::read_dir(&dir).await {
-                Ok(entries) => entries,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => {
-                    return Err(err).with_context(|| {
-                        format!("read CoreStore shard directory {}", dir.display())
-                    });
-                }
-            };
-            while let Some(entry) = entries.next_entry().await? {
-                if is_core_store_temp_entry(&entry.file_name()) {
-                    continue;
-                }
-                let file_type = match entry.file_type().await {
-                    Ok(file_type) => file_type,
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(err) => return Err(err).with_context(|| "read CoreStore shard entry type"),
-                };
-                if !file_type.is_file() {
-                    continue;
-                }
-                let Some(file_name) = entry.file_name().to_str().map(str::to_string) else {
-                    continue;
-                };
-                let Some((shard_index, shard_hash)) = parse_shard_file_name(&file_name) else {
-                    continue;
-                };
-                let expected_block_id = local_block_id_for_object_hash(object_hash);
-                let expected_payload_hash = format!("sha256:{shard_hash}");
-                let decoded = match read_block_shard_file_dynamic(
-                    &entry.path(),
-                    &expected_block_id,
-                    shard_index,
-                    &expected_payload_hash,
-                    "read_manifest_shard_header",
-                )
-                .await
-                {
-                    Ok(payload) => payload,
-                    Err(_) => continue,
-                };
-                if desired_profile.id != decoded.erasure_profile_id {
-                    continue;
-                }
-                let profile = match local_erasure_profile(&decoded.erasure_profile_id) {
-                    Ok(profile) => profile,
-                    Err(_) => continue,
-                };
-                let stripe_size = stripe_size_by_profile
-                    .entry(profile.id.to_string())
-                    .or_default();
-                *stripe_size = (*stripe_size)
-                    .max((decoded.payload.len() as u64).saturating_mul(profile.data_shards as u64));
-                placements_by_profile
-                    .entry(profile.id.to_string())
-                    .or_default()
-                    .push(CoreObjectPlacement {
-                        shard_index,
-                        node_id: node_id.clone(),
-                        region_id: "local".to_string(),
-                        cell_id: local_cell_id_for_shard(profile, usize::from(shard_index)),
-                        shard_hash: format!("sha256:{shard_hash}"),
-                        stored_size: decoded.payload.len() as u64,
-                        generation: 1,
-                        placement_epoch: LOCAL_PLACEMENT_EPOCH,
-                        fsync_sequence: LOCAL_SHARD_FSYNC_SEQUENCE,
-                    });
-            }
-        }
-
-        let (profile, mut placements) = select_reconstructed_profile(
-            desired_profile,
-            placements_by_profile,
-            object_ref,
-            required_indices,
+        let profile = local_erasure_profile_for_counts(
+            decode_manifest_ref_profile(&object_ref.manifest_ref)?,
+            usize::from(object_ref.encoding.data_shards),
+            usize::from(object_ref.encoding.parity_shards),
         )?;
-        let stripe_size = stripe_size_by_profile
-            .remove(profile.id)
-            .unwrap_or_default();
+        if object_ref.encoding.profile_id != profile.id {
+            bail!("CoreStore object ref encoding profile does not match manifest ref");
+        }
+        let mut placements = Vec::new();
+        let mut stripe_size = 0u64;
+        let expected_block_id = local_block_id_for_object_hash(object_hash);
+        for placement in &object_ref.placements {
+            if usize::from(placement.shard_index) >= profile.total_shards() {
+                bail!("CoreStore object ref contains shard index outside profile");
+            }
+            let shard_hash = strip_sha256_prefix(&placement.shard_hash)?;
+            let path = self.shard_path(
+                &placement.node_id,
+                object_hash,
+                placement.shard_index,
+                shard_hash,
+            );
+            let decoded = match read_block_shard_file_dynamic(
+                &path,
+                &expected_block_id,
+                placement.shard_index,
+                &placement.shard_hash,
+                "read_manifest_shard_header",
+            )
+            .await
+            {
+                Ok(payload) => payload,
+                Err(err) if is_not_found_error(&err) => continue,
+                Err(_) => continue,
+            };
+            if decoded.erasure_profile_id != profile.id {
+                continue;
+            }
+            stripe_size = stripe_size
+                .max((decoded.payload.len() as u64).saturating_mul(profile.data_shards as u64));
+            let mut present = placement.clone();
+            present.stored_size = decoded.payload.len() as u64;
+            placements.push(present);
+        }
 
         placements.sort_by_key(|placement| placement.shard_index);
         placements.dedup_by_key(|placement| placement.shard_index);
@@ -3670,14 +3648,7 @@ impl CoreStore {
         if manifest.schema != CORE_OBJECT_MANIFEST_SCHEMA {
             bail!("CoreStore embedded root segment manifest has invalid schema");
         }
-        let object_ref = CoreObjectRef {
-            hash: manifest.object_hash.clone(),
-            logical_size: manifest.logical_size,
-            manifest_ref: encode_manifest_ref_with_profile(
-                strip_sha256_prefix(&manifest.object_hash)?,
-                &manifest.encoding.profile_id,
-            ),
-        };
+        let object_ref = object_ref_from_object_manifest(manifest)?;
         let bytes = self
             .get_blob(GetBlob { object_ref })
             .await
@@ -4213,14 +4184,7 @@ fn logical_file_manifest_from_object_manifest(
 ) -> Result<CoreLogicalFileManifest> {
     validate_manifest_for_object_ref(
         object_manifest,
-        &CoreObjectRef {
-            hash: object_manifest.object_hash.clone(),
-            logical_size: object_manifest.logical_size,
-            manifest_ref: encode_manifest_ref_with_profile(
-                strip_sha256_prefix(&object_manifest.object_hash)?,
-                &object_manifest.encoding.profile_id,
-            ),
-        },
+        &object_ref_from_object_manifest(object_manifest)?,
         strip_sha256_prefix(&object_manifest.object_hash)?,
     )?;
 
@@ -4423,6 +4387,19 @@ fn object_ref_from_logical_file_manifest(
 ) -> Result<CoreObjectRef> {
     validate_logical_file_manifest_shape(manifest)?;
     Ok(core_object_ref_from_logical_file_manifest(manifest))
+}
+
+fn object_ref_from_object_manifest(manifest: &CoreObjectManifest) -> Result<CoreObjectRef> {
+    Ok(CoreObjectRef {
+        hash: manifest.object_hash.clone(),
+        logical_size: manifest.logical_size,
+        manifest_ref: encode_manifest_ref_with_profile(
+            strip_sha256_prefix(&manifest.object_hash)?,
+            &manifest.encoding.profile_id,
+        ),
+        encoding: manifest.encoding.clone(),
+        placements: manifest.placements.clone(),
+    })
 }
 
 fn ensure_range_is_inside_expected_boundary(
@@ -5128,12 +5105,6 @@ fn local_erasure_profile_for_counts(
     Ok(profile)
 }
 
-fn all_local_shard_node_ids() -> Vec<String> {
-    (1..=LOCAL_MAX_SHARDS)
-        .map(|index| format!("{LOCAL_NODE_ID_PREFIX}-{index}"))
-        .collect()
-}
-
 fn plan_local_shard_placements(profile: LocalErasureProfile) -> Result<Vec<LocalShardPlacement>> {
     let placements = (0..profile.total_shards())
         .map(|shard_index| LocalShardPlacement {
@@ -5206,43 +5177,6 @@ fn validate_local_publish_placements(
         _ => bail!("CoreStore unsupported erasure profile {}", profile.id),
     }
     Ok(())
-}
-
-fn select_reconstructed_profile(
-    desired_profile: LocalErasureProfile,
-    mut placements_by_profile: BTreeMap<String, Vec<CoreObjectPlacement>>,
-    object_ref: &CoreObjectRef,
-    required_indices: Option<&BTreeSet<u16>>,
-) -> Result<(LocalErasureProfile, Vec<CoreObjectPlacement>)> {
-    let placements = placements_by_profile
-        .remove(desired_profile.id)
-        .unwrap_or_default();
-    if let Some(required_indices) = required_indices {
-        let present = placements
-            .iter()
-            .map(|placement| placement.shard_index)
-            .collect::<BTreeSet<_>>();
-        let missing = required_indices
-            .difference(&present)
-            .copied()
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            bail!(
-                "CoreStore manifest {} is missing required range shards {:?}",
-                object_ref.manifest_ref,
-                missing
-            );
-        }
-    } else if placements.len() < desired_profile.minimum_read_shards {
-        bail!(
-            "CoreStore manifest {} has only {} shard placements for {}; {} required",
-            object_ref.manifest_ref,
-            placements.len(),
-            desired_profile.id,
-            desired_profile.minimum_read_shards
-        );
-    }
-    Ok((desired_profile, placements))
 }
 
 fn boundary_schema_ref_name(bucket: &str) -> String {
@@ -5440,19 +5374,6 @@ fn validate_boundary_hint(value: &str, allowed: &[&str], label: &str) -> Result<
     } else {
         bail!("CoreStore boundary {label} {value:?} is not supported")
     }
-}
-
-fn parse_shard_file_name(file_name: &str) -> Option<(u16, String)> {
-    let file_name = file_name.strip_prefix("shard-")?;
-    let file_name = file_name.strip_suffix(".bin")?;
-    let (index, hash) = file_name.split_once('-')?;
-    if index.len() != 5 || !index.as_bytes().iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    if hash.len() != 64 || !hash.as_bytes().iter().all(u8::is_ascii_hexdigit) {
-        return None;
-    }
-    Some((index.parse().ok()?, hash.to_string()))
 }
 
 fn validate_logical_id(value: &str, label: &str) -> Result<()> {
@@ -6609,6 +6530,48 @@ mod tests {
         }
     }
 
+    fn test_object_ref_for_payload(bytes: &[u8], profile: LocalErasureProfile) -> CoreObjectRef {
+        let hash = sha256_hex(bytes);
+        let shards = encode_erasure_shards(bytes, profile).unwrap();
+        let placements = plan_local_shard_placements(profile).unwrap();
+        let mut object_placements = Vec::new();
+        let mut stripe_size = 0u64;
+        for (shard_index, shard) in shards.iter().enumerate() {
+            let shard_hash = sha256_hex(shard);
+            let placement = &placements[shard_index];
+            stripe_size =
+                stripe_size.max((shard.len() as u64).saturating_mul(profile.data_shards as u64));
+            object_placements.push(CoreObjectPlacement {
+                shard_index: shard_index as u16,
+                node_id: placement.node_id.clone(),
+                region_id: placement.region_id.clone(),
+                cell_id: placement.cell_id.clone(),
+                shard_hash: format!("sha256:{shard_hash}"),
+                stored_size: shard.len() as u64,
+                generation: 1,
+                placement_epoch: LOCAL_PLACEMENT_EPOCH,
+                fsync_sequence: LOCAL_SHARD_FSYNC_SEQUENCE,
+            });
+        }
+        CoreObjectRef {
+            hash: format!("sha256:{hash}"),
+            logical_size: bytes.len() as u64,
+            manifest_ref: encode_manifest_ref(&hash),
+            encoding: CoreObjectEncoding {
+                profile_id: profile.id.to_string(),
+                data_shards: profile.data_shards as u16,
+                parity_shards: profile.parity_shards as u16,
+                minimum_read_shards: profile.minimum_read_shards as u16,
+                minimum_write_ack_shards: profile.minimum_write_ack_shards as u16,
+                stripe_size,
+                placement_scope: "region".to_string(),
+                repair_priority: "normal".to_string(),
+                encryption: "none".to_string(),
+            },
+            placements: object_placements,
+        }
+    }
+
     async fn write_test_wal_records(store: &CoreStore, records: Vec<CoreWalAdmissionRecord>) {
         fs::create_dir_all(store.admission_wal_dir()).await.unwrap();
         let mut bytes = encode_wal_file_header(CORE_WAL_NODE_ID, CORE_WAL_EPOCH, 1).unwrap();
@@ -7375,7 +7338,6 @@ mod tests {
         let storage = Storage::new_at(tmp.path()).await.unwrap();
         let store = CoreStore::new(storage.clone()).await.unwrap();
         let bytes = b"recover object from wal".to_vec();
-        let hash = sha256_hex(&bytes);
         store
             .admit_core_mutation(
                 "object.put",
@@ -7395,11 +7357,7 @@ mod tests {
         drop(store);
 
         let recovered = CoreStore::new(storage).await.unwrap();
-        let object_ref = CoreObjectRef {
-            hash: format!("sha256:{hash}"),
-            logical_size: bytes.len() as u64,
-            manifest_ref: encode_manifest_ref(&hash),
-        };
+        let object_ref = test_object_ref_for_payload(&bytes, LOCAL_EC_4_2_PROFILE);
         assert_eq!(
             recovered
                 .get_blob(GetBlob {
