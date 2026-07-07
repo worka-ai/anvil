@@ -1,6 +1,9 @@
 use crate::{
     authz_journal::{self, AuthzTupleFilter},
-    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    core_store::{
+        CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
+        WriteLogicalFileRequest,
+    },
     formats::hash32,
     persistence::AuthzTupleRecord,
     storage::Storage,
@@ -296,20 +299,28 @@ pub async fn write_derived_userset_index(
     let ref_name = derived_userset_index_ref_name(index.tenant_id, &index.derived_index_id)?;
     let bytes = serde_json::to_vec_pretty(index)?;
     let store = CoreStore::new(storage.clone()).await?;
+    let current = store.read_ref(&ref_name).await?;
     let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.clone(),
-            bytes,
+        .write_logical_file_ref(WriteLogicalFileRequest {
+            writer_family: "authz".to_string(),
+            generation: current
+                .as_ref()
+                .map(|value| value.generation + 1)
+                .unwrap_or(1),
+            logical_file_id: ref_name.clone(),
+            source: bytes,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!(
                 "authz-derived-userset-index:{}:{}:{}",
                 index.tenant_id, index.derived_index_id, index.generation
             ),
+            region_id: "local".to_string(),
         })
         .await?;
     let new_target = encode_core_object_ref_target(&object_ref)?;
-    let current = store.read_ref(&ref_name).await?;
     store
         .compare_and_swap_ref(CompareAndSwapRef {
             ref_name,

@@ -149,7 +149,7 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
                 "anvil-core/src/authz_realm_schema.rs",
             ],
             required_terms: &["AuthzNamespaceSchemaRecord", "write_authz_namespace_schema"],
-            corestore_terms: &["CoreStore", ".put_blob", ".compare_and_swap_ref"],
+            corestore_terms: &["CoreStore", ".write_logical_file", ".compare_and_swap_ref"],
         },
         DurableFeatureFamily {
             name: "authz_tuple",
@@ -166,7 +166,7 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
             name: "authz_derived_index",
             source_files: &["anvil-core/src/authz_userset_index.rs"],
             required_terms: &["AuthzDerivedUsersetIndex", "write_derived_userset_index"],
-            corestore_terms: &["CoreStore", ".put_blob", ".compare_and_swap_ref"],
+            corestore_terms: &["CoreStore", ".write_logical_file", ".compare_and_swap_ref"],
         },
         DurableFeatureFamily {
             name: "path_index",

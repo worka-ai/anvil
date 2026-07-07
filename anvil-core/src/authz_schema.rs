@@ -1,6 +1,9 @@
 use crate::{
     anvil_api::{AuthzNamespaceSchema, AuthzRelationRule, AuthzRelationSchema},
-    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    core_store::{
+        CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
+        WriteLogicalFileRequest,
+    },
     formats::hash32,
     storage::Storage,
 };
@@ -279,15 +282,23 @@ async fn write_namespace_schema_ref(
     let current = read_namespace_schema_ref_state(storage, &ref_name).await?;
     let store = CoreStore::new(storage.clone()).await?;
     let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.clone(),
-            bytes: serde_json::to_vec_pretty(record)?,
+        .write_logical_file_ref(WriteLogicalFileRequest {
+            writer_family: "authz".to_string(),
+            generation: current
+                .as_ref()
+                .map(|(value, _)| value.generation + 1)
+                .unwrap_or(1),
+            logical_file_id: ref_name.clone(),
+            source: serde_json::to_vec_pretty(record)?,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!(
                 "authz-namespace-schema:{}:{}:{}",
                 record.tenant_id, record.namespace, record.schema_version
             ),
+            region_id: "local".to_string(),
         })
         .await?;
     store

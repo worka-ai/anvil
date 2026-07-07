@@ -1,6 +1,7 @@
 use crate::anvil_api::AuthzNamespaceSchema;
 use crate::core_store::{
-    CompareAndSwapRef, CoreObjectRef, CoreRefValue, CoreStore, GetBlob, PutBlob,
+    CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreRefValue, CoreStore,
+    CoreTraceContext, GetBlob, WriteLogicalFileRequest,
 };
 use crate::formats::hash32;
 use crate::storage::Storage;
@@ -267,12 +268,17 @@ async fn write_json_ref_with_expected<T: Serialize>(
 ) -> Result<()> {
     let store = CoreStore::new(storage.clone()).await?;
     let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.to_string(),
-            bytes: serde_json::to_vec_pretty(value)?,
+        .write_logical_file_ref(WriteLogicalFileRequest {
+            writer_family: "authz".to_string(),
+            generation: expected_ref.map(|value| value.generation + 1).unwrap_or(1),
+            logical_file_id: ref_name.to_string(),
+            source: serde_json::to_vec_pretty(value)?,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!("authz-schema:{}", uuid::Uuid::new_v4().simple()),
+            region_id: "local".to_string(),
         })
         .await?;
     store
