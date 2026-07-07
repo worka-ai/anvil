@@ -108,6 +108,13 @@ struct LocalErasureProfile {
     max_shard_size_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalShardPlacement {
+    node_id: String,
+    region_id: String,
+    cell_id: String,
+}
+
 impl LocalErasureProfile {
     fn total_shards(self) -> usize {
         self.data_shards + self.parity_shards
@@ -436,11 +443,15 @@ impl CoreStore {
             bail!("CoreStore object materialisation hash mismatch");
         }
         let shards = encode_erasure_shards(materialised_bytes, profile)?;
+        let placements = plan_local_shard_placements(profile)?;
 
         for (shard_index, shard) in shards.iter().enumerate() {
-            let node_id = format!("{LOCAL_NODE_ID_PREFIX}-{}", shard_index + 1);
+            let placement = placements.get(shard_index).ok_or_else(|| {
+                anyhow!("CoreStore missing local placement for shard {shard_index}")
+            })?;
             let shard_hash = sha256_hex(shard);
-            let shard_path = self.shard_path(&node_id, hash, shard_index as u16, &shard_hash);
+            let shard_path =
+                self.shard_path(&placement.node_id, hash, shard_index as u16, &shard_hash);
             let logical_offset = shard_index as u64 * shard.len() as u64;
             let shard_file = encode_block_shard_file(
                 BlockShardHeaderInput {
@@ -3503,7 +3514,7 @@ impl CoreStore {
                         shard_index,
                         node_id: node_id.clone(),
                         region_id: "local".to_string(),
-                        cell_id: format!("local-cell-{}", (usize::from(shard_index) % 3) + 1),
+                        cell_id: local_cell_id_for_shard(profile, usize::from(shard_index)),
                         shard_hash: format!("sha256:{shard_hash}"),
                         stored_size: decoded.payload.len() as u64,
                         generation: 1,
@@ -4931,6 +4942,80 @@ fn all_local_shard_node_ids() -> Vec<String> {
     (1..=LOCAL_MAX_SHARDS)
         .map(|index| format!("{LOCAL_NODE_ID_PREFIX}-{index}"))
         .collect()
+}
+
+fn plan_local_shard_placements(profile: LocalErasureProfile) -> Result<Vec<LocalShardPlacement>> {
+    let placements = (0..profile.total_shards())
+        .map(|shard_index| LocalShardPlacement {
+            node_id: format!("{LOCAL_NODE_ID_PREFIX}-{}", shard_index + 1),
+            region_id: "local".to_string(),
+            cell_id: local_cell_id_for_shard(profile, shard_index),
+        })
+        .collect::<Vec<_>>();
+    validate_local_publish_placements(profile, &placements)?;
+    Ok(placements)
+}
+
+fn local_cell_count_for_profile(profile: LocalErasureProfile) -> usize {
+    match profile.id {
+        "ec-8-3" => 4,
+        _ => 3,
+    }
+}
+
+fn local_cell_id_for_shard(profile: LocalErasureProfile, shard_index: usize) -> String {
+    format!(
+        "local-cell-{}",
+        (shard_index % local_cell_count_for_profile(profile)) + 1
+    )
+}
+
+fn validate_local_publish_placements(
+    profile: LocalErasureProfile,
+    placements: &[LocalShardPlacement],
+) -> Result<()> {
+    if placements.len() != profile.total_shards() {
+        bail!(
+            "CoreStore placement for {} expected {} shards, got {}",
+            profile.id,
+            profile.total_shards(),
+            placements.len()
+        );
+    }
+    let unique_nodes = placements
+        .iter()
+        .map(|placement| placement.node_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if unique_nodes.len() != placements.len() {
+        bail!("CoreStore placement must put at most one shard on each node");
+    }
+    let mut cell_counts = BTreeMap::<&str, usize>::new();
+    for placement in placements {
+        *cell_counts.entry(placement.cell_id.as_str()).or_default() += 1;
+    }
+    match profile.id {
+        "ec-4-2" => {
+            if cell_counts.len() < 3 || cell_counts.values().any(|count| *count > 2) {
+                bail!(
+                    "CoreStore ec-4-2 placement requires at least 3 cells and at most 2 shards per cell"
+                );
+            }
+        }
+        "ec-8-3" => {
+            if cell_counts.len() < 4 || cell_counts.values().any(|count| *count > 3) {
+                bail!(
+                    "CoreStore ec-8-3 placement requires at least 4 cells and at most 3 shards per cell"
+                );
+            }
+        }
+        "replicated-3" => {
+            if placements.len() < 3 || unique_nodes.len() < 3 {
+                bail!("CoreStore replicated-3 placement requires at least 3 distinct nodes");
+            }
+        }
+        _ => bail!("CoreStore unsupported erasure profile {}", profile.id),
+    }
+    Ok(())
 }
 
 fn select_reconstructed_profile(
@@ -6610,6 +6695,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn core_store_local_placement_satisfies_profile_failure_domains() {
+        let ec_4_2 = plan_local_shard_placements(LOCAL_EC_4_2_PROFILE).unwrap();
+        assert_eq!(ec_4_2.len(), 6);
+        assert_eq!(
+            cell_counts(&ec_4_2),
+            BTreeMap::from([
+                ("local-cell-1", 2),
+                ("local-cell-2", 2),
+                ("local-cell-3", 2)
+            ])
+        );
+
+        let ec_8_3 = plan_local_shard_placements(LOCAL_EC_8_3_PROFILE).unwrap();
+        assert_eq!(ec_8_3.len(), 11);
+        assert_eq!(
+            cell_counts(&ec_8_3),
+            BTreeMap::from([
+                ("local-cell-1", 3),
+                ("local-cell-2", 3),
+                ("local-cell-3", 3),
+                ("local-cell-4", 2),
+            ])
+        );
+
+        let replicated = plan_local_shard_placements(LOCAL_REPLICATED_3_PROFILE).unwrap();
+        assert_eq!(replicated.len(), 3);
+        assert_eq!(
+            replicated
+                .iter()
+                .map(|placement| placement.node_id.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            3
+        );
+    }
+
+    fn cell_counts(placements: &[LocalShardPlacement]) -> BTreeMap<&str, usize> {
+        let mut counts = BTreeMap::new();
+        for placement in placements {
+            *counts.entry(placement.cell_id.as_str()).or_default() += 1;
+        }
+        counts
     }
 
     fn shard_missing_sets(total_shards: usize, max_missing: usize) -> Vec<Vec<usize>> {
