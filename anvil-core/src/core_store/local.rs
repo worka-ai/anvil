@@ -849,8 +849,13 @@ impl CoreStore {
             return Ok(blocks);
         }
 
-        for (index, chunk) in source.chunks(target_block_size).enumerate() {
-            let logical_offset = (index as u64).saturating_mul(target_block_size as u64);
+        for (index, (start, end)) in
+            logical_block_ranges_for_source(&source, request, target_block_size)
+                .into_iter()
+                .enumerate()
+        {
+            let logical_offset = start as u64;
+            let chunk = &source[start..end];
             let chunk_bytes = chunk.to_vec();
             let chunk_hash = format!("sha256:{}", sha256_hex(&chunk_bytes));
             let object_ref = self
@@ -4778,6 +4783,44 @@ fn effective_target_block_size(policy: &CorePipelinePolicy, profile: LocalErasur
         .min(profile.logical_block_target_bytes)
 }
 
+fn logical_block_ranges_for_source(
+    source: &[u8],
+    request: &WriteLogicalFileRequest,
+    target_block_size: usize,
+) -> Vec<(usize, usize)> {
+    let len = source.len();
+    if len == 0 {
+        return vec![(0, 0)];
+    }
+
+    let mut cuts = BTreeSet::from([0usize, len]);
+    for offset in (target_block_size..len).step_by(target_block_size) {
+        cuts.insert(offset);
+    }
+    for hint in &request.range_hints {
+        if hint.preferred_block_boundary != "required" {
+            continue;
+        }
+        for boundary in [hint.byte_start, hint.byte_end] {
+            if boundary == 0 || boundary >= len as u64 {
+                continue;
+            }
+            if let Ok(boundary) = usize::try_from(boundary) {
+                cuts.insert(boundary);
+            }
+        }
+    }
+
+    let ordered = cuts.into_iter().collect::<Vec<_>>();
+    ordered
+        .windows(2)
+        .filter_map(|window| match window {
+            [start, end] if start < end => Some((*start, *end)),
+            _ => None,
+        })
+        .collect()
+}
+
 fn validate_logical_range_hint(hint: &CoreLogicalRangeHint) -> Result<()> {
     validate_logical_id(&hint.range_id, "logical range id")?;
     validate_logical_id(&hint.writer_record_kind, "logical range writer record kind")?;
@@ -7059,7 +7102,7 @@ mod tests {
                     writer_record_kind: "typed_column_page".to_string(),
                     boundary_values: Vec::new(),
                     writer_statistics: Vec::new(),
-                    preferred_block_boundary: "required".to_string(),
+                    preferred_block_boundary: "preferred".to_string(),
                     boundary_dimension_ids: Vec::new(),
                     prefetch_next_range_ids: Vec::new(),
                     shared_range: None,
@@ -7106,6 +7149,53 @@ mod tests {
             .unwrap();
         assert_eq!(slice, payload[24..72].to_vec());
         store.verify_logical_file_manifest(&manifest).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn core_store_logical_file_pipeline_honours_required_writer_boundaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        let payload = (0..96).map(|value| value as u8).collect::<Vec<_>>();
+        let manifest = store
+            .write_logical_file(WriteLogicalFileRequest {
+                writer_family: "stream".to_string(),
+                generation: 2,
+                logical_file_id: "streams/required-boundary/segment-2".to_string(),
+                source: payload,
+                range_hints: vec![CoreLogicalRangeHint {
+                    range_id: "record-frame-1".to_string(),
+                    byte_start: 24,
+                    byte_end: 72,
+                    writer_record_kind: "record_frame".to_string(),
+                    boundary_values: Vec::new(),
+                    writer_statistics: Vec::new(),
+                    preferred_block_boundary: "required".to_string(),
+                    boundary_dimension_ids: Vec::new(),
+                    prefetch_next_range_ids: Vec::new(),
+                    shared_range: None,
+                }],
+                pipeline_policy: CorePipelinePolicy {
+                    target_block_size: 64,
+                    ..Default::default()
+                },
+                trace_context: CoreTraceContext::default(),
+                boundary_values: Vec::new(),
+                mutation_id: "logical-file-required-boundary-mut-1".to_string(),
+                region_id: "local".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manifest
+                .blocks
+                .iter()
+                .map(|block| (block.logical_offset, block.logical_length))
+                .collect::<Vec<_>>(),
+            vec![(0, 24), (24, 40), (64, 8), (72, 24)]
+        );
+        assert_eq!(manifest.ranges[0].block_ids.len(), 2);
     }
 
     #[tokio::test]
