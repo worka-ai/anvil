@@ -297,6 +297,7 @@ impl CoreStore {
             write_lock: Arc::new(Mutex::new(())),
         };
         store.ensure_layout().await?;
+        store.recover_core_wal().await?;
         Ok(store)
     }
 
@@ -327,24 +328,38 @@ impl CoreStore {
             })?;
         let materialised_bytes = self.read_landed_bytes(&landed).await?;
         let hash = strip_sha256_prefix(&landed.sha256)?.to_string();
-        let shards = encode_erasure_shards(&materialised_bytes)?;
+        let object_ref = self
+            .materialise_object_blob_bytes(&hash, &materialised_bytes)
+            .await?;
+        self.mark_core_wal_finalised_unlocked(&admission, "committed")
+            .await?;
+        Ok(object_ref)
+    }
+
+    async fn materialise_object_blob_bytes(
+        &self,
+        hash: &str,
+        materialised_bytes: &[u8],
+    ) -> Result<CoreObjectRef> {
+        if sha256_hex(materialised_bytes) != hash {
+            bail!("CoreStore object materialisation hash mismatch");
+        }
+        let shards = encode_erasure_shards(materialised_bytes)?;
 
         for (shard_index, shard) in shards.iter().enumerate() {
             let node_id = format!("{LOCAL_NODE_ID_PREFIX}-{}", shard_index + 1);
             let shard_hash = sha256_hex(shard);
-            let shard_path = self.shard_path(&node_id, &hash, shard_index as u16, &shard_hash);
+            let shard_path = self.shard_path(&node_id, hash, shard_index as u16, &shard_hash);
             if let Some(parent) = shard_path.parent() {
                 fs::create_dir_all(parent).await?;
             }
             write_file_atomic(&shard_path, shard).await?;
         }
-        self.mark_core_wal_finalised_unlocked(&admission, "committed")
-            .await?;
 
         Ok(CoreObjectRef {
             hash: format!("sha256:{hash}"),
             logical_size: materialised_bytes.len() as u64,
-            manifest_ref: encode_manifest_ref(&hash),
+            manifest_ref: encode_manifest_ref(hash),
         })
     }
 
@@ -481,6 +496,9 @@ impl CoreStore {
         if let Some(receipt) = self.stream_idempotent_replay_unlocked(&input).await? {
             return Ok(receipt);
         }
+        if let Some(fence) = input.fence.as_ref() {
+            self.validate_fence_precondition_unlocked(fence).await?;
+        }
         let wal_payload = if input.payload.len() <= CORE_WAL_MAX_INLINE_PAYLOAD_BYTES {
             CoreWalPayload::Inline(&input.payload)
         } else {
@@ -494,6 +512,7 @@ impl CoreStore {
                     "stream_id": input.stream_id.clone(),
                     "partition_id": input.partition_id.clone(),
                     "record_kind": input.record_kind.clone(),
+                    "transaction_id": input.transaction_id.clone(),
                 }),
                 input
                     .transaction_id
@@ -532,17 +551,33 @@ impl CoreStore {
         &self,
         input: AppendStreamRecord,
     ) -> Result<StreamAppendReceipt> {
+        let idempotency_key_hash = input
+            .idempotency_key
+            .as_deref()
+            .map(|key| format!("sha256:{}", sha256_hex(key.as_bytes())));
+        self.append_stream_unlocked_with_idempotency_hash(input, idempotency_key_hash)
+            .await
+    }
+
+    async fn append_stream_unlocked_with_idempotency_hash(
+        &self,
+        input: AppendStreamRecord,
+        idempotency_key_hash: Option<String>,
+    ) -> Result<StreamAppendReceipt> {
         if let Some(fence) = input.fence.as_ref() {
             self.validate_fence_precondition_unlocked(fence).await?;
         }
-        if let Some(receipt) = self.stream_idempotent_replay_unlocked(&input).await? {
+        if let Some(receipt) = self
+            .stream_idempotent_replay_by_hash_unlocked(
+                &input.stream_id,
+                &input.payload,
+                idempotency_key_hash.as_deref(),
+            )
+            .await?
+        {
             return Ok(receipt);
         }
         let mut records = self.read_all_stream_records(&input.stream_id).await?;
-        let idempotency_key_hash = match input.idempotency_key.as_deref() {
-            Some(key) => Some(format!("sha256:{}", sha256_hex(key.as_bytes()))),
-            None => None,
-        };
         let payload_hash = format!("sha256:{}", sha256_hex(&input.payload));
 
         let sequence = records
@@ -593,16 +628,33 @@ impl CoreStore {
             return Ok(None);
         };
         let idempotency_key_hash = format!("sha256:{}", sha256_hex(idempotency_key.as_bytes()));
-        let payload_hash = format!("sha256:{}", sha256_hex(&input.payload));
-        let records = self.read_all_stream_records(&input.stream_id).await?;
+        self.stream_idempotent_replay_by_hash_unlocked(
+            &input.stream_id,
+            &input.payload,
+            Some(&idempotency_key_hash),
+        )
+        .await
+    }
+
+    async fn stream_idempotent_replay_by_hash_unlocked(
+        &self,
+        stream_id: &str,
+        payload: &[u8],
+        idempotency_key_hash: Option<&str>,
+    ) -> Result<Option<StreamAppendReceipt>> {
+        let Some(idempotency_key_hash) = idempotency_key_hash else {
+            return Ok(None);
+        };
+        let payload_hash = format!("sha256:{}", sha256_hex(payload));
+        let records = self.read_all_stream_records(stream_id).await?;
         if let Some(existing) = records
             .iter()
-            .find(|record| record.idempotency_key_hash.as_deref() == Some(&idempotency_key_hash))
+            .find(|record| record.idempotency_key_hash.as_deref() == Some(idempotency_key_hash))
         {
             if existing.payload_hash != payload_hash {
                 bail!(
                     "CoreStore stream idempotency conflict for stream {}",
-                    input.stream_id
+                    stream_id
                 );
             }
             return Ok(Some(StreamAppendReceipt {
@@ -1460,18 +1512,26 @@ impl CoreStore {
     }
 
     async fn read_core_wal_records(&self) -> Result<Vec<CoreWalAdmissionRecord>> {
+        self.read_core_wal_records_with_payload()
+            .await
+            .map(|records| {
+                records
+                    .into_iter()
+                    .map(|(record, _payload)| record)
+                    .collect()
+            })
+    }
+
+    async fn read_core_wal_records_with_payload(
+        &self,
+    ) -> Result<Vec<(CoreWalAdmissionRecord, Vec<u8>)>> {
         let path = self.active_wal_path();
         let bytes = match fs::read(&path).await {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
         };
-        decode_wal_records(&bytes).map(|records| {
-            records
-                .into_iter()
-                .map(|(record, _payload)| record)
-                .collect()
-        })
+        decode_wal_records(&bytes)
     }
 
     async fn read_core_wal_finalisation_keys(&self) -> Result<BTreeSet<CoreWalRecordKey>> {
@@ -1633,6 +1693,93 @@ impl CoreStore {
         let actual = format!("sha256:{}", sha256_hex(&bytes));
         if actual != landed.sha256 {
             bail!("CoreStore landed bytes hash mismatch");
+        }
+        Ok(bytes)
+    }
+
+    async fn recover_core_wal(&self) -> Result<()> {
+        let _guard = self.write_lock.lock().await;
+        let records = self.read_core_wal_records_with_payload().await?;
+        if records.is_empty() {
+            return Ok(());
+        }
+        let finalised = self.read_core_wal_finalisation_keys().await?;
+        for (record, payload) in records {
+            if finalised.contains(&CoreWalRecordKey::from(&record)) {
+                continue;
+            }
+            let state = self
+                .replay_core_wal_record_unlocked(&record, &payload)
+                .await
+                .with_context(|| {
+                    format!(
+                        "replay CoreStore WAL mutation {} sequence {}",
+                        record.mutation_id, record.sequence
+                    )
+                })?;
+            self.mark_core_wal_finalised_unlocked(&record, state)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn replay_core_wal_record_unlocked(
+        &self,
+        record: &CoreWalAdmissionRecord,
+        payload: &[u8],
+    ) -> Result<&'static str> {
+        match record.operation_family.as_str() {
+            "object.put" => {
+                let materialised_bytes = self.core_wal_payload_bytes(record, payload).await?;
+                let hash = sha256_hex(&materialised_bytes);
+                if let Some(landed) = record.landed_bytes.first() {
+                    let landed_hash = strip_sha256_prefix(&landed.sha256)?;
+                    if landed_hash != hash {
+                        bail!("CoreStore WAL object.put landed hash mismatch");
+                    }
+                }
+                self.materialise_object_blob_bytes(&hash, &materialised_bytes)
+                    .await?;
+                Ok("committed")
+            }
+            "stream.append" => {
+                let stream_id = json_required_string(&record.target, "stream_id")?;
+                let partition_id = json_required_string(&record.target, "partition_id")?;
+                let record_kind = json_required_string(&record.target, "record_kind")?;
+                let transaction_id = json_optional_string(&record.target, "transaction_id")?;
+                let payload = self.core_wal_payload_bytes(record, payload).await?;
+                self.append_stream_unlocked_with_idempotency_hash(
+                    AppendStreamRecord {
+                        stream_id,
+                        partition_id,
+                        record_kind,
+                        payload,
+                        fence: None,
+                        transaction_id,
+                        idempotency_key: None,
+                    },
+                    record.idempotency_key_hash.clone(),
+                )
+                .await?;
+                Ok("committed")
+            }
+            other => bail!(
+                "CoreStore WAL recovery does not support operation family {other}; refusing startup with unfinalised WAL"
+            ),
+        }
+    }
+
+    async fn core_wal_payload_bytes(
+        &self,
+        record: &CoreWalAdmissionRecord,
+        payload: &[u8],
+    ) -> Result<Vec<u8>> {
+        if !payload.is_empty() {
+            return Ok(payload.to_vec());
+        }
+        let mut bytes = Vec::new();
+        for landed in &record.landed_bytes {
+            bytes.extend_from_slice(&self.read_landed_bytes(landed).await?);
         }
         Ok(bytes)
     }
@@ -3788,6 +3935,22 @@ fn unix_timestamp_nanos() -> u64 {
     u64::try_from(now.as_nanos()).unwrap_or(u64::MAX)
 }
 
+fn json_required_string(value: &serde_json::Value, field: &str) -> Result<String> {
+    value
+        .get(field)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("CoreStore WAL target is missing string field {field}"))
+}
+
+fn json_optional_string(value: &serde_json::Value, field: &str) -> Result<Option<String>> {
+    match value.get(field) {
+        Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
+        Some(serde_json::Value::Null) | None => Ok(None),
+        Some(_) => bail!("CoreStore WAL target field {field} must be a string or null"),
+    }
+}
+
 fn read_exact<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> Result<&'a [u8]> {
     let end = offset
         .checked_add(len)
@@ -4052,6 +4215,102 @@ mod tests {
                 .unwrap()
                 .exists(),
             "large payload bytes must land outside the WAL and be referenced by hash/length"
+        );
+    }
+
+    #[tokio::test]
+    async fn core_store_recovers_unfinalised_put_blob_wal_on_startup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        let bytes = b"recover object from wal".to_vec();
+        let hash = sha256_hex(&bytes);
+        store
+            .admit_core_mutation(
+                "object.put",
+                "object_blob",
+                serde_json::json!({
+                    "logical_name": "tenant:t/bucket:b/object:recovered",
+                    "region_id": "local"
+                }),
+                "recover-object-from-wal".to_string(),
+                None,
+                CoreWalPayload::Landed(&bytes),
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let recovered = CoreStore::new(storage).await.unwrap();
+        let object_ref = CoreObjectRef {
+            hash: format!("sha256:{hash}"),
+            logical_size: bytes.len() as u64,
+            manifest_ref: encode_manifest_ref(&hash),
+        };
+        assert_eq!(
+            recovered
+                .get_blob(GetBlob {
+                    object_ref: object_ref.clone()
+                })
+                .await
+                .unwrap(),
+            bytes
+        );
+        let wal_bytes = tokio::fs::read(recovered.active_wal_path()).await.unwrap();
+        assert!(
+            decode_wal_records(&wal_bytes).unwrap().is_empty(),
+            "startup recovery must checkpoint recovered object WAL records"
+        );
+        assert_eq!(recovered.admission_landed_bytes().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn core_store_recovers_unfinalised_stream_append_wal_on_startup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        let payload = br#"{"event":"recover"}"#.to_vec();
+        let idempotency_key = "recover-stream-idempotency";
+        store
+            .admit_core_mutation(
+                "stream.append",
+                "stream",
+                serde_json::json!({
+                    "stream_id": "tenant:t/bucket:b/recovered-stream",
+                    "partition_id": "tenant:t/bucket:b",
+                    "record_kind": "event.recovered",
+                    "transaction_id": null,
+                }),
+                "recover-stream-from-wal".to_string(),
+                Some(idempotency_key.to_string()),
+                CoreWalPayload::Inline(&payload),
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let recovered = CoreStore::new(storage).await.unwrap();
+        let records = recovered
+            .read_stream(ReadStream {
+                stream_id: "tenant:t/bucket:b/recovered-stream".to_string(),
+                after_sequence: 0,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].record_kind, "event.recovered");
+        assert_eq!(records[0].payload, payload);
+        let expected_idempotency_hash =
+            format!("sha256:{}", sha256_hex(idempotency_key.as_bytes()));
+        assert_eq!(
+            records[0].idempotency_key_hash.as_deref(),
+            Some(expected_idempotency_hash.as_str())
+        );
+        let wal_bytes = tokio::fs::read(recovered.active_wal_path()).await.unwrap();
+        assert!(
+            decode_wal_records(&wal_bytes).unwrap().is_empty(),
+            "startup recovery must checkpoint recovered stream WAL records"
         );
     }
 
