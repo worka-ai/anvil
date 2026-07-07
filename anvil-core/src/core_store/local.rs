@@ -1615,6 +1615,7 @@ impl CoreStore {
                     bytes.len() as u64,
                     started_at.elapsed(),
                 );
+                sync_parent_dir(&final_path, "landed_file_sync_parent_dir").await?;
             }
             Err(err) => {
                 return Err(err).with_context(|| {
@@ -2182,6 +2183,7 @@ impl CoreStore {
             header.len() as u64,
             started_at.elapsed(),
         );
+        sync_parent_dir(&path, "wal_header_sync_parent_dir").await?;
         Ok(())
     }
 
@@ -5430,6 +5432,26 @@ async fn write_file_atomic(path: &PathBuf, bytes: &[u8]) -> Result<()> {
             )
         });
     }
+    sync_parent_dir(path, "atomic_write_sync_parent_dir").await?;
+    Ok(())
+}
+
+async fn sync_parent_dir(path: &PathBuf, operation: &'static str) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let parent = parent.to_path_buf();
+    let started_at = Instant::now();
+    tokio::task::spawn_blocking({
+        let parent = parent.clone();
+        move || -> std::io::Result<()> {
+            let dir = std::fs::File::open(&parent)?;
+            dir.sync_all()
+        }
+    })
+    .await
+    .map_err(|err| anyhow!("CoreStore directory fsync task failed: {err}"))??;
+    crate::perf::record_io_duration("core_store", operation, &parent, 0, started_at.elapsed());
     Ok(())
 }
 
