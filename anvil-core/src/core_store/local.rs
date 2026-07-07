@@ -24,8 +24,11 @@ const CORE_CONTROL_READ_RETRY_ATTEMPTS: usize = 400;
 const LOCAL_ERASURE_PROFILE_ID: &str = "ec-4-2";
 const LOCAL_PLACEMENT_EPOCH: u64 = 1;
 const LOCAL_SHARD_FSYNC_SEQUENCE: u64 = 1;
+#[cfg(test)]
 const LOCAL_DATA_SHARDS: usize = 4;
+#[cfg(test)]
 const LOCAL_PARITY_SHARDS: usize = 2;
+const LOCAL_MAX_SHARDS: usize = 11;
 const LOCAL_NODE_ID_PREFIX: &str = "local-node";
 const LOCAL_CONTROL_REPLICA_COUNT: usize = 5;
 const LOCAL_CONTROL_WRITE_QUORUM: usize = 3;
@@ -93,6 +96,57 @@ const CORE_TRANSACTION_PARTITION_ID: &str = "core-control";
 const CORE_TRANSACTION_RECORD_KIND: &str = "core_transaction";
 
 type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalErasureProfile {
+    id: &'static str,
+    codec_id: &'static str,
+    data_shards: usize,
+    parity_shards: usize,
+    minimum_read_shards: usize,
+    minimum_write_ack_shards: usize,
+    logical_block_target_bytes: u64,
+    max_shard_size_bytes: u64,
+}
+
+impl LocalErasureProfile {
+    fn total_shards(self) -> usize {
+        self.data_shards + self.parity_shards
+    }
+}
+
+const LOCAL_EC_4_2_PROFILE: LocalErasureProfile = LocalErasureProfile {
+    id: "ec-4-2",
+    codec_id: "rs-gf256-vandermonde-0x11d-v1/ec-4-2",
+    data_shards: 4,
+    parity_shards: 2,
+    minimum_read_shards: 4,
+    minimum_write_ack_shards: 6,
+    logical_block_target_bytes: 64 * 1024 * 1024,
+    max_shard_size_bytes: 16 * 1024 * 1024,
+};
+
+const LOCAL_EC_8_3_PROFILE: LocalErasureProfile = LocalErasureProfile {
+    id: "ec-8-3",
+    codec_id: "rs-gf256-vandermonde-0x11d-v1/ec-8-3",
+    data_shards: 8,
+    parity_shards: 3,
+    minimum_read_shards: 8,
+    minimum_write_ack_shards: 11,
+    logical_block_target_bytes: 128 * 1024 * 1024,
+    max_shard_size_bytes: 16 * 1024 * 1024,
+};
+
+const LOCAL_REPLICATED_3_PROFILE: LocalErasureProfile = LocalErasureProfile {
+    id: "replicated-3",
+    codec_id: "rs-gf256-vandermonde-0x11d-v1/replicated-3",
+    data_shards: 1,
+    parity_shards: 2,
+    minimum_read_shards: 1,
+    minimum_write_ack_shards: 3,
+    logical_block_target_bytes: 16 * 1024 * 1024,
+    max_shard_size_bytes: 16 * 1024 * 1024,
+};
 
 #[derive(Debug, Clone, Copy)]
 struct CoreAdmissionCapacityLimits {
@@ -324,6 +378,15 @@ impl CoreStore {
     }
 
     pub async fn put_blob(&self, input: PutBlob) -> Result<CoreObjectRef> {
+        self.put_blob_with_profile(input, local_erasure_profile(LOCAL_ERASURE_PROFILE_ID)?)
+            .await
+    }
+
+    async fn put_blob_with_profile(
+        &self,
+        input: PutBlob,
+        profile: LocalErasureProfile,
+    ) -> Result<CoreObjectRef> {
         let _perf_guard = crate::perf::guard("anvil_core_store_op", &[("operation", "put_blob")]);
         self.ensure_layout().await?;
         validate_logical_id(&input.logical_name, "blob logical name")?;
@@ -334,6 +397,7 @@ impl CoreStore {
                 serde_json::json!({
                     "logical_name": input.logical_name.clone(),
                     "region_id": input.region_id.clone(),
+                    "erasure_profile_id": profile.id,
                 }),
                 input.mutation_id.clone(),
                 None,
@@ -353,6 +417,7 @@ impl CoreStore {
                 &materialised_bytes,
                 &admission.boundary_values,
                 &admission.mutation_id,
+                profile,
             )
             .await?;
         self.mark_core_wal_finalised_unlocked(&admission, "committed")
@@ -366,11 +431,12 @@ impl CoreStore {
         materialised_bytes: &[u8],
         boundary_values: &[CoreBoundaryValue],
         mutation_id: &str,
+        profile: LocalErasureProfile,
     ) -> Result<CoreObjectRef> {
         if sha256_hex(materialised_bytes) != hash {
             bail!("CoreStore object materialisation hash mismatch");
         }
-        let shards = encode_erasure_shards(materialised_bytes)?;
+        let shards = encode_erasure_shards(materialised_bytes, profile)?;
 
         for (shard_index, shard) in shards.iter().enumerate() {
             let node_id = format!("{LOCAL_NODE_ID_PREFIX}-{}", shard_index + 1);
@@ -382,7 +448,7 @@ impl CoreStore {
                     block_id: format!("sha256:{hash}"),
                     erasure_set_id: "local-erasure-set".to_string(),
                     shard_index: shard_index as u16,
-                    erasure_profile_id: LOCAL_ERASURE_PROFILE_ID.to_string(),
+                    erasure_profile_id: profile.id.to_string(),
                     logical_file_id: format!("sha256:{hash}"),
                     logical_offset,
                     logical_length: shard.len() as u64,
@@ -406,7 +472,7 @@ impl CoreStore {
         Ok(CoreObjectRef {
             hash: format!("sha256:{hash}"),
             logical_size: materialised_bytes.len() as u64,
-            manifest_ref: encode_manifest_ref(hash),
+            manifest_ref: encode_manifest_ref_with_profile(hash, profile.id),
         })
     }
 
@@ -428,12 +494,7 @@ impl CoreStore {
                 manifest.logical_size
             );
         }
-        if manifest.encoding.profile_id != LOCAL_ERASURE_PROFILE_ID {
-            bail!(
-                "CoreStore unsupported erasure profile {}",
-                manifest.encoding.profile_id
-            );
-        }
+        let profile = local_erasure_profile(&manifest.encoding.profile_id)?;
 
         let data_shards = usize::from(manifest.encoding.data_shards);
         let parity_shards = usize::from(manifest.encoding.parity_shards);
@@ -489,7 +550,7 @@ impl CoreStore {
                 BlockShardExpectation {
                     block_id: &expected_block_id,
                     shard_index: placement.shard_index,
-                    erasure_profile_id: LOCAL_ERASURE_PROFILE_ID,
+                    erasure_profile_id: profile.id,
                     placement_epoch: placement.placement_epoch,
                     payload_hash: &placement.shard_hash,
                     payload_len: placement.stored_size,
@@ -599,7 +660,7 @@ impl CoreStore {
                 BlockShardExpectation {
                     block_id: &expected_block_id,
                     shard_index: placement.shard_index,
-                    erasure_profile_id: LOCAL_ERASURE_PROFILE_ID,
+                    erasure_profile_id: &manifest.encoding.profile_id,
                     placement_epoch: placement.placement_epoch,
                     payload_hash: &placement.shard_hash,
                     payload_len: placement.stored_size,
@@ -652,12 +713,7 @@ impl CoreStore {
         validate_logical_id(&request.writer_family, "writer family")?;
         validate_logical_id(&request.logical_file_id, "logical file id")?;
         validate_logical_id(&request.mutation_id, "logical file mutation id")?;
-        if request.pipeline_policy.erasure_profile_id != LOCAL_ERASURE_PROFILE_ID {
-            bail!(
-                "CoreStore logical file erasure profile {} is unsupported by this backend",
-                request.pipeline_policy.erasure_profile_id
-            );
-        }
+        let profile = local_erasure_profile(&request.pipeline_policy.erasure_profile_id)?;
         if request.pipeline_policy.compression != "none" {
             bail!("CoreStore logical file compression policy is not implemented for local backend");
         }
@@ -667,13 +723,16 @@ impl CoreStore {
 
         let source = std::mem::take(&mut request.source);
         let object_ref = self
-            .put_blob(PutBlob {
-                logical_name: request.logical_file_id.clone(),
-                bytes: source,
-                boundary_values: request.boundary_values.clone(),
-                region_id: request.region_id.clone(),
-                mutation_id: request.mutation_id.clone(),
-            })
+            .put_blob_with_profile(
+                PutBlob {
+                    logical_name: request.logical_file_id.clone(),
+                    bytes: source,
+                    boundary_values: request.boundary_values.clone(),
+                    region_id: request.region_id.clone(),
+                    mutation_id: request.mutation_id.clone(),
+                },
+                profile,
+            )
             .await?;
         let object_manifest = self.read_object_manifest(&object_ref).await?;
         logical_file_manifest_from_object_manifest(&request, &object_manifest)
@@ -2164,6 +2223,8 @@ impl CoreStore {
     ) -> Result<&'static str> {
         match record.operation_family.as_str() {
             "object.put" => {
+                let profile_id = json_required_string(&record.target, "erasure_profile_id")?;
+                let profile = local_erasure_profile(&profile_id)?;
                 let materialised_bytes = self.core_wal_payload_bytes(record, payload).await?;
                 let hash = sha256_hex(&materialised_bytes);
                 if let Some(landed) = record.landed_bytes.first() {
@@ -2177,6 +2238,7 @@ impl CoreStore {
                     &materialised_bytes,
                     &record.boundary_values,
                     &record.mutation_id,
+                    profile,
                 )
                 .await?;
                 Ok("committed")
@@ -3313,17 +3375,37 @@ impl CoreStore {
         if object_hash != manifest_hash {
             bail!("CoreStore object manifest ref/hash mismatch");
         }
+        let profile =
+            local_erasure_profile(decode_manifest_ref_profile(&object_ref.manifest_ref)?)?;
         let required_indices = required_data_shard_indices_for_range(
             object_ref.logical_size,
-            LOCAL_DATA_SHARDS,
+            profile.data_shards,
             range,
         )?;
-        self.reconstruct_object_manifest_from_shards_with_required_indices(
-            object_ref,
-            manifest_hash,
-            Some(&required_indices),
-        )
-        .await
+        let manifest = self
+            .reconstruct_object_manifest_from_shards_with_required_indices(
+                object_ref,
+                manifest_hash,
+                Some(&required_indices),
+            )
+            .await?;
+        let present = manifest
+            .placements
+            .iter()
+            .map(|placement| placement.shard_index)
+            .collect::<BTreeSet<_>>();
+        let missing = required_indices
+            .difference(&present)
+            .copied()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            bail!(
+                "CoreStore manifest {} is missing required range shards {:?}",
+                object_ref.manifest_ref,
+                missing
+            );
+        }
+        Ok(manifest)
     }
 
     async fn reconstruct_object_manifest_from_shards(
@@ -3345,9 +3427,11 @@ impl CoreStore {
         object_hash: &str,
         required_indices: Option<&BTreeSet<u16>>,
     ) -> Result<CoreObjectManifest> {
-        let mut placements = Vec::with_capacity(LOCAL_DATA_SHARDS + LOCAL_PARITY_SHARDS);
-        let mut stripe_size = 0u64;
-        for node_id in local_shard_node_ids() {
+        let desired_profile =
+            local_erasure_profile(decode_manifest_ref_profile(&object_ref.manifest_ref)?)?;
+        let mut placements_by_profile: BTreeMap<String, Vec<CoreObjectPlacement>> = BTreeMap::new();
+        let mut stripe_size_by_profile: BTreeMap<String, u64> = BTreeMap::new();
+        for node_id in all_local_shard_node_ids() {
             let prefix = &object_hash[0..2];
             let dir = self
                 .storage
@@ -3385,16 +3469,11 @@ impl CoreStore {
                 };
                 let expected_block_id = format!("sha256:{object_hash}");
                 let expected_payload_hash = format!("sha256:{shard_hash}");
-                let shard_payload = match read_block_shard_file(
+                let decoded = match read_block_shard_file_dynamic(
                     &entry.path(),
-                    BlockShardExpectation {
-                        block_id: &expected_block_id,
-                        shard_index,
-                        erasure_profile_id: LOCAL_ERASURE_PROFILE_ID,
-                        placement_epoch: LOCAL_PLACEMENT_EPOCH,
-                        payload_hash: &expected_payload_hash,
-                        payload_len: 0,
-                    },
+                    &expected_block_id,
+                    shard_index,
+                    &expected_payload_hash,
                     "read_manifest_shard_header",
                 )
                 .await
@@ -3402,21 +3481,44 @@ impl CoreStore {
                     Ok(payload) => payload,
                     Err(_) => continue,
                 };
-                stripe_size = stripe_size
-                    .max((shard_payload.len() as u64).saturating_mul(LOCAL_DATA_SHARDS as u64));
-                placements.push(CoreObjectPlacement {
-                    shard_index,
-                    node_id: node_id.clone(),
-                    region_id: "local".to_string(),
-                    cell_id: format!("local-cell-{}", (usize::from(shard_index) % 3) + 1),
-                    shard_hash: format!("sha256:{shard_hash}"),
-                    stored_size: shard_payload.len() as u64,
-                    generation: 1,
-                    placement_epoch: LOCAL_PLACEMENT_EPOCH,
-                    fsync_sequence: LOCAL_SHARD_FSYNC_SEQUENCE,
-                });
+                if desired_profile.id != decoded.erasure_profile_id {
+                    continue;
+                }
+                let profile = match local_erasure_profile(&decoded.erasure_profile_id) {
+                    Ok(profile) => profile,
+                    Err(_) => continue,
+                };
+                let stripe_size = stripe_size_by_profile
+                    .entry(profile.id.to_string())
+                    .or_default();
+                *stripe_size = (*stripe_size)
+                    .max((decoded.payload.len() as u64).saturating_mul(profile.data_shards as u64));
+                placements_by_profile
+                    .entry(profile.id.to_string())
+                    .or_default()
+                    .push(CoreObjectPlacement {
+                        shard_index,
+                        node_id: node_id.clone(),
+                        region_id: "local".to_string(),
+                        cell_id: format!("local-cell-{}", (usize::from(shard_index) % 3) + 1),
+                        shard_hash: format!("sha256:{shard_hash}"),
+                        stored_size: decoded.payload.len() as u64,
+                        generation: 1,
+                        placement_epoch: LOCAL_PLACEMENT_EPOCH,
+                        fsync_sequence: LOCAL_SHARD_FSYNC_SEQUENCE,
+                    });
             }
         }
+
+        let (profile, mut placements) = select_reconstructed_profile(
+            desired_profile,
+            placements_by_profile,
+            object_ref,
+            required_indices,
+        )?;
+        let stripe_size = stripe_size_by_profile
+            .remove(profile.id)
+            .unwrap_or_default();
 
         placements.sort_by_key(|placement| placement.shard_index);
         placements.dedup_by_key(|placement| placement.shard_index);
@@ -3436,12 +3538,12 @@ impl CoreStore {
                     missing
                 );
             }
-        } else if placements.len() < LOCAL_DATA_SHARDS {
+        } else if placements.len() < profile.minimum_read_shards {
             bail!(
                 "CoreStore manifest {} has only {} shard placements; {} data shards required",
                 object_ref.manifest_ref,
                 placements.len(),
-                LOCAL_DATA_SHARDS
+                profile.minimum_read_shards
             );
         }
 
@@ -3456,11 +3558,11 @@ impl CoreStore {
             logical_size: object_ref.logical_size,
             boundary_values,
             encoding: CoreObjectEncoding {
-                profile_id: LOCAL_ERASURE_PROFILE_ID.to_string(),
-                data_shards: LOCAL_DATA_SHARDS as u16,
-                parity_shards: LOCAL_PARITY_SHARDS as u16,
-                minimum_read_shards: LOCAL_DATA_SHARDS as u16,
-                minimum_write_ack_shards: (LOCAL_DATA_SHARDS + LOCAL_PARITY_SHARDS) as u16,
+                profile_id: profile.id.to_string(),
+                data_shards: profile.data_shards as u16,
+                parity_shards: profile.parity_shards as u16,
+                minimum_read_shards: profile.minimum_read_shards as u16,
+                minimum_write_ack_shards: profile.minimum_write_ack_shards as u16,
                 stripe_size,
                 placement_scope: "region".to_string(),
                 repair_priority: "normal".to_string(),
@@ -3509,7 +3611,10 @@ impl CoreStore {
         let object_ref = CoreObjectRef {
             hash: manifest.object_hash.clone(),
             logical_size: manifest.logical_size,
-            manifest_ref: encode_manifest_ref(strip_sha256_prefix(&manifest.object_hash)?),
+            manifest_ref: encode_manifest_ref_with_profile(
+                strip_sha256_prefix(&manifest.object_hash)?,
+                &manifest.encoding.profile_id,
+            ),
         };
         let bytes = self
             .get_blob(GetBlob { object_ref })
@@ -3820,11 +3925,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn encode_erasure_shards(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
-    let shard_len = bytes.len().div_ceil(LOCAL_DATA_SHARDS).max(1);
-    let total_shards = LOCAL_DATA_SHARDS + LOCAL_PARITY_SHARDS;
+fn encode_erasure_shards(bytes: &[u8], profile: LocalErasureProfile) -> Result<Vec<Vec<u8>>> {
+    let shard_len = bytes.len().div_ceil(profile.data_shards).max(1);
+    let total_shards = profile.total_shards();
     let mut shards = vec![vec![0u8; shard_len]; total_shards];
-    for (index, shard) in shards.iter_mut().take(LOCAL_DATA_SHARDS).enumerate() {
+    for (index, shard) in shards.iter_mut().take(profile.data_shards).enumerate() {
         let start = index.saturating_mul(shard_len);
         if start >= bytes.len() {
             break;
@@ -3832,7 +3937,7 @@ fn encode_erasure_shards(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
         let end = usize::min(start + shard_len, bytes.len());
         shard[..end - start].copy_from_slice(&bytes[start..end]);
     }
-    let reed_solomon = ReedSolomon::new(LOCAL_DATA_SHARDS, LOCAL_PARITY_SHARDS)?;
+    let reed_solomon = ReedSolomon::new(profile.data_shards, profile.parity_shards)?;
     reed_solomon.encode(&mut shards)?;
     Ok(shards)
 }
@@ -3873,7 +3978,10 @@ fn logical_file_manifest_from_object_manifest(
         &CoreObjectRef {
             hash: object_manifest.object_hash.clone(),
             logical_size: object_manifest.logical_size,
-            manifest_ref: encode_manifest_ref(strip_sha256_prefix(&object_manifest.object_hash)?),
+            manifest_ref: encode_manifest_ref_with_profile(
+                strip_sha256_prefix(&object_manifest.object_hash)?,
+                &object_manifest.encoding.profile_id,
+            ),
         },
         strip_sha256_prefix(&object_manifest.object_hash)?,
     )?;
@@ -3886,6 +3994,11 @@ fn logical_file_manifest_from_object_manifest(
         .unwrap_or(0);
     let data_shards = u32::from(object_manifest.encoding.data_shards);
     let parity_shards = u32::from(object_manifest.encoding.parity_shards);
+    let profile = local_erasure_profile_for_counts(
+        &object_manifest.encoding.profile_id,
+        data_shards as usize,
+        parity_shards as usize,
+    )?;
     let block_id = object_manifest.object_hash.clone();
     let block_ids = vec![block_id.clone()];
     let boundary_schema_generation = request
@@ -3962,7 +4075,7 @@ fn logical_file_manifest_from_object_manifest(
                     fsync_sequence: placement.fsync_sequence,
                 })
                 .collect(),
-            codec_id: "reed-solomon-galois-8".to_string(),
+            codec_id: profile.codec_id.to_string(),
             data_shards,
             parity_shards,
             plaintext_block_len: object_manifest.logical_size,
@@ -4000,7 +4113,7 @@ fn logical_file_manifest_from_object_manifest(
         erasure_profile_id: object_manifest.encoding.profile_id.clone(),
         placement_epoch: LOCAL_PLACEMENT_EPOCH,
         created_by_mutation_id: request.mutation_id.clone(),
-        codec_id: "reed-solomon-galois-8".to_string(),
+        codec_id: profile.codec_id.to_string(),
         data_shards,
         parity_shards,
     })
@@ -4012,16 +4125,13 @@ fn validate_logical_file_manifest_shape(manifest: &CoreLogicalFileManifest) -> R
     }
     validate_logical_id(&manifest.logical_file_id, "logical file id")?;
     validate_logical_id(&manifest.writer_family, "writer family")?;
-    if manifest.erasure_profile_id != LOCAL_ERASURE_PROFILE_ID {
-        bail!(
-            "CoreStore logical file manifest has unsupported erasure profile {}",
-            manifest.erasure_profile_id
-        );
-    }
-    if manifest.data_shards != LOCAL_DATA_SHARDS as u32
-        || manifest.parity_shards != LOCAL_PARITY_SHARDS as u32
-    {
-        bail!("CoreStore logical file manifest shard counts do not match the local EC profile");
+    let profile = local_erasure_profile_for_counts(
+        &manifest.erasure_profile_id,
+        manifest.data_shards as usize,
+        manifest.parity_shards as usize,
+    )?;
+    if manifest.codec_id != profile.codec_id {
+        bail!("CoreStore logical file manifest codec id does not match erasure profile");
     }
     if manifest.blocks.is_empty() {
         bail!("CoreStore logical file manifest must contain at least one block");
@@ -4032,7 +4142,10 @@ fn validate_logical_file_manifest_shape(manifest: &CoreLogicalFileManifest) -> R
         {
             bail!("CoreStore logical file block shard counts mismatch manifest");
         }
-        if block.shards.len() < LOCAL_DATA_SHARDS {
+        if block.codec_id != profile.codec_id {
+            bail!("CoreStore logical file block codec id does not match erasure profile");
+        }
+        if block.shards.len() < profile.minimum_read_shards {
             bail!("CoreStore logical file block does not contain enough shard receipts");
         }
         for shard in &block.shards {
@@ -4119,6 +4232,12 @@ struct BlockShardExpectation<'a> {
     payload_len: u64,
 }
 
+#[derive(Debug)]
+struct DecodedBlockShard {
+    erasure_profile_id: String,
+    payload: Vec<u8>,
+}
+
 fn encode_block_shard_file(header: BlockShardHeaderInput, payload: &[u8]) -> Result<Vec<u8>> {
     let header_cbor = encode_minimal_cbor_map(&block_shard_header_map(header)?);
     let mut out = Vec::with_capacity(
@@ -4174,6 +4293,37 @@ async fn read_block_shard_file(
         bail!("CoreStore block shard payload length mismatch");
     }
     Ok(payload)
+}
+
+async fn read_block_shard_file_dynamic(
+    path: &PathBuf,
+    expected_block_id: &str,
+    expected_shard_index: u16,
+    expected_payload_hash: &str,
+    operation: &'static str,
+) -> Result<DecodedBlockShard> {
+    let bytes = read_file(path, "core_store", operation)
+        .await
+        .with_context(|| format!("read CoreStore block shard {}", path.display()))?;
+    let (header, payload) = decode_block_shard_file(&bytes)?;
+    expect_cbor_text(&header, "schema", CORE_BLOCK_SHARD_HEADER_SCHEMA)?;
+    expect_cbor_text(&header, "block_id", expected_block_id)?;
+    expect_cbor_u64(&header, "shard_index", u64::from(expected_shard_index))?;
+    expect_cbor_u64(&header, "placement_epoch", LOCAL_PLACEMENT_EPOCH)?;
+    expect_cbor_text(&header, "payload_stored_hash", expected_payload_hash)?;
+    expect_cbor_text(&header, "payload_plain_hash", expected_payload_hash)?;
+    let actual_hash = format!("sha256:{}", sha256_hex(&payload));
+    if actual_hash != expected_payload_hash {
+        bail!(
+            "CoreStore block shard payload hash mismatch: expected {}, got {}",
+            expected_payload_hash,
+            actual_hash
+        );
+    }
+    Ok(DecodedBlockShard {
+        erasure_profile_id: cbor_text_value(&header, "erasure_profile_id")?.to_string(),
+        payload,
+    })
 }
 
 fn decode_block_shard_file(bytes: &[u8]) -> Result<(BTreeMap<String, MinimalCborValue>, Vec<u8>)> {
@@ -4302,6 +4452,16 @@ fn expect_cbor_text(
         Some(MinimalCborValue::Text(actual)) => {
             bail!("CoreStore block shard header {key} mismatch: expected {expected}, got {actual}")
         }
+        _ => bail!("CoreStore block shard header missing text field {key}"),
+    }
+}
+
+fn cbor_text_value<'a>(
+    header: &'a BTreeMap<String, MinimalCborValue>,
+    key: &str,
+) -> Result<&'a str> {
+    match header.get(key) {
+        Some(MinimalCborValue::Text(value)) => Ok(value),
         _ => bail!("CoreStore block shard header missing text field {key}"),
     }
 }
@@ -4470,15 +4630,21 @@ fn validate_manifest_for_object_ref(
             manifest.logical_size
         );
     }
-    if manifest.encoding.profile_id != LOCAL_ERASURE_PROFILE_ID {
+    let manifest_ref_profile = decode_manifest_ref_profile(&object_ref.manifest_ref)?;
+    if manifest_ref_profile != manifest.encoding.profile_id {
         bail!(
-            "CoreStore unsupported erasure profile {}",
+            "CoreStore manifest profile mismatch: ref {}, manifest {}",
+            manifest_ref_profile,
             manifest.encoding.profile_id
         );
     }
-
     let data_shards = usize::from(manifest.encoding.data_shards);
     let parity_shards = usize::from(manifest.encoding.parity_shards);
+    let profile = local_erasure_profile_for_counts(
+        &manifest.encoding.profile_id,
+        data_shards,
+        parity_shards,
+    )?;
     let minimum_read_shards = usize::from(manifest.encoding.minimum_read_shards);
     let minimum_write_ack_shards = usize::from(manifest.encoding.minimum_write_ack_shards);
     if data_shards == 0 || parity_shards == 0 {
@@ -4491,11 +4657,12 @@ fn validate_manifest_for_object_ref(
             data_shards
         );
     }
-    if minimum_write_ack_shards > data_shards + parity_shards {
+    if minimum_write_ack_shards != profile.minimum_write_ack_shards {
         bail!(
-            "CoreStore minimum_write_ack_shards {} exceeds total shard count {}",
+            "CoreStore minimum_write_ack_shards {} does not match profile {} requirement {}",
             minimum_write_ack_shards,
-            data_shards + parity_shards
+            profile.id,
+            profile.minimum_write_ack_shards
         );
     }
     if manifest.encoding.placement_scope != "region" {
@@ -4566,10 +4733,75 @@ fn local_control_node_ids() -> Vec<String> {
         .collect()
 }
 
-fn local_shard_node_ids() -> Vec<String> {
-    (1..=(LOCAL_DATA_SHARDS + LOCAL_PARITY_SHARDS))
+fn local_erasure_profile(id: &str) -> Result<LocalErasureProfile> {
+    match id {
+        "ec-4-2" => Ok(LOCAL_EC_4_2_PROFILE),
+        "ec-8-3" => Ok(LOCAL_EC_8_3_PROFILE),
+        "replicated-3" => Ok(LOCAL_REPLICATED_3_PROFILE),
+        _ => bail!("CoreStore unsupported erasure profile {id}"),
+    }
+}
+
+fn local_erasure_profile_for_counts(
+    profile_id: &str,
+    data_shards: usize,
+    parity_shards: usize,
+) -> Result<LocalErasureProfile> {
+    let profile = local_erasure_profile(profile_id)?;
+    if profile.data_shards != data_shards || profile.parity_shards != parity_shards {
+        bail!(
+            "CoreStore erasure profile {} count mismatch: expected {}+{}, got {}+{}",
+            profile.id,
+            profile.data_shards,
+            profile.parity_shards,
+            data_shards,
+            parity_shards
+        );
+    }
+    Ok(profile)
+}
+
+fn all_local_shard_node_ids() -> Vec<String> {
+    (1..=LOCAL_MAX_SHARDS)
         .map(|index| format!("{LOCAL_NODE_ID_PREFIX}-{index}"))
         .collect()
+}
+
+fn select_reconstructed_profile(
+    desired_profile: LocalErasureProfile,
+    mut placements_by_profile: BTreeMap<String, Vec<CoreObjectPlacement>>,
+    object_ref: &CoreObjectRef,
+    required_indices: Option<&BTreeSet<u16>>,
+) -> Result<(LocalErasureProfile, Vec<CoreObjectPlacement>)> {
+    let placements = placements_by_profile
+        .remove(desired_profile.id)
+        .unwrap_or_default();
+    if let Some(required_indices) = required_indices {
+        let present = placements
+            .iter()
+            .map(|placement| placement.shard_index)
+            .collect::<BTreeSet<_>>();
+        let missing = required_indices
+            .difference(&present)
+            .copied()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            bail!(
+                "CoreStore manifest {} is missing required range shards {:?}",
+                object_ref.manifest_ref,
+                missing
+            );
+        }
+    } else if placements.len() < desired_profile.minimum_read_shards {
+        bail!(
+            "CoreStore manifest {} has only {} shard placements for {}; {} required",
+            object_ref.manifest_ref,
+            placements.len(),
+            desired_profile.id,
+            desired_profile.minimum_read_shards
+        );
+    }
+    Ok((desired_profile, placements))
 }
 
 fn boundary_schema_ref_name(bucket: &str) -> String {
@@ -4995,18 +5227,35 @@ fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
     Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
 }
 
+#[cfg(test)]
 fn encode_manifest_ref(hash: &str) -> String {
-    format!("core-manifest-sha256:{hash}")
+    encode_manifest_ref_with_profile(hash, LOCAL_ERASURE_PROFILE_ID)
+}
+
+fn encode_manifest_ref_with_profile(hash: &str, profile_id: &str) -> String {
+    format!("core-manifest-sha256:{hash}:profile:{profile_id}")
 }
 
 fn decode_manifest_ref(manifest_ref: &str) -> Result<&str> {
-    let hash = manifest_ref
+    Ok(decode_manifest_ref_parts(manifest_ref)?.0)
+}
+
+fn decode_manifest_ref_profile(manifest_ref: &str) -> Result<&str> {
+    Ok(decode_manifest_ref_parts(manifest_ref)?.1)
+}
+
+fn decode_manifest_ref_parts(manifest_ref: &str) -> Result<(&str, &str)> {
+    let raw = manifest_ref
         .strip_prefix("core-manifest-sha256:")
         .ok_or_else(|| anyhow!("CoreStore manifest_ref is not a CoreStore manifest reference"))?;
+    let Some((hash, profile)) = raw.split_once(":profile:") else {
+        bail!("CoreStore manifest_ref is missing erasure profile");
+    };
     if hash.len() != 64 || !hash.as_bytes().iter().all(u8::is_ascii_hexdigit) {
         bail!("CoreStore manifest_ref hash is invalid");
     }
-    Ok(hash)
+    validate_logical_id(profile, "manifest erasure profile")?;
+    Ok((hash, profile))
 }
 
 fn root_catalog_region(catalog: &CoreRootCatalog) -> String {
@@ -6118,6 +6367,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn core_store_logical_file_api_accepts_all_normative_erasure_profiles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+
+        for (profile_id, data_shards, parity_shards, codec_id) in [
+            ("ec-4-2", 4, 2, "rs-gf256-vandermonde-0x11d-v1/ec-4-2"),
+            ("ec-8-3", 8, 3, "rs-gf256-vandermonde-0x11d-v1/ec-8-3"),
+            (
+                "replicated-3",
+                1,
+                2,
+                "rs-gf256-vandermonde-0x11d-v1/replicated-3",
+            ),
+        ] {
+            let payload = format!("profile:{profile_id}:logical-file-payload").into_bytes();
+            let manifest = store
+                .write_logical_file(WriteLogicalFileRequest {
+                    writer_family: "profile_test".to_string(),
+                    generation: 1,
+                    logical_file_id: format!("profile-test/{profile_id}/segment-1"),
+                    source: payload.clone(),
+                    range_hints: Vec::new(),
+                    pipeline_policy: CorePipelinePolicy {
+                        erasure_profile_id: profile_id.to_string(),
+                        ..Default::default()
+                    },
+                    trace_context: CoreTraceContext::default(),
+                    boundary_values: Vec::new(),
+                    mutation_id: format!("profile-test-{profile_id}"),
+                    region_id: "local".to_string(),
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(manifest.erasure_profile_id, profile_id);
+            assert_eq!(manifest.data_shards, data_shards);
+            assert_eq!(manifest.parity_shards, parity_shards);
+            assert_eq!(manifest.codec_id, codec_id);
+            assert_eq!(manifest.blocks[0].codec_id, codec_id);
+            assert_eq!(
+                manifest.blocks[0].shards.len(),
+                (data_shards + parity_shards) as usize
+            );
+            assert!(
+                core_object_ref_from_logical_file_manifest(&manifest)
+                    .manifest_ref
+                    .ends_with(&format!(":profile:{profile_id}"))
+            );
+
+            store.verify_logical_file_manifest(&manifest).await.unwrap();
+            let read_back = store
+                .read_logical_range(ReadLogicalRangeRequest {
+                    manifest,
+                    ranges: vec![CoreByteRange {
+                        start: 0,
+                        end_exclusive: payload.len() as u64,
+                    }],
+                    authz_scope: AuthzScopeRef {
+                        anvil_storage_tenant_id: "local".to_string(),
+                        authz_realm_id: "system".to_string(),
+                    },
+                    expected_boundary: None,
+                    prefetch_policy: CorePrefetchPolicy::default(),
+                    trace_context: CoreTraceContext::default(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(read_back, payload);
+        }
+    }
+
+    #[tokio::test]
     async fn core_store_boundary_schema_round_trips_through_corestore() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = Storage::new_at(tmp.path()).await.unwrap();
@@ -6265,7 +6587,10 @@ mod tests {
             .admit_core_mutation(
                 "object.put",
                 "object_blob",
-                serde_json::json!({"logical_name":"tenant:t/bucket:b/object:large"}),
+                serde_json::json!({
+                    "logical_name":"tenant:t/bucket:b/object:large",
+                    "erasure_profile_id": LOCAL_ERASURE_PROFILE_ID,
+                }),
                 "large-payload-admission".to_string(),
                 None,
                 CoreWalPayload::Landed(&bytes),
@@ -6301,7 +6626,10 @@ mod tests {
             .admit_core_mutation(
                 "object.put",
                 "object_blob",
-                serde_json::json!({"logical_name":"tenant:t/bucket:b/object:bounded"}),
+                serde_json::json!({
+                    "logical_name":"tenant:t/bucket:b/object:bounded",
+                    "erasure_profile_id": LOCAL_ERASURE_PROFILE_ID,
+                }),
                 "bounded-payload-admission".to_string(),
                 None,
                 CoreWalPayload::Landed(b"bounded"),
@@ -6383,7 +6711,8 @@ mod tests {
                 "object_blob",
                 serde_json::json!({
                     "logical_name": "tenant:t/bucket:b/object:recovered",
-                    "region_id": "local"
+                    "region_id": "local",
+                    "erasure_profile_id": LOCAL_ERASURE_PROFILE_ID,
                 }),
                 "recover-object-from-wal".to_string(),
                 None,

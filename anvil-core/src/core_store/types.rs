@@ -218,7 +218,10 @@ pub fn core_object_ref_from_logical_file_manifest(
     CoreObjectRef {
         hash: manifest.content_hash.clone(),
         logical_size: manifest.logical_size,
-        manifest_ref: format!("core-manifest-sha256:{manifest_hash}"),
+        manifest_ref: format!(
+            "core-manifest-sha256:{manifest_hash}:profile:{}",
+            manifest.erasure_profile_id
+        ),
     }
 }
 
