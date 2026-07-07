@@ -159,3 +159,7 @@ This release is intended to be consumed as a coordinated server/client/docs rele
 Start with the Docker-first setup tutorial if you want to run Anvil locally. Read the Learn section if the vocabulary is new. Use the Tutorials book when you want to perform a specific operation. Use the Operators book before a real deployment. Use the Reference book when you need exact command families, action/resource strings, or JSON field shapes.
 
 Anvil 0.2.4 is a storage release, an operations release, and a documentation release. It makes the system stricter internally and clearer externally, which is the right foundation for teams that want object storage to carry real product data rather than only static blobs.
+
+## What to validate after upgrading
+
+After upgrading to this release line, validate both the new storage discipline and the hardened administration path. Run an object write/read, an index query with diagnostics, a relationship-authorisation check, a PersonalDB catch-up if your deployment uses it, `anvil-admin diagnostics list`, and one read-only routing list. Those checks prove more than process health: they prove source records, derived views, public policy, system-realm authorisation, and admin-plane connectivity are all still aligned.

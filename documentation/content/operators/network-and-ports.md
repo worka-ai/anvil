@@ -99,3 +99,9 @@ For the cluster plane, prove that nodes can dial the configured `PUBLIC_CLUSTER_
 For gateways, verify host routing deliberately. A path-style S3 request should route to the intended bucket. A host-routed request should work only when `PUBLIC_REGION_BASE_DOMAIN`, DNS, TLS, trusted proxy metadata, host alias state, bucket policy, and object authorisation all line up. Requests for `_anvil/` paths should be rejected through public and gateway routes. A successful static or S3 read proves the public data path, not admin reachability and not broad tenant visibility.
 
 Common misconfigurations are usually easy to name after the fact: `PUBLIC_API_ADDR` set to a bind address, admin bound to `0.0.0.0` and published by Compose, cluster UDP exposed on the internet, forwarded host headers trusted from every source, S3 signatures broken by TLS termination, or a custom host alias created without `PUBLIC_REGION_BASE_DOMAIN` on the serving process. Write these checks into the deployment runbook before the first incident.
+
+## Plane exposure checklist
+
+Public ingress may route native gRPC, S3-compatible HTTP, and static HTTP to the public listener. Admin ingress should be absent from public networks and reachable only through loopback, private service discovery, a bastion, or an operator job. Cluster QUIC should be reachable only by nodes that are expected to join the mesh.
+
+When a command fails, confirm the endpoint before investigating credentials. Pointing `anvil-admin` at the public listener can look like an authentication problem, while pointing `anvil` at the admin listener can look like a service outage.

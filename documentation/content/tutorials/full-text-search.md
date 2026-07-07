@@ -9,6 +9,8 @@ This tutorial continues from [Metadata and Typed Fields](/tutorials/metadata-and
 
 Use the public Index API directly in applications. The `anvil index create`, `anvil index query`, and `anvil index diagnostics` commands below are manual helpers over the same API fields; the broader command reference is [Public CLI](/reference/public-cli/). Keep [Indexes and Query](/learn/indexes-and-query/), [Index Definitions and Query JSON](/reference/index-definitions-and-query-json/), and [Authorisation Actions and Resources](/reference/authorisation-actions-and-resources/) nearby. If you need semantic similarity rather than token matching, read [Vector Search](/tutorials/vector-search/) after this page.
 
+Read this page as a search-contract walkthrough rather than a tokenizer demo. You will choose which text becomes searchable, create a full-text index with explicit selector and extractor JSON, run term and phrase queries, keep object authorisation in the result path, and understand which freshness guarantees are not yet meaningful for direct full-text queries.
+
 ## What full-text search does today
 
 Full-text search is for human-language text: titles, paragraphs, notes, transcripts, descriptions, or source text. Anvil tokenises selected text into terms, stores postings for each term, and ranks matching object fields with BM25-style scoring. A higher score means the indexed field looked more relevant to the query terms under the current scoring recipe.
@@ -22,6 +24,8 @@ Full-text search is not a substitute for structured filters. Use path prefixes a
 ## Prerequisites and current tutorial limits
 
 The commands in this page are valid current public CLI shapes, but they are illustrative until your local tutorial environment has working bucket placement, index grants, source objects, and index builder execution. The current public CLI object upload helper still cannot attach `content_type` or `user_metadata_json`, so examples that rely on content-type selectors or metadata filters need objects uploaded through the public API/Rust client, or existing objects that already carry those fields.
+
+Full-text indexes are tenant-owned public-plane resources. Create and query them with the public API or `anvil`; do not use `anvil-admin` for this work. The admin plane may bootstrap tenant credentials or diagnose system-wide operations, but the index definition, query, and diagnostics in this tutorial belong to the tenant.
 
 Use narrow grants. The relevant public policy scopes are:
 
@@ -68,6 +72,8 @@ Suppose Acme stores JSON articles under `tutorial/articles/` with a shape like t
 }
 ```
 
+The selector for this tutorial will be `{"prefix":"tutorial/articles/"}`. That means only object keys beginning with that prefix are eligible for the index. The selector does not inspect JSON fields and it is not a query-time filter; it decides what source records the builder will ever consider.
+
 A full-text extractor can index several fields from that one JSON body:
 
 ```json
@@ -84,6 +90,8 @@ A full-text extractor can index several fields from that one JSON body:
 Each field is tokenised separately. Phrase matching only checks adjacent tokens inside one field; it does not join the title and body together into one long phrase. `object_key` is useful when users search for stable names or identifiers. `json_pointer` decodes the object body as JSON and extracts the value at a pointer. Strings are indexed as text; arrays and objects are stringified JSON.
 
 If the whole object body is plain UTF-8 text, use an empty extractor or `{"source":"object_body_utf8"}` instead. If you use a JSON Pointer extractor against a non-JSON body, the builder records a diagnostic and that field is not indexed for that object version.
+
+Treat `extractor_json` as an application contract. Adding `/body` to the extractor means users may later find the object because of body text; removing it means body-only matches disappear after rebuild. Changing extractor fields is therefore a product change, not just an optimisation.
 
 ## Create the full-text index
 
@@ -116,6 +124,14 @@ This calls `IndexService.QueryIndex` with `query_text = "payment renewal"`. A su
 The query is not an implicit `AND`. It tokenises to terms such as `payment` and `renewal`, finds fields containing any of those terms, and scores them. A field containing both terms should usually rank better than a field containing one, but a one-term match can still appear. Use structured filters for hard constraints rather than trying to encode them into `query_text`.
 
 The CLI prints `score`, `object_key`, and `metadata_json`. Current full-text `metadata_json` includes details such as matched term count and an authz label hash. It does not return text snippets or highlighted passages today.
+
+A typical successful row is shaped like this:
+
+```text
+score=4.281 object_key=tutorial/articles/billing/renewal-payment.json metadata_json={...}
+```
+
+Read the row as evidence that an indexed field matched and the caller was allowed to see that object. It is not a body read. If your UI needs the document title, snippet, or current metadata, follow up with an authorised object read or application API call.
 
 If the command fails with `IndexUnavailable`, the definition exists but no full-text segment is available. If it fails with `query_text is required`, the text was empty or tokenised to no searchable terms.
 
@@ -185,3 +201,11 @@ Common full-text diagnostics include non-UTF-8 bodies for UTF-8 extraction, inva
 ## What to take forward
 
 Use full-text search for words and phrases, not for boolean query languages or structured ranges. Keep `selector_json` focused so the index covers the source records you intended. Use `extractor_json` to name the text fields clearly. Keep `positions` enabled if users need phrase search. Use path prefixes and metadata filters for hard narrowing, and rely on `inherit_object` unless the search corpus is deliberately visible to every bucket-level index reader. Treat full-text freshness as derived-data lag today, and use diagnostics plus watch-driven operations to understand when text extraction has caught up.
+
+## Success and failure cues
+
+A full-text index definition proves the tokenizer and extractor contract was accepted. Search results prove the query terms matched materialised text and survived authorisation filtering; they do not prove the corpus is fully fresh. Empty results usually come from selector mismatch, missing extracted text, non-UTF-8 or invalid JSON input, phrase queries without stored positions, derived lag, or object visibility. Diagnostics tell you which source objects failed extraction.
+
+## Where to go next
+
+Read [Vector Search](/tutorials/vector-search/) if exact word matching is not enough, then [Hybrid Search](/tutorials/hybrid-search/) when the product needs both lexical and semantic ranking. Keep [Watches](/tutorials/watches/) nearby for the derived-data side of search freshness, and use diagnostics before assuming a missing hit is a query bug.

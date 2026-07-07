@@ -209,3 +209,9 @@ Some current surfaces are coarser or less complete than the ideal model. Design 
 | Lifecycle | Region activation checkpoint generation and drain-completion workflows are still coarse. Do not work around them with storage edits. |
 
 The conservative posture is straightforward: keep admin private, keep cluster private, grant public scopes narrowly, model product sharing with tenant relationship tuples, keep tenants out of the system realm, reject reserved namespaces on every public and gateway path, protect server secrets and key history, use CoreStore preconditions and fences instead of direct writes, log evidence without secrets, and run release gates before deploying.
+
+## Review questions
+
+For every credential, ask what plane it can reach, which actions it can perform, which resource strings it can name, and how it is rotated. For every gateway, ask which hostnames are trusted, how public access is intentionally enabled, and whether the gateway can reveal data that native object reads would hide. For every admin principal, ask which system-realm relation justifies the access.
+
+A secure deployment should fail closed. Missing auth should not become anonymous access, denied relationship checks should not become partial search snippets, and reserved namespace requests should not reveal whether internal records exist.

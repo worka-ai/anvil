@@ -11,6 +11,14 @@ The local tutorial chain currently has two practical limits: region activation m
 
 For full index JSON syntax, use [Index Definitions and Query JSON](/reference/index-definitions-and-query-json/). For the permission strings behind index and object operations, use [Authorisation Actions and Resources](/reference/authorisation-actions-and-resources/).
 
+This tutorial is about deciding where structured data belongs. You will compare canonical JSON body fields, object metadata, and typed index fields; then you will define extractors with JSON Pointer, create typed fields, and query them without turning object metadata into an unreviewed shadow database.
+
+## Prerequisites and data ownership
+
+The examples assume you understand the `documents` bucket and `tutorial/welcome.txt` object from the object tutorial. Metadata and typed fields are tenant-owned public-plane modelling choices, so use the public API or `anvil`; do not use `anvil-admin` to attach metadata or create typed indexes. The admin plane may help bootstrap tenants, but it should not become the path for application schema evolution.
+
+As you read, keep one question in mind: if two copies of a value disagree, which one is authoritative? This tutorial treats the JSON body as the canonical business record, user metadata as compact operational labels, and typed index fields as derived query rows. That discipline prevents a later search, repair, or export from depending on stale duplicated values.
+
 ## The three places data can live
 
 When you store JSON-looking business data in Anvil, there are three different places it can appear:
@@ -232,3 +240,11 @@ For the example metadata object, this query filter means `customer_id` must equa
 ## What to take forward
 
 Use object metadata for compact operational labels. Keep the canonical document in the object body. Use JSON Pointer to name body fields precisely. Use `selector_json` to decide which records enter an index. Use typed JSON fields to materialise queryable values from the canonical body, and use metadata filters for simple metadata equality checks. When in doubt, store the truth once and derive query views from it.
+
+## Success and failure cues
+
+A good metadata design has a small canonical body, intentionally duplicated user metadata only when equality filtering or gateway compatibility needs it, and typed fields that can be rebuilt from the source object. If queries return no rows, check selector prefix first, then JSON Pointer paths, then field type mismatches, then index diagnostics. A missing typed row is not a reason to store more truth in metadata; it is usually an extraction or derived-state problem.
+
+## Where to go next
+
+Continue with [Indexes, Path Metadata, and Typed Query](/tutorials/indexes-path-metadata-and-typed-query/) to turn the field choices from this page into queryable derived rows. Use [Index Definitions and Query JSON](/reference/index-definitions-and-query-json/) as the exact contract when you add new selectors, extractors, typed fields, predicates, or ordering rules.

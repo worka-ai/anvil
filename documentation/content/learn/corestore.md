@@ -163,3 +163,9 @@ These errors are part of the design. They tell a caller or operator which correc
 CoreStore is the reason Anvil can present many features without becoming many unrelated stores. Objects, links, indexes, watches, append streams, task leases, authorisation records, PersonalDB state, gateway records, mesh routing, audit, and repair evidence all build on the same durable vocabulary: blobs for immutable bytes, refs for mutable heads, streams for ordered history, mutation batches for visibility, fences for ownership, and cursors for replay.
 
 The model is intentionally API-first and server-owned. Application code should use Anvil APIs. Operators should use admin APIs and documented runbooks. Feature code should persist durable truth through CoreStore primitives. Derived views should be rebuildable from CoreStore-backed source records. That discipline is what keeps Anvil explainable when a write races, a worker crashes, a query lags, a region drains, or an operator has to prove what happened.
+
+## Why source and derived records stay separate
+
+CoreStore lets Anvil keep a clean line between facts and views. An object metadata stream entry says a version was written. A directory segment makes listing fast. A full-text segment makes search fast. If the segment is missing or corrupt, the stream entry is still the evidence from which repair can rebuild the segment. If the stream entry is missing, repair cannot safely invent the write.
+
+This distinction should guide design reviews. New features should identify which CoreStore record is the source, which records are derived, which ref names are compare-and-swap heads, and which watch cursor proves a derived view is caught up.

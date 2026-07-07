@@ -99,3 +99,9 @@ Document these gaps in your deployment runbook. The safe response to a missing s
 A healthy topology is visible. Region, cell, and node descriptors have expected lifecycle states and generations. The public endpoints for each region match `PUBLIC_API_ADDR` and gateway DNS. Bucket locators name the expected home region and cell. Host aliases route only when active and configured. Wrong-region requests redirect, proxy, or fail according to the chosen policy. Drains produce blockers or completion evidence instead of silent disappearance. Admin audit explains who changed topology and why.
 
 Those signals should appear in dashboards and release checks before a production incident. If a user says an object disappeared, the first questions should include "which region owns the bucket?", "which locator status is current?", "did the request arrive at the wrong region?", "is the host alias active?", and "are routing diagnostics clean?" Topology planning is successful when those answers are easy to find.
+
+## Pre-activation checklist
+
+Before activating a region, cell, or node, verify durable identity paths, public API address reachability, cluster address reachability, capability list, placement weight, expected region/cell membership, and backup coverage. For regions, also verify public base URL and virtual-host suffix because gateways and redirects will expose those values to clients.
+
+Activation should be a confirmation that the resource is ready, not the first time the operator learns whether it can be reached.

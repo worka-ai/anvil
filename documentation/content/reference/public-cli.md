@@ -480,3 +480,9 @@ Several CLI helpers intentionally expose only the common manual path:
 | Repair | Surface-specific commands only. | Automated incident tooling with request ids, audit correlation, and post-repair verification. |
 
 Keep long-lived application code on the API/client path. Keep the CLI for evidence, smoke tests, manual administration, and examples that make the public API shape visible.
+
+## Reading command failures
+
+A public CLI failure usually falls into one of five buckets: it could not find credentials, token exchange failed, the service rejected the public policy scope, a relationship check filtered or denied the resource, or the request reached the wrong region or gateway route. Capture the command, profile, endpoint, action/resource grant expected, bucket/key or index name, and whether `ANVIL_AUTH_TOKEN` or stored credentials were used.
+
+Do not solve a public CLI failure by switching to `anvil-admin` unless the task is actually operator-owned. For example, a tenant app that cannot query an index needs a public policy or relationship-authorisation fix, not an admin routing command.

@@ -211,3 +211,9 @@ Current limitations to plan around:
 | Distributed recovery | The current local backend uses local shard/control-replica machinery inside one storage path; do not treat image rollback or node restart as multi-region disaster recovery. |
 
 Design upgrades around those facts. Pin artefacts, keep CLIs and clients compatible, drain narrowly, verify source records before derived state, document one-way changes, and choose rollback only when the storage state makes rollback safe.
+
+## Format and CLI compatibility
+
+Before rollback, identify whether the newer version wrote durable records that the older version cannot parse. If it did, restoring the pre-upgrade backup is safer than starting old binaries on new data. Also keep CLI versions aligned with the server release; an older CLI can omit fields such as generation, idempotency, catch-up, or lifecycle options that the runbook relies on.
+
+After upgrade, run one public CLI smoke test and one admin CLI smoke test from the same network locations operators and applications use. That catches endpoint, DNS, and proxy issues that unit tests cannot see.

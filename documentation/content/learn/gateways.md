@@ -158,3 +158,9 @@ Design with those limits visible. Use gateways where they help existing tools re
 ## What to take forward
 
 Gateways make Anvil easier to adopt without changing what Anvil is. They translate familiar protocol requests into the native storage, identity, authorisation, routing, and CoreStore model. S3 and static object delivery are implemented adapters. Package/registry support is currently a foundations and modelling story, not a set of production package-manager endpoints. The safest architecture keeps gateway traffic on the public data plane, operator lifecycle on the private admin plane, and durable truth in Anvil's source records rather than in protocol-specific side stores.
+
+## Gateway design test
+
+Before adding or enabling a gateway path, write down the native Anvil operation it represents. For S3 `PUT Object`, name the tenant, bucket, key, metadata, public policy action, region, mutation context, and whether the protocol can express the precondition you need. For static HTTP, name the host alias, bucket prefix, link behaviour, cache headers, and public-read decision.
+
+If the outside protocol cannot express a safety requirement, do that part through the native API. Gateways should widen client compatibility, not weaken Anvil's storage, authorisation, or topology model.

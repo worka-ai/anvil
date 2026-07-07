@@ -269,3 +269,9 @@ The postmortem should also record what not to repeat: direct storage edits that 
 The current repository provides useful diagnostics, repairs, audit, public/admin CLIs, gateway request ids, and feature-specific smoke paths, but it is not a complete incident platform. There is no documented general `corestore fsck`, no bundled dashboard pack, no single command that certifies all derived systems, and no complete graceful drain workflow for every lifecycle case. Some watch and PersonalDB projection evidence is API-only. Some public policy scopes are coarser than ideal, especially object listing and index read surfaces.
 
 Plan incidents with those limits in mind. Prefer evidence-preserving mitigations, use API surfaces where the CLI is compact, keep admin and tenant work on their proper planes, and file missing operational surfaces as gaps instead of filling them with direct storage edits or undocumented bypasses.
+
+## Source-versus-derived triage
+
+The fastest way to reduce incident scope is to compare a source read with the failing derived path. If object reads work but search fails, focus on index builders, selectors, diagnostics, and result filtering. If object reads fail through both native and gateway paths, focus on object existence, policy, routing, or storage. If admin topology reads fail but public reads continue, focus on the admin listener or system-realm authorisation rather than tenant credentials.
+
+Capture audit before changing state. A recent policy revoke, region drain, host-alias suspension, or secret rotation can explain symptoms that otherwise look like storage faults.

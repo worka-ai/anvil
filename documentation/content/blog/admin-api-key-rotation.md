@@ -88,3 +88,9 @@ The deployment boundary is now clearer:
 - use network admin commands for tenant, application, policy, bucket, mesh, diagnostics, repair, audit, and key rotation work.
 
 This is the direction Anvil's operator surface will continue to follow: server-owned durable state, network-administered control, explicit authorisation, and auditability for every administrative mutation.
+
+## Operator takeaway
+
+The change is intentionally conservative: the server remains the only writer of durable Anvil state, while operators express intent through the authenticated admin API. That means provisioning jobs no longer need the storage mount or the active secret-encryption key. It also means admin automation can be audited, retried with idempotency, and constrained by system-realm relations instead of filesystem access.
+
+If an operational process still asks for direct storage access to create tenants or grants, update that process to use `anvil-admin` against the private admin listener.

@@ -152,3 +152,9 @@ These are not reasons to avoid indexes. They are reasons to choose boundaries de
 ## What to take forward
 
 An Anvil index is a derived, authorised, repairable view over source records. `selector_json` decides what can enter the view, `extractor_json` and `build_policy_json` decide what is materialised, and query fields ask questions of the materialised rows. Pick the index kind that matches the question, keep `inherit_object` unless the derived data is deliberately safe for every index reader, treat page tokens as bound and opaque, and use catch-up, diagnostics, watches, and repair to make freshness and correctness explicit.
+
+## Freshness and correctness example
+
+Suppose an app uploads `contracts/alpha.json` and immediately queries a typed JSON index for `status = active`. A direct object read can be fresh before the index builder has processed the object metadata stream. That is not an inconsistency in the object store; it is derived-view lag. The caller has three choices: tolerate the lag, use query catch-up controls for a known watch cursor, or read the source object directly when strict freshness is required.
+
+Result visibility is a separate correctness check. If the index uses `inherit_object`, a matching document can still be filtered out because the caller lacks object read visibility. If the index uses `index_only`, query permission is the visibility boundary for derived fields. Choose that only when the indexed fields are safe to expose to every principal with index read authority.

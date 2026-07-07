@@ -194,3 +194,9 @@ These limitations do not make topology optional. They tell you where to be caref
 A mesh is Anvil's routing and lifecycle universe. A region is the placement and routing boundary. A cell is a failure and capacity boundary inside a region. A node is one Anvil process with declared capabilities. Lifecycle state decides whether those records can receive work. Generations protect operator updates. Bucket locators connect tenant buckets to home regions and cells. Routing descriptors let requests find the right place.
 
 If you keep that model clear, later topics become easier: bucket creation is placement, redirects are region decisions, host aliases are routing descriptors, drains are lifecycle transitions, repair rebuilds projections, and local setup is not a special toy model but the smallest useful mesh.
+
+## Topology as an operator contract
+
+A region name is part of the durability and routing contract for buckets. A cell name is part of the operator's failure-domain contract. A node id is part of the lifecycle contract for one server process identity. Treat those names as durable operational identifiers, not labels to casually rename after traffic starts.
+
+A node can advertise capabilities such as object, index, PersonalDB, gateway, or admin, but those capabilities do not create a separate worker class. The same Anvil process participates in mesh state and uses leases for background tasks. When writing runbooks, prefer "node with index capability" over "index worker node" so the lifecycle model remains accurate.

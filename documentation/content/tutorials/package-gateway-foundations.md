@@ -15,6 +15,10 @@ Applications should call the public APIs directly when they own the publishing w
 
 For the broader concepts, read [Gateways](/learn/gateways/), [Reads, Listing, and Links](/learn/reads-listing-and-links/), [Indexes and Query](/learn/indexes-and-query/), [Public CLI](/reference/public-cli/), and [Authorisation Actions and Resources](/reference/authorisation-actions-and-resources/).
 
+This tutorial models a package gateway as ordinary Anvil data first and protocol compatibility second. You will store immutable artefacts, publish version manifests, move channels with links, build a typed catalogue, and decide what belongs on public delivery surfaces before thinking about gateway-specific request syntax.
+
+Everything in this page is tenant-owned public-plane work. Use `anvil` or the public API for package objects, links, catalogue indexes, and public-read policy. Do not use `anvil-admin` to publish packages or move channels. Operators may configure gateway routing and tenant bootstrap, but package state belongs to the tenant.
+
 ## Separate the product model from the protocol
 
 A package manager usually presents one convenient command such as "publish this package" or "install the latest version". Under that command are several separate state changes. The package archive is content-addressed and should be immutable. A version manifest records the package name, version, digest, media type, size, and any ecosystem metadata. A channel such as `latest`, `stable`, or `beta` is mutable and should move with a compare-and-swap check. A catalogue or search page is derived data over committed manifests. Pull and publish permissions are different authorisation decisions.
@@ -161,6 +165,8 @@ A package catalogue is derived data. It should help users answer questions such 
 
 The following index selects manifest objects under `packages/` and extracts fields from the JSON body. The build policy uses `object_current`, which means the index sees the current version of each manifest object.
 
+Read the JSON fields before running the command. `selector_json` is the build-time boundary: only source object keys under `packages/` are eligible. `extractor_json` is `{}` because current `typed_json` indexes put field definitions in `build_policy_json`. The build policy names each typed field and the JSON Pointer that extracts it from the manifest body. Query-time `typed_predicates_json` and `typed_order_json` later ask questions of those materialised fields; they do not change what the index stores.
+
 ```bash
 anvil --profile acme index create documents package_catalog typed_json \
   --selector-json '{"prefix":"packages/"}' \
@@ -181,7 +187,9 @@ anvil --profile acme index query documents package_catalog \
   --limit 20
 ```
 
-A successful query proves the typed predicate array and order array parsed, a materialised segment was available, and each returned hit was visible under the index's authorisation mode. Because the index uses `inherit_object`, the caller still needs object read visibility for the manifest object. If the command returns no rows, do not immediately conclude that no versions exist. The index may not have caught up, the selector may be wrong, the manifest JSON may have failed extraction, or the caller may not be allowed to see the manifest.
+A successful query proves the typed predicate array and order array parsed, a materialised segment was available, and each returned hit was visible under the index's authorisation mode. Because the index uses `inherit_object`, the caller still needs object read visibility for the manifest object. If the command returns no rows, do not immediately conclude that no versions exist. The index may not have caught up, the selector may be wrong, the manifest JSON may have failed extraction, the JSON value types may not match the predicate, or the caller may not be allowed to see the manifest.
+
+A package client should treat catalogue rows as discovery data. Before installing, read the manifest object and validate the artifact digest, size, signature/provenance fields, and policy that your package ecosystem requires. The typed index helps find candidates; it is not the package-verification engine.
 
 Use diagnostics when rows are missing:
 
@@ -228,3 +236,11 @@ Today's public surfaces let you model packages, but they do not enforce a comple
 Gateway-specific implementation is also intentionally limited today. S3 and static object delivery exist; package protocol handlers, package gateway CLI commands, public mount management, registry-token challenge endpoints, and package upload sessions are not exposed. If a necessary workflow is not in the current public API or CLI, document it as a gap and keep the publishing path on ordinary Anvil objects until the gateway exists.
 
 Keep the security boundary simple: public API and S3 gateway for tenant package publishing and pulling, public policy scopes plus relationship authorisation for decisions, object links for movable names, indexes for derived catalogues, and the private admin API only for operator lifecycle and repair.
+
+## Success and failure cues
+
+A package gateway design is on the right track when immutable artefact keys never move, manifests describe exactly what clients install, channel links move with generation checks, and catalogue indexes can be rebuilt from source objects. If a client sees an unexpected package, check the channel link generation, manifest body, typed catalogue row, and public-delivery policy before assuming the protocol adapter is wrong.
+
+## Where to go next
+
+Read [Object Versions, CAS, and Links](/tutorials/object-versions-cas-and-links/) for safer channel movement, [Indexes, Path Metadata, and Typed Query](/tutorials/indexes-path-metadata-and-typed-query/) for catalogues, and [Public Access](/tutorials/public-access/) before serving artefacts anonymously. Operators planning a real package gateway should also read [Gateway Operations](/operators/gateway-operations/).

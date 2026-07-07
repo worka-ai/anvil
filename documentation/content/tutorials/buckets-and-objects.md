@@ -11,6 +11,19 @@ Buckets and objects are tenant/public API work. Do not use the private admin CLI
 
 For the model behind this page, read [Object Model](/learn/object-model/) and [Reads, Listing, and Links](/learn/reads-listing-and-links/). Versions, compare-and-swap writes, and links are introduced here only briefly; the detailed flow belongs in [Object Versions, CAS, and Links](/tutorials/object-versions-cas-and-links/). The CLI reference is [Public CLI](/reference/public-cli/), and the permission strings used by the examples are detailed in [Authorisation Actions and Resources](/reference/authorisation-actions-and-resources/).
 
+The page deliberately separates the data model from CLI convenience. You will learn what a bucket protects, what an object key means, which command proves placement and authorisation, why list access is different from read access, and where the public API is more precise than the current helper CLI.
+
+## Prerequisites and current authority
+
+Before running commands, check which principal your shell will use. Both public and admin CLIs honour `ANVIL_AUTH_TOKEN`, so a leftover system-admin token can hide missing tenant grants. For this page, mint a tenant token from the `acme` profile:
+
+```bash
+export ANVIL_AUTH_TOKEN="$(anvil --profile acme auth get-token)"
+printf 'using acme token with %s characters\n' "${#ANVIL_AUTH_TOKEN}"
+```
+
+This proves token exchange for the tenant app, not bucket readiness. Bucket creation can still fail if topology has not made `local` writable. Object upload can still fail if the current CLI needs a broader bucket lookup than the exact object grant. Keep those failures separate while reading the rest of the page.
+
 ## Understand buckets and object keys
 
 A **bucket** is a tenant-scoped namespace. The `acme` tenant can have a bucket named `documents`, and another tenant can also have a bucket named `documents`, because the tenant boundary is part of every authorisation and routing decision. Use buckets for durable operational boundaries: placement, lifecycle, policy shape, gateway exposure, indexing strategy, and recovery scope.
@@ -104,3 +117,11 @@ That API shape is why application clients can be more precise than the current C
 ## What you should take forward
 
 Use buckets as tenant-scoped operational boundaries, not as tiny folders. Put stable scope early in object keys. Treat object metadata as protected data. Grant reads, writes, deletes, and listings separately. Do not use the private admin API for tenant object work. And when a command is denied, read the denial as a useful signal: either the region is not ready for placement, the bucket does not exist, or the current principal does not have the specific public API scope required for that operation.
+
+## Success and failure cues
+
+A successful bucket create proves public-plane tenant authority and a writable placement target. A successful object upload proves the bucket exists, the exact key is writable, and the public object path can commit a current version. Permission denied on listing is expected in the least-privilege path unless `object:list` was granted, and placement errors are expected while the region remains unactivated. Keep those failure classes separate; broadening grants cannot fix a region lifecycle precondition.
+
+## Where to go next
+
+After you understand bucket placement and one-object access, read [Object Versions, CAS, and Links](/tutorials/object-versions-cas-and-links/) for safe updates and aliases, then [Metadata and Typed Fields](/tutorials/metadata-and-typed-fields/) before adding queryable structure. If you are still blocked on placement, return to [Mesh Regions, Cells, and Nodes](/tutorials/mesh-regions-cells-and-nodes/) instead of widening tenant credentials.

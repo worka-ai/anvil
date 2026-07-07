@@ -201,3 +201,9 @@ Several limits are current behaviour, not operator error:
 | Specialised kinds | `personaldb_row_metadata` and `git_source` are enum values, not generic materialised `QueryIndex` paths today. Use their service-specific APIs and docs. |
 
 These limits should shape product and operator runbooks. Keep protected corpora on `inherit_object`, split buckets when bucket-level `index:read` is too broad, prefer focused selectors, make malformed records visible through diagnostics, and treat full-text/vector/hybrid freshness as derived lag until the implementation exposes stronger catch-up evidence.
+
+## Query complaint triage
+
+When a user reports a missing search result, check in this order: source object exists, caller can read the object, selector includes the object, extractor succeeds for the object, builder cursor has reached the write, query predicates match, and result authorisation does not filter the hit. This order prevents rebuilding an index when the actual issue is a policy grant or a selector mismatch.
+
+For vector and hybrid indexes, also verify provider configuration, dimension, and whether the query vector length matches the index definition.

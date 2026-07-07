@@ -233,3 +233,9 @@ Placement is bucket-level in the tenant-facing model, and region lifecycle must 
 The object model is the source vocabulary for Anvil. A storage tenant owns buckets. A bucket owns keys. A key has a current pointer. A current pointer names a committed version or delete marker. A version has bytes, metadata, identity, and evidence. Links are aliases, not copies. Prefixes are naming structure, not directories. Placement belongs to buckets and mesh routing. Gateways adapt protocols onto this model; they do not replace it.
 
 If you keep those distinctions clear, the rest of Anvil becomes easier to reason about. Reads, writes, indexes, watches, authorisation, public access, S3, static hosting, repair, and mesh routing all become different views over the same durable object records.
+
+## Example object lifecycle
+
+Consider `s3://documents/projects/42/report.pdf`. The tenant owns the `documents` bucket. The key is `projects/42/report.pdf`. A first upload creates a version and moves the current pointer to that version. A later replacement creates another version and moves the current pointer again if the write precondition passes. A stable link such as `projects/42/current-report.pdf` can point at the current key or a pinned version, depending on whether readers should follow future replacements.
+
+That lifecycle gives operators several observable facts. A direct object read proves current pointer resolution and byte retrieval. A `HEAD` proves metadata visibility. A prefix listing proves the directory-derived view has caught up far enough. A link read proves the link descriptor and generation. An index query proves the derived index generation and query authorisation. When those disagree, source reads are the first truth to check; derived views should be repaired from source records rather than edited directly.

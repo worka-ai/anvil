@@ -11,6 +11,14 @@ Public access in Anvil is not a bypass. It is a bucket policy choice that change
 
 Use the public API or a client library for automation. The `anvil bucket set-public` CLI command in this page is a manual helper over the public Bucket API. For the surrounding model, read [Authorisation](/learn/authorisation/), [Gateways](/learn/gateways/), [Public CLI](/reference/public-cli/), and [Authorisation Actions and Resources](/reference/authorisation-actions-and-resources/). Public object delivery through protocol adapters is covered in [S3-Compatible Gateway](/tutorials/s3-gateway/) and [Static Hosting and Aliases](/tutorials/static-hosting-and-aliases/).
 
+The goal is to make anonymous delivery boring and explicit. You will decide which surfaces can serve public data, enable and verify public-read policy for a bucket, and learn why public access does not imply admin access, list access, private-object access, or hidden gateway magic.
+
+## Prerequisites and exposure decision
+
+Public access is a tenant data decision, not an operator shortcut. The examples assume a tenant app with `bucket:write` on the target bucket and object data that is safe for anonymous readers. Do not enable public-read on a bucket that also contains private objects unless the whole bucket is designed for public delivery. Moving a private object into a public bucket should be treated as publishing it.
+
+Before changing policy, write down what an unauthenticated caller should be able to do: read one object, read all current objects in a public prefix, use S3-compatible GET, or hit a static hostname. Then verify exactly that surface. Public-read should never imply admin API reachability, object writes, private-bucket reads, or broad list access unless the documented public route explicitly provides it.
+
 ## What public means
 
 A private bucket requires an authenticated principal and a successful authorisation decision before object data is returned. That decision can come from public policy scopes, relationship authorisation, or another allowed path in the service.
@@ -119,3 +127,11 @@ Turning public-read off is not the same as erasing every copy. Browser caches, C
 ## What to take forward
 
 Use public-read only for buckets whose contents, names, metadata, and versions are safe for anonymous readers. Keep private and public data in separate buckets where possible. Remember that public access is a data-plane read policy, not an admin bypass. Verify public delivery with a request that truly has no credentials. Keep the admin API private. Record and review public-read changes as security-relevant configuration changes, because the effect is simple: anyone who can reach the public surface can read the matching data.
+
+## Success and failure cues
+
+A public-read bucket should serve the intended object through an unauthenticated public path and still deny private paths, writes, admin operations, and unrelated buckets. If an anonymous read fails, check bucket public policy, object key, region/gateway routing, host alias state, and content existence before changing app credentials. If an anonymous list succeeds when you did not intend it, treat that as a data-exposure incident.
+
+## Where to go next
+
+For browser-style websites and custom hostnames, continue to [Static Hosting and Aliases](/tutorials/static-hosting-and-aliases/). For S3-compatible anonymous reads, read [S3 Gateway](/tutorials/s3-gateway/). In either case, treat public-read policy as a data exposure decision and verify it through the same public surface users will actually hit.

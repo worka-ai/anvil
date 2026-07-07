@@ -11,6 +11,14 @@ This page assumes you know ordinary SQLite tables and transactions. It teaches t
 
 Applications should use the public `PersonalDbService` API or a generated/client library for production synchronisation. The `anvil personaldb` commands are manual helpers for creating groups, reading definitions, checking catch-up state, and tailing watch streams. They do not currently expose every request field needed for a complete production commit loop.
 
+PersonalDB is not another object bucket. This page teaches the group, commit, witness, projection, catch-up, and watch vocabulary you need before building offline-capable or replica-driven features on Anvil's PersonalDB service.
+
+## Prerequisites and ownership boundary
+
+PersonalDB groups are tenant-owned public-plane resources. Use `anvil personaldb ...` or the public PersonalDB API for the group, changeset, catch-up, watch, and projection examples. Do not use `anvil-admin` to submit application changesets. Admin diagnostics and repair may inspect PersonalDB log-chain health later, but the committed data model belongs to the tenant.
+
+A safe reader should know three values before building a replica loop: the database or group id, the last committed head or witness it has durably applied, and the projection cursor if it maintains a derived view. Without those values, a client cannot distinguish "I am caught up" from "I lost my place" after a restart.
+
 ## How PersonalDB differs from object storage
 
 Object storage stores bytes at keys. You can version an object, attach metadata, and use preconditions to avoid overwriting another writer. That is the right model for documents, images, exports, snapshots, and other named blobs.
@@ -288,3 +296,11 @@ Use objects for large attachments or full SQLite snapshot payloads, and use Pers
 PersonalDB lets SQLite remain the application database while Anvil witnesses the shared history. The group manifest tells clients which schema and epochs are active. The committed head tells replicas where the accepted chain ends. Changeset commits are authorised, witnessed, certified, and replayable. Watches let consumers avoid rescanning, and projections turn source commits into derived PersonalDB groups when the server needs filtered or transformed data.
 
 The current API is the reliable production surface. The current CLI is useful for group/projection setup, read checks, catch-up counts, watches, and repair inspection, but it is not yet a full PersonalDB sync client.
+
+## Success and failure cues
+
+A PersonalDB group is healthy when commits form a verifiable chain, catch-up returns the missing range a replica requested, and projections can state which source cursor they reflect. A watch event means the group advanced; it does not prove a projection is already current. Repair evidence should be read as log/projection evidence, not as object-store evidence. If your application cannot name its last durable commit or projection cursor, it cannot recover safely.
+
+## Where to go next
+
+Read [Watches](/tutorials/watches/) for the group-watch shape used by PersonalDB projection workers, and [Repair and Diagnostics](/tutorials/repair-and-diagnostics/) before building operator runbooks around log-chain or projection repair. If your product only needs immutable blobs and current pointers, return to [Buckets and Objects](/tutorials/buckets-and-objects/) instead of forcing it into PersonalDB.

@@ -23,6 +23,14 @@ There is one important prerequisite gap in the tutorial chain: the previous page
 
 Those are public policy scopes. They authorise the API calls that write schemas, write tuples, and perform checks. They are not relationship tuples themselves, and they are not system-realm admin relations. Do not replace this table with wildcard grants just to make a local script easier.
 
+The goal is to make authorisation concrete on one document before you apply it across a product. You will see how public policy scopes let a service call Anvil APIs, how relationship tuples express product access, how schema bindings give those tuples meaning, and how checks, zookies, and watches fit into a safe application flow.
+
+## Prerequisites and scope setup
+
+The commands in this page require public policy scopes for relationship-authorisation administration. That is intentional. A service cannot write schemas or tuples just because it can read an object, and a relationship tuple cannot mint a bearer token. Before running the examples, make sure the current `acme` profile represents a tenant app that has been delegated the exact `authz:schema_write`, `authz:schema_read`, `authz:tuple_write`, `authz:tuple_read`, `authz:check`, and `authz:watch` resources named below. If a command fails with permission denied, fix the public policy grant for that API operation; do not move the operation to `anvil-admin` and do not try to edit the system realm.
+
+The examples use `document/documents/tutorial/welcome.txt#viewer`-style resources because the document namespace, object id, and relation are part of the public policy check. The object id deliberately includes the bucket/key pair from the object tutorial so you can see how a product document maps onto an authz object.
+
 ## Keep the two authorisation layers separate
 
 Anvil has two authorisation layers that work together but answer different questions.
@@ -332,3 +340,11 @@ There is no complete public schema grammar reference page in this documentation 
 ## What you should take forward
 
 Use public policy scopes to decide who may call Anvil APIs. Use relationship tuples to describe who is related to application objects. Use schemas and bindings as reviewed, versioned contracts for a realm. Use usersets when one relation should include another relation. Use checks for effective access decisions, not tuple listings. Carry zookies when a later read must observe a previous write. And keep tenant-owned authz work on the public API; do not use tenant credentials to modify Anvil's built-in system realm.
+
+## Success and failure cues
+
+Schema writes and bindings prove the tenant can define a relationship vocabulary, while tuple writes prove it can record facts in that vocabulary. A successful `check` proves the effective relation at the requested consistency, not merely that a direct tuple exists. If a check denies unexpectedly, inspect the active schema binding, tuple coordinates, subject kind, zookie mode, and caveat hash before adding more public policy scopes; API-call authority and product access are separate layers.
+
+## Where to go next
+
+Apply the same layer separation in [Object Versions, CAS, and Links](/tutorials/object-versions-cas-and-links/) and [Indexes, Path Metadata, and Typed Query](/tutorials/indexes-path-metadata-and-typed-query/), where relationship visibility can affect reads and search results. For the complete resource/action table, use [Authorisation Actions and Resources](/reference/authorisation-actions-and-resources/); for design background, use [Learn: Authorisation](/learn/authorisation/).

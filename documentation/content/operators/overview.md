@@ -48,3 +48,9 @@ For release work, combine this book with the references. The operator chapters e
 The operator documentation is intentionally conservative about unsupported behaviour. Some workflows are still easier to describe conceptually than to drive end-to-end from a public CLI, especially around fine-grained lifecycle checkpoints, drain completion, derived repair surfaces, and newer gateway foundations. Treat those notes as operational constraints, not as invitations to bypass the API.
 
 The safe posture is consistent across the book: keep the admin API private, use the public API for tenant-facing work, store durable state in CoreStore-backed records, make derived consumers checkpoint only after their work is durable, and prefer diagnostics before repair. Where current implementation or CLI exposure falls short of that model, the relevant chapter should call out the gap and point you back to the Learn and Reference pages rather than pretending the command exists.
+
+## Daily operator loop
+
+A useful daily check covers both planes and at least one derived view: public readiness, admin diagnostics, storage capacity, recent admin audit events, one tenant object smoke path, and index or watch lag for a known bucket. If those disagree, classify the problem before acting: source data missing, derived view stale, authorisation denied, routing wrong, or gateway translation broken.
+
+Use tenant commands to prove tenant behaviour and admin commands to prove platform behaviour. A tenant support ticket should not require giving the application an admin credential. An operator topology change should not be made through a tenant app credential.

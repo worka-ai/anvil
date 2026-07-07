@@ -11,6 +11,10 @@ Use [Public CLI](/reference/public-cli/) for tenant-facing command shapes, [Admi
 
 Start by diagnosing before repairing. Diagnostics are read-only evidence about a scoped inconsistency. Repair is an explicit action that may rebuild or rewrite derived state. A repair can make a query, directory index, authorisation projection, PersonalDB log-chain check, or mesh routing projection healthier, but it does not turn derived state into the source of truth.
 
+This page is written for incident moments, when the safest first action is usually to read evidence. It walks from tenant-scoped diagnostics to narrow repair jobs and then to private admin diagnostics, keeping source data, derived data, audit evidence, and rebuild actions distinct.
+
+The plane boundary matters more during repair than during happy-path tutorials. Tenant-owned indexes, directories, PersonalDB groups, and relationship-derived views are inspected through the public API when the tenant has the relevant scopes. System topology, routing, and mesh-wide diagnostics are inspected through the private admin API. Do not use `anvil-admin` to repair a tenant index just because the page later shows admin diagnostics; choose the surface that owns the broken state.
+
 ## Understand what diagnostics and repairs mean
 
 A diagnostic is a record of something Anvil noticed while building, checking, or comparing state. Current diagnostic records carry a source, severity, code, message, scope kind, scope id, optional object key and version id, details JSON, a creation timestamp, and a cursor-like position. For index diagnostics, the public CLI prints the compact part: cursor, severity, code, and message. The API response contains the rest.
@@ -156,7 +160,7 @@ This calls `RepairPersonalDbLogChain`. A successful response proves the caller h
 Tenant diagnostics cannot see mesh lifecycle or routing projection state. Use the admin API only from a private management path. In the local tutorials, the admin listener is private inside the `anvil-local` container, so run the admin CLI through `docker exec` with a bearer token:
 
 ```bash
-export ANVIL_AUTH_TOKEN="$(anvil auth get-token)"
+export ANVIL_AUTH_TOKEN="$(anvil --profile local-system auth get-token)"
 
 docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local \
   anvil-admin diagnostics list --source mesh --limit 50
@@ -241,6 +245,8 @@ A repair response is not the end of the incident. It tells you what the repair b
 
 For an index incident, rerun the query. If the query depends on a recent object write and you saved an object-watch cursor, require catch-up:
 
+The verification query uses the typed-query JSON shape from the index tutorial. `typed_predicates_json` is an array of field/operator/value predicates over fields materialised by the index build policy. `typed_order_json` is an array of stable sort fields. These are query-time inputs; they do not repair or redefine the index.
+
 ```bash
 anvil --profile acme index query documents invoices_by_due \
   --typed-predicates-json '[{"field":"customer_id","op":"eq","value":"acme"}]' \
@@ -277,3 +283,11 @@ Repair is also not a fake runbook for every possible incident. The current CLI/A
 ## What to take forward
 
 Use diagnostics as safe, read-only triage. Use repair only after you know the source, scope, and failing operation. Prefer tenant/public repair for tenant-owned indexes, directory indexes, tenant authz derived indexes, and PersonalDB verification. Use the private admin repair surface for operator-only system concerns such as mesh routing projections, and keep the audit reason concrete enough for later review. After every repair, rerun the original operation and any relevant diagnostics; a repair report tells you what Anvil did, not what the user can now observe.
+
+## Success and failure cues
+
+A diagnostic listing is evidence, not repair. A dry repair run should name the narrow target and either report no findings or create findings you can review. A rebuild is successful only after the user-visible symptom is rechecked against source data, authorisation, and freshness requirements. If a repair touches derived state, never describe it as proving the original object, tuple, stream, or PersonalDB commit was correct.
+
+## Where to go next
+
+Use [Watches](/tutorials/watches/) to understand the source cursors behind derived state, [Indexes, Path Metadata, and Typed Query](/tutorials/indexes-path-metadata-and-typed-query/) for index-specific lag, and [PersonalDB](/tutorials/personaldb/) for log/projection repair vocabulary. Operators should turn the checks in this page into runbooks with [Incident Response](/operators/incident-response/) and [Backup and Recovery](/operators/backup-and-recovery/).

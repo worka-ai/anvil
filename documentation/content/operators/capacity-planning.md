@@ -150,3 +150,9 @@ Index operations expose diagnostics and repair, but not every index family has t
 PersonalDB has rich API concepts for groups, commits, catch-up, projections, watches, snapshots, and repair, but some CLI helpers are compact or incomplete for production synchronisation. Package gateways are foundational rather than complete registry protocol surfaces. Observability concepts and signal names exist, but dashboards and export wiring are deployment work. Billion-tenant or billion-object targets should be validated with representative load tests before being promised to customers.
 
 A practical capacity plan is therefore iterative. Design tenant, bucket, region, cell, node, index, watch, and gateway boundaries. Measure the units above under representative load. Keep repair and drain headroom. Run restore and rebuild drills. Treat derived lag as a first-class signal. Then revise the topology before the next growth step, not after the cell, index, or gateway is already saturated.
+
+## Capacity categories
+
+Separate capacity planning into payload bytes, metadata and stream records, derived index segments, PersonalDB commits and snapshots, gateway/audit records, and rebuild headroom. The last category is operationally important: a rebuild may need to write a complete new derived generation while the old generation still serves reads.
+
+When estimating vector search, include both vector payload size and graph/index overhead. When estimating full-text search, include extracted text and postings. When estimating PersonalDB, include accepted changesets, snapshots, and projection outputs.

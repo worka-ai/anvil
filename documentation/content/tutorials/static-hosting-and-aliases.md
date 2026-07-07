@@ -11,6 +11,14 @@ Static hosting in Anvil is object delivery through a gateway route. A request ar
 
 The API is the primary product surface. Application deployment tools should normally call the public Object API to upload assets, create links, and manage tenant-owned host aliases. The `anvil` CLI commands in this page are supporting manual helpers over that public API. Operators use the private admin CLI only for system-side routing, host-alias lifecycle, repair, and mesh administration. For background, read [Gateways](/learn/gateways/), [Reads, Listing, and Links](/learn/reads-listing-and-links/), [Public CLI](/reference/public-cli/), [Admin CLI](/reference/admin-cli/), and [Authorisation Actions and Resources](/reference/authorisation-actions-and-resources/).
 
+Static hosting in Anvil is object delivery plus routing state. This tutorial explains how links, bucket public-read policy, tenant host aliases, DNS/TLS/proxy ownership, and region gateway configuration fit together so a website route does not accidentally become a private-data leak or an admin-plane dependency.
+
+## Prerequisites and exposure boundary
+
+Static hosting combines tenant-owned data with operator-owned routing. A tenant can write site objects, create links, and request or manage tenant host-alias records where delegated. Operators still own DNS, TLS, trusted proxy configuration, regional gateway routing, and any system host-alias lifecycle that belongs to the admin plane. Keep those responsibilities separate when debugging a failed website request.
+
+Before publishing a hostname, decide whether the backing bucket or prefix is meant to be anonymous. A host alias does not make private objects public by itself, and public-read policy does not create DNS or TLS records. Both sides must be correct for browser delivery to work.
+
 ## Understand host routing before creating records
 
 Anvil has three related URL shapes for object delivery.
@@ -255,3 +263,11 @@ Host alias serving requires both durable alias state and runtime routing configu
 Verification is also deliberately narrow today: Anvil compares the challenge value it is given, but it does not independently query DNS. Treat that as an implementation gap in automated domain onboarding. Do not mark an alias active until your deployment has actually proved domain control.
 
 Finally, keep public and private boundaries visible. Use public APIs for tenant assets, links, and tenant-owned aliases. Use the private admin API only for system routing lifecycle and repair. Do not expose the admin listener to make a website work, and do not put private and public objects in the same bucket unless the whole bucket is safe to publish.
+
+## Success and failure cues
+
+A working static route has four aligned pieces: the alias is verified and active, the incoming `Host` header matches the alias, the bucket/prefix contains the target object or link, and the public-read or signed-read policy permits the request. DNS or TLS success alone does not prove Anvil routing is correct. Likewise, an active alias does not make private bucket content public without the corresponding data-plane policy.
+
+## Where to go next
+
+Use [Public Access](/tutorials/public-access/) for the bucket policy boundary and [S3 Gateway](/tutorials/s3-gateway/) for S3-compatible object access. Operators should pair this page with [Gateway Operations](/operators/gateway-operations/) and [Network and Ports](/operators/network-and-ports/) before wiring real DNS, TLS, trusted proxies, or regional gateway routes.

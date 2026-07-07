@@ -242,3 +242,9 @@ The current operational surface is intentionally conservative. The repository ex
 The current local CoreStore backend uses local shard/control-replica machinery inside one storage path. That improves local integrity checks, but it is not proof that a node can lose its whole volume and reconstruct from other regions. Cross-region routing, proxying, activation checkpoints, and drains have their own current gaps, so do not describe a mesh as disaster-recovery-capable until you have a tested recovery design that matches the deployed code.
 
 The practical posture is simple: protect every node volume, keep server key history with backup retention, preserve node identity intentionally, store admin credentials in a secret manager, take configuration snapshots, test restores in isolation, verify source records before derived views, and document any gap as an implementation or operations gap rather than papering over it with direct storage edits.
+
+## Restore acceptance checklist
+
+A restore is acceptable only after both source and derived behaviours are verified. Check token exchange, bucket listing, object write/read, prefix listing, link read, at least one index query, relationship authorisation check, PersonalDB catch-up if used, admin diagnostics, routing list, and repair finding listing. Record the image digest and secret key ids used for the restored environment.
+
+If the restore passes object reads but fails app token exchange, suspect missing or wrong secret encryption keys. If token exchange works but routing is wrong, suspect topology records or routing projection state. If routing works but search is stale, use index diagnostics and rebuild rather than rejecting the whole backup immediately.

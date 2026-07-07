@@ -181,3 +181,9 @@ Design applications with those facts in mind. Use the API directly when a produc
 ## What to take forward
 
 Anvil authorisation is a layered model. Authentication identifies the caller. Public policy scopes authorise public API calls. Relationship tuples and usersets model product access inside a storage tenant. Revisions and zookies make permission freshness explicit. The system realm authorises private admin operations and is not tenant-owned. Public access changes object read visibility, not Anvil's control plane. The safest designs keep those boundaries visible in code, credentials, runbooks, and audit logs.
+
+## Practical modelling pattern
+
+Start with the public policy scope that lets an application call an Anvil service, then add relationship tuples only for product-level visibility. For a document viewer, the app might need `index:read` on the bucket so it can call the query API, while the query itself uses `inherit_object` and relationship tuples such as `document:doc-42#viewer@user:amy` to decide which hits Amy can see. Removing either layer should deny the result: no public scope means the app cannot call the service, and no relationship means the product subject cannot see the object.
+
+Keep admin authority out of that model. A system-realm relation such as `manage_regions` is for operators changing Anvil topology. It is not a stronger tenant role, and it should not be used to let product code bypass public policy or relationship checks.

@@ -108,3 +108,9 @@ This honesty is intentional. A book-quality storage guide should not make a juni
 Anvil gives you a way to build object-backed applications where bytes, metadata, versions, access, search, events, and operation belong to one explainable model. The public API is where tenants and applications work. The admin API is where operators manage the system boundary. Source records are protected durable truth. Derived views are useful, rebuildable, and sometimes lagging. Gateways are edges. CoreStore is the substrate underneath.
 
 If you keep those distinctions clear, the rest of Learn becomes much easier: every chapter is a deeper explanation of one part of the same system.
+
+## Reading the model as a sequence
+
+A useful way to read the Learn book is to follow one document through the system. First the object model names the document as a bucket/key/version. The write chapter explains the mutation context that made the version visible. The read chapter explains how current pointers, range reads, listings, and links find it again. The authorisation chapter explains which app or product subject can see it. The index chapter explains how a derived search hit is built from the object source record. The watch chapter explains how builders and applications catch up without rescanning. The gateway chapter explains how S3 or static HTTP maps back to the same object. The topology chapters explain which region, cell, and node serve the request.
+
+If a concept seems abstract, ask two questions: where is the source record, and which plane is allowed to mutate it? Those answers usually determine the correct API, CLI, failure mode, and repair path.

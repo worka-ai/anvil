@@ -9,6 +9,8 @@ This tutorial continues from [Full-Text Search](/tutorials/full-text-search/) an
 
 Applications should use the public Index API directly. The `anvil index create`, `anvil index query`, and `anvil index diagnostics` commands below are supporting manual helpers over the same API fields; the complete command surface is in [Public CLI](/reference/public-cli/). Keep [Indexes and Query](/learn/indexes-and-query/) and [Authorisation Actions and Resources](/reference/authorisation-actions-and-resources/) nearby. If you need to combine words and semantic similarity, read [Hybrid Search](/tutorials/hybrid-search/) after this page.
 
+The examples use tiny vectors so the shape is readable, but the contract is production-shaped. You will keep the embedding model, dimension, modality, metric, normalisation, extractor, and ANN settings explicit; then query with a vector from the same space and preserve per-object visibility in the result set.
+
 ## Understand the vector contract first
 
 An embedding is a list of numbers produced by a model. A text embedding model might turn "renewal payment notice" into a vector such as `[0.10, 0.20, 0.30, 0.40]`; an image model might produce a much longer vector for an image. The numbers do not mean much one by one. Their value comes from the model arranging related inputs near each other in the same vector space.
@@ -26,6 +28,8 @@ Anvil's vector definition uses ANN, approximate nearest neighbour, configuration
 ## Prerequisites and current tutorial limits
 
 The commands below are valid current public CLI shapes, but they are illustrative until your local tutorial environment has bucket placement, source objects, index grants, and a running index builder. Earlier tutorial gaps still matter here: the public CLI upload helper cannot attach all metadata-rich object fields, and it does not generate embeddings for you.
+
+Vector indexes are tenant-owned public-plane resources. Create, query, and inspect them with the public Index API or `anvil`, not `anvil-admin`. Operators may configure embedding providers and diagnose system health, but the index definition in this tutorial belongs to the tenant and is authorised by public policy scopes.
 
 Use narrow grants rather than wildcards. The relevant public policy scopes are:
 
@@ -67,7 +71,7 @@ The JSON vector extractor can read a direct numeric array, an object containing 
 
 ## Create a caller-supplied vector index
 
-A vector index keeps its vector extractor inside `build_policy_json`. For kind `vector`, `extractor_json` must be `{}` or `null`; current validation rejects a separate vector extractor there.
+A vector index uses the same four-index-field idea as the structured tutorial, but one detail is different. `selector_json` still chooses which source objects are eligible. For this tutorial, `{"prefix":"tutorial/vectors/"}` means only object keys under that prefix can contribute vectors. `extractor_json` must be `{}` or `null` for kind `vector`; current validation rejects a separate vector extractor there. The vector extractor lives inside `build_policy_json` because it is part of the vector definition alongside embedding provenance and ANN settings. Query-time JSON and flags, such as `--vector`, `--path-prefix`, and `--metadata-filters-json`, narrow or rank rows that were already materialised.
 
 Create a tutorial index over objects under `tutorial/vectors/`:
 
@@ -82,6 +86,8 @@ anvil --profile acme index create documents tutorial_vectors vector \
 This calls `IndexService.CreateIndex`. A successful response proves that the caller authenticated, had `index:create` on `documents/tutorial_vectors`, the bucket exists, the index kind is recognised, the three JSON fields parsed, the vector schema passed validation, and Anvil stored an enabled index definition. It also enqueues build work.
 
 It does not prove that any selected object exists, that every object body is valid JSON, that `/embedding` exists, that the extracted vector has four numbers, or that a vector segment has already been materialised. Those facts are discovered by the index builder and visible through diagnostics.
+
+A typical successful create response from the CLI is terse. Application code should keep the index name, definition version or generation if exposed by the API, and the exact vector contract it sent. Those values are how you later explain why a query vector of length `1536` does not fit a tutorial index declared with `dimension: 4`.
 
 The `selector_json` prefix is a build-time boundary. Objects outside `tutorial/vectors/` are not materialised into this index. Query-time `--path-prefix` can narrow within the selected set, but it cannot make the query search objects that the selector excluded.
 
@@ -109,7 +115,13 @@ anvil --profile acme index query documents tutorial_vectors \
 
 This calls `IndexService.QueryIndex` with `query_vector` set to the four numbers from the CLI flag. A successful response proves that the caller has `index:read` on `documents`, the index exists and is enabled, a vector segment is available, the query vector dimension matches the segment, and every printed hit passed the index's authorisation mode checks.
 
-The CLI prints `score`, `object_key`, and `metadata_json`. For direct vector queries, current metadata includes details such as bucket name, metric, and modality. Results are ordered by score descending. For `cosine` and `dot`, higher means more similar under that metric. For `l2`, higher still means closer because Anvil returns negative distance as the score.
+The CLI prints `score`, `object_key`, and `metadata_json`. For direct vector queries, current metadata includes details such as bucket name, metric, and modality. Results are ordered by score descending. For `cosine` and `dot`, higher means more similar under that metric. For `l2`, higher still means closer because Anvil returns negative distance as the score. A typical row is shaped like this:
+
+```text
+score=0.992 object_key=tutorial/vectors/renewal.json metadata_json={...}
+```
+
+Read this as retrieval evidence, not as the source document. If the application needs the title, snippet, or current business fields, perform a normal authorised object read after choosing which hits to show.
 
 If the command fails with `query_vector dimension mismatch`, the query vector length does not match the index dimension. If it fails with `IndexUnavailable`, the definition exists but no vector segment is available yet. If it returns no rows, possible causes include no matching vectors, indexing lag, metadata/path filters, or object visibility under `inherit_object`.
 
@@ -163,3 +175,11 @@ Common vector diagnostics include invalid JSON bodies, unsupported JSON vector s
 ## What to take forward
 
 Use vector search for semantic similarity, not for exact words, boolean syntax, or structured workflow predicates. Keep model, dimension, modality, metric, normalisation, and chunking as explicit contracts. Prefer caller-supplied vectors when your application already owns the embedding pipeline, and use provider-generated vectors only after configuring a production embedding provider on the server. Query with a vector from the same model space, narrow with path and metadata filters, keep `inherit_object` for protected corpora, and treat vector freshness as derived-data lag until the vector catch-up path reports meaningful cursors.
+
+## Success and failure cues
+
+A vector index is healthy only when the source vectors and query vector share the same model contract and dimension. Creation failures usually point to invalid definition JSON or unsupported ANN settings. Missing hits usually come from selector mismatch, absent vectors, dimension errors, provider failures, derived lag, or object-authorisation filtering. Scores are comparable only within the same index, query, metric, and embedding space.
+
+## Where to go next
+
+Continue to [Hybrid Search](/tutorials/hybrid-search/) when you need to blend semantic neighbours with text terms, or return to [Metadata and Typed Fields](/tutorials/metadata-and-typed-fields/) if the product question is really a structured filter. For exact JSON shapes and accepted ANN fields, use [Index Definitions and Query JSON](/reference/index-definitions-and-query-json/).

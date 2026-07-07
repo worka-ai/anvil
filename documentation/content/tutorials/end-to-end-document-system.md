@@ -11,6 +11,8 @@ The goal is decision-making, not a copy-and-paste deployment script. Production 
 
 This page builds on [Tenants, Apps, and Credentials](/tutorials/tenants-apps-and-credentials/), [Buckets and Objects](/tutorials/buckets-and-objects/), [Metadata and Typed Fields](/tutorials/metadata-and-typed-fields/), [Object Versions, CAS, and Links](/tutorials/object-versions-cas-and-links/), [Authorisation](/tutorials/authorisation/), [Path, Metadata, and Typed Query Indexes](/tutorials/indexes-path-metadata-and-typed-query/), [Full-Text Search](/tutorials/full-text-search/), [Vector Search](/tutorials/vector-search/), [Hybrid Search](/tutorials/hybrid-search/), [Watches](/tutorials/watches/), [Append Streams and Audit Logs](/tutorials/append-streams-and-audit-logs/), [Task Leases and Fenced Mutations](/tutorials/task-leases-and-fenced-mutations/), [Public Access](/tutorials/public-access/), [Static Hosting and Aliases](/tutorials/static-hosting-and-aliases/), and [Repair and Diagnostics](/tutorials/repair-and-diagnostics/). Keep [Public CLI](/reference/public-cli/), [Index Definitions and Query JSON](/reference/index-definitions-and-query-json/), and [Authorisation Actions and Resources](/reference/authorisation-actions-and-resources/) nearby for exact reference syntax.
 
+This chapter is the integration map for the tutorial series. It uses a single document system to show where each Anvil primitive belongs: objects for the canonical record, tuples for end-user access, links for stable names, indexes for derived views, watches for maintenance, append streams for history, leases for workers, and diagnostics for incident review.
+
 ## Start with the current tutorial limits
 
 The earlier limits still apply. A local `documents` bucket may not exist until the `local` region is active and writable. The current public CLI upload helpers build mutation contexts by listing buckets, so they can hit the least-privilege `ListBuckets` gap described in [Buckets and Objects](/tutorials/buckets-and-objects/). The CLI `object put` helper also does not expose `content_type`, `user_metadata_json`, version preconditions, structured write preconditions, or mutation batches.
@@ -174,7 +176,9 @@ This update succeeds only if the link is still at generation `1`. If another pub
 
 ## Build structured and text indexes
 
-The object is the source of truth; indexes are maintained shortcuts. Create a typed JSON index for dashboards and queues:
+The object is the source of truth; indexes are maintained shortcuts. Before creating them, separate the JSON roles. `selector_json` chooses source document objects under `library/acme/`. `extractor_json` is empty for the typed index because typed fields are declared in `build_policy_json`; for full-text and hybrid indexes it names the text fields. `build_policy_json` defines typed fields, tokenisation, vector extraction, or ANN settings. Query-time JSON such as `typed_predicates_json` and `typed_order_json` asks questions of rows already built from those definitions.
+
+Create a typed JSON index for dashboards and queues:
 
 ```bash
 anvil --profile acme index create documents docs_workflow typed_json \
@@ -402,3 +406,11 @@ This lists tenant audit events recorded by Anvil services. It does not list your
 The final shape has one source and several derived or supporting views. `documents/library/acme/doc-001.json` is the canonical current document. Relationship tuples say who can see or administer it. Object versions and API preconditions protect concurrent edits. Links give stable aliases without copying payloads. Typed, text, and optional hybrid indexes make the document discoverable. Watches drive workers without rescanning. Append streams record product history. Task leases and API-only fenced mutation batches stop stale workers from committing output. Public/static delivery uses separate public buckets or explicit host aliases when the document is meant for anonymous readers. Diagnostics and repair keep derived state honest without confusing it with source data.
 
 The CLI can prove many pieces manually, but production code should hold the structured API responses: version ids, watch cursors, stream ids, repair finding ids, zookies, fence tokens, and idempotency keys. Those values are the difference between a demo that happens to work and a document system that remains explainable under retries, races, lag, and incident review.
+
+## Success and failure cues
+
+The complete design is healthy when every user-visible answer can be traced back to one source record and one authorisation reason. Search results trace to object versions and index diagnostics, document access traces to tuples or object-read scopes, aliases trace to link generations, history traces to append sequence numbers, and worker output traces to lease fences and idempotency keys. If a component cannot produce that evidence, treat it as a design gap before scaling it.
+
+## Where to go next
+
+Use this page as a design checklist. When you implement a real service, revisit the individual tutorials for exact API shapes and carry the durable values they name: version ids, zookies, watch cursors, stream ids, lease fence tokens, diagnostic cursors, and idempotency keys. For operations, turn the same model into deployment, security, backup, and incident runbooks under [Operators](/operators/overview/).

@@ -122,3 +122,9 @@ Those gaps do not make PersonalDB conceptual only. They mean production applicat
 ## What to take forward
 
 PersonalDB is a local-first replication primitive, not an object bucket and not a hosted SQL database. A client edits SQLite locally, submits SQLite changesets, stores commit certificates, catches up from a known head, and tails watches for new history. Anvil validates and witnesses the ordered group log, enforces group and row-level authorisation, builds snapshots and projections, and records enough evidence for repair. The safest designs treat every replica, projection, and repair tool as a consumer of the same committed chain rather than as a second source of truth.
+
+## PersonalDB versus object storage
+
+Use ordinary objects when the source of truth is a file, document, model, package, or media payload. Use PersonalDB when the source of truth is an ordered sequence of SQLite changes accepted from local replicas. Storing a SQLite database file as an object can preserve bytes, but it does not provide commit witnessing, catch-up, projection records, or row-level authorisation evidence.
+
+A PersonalDB incident should therefore be debugged as a log and witness problem: which replica submitted the changeset, what base log index it claimed, which commit certificate was returned, which snapshot generation is current, and which projection cursor has caught up.

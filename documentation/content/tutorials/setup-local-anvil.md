@@ -5,27 +5,46 @@ description: Start a Docker-based local Anvil node and learn the listener, crede
 
 # Run Anvil Locally
 
-This tutorial starts one disposable Anvil node with Docker. It is a learning environment, not a production topology, but it uses the same separation between application traffic, operator traffic, durable state, and credentials that a real deployment uses.
+This tutorial starts one disposable Anvil node with Docker. It is a learning environment, not a production topology, but it uses the same boundaries as a real deployment: one public listener for tenant/application traffic, one private admin listener for operator traffic, one Anvil-owned storage directory, and explicit server secret material.
 
-The command-line tools in this page are helpers over the API. They are useful for manual setup and inspection. Applications should normally use the Rust client or the native API directly, then reserve the CLI for provisioning, smoke tests, and operator checks. The detailed command references are [Public CLI](/reference/public-cli/) and [Admin CLI](/reference/admin-cli/).
+The command-line tools in this page are helpers over APIs. The public CLI is `anvil`; it talks to the public plane. The admin CLI is `anvil-admin`; it talks to the private admin plane except for its local key-generation helper. Applications should normally use the public API or a client library, then reserve the CLIs for provisioning, smoke tests, and operator checks. The command references are [Public CLI](/reference/public-cli/) and [Admin CLI](/reference/admin-cli/).
 
-## Understand the two request surfaces
+By the end of this page you will have a running `anvil-local` container, a host-side public endpoint at `http://127.0.0.1:50051`, a private admin endpoint reachable only from inside the container, and a CLI profile that can exchange the first-start credential for short-lived bearer tokens.
 
-Before you open a port, know which surface you are opening and who is meant to call it.
+## Prerequisites
 
-The **public API** is the application-facing surface. It listens on port `50051` in the default container configuration. Tenant applications, automation jobs, S3-compatible gateway clients, and the public `anvil` CLI use this surface for authentication, bucket and object operations, indexes, watches, PersonalDB, and tenant-owned authorisation. In a real deployment this is the surface you may put behind a public or tenant-facing load balancer. In this tutorial it is published only on `127.0.0.1`.
+You need Docker, a shell, `curl`, and the `anvil` and `anvil-admin` binaries that match the server image you run. The examples use `jq` to read JSON credential files. If you do not have `jq`, the same steps still work; you will copy the `client_id` and `client_secret` fields manually.
 
-The **admin API** is the operator-facing surface. It listens on port `50052` by default. It changes system-level state such as the system realm, tenants, first application credentials, topology, routing, repair operations, and server-side secret envelopes. It must stay on loopback, a private management network, or an equivalent operator-only path. Do not publish it to the internet and do not treat it as an application API.
+Use a scratch directory for generated files. Do not write copied credentials into the repository.
 
-Operators sometimes call these surfaces the public plane and the admin plane. Anvil keeps them separate so that ordinary application traffic can be exposed without also exposing system administration. The split is a network boundary and a mental model: public clients should not need admin reachability, and admin automation should be deliberately routed through a private path. For a fuller treatment of bind addresses, load balancers, cluster traffic, and the `7443` node-to-node port, see [Network and Ports](/operators/network-and-ports/).
+```bash
+mkdir -p /tmp/anvil-tutorial
+cd /tmp/anvil-tutorial
+```
 
-## Generate server secret material with Docker
-
-Anvil needs server-side secret encryption material before it can persist encrypted server secrets, including stored application credential envelopes. Set `ANVIL_IMAGE` to the Anvil server image you intend to run, then generate a local-only value with that image so this setup remains Docker-first. In production, pin the image by release tag or digest and generate/store the key with your secret manager; the lifecycle is covered in [Secrets and Key Management](/operators/secrets-and-key-management/).
+The examples also assume the Anvil image is available to Docker. Set `ANVIL_IMAGE` to the image you intend to run. Production deployments should pin a release tag or digest; `latest` is acceptable only for a disposable local tutorial.
 
 ```bash
 export ANVIL_IMAGE="${ANVIL_IMAGE:-ghcr.io/<your-org>/anvil:latest}"
+```
 
+If the image name is wrong, the first Docker command that uses it fails before Anvil starts. Fix the image reference first; do not change listener or credential settings to work around an image-pull error.
+
+## Understand the two request surfaces
+
+Before you open a port, know which surface you are opening.
+
+The **public API** is the tenant-facing and application-facing surface. It listens on port `50051` in the default container configuration. Tenant applications, automation jobs, S3-compatible gateway clients, static/object gateway traffic, and the public `anvil` CLI use this surface for authentication, bucket and object operations, indexes, watches, PersonalDB, tenant-owned authorisation, app credentials, and public policy grants. In a real deployment this is the surface you may put behind a public or tenant-facing load balancer. In this tutorial it is published only on host loopback.
+
+The **admin API** is the operator-facing surface. It listens on port `50052` by default. It changes system-level state such as the system realm, tenants, first application credentials, mesh topology, routing, repair operations, diagnostics, admin audit reads, and server-side secret envelopes. It must stay on loopback, a private management network, or an equivalent operator-only path. The admin API is not an application API, and tenant applications should not need to reach it.
+
+This split is both a network boundary and an ownership boundary. Public-plane operations belong to tenants where appropriate. Admin-plane operations belong to operators. Later tutorials keep that distinction: buckets, objects, indexes, watches, app delegation, and tenant-owned authz use `anvil`; topology, first tenant bootstrap, admin diagnostics, and mesh lifecycle use `anvil-admin` from inside the private boundary. For production network planning, see [Network and Ports](/operators/network-and-ports/) and [Admin Plane](/operators/admin-plane/).
+
+## Generate server secret material with Docker
+
+Anvil needs server-side secret encryption material before it can persist encrypted server secrets, including stored application credential envelopes. Generate the value with the same image family you plan to run so the tutorial stays Docker-first.
+
+```bash
 export ANVIL_SECRET_ENCRYPTION_KEY="$(
   docker run --rm "$ANVIL_IMAGE" \
     anvil-admin key generate-secret-encryption-key 2>/dev/null
@@ -33,11 +52,21 @@ export ANVIL_SECRET_ENCRYPTION_KEY="$(
 export ANVIL_SECRET_ENCRYPTION_KEY_ID="local-tutorial"
 ```
 
-After this command, your shell has the key material required to start the local server. This key is not an administrator password, not a client secret, and not a bearer token. It belongs only to the Anvil server process that owns the storage directory.
+The `anvil-admin key generate-secret-encryption-key` command is a local helper. It does not call the admin API, does not authenticate, and does not install the key anywhere. It prints random key material suitable for the server environment variable `ANVIL_SECRET_ENCRYPTION_KEY`.
+
+A successful command leaves two shell variables set. You can confirm the key is present without printing the secret itself:
+
+```bash
+printf 'secret key id=%s, key bytes=%s hex characters\n' \
+  "$ANVIL_SECRET_ENCRYPTION_KEY_ID" \
+  "${#ANVIL_SECRET_ENCRYPTION_KEY}"
+```
+
+If key generation fails, check the Docker image and binary path. Do not invent a shorter key or reuse `JWT_SECRET`; those variables protect different things.
 
 ## Start a single-node container
 
-The next command creates a named Docker volume for Anvil-owned state and starts the server. It publishes only the public API on host loopback. The admin API is bound to loopback inside the container and is not published to the host. The first-start credential file is written inside the Anvil volume so you can copy it out deliberately after startup.
+The next command creates a named Docker volume for Anvil-owned state and starts the server. It publishes only the public API on host loopback. The admin API binds to loopback inside the container and is not published to the host.
 
 ```bash
 docker volume create anvil-local-data
@@ -65,48 +94,69 @@ docker run -d \
   "$ANVIL_IMAGE"
 ```
 
-Docker prints the volume name and then the container id. From this point, `/var/lib/anvil` in the container is the durable state directory for this tutorial. Do not edit files in that directory by hand; the server owns CoreStore state, indexes, system-realm records, audit data, and encrypted secret envelopes.
+The command has a few details worth understanding before you continue:
 
-The host can reach `http://127.0.0.1:50051` because the public API was published. The host cannot reach `50052` because the admin API was not published. That is intentional: local admin checks in this page run with `docker exec`, which keeps operator traffic inside the container boundary instead of opening the admin port.
+- `STORAGE_PATH=/var/lib/anvil` tells the server where its durable state lives inside the container. That directory belongs to Anvil; do not edit it by hand.
+- `API_LISTEN_ADDR=0.0.0.0:50051` lets Docker publish the public listener to host loopback. The host-side `-p 127.0.0.1:50051:50051` keeps it local.
+- `ADMIN_LISTEN_ADDR=127.0.0.1:50052` keeps the admin listener inside the container. There is no `-p` line for `50052`.
+- `BOOTSTRAP_SYSTEM_ADMIN_*` values are first-start settings. They are used only when the system realm does not already exist.
+- `ANVIL_BOOTSTRAP_CREDENTIAL_FILE`, `ANVIL_PUBLIC_ENDPOINT`, and `ANVIL_ADMIN_ENDPOINT` help CLI commands run inside the container during this tutorial. They do not make the admin API public.
+
+Docker prints the volume name and container id. From that point, `/var/lib/anvil` in the container is the durable state directory for this tutorial. It contains CoreStore state, indexes, system-realm records, audit data, and encrypted secret envelopes.
+
+If the command fails because the container name already exists, inspect the existing container before deleting it:
+
+```bash
+docker ps -a --filter name=anvil-local
+```
+
+Remove it only if it is the disposable tutorial container you intend to replace. Do not delete a shared or production container to make a local tutorial command pass.
 
 ## Wait for the public API to become ready
 
-Use the public listener's readiness endpoint as a startup check. This confirms the container is accepting local public API traffic; it does not prove that authorisation, credentials, or later tenant setup are correct.
+Readiness is the first proof that the server accepted its configuration and is serving the public listener.
 
 ```bash
 curl -fsS http://127.0.0.1:50051/ready
 ```
 
-If the command exits successfully, the local public API listener is ready for the next step. If it fails, inspect the container logs before changing configuration; startup failures usually point to missing required environment, a reused container name, or a state directory from an earlier incompatible experiment.
+A successful response proves the public endpoint is reachable from the host. It does not prove the first administrator exists, that credentials can mint tokens, or that the admin plane is reachable. Those are separate checks below.
 
-When readiness does not pass, this command shows the recent server log lines without changing the container.
+If readiness fails, inspect logs before changing configuration:
 
 ```bash
 docker logs --tail 80 anvil-local
 ```
 
-Use the log output to fix the cause, then re-run the readiness check. Avoid deleting the volume unless you are intentionally starting the tutorial from scratch.
+Common causes are an invalid image, missing secret environment, an incompatible reused volume, or a port already in use. Avoid deleting `anvil-local-data` unless you are intentionally starting over; deleting the volume deletes the tutorial server state.
 
-## Understand the first administration credential
+## Confirm the first administration credential exists
 
-On first startup, if the system realm does not exist, Anvil initialises that realm and creates the first system administration service principal and credential. In this tutorial the principal is named `system-admin`, and the bootstrap-generated credential file is written to `/var/lib/anvil/bootstrap/system-admin.json` inside the container.
+On first startup, if the system realm does not exist, Anvil initialises that realm and creates the first system administration service principal. In this tutorial the principal is named `system-admin`, and the generated long-lived client credential is written inside the Docker volume.
 
-That file is long-lived credential material for the first system administration principal. It is not a request credential. It does not make API calls by itself. The CLI uses the client id and secret to ask the public API for short-lived bearer tokens, and the admin API still checks system-realm authorisation for each admin operation. If the system realm already exists, the first-start credential settings are ignored rather than creating another first administrator.
+Check that the file exists without printing its secret contents:
 
-Copy the generated file out only so your local CLI can create a profile for this tutorial. The `chmod` keeps the copied secret readable only by your user on Unix-like systems.
+```bash
+docker exec anvil-local sh -c \
+  'test -s /var/lib/anvil/bootstrap/system-admin.json && echo "system-admin credential file exists"'
+```
+
+This proves the bootstrap transaction produced a credential file. It does not prove the credential should be shared. The file contains long-lived credential material: a client id and client secret that can be exchanged for short-lived bearer tokens. Treat it like a password file.
+
+Copy the credential out only so your host-side CLI can create a tutorial profile:
 
 ```bash
 docker cp anvil-local:/var/lib/anvil/bootstrap/system-admin.json /tmp/anvil-system-admin.json
 chmod 600 /tmp/anvil-system-admin.json
 ```
 
-After this command, `/tmp/anvil-system-admin.json` contains the first system administration client id and client secret. Treat it like a password file. Store real deployment credentials in a secret manager, not in `/tmp`, shell history, source control, container images, or chat transcripts.
+In production, store first-start credentials in a secret manager or protected break-glass store. Do not put them in source control, container images, CI logs, or chat transcripts.
 
-## Configure a CLI profile for token exchange
+## Configure a public CLI profile for token exchange
 
-`anvil static-config` writes a CLI profile non-interactively. A profile has a name, the public API endpoint it should call, and the client id and client secret the CLI can use for token exchange. The profile is CLI convenience: it is not a grant, not a separate security boundary, and not the primary product interface for applications.
+`anvil static-config` writes a CLI profile non-interactively. A profile has a name, a public API endpoint, and client credential material. The profile is convenience for the CLI; it is not a grant and not a second security boundary.
 
-The profile points at `http://127.0.0.1:50051` because token exchange is part of public authentication. This command reads the copied credential file with `jq`; if you do not have `jq`, copy the `client_id` and `client_secret` values from the JSON file into environment variables and pass those instead.
+Create a `local-system` profile that points at the public endpoint:
 
 ```bash
 anvil static-config \
@@ -117,40 +167,51 @@ anvil static-config \
   --default
 ```
 
-After this command, the public `anvil` CLI has a default profile named `local-system`. Later commands can use that profile without repeating the endpoint or long-lived credential material on every invocation. For more profile and tenant-facing command examples, see [Public CLI](/reference/public-cli/).
+This command does not call the private admin API. It writes local CLI configuration so later `anvil` commands know how to ask the public authentication service for tokens. If you do not have `jq`, read `/tmp/anvil-system-admin.json`, export the two values manually, and pass them with `--client-id` and `--client-secret`.
 
 ## Mint a short-lived bearer token
 
-You might wonder why `anvil auth get-token` exists when the profile already has a client id and client secret. The difference is credential lifetime and purpose. The client id and client secret are long-lived credential material, so you store and rotate them carefully. A bearer token is a short-lived request credential, so individual API calls can carry it without sending the long-lived secret every time.
-
-This command asks the public API to exchange the profile's client id and client secret for a bearer token, then stores that token in your shell for manual checks.
+A bearer token is the request credential that API calls send. It is shorter-lived than the client secret. The CLI can mint tokens automatically when it has a profile, but making the exchange explicit helps you see what applications do through the public API.
 
 ```bash
-export ANVIL_AUTH_TOKEN="$(anvil auth get-token)"
+export ANVIL_AUTH_TOKEN="$(anvil --profile local-system auth get-token)"
 printf 'received bearer token with %s characters\n' "${#ANVIL_AUTH_TOKEN}"
 ```
 
-The printed length tells you the token exchange worked without dumping the token itself into the terminal. The CLI can also mint tokens automatically when it has a profile, but making the exchange visible here helps you understand what applications do through the API or Rust client.
+The printed length is the expected output. Do not print the token itself into logs. If token exchange fails, debug the public endpoint and the profile values first. A token failure is not an admin-port problem because token exchange happens on the public plane.
+
+When a token expires, run the exchange again. Do not copy old tokens out of terminal scrollback.
 
 ## Check the private admin API without exposing it
 
-The host still should not be able to dial the admin listener. To prove the admin API is alive without publishing port `50052`, run the admin CLI inside the container. The environment variables supplied at container start tell the CLI where the credential file, public API, and admin API are.
+The host should still not be able to dial `50052` directly. To prove the admin API is alive without publishing it, run the admin CLI inside the container and pass the token explicitly:
 
 ```bash
-docker exec anvil-local anvil-admin audit list --limit 5
+docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local \
+  anvil-admin audit list --limit 5
 ```
 
-A successful response means the admin CLI authenticated through the public API, received a bearer token, reached the loopback-only admin API from inside the container, and passed the system-realm authorisation check for listing audit events. For the full operator command surface, use [Admin CLI](/reference/admin-cli/).
+A successful response proves four things: the bearer token is valid, the admin CLI can reach `http://127.0.0.1:50052` from inside the container, the admin API accepted the request, and the system realm authorises this principal to read admin audit events. It does not prove the admin listener is private from every network path; that is a deployment firewall, Docker, Kubernetes, proxy, or load-balancer question.
+
+If this command fails with permission denied, treat it as an admin authorisation issue. If it cannot connect, check `ANVIL_ADMIN_ENDPOINT` inside the container and the server logs. Do not publish the admin port just to make the smoke test easier.
 
 ## Know what an app means in Anvil
 
-The generated `system-admin` identity is an app in current CLI terminology. In Anvil, an app is an application or service principal: a credentialed identity for automation, services, importers, operators, or tenant-owned tools. It is not an S3-era artefact and it is not limited to object storage.
+The generated `system-admin` identity is an app in current CLI terminology. In Anvil, an app is an application or service principal: a credentialed identity for automation, services, importers, operators, or tenant-owned tools. It is not an S3-specific artefact and it is not limited to object storage.
 
-Separate apps let you give different services independent audit trails, rotation schedules, scopes, revocation paths, and least-privilege policies. Do not use the first system administration app as a general application credential. The next tutorial that creates tenants and service principals is [Tenants, Apps, and Credentials](/tutorials/tenants-apps-and-credentials/).
+Separate apps give you different audit identities, rotation schedules, scopes, revocation paths, and least-privilege boundaries. The first system administration app is useful for local bootstrap, but it is too broad for ordinary production work. Later tutorials create tenant apps through the public plane and keep them separate from system administration.
+
+## Success and failure cues
+
+A healthy local setup has three visible signs: `curl /ready` succeeds on `127.0.0.1:50051`, `/var/lib/anvil/bootstrap/system-admin.json` exists inside the container, and `docker exec anvil-local anvil-admin audit list --limit 5` succeeds without publishing host port `50052`.
+
+Use the failing checkpoint to choose the next diagnostic step. Public readiness failures point to server startup or container configuration. Token failures point to the copied credential, profile, or public authentication endpoint. Admin smoke-test failures point to the private endpoint, bearer token, or system-realm relation. These are different failure classes; do not fix one by widening another boundary.
 
 ## Clean up the local node
 
-When you are finished, remove the tutorial container, its Docker volume, the copied credential file, and the shell variables created by this page. Do not run this cleanup if you want to keep experimenting with the same local state.
+Do not run cleanup if you want to continue the tutorial chain. The next pages expect the `anvil-local` container, volume, copied credential, and CLI profile to keep existing.
+
+When you are finished, remove the disposable container, volume, copied credential, and shell variables:
 
 ```bash
 docker rm -f anvil-local
@@ -160,3 +221,7 @@ unset ANVIL_AUTH_TOKEN ANVIL_SECRET_ENCRYPTION_KEY ANVIL_SECRET_ENCRYPTION_KEY_I
 ```
 
 After cleanup, the server state for this tutorial is gone. Your CLI profile may still exist in your user configuration; overwrite it with another profile or edit your CLI config if you no longer want `local-system` as the default.
+
+## Where to go next
+
+Continue to [Bootstrap Administration](/tutorials/admin-bootstrap/) to inspect first-start administration and the private admin API boundary. Then read [Mesh Regions, Cells, and Nodes](/tutorials/mesh-regions-cells-and-nodes/) before tenant bucket placement, because later data-plane examples depend on topology being understood.

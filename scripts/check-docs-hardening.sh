@@ -17,9 +17,16 @@ allowed_tutorial_admin = {
 }
 
 def first_command_group(line: str):
-    if 'anvil-admin' not in line:
+    stripped = line.strip()
+    if stripped.startswith('anvil-admin '):
+        tail = stripped.removeprefix('anvil-admin').strip()
+    elif re.search(r'\banvil-local\s+\\?$', stripped):
+        # Multi-line docker exec command; the next line carries the real command.
         return None
-    tail = line.split('anvil-admin', 1)[1].strip()
+    elif re.search(r'\banvil-admin\b', stripped) and re.match(r'^(docker|podman)\s+exec\b', stripped):
+        tail = stripped.split('anvil-admin', 1)[1].strip()
+    else:
+        return None
     if not tail:
         return None
     tokens = tail.split()

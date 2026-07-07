@@ -157,3 +157,9 @@ The current admin CLI covers the main implemented admin service families: tenant
 There are still surfaces to treat carefully. First-boot can create a named system admin app or write tuples for an explicit subject, but the routine token-authenticated admin path currently checks app subjects. Do not assume arbitrary subject kinds are useful without a compatible authentication path. Region activation uses an activation checkpoint file, while checkpoint generation and drain-completion automation are still coarse operational surfaces; plan those workflows from [Topology Planning](/operators/topology-planning/) and [Mesh Routing and Lifecycle](/learn/mesh-routing-and-lifecycle/) rather than editing records by hand. Some admin reference examples may lag the current CLI; prefer the compiled CLI help and source when an example and the implementation disagree.
 
 The absence of a public or admin command for a desired maintenance action is not permission to mutate CoreStore directly. The safe escalation path is: diagnose through read-only admin/public APIs, run the narrowest implemented repair if one exists, preserve audit evidence, and file the missing workflow as an implementation gap. [Repair and Diagnostics](/operators/repair-and-diagnostics/) and [Incident Response](/operators/incident-response/) describe that posture in more detail.
+
+## Safe admin automation
+
+Admin automation should be narrow, audited, and idempotent. Give each controller a distinct admin principal where possible. Set explicit `--request-id`, `--idempotency-key`, and `--audit-reason` for repeatable jobs. Read current generation before lifecycle updates and pass `--expected-generation` so a stale controller cannot overwrite an operator's newer decision.
+
+Do not run admin automation in the same trust boundary as tenant application traffic. Even read-only admin diagnostics expose platform state that tenant applications should not depend on.

@@ -139,3 +139,9 @@ Design runbooks and application expectations with those gaps visible. Prefer reg
 ## What to take forward
 
 Mesh routing is the layer that connects Anvil's object model to physical and operational reality. Regions decide placement and wrong-region behaviour. Cells describe failure and capacity boundaries. Nodes are single Anvil processes with advertised capabilities. Locators and host aliases route requests to tenant data. Lifecycle states and generations protect topology changes. Activation checkpoints and drains are safety evidence. Cross-region proxying helps where implemented, but it does not bypass authorisation or replace regional routing. The healthiest deployments keep these concepts visible in APIs, operator runbooks, diagnostics, and audit trails.
+
+## Lifecycle decision table
+
+Use `create` or `register` when a resource should exist in source topology records but is not ready for traffic. Use `activate` only after reachability, identity, and dependency checks pass. Use `set-read-only` when writes must stop but reads may continue. Use `drain` when placement or routing should move away from the resource under an explicit disposition. Use `remove` only after the resource is drained and no routing projection should point at it.
+
+If routing output looks wrong, repair the materialised routing record from lifecycle source state before changing source topology again. Changing topology to compensate for a stale projection can make the source model harder to reason about and can hide the original fault.

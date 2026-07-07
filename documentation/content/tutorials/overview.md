@@ -13,6 +13,14 @@ If you are new to Anvil, read the pages in order. If you already operate Anvil, 
 
 For the conceptual background, keep [Learn: Overview](/learn/overview/), [Object Model](/learn/object-model/), [Authorisation](/learn/authorisation/), [Indexes and Query](/learn/indexes-and-query/), [Watches and Derived Data](/learn/watches-and-derived-data/), [Gateways](/learn/gateways/), and [Regions, Cells, and Nodes](/learn/regions-cells-and-nodes/) nearby. For exact command and permission reference, use [Public CLI](/reference/public-cli/), [Admin CLI](/reference/admin-cli/), [Authorisation Actions and Resources](/reference/authorisation-actions-and-resources/), and [Index Definitions and Query JSON](/reference/index-definitions-and-query-json/).
 
+The overview is a reading plan, not a glossary. It tells you what each tutorial builds, which boundaries are intentionally separate, and which local-flow gaps you should treat as documented checkpoints instead of papering over with broad grants or admin-plane shortcuts.
+
+## How to use the tutorials
+
+Each tutorial follows the same pattern: establish prerequisites, introduce the concept, run a concrete public-plane or admin-plane step, explain what success proves, and explain common failure modes. When a page says a command is illustrative, it is not hand-waving; it means the command shape is current but a known prerequisite such as region activation, metadata-rich upload support, or an index builder may not be present in your local chain yet. Treat those notes as part of the tutorial rather than as optional caveats.
+
+If you are reviewing the docs for implementation readiness, check whether every command names the owning plane, the required scope or system relation, and the durable value an application should keep. Those three details are more important than making every local command pass by broadening credentials.
+
 ## What you are building towards
 
 The path ends with a small document system, but the document domain is only a teaching device. Along the way you learn the pattern Anvil expects for many application families: create a tenant boundary, use separate app credentials, write canonical objects, keep protected metadata small, version writes safely, grant relationship-based access, derive query and search indexes, process watches instead of rescanning, record event history in append streams, coordinate workers with leases and fences, expose public copies deliberately, and diagnose or repair derived state without pretending it is the source of truth.
@@ -111,3 +119,11 @@ Those gaps do not weaken the learning path. They are part of the learning path. 
 After each tutorial, ask four questions. What durable state changed? Which principal was authorised to change it? Which API plane owned the operation? What evidence would I use to debug or reverse it later?
 
 If you can answer those questions, continue. If you cannot, reread the page before adding more permissions or moving to the next feature. Anvil is designed so that storage, authorisation, indexes, watches, and repair evidence form one explainable system. The tutorials are written to teach that system in order.
+
+## Success and failure cues
+
+You are ready to leave the overview when you can answer four questions for any tutorial page: which API plane owns the operation, which durable value should application code persist, which authorisation layer is being exercised, and what failure would be considered correct rather than surprising. If those answers are unclear, read the concept page linked by the tutorial before running more commands.
+
+## Where to go next
+
+Start with [Run Anvil Locally](/tutorials/setup-local-anvil/) if you want the Docker-first local path, or jump to [Tenants, Apps, and Credentials](/tutorials/tenants-apps-and-credentials/) if an operator has already provisioned your tenant. Return to this overview whenever you are unsure whether a task belongs to the public plane, the admin plane, a derived index, a watch consumer, a gateway, or a repair workflow.

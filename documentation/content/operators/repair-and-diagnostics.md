@@ -254,3 +254,9 @@ The current repair and diagnostics surface is intentionally focused:
 Current gaps matter during incidents. There is no general `corestore fsck`, no broad automatic proof that every derived system is correct, no universal append-stream repair, no complete CLI projection-repair workflow for every PersonalDB projection case, and some watch/projection evidence is API-only. Some diagnostics are surface-specific and may not cover the path you are investigating. Some repair commands rebuild derived state but intentionally refuse to synthesise committed source records.
 
 The safe operating model is therefore conservative: diagnose read-only first, name the source and derived target, run the narrowest repair available, preserve audit evidence, verify the original symptom, and treat missing repair surfaces as implementation gaps rather than reasons for direct storage edits.
+
+## Repair safety rules
+
+Run the narrowest repair that matches the evidence. Use check/list diagnostics before rebuild when you are still diagnosing. Use tenant repair for tenant-owned derived state. Use admin repair for platform routing or administrative backends. Always preserve command output and request ids so the next operator can see what changed.
+
+Repair cannot create missing source truth. If object metadata streams, authz tuple logs, PersonalDB commits, or lifecycle records are absent after a restore, repeated derived rebuilds will not fix the source gap.

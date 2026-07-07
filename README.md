@@ -118,3 +118,36 @@ See `documentation/content/operators/release-readiness-checklist.md` for the ope
 ## License
 
 Anvil is licensed under the Apache 2.0 License. See `LICENSE`.
+
+## Docker-first local run shape
+
+A single-node local run is useful for learning the planes before building a larger topology. Keep the storage path on a volume, generate real secret material for anything you intend to keep, and remember that the admin listener is private even in local demos.
+
+```sh
+export ANVIL_IMAGE="ghcr.io/anvil-storage/anvil:v0.2.4"
+export ANVIL_SECRET_ENCRYPTION_KEY="$(anvil-admin key generate-secret-encryption-key)"
+
+docker run --rm \
+  --name anvil-local \
+  -p 127.0.0.1:50051:50051 \
+  -v anvil-local-data:/var/lib/anvil \
+  -e STORAGE_PATH=/var/lib/anvil \
+  -e REGION=local \
+  -e API_LISTEN_ADDR=0.0.0.0:50051 \
+  -e PUBLIC_API_ADDR=http://127.0.0.1:50051 \
+  -e ADMIN_LISTEN_ADDR=127.0.0.1:50052 \
+  -e JWT_SECRET="local-jwt-secret-change-me" \
+  -e ANVIL_SECRET_ENCRYPTION_KEY="$ANVIL_SECRET_ENCRYPTION_KEY" \
+  -e CLUSTER_SECRET="local-cluster-secret-change-me" \
+  -e BOOTSTRAP_SYSTEM_ADMIN_APP_NAME=ops-admin \
+  -e BOOTSTRAP_SYSTEM_ADMIN_CREDENTIAL_OUTPUT_PATH=/var/lib/anvil/first-admin.json \
+  "$ANVIL_IMAGE"
+```
+
+After the container is ready, the host can reach only the public plane at `http://127.0.0.1:50051`. The admin listener is bound to loopback inside the container and is deliberately not published to the host. For local admin smoke tests, run `anvil-admin` with `docker exec` so the command executes inside that private boundary; for example, pass `ANVIL_AUTH_TOKEN` into the container and let the in-container CLI call `http://127.0.0.1:50052`.
+
+Tenant applications should use only the public endpoint and the `anvil` CLI or Rust client. If a README example requires the admin CLI to read or write tenant objects, treat that as a documentation bug.
+
+## Plane quick reference
+
+Use the public plane for tenant-owned resources: buckets, objects, object links, tenant application credentials, public policy delegation, relationship tuples, index definitions and queries, watches, append streams, task leases, PersonalDB groups, tenant diagnostics, and tenant repair. Use the admin plane for operator-owned resources: tenants, first application handover, server-side policy grants, secret-envelope rotation, regions, cells, nodes, routing projection repair, administrative diagnostics, and administrative audit. The two planes share authentication mechanics, but they do not share authorisation: public policy scopes do not grant system-realm admin relations.

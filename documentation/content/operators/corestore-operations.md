@@ -183,3 +183,9 @@ The local backend's `4+2` shard layout and five local control replicas are usefu
 Some observability names exist in code before a deployment has exported dashboards for them. Treat the catalog as the signals to wire, not as proof that your environment already alerts on them. Some repairs rebuild derived state but intentionally refuse to synthesize source records. Some old or migrated data may require explicit migration handling if it is not CoreStore-backed.
 
 The safe operational posture is conservative: protect the storage path, keep secrets and storage snapshots together, watch disk and lag, use public/admin APIs instead of direct files, repair derived views from source records, and prove recovery with restore drills.
+
+## CoreStore change control
+
+Any runbook that proposes editing files under `STORAGE_PATH` should stop for review. CoreStore records carry visibility, cursor, checksum, and compare-and-swap expectations that ad hoc file edits cannot satisfy. Prefer API-level repair because repair can write new derived state with the same validation and audit path as the rest of Anvil.
+
+If storage corruption is suspected, preserve the volume before running repeated repair attempts. The first evidence often matters more than making a derived view temporarily green.

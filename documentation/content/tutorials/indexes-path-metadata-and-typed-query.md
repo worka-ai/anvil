@@ -11,6 +11,8 @@ An index is a maintained shortcut over committed Anvil data. It lets an applicat
 
 Applications should call the public Index API directly in production. The `anvil index` commands in this page are manual helpers over the same API fields. Use [Index Definitions and Query JSON](/reference/index-definitions-and-query-json/) for the full JSON grammar, [Authorisation Actions and Resources](/reference/authorisation-actions-and-resources/) for scope strings, and [Public CLI](/reference/public-cli/) for the CLI command reference. The conceptual background lives in [Indexes and Query](/learn/indexes-and-query/) and [Watches and Derived Data](/learn/watches-and-derived-data/).
 
+This page is the foundation for the later search tutorials. It teaches the four JSON fields every index definition carries, then walks from prefix navigation to metadata equality and typed JSON range queries. Pay attention to selector, extractor, build-policy, and query JSON; those same shapes appear in full-text, vector, hybrid, and append-stream indexes.
+
 ## Know the four JSON fields before creating an index
 
 The Index API separates build-time decisions from query-time decisions. Keeping those roles separate prevents two common mistakes: building a huge index because the selector was vague, and expecting a query filter to find rows that were never materialised.
@@ -23,9 +25,15 @@ The Index API separates build-time decisions from query-time decisions. Keeping 
 
 Query JSON is different. `metadata_filters_json`, `typed_predicates_json`, and `typed_order_json` are sent with `QueryIndex`, not stored in the index definition. They ask questions of rows that have already been built.
 
+Read these names literally when reviewing an index definition. The selector answers "which source records are eligible?" The extractor answers "what part of each eligible record should be read?" The build policy answers "how should that extracted material be stored?" Query JSON answers "what question is this caller asking now?" A query cannot recover data that the selector excluded, and changing query JSON does not change the stored definition.
+
+For example, an invoice object under `accounting/invoices/2026-07/acme-1001.json` may be eligible because the selector prefix is `accounting/invoices/`. A typed field named `due_at` may be extracted from `/due_at` in the JSON body. A later query may ask for `due_at <= 2026-07-31T23:59:59Z`. Those are three different decisions, and production code should keep them visible in code review.
+
 ## Prerequisites and current tutorial limits
 
 The local tutorial chain may still be blocked by earlier implementation gaps: region activation may prevent bucket placement, the current public CLI upload helper cannot set `content_type` or `user_metadata_json`, and the previous pages do not automatically grant index scopes. Treat the commands as valid current CLI/API shapes, but do not assume they will run until your local tenant, bucket, region, uploads, index builder, and grants are ready.
+
+The examples use the public `anvil` CLI because index definitions are tenant-owned public-plane resources. Do not use `anvil-admin` to create these indexes. An operator may bootstrap the tenant and initial scopes, but a tenant app with `index:create` owns the index definition and later queries it through the public Index API.
 
 Use narrow grants rather than wildcards. The useful scopes for this page are:
 
@@ -49,6 +57,24 @@ With `index_only` or `public`, the query path does not re-check object read perm
 
 The commands below set `--authorization-mode inherit_object` explicitly so the tutorial is clear even though it is also the default.
 
+## Prepare source objects intentionally
+
+Indexes are only useful when the source object layout is deliberate. A typed invoice object for this tutorial would have a body like this:
+
+```json
+{
+  "invoice_id": "acme-1001",
+  "customer": {"id": "acme"},
+  "state": "open",
+  "due_at": "2026-07-31T23:59:59Z",
+  "amount": {"cents": 129900}
+}
+```
+
+The object key might be `accounting/invoices/2026-07/acme-1001.json`. That key makes prefix navigation possible. The JSON body is the canonical business record. Optional user metadata such as `{"workflow_state":"open"}` can make equality filters cheap, but it should not become a second copy of the invoice. If metadata and the body disagree, your application must know which one is authoritative; this tutorial treats the body as authoritative and indexes derived rows from it.
+
+The public CLI upload helper cannot set all metadata-rich fields today, so metadata-filter examples may need objects created by the public API or a client library. That limitation is a CLI limitation, not a reason to move tenant-owned writes to the admin plane.
+
 ## Create a path index for prefix navigation
 
 A path index is for object-key navigation. It answers questions such as "what objects are under `tutorial/`?" without downloading object bodies. It is a good fit for folder-like screens, import repair scopes, static-site inventories, and worker queues that use stable key prefixes.
@@ -63,7 +89,7 @@ anvil --profile acme index create documents documents_path path \
   --authorization-mode inherit_object
 ```
 
-This calls `IndexService.CreateIndex` for bucket `documents`, index name `documents_path`, and kind `path`. A successful response proves the caller authenticated, had `index:create` on `documents/documents_path`, the bucket exists, the JSON fields parsed, and Anvil stored an enabled index definition. It also enqueues build work for that index.
+This calls `IndexService.CreateIndex` for bucket `documents`, index name `documents_path`, and kind `path`. A successful response proves the caller authenticated, had `index:create` on `documents/documents_path`, the bucket exists, the JSON fields parsed, and Anvil stored an enabled index definition. It also enqueues build work for that index. The response format is compact in the CLI, but application code should keep the index name, version, request id, and any returned revision or generation fields that the API exposes for the release you are using.
 
 It does not prove the index has already materialised rows. An index builder still has to process source object metadata and publish a segment. Until then, a query can fail with `IndexUnavailable` or return no hits if there are no matching, visible objects.
 
@@ -196,6 +222,8 @@ This query proves the typed predicate array and typed order array parse, the typ
 
 Do not send the old object-shaped predicate form such as `{"eq":{"state":"open"}}`. Current `typed_predicates_json` expects the array form shown above.
 
+When a predicate uses `value`, the comparison value is a JSON value. Strings, numbers, booleans, arrays, and null keep their JSON type. Do not rely on the server to coerce `"129900"` into `129900` or parse local date formats into timestamps. When a predicate uses `values`, it is for operators that accept a set of alternatives. Keep predicate arrays short and reviewable; if your product is building arbitrary user filters, validate them before forwarding them to Anvil.
+
 ## Require catch-up when a query depends on recent writes
 
 If a worker just observed an object watch cursor in the watches tutorial, it can ask the query to prove the typed or metadata-backed index has processed at least that cursor. Suppose `LAST_CURSOR` contains the object watch cursor you saved after processing a relevant invoice write:
@@ -242,3 +270,11 @@ If the next-page command changes the predicate or order, Anvil should reject the
 ## What to take forward
 
 Use path indexes for prefix navigation over object keys. Use metadata-filter indexes for exact equality over small user metadata labels. Use typed JSON indexes for structured predicates, ranges, and stable ordering over canonical JSON bodies or append records. Keep `selector_json` focused, keep `extractor_json` empty for these three current examples, put typed field definitions in `build_policy_json`, and send query JSON only when asking a question. Prefer `inherit_object` unless the indexed data is intentionally visible to every caller with bucket-level `index:read`. When recent writes matter, carry the object watch cursor into `require_caught_up_to_watch_cursor` rather than hoping the derived index has caught up.
+
+## Success and failure cues
+
+Index creation proves the definition is syntactically valid and the caller can create that index name; it does not prove every selected object has already materialised into a row. A query that returns fewer rows than expected can come from selector exclusion, missing or mistyped extracted fields, derived lag, diagnostics, or per-hit authorisation. Use diagnostics and watch-cursor catch-up before changing the selector or granting broader read access.
+
+## Where to go next
+
+Use this page as the base before adding richer retrieval. Read [Full-Text Search](/tutorials/full-text-search/) for tokenised text, [Vector Search](/tutorials/vector-search/) for embedding similarity, and [Hybrid Search](/tutorials/hybrid-search/) when a product search endpoint intentionally combines both. For freshness-sensitive derived data, continue to [Watches](/tutorials/watches/).

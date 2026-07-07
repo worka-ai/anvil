@@ -348,3 +348,9 @@ Some current checks are broader than an ideal product policy model. Treat these 
 | System realm management | The admin system realm is bootstrapped and checked by server code. There is no public tenant path to alter its schema. |
 
 If an application needs a narrower boundary than the current service checks provide, use an API path that checks the narrower resource, add the missing enforcement before relying on it, or keep the broader grant in a temporary controlled smoke-test profile rather than in a production app credential.
+
+## Grant review examples
+
+A grant such as `object:read|documents/public/*` is understandable: it names one action and one prefix. A grant such as `object:*|*` is an ownership-level grant and should have an explicit reason, owner, and review date. A grant to manage relationship tuples should be held by the service that owns the product authorisation model, not by every reader app.
+
+When a request is denied, compare the action/resource checked by the service with the action/resource stored in policy. Many mistakes are simple shape mismatches: granting a bucket name when the service checks a bucket/key resource, or granting index definition management when the caller only needed query permission.

@@ -11,6 +11,8 @@ Applications should use the public Object API directly. The `anvil stream` comma
 
 Use append streams for durable event trails, delivery attempts, background job histories, integration callbacks, product timelines, and application-owned audit logs. Do not use them as a replacement for Anvil's object watch streams. Watches tell consumers that Anvil state changed. Append streams are application data that your tenant writes, reads, replays, and indexes.
 
+By the end of the page, you should be able to tell when an ordered append stream is a better fit than a mutable object, what identity a stream record carries, how stream reads differ from Anvil's service-recorded tenant audit log, and which public scopes a writer or replay worker needs. The examples stay small, but the same pattern is the foundation for product audit trails, delivery histories, job logs, and replayable integration workers.
+
 ## What an append stream contains
 
 An append stream belongs to a bucket and has two identifiers. The `stream_key` is the application name, such as `audits/customer-acme` or `jobs/email-delivery/message-42`. The `stream_id` is the UUID returned when the stream is created. Current APIs require both. Treat `bucket_name`, `stream_key`, and `stream_id` together as the stream identity.
@@ -145,6 +147,8 @@ The current implementation also does not expose a public list of sealed segments
 
 Append streams are efficient for replay, but replaying every payload is not how you should build dashboards. For queryable audit summaries, create a derived index over append records. Current typed JSON indexes support `source_kind: "append_record"` and extract fields from the stream key, record sequence, content type, payload JSON, and user metadata.
 
+The index definition has the same four JSON roles as the typed-query tutorial. `selector_json` chooses append stream records before extraction; here it selects stream keys starting with `audits/` and records whose content type is exactly `application/json`. `extractor_json` is `{}` for current `typed_json` indexes because typed field definitions live in `build_policy_json`. The build policy uses `source_kind: "append_record"` and defines typed fields from append-record attributes and payload JSON. Query-time `typed_predicates_json` and `typed_order_json` ask questions of rows after the builder has materialised them.
+
 Create an index over audit stream records:
 
 ```bash
@@ -213,3 +217,11 @@ Common read failures are missing coarse read/list scope for the bucket, a mismat
 ## What to take forward
 
 Use append streams when order and replay matter. Store the stream id, make every payload a stable event contract, checkpoint consumers by last processed sequence, and use typed JSON indexes for queryable summaries. Treat sealing as checkpoint evidence rather than stream closure. Keep application audit streams separate from Anvil's service-recorded tenant audit log, and design authorisation deliberately because stream reads, derived rows, and audit listings expose history even when they do not expose mutable object state.
+
+## Success and failure cues
+
+A stream create returns the `stream_id` you must keep. An append returns a monotonically increasing record sequence inside that stream. A replay reader should be able to start from a saved sequence and process records idempotently. Common failures are losing the stream id, confusing application append streams with tenant audit events, sealing an empty stream, reading with insufficient bucket read/list scope, or indexing append payloads with a typed-field definition that does not match the event JSON.
+
+## Where to go next
+
+Read [Watches](/tutorials/watches/) if the stream consumer also maintains derived state from Anvil changes, and [Task Leases and Fenced Mutations](/tutorials/task-leases-and-fenced-mutations/) if several workers may compete for the same stream or shard. For service-recorded events and repairs, use [Repair and Diagnostics](/tutorials/repair-and-diagnostics/) rather than treating application append streams as the operator audit log.

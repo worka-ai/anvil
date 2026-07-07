@@ -78,3 +78,9 @@ Before deploying Anvil for real tenants, decide the model explicitly. Choose whi
 Those choices also define release and incident evidence. A ready deployment can prove that tenant principals can write and read through the public plane, that admin operations require private reachability plus system authorisation, that cluster traffic is not public user traffic, that CoreStore-backed state survives restore drills, that derived state reports lag rather than pretending to be fresh, that gateways respect the same object and authz model, and that repair starts from diagnostics instead of broad mutation.
 
 If a current public CLI or admin CLI command does not expose a workflow at that level of detail, document the gap in your runbook and use the narrowest supported API or operator tool for your release. Do not replace a missing command with an unaudited storage edit. The production model is only useful if the deployment can explain how each state change happened.
+
+## Production invariants
+
+Keep these invariants true during normal operation: one server process owns each writable storage path; admin traffic stays private; tenant traffic uses public APIs; server secrets are not mounted into tenant jobs; node identity files persist across restarts; and backups restore the full storage path together with the secret-manager state required to decrypt it.
+
+When an incident response action would break one of those invariants, treat it as a break-glass action. Capture evidence first and document how the deployment returns to the normal model.

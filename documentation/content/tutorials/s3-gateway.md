@@ -11,6 +11,14 @@ The S3-compatible gateway lets existing S3 tools talk to Anvil. It is useful for
 
 Use the native public API when you control the client and need Anvil-specific features such as rich metadata, indexes, watches, PersonalDB, relationship schemas and tuples, task leases, fenced mutations, repair, or diagnostics. Use the S3 gateway when the client is already S3-shaped and the operation is object movement or S3-style object inspection. For the surrounding model, read [Gateways](/learn/gateways/), [Authorisation](/learn/authorisation/), [Public CLI](/reference/public-cli/), [Authorisation Actions and Resources](/reference/authorisation-actions-and-resources/), and [Static Hosting and Aliases](/tutorials/static-hosting-and-aliases/).
 
+The S3 gateway is a protocol front door over Anvil's object model. This tutorial shows how S3 signing maps to app credentials, how bucket/key operations map to public Object API calls, where metadata and versions fit, and which S3 habits are unsafe when Anvil policy, links, and host routing are the real authority.
+
+## Prerequisites and client boundary
+
+The S3 examples assume the caller already has an Anvil app credential that can be used for S3 signing and the corresponding public object scopes on the bucket/key paths. The S3 gateway is a public-plane protocol adapter; it should not require the admin API, a CoreStore path, or server secret material. If an S3 client cannot authenticate, debug endpoint, signing, app credentials, and public policy before touching operator configuration.
+
+Remember that S3 vocabulary does not replace Anvil's model. A bucket is still a tenant bucket, a key is still an Anvil object key, public-read is still an Anvil policy decision, object links are still Anvil link descriptors, and versions/CAS semantics remain those exposed by the native API.
+
 ## Understand what is being exposed
 
 The current Anvil server serves the native public gRPC API and the S3 gateway from the same public listener. In the local tutorials that listener is `http://127.0.0.1:50051`; there is not a separate local S3 port such as `9000`. Requests with a gRPC content type go to the native public API. Other HTTP requests are routed to the S3 gateway.
@@ -272,3 +280,11 @@ The gateway is useful, but it is intentionally not all of S3 and not all of Anvi
 Versioning is always exposed as enabled for existing buckets, and suspending or disabling it through S3 is not supported. S3 metadata is limited to content type and string `x-amz-meta-*` values. Prefix-specific list grants are coarser than the ideal model because ordinary object listing currently checks `object:list` on the bucket name. Public-read bucket listing and version listing can expose names and metadata, so public buckets must be curated deliberately. S3 management surfaces such as AWS IAM policy documents, ACLs, lifecycle rules, tags, notifications, CORS configuration, and website configuration are not the core Anvil control plane. Native-only features remain native-only.
 
 Those gaps are not reasons to avoid the gateway. They are reasons to use it for what it does well: move and read object bytes with existing S3 tooling while Anvil remains the authoritative model for tenants, credentials, authorisation, versions, links, derived data, and operations.
+
+## Success and failure cues
+
+Successful S3 operations prove the signing credential maps to an Anvil app, the bucket/key operation maps to an authorised public Object API call, and the gateway can translate the response back into S3 shape. S3 errors should be debugged from the boundary inward: signature and endpoint first, then bucket/key parsing, then Anvil public policy, then object/link/version state. Do not fix gateway failures by exposing the admin API.
+
+## Where to go next
+
+If you need anonymous delivery, read [Public Access](/tutorials/public-access/) and [Static Hosting and Aliases](/tutorials/static-hosting-and-aliases/). If you need richer object preconditions, metadata, links, watches, or derived indexes than S3 clients expose, use the native public API paths documented in [Public CLI](/reference/public-cli/) and the object/index tutorials instead of extending S3 semantics locally.

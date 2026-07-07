@@ -166,3 +166,9 @@ Current Anvil source provides building blocks rather than a complete observabili
 Administrative diagnostics currently cover specific backends such as index diagnostics and mesh lifecycle/routing projection diagnostics. Tenant-facing diagnostics focus on indexes. Repair commands cover focused targets, and some repairs intentionally rebuild derived state rather than synthesising lost source records. If your incident requires evidence outside those surfaces, document the gap, preserve storage and logs, and avoid direct storage edits.
 
 The practical posture is to wire the current signals you have, keep dashboards honest about what they prove, include request ids in every incident trail, protect logs and audit evidence, and rehearse the difference between stale derived state, failed authorisation, wrong routing, gateway authentication failure, and true source-data loss.
+
+## Useful alert labels
+
+Alerts should include the plane, tenant id when applicable, bucket or index name when applicable, region, node id, command or API family, and last known cursor or generation. Those labels let a responder decide whether to look at policy, routing, derived lag, storage capacity, or gateway translation.
+
+Avoid alerts that only say "Anvil is unhealthy". An object write failure, an index lag warning, a watch checkpoint failure, and an admin routing diagnostic have different owners and different safe actions.

@@ -7,25 +7,40 @@ description: Register the local topology descriptors Anvil uses for placement, r
 
 This tutorial continues from [Run Anvil Locally](/tutorials/setup-local-anvil/) and [Bootstrap Administration](/tutorials/admin-bootstrap/). It assumes the `anvil-local` container is running and your shell has `ANVIL_AUTH_TOKEN` set to a short-lived bearer token for the bootstrap-created system administrator.
 
-Mesh topology is system administration. The public API cannot create regions, cells, or nodes. The control path is the private admin API on port `50052`; the `anvil-admin` CLI is only a manual helper over that API. In this Docker setup the admin port is not published to the host, so the commands run inside the container with `docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local ...`.
+Mesh topology is system administration. Regions, cells, and nodes affect placement, routing, lifecycle, repair, and operational blast radius for the whole Anvil deployment. Tenant apps cannot create or activate these records through the public API. The control path is the private admin API on port `50052`, and in this Docker setup that port is reachable only from inside the container.
 
-For the conceptual model, read [Regions, Cells, and Nodes](/learn/regions-cells-and-nodes/) and [Mesh Routing and Lifecycle](/learn/mesh-routing-and-lifecycle/). For production planning, read [Topology Planning](/operators/topology-planning/) and [Network and Ports](/operators/network-and-ports/). The command reference is [Admin CLI](/reference/admin-cli/).
+The commands use `anvil-admin` as a helper over the private admin API. The conceptual model is in [Regions, Cells, and Nodes](/learn/regions-cells-and-nodes/) and [Mesh Routing and Lifecycle](/learn/mesh-routing-and-lifecycle/). Production planning is covered in [Topology Planning](/operators/topology-planning/) and [Network and Ports](/operators/network-and-ports/). Exact command flags are in [Admin CLI](/reference/admin-cli/).
+
+By the end of this page, the local mesh has a region descriptor, an active cell, and an active node descriptor. The region itself remains in the joining lifecycle state because the current `region activate` command requires a real activation checkpoint file; this tutorial does not fake one.
+
+## Prerequisites and private-plane check
+
+First confirm that the private admin path still works from inside the container:
+
+```bash
+docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local \
+  anvil-admin audit list --limit 1
+```
+
+A successful read proves your token is valid for at least one admin-plane operation and that the private endpoint is reachable. It does not prove the principal can mutate topology; the topology commands below still check system-realm relations such as region, cell, and node management.
+
+If this check fails, return to [Bootstrap Administration](/tutorials/admin-bootstrap/) before registering topology. Do not publish the admin port to the host.
 
 ## Understand the topology model
 
-A **mesh** is the whole cooperating Anvil deployment and routing universe. It is the boundary inside which regions, cells, nodes, routing records, lifecycle state, and placement decisions are meant to agree. The local tutorial has only one container, but it still belongs to a mesh so the same control-plane language works later for multi-region deployments.
+A **mesh** is the whole cooperating Anvil deployment and routing universe. It is the boundary inside which regions, cells, nodes, route records, lifecycle state, and placement decisions are expected to agree. The local tutorial has one container, but it still uses mesh records so the same language applies later to multi-node and multi-region deployments.
 
-A **region** is a placement, failure, and latency boundary. In production it is usually a cloud region, data centre, or other location where you can reason about user latency, regulatory placement, outage blast radius, and routing. When a bucket or route chooses a region, Anvil needs a region descriptor that says where that region is served and how it should participate in placement.
+A **region** is a placement, failure, and latency boundary. In production it is usually a cloud region, data centre, jurisdiction, or other location where you can reason about user latency, regulatory placement, outage blast radius, and routing. When a bucket or route chooses a region, Anvil needs a region descriptor that says how that region should participate in placement and public routing.
 
-A **cell** is a smaller failure domain inside a region. In many deployments it maps to a rack, availability-zone slice, storage pool, or other unit you can drain independently. Cells let operators express, "these nodes fail or drain together", rather than treating every server in a region as identical.
+A **cell** is a smaller failure domain inside a region. In many deployments it maps to a rack, availability-zone slice, storage pool, or other unit you can drain independently. Cells let operators express, "these nodes fail or drain together", rather than treating every server in a region as interchangeable.
 
-A **node** is one Anvil server process participating in storage, routing, serving, indexing, PersonalDB work, gateway handling, or administrative responsibilities. A node descriptor records where the process belongs and which capabilities it should advertise. That is operational intent: routing and background work should not guess whether a node can serve object reads, index maintenance, or admin work.
+A **node** is one Anvil server process. Nodes advertise capabilities such as object serving, indexing, PersonalDB work, gateway serving, and admin capability. Capabilities are operator intent: they tell routing, maintenance, and repair workflows what this process is meant to do.
 
-You configure this topology so Anvil can make placement and routing decisions, isolate failures, drain parts of the deployment deliberately, and leave an audit trail for operator intent. Even in a one-container tutorial, registering the descriptors teaches the same shape as production.
+Lifecycle state matters as much as existence. A joining record is known but not fully serving. An active record can receive the relevant work. Draining and drained states are used for maintenance and migration. Generation values are optimistic concurrency guards: if a descriptor has generation `3`, a lifecycle update should carry `--expected-generation 3` so two operators do not silently race.
 
 ## Register the local region
 
-The local region is a control-plane descriptor for this tutorial's placement boundary. The `public-base-url` is the public API address clients use for this local deployment. The `virtual-host-suffix` is the suffix Anvil can use when it builds or validates virtual-host-style routes. The `default-cell` records the cell we intend to register next.
+The local region is a control-plane descriptor for the tutorial's placement boundary. The public base URL is the public API address clients use for this deployment. The virtual-host suffix is the suffix Anvil can use when building or validating virtual-host-style routes. The default cell records the cell we intend to register next.
 
 ```bash
 docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local \
@@ -38,11 +53,15 @@ docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local \
     --audit-reason 'register local tutorial region'
 ```
 
-After this command, Anvil has a `local` region descriptor in the mesh lifecycle state. New descriptors start in a joining lifecycle state; activation is a separate lifecycle step because production region activation must prove that routing control streams have reached a safe checkpoint.
+A successful response proves the caller authenticated to the admin API, had the system-realm relation required to manage regions, the region id was accepted, and Anvil stored the descriptor with audit evidence. The response should include a generation value and an audit event id. New descriptors start in a joining lifecycle state; activation is separate because production region activation must prove routing/control streams have reached a safe checkpoint.
+
+The region response is operator evidence, not tenant placement proof. A tenant may later ask to create a bucket in `local`, but bucket creation should still reject placement while the region lifecycle says joining. That rejection is a safety property: it prevents data from being silently placed into a region that has not completed the control-plane activation workflow.
+
+Common failures are straightforward. `AlreadyExists` means you previously registered `local`; list regions and reuse the existing generation if you are rerunning the tutorial. `PermissionDenied` means the admin principal lacks region-management authority. A validation error usually points to an invalid URL, suffix, or missing required flag.
 
 ## Register and activate the local cell
 
-A region needs at least one cell before it can be useful for placement. This cell represents the local machine's tiny failure domain. In production, choose a cell id that maps to a real operational unit such as a rack, zone slice, or storage pool.
+A region needs at least one cell before it is useful for placement. This tutorial's cell represents the local machine's tiny failure domain. In production, choose a cell id that maps to a real operational unit such as a rack, availability-zone slice, or storage pool.
 
 ```bash
 docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local \
@@ -53,7 +72,7 @@ docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local \
     --audit-reason 'register local tutorial cell'
 ```
 
-The cell now exists, but it is still joining. Activating it records that the cell is allowed to receive work. Update commands require `--expected-generation` so two operators or controllers do not accidentally overwrite each other's lifecycle changes; a newly registered cell has generation `1`.
+Registration stores the cell descriptor in the joining state. A newly registered cell has generation `1`, so the activation command uses that expected generation:
 
 ```bash
 docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local \
@@ -64,13 +83,15 @@ docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local \
     --audit-reason 'activate local tutorial cell'
 ```
 
-After activation, the cell is ready for node placement. If this command reports a generation mismatch, list the cell and use the current generation from the response rather than guessing.
+Activation proves the descriptor still had the generation you expected and records that the cell may receive work. If activation reports a generation mismatch, list the cell and retry with the current generation. Do not guess a new value; the mismatch exists to prevent accidental races.
+
+If activation fails because the region is missing, register or inspect the region first. If it fails because the cell already exists or is already active during a rerun, read the current record rather than deleting it. Lifecycle commands are safer when they are idempotent in your runbook: inspect, compare desired state, then mutate only when a transition is actually required.
 
 ## Register and activate the local node
 
 The node descriptor represents the running `anvil-local` server process. Its public API address is the address clients use from the host. Its cluster address is the private node-to-node address other Anvil nodes would dial in a real mesh. This single-node tutorial does not publish the cluster port to the host, but the descriptor still shows where that value belongs.
 
-Capabilities are part of the contract. They tell Anvil and operators what this process is meant to do. For the local all-in-one node, it is reasonable to advertise object storage, indexing, PersonalDB work, gateway serving, and admin capability. In production, keep capabilities accurate so routing, draining, and repair decisions match reality.
+Capabilities should reflect the process you are actually running. The local all-in-one node advertises object storage, indexing, PersonalDB work, gateway serving, and admin capability. Production deployments may split capabilities across processes, but Anvil nodes are still peers in one system model; avoid inventing a special worker-node hierarchy in docs or runbooks unless the implementation provides one.
 
 ```bash
 docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local \
@@ -85,7 +106,7 @@ docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local \
     --audit-reason 'register local tutorial node'
 ```
 
-The node now exists in the joining state. Activating it records that the node may serve the responsibilities described by its capabilities. A newly registered node has generation `1`, so the activation command uses that expected generation.
+The node now exists in the joining state. Activate it with the generation created by registration:
 
 ```bash
 docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local \
@@ -95,11 +116,13 @@ docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local \
     --audit-reason 'activate local tutorial node'
 ```
 
-After this command, the mesh has a local region descriptor, an active local cell, and an active local node. That is enough to inspect topology and understand lifecycle state, even though the region itself remains in the joining state until the activation checkpoint workflow is available for this tutorial flow.
+Success proves Anvil recorded the node descriptor, accepted the advertised capability list, and moved the node lifecycle to active using a generation check. It does not prove region activation, bucket placement, S3 routing, host aliases, or cluster gossip are production-ready.
+
+If a capability is wrong, fix the descriptor through the supported lifecycle/update path rather than hoping other services infer reality from traffic. A node that cannot serve gateway traffic should not advertise `gateway`; a node that should not receive admin responsibilities should not advertise `admin`. Accurate capabilities are what make later drain and repair operations explainable.
 
 ## Inspect the registered topology
 
-Listing the descriptors is the safest way to confirm what Anvil recorded. These reads still use the admin API, because mesh topology is control-plane state rather than tenant data.
+Listing descriptors is the safest verification step. These reads are admin-plane reads because topology is control-plane state, not tenant data.
 
 ```bash
 docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local \
@@ -112,12 +135,22 @@ docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local \
   anvil-admin node list --region local --cell-id local-cell-1
 ```
 
-The output should show the `local` region, `local-cell-1`, and `local-node-1`. Pay attention to lifecycle state and generation values. State tells you whether a descriptor is joining, active, draining, drained, offline, or removed. Generation values are the optimistic-concurrency guard you pass to later lifecycle updates.
+The output should show `local`, `local-cell-1`, and `local-node-1`. Pay attention to lifecycle state and generation values. The region may still be joining. The cell and node should be active if the activation steps succeeded.
 
-## About region activation in the current CLI
+If a later command needs an expected generation, copy it from the current list output. Do not assume it is still `1` after another operator, controller, or rerun has touched the descriptor.
 
-The current admin CLI does have a `region activate` command, but it requires an activation checkpoint file. That checkpoint is not a decorative flag: it proves the region has reached the required mesh control-stream positions before placement and routing treat it as active.
+## About region activation and bucket placement
 
-This page does not invent a local checkpoint generator or tell you to hand-write one. In the current documented command surface, the safe tutorial path is to register the region, activate the cell and node, and inspect the resulting topology. A production-ready region activation walkthrough needs the checkpoint creation and verification path documented alongside the admin API command.
+The current admin CLI has a `region activate` command, but it requires an activation checkpoint file. That checkpoint is not decorative. It proves the region has reached the required mesh control-stream positions before placement and routing treat it as active.
 
-When that path is available, it should remain an admin-plane operation. Do not perform mesh lifecycle changes through the public API, and do not work around activation checks with data-plane grants.
+This tutorial does not hand-write a fake checkpoint and does not tell you to bypass activation. The safe local path is to register the region, activate the cell and node, inspect the topology, and understand why later bucket placement may fail while the region remains joining. A production-ready activation walkthrough needs the checkpoint creation and verification path documented alongside the admin API command.
+
+When region activation is available in your deployment workflow, keep it on the admin plane. Do not perform mesh lifecycle changes through the public API, and do not work around activation checks with tenant data-plane grants.
+
+## Success and failure cues
+
+A useful local topology has three inspectable records: a `local` region, an active `local-cell-1`, and an active `local-node-1` with the capabilities you intended to advertise. Generation mismatches mean another operation changed the descriptor, so list the record and retry with the current generation. Placement failures later in the tutorial usually mean the region is still joining or not writable; do not reinterpret them as tenant credential failures until topology is confirmed.
+
+## Where to go next
+
+Read [Tenants, Apps, and Credentials](/tutorials/tenants-apps-and-credentials/) to hand a storage tenant to the public plane. If you operate real deployments, also read [Mesh Routing and Lifecycle](/tutorials/mesh-routing-and-lifecycle/) before activating, draining, or routing regions; it explains the checkpoint and audit evidence that this local page deliberately does not fake.

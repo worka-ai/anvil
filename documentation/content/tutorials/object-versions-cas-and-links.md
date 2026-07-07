@@ -11,6 +11,14 @@ The limits still matter here. Region activation may still block bucket placement
 
 For the read-side model behind this page, keep [Reads, Listing, and Links](/learn/reads-listing-and-links/) open. For the write-side model, especially stale writer rejection and fences, read [Writes, Consistency, and Fences](/learn/writes-consistency-and-fences/).
 
+The point of this page is safe naming under change. It shows why every object write creates a version, how compare-and-swap protects the current pointer, how API preconditions differ from CLI read/write helpers, and how links give stable aliases without copying object bodies.
+
+## Prerequisites and public-plane boundary
+
+The examples assume an `acme` public profile, a `documents` bucket, and object permissions for the paths being used. Versioned object work is tenant-owned public-plane work. Use `anvil` or the public Object API. Do not use `anvil-admin` to write tenant objects, move release aliases, or repair a missed application CAS failure. The admin plane can bootstrap tenants and operate system repairs, but normal object concurrency belongs to the tenant.
+
+For the link examples, the caller needs `object:write` on the link key and target upload keys, `object:read` to inspect links or targets, `object:delete` to remove links, and `object:list` to enumerate link prefixes. With a least-privilege tutorial profile, some commands may correctly fail until you grant those exact resources. Treat that as evidence that the path is protected, not as a reason to grant `object:*` on the whole bucket.
+
 ## Why versions exist
 
 An object key is a stable name. A version is one committed state of that name.
@@ -90,6 +98,8 @@ NativeMutationContext {
 
 The body stream then sends the new bytes. If the current pointer is still that version, Anvil writes a new version and moves the pointer. If another writer won first, the request fails with a precondition failure. That failure is not a storage outage. It is the system telling the client to reload, merge, ask the user, or abandon the stale write.
 
+Before using a precondition, choose what kind of race you are trying to prevent. A user-edit save usually wants `version:<version_id>`. A create-once workflow usually wants `not_exists`. A maintenance rewrite may use `exists`. A last-writer-wins cache refresh may deliberately use `none`.
+
 The native mutation precondition supports these current-pointer forms:
 
 | Precondition | Meaning |
@@ -102,7 +112,7 @@ The native mutation precondition supports these current-pointer forms:
 
 Invalid precondition syntax is an invalid request. A syntactically valid precondition that no longer matches is a failed precondition. Missing `object:write`, a bucket mismatch, or a principal mismatch is an authorisation or validation failure instead. Keep those cases separate in application error handling because they require different action.
 
-The current public CLI `object put` always builds a mutation context with `precondition: "none"` and does not expose a flag for version or ETag preconditions. It is useful for a manual upload once the local path is ready:
+The current public CLI `object put` always builds a mutation context with `precondition: "none"` and does not expose a flag for version or ETag preconditions. That is why the command below is a demonstration of an ordinary upload, not a safe-edit pattern. It is useful for a manual upload once the local path is ready:
 
 ```bash
 anvil --profile acme object put tutorial-welcome.txt s3://documents/tutorial/welcome.txt
@@ -274,3 +284,11 @@ The response is a descriptor listing, not a version listing and not a body listi
 ## What to take forward
 
 Use object versions as concurrency evidence. Carry `version_id` or ETag from reads into writes that must not lose updates. Treat precondition failures and link generation conflicts as successful race detection, not generic outages. Use API calls, not current CLI upload helpers, for CAS, pinned reads, pinned links, structured preconditions, metadata-rich writes, and mutation batches. Use links for aliases, not copies, and make the difference between following, redirecting, moving, dangling, and deleting explicit in both application code and operator runbooks.
+
+## Success and failure cues
+
+A normal object write moves the current pointer and returns a new version. A CAS write should fail when the observed version is stale; that is the protection working. A link create or update changes only the alias descriptor, not the target object's bytes. If a link read fails, distinguish a missing link from a dangling target, a target read denial, and a resolution-mode redirect that your client must follow deliberately.
+
+## Where to go next
+
+Read [Static Hosting and Aliases](/tutorials/static-hosting-and-aliases/) if links will back public names or websites, and [Task Leases and Fenced Mutations](/tutorials/task-leases-and-fenced-mutations/) if background workers will update objects concurrently. For query surfaces that must follow new versions, read [Watches](/tutorials/watches/) and carry the relevant cursors into index queries where supported.

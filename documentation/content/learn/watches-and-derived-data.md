@@ -167,3 +167,9 @@ Use narrow grants. A service account that exports one project prefix should not 
 ## What to take forward
 
 Watches are how Anvil connects source records to derived data without rescanning everything. A watch event is not complete until the consumer's derived output and checkpoint are durable. Cursors are scoped, checkpoints must be stored carefully, and replay must be safe. Lag is normal until a reader requires catch-up. Repair rebuilds derived views from source records; it does not invent source truth. The API exposes more watch detail than the current CLI, so production workers should use the API when they need envelopes, split cursors, exact lag, or API-only watch families.
+
+## Consumer contract
+
+A watch consumer should be able to crash at any point without losing source facts. That means it applies an event idempotently, commits its own output, and then stores the cursor it has processed. If it crashes before storing the cursor, it may process the event again. If it stores the cursor before applying the event, it can skip work permanently.
+
+Anvil's own derived builders follow the same idea with stronger fencing. The lease owner owns a partition for a bounded time, writes output with a fence token, and checkpoints progress only while ownership remains valid.

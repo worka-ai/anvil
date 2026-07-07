@@ -247,3 +247,9 @@ The gaps are operationally significant:
 | Dashboards | Metrics names and evidence concepts exist, but production export and dashboards are deployment work. |
 
 Design production operations around those limits. Keep SQLite as the application's local database. Keep Anvil as the witness, log, certificate, projection, snapshot, watch, and repair layer. Use the API where correctness depends on full PersonalDB fields. Use the CLI for manual checks, not as a synchronisation engine.
+
+## Data-correctness escalation
+
+A PersonalDB failure is often a correctness event rather than a capacity event. If commits fail validation, identify the client version, base log index, base hash, database id, and replica id before asking clients to retry. Blind retries with the same invalid changeset will only create noise.
+
+If projections fail but the commit log is healthy, repair or rebuild the projection from accepted commits. If the commit log chain is unhealthy, preserve evidence and restore from a known-good backup if repair cannot prove the chain.

@@ -314,4 +314,8 @@ These gaps do not make the workflows useless; they define what the CLI can and c
 | Repair coverage | Repairs are surface-specific; there is no single CLI `fsck` proving every CoreStore invariant. | Run read-only diagnostics first, choose the smallest repair family, and verify the original symptom afterwards. |
 | Gateways | CLI host-alias and public-read commands manage Anvil records only. | Verify DNS, TLS, reverse proxy, S3/static gateway behaviour, and trusted host forwarding outside the CLI as part of gateway operations. |
 
-When a workflow needs a capability the CLI does not expose, do not invent a flag in a runbook. Either call the API directly, use the Rust client, or document the limitation and the narrow manual workaround you used.
+When a workflow needs a capability the CLI does not expose, do not invent a flag in a runbook. Either call the API directly, use the Rust client, or document the limitation and the narrow manual temporary path you used.
+
+## Workflow evidence standard
+
+A workflow should state what it proves and what it does not prove. `anvil object get` proves the current version is readable by that app through the public API; it does not prove historical version reads or S3 signature handling. `anvil-admin region activate` proves an authorised operator moved a lifecycle record; it does not prove every gateway DNS name is reachable. Good runbooks make those limits explicit so the next operator does not overinterpret a green smoke test.

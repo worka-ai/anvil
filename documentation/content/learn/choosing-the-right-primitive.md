@@ -150,3 +150,7 @@ A package or static delivery workflow should keep immutable artefacts as objects
 ## What to take forward
 
 Choose the primitive by the proof you need later. Objects prove versions of named bytes. Metadata gives compact labels for those versions. Indexes answer derived questions. Full-text, vector, and hybrid search rank content in different ways. Append streams prove ordered events. Watches keep derived systems from rescanning. Leases and fences prove the current worker still owns the job. PersonalDB proves accepted SQLite history. Links and public delivery give stable read names without copying bytes. Gateways adapt outside protocols to Anvil; they do not replace the native model. Admin topology operations shape the deployment and must remain on the private operator plane.
+
+## A quick design review script
+
+For every new feature, write one sentence each for source of truth, derived views, caller authority, retry key, freshness requirement, and repair path. If the source of truth is "whatever the latest index says", the design is probably inverted. If the repair path is "rerun an admin command from the application", the plane boundary is probably wrong. If the retry key is random per attempt, the operation is probably not safely retryable.

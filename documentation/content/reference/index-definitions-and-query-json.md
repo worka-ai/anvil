@@ -729,3 +729,9 @@ These current edges matter when you decide whether to use the CLI helper, the di
 - The current CLI defaults `--typed-predicates-json` to `{}`, which is invalid for direct typed JSON queries. Pass a valid array such as `[]` or a predicate list.
 - The current CLI default `--typed-order-json '[]'` does not exercise `default_order`; API callers can send an empty string to use the default order.
 - `personaldb_row_metadata` and `git_source` are accepted index kinds, but the generic Index service does not currently materialise/query them through the ordinary builder path.
+
+## Debugging query JSON
+
+When a query returns no hits, validate each layer separately. First query with only `path_prefix` or a very broad text query to prove the index has data. Then add metadata filters, typed predicates, ordering, phrase mode, vector input, and catch-up requirements one at a time. If a typed predicate fails, confirm the field name exists in the build policy and that extracted values have the expected JSON type. If vector query fails, confirm the vector dimension matches the index configuration.
+
+For production clients, log the index name, definition generation, query JSON fields, page token, catch-up cursor, lag timeout, and caller principal. That log gives operators enough information to distinguish malformed queries from stale or broken derived state.

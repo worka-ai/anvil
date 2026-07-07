@@ -11,6 +11,14 @@ A watch is Anvil's way to say: "show me committed changes after this position". 
 
 Applications should use the streaming public API directly for production consumers. The `anvil watch`, `anvil authz watch`, `anvil index query`, and `anvil personaldb watch` commands in this page are manual helpers over those APIs. Keep [Watches and Derived Data](/learn/watches-and-derived-data/), [Indexes and Query](/learn/indexes-and-query/), [Public CLI](/reference/public-cli/), [Index Definitions and Query JSON](/reference/index-definitions-and-query-json/), and [Authorisation Actions and Resources](/reference/authorisation-actions-and-resources/) nearby while you read.
 
+This page teaches watches as restartable maintenance streams, not live notifications for user interfaces. You will see how cursors, revisions, checkpoints, derived writes, and replay fit together across object, authz, index, and PersonalDB surfaces.
+
+## Prerequisites and checkpoint storage
+
+A watch is useful only if the consumer stores checkpoints somewhere durable. Before running the examples, decide where your worker would write its checkpoint: an object, a database row in your application, a PersonalDB projection record, or another durable control record. A terminal scrollback cursor is enough for a tutorial, but not for a production worker.
+
+Watches are public-plane reads unless the specific stream is an admin/system stream. The examples use `anvil` and tenant tokens. Do not use the private admin API to consume ordinary object, authz, index, or PersonalDB watches for an application worker. Use admin diagnostics when the watch infrastructure itself is unhealthy.
+
 ## Why watches exist
 
 Without a watch, a worker that maintains a search index, cache, projection, or export has two poor choices. It can rescan source data repeatedly, which becomes expensive and can race with concurrent writes. Or it can remember local timestamps and hope they line up with committed Anvil state, which is unsafe in a distributed system.
@@ -119,6 +127,8 @@ Indexes are derived data. An object write commits before every index necessarily
 
 The API field is `require_caught_up_to_watch_cursor` on `IndexService.QueryIndex`. The current CLI exposes it as `--require-caught-up-to-watch-cursor`:
 
+The example query uses `typed_predicates_json`, which is an array of predicates over fields already materialised by a typed JSON index. In this example, the index must have a field named `status`; the predicate asks for rows whose materialised JSON value equals the string `ready`. The catch-up flag then asks Anvil to prove that the answer is not older than the watch cursor.
+
 ```bash
 anvil --profile acme index query documents documents_by_status \
   --typed-predicates-json '[{"field":"status","op":"eq","value":"ready"}]' \
@@ -215,3 +225,11 @@ A derived worker should store enough context with the cursor to make mistakes ob
 ## What to take forward
 
 Use watches when a system needs to keep derived state aligned with committed Anvil state. Store checkpoints after work is durable. Expect replay and make processing idempotent. Use object prefix watches for object-derived work, bucket watches for bucket metadata through the API, authz tuple watches for relationship changes, index watches for derived index maintenance, and PersonalDB watches for PersonalDB log/projection workflows. When query correctness depends on a write you just saw, pass the relevant source object cursor with `require_caught_up_to_watch_cursor` instead of hoping the index has caught up.
+
+## Success and failure cues
+
+A watch connection proves the caller can open the stream; it does not prove the worker has processed anything. The durable checkpoint is your evidence of processing. If a worker repeats an event after restart, that is normal when it crashed before checkpointing. If it skips work, look for checkpoints written before side effects became durable. If the stream reports a gap or unavailable cursor, rebuild or repair from source rather than inventing a later cursor.
+
+## Where to go next
+
+Pair watches with [Append Streams and Audit Logs](/tutorials/append-streams-and-audit-logs/) when a worker needs replayable domain events, and with [Task Leases and Fenced Mutations](/tutorials/task-leases-and-fenced-mutations/) when only one worker should process a shard at a time. For index-specific lag and rebuild evidence, continue to [Repair and Diagnostics](/tutorials/repair-and-diagnostics/).

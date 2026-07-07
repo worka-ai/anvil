@@ -221,3 +221,9 @@ Current gaps matter for production design:
 | Observability | There are logs, request ids, diagnostics, repair, and audit surfaces, but no guarantee of a turnkey gateway dashboard or a single command that certifies every adapter path. |
 
 Operate within those limits. Use gateways to make existing clients useful. Use native APIs where the product needs Anvil-specific correctness and evidence. Keep tenant publishing on the public plane, keep admin lifecycle on the private plane, and make every gateway incident explainable in native Anvil terms.
+
+## Native comparison test
+
+For every gateway incident, reproduce the same logical resource through the native public API. If native `object head` and `object get` fail, investigate storage, policy, relationship visibility, or routing. If native operations succeed while S3 or static HTTP fails, investigate signature calculation, host alias state, virtual-host suffix, proxy headers, cache, or gateway-specific metadata translation.
+
+This comparison keeps gateway debugging from turning into broad storage repair when the source object is healthy.

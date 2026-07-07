@@ -9,6 +9,8 @@ This tutorial builds on [Full-Text Search](/tutorials/full-text-search/), [Vecto
 
 Applications should call the public Index API directly. The `anvil index create`, `anvil index query`, and `anvil index diagnostics` commands below are manual helpers over the same request fields; the complete command surface is described in [Public CLI](/reference/public-cli/). Keep [Indexes and Query](/learn/indexes-and-query/) nearby for the conceptual model and [Authorisation Actions and Resources](/reference/authorisation-actions-and-resources/) for scope strings.
 
+Hybrid search is useful only when two retrieval signals are intentional. This tutorial explains how Anvil combines text and vector evidence, how selectors and metadata filters remain hard constraints, why the query vector must come from the same model space as the index, and how authorisation and derived-data lag shape a production search service.
+
 ## When hybrid search is the right tool
 
 Use hybrid search when neither exact words nor embeddings alone explain the user's intent. A user searching for `renewal notice` may expect documents containing that phrase to rank well, but they may also expect semantically related content such as "subscription reminder" or "upcoming payment message". The full-text side rewards matching terms and phrases. The vector side rewards nearby embeddings. The hybrid query path combines those scores and applies authorisation before returning hits.
@@ -20,6 +22,8 @@ A current hybrid index is not a pointer to two existing index definitions. It is
 ## Prerequisites and current tutorial limits
 
 The commands in this page are valid current public CLI shapes, but they are illustrative until your local tutorial environment has bucket placement, source objects, index grants, a running index builder, and source objects that already contain vectors. The public CLI does not generate embeddings, and its object upload helper still cannot attach all metadata-rich object fields. Use the public API or a client library for production ingestion.
+
+Hybrid indexes are tenant-owned public-plane resources. Create and query them with the public Index API or `anvil`; do not use `anvil-admin` for tenant search definitions. The admin plane can bootstrap tenant credentials and operate system lifecycle, but routine index modelling belongs to the tenant.
 
 Use narrow grants rather than wildcards. The relevant public policy scopes are:
 
@@ -50,7 +54,7 @@ The example uses a four-dimensional vector only so the commands fit on the page.
 
 ## Understand the four definition parts
 
-`selector_json` chooses the source objects before indexing. In this tutorial, it selects objects under `tutorial/search/`. The selector applies to both the full-text and vector build paths. If the text and vector sources need different object families, use separate indexes or an application-level plan instead of forcing them into one hybrid definition.
+`selector_json` chooses the source objects before indexing. In this tutorial, it selects objects under `tutorial/search/`. That selector is the build-time boundary: an object outside the prefix is not searchable by this hybrid index even if its text or vector would be a perfect match. The selector applies to both the full-text and vector build paths. If the text and vector sources need different object families, use separate indexes or an application-level plan instead of forcing them into one hybrid definition.
 
 `extractor_json` describes the text extraction side. For hybrid indexes, keep the full-text extractor under the `text` key so it is clear which fields feed tokenisation. The vector extractor does not belong in `extractor_json`; current vector build behaviour takes it from `build_policy_json.vector.extractor`.
 
@@ -92,6 +96,14 @@ anvil --profile acme index query documents tutorial_hybrid \
 ```
 
 This calls `IndexService.QueryIndex`. A successful response proves the caller has `index:read` on `documents`, the hybrid index exists and is enabled, the full-text segment is available, the vector segment is available, the query vector dimension matches the vector segment, the metadata filter JSON is valid, and every printed hit passed the index's authorisation mode checks.
+
+A typical CLI row is shaped like this:
+
+```text
+score=1.743 object_key=tutorial/search/billing/renewal-payment.json metadata_json={...}
+```
+
+Read the score only inside this index and query. Hybrid scores are not portable across indexes, embedding models, fusion weights, or query mixes. If the application needs to explain a ranking decision, keep the source object key, query text, query vector provenance, index definition version, and scoring metadata in your own request logs.
 
 The CLI prints `score`, `object_key`, and `metadata_json`. For hybrid hits, current `metadata_json` includes the raw text score, raw vector score, freshness score, and normalised text/vector scores. The API response also carries `scoring_recipe_json`, including the weights and segment generations, although the current CLI does not print that response field.
 
@@ -171,3 +183,11 @@ Full-text diagnostics can include non-UTF-8 bodies, invalid JSON for text JSON P
 ## What to take forward
 
 Use hybrid search when a user-facing search result needs both lexical evidence and semantic similarity. Keep the hybrid definition as one index with shared selection, a text extractor in `extractor_json.text`, and a complete vector definition in `build_policy_json.vector`. Query with text and a same-model vector when you want the current fixed text/vector/freshness scoring recipe. Use path and metadata filters for hard narrowing, keep `inherit_object` for protected corpora, and treat catch-up for hybrid search as an operational lag concern until direct hybrid queries expose meaningful watch-cursor freshness.
+
+## Success and failure cues
+
+Hybrid results are easiest to debug by temporarily querying each signal alone. If lexical-only works but hybrid does not, inspect vector dimension, model provenance, and fusion weights. If vector-only works but hybrid does not, inspect text extractors and tokenisation. If both work separately but expected rows disappear together, check hard filters, selector scope, derived lag, and per-object visibility before changing ranking parameters.
+
+## Where to go next
+
+Use [End-to-End Document System](/tutorials/end-to-end-document-system/) to see hybrid retrieval in a fuller application design. If the problem you are solving is freshness or maintenance rather than ranking quality, read [Watches](/tutorials/watches/) and [Repair and Diagnostics](/tutorials/repair-and-diagnostics/) before changing index definitions.

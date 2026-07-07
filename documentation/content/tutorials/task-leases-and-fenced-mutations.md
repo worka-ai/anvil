@@ -9,6 +9,14 @@ This tutorial builds on [Watches](/tutorials/watches/) and [Append Streams and A
 
 Applications should use the public Coordination and Object APIs directly for production workers. The `anvil lease` commands below are manual helpers over the current `CoordinationService` task-lease methods; they are useful for learning and operations. The command reference is [Public CLI](/reference/public-cli/), the scope strings are in [Authorisation Actions and Resources](/reference/authorisation-actions-and-resources/), and the consistency model is introduced in [Writes, Consistency, and Fences](/learn/writes-consistency-and-fences/).
 
+Task leases are coordination records, not locks around the whole storage system. This page shows how a worker acquires ownership, checkpoints progress, renews or commits deliberately, and then uses API-only lease fences when stale owners must be prevented from writing output.
+
+## Prerequisites and worker boundary
+
+The lease examples use tenant-owned public-plane coordination records. A worker needs public policy authority for the lease resource and separate authority for any object, stream, or index state it reads or writes. A lease does not grant data permissions. It only records which owner currently claims a task and which fence token must accompany correctness-sensitive writes.
+
+When adapting this tutorial, name the task id before writing code. Good task ids include a tenant-owned unit of work such as `indexer/documents/tutorial`, `stream/audits/customer-acme`, or `projection/customer-notes/main`. Avoid task ids that hide the source cursor or shard they protect; a later operator should be able to read the lease and understand what worker is allowed to make progress.
+
 ## What a task lease is
 
 A task lease is a temporary claim on a named task inside one tenant. The task id is your application name for the work, such as `import-acme-docs`, `projector-audit-events`, or `rebuild-search-billing`. Only one active security owner can hold that task at a time.
@@ -188,3 +196,11 @@ A robust retry loop looks like this: acquire or renew the lease, read from the l
 ## What to take forward
 
 Use task leases to coordinate who may work, not as a substitute for data permissions. Use fence tokens to prevent stale owners from making progress. Use checkpoints for restartable progress, and store completed state somewhere durable if you need it after commit removes the lease. Use direct API mutation batches with `lease_fence`, object-version preconditions, and manifest CAS for correctness-sensitive writes, because the current public CLI only exposes the lease lifecycle and not fenced data mutations.
+
+## Success and failure cues
+
+A lease acquire proves one owner currently holds the task; a checkpoint proves that owner reported durable progress; a commit removes the active lease after completion. These lifecycle calls do not stop a stale worker from writing unless the worker's data mutations carry the lease-fence precondition. If you see owner mismatch or stale fence errors, stop the old worker path rather than retrying ordinary writes.
+
+## Where to go next
+
+Use leases with [Append Streams and Audit Logs](/tutorials/append-streams-and-audit-logs/) for replay workers and with [Watches](/tutorials/watches/) for derived-data workers. When a lease-protected worker writes objects that users query immediately, combine lease fences with object-version preconditions and the index catch-up behaviour described in [Indexes, Path Metadata, and Typed Query](/tutorials/indexes-path-metadata-and-typed-query/).

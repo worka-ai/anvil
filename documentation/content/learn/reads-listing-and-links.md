@@ -212,3 +212,9 @@ For production applications, prefer the API surface that exposes the evidence yo
 A current read follows the current pointer. A pinned read asks for a specific version. `HEAD` is the efficient way to inspect metadata and validators. Prefix listing is string listing over current, non-deleted entries, with marker-based paging rather than a universal snapshot token. Version listing is how you see delete markers and history. Public-read makes read-side data public through configured surfaces; it is not an admin bypass. Links are generation-checked aliases, not copies. Host aliases route requests to keys; they do not grant access.
 
 If a read fails, keep those distinctions visible. "Not found" might mean no current object, a current delete marker, an absent pinned version, a dangling link, an unauthenticated private bucket, or a remote-region route. The fix depends on which layer made the decision.
+
+## Diagnosing read/list/link disagreements
+
+When `object get` succeeds but `object ls` omits the key, the object source record is probably present and the directory-derived view or list permission is the next place to inspect. When `object link read` shows a target but data reads through the link fail, separate target existence, target visibility, and link resolution mode. When S3 reads fail but native reads succeed, focus on gateway signing, host routing, metadata translation, or proxy configuration rather than object durability.
+
+For support tickets, capture the exact bucket, key, optional version, link generation, caller app, region reached by the request, and whether the failing request was native public API, S3, or static HTTP. That evidence tells the next reader whether to use tenant diagnostics, index/directory repair, gateway operations, or admin routing diagnostics.

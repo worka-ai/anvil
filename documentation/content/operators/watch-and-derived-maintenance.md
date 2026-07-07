@@ -203,3 +203,9 @@ Current observability defines names such as `watch_stream_lag`, `full_text_index
 ## What to take forward
 
 Operate watches as correctness machinery, not convenience streams. Checkpoints are durable claims about completed work. Idempotency makes replay safe. Lag tells you how far derived state is behind source truth. Poisoned events need diagnostics, not silent skips. Rebuilds and repairs are valid recovery tools when they rebuild derived state from committed source records. The API currently exposes more watch detail than the CLI, so production workers should use API surfaces when they need full envelopes, split cursors, projection watches, authz namespace or derived-lag watches, bucket metadata watches, or Git source watches.
+
+## Cursor evidence
+
+Every derived maintenance incident should name the source cursor, applied cursor, checkpoint owner, and fence token. Without those values, it is hard to distinguish a slow builder from a stuck builder or a stale owner from a healthy takeover.
+
+If a consumer cannot resume because its cursor is invalid or too old, use the feature-specific rebuild path. Do not advance the cursor manually to make lag disappear; that only hides skipped work.

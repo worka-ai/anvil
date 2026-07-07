@@ -11,6 +11,14 @@ Mesh operations are operator operations. A tenant application uses the public AP
 
 Keep [Regions, Cells, and Nodes](/learn/regions-cells-and-nodes/), [Mesh Routing and Lifecycle](/learn/mesh-routing-and-lifecycle/), [Gateways](/learn/gateways/), [Admin CLI](/reference/admin-cli/), [Public CLI](/reference/public-cli/), [Authorisation Actions and Resources](/reference/authorisation-actions-and-resources/), and [Network and Ports](/operators/network-and-ports/) nearby while reading this page.
 
+Use this page as the operational companion to the topology tutorial. It explains how placement, route records, lifecycle states, host routing, diagnostics, and audit evidence fit together before you change them, so an operator can tell the difference between a data-plane problem and an unsafe mesh-control-plane change.
+
+## Prerequisites and operating posture
+
+This page is operator material. Use it with a system-admin or named operator token and a private admin endpoint; do not run these lifecycle commands from tenant application credentials. Before changing any route or lifecycle state, capture the current descriptor generation and an audit reason that would make sense to another operator during review. A command that changes routing without a reason, generation check, or before/after evidence should be treated as an unsafe runbook step.
+
+For local examples, continue using `docker exec -e ANVIL_AUTH_TOKEN=... anvil-local anvil-admin ...` so the admin API stays private. For production, replace `docker exec` with your management-network path, but keep the same boundary: public traffic may reach Anvil's public plane; topology mutation should not.
+
 ## Understand the moving parts before changing them
 
 A **mesh** is one Anvil routing and lifecycle universe. It has a stable `MESH_ID`, a set of regions, cells, nodes, routing records, host-alias records, and control streams that should agree about where data lives. A single local container still belongs to a mesh so the same operator vocabulary works in production.
@@ -269,3 +277,11 @@ A successful audit read proves the operator principal can view the admin audit s
 ## What to take forward
 
 Use the public API for tenant data and the private admin API for mesh lifecycle. Inspect topology before changing it. Treat routing records as repairable projections over control streams, not as a second source of truth. Treat bucket home region as a placement fact that data-plane clients must respect. Prefer regional endpoints when clients know the bucket's region; let `CROSS_REGION_ROUTING_POLICY` decide whether a wrong-region S3 request redirects, proxies, or fails. Keep host routing separate from authorisation and public-read policy. Do not hand-write activation checkpoints or rely on drain completion paths that the current CLI/API does not expose.
+
+## Success and failure cues
+
+A safe lifecycle change has three pieces of evidence: the descriptor generation matched, the lifecycle state changed to the intended value, and the admin audit stream records who changed it and why. Routing problems should be debugged by reading route records and diagnostics before mutating topology. If you cannot explain whether a failure is region lifecycle, host routing, bucket placement, or gateway configuration, pause before running repair or drain commands.
+
+## Where to go next
+
+For local setup, this page points back to [Mesh Regions, Cells, and Nodes](/tutorials/mesh-regions-cells-and-nodes/). For production, continue through [Topology Planning](/operators/topology-planning/), [Gateway Operations](/operators/gateway-operations/), and [Incident Response](/operators/incident-response/) before automating region activation, route changes, draining, or host-alias lifecycle.

@@ -291,3 +291,9 @@ Current gaps to account for:
 | Package registry protocols beyond current surfaces are not release artefacts. | Do not announce npm, PyPI, Maven, Docker registry, or similar gateway support unless the implementation and workflow actually ship it. |
 
 The release is ready when the evidence is coherent: source tests passed, hardening checks passed, docs built and published, the image was tested and pushed with a digest, the Rust client crate was dry-run and published or intentionally skipped because it already exists, the GitHub release links the right artefacts, storage and backup risks are understood, smoke tests passed through the public and admin planes, and known limitations are written down for operators.
+
+## Documentation gate
+
+Before tagging, scan the docs for plane confusion. Public tutorials and reference examples should use `anvil` for tenant-owned operations. Admin examples should use `anvil-admin` only for private operator tasks. Release notes should state whether a change affects the public API, admin API, Docker image, Rust client, gateway behaviour, storage format, or documentation only.
+
+The release blog should be specific enough that `scripts/render-release-notes.py` produces useful notes without hand-editing: include the release tag, artifact metadata, operator impact, validation guidance, and rollback cautions.

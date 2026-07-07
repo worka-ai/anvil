@@ -166,3 +166,9 @@ Before declaring the deployment ready, also prove the negative cases: the admin 
 Docker gives Anvil a repeatable runtime, but it does not remove operator responsibility. Each live node needs its own durable state directory. Server secret keys must be present before startup and must be rotated deliberately. The admin API must stay private even when the public API, S3 gateway, or static hosting are exposed. `/ready` is a startup signal, not a full correctness proof. Region activation checkpoint generation and some drain-completion workflows are still gaps to plan around. The current server help advertises the cluster secret environment variable as `CLUSTER_SECRET`; treat snippets that use a different name for that setting as stale until they are corrected. Kubernetes deployments are deployment-specific today because the repository does not ship a complete chart.
 
 The safest deployment is one where every state change has a plane, a principal, an audit reason, and a recovery story. If a command or orchestration step cannot explain those four things, stop and make the boundary explicit before putting tenant data on the system.
+
+## Deployment smoke test
+
+After starting a node, verify the surfaces in the order users depend on them. First check `/ready` on the public listener. Then use `anvil-admin diagnostics list` against the private admin listener. Then create or use a tenant app credential, configure `anvil`, create a bucket in an active region, write an object, read it back, and inspect tenant audit. Finally, if gateways are enabled, read the same object through the S3/static route that users will use.
+
+A deployment is not ready just because the process is listening. It is ready when token exchange, storage writes, source reads, derived views, and the intended routing path all work under the correct plane.

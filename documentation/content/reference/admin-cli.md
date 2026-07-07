@@ -522,3 +522,9 @@ The current admin CLI is intentionally narrower than the full platform model:
 | Package gateways | The admin CLI does not expose full Docker/npm/PyPI/Maven registry gateway lifecycle commands. Treat package gateway work as foundational unless current protocol handlers are added. |
 
 Use `anvil-admin` when the operation belongs to the private operator plane: tenants, first credentials, emergency policy changes, topology, routing, diagnostics, repair, audit, and secret envelope rotation. Use the public API and `anvil` when the operation is tenant-owned data work. If a workflow cannot be completed through either current surface, document it as an implementation gap rather than creating a direct storage writer.
+
+## Reading admin command failures
+
+An admin CLI failure has a different shape from a tenant failure. First confirm `ANVIL_ADMIN_ENDPOINT` points at the private admin listener and `ANVIL_PUBLIC_ENDPOINT` points at the public token service. Then distinguish authentication failure from system-realm denial. A token can be valid and still lack the relation required for `manage_regions`, `manage_nodes`, `run_repair`, or another admin operation.
+
+For lifecycle mutations, also check generation. A stale `--expected-generation` failure is a safety feature: it means another operator or controller changed the resource after the value you read. Re-read the resource, review the newer generation, and decide whether the planned mutation is still valid.

@@ -236,3 +236,9 @@ Use [Watch and Derived Maintenance](/operators/watch-and-derived-maintenance/) f
 Writes in Anvil are versioned, cursor-producing mutations over source records. Safe clients make their assumptions explicit. Idempotency handles retry ambiguity. CAS and object-version preconditions prevent lost updates. Manifest CAS protects mutable JSON heads. Task leases decide who owns background work. Fence tokens reject stale owners at mutation time. Watch cursors connect source writes to derived consumers.
 
 The API exposes these concepts more completely than the current CLI. Use CLI commands as manual helpers and smoke tests. Use the public API for production code that must be correct under retries, races, stale workers, and derived-data lag.
+
+## Choosing retry behaviour
+
+A safe retry repeats the same logical operation with the same idempotency key and the same intended precondition. It should not generate a new business operation every time a network timeout occurs. For example, a renderer writing `reports/42/output.pdf` should use a stable request id or idempotency key derived from report id and render generation, then treat a precondition failure as evidence that another writer changed the object.
+
+Fences add one more guarantee for background work. A worker that acquired a lease at fence token `7` can publish output only while token `7` is still valid for that task. If the lease expires and another node acquires token `8`, late writes from token `7` must fail. This is why Anvil background maintenance is described as in-process leased work rather than a best-effort daemon loop.

@@ -5,97 +5,152 @@ description: Understand first-start administration, the system realm, and the pr
 
 # Bootstrap Administration
 
-This page continues from [Run Anvil Locally](/tutorials/setup-local-anvil/). It assumes the `anvil-local` container is still running, the public API is reachable on host port `50051`, and the admin API on `50052` is not published to the host. Because the admin listener is private in this Docker setup, admin examples use `docker exec anvil-local ...`.
+This tutorial continues from [Run Anvil Locally](/tutorials/setup-local-anvil/). It assumes the `anvil-local` container is running, the public API is reachable on host port `50051`, and the admin API on `50052` is not published to the host.
 
-The CLI is supporting tooling over the same APIs that production automation can call directly. Use it here because it makes the request path readable. In production, a release controller, topology reconciler, audit exporter, or repair service may call the admin API directly with the same authentication, authorisation, and audit expectations. The full command surface is documented in [Admin CLI](/reference/admin-cli/) and the tenant-facing command surface is documented in [Public CLI](/reference/public-cli/).
+Bootstrap is the moment a brand-new Anvil storage directory gets its first system administrator. This page shows how to inspect that first credential, how `anvil-admin` obtains a bearer token, how to call the private admin API without exposing it, and why production administration should move from one bootstrap credential to named, auditable admin principals. For exact command shapes, use [Admin CLI](/reference/admin-cli/). For tenant-facing command shapes, use [Public CLI](/reference/public-cli/).
 
-## What bootstrap means
+The admin CLI is supporting tooling over the private admin API. It is not a filesystem repair program, and it is not a shortcut around authentication or authorisation. Except for local helper commands such as key generation, `anvil-admin` sends a bearer token to the admin listener and the server checks Anvil's built-in system realm.
 
-Anvil stores system administration authority in the **system realm**. The system realm is the built-in authorisation realm that decides who may create tenants, manage application credentials, change mesh topology, run repairs, read administrative audit streams, and rotate server-side secret envelopes.
+## Prerequisites
 
-A brand-new storage directory has no system realm yet. Bootstrap is the first-start server transaction that creates that realm and creates or binds the first system administration service principal if none exists. In the local setup, that first principal is the `system-admin` app, and its generated credential file is `/var/lib/anvil/bootstrap/system-admin.json` inside the container.
-
-An `app` in this context is an application or service principal: a credentialed identity for software, automation, or operators. It is not an S3-specific artefact. The generated `system-admin` app is powerful enough for a disposable local tutorial because the local node has one operator and no tenant data worth separating. That same shape is usually too coarse for production.
-
-For deeper operator design, read [Admin Plane](/operators/admin-plane/) and [Security Hardening](/operators/security-hardening/).
-
-## What bootstrap is not
-
-Bootstrap is not an API bypass. It is not a recurring admin mode. It is not a second authentication system you can turn on later.
-
-The first-start transaction happens before public or admin requests are accepted. Once the system realm exists, every admin operation follows the ordinary path: authenticate the caller, authorise the requested relation in the system realm, validate the request, mutate Anvil-owned state, and record audit evidence. If you restart a node with first-start bootstrap settings after the system realm already exists, those settings do not mint fresh authority.
-
-This distinction matters operationally. If an operator cannot perform an admin action after first start, the fix is to repair the principal, credential, or system-realm authorisation model. Do not invent a special admin mode or route around the API.
-
-## Confirm the local first credential exists
-
-The setup page configured the server to write the first credential file inside the Docker volume. Before using it, check that the file exists without printing its secret contents.
+Before starting this page, verify the local setup checkpoints:
 
 ```bash
-docker exec anvil-local sh -c 'test -s /var/lib/anvil/bootstrap/system-admin.json && echo "system-admin credential file exists"'
+curl -fsS http://127.0.0.1:50051/ready
+
+docker exec anvil-local sh -c \
+  'test -s /var/lib/anvil/bootstrap/system-admin.json && echo "system-admin credential file exists"'
 ```
 
-The message confirms that the container has the generated first-start credential file. It does not prove the credential is safe to expose. Keep the file private, and use it only to mint short-lived request credentials for this local bootstrap flow.
+The first command proves the public plane is reachable from the host. The second proves the first-start credential file exists inside the Docker volume. Neither command exposes the admin API to the host.
 
-## Understand how `anvil-admin` gets a bearer token
-
-`anvil-admin` sends a bearer token to the admin API. That token is a short-lived request credential. It is different from the client id and client secret in `system-admin.json`, which are long-lived credential material.
-
-`ANVIL_AUTH_TOKEN` controls the first step. If `ANVIL_AUTH_TOKEN` is set, `anvil-admin` sends that token to the admin API and does not need to exchange client credentials first. If `ANVIL_AUTH_TOKEN` is absent, the CLI can mint a token through the public API: in the local container it can read the credential-file environment path configured during setup, and in a host or CI environment it can use the selected CLI profile's client id and client secret. The minted token is then sent to the admin API.
-
-Because the setup page created a host-side `local-system` profile, you can mint a fresh token from the host public API. The command prints only the token length so you do not accidentally paste the token into logs.
+If your shell does not already have a system-admin bearer token, mint one from the `local-system` profile created in the setup tutorial:
 
 ```bash
-export ANVIL_AUTH_TOKEN="$(anvil auth get-token)"
+export ANVIL_AUTH_TOKEN="$(anvil --profile local-system auth get-token)"
 printf 'received admin bearer token with %s characters\n' "${#ANVIL_AUTH_TOKEN}"
 ```
 
-After this command, your shell has a bearer token for the first system administration principal. The token is suitable for short manual checks. When it expires, run the token exchange again instead of reusing old output from a terminal scrollback.
+The token is short-lived. When it expires, mint a new one rather than reusing old terminal output.
 
-## Call the private admin API from inside Docker
+## What bootstrap creates
 
-The admin API is still private to the container. Pass the short-lived bearer token into `docker exec` so the admin CLI can send it to `http://127.0.0.1:50052` inside the container.
+Anvil stores system administration authority in the **system realm**. The system realm is the built-in relationship-authorisation realm that decides who may create tenants, manage application credentials during bootstrap, grant public policies, change topology, run repairs, read admin diagnostics, read admin audit events, and rotate server-side secret envelopes.
+
+A brand-new storage directory has no system realm yet. First-start bootstrap is the server transaction that creates that realm and creates or binds the first system administration service principal if none exists. In this local setup, that first principal is the `system-admin` app, and its generated credential file is `/var/lib/anvil/bootstrap/system-admin.json` inside the container.
+
+An app is a credentialed identity for software, automation, or operators. It is not an S3-only concept. The generated `system-admin` app is powerful enough for a disposable local tutorial because the node has one operator and no production tenant data. That same shape is usually too coarse for production. Production operators should create named principals for distinct duties such as topology control, tenant provisioning, audit export, repair, secret rotation, and emergency break-glass access.
+
+## What bootstrap does not create
+
+Bootstrap is not an API bypass. It is not a recurring admin mode. It is not a second authentication system you can turn on later.
+
+The first-start transaction happens before public or admin requests are accepted. Once the system realm exists, every admin operation follows the ordinary path: authenticate the caller, authorise the requested relation in the system realm, validate the request, mutate Anvil-owned state, and record audit evidence. If you restart a node with first-start bootstrap settings after the system realm already exists, those settings do not mint a fresh administrator.
+
+This matters during incident response. If an operator cannot perform an admin action after first start, the fix is to repair or rotate the principal, credential, or system-realm relation. Do not add a secret admin flag, expose the admin listener, edit storage files, or use public policy grants to emulate system administration.
+
+## Inspect the first credential without leaking it
+
+The credential file contains a client id and client secret. It is long-lived credential material, so the tutorial checks only that it exists and is valid JSON enough to read the client id. Do not print the secret value into logs.
+
+```bash
+docker exec anvil-local sh -c \
+  'jq -r .client_id /var/lib/anvil/bootstrap/system-admin.json | sed "s/.*/client id present/"'
+```
+
+If `jq` is not installed in the container image, use the host-side copy from the setup tutorial:
+
+```bash
+jq -r .client_id /tmp/anvil-system-admin.json | sed 's/.*/client id present/'
+```
+
+Success proves the bootstrap credential file is readable in the place the server wrote it. It does not prove the admin API will accept a request. API acceptance requires a bearer token and system-realm authorisation.
+
+## Understand how `anvil-admin` gets a bearer token
+
+`anvil-admin` sends bearer tokens to the admin API. The bearer token is a short-lived request credential. It is different from the client id and client secret stored in `system-admin.json`.
+
+Token resolution follows the same broad order as the public CLI:
+
+| Input | Behaviour |
+| --- | --- |
+| `ANVIL_AUTH_TOKEN` | Sent directly to the admin API. No token exchange is performed. |
+| `ANVIL_BOOTSTRAP_CREDENTIAL_FILE` | Reads `client_id` and `client_secret`, then exchanges them for a token through the public API. |
+| Stored profile | Uses the selected profile credentials when no token or credential file is present. |
+| `ANVIL_PUBLIC_ENDPOINT` | Selects the public endpoint used for token exchange. It does not change the admin API endpoint. |
+
+In this tutorial, passing `ANVIL_AUTH_TOKEN` into `docker exec` makes the credential source explicit:
+
+```bash
+docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local \
+  anvil-admin --host http://127.0.0.1:50052 audit list --limit 5
+```
+
+The `--host` value is the private admin endpoint as seen from inside the container. It is not the public endpoint, and it is not reachable from the host because the setup page did not publish port `50052`.
+
+If you omit `ANVIL_AUTH_TOKEN` in this local container, `anvil-admin` can still mint a token because the setup page supplied `ANVIL_BOOTSTRAP_CREDENTIAL_FILE` and `ANVIL_PUBLIC_ENDPOINT` as container environment variables. That fallback is convenient for local inspection, but production automation should make its credential source explicit.
+
+## Call a read-only admin operation first
+
+Start with an admin audit read because it is read-only and easy to interpret:
 
 ```bash
 docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local \
   anvil-admin audit list --limit 10
 ```
 
-A successful response proves three things: the token is valid, the admin API is reachable inside the container, and the system realm authorises the principal to read admin audit events. The host still has no direct admin-port exposure.
+A successful response proves three things at once: the token is valid, the admin API is reachable inside the container, and the system realm authorises this principal to read admin audit events. It also proves the host still does not need direct admin-port exposure.
 
-If you omit `-e ANVIL_AUTH_TOKEN=...` in this local container, `anvil-admin` can still mint a token because setup supplied `ANVIL_BOOTSTRAP_CREDENTIAL_FILE` and `ANVIL_PUBLIC_ENDPOINT` to the container. That fallback is convenient for local inspection, but production automation should make its credential source explicit.
+A failure tells you where to look:
 
-## What the generated system-admin credential can and cannot do
+- Connection refused means the admin endpoint is wrong or the server is not listening where the CLI expects.
+- Unauthenticated means the token is missing, expired, malformed, or minted by the wrong public endpoint.
+- Permission denied means the principal is authenticated but lacks the required system-realm relation.
+- Empty output is not a failure. It can mean there are no matching audit events in the requested page.
 
-The generated `system-admin` credential can mint a bearer token for the bootstrap-created system owner/admin principal. That bearer token can call admin API operations that the system realm authorises for that principal. In this local tutorial, that is enough to prove the private admin API is reachable, tokens work, and admin authorisation is enforced by the system realm.
+Keep this habit for other admin work: read first, mutate only after you know which private endpoint, principal, and relation are involved.
 
-The generated credential is not a recommended daily production credential. It is the first-start credential that gets a new Anvil system out of a zero-administrator state. In production, keep it in protected break-glass storage after normal operator access is established. Do not bake it into release jobs, dashboards, runbooks, or application containers.
+## Understand the generated credential's limits
 
-Creating another app is only creating identity material. `anvil-admin app create` can create a client id and client secret for a named app, but that does not by itself grant admin authority. Public policy grants are also not a substitute: they are data/public API scopes, not system-realm admin relations.
+The generated `system-admin` credential can mint a bearer token for the bootstrap-created system administrator. In this local tutorial that is enough to prove private admin reachability, token exchange, system-realm authorisation, and admin audit reading.
 
-## Named admin principals require system-realm relations
+It is not a recommended daily production credential. It is the first-start credential that gets a new Anvil system out of a zero-administrator state. After named production access exists, store it in protected break-glass storage. Do not bake it into release jobs, dashboards, application containers, routine repair jobs, or tenant automation.
 
-A named production admin app should represent one duty or automation boundary. Topology controllers, repair tooling, audit exporters, release automation, secret-rotation jobs, and emergency break-glass access should not all share one credential if they have different risk profiles. Separate principals give clearer audit identity, independent rotation, independent revocation, and least-privilege authorisation.
+Creating another app is only creating identity material. `anvil-admin app create` can create a client id and client secret for a named app, but that does not by itself grant admin authority. Public policy grants are also not a substitute: they are public/data-plane scopes, not system-realm admin relations. See [Authorisation Actions and Resources](/reference/authorisation-actions-and-resources/) for the distinction between public policy scopes, relationship authorisation, and system-realm relations.
 
-That separation only works after each named app is bound to the right system-realm relation. The current system-realm relation model distinguishes tenant management, app management, policy management, secret-encryption-key management, bucket management, node management, region management, routing management, host-alias management, link management, repair execution, diagnostic viewing, and audit-log viewing. A topology controller might need region, node, and routing relations; a repair service might need repair and diagnostics relations; an audit exporter might need audit-log viewing but not tenant creation or secret rotation.
+## Plan named admin principals before production
 
-This tutorial does not invent a command for binding those system-realm relations. At the time of this page, the documented CLI flow can show first-start bootstrap and local admin API access, but it does not expose a complete named-admin-principal delegation workflow. The production model remains: create named service principals, bind only the system-realm relations they need, and verify unrelated admin calls fail. The implementation and command reference must document that relation-binding path before this tutorial can safely present it as a runnable sequence.
+A named production admin app should represent one duty or automation boundary. Examples include:
 
-For the intended production posture, keep [Admin Plane](/operators/admin-plane/) and [Security Hardening](/operators/security-hardening/) as the design references.
+| Principal | Likely system-realm relations | Should not have |
+| --- | --- | --- |
+| Tenant provisioner | tenant, app, and public-policy management | topology repair, secret rotation |
+| Topology controller | region, cell, node, and routing management | tenant object access |
+| Audit exporter | admin audit-log viewing | tenant creation, repair execution |
+| Repair service | repair execution and diagnostics viewing | app secret rotation |
+| Secret-rotation job | secret-encryption-key management | bucket or topology changes |
 
-## Verify audit evidence
+The exact relation names are documented in [Admin CLI](/reference/admin-cli/). This tutorial does not invent a command for binding those relations if the documented CLI flow does not expose one. The safe production model remains: create named service principals, bind only the system-realm relations they need through the supported admin-plane workflow, verify unrelated admin calls fail, and record audit evidence for every mutation.
 
-Admin changes should not be anonymous maintenance. List recent audit events during local bootstrap work so you can inspect the request id, principal, action, and stated reason for any recorded administrative changes.
+Do not try to model those duties with tenant public policy grants. A tenant app can own and manage tenant resources through the public plane where delegated, but it cannot grant itself system topology authority or rewrite the built-in system realm.
+
+## Verify audit evidence after mutations
+
+Every mutating admin command should carry an audit reason. The local setup page has not yet made mutating admin changes beyond first-start bootstrap, but the same audit stream is where you verify later tenant, topology, policy, repair, and lifecycle changes.
 
 ```bash
 docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local \
   anvil-admin audit list --limit 20
 ```
 
-On a fresh local node, the important check is that the authenticated audit read succeeds without exposing the admin port on the host. After mutating admin commands, use the same audit stream to confirm that the change is attributable. A deployment that cannot explain administrative changes is not ready to host production data.
+Read the response for the principal, action, resource, request id, and stated reason. A deployment that cannot explain administrative changes is not ready to host production data.
 
-## Reduce dependence on the first-start credential
+## Success and failure cues
 
-For the local tutorial, you can continue using the `system-admin` profile. For production, move the first-start credential into protected break-glass storage after the named-principal and system-realm relation workflow is implemented, documented, and verified. Day-to-day automation should use its own app, its own secret, its own narrow system-realm relations, and its own audit identity.
+The happy path is deliberately narrow: the credential file exists, token exchange returns a non-empty bearer token, and a read-only `anvil-admin audit list` works from inside the container boundary. The host admin port remains unpublished.
 
-The next operator-heavy tutorial is [Mesh Regions, Cells, and Nodes](/tutorials/mesh-regions-cells-and-nodes/). In the local Docker posture from this page, keep using `docker exec anvil-local ...` for admin commands unless you intentionally expose the admin listener on a protected internal endpoint.
+Common failures usually mean one of three things. If token exchange fails, inspect the public endpoint and credential source. If an admin command cannot connect, inspect `ANVIL_ADMIN_ENDPOINT`, `--host`, and server logs. If the command returns permission denied, treat it as a system-realm authorisation problem; do not expose `50052`, add public scopes, or edit storage files to bypass the relation check.
+
+## Where to go next
+
+Continue with [Mesh Regions, Cells, and Nodes](/tutorials/mesh-regions-cells-and-nodes/) to register the local topology descriptors through the private admin plane. When you are ready to hand work to tenants, read [Tenants, Apps, and Credentials](/tutorials/tenants-apps-and-credentials/). For production posture, keep [Admin Plane](/operators/admin-plane/) and [Security Hardening](/operators/security-hardening/) nearby.

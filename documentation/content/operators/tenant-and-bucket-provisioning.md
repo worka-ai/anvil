@@ -164,7 +164,7 @@ anvil-admin --host http://10.10.0.12:50052 policy grant \
   --audit-reason 'temporary CLI bucket id discovery for docs-ingest smoke test'
 ```
 
-Use that as a temporary workaround, not as a normal service grant. Revoke it after the test if the service does not need tenant-wide bucket listing:
+Use that as a temporary temporary path, not as a normal service grant. Revoke it after the test if the service does not need tenant-wide bucket listing:
 
 ```bash
 anvil-admin --host http://10.10.0.12:50052 policy revoke \
@@ -193,7 +193,7 @@ Admin bucket public-access commands exist for operator-controlled provisioning, 
 
 ## Deprovisioning and evidence
 
-Deprovisioning should be as deliberate as provisioning. Start by identifying which app credentials and grants are still in use. Revoke public policy grants that are no longer needed, rotate or delete tenant app credentials through the public app APIs where possible, and remove temporary wildcard-resource workarounds. If the tenant still has public-read buckets, host aliases, object links, indexes, watches, task leases, append streams, or PersonalDB groups, decide whether each must be drained, archived, retained, or deleted under your retention policy.
+Deprovisioning should be as deliberate as provisioning. Start by identifying which app credentials and grants are still in use. Revoke public policy grants that are no longer needed, rotate or delete tenant app credentials through the public app APIs where possible, and remove temporary wildcard-resource temporary paths. If the tenant still has public-read buckets, host aliases, object links, indexes, watches, task leases, append streams, or PersonalDB groups, decide whether each must be drained, archived, retained, or deleted under your retention policy.
 
 For object and bucket removal, use tenant-owned APIs when the tenant is responsible for the data:
 
@@ -210,3 +210,9 @@ Keep audit evidence from both planes. Admin provisioning, admin policy grants, a
 The current implementation is usable for handover, but not every least-privilege shape is exposed cleanly through the public CLI. The most visible gap is public object mutation: the CLI discovers `bucket_id` through `ListBuckets`, and `ListBuckets` currently requires `bucket:list` on `*`. That blocks a clean CLI-only upload profile for one bucket or one prefix. Direct API clients can work around it by retaining the bucket id, while the product should eventually expose a narrower bucket lookup or accept a safer mutation context flow.
 
 The public CLI upload path also lacks flags for `content_type` and `user_metadata_json`. Some public scopes are broader than ideal, especially bucket listing, object listing, tenant app management, and some index read/query paths. Tenant `--home-region` handling has an implementation mismatch as described earlier, and region activation/placement workflows still need operator care. Treat these as documented constraints when writing runbooks, not as reasons to use global wildcard grants or direct storage writes.
+
+## Handover evidence
+
+A complete handover gives the tenant owner a client id, the one-time client secret, the public endpoint, the initial grants, and the bucket or region assumptions. It should also record which admin principal created the tenant and app, which audit reasons were used, and which wildcard grants are temporary.
+
+After handover, prove that the tenant owner can mint a token and perform only the intended public operations. A good first check is `anvil auth get-token`, `anvil bucket ls`, and one narrow object write/read under the prefix the app is supposed to own.

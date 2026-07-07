@@ -147,3 +147,9 @@ Generate server-side encryption keys with the helper, store all server secrets i
 Rotate when a secret leaks, when staff or automation with access leaves the trust boundary, before old key history becomes too large, or as part of scheduled security maintenance. For `ANVIL_SECRET_ENCRYPTION_KEY`, rotate with previous keys configured and verify the admin rotation response before removing old keys. For `JWT_SECRET` and `CLUSTER_SECRET`, plan coordinated node rollout because there is no current documented multi-key overlap workflow equivalent to envelope rotation. For app credentials, rotate the specific app and update only the service that owns it.
 
 Finally, test recovery. A restore drill should prove that Anvil can start with restored `STORAGE_PATH`, the active and previous encryption keys needed for that backup, the expected JWT and cluster secret configuration, and at least one authorised admin credential. A backup that cannot decrypt app secrets or cannot authenticate an operator is not a complete recovery plan.
+
+## Rotation evidence
+
+A secret rotation is complete only after new credentials are stored, old credentials are no longer accepted where intended, dependent services have reloaded, and audit records show who performed the change. For server-side secret-envelope rotation, keep previous keys configured until the rotation command and application credential smoke tests both pass.
+
+Do not confuse key generation with key installation. `anvil-admin key generate-secret-encryption-key` prints local material. The server uses it only after operators store it in configuration and restart or roll nodes according to the deployment model.
