@@ -1,8 +1,9 @@
 use crate::{
     core_store::{
         AppendStreamRecord, AuthzScopeRef, CompareAndSwapRef, CoreMutationBatch,
-        CoreMutationOperation, CoreMutationPrecondition, CoreObjectRef, CoreRefValue, CoreStore,
-        GetBlob, PutBlob, ReadStream, StreamAppendReceipt, StreamRecord,
+        CoreMutationOperation, CoreMutationPrecondition, CoreObjectRef, CorePipelinePolicy,
+        CoreRefValue, CoreStore, CoreTraceContext, GetBlob, ReadStream, StreamAppendReceipt,
+        StreamRecord, WriteLogicalFileRequest, core_object_ref_from_logical_file_manifest,
     },
     formats::hash32,
     storage::Storage,
@@ -396,17 +397,15 @@ pub async fn put_gateway_blob(
     }
 
     let store = CoreStore::new(storage.clone()).await?;
-    let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.clone(),
-            bytes: bytes.to_vec(),
-            boundary_values: Vec::new(),
-            region_id: "local".to_string(),
-            mutation_id: format!(
-                "gateway-blob:{tenant_id}:{gateway}:{registry_instance_id}:{repository}:{digest}"
-            ),
-        })
-        .await?;
+    let object_ref = write_gateway_logical_file(
+        &store,
+        "registry_blob",
+        1,
+        ref_name.clone(),
+        bytes.to_vec(),
+        format!("gateway-blob:{tenant_id}:{gateway}:{registry_instance_id}:{repository}:{digest}"),
+    )
+    .await?;
     let mut record = GatewayBlobRecord {
         schema: GATEWAY_BLOB_SCHEMA.to_string(),
         tenant_id,
@@ -618,19 +617,19 @@ pub async fn create_gateway_upload_session(
     };
     record.record_hash = hash_record(&record)?;
     let session_ref_name = gateway_upload_ref_name(&record)?;
-    let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: session_ref_name.clone(),
-            bytes: serde_json::to_vec_pretty(&record)?,
-            boundary_values: Vec::new(),
-            region_id: "local".to_string(),
-            mutation_id: format!(
-                "gateway-upload-start:{}:{}",
-                session_ref_name,
-                Uuid::new_v4().simple()
-            ),
-        })
-        .await?;
+    let object_ref = write_gateway_logical_file(
+        &store,
+        "registry_upload_session",
+        1,
+        session_ref_name.clone(),
+        serde_json::to_vec_pretty(&record)?,
+        format!(
+            "gateway-upload-start:{}:{}",
+            session_ref_name,
+            Uuid::new_v4().simple()
+        ),
+    )
+    .await?;
     let receipt = store
         .commit_mutation_batch(CoreMutationBatch {
             transaction_id: format!(
@@ -937,21 +936,21 @@ pub async fn append_gateway_upload_part(
     }
 
     let store = CoreStore::new(storage.clone()).await?;
-    let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: format!(
-                "gateway_upload_part:tenant:{tenant_id}:gateway:{}:registry:{}:repository:{}:upload:{}:part:{part_id}",
-                record.gateway, record.registry_instance_id, record.repository, record.upload_id
-            ),
-            bytes: bytes.to_vec(),
-            boundary_values: Vec::new(),
-            region_id: "local".to_string(),
-            mutation_id: format!(
-                "gateway-upload-part:{tenant_id}:{}:{}:{}:{}:{part_id}:{idempotency_key_hash}",
-                record.gateway, record.registry_instance_id, record.repository, record.upload_id
-            ),
-        })
-        .await?;
+    let object_ref = write_gateway_logical_file(
+        &store,
+        "registry_upload_part",
+        record.staged_parts.len() as u64 + 1,
+        format!(
+            "gateway_upload_part:tenant:{tenant_id}:gateway:{}:registry:{}:repository:{}:upload:{}:part:{part_id}",
+            record.gateway, record.registry_instance_id, record.repository, record.upload_id
+        ),
+        bytes.to_vec(),
+        format!(
+            "gateway-upload-part:{tenant_id}:{}:{}:{}:{}:{part_id}:{idempotency_key_hash}",
+            record.gateway, record.registry_instance_id, record.repository, record.upload_id
+        ),
+    )
+    .await?;
     record.staged_parts.push(GatewayUploadPartRecord {
         schema: "anvil.gateway.upload_part.v1".to_string(),
         session_id: record.upload_id.clone(),
@@ -1098,17 +1097,17 @@ pub async fn finalise_gateway_upload_session(
             .map(|_| existing);
     }
 
-    let payload_ref = store
-        .put_blob(PutBlob {
-            logical_name: blob_ref_name.clone(),
-            bytes: payload,
-            boundary_values: Vec::new(),
-            region_id: "local".to_string(),
-            mutation_id: format!(
-                "gateway-upload-finalise:{tenant_id}:{gateway}:{registry_instance_id}:{repository}:{target_digest}"
-            ),
-        })
-        .await?;
+    let payload_ref = write_gateway_logical_file(
+        &store,
+        "registry_blob",
+        1,
+        blob_ref_name.clone(),
+        payload,
+        format!(
+            "gateway-upload-finalise:{tenant_id}:{gateway}:{registry_instance_id}:{repository}:{target_digest}"
+        ),
+    )
+    .await?;
     let mut blob_record = GatewayBlobRecord {
         schema: GATEWAY_BLOB_SCHEMA.to_string(),
         tenant_id,
@@ -1124,18 +1123,18 @@ pub async fn finalise_gateway_upload_session(
         record_hash: String::new(),
     };
     blob_record.record_hash = hash_record(&blob_record)?;
-    let blob_record_ref = store
-        .put_blob(PutBlob {
-            logical_name: blob_ref_name.clone(),
-            bytes: serde_json::to_vec_pretty(&blob_record)?,
-            boundary_values: Vec::new(),
-            region_id: "local".to_string(),
-            mutation_id: format!(
-                "gateway-blob-record:{blob_ref_name}:{}",
-                Uuid::new_v4().simple()
-            ),
-        })
-        .await?;
+    let blob_record_ref = write_gateway_logical_file(
+        &store,
+        "registry_metadata",
+        1,
+        blob_ref_name.clone(),
+        serde_json::to_vec_pretty(&blob_record)?,
+        format!(
+            "gateway-blob-record:{blob_ref_name}:{}",
+            Uuid::new_v4().simple()
+        ),
+    )
+    .await?;
     commit_upload_session_record(
         store,
         session,
@@ -1621,19 +1620,19 @@ async fn commit_upload_session_record(
     session.record_hash.clear();
     session.record_hash = hash_record(&session)?;
     let session_ref_name = gateway_upload_ref_name(&session)?;
-    let session_object_ref = store
-        .put_blob(PutBlob {
-            logical_name: session_ref_name.clone(),
-            bytes: serde_json::to_vec_pretty(&session)?,
-            boundary_values: Vec::new(),
-            region_id: "local".to_string(),
-            mutation_id: format!(
-                "gateway-upload-commit:{}:{}",
-                session_ref_name,
-                Uuid::new_v4().simple()
-            ),
-        })
-        .await?;
+    let session_object_ref = write_gateway_logical_file(
+        &store,
+        "registry_upload_session",
+        session_ref.generation + 1,
+        session_ref_name.clone(),
+        serde_json::to_vec_pretty(&session)?,
+        format!(
+            "gateway-upload-commit:{}:{}",
+            session_ref_name,
+            Uuid::new_v4().simple()
+        ),
+    )
+    .await?;
     let mut preconditions = vec![CoreMutationPrecondition::Ref {
         ref_name: session_ref_name.clone(),
         expected_generation: Some(session_ref.generation),
@@ -1711,6 +1710,31 @@ async fn commit_upload_session_record(
     })
 }
 
+async fn write_gateway_logical_file(
+    store: &CoreStore,
+    writer_family: &str,
+    generation: u64,
+    logical_file_id: String,
+    source: Vec<u8>,
+    mutation_id: String,
+) -> Result<CoreObjectRef> {
+    let manifest = store
+        .write_logical_file(WriteLogicalFileRequest {
+            writer_family: writer_family.to_string(),
+            generation,
+            logical_file_id,
+            source,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
+            boundary_values: Vec::new(),
+            mutation_id,
+            region_id: "local".to_string(),
+        })
+        .await?;
+    Ok(core_object_ref_from_logical_file_manifest(&manifest))
+}
+
 async fn put_record_ref<T: Serialize>(
     storage: &Storage,
     ref_name: &str,
@@ -1729,15 +1753,18 @@ async fn put_record_ref<T: Serialize>(
             bail!("CoreStore gateway ref {ref_name} generation mismatch");
         }
     }
-    let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.to_string(),
-            bytes: serde_json::to_vec_pretty(record)?,
-            boundary_values: Vec::new(),
-            region_id: "local".to_string(),
-            mutation_id: format!("gateway-record:{ref_name}:{}", Uuid::new_v4().simple()),
-        })
-        .await?;
+    let object_ref = write_gateway_logical_file(
+        &store,
+        "registry_metadata",
+        current
+            .as_ref()
+            .map(|value| value.generation + 1)
+            .unwrap_or(1),
+        ref_name.to_string(),
+        serde_json::to_vec_pretty(record)?,
+        format!("gateway-record:{ref_name}:{}", Uuid::new_v4().simple()),
+    )
+    .await?;
     store
         .compare_and_swap_ref(CompareAndSwapRef {
             ref_name: ref_name.to_string(),

@@ -224,19 +224,19 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
             name: "package_repository",
             source_files: &["anvil-core/src/gateway_store.rs"],
             required_terms: &["GatewayRepositoryRecord", "create_gateway_repository"],
-            corestore_terms: &["CoreStore", ".put_blob", ".compare_and_swap_ref"],
+            corestore_terms: &["CoreStore", ".write_logical_file", ".compare_and_swap_ref"],
         },
         DurableFeatureFamily {
             name: "package_blob",
             source_files: &["anvil-core/src/gateway_store.rs"],
             required_terms: &["GatewayBlobRecord", "put_gateway_blob"],
-            corestore_terms: &["CoreStore", ".put_blob", ".compare_and_swap_ref"],
+            corestore_terms: &["CoreStore", ".write_logical_file", ".compare_and_swap_ref"],
         },
         DurableFeatureFamily {
             name: "gateway_mount",
             source_files: &["anvil-core/src/gateway_store.rs"],
             required_terms: &["GatewayMountRecord", "resolve_gateway_mount"],
-            corestore_terms: &["CoreStore", ".put_blob", ".compare_and_swap_ref"],
+            corestore_terms: &["CoreStore", ".write_logical_file", ".compare_and_swap_ref"],
         },
         DurableFeatureFamily {
             name: "mesh_route",
