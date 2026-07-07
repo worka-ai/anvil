@@ -310,6 +310,7 @@ pub struct CoreTransaction {
     pub operations_hash: String,
     pub prepared_refs: Vec<String>,
     pub visible_updates: Vec<CoreTransactionUpdate>,
+    pub finalisation_error: Option<String>,
     pub committed_at: String,
     pub committed_by_principal: String,
 }
@@ -319,6 +320,7 @@ pub struct CoreTransaction {
 pub enum CoreTransactionState {
     Prepared,
     Committed,
+    FinalisationFailed,
     Aborted,
 }
 
@@ -390,7 +392,9 @@ pub enum CoreMutationOperation {
 pub struct CoreMutationBatchReceipt {
     pub transaction_id: String,
     pub scope_partition: String,
+    pub state: CoreTransactionState,
     pub visible_updates: Vec<CoreTransactionUpdate>,
+    pub finalisation_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

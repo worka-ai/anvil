@@ -1695,15 +1695,11 @@ impl CoreStore {
             step_start.elapsed(),
         );
         let step_start = std::time::Instant::now();
-        if self
+        if let Some(transaction) = self
             .read_transaction_unlocked(&batch.transaction_id)
             .await?
-            .is_some()
         {
-            bail!(
-                "CoreStore transaction {} already exists",
-                batch.transaction_id
-            );
+            return Ok(receipt_from_transaction(&transaction));
         }
         crate::emit_test_timing(
             format!("core_store.commit_mutation_batch read_transaction tx={timing_name}"),
@@ -1741,49 +1737,53 @@ impl CoreStore {
 
         let mut visible_updates = Vec::with_capacity(batch.operations.len());
         let step_start = std::time::Instant::now();
+        let mut finalisation_error = None;
         for operation in &batch.operations {
-            match operation {
+            let operation_result = match operation {
                 CoreMutationOperation::RefUpdate {
                     ref_name,
                     new_target,
                     ..
-                } => {
-                    let update = self
-                        .apply_ref_update_unlocked(
-                            ref_name,
-                            new_target,
-                            Some(batch.transaction_id.clone()),
-                            ref_precondition_for(&batch.preconditions, ref_name),
-                        )
-                        .await?;
-                    visible_updates.push(CoreTransactionUpdate::CoreRefUpdate {
+                } => self
+                    .apply_ref_update_unlocked(
+                        ref_name,
+                        new_target,
+                        Some(batch.transaction_id.clone()),
+                        ref_precondition_for(&batch.preconditions, ref_name),
+                    )
+                    .await
+                    .map(|update| CoreTransactionUpdate::CoreRefUpdate {
                         ref_name: ref_name.clone(),
                         new_generation: update.generation,
-                    });
-                }
+                    }),
                 CoreMutationOperation::StreamAppend {
                     partition_id,
                     stream_id,
                     record_kind,
                     payload,
                     idempotency_key,
-                } => {
-                    let receipt = self
-                        .append_stream_unlocked(AppendStreamRecord {
-                            stream_id: stream_id.clone(),
-                            partition_id: partition_id.clone(),
-                            record_kind: record_kind.clone(),
-                            payload: payload.clone(),
-                            fence: None,
-                            transaction_id: Some(batch.transaction_id.clone()),
-                            idempotency_key: idempotency_key.clone(),
-                        })
-                        .await?;
-                    visible_updates.push(CoreTransactionUpdate::StreamAppend {
+                } => self
+                    .append_stream_unlocked(AppendStreamRecord {
+                        stream_id: stream_id.clone(),
+                        partition_id: partition_id.clone(),
+                        record_kind: record_kind.clone(),
+                        payload: payload.clone(),
+                        fence: None,
+                        transaction_id: Some(batch.transaction_id.clone()),
+                        idempotency_key: idempotency_key.clone(),
+                    })
+                    .await
+                    .map(|receipt| CoreTransactionUpdate::StreamAppend {
                         stream_id: stream_id.clone(),
                         visible_sequence: receipt.sequence,
                         prepared_record_hash: receipt.event_hash,
-                    });
+                    }),
+            };
+            match operation_result {
+                Ok(update) => visible_updates.push(update),
+                Err(error) => {
+                    finalisation_error = Some(format!("{error:#}"));
+                    break;
                 }
             }
         }
@@ -1792,11 +1792,21 @@ impl CoreStore {
             step_start.elapsed(),
         );
 
+        let transaction_state = if finalisation_error.is_some() {
+            CoreTransactionState::FinalisationFailed
+        } else {
+            CoreTransactionState::Committed
+        };
+        let transaction_visible_updates = if finalisation_error.is_some() {
+            Vec::new()
+        } else {
+            visible_updates.clone()
+        };
         let transaction = CoreTransaction {
             schema: CORE_TRANSACTION_SCHEMA.to_string(),
             transaction_id: batch.transaction_id.clone(),
             scope_partition: batch.scope_partition.clone(),
-            state: CoreTransactionState::Committed,
+            state: transaction_state,
             preconditions_hash: format!(
                 "sha256:{}",
                 sha256_hex(&serde_json::to_vec(&batch.preconditions)?)
@@ -1806,7 +1816,8 @@ impl CoreStore {
                 sha256_hex(&serde_json::to_vec(&batch.operations)?)
             ),
             prepared_refs: Vec::new(),
-            visible_updates: visible_updates.clone(),
+            visible_updates: transaction_visible_updates.clone(),
+            finalisation_error: finalisation_error.clone(),
             committed_at: now_rfc3339(),
             committed_by_principal: batch.committed_by_principal.clone(),
         };
@@ -1824,7 +1835,9 @@ impl CoreStore {
         Ok(CoreMutationBatchReceipt {
             transaction_id: batch.transaction_id,
             scope_partition: batch.scope_partition,
-            visible_updates,
+            state: transaction_state,
+            visible_updates: transaction_visible_updates,
+            finalisation_error,
         })
     }
 
@@ -2524,6 +2537,20 @@ fn is_quorum_visibility_gap(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.to_string().contains("did not reach read quorum"))
+}
+
+fn receipt_from_transaction(transaction: &CoreTransaction) -> CoreMutationBatchReceipt {
+    CoreMutationBatchReceipt {
+        transaction_id: transaction.transaction_id.clone(),
+        scope_partition: transaction.scope_partition.clone(),
+        state: transaction.state,
+        visible_updates: if transaction.state == CoreTransactionState::Committed {
+            transaction.visible_updates.clone()
+        } else {
+            Vec::new()
+        },
+        finalisation_error: transaction.finalisation_error.clone(),
+    }
 }
 
 fn local_control_node_id(index: usize) -> String {
@@ -3898,6 +3925,8 @@ mod tests {
             .expect("transaction record");
         assert_eq!(transaction.state, CoreTransactionState::Committed);
         assert_eq!(transaction.visible_updates.len(), 2);
+        assert_eq!(receipt.state, CoreTransactionState::Committed);
+        assert!(receipt.finalisation_error.is_none());
     }
 
     #[tokio::test]
@@ -3981,6 +4010,7 @@ mod tests {
                         prepared_record_hash: "sha256:prepared".to_string(),
                     },
                 ],
+                finalisation_error: None,
                 committed_at: now_rfc3339(),
                 committed_by_principal: "principal:test".to_string(),
             })
@@ -4012,6 +4042,83 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn core_store_failed_finalisation_is_terminal_and_not_visible() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        let batch = CoreMutationBatch {
+            transaction_id: "txn-finalisation-fails".to_string(),
+            scope_partition: "bucket-partition-finalisation".to_string(),
+            committed_by_principal: "principal:test".to_string(),
+            preconditions: Vec::new(),
+            operations: vec![
+                CoreMutationOperation::RefUpdate {
+                    partition_id: "bucket-partition-finalisation".to_string(),
+                    ref_name: "tenant/t/bucket/b/object/finalisation/current".to_string(),
+                    new_target: "core-object-ref:should-not-be-visible".to_string(),
+                },
+                CoreMutationOperation::StreamAppend {
+                    partition_id: "bucket-partition-finalisation".to_string(),
+                    stream_id: "object_metadata:t:b:finalisation".to_string(),
+                    record_kind: "object.put".to_string(),
+                    payload: br#"{"object":"first"}"#.to_vec(),
+                    idempotency_key: Some("same-idempotency-key".to_string()),
+                },
+                CoreMutationOperation::StreamAppend {
+                    partition_id: "bucket-partition-finalisation".to_string(),
+                    stream_id: "object_metadata:t:b:finalisation".to_string(),
+                    record_kind: "object.put".to_string(),
+                    payload: br#"{"object":"conflict"}"#.to_vec(),
+                    idempotency_key: Some("same-idempotency-key".to_string()),
+                },
+            ],
+        };
+
+        let receipt = store.commit_mutation_batch(batch.clone()).await.unwrap();
+        assert_eq!(receipt.state, CoreTransactionState::FinalisationFailed);
+        assert!(receipt.visible_updates.is_empty());
+        assert!(
+            receipt
+                .finalisation_error
+                .as_deref()
+                .is_some_and(|error| error.contains("idempotency conflict"))
+        );
+        let transaction = store
+            .read_transaction("txn-finalisation-fails")
+            .await
+            .unwrap()
+            .expect("failed transaction record");
+        assert_eq!(transaction.state, CoreTransactionState::FinalisationFailed);
+        assert!(transaction.visible_updates.is_empty());
+        assert!(transaction.finalisation_error.is_some());
+        assert!(
+            store
+                .read_ref("tenant/t/bucket/b/object/finalisation/current")
+                .await
+                .unwrap()
+                .is_none(),
+            "failed finalisation ref updates must not become visible"
+        );
+        assert!(
+            store
+                .read_stream(ReadStream {
+                    stream_id: "object_metadata:t:b:finalisation".to_string(),
+                    after_sequence: 0,
+                    limit: 10,
+                })
+                .await
+                .unwrap()
+                .is_empty(),
+            "failed finalisation stream appends must not become visible"
+        );
+
+        let replay = store.commit_mutation_batch(batch).await.unwrap();
+        assert_eq!(replay.state, CoreTransactionState::FinalisationFailed);
+        assert_eq!(replay.finalisation_error, receipt.finalisation_error);
+        assert!(replay.visible_updates.is_empty());
     }
 
     #[tokio::test]
