@@ -1358,18 +1358,24 @@ impl CoreStore {
             first_sequence,
             last_sequence,
         )?;
-        let object_ref = self
-            .put_blob(PutBlob {
-                logical_name: format!(
+        let segment_manifest = self
+            .write_logical_file(WriteLogicalFileRequest {
+                writer_family: "stream".to_string(),
+                generation: 1,
+                logical_file_id: format!(
                     "core_stream_segment:{}:{first_sequence:020}:{last_sequence:020}",
                     input.stream_id
                 ),
-                bytes: segment_bytes,
+                source: segment_bytes,
+                range_hints: Vec::new(),
+                pipeline_policy: CorePipelinePolicy::default(),
+                trace_context: CoreTraceContext::default(),
                 boundary_values: Vec::new(),
-                region_id: "local".to_string(),
                 mutation_id: input.mutation_id,
+                region_id: "local".to_string(),
             })
             .await?;
+        let object_ref = core_object_ref_from_logical_file_manifest(&segment_manifest);
         Ok(CoreSegmentRef {
             stream_id: input.stream_id,
             partition_id: input.partition_id,
