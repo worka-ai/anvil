@@ -894,7 +894,7 @@ impl CoreStore {
             "anvil_core_store_op",
             &[("operation", "read_logical_range")],
         );
-        self.verify_logical_file_manifest(&request.manifest).await?;
+        validate_logical_file_manifest_shape(&request.manifest)?;
         if request.manifest.compression.algorithm != "none" {
             return self.read_compressed_logical_range(request).await;
         }
@@ -7196,6 +7196,74 @@ mod tests {
             vec![(0, 24), (24, 40), (64, 8), (72, 24)]
         );
         assert_eq!(manifest.ranges[0].block_ids.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn core_store_logical_range_read_does_not_materialise_unrelated_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        let payload = (0..96).map(|value| value as u8).collect::<Vec<_>>();
+        let manifest = store
+            .write_logical_file(WriteLogicalFileRequest {
+                writer_family: "vector".to_string(),
+                generation: 5,
+                logical_file_id: "index/vector/range/segment-5".to_string(),
+                source: payload.clone(),
+                range_hints: Vec::new(),
+                pipeline_policy: CorePipelinePolicy {
+                    target_block_size: 32,
+                    ..Default::default()
+                },
+                trace_context: CoreTraceContext::default(),
+                boundary_values: Vec::new(),
+                mutation_id: "logical-file-range-only-mut-1".to_string(),
+                region_id: "local".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let unrelated = manifest
+            .blocks
+            .iter()
+            .find(|block| block.logical_offset == 64)
+            .unwrap();
+        let unrelated_ref =
+            object_ref_from_logical_block_ref(unrelated, &manifest.erasure_profile_id).unwrap();
+        let placement = unrelated_ref
+            .placements
+            .iter()
+            .find(|placement| placement.shard_index == 0)
+            .unwrap();
+        let shard_hash = strip_sha256_prefix(&placement.shard_hash).unwrap();
+        let object_hash = strip_sha256_prefix(&unrelated_ref.hash).unwrap();
+        let shard_path = store.shard_path(&placement.node_id, object_hash, 0, shard_hash);
+        fs::write(&shard_path, vec![0xee; placement.stored_size as usize])
+            .await
+            .unwrap();
+
+        let slice = store
+            .read_logical_range(ReadLogicalRangeRequest {
+                manifest: manifest.clone(),
+                ranges: vec![CoreByteRange {
+                    start: 0,
+                    end_exclusive: 16,
+                }],
+                authz_scope: AuthzScopeRef {
+                    anvil_storage_tenant_id: "local".to_string(),
+                    authz_realm_id: "system".to_string(),
+                },
+                expected_boundary: None,
+                prefetch_policy: CorePrefetchPolicy::default(),
+                trace_context: CoreTraceContext::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(slice, payload[0..16].to_vec());
+        assert!(
+            store.verify_logical_file_manifest(&manifest).await.is_err(),
+            "full verification must fail after corrupting a block not needed by the range read"
+        );
     }
 
     #[tokio::test]
