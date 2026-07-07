@@ -51,6 +51,7 @@ pub async fn run(
     object_manager: ObjectManager,
     keyring: Arc<EncryptionKeyring>,
 ) -> Result<()> {
+    let task_notify = persistence.task_notify();
     loop {
         let tasks = match persistence.claim_pending_tasks(10).await {
             Ok(tasks) => tasks,
@@ -62,7 +63,10 @@ pub async fn run(
         };
 
         if tasks.is_empty() {
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::select! {
+                _ = task_notify.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            }
             continue;
         }
 

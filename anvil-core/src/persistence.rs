@@ -3,7 +3,8 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use tokio::sync::mpsc::Sender;
+use std::sync::Arc;
+use tokio::sync::{Notify, mpsc::Sender};
 
 use crate::{
     append_journal, authz_journal, authz_repair,
@@ -36,6 +37,7 @@ pub struct Persistence {
     storage: Storage,
     cache: MetadataCache,
     event_publisher: Option<Sender<MetadataEvent>>,
+    task_notify: Arc<Notify>,
     mesh_id: String,
     region: String,
     cell_id: String,
@@ -571,6 +573,7 @@ impl Persistence {
             storage: Storage::new_at_sync(&config.storage_path)?,
             cache: MetadataCache::new(config),
             event_publisher,
+            task_notify: Arc::new(Notify::new()),
             mesh_id: nonempty_or(&config.mesh_id, "default"),
             region: nonempty_or(&config.region, "default"),
             cell_id: nonempty_or(&config.cell_id, "default"),
@@ -594,6 +597,14 @@ impl Persistence {
         if let Some(sender) = &self.event_publisher {
             let _ = sender.send(event).await;
         }
+    }
+
+    pub fn task_notify(&self) -> Arc<Notify> {
+        self.task_notify.clone()
+    }
+
+    fn notify_task_enqueued(&self) {
+        self.task_notify.notify_waiters();
     }
 
     async fn write_mesh_tenant_locators(
@@ -4603,7 +4614,9 @@ impl Persistence {
             &permit,
             &self.partition_owner_signing_key,
         )
-        .await
+        .await?;
+        self.notify_task_enqueued();
+        Ok(())
     }
 
     pub async fn enqueue_task_if_absent(
@@ -4613,7 +4626,7 @@ impl Persistence {
         priority: i32,
     ) -> Result<bool> {
         let permit = self.task_queue_write_permit().await?;
-        task_journal::enqueue_task_if_absent_with_permit(
+        let enqueued = task_journal::enqueue_task_if_absent_with_permit(
             &self.storage,
             task_type,
             payload,
@@ -4621,7 +4634,11 @@ impl Persistence {
             &permit,
             &self.partition_owner_signing_key,
         )
-        .await
+        .await?;
+        if enqueued {
+            self.notify_task_enqueued();
+        }
+        Ok(enqueued)
     }
 
     async fn enqueue_index_build_task(&self, payload: JsonValue, priority: i32) -> Result<bool> {
@@ -4645,7 +4662,12 @@ impl Persistence {
             )
             .await
             {
-                Ok(result) => return Ok(result),
+                Ok(result) => {
+                    if result {
+                        self.notify_task_enqueued();
+                    }
+                    return Ok(result);
+                }
                 Err(error) if is_retryable_partition_fence_error(&error) => {
                     last_error = Some(error);
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
