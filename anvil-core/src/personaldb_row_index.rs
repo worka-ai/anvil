@@ -85,6 +85,7 @@ pub async fn write_personaldb_row_index(
         .put_blob(PutBlob {
             logical_name: ref_name.clone(),
             bytes,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!(
                 "personaldb-row-index:{}:{}:{}",

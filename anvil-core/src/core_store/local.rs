@@ -191,7 +191,7 @@ struct CoreWalAdmissionRecord {
     writer_family: String,
     target: serde_json::Value,
     preconditions: serde_json::Value,
-    boundary_values: Vec<serde_json::Value>,
+    boundary_values: Vec<CoreBoundaryValue>,
     landed_bytes: Vec<CoreWalLandedByte>,
     created_at_unix_nanos: u64,
 }
@@ -320,6 +320,7 @@ impl CoreStore {
                 input.mutation_id.clone(),
                 None,
                 CoreWalPayload::Landed(&input.bytes),
+                input.boundary_values,
             )
             .await?;
         let landed =
@@ -520,6 +521,7 @@ impl CoreStore {
                     schema.bucket, schema.generation
                 ),
                 bytes,
+                boundary_values: Vec::new(),
                 region_id: "local".to_string(),
                 mutation_id: input.mutation_id.clone(),
             })
@@ -598,6 +600,7 @@ impl CoreStore {
                     .unwrap_or_else(|| format!("stream-append:{}", uuid::Uuid::new_v4())),
                 input.idempotency_key.clone(),
                 wal_payload,
+                Vec::new(),
             )
             .await?;
         match self.append_stream_unlocked(input).await {
@@ -814,6 +817,7 @@ impl CoreStore {
                     input.stream_id
                 ),
                 bytes: segment_bytes,
+                boundary_values: Vec::new(),
                 region_id: "local".to_string(),
                 mutation_id: input.mutation_id,
             })
@@ -954,6 +958,7 @@ impl CoreStore {
             .put_blob(PutBlob {
                 logical_name: ref_name.clone(),
                 bytes: serde_json::to_vec(&record)?,
+                boundary_values: Vec::new(),
                 region_id: "local".to_string(),
                 mutation_id: format!("core-fence:{}:{next_token}", input.fence_name),
             })
@@ -1012,6 +1017,7 @@ impl CoreStore {
             .put_blob(PutBlob {
                 logical_name: ref_name.clone(),
                 bytes: serde_json::to_vec(&released)?,
+                boundary_values: Vec::new(),
                 region_id: "local".to_string(),
                 mutation_id: format!(
                     "core-fence-release:{}:{}",
@@ -1087,6 +1093,7 @@ impl CoreStore {
             .put_blob(PutBlob {
                 logical_name: format!("mesh:{}/system/mesh/root_catalog", catalog.mesh_id),
                 bytes: serde_json::to_vec(&catalog)?,
+                boundary_values: Vec::new(),
                 region_id: root_catalog_region(&catalog),
                 mutation_id: format!(
                     "root-catalog:{}:{}:{}",
@@ -1201,6 +1208,7 @@ impl CoreStore {
                     profile.placement_group, profile.epoch
                 ),
                 bytes: serde_json::to_vec(&profile)?,
+                boundary_values: Vec::new(),
                 region_id: "local".to_string(),
                 mutation_id: format!(
                     "quorum-profile:{}:{}:{profile_hash}",
@@ -1301,6 +1309,7 @@ impl CoreStore {
         mutation_id: String,
         idempotency_key: Option<String>,
         payload: CoreWalPayload<'_>,
+        boundary_values: Vec<CoreBoundaryValue>,
     ) -> Result<CoreWalAdmissionRecord> {
         validate_logical_id(&mutation_id, "wal mutation id")?;
         let (inline_payload, landed_bytes) = match payload {
@@ -1321,6 +1330,7 @@ impl CoreStore {
             idempotency_key,
             landed_bytes,
             &inline_payload,
+            boundary_values,
         )
         .await
     }
@@ -1334,6 +1344,7 @@ impl CoreStore {
         idempotency_key: Option<String>,
         landed_bytes: Vec<CoreWalLandedByte>,
         payload: &[u8],
+        boundary_values: Vec<CoreBoundaryValue>,
     ) -> Result<CoreWalAdmissionRecord> {
         if payload.len() > CORE_WAL_MAX_INLINE_PAYLOAD_BYTES {
             bail!(
@@ -1359,7 +1370,7 @@ impl CoreStore {
             writer_family: writer_family.to_string(),
             target,
             preconditions: serde_json::json!([]),
-            boundary_values: Vec::new(),
+            boundary_values,
             landed_bytes,
             created_at_unix_nanos: unix_timestamp_nanos(),
         };
@@ -2123,6 +2134,7 @@ impl CoreStore {
                     .unwrap_or_else(|| format!("ref-cas:{ref_name}:{}", uuid::Uuid::new_v4())),
                 None,
                 CoreWalPayload::Empty,
+                Vec::new(),
             )
             .await?;
 
@@ -2223,6 +2235,7 @@ impl CoreStore {
                     format!("core-ref-delete:{ref_name}:{}", previous.generation),
                     None,
                     CoreWalPayload::Empty,
+                    Vec::new(),
                 )
                 .await?;
             let update = CoreRefUpdateRecord {
@@ -2418,6 +2431,7 @@ impl CoreStore {
                 batch.transaction_id.clone(),
                 Some(batch.transaction_id.clone()),
                 wal_payload,
+                Vec::new(),
             )
             .await?;
 
@@ -4682,6 +4696,7 @@ mod tests {
             .put_blob(PutBlob {
                 logical_name: "tenant:t/bucket:b/object:a".to_string(),
                 bytes: b"hello corestore".to_vec(),
+                boundary_values: Vec::new(),
                 region_id: "local".to_string(),
                 mutation_id: "mut-1".to_string(),
             })
@@ -4854,6 +4869,7 @@ mod tests {
                 "large-payload-admission".to_string(),
                 None,
                 CoreWalPayload::Landed(&bytes),
+                Vec::new(),
             )
             .await
             .unwrap();
@@ -4877,6 +4893,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn core_store_wal_records_include_boundary_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        store
+            .admit_core_mutation(
+                "object.put",
+                "object_blob",
+                serde_json::json!({"logical_name":"tenant:t/bucket:b/object:bounded"}),
+                "bounded-payload-admission".to_string(),
+                None,
+                CoreWalPayload::Landed(b"bounded"),
+                vec![CoreBoundaryValue {
+                    schema_generation: 2,
+                    name: "customer_tenant".to_string(),
+                    value_type: "uuid".to_string(),
+                    value: "8e4b4477-99d8-4f4b-89db-876d2c7f0c6a".to_string(),
+                    categories: vec!["security_realm".to_string()],
+                    source_kind: "user_metadata_json_pointer".to_string(),
+                    required: true,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let wal_bytes = tokio::fs::read(store.active_wal_path()).await.unwrap();
+        let wal_records = decode_wal_records(&wal_bytes).unwrap();
+        assert_eq!(wal_records.len(), 1);
+        assert_eq!(wal_records[0].0.boundary_values.len(), 1);
+        assert_eq!(wal_records[0].0.boundary_values[0].name, "customer_tenant");
+        assert_eq!(
+            wal_records[0].0.boundary_values[0].value,
+            "8e4b4477-99d8-4f4b-89db-876d2c7f0c6a"
+        );
+    }
+
+    #[tokio::test]
     async fn core_store_recovers_unfinalised_put_blob_wal_on_startup() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = Storage::new_at(tmp.path()).await.unwrap();
@@ -4894,6 +4947,7 @@ mod tests {
                 "recover-object-from-wal".to_string(),
                 None,
                 CoreWalPayload::Landed(&bytes),
+                Vec::new(),
             )
             .await
             .unwrap();
@@ -4942,6 +4996,7 @@ mod tests {
                 "recover-stream-from-wal".to_string(),
                 Some(idempotency_key.to_string()),
                 CoreWalPayload::Inline(&payload),
+                Vec::new(),
             )
             .await
             .unwrap();
@@ -4993,6 +5048,7 @@ mod tests {
                 "recover-ref-cas-from-wal".to_string(),
                 None,
                 CoreWalPayload::Empty,
+                Vec::new(),
             )
             .await
             .unwrap();
@@ -5047,6 +5103,7 @@ mod tests {
                 "recover-ref-delete-from-wal".to_string(),
                 None,
                 CoreWalPayload::Empty,
+                Vec::new(),
             )
             .await
             .unwrap();
@@ -5114,6 +5171,7 @@ mod tests {
                 batch.transaction_id.clone(),
                 Some(batch.transaction_id.clone()),
                 CoreWalPayload::Inline(&serde_json::to_vec(&batch).unwrap()),
+                Vec::new(),
             )
             .await
             .unwrap();
@@ -5330,6 +5388,7 @@ mod tests {
             .put_blob(PutBlob {
                 logical_name: "mesh:test/tenant:t/bucket:b/object:a".to_string(),
                 bytes: payload.clone(),
+                boundary_values: Vec::new(),
                 region_id: "local".to_string(),
                 mutation_id: "mut-1".to_string(),
             })
@@ -5402,6 +5461,7 @@ mod tests {
             .put_blob(PutBlob {
                 logical_name: "mesh:test/tenant:t/bucket:b/object:a".to_string(),
                 bytes: b"small but durable".to_vec(),
+                boundary_values: Vec::new(),
                 region_id: "local".to_string(),
                 mutation_id: "mut-1".to_string(),
             })
@@ -6402,6 +6462,7 @@ mod tests {
             .put_blob(PutBlob {
                 logical_name: "mesh:test/system/mesh/root-segment/head".to_string(),
                 bytes: br#"{"refs":[],"streams":[]}"#.to_vec(),
+                boundary_values: Vec::new(),
                 region_id: "local".to_string(),
                 mutation_id: "root-segment-1".to_string(),
             })

@@ -345,6 +345,7 @@ async fn write_repair_finding_ref(storage: &Storage, finding: &RepairFinding) ->
         .put_blob(PutBlob {
             logical_name: ref_name.clone(),
             bytes: serde_json::to_vec_pretty(finding)?,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!(
                 "repair-finding:{}:{}:{}",
@@ -477,6 +478,7 @@ mod tests {
             .put_blob(PutBlob {
                 logical_name: "repair-finding-tamper".to_string(),
                 bytes: serde_json::to_vec_pretty(&value).unwrap(),
+                boundary_values: Vec::new(),
                 region_id: "local".to_string(),
                 mutation_id: "repair-finding-tamper".to_string(),
             })

@@ -136,6 +136,7 @@ pub async fn write_projection_definition(
         .put_blob(PutBlob {
             logical_name: ref_name.clone(),
             bytes,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!(
                 "personaldb-projection-definition:{tenant_id}:{database_id}:{}",

@@ -1,6 +1,10 @@
 use crate::{
     access_control, auth, bucket_journal,
-    core_store::{CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    core_store::{
+        CoreBoundarySchema, CoreBoundarySource, CoreBoundaryValue, CoreObjectRef, CoreStore,
+        GetBlob, PutBlob,
+    },
+    error_codes::AnvilErrorCode,
     metadata_journal, object_links,
     observability::{
         OBJECT_READ_LATENCY, OBJECT_WRITE_LATENCY, Observability, PREFIX_LIST_LATENCY,
@@ -15,6 +19,7 @@ use crate::{
     storage::Storage,
     validation, watch_log,
 };
+use anyhow::{Result as AnyhowResult, anyhow, bail};
 use futures_util::{Stream, StreamExt};
 use serde_json::Value as JsonValue;
 use std::pin::Pin;
@@ -172,6 +177,26 @@ impl ObjectManager {
         );
     }
 
+    async fn object_write_boundary_values(
+        &self,
+        bucket_name: &str,
+        object_key: &str,
+        content_type: Option<&str>,
+        user_metadata: Option<&JsonValue>,
+        payload: &[u8],
+    ) -> Result<Vec<CoreBoundaryValue>, Status> {
+        let Some(schema) = self
+            .core_store
+            .read_boundary_schema(bucket_name)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+        else {
+            return Ok(Vec::new());
+        };
+        extract_object_boundary_values(&schema, object_key, content_type, user_metadata, payload)
+            .map_err(|error| Status::invalid_argument(error.to_string()))
+    }
+
     pub async fn put_object(
         &self,
         tenant_id: i64,
@@ -256,6 +281,15 @@ impl ObjectManager {
             "object_manager.put_object read_and_remove_temp_file",
             step_start.elapsed(),
         );
+        let boundary_values = self
+            .object_write_boundary_values(
+                &bucket.name,
+                object_key,
+                options.content_type.as_deref(),
+                options.user_metadata.as_ref(),
+                &payload,
+            )
+            .await?;
         let step_start = std::time::Instant::now();
         let object_ref = self
             .core_store
@@ -265,6 +299,7 @@ impl ObjectManager {
                     bucket.name, object_key
                 ),
                 bytes: payload,
+                boundary_values,
                 region_id: self.region.clone(),
                 mutation_id: uuid::Uuid::new_v4().to_string(),
             })
@@ -388,6 +423,7 @@ impl ObjectManager {
                     bucket.name
                 ),
                 bytes: payload,
+                boundary_values: Vec::new(),
                 region_id: self.region.clone(),
                 mutation_id: uuid::Uuid::new_v4().to_string(),
             })
@@ -676,6 +712,7 @@ impl ObjectManager {
                     uuid::Uuid::new_v4()
                 ),
                 bytes: payload,
+                boundary_values: Vec::new(),
                 region_id: self.region.clone(),
                 mutation_id: uuid::Uuid::new_v4().to_string(),
             })
@@ -2161,6 +2198,347 @@ fn core_object_ref_from_shard_map(value: &JsonValue) -> Option<CoreObjectRef> {
     })
 }
 
+fn extract_object_boundary_values(
+    schema: &CoreBoundarySchema,
+    object_key: &str,
+    content_type: Option<&str>,
+    user_metadata: Option<&JsonValue>,
+    payload: &[u8],
+) -> AnyhowResult<Vec<CoreBoundaryValue>> {
+    let mut values = Vec::new();
+    for dimension in &schema.dimensions {
+        let (source_kind, raw_value) = match &dimension.source {
+            CoreBoundarySource::UserMetadataJsonPointer { pointer } => (
+                "user_metadata_json_pointer",
+                user_metadata
+                    .and_then(|metadata| metadata.pointer(pointer))
+                    .cloned(),
+            ),
+            CoreBoundarySource::PathTemplate { template } => (
+                "path_template",
+                extract_path_template_capture(template, object_key, &dimension.name),
+            ),
+            CoreBoundarySource::BodyJsonPointer {
+                pointer,
+                max_body_bytes,
+            } => {
+                if !content_type.is_some_and(is_json_content_type) {
+                    bail!(
+                        "{}: boundary dimension {} requires JSON content type",
+                        AnvilErrorCode::BoundaryExtractorUnsupportedContentType.as_str(),
+                        dimension.name
+                    );
+                }
+                if payload.len() as u64 > *max_body_bytes {
+                    bail!(
+                        "{}: boundary dimension {} body exceeds {} bytes",
+                        AnvilErrorCode::BoundaryExtractorBodyTooLarge.as_str(),
+                        dimension.name,
+                        max_body_bytes
+                    );
+                }
+                let body: JsonValue = serde_json::from_slice(payload).map_err(|error| {
+                    anyhow!(
+                        "{}: boundary dimension {} body is not valid JSON: {error}",
+                        AnvilErrorCode::BoundaryTypeMismatch.as_str(),
+                        dimension.name
+                    )
+                })?;
+                ("body_json_pointer", body.pointer(pointer).cloned())
+            }
+        };
+
+        let Some(raw_value) = raw_value else {
+            if dimension.required {
+                bail!(
+                    "{}: required boundary dimension {} is missing",
+                    AnvilErrorCode::BoundaryRequiredMissing.as_str(),
+                    dimension.name
+                );
+            }
+            continue;
+        };
+        let value = normalise_boundary_value(&dimension.value_type, &raw_value)
+            .map_err(|error| anyhow!("{} for dimension {}", error, dimension.name))?;
+        values.push(CoreBoundaryValue {
+            schema_generation: schema.generation,
+            name: dimension.name.clone(),
+            value_type: dimension.value_type.clone(),
+            value,
+            categories: dimension.categories.clone(),
+            source_kind: source_kind.to_string(),
+            required: dimension.required,
+        });
+    }
+    Ok(values)
+}
+
+fn is_json_content_type(content_type: &str) -> bool {
+    let content_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_ascii_lowercase();
+    content_type == "application/json" || content_type.ends_with("+json")
+}
+
+fn extract_path_template_capture(
+    template: &str,
+    object_key: &str,
+    capture_name: &str,
+) -> Option<JsonValue> {
+    let template_segments = template
+        .trim_start_matches('/')
+        .split('/')
+        .collect::<Vec<_>>();
+    let object_segments = object_key
+        .trim_start_matches('/')
+        .split('/')
+        .collect::<Vec<_>>();
+    let mut captures = serde_json::Map::new();
+    let mut object_index = 0usize;
+    for segment in template_segments {
+        if segment == "**" {
+            break;
+        }
+        let object_segment = object_segments.get(object_index)?;
+        object_index += 1;
+        if let Some(capture) = segment
+            .strip_prefix('{')
+            .and_then(|value| value.strip_suffix('}'))
+        {
+            let name = capture.split(':').next().unwrap_or(capture);
+            captures.insert(
+                name.to_string(),
+                JsonValue::String((*object_segment).to_string()),
+            );
+        } else if segment != *object_segment {
+            return None;
+        }
+    }
+    captures.remove(capture_name)
+}
+
+fn normalise_boundary_value(value_type: &str, value: &JsonValue) -> AnyhowResult<String> {
+    match value_type {
+        "string" => value.as_str().map(str::to_string).ok_or_else(|| {
+            anyhow!(
+                "{}: expected string boundary value",
+                AnvilErrorCode::BoundaryTypeMismatch.as_str()
+            )
+        }),
+        "uuid" => {
+            let value = value.as_str().ok_or_else(|| {
+                anyhow!(
+                    "{}: expected uuid string boundary value",
+                    AnvilErrorCode::BoundaryTypeMismatch.as_str()
+                )
+            })?;
+            let uuid = uuid::Uuid::parse_str(value).map_err(|_| {
+                anyhow!(
+                    "{}: expected canonical uuid boundary value",
+                    AnvilErrorCode::BoundaryTypeMismatch.as_str()
+                )
+            })?;
+            Ok(uuid.to_string())
+        }
+        "u64" => value
+            .as_u64()
+            .map(|value| value.to_string())
+            .or_else(|| {
+                value
+                    .as_str()?
+                    .parse::<u64>()
+                    .ok()
+                    .map(|value| value.to_string())
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "{}: expected u64 boundary value",
+                    AnvilErrorCode::BoundaryTypeMismatch.as_str()
+                )
+            }),
+        "i64" => value
+            .as_i64()
+            .map(|value| value.to_string())
+            .or_else(|| {
+                value
+                    .as_str()?
+                    .parse::<i64>()
+                    .ok()
+                    .map(|value| value.to_string())
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "{}: expected i64 boundary value",
+                    AnvilErrorCode::BoundaryTypeMismatch.as_str()
+                )
+            }),
+        "date" => {
+            let value = value.as_str().ok_or_else(|| {
+                anyhow!(
+                    "{}: expected date string boundary value",
+                    AnvilErrorCode::BoundaryTypeMismatch.as_str()
+                )
+            })?;
+            let date = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| {
+                anyhow!(
+                    "{}: expected YYYY-MM-DD boundary date",
+                    AnvilErrorCode::BoundaryTypeMismatch.as_str()
+                )
+            })?;
+            Ok(date.to_string())
+        }
+        "timestamp" => {
+            let value = value.as_str().ok_or_else(|| {
+                anyhow!(
+                    "{}: expected timestamp string boundary value",
+                    AnvilErrorCode::BoundaryTypeMismatch.as_str()
+                )
+            })?;
+            let timestamp = chrono::DateTime::parse_from_rfc3339(value).map_err(|_| {
+                anyhow!(
+                    "{}: expected RFC3339 boundary timestamp",
+                    AnvilErrorCode::BoundaryTypeMismatch.as_str()
+                )
+            })?;
+            Ok(timestamp.to_rfc3339())
+        }
+        _ => bail!("unsupported boundary value type {value_type}"),
+    }
+}
+
 fn trim_s3_etag(value: &str) -> &str {
     value.trim().trim_matches('"')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn boundary_schema() -> CoreBoundarySchema {
+        CoreBoundarySchema {
+            schema: crate::core_store::CORE_BOUNDARY_SCHEMA_SCHEMA.to_string(),
+            bucket: "docs".to_string(),
+            generation: 3,
+            dimensions: vec![
+                crate::core_store::CoreBoundaryDimension {
+                    name: "customer_tenant".to_string(),
+                    source: CoreBoundarySource::UserMetadataJsonPointer {
+                        pointer: "/customer_tenant_id".to_string(),
+                    },
+                    value_type: "uuid".to_string(),
+                    categories: vec![
+                        "security_realm".to_string(),
+                        "storage_partition".to_string(),
+                    ],
+                    required: true,
+                    cardinality: "extreme".to_string(),
+                    max_values_per_block: 1,
+                    placement_affinity: "prefer_colocate".to_string(),
+                    compaction_scope: "require_same_value".to_string(),
+                    shared_ranges_allowed: false,
+                    shared_record_kinds: Vec::new(),
+                    deprecated: false,
+                },
+                crate::core_store::CoreBoundaryDimension {
+                    name: "project".to_string(),
+                    source: CoreBoundarySource::PathTemplate {
+                        template: "/customers/{customer_tenant}/projects/{project}/**".to_string(),
+                    },
+                    value_type: "string".to_string(),
+                    categories: vec!["query_prune".to_string()],
+                    required: true,
+                    cardinality: "high".to_string(),
+                    max_values_per_block: 8,
+                    placement_affinity: "prefer_colocate".to_string(),
+                    compaction_scope: "prefer_same_value".to_string(),
+                    shared_ranges_allowed: false,
+                    shared_record_kinds: Vec::new(),
+                    deprecated: false,
+                },
+                crate::core_store::CoreBoundaryDimension {
+                    name: "document_day".to_string(),
+                    source: CoreBoundarySource::BodyJsonPointer {
+                        pointer: "/document/day".to_string(),
+                        max_body_bytes: 1024,
+                    },
+                    value_type: "date".to_string(),
+                    categories: vec!["retention_group".to_string()],
+                    required: false,
+                    cardinality: "medium".to_string(),
+                    max_values_per_block: 32,
+                    placement_affinity: "none".to_string(),
+                    compaction_scope: "none".to_string(),
+                    shared_ranges_allowed: false,
+                    shared_record_kinds: Vec::new(),
+                    deprecated: false,
+                },
+            ],
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn object_boundary_extraction_reads_metadata_path_and_body() {
+        let values = extract_object_boundary_values(
+            &boundary_schema(),
+            "customers/8e4b4477-99d8-4f4b-89db-876d2c7f0c6a/projects/alpha/docs/a.json",
+            Some("application/json"),
+            Some(&serde_json::json!({
+                "customer_tenant_id": "8e4b4477-99d8-4f4b-89db-876d2c7f0c6a"
+            })),
+            br#"{"document":{"day":"2026-07-07"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0].schema_generation, 3);
+        assert_eq!(values[0].name, "customer_tenant");
+        assert_eq!(values[0].value, "8e4b4477-99d8-4f4b-89db-876d2c7f0c6a");
+        assert_eq!(values[0].source_kind, "user_metadata_json_pointer");
+        assert_eq!(values[1].name, "project");
+        assert_eq!(values[1].value, "alpha");
+        assert_eq!(values[1].source_kind, "path_template");
+        assert_eq!(values[2].name, "document_day");
+        assert_eq!(values[2].value, "2026-07-07");
+        assert_eq!(values[2].source_kind, "body_json_pointer");
+    }
+
+    #[test]
+    fn object_boundary_extraction_rejects_missing_required_metadata() {
+        let error = extract_object_boundary_values(
+            &boundary_schema(),
+            "customers/8e4b4477-99d8-4f4b-89db-876d2c7f0c6a/projects/alpha/docs/a.json",
+            Some("application/json"),
+            Some(&serde_json::json!({})),
+            br#"{"document":{"day":"2026-07-07"}}"#,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(AnvilErrorCode::BoundaryRequiredMissing.as_str())
+        );
+    }
+
+    #[test]
+    fn object_boundary_extraction_rejects_non_json_body_source() {
+        let error = extract_object_boundary_values(
+            &boundary_schema(),
+            "customers/8e4b4477-99d8-4f4b-89db-876d2c7f0c6a/projects/alpha/docs/a.json",
+            Some("text/plain"),
+            Some(&serde_json::json!({
+                "customer_tenant_id": "8e4b4477-99d8-4f4b-89db-876d2c7f0c6a"
+            })),
+            b"plain",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(AnvilErrorCode::BoundaryExtractorUnsupportedContentType.as_str())
+        );
+    }
 }

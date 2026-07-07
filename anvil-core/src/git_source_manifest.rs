@@ -35,6 +35,7 @@ pub async fn write_git_source_repository_manifest(
         .put_blob(PutBlob {
             logical_name: ref_name.clone(),
             bytes: serde_json::to_vec(manifest)?,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!(
                 "git-source-manifest:{}:{}",

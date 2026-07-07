@@ -27,6 +27,7 @@ pub async fn write_personaldb_schema_sql(
         .put_blob(PutBlob {
             logical_name: ref_name.clone(),
             bytes: schema_sql.as_bytes().to_vec(),
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!("personaldb-schema:{tenant_id}:{database_id}:{schema_hash}"),
         })

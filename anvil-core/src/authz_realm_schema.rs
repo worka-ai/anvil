@@ -270,6 +270,7 @@ async fn write_json_ref_with_expected<T: Serialize>(
         .put_blob(PutBlob {
             logical_name: ref_name.to_string(),
             bytes: serde_json::to_vec_pretty(value)?,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!("authz-schema:{}", uuid::Uuid::new_v4().simple()),
         })

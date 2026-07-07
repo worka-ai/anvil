@@ -160,6 +160,7 @@ pub async fn write_vector_segment(
         .put_blob(PutBlob {
             logical_name: ref_name.clone(),
             bytes,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!("vector-segment:{}:{}", input.index_id, input.generation),
         })

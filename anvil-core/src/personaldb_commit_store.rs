@@ -47,6 +47,7 @@ pub async fn write_personaldb_changeset_payload(
         .put_blob(PutBlob {
             logical_name: by_hash_ref.clone(),
             bytes: changeset_bytes.to_vec(),
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!(
                 "personaldb-changeset-payload:{tenant_id}:{database_id}:{log_index}:{payload_hash_hex}"
@@ -138,6 +139,7 @@ pub async fn write_personaldb_commit_certificate(
         .put_blob(PutBlob {
             logical_name: ref_name.clone(),
             bytes: bytes.clone(),
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!(
                 "personaldb-commit-certificate:{tenant_id}:{database_id}:{}:{}",
@@ -378,6 +380,7 @@ mod tests {
             .put_blob(PutBlob {
                 logical_name: "corrupt-changeset".to_string(),
                 bytes: b"corrupt".to_vec(),
+                boundary_values: Vec::new(),
                 region_id: "local".to_string(),
                 mutation_id: "corrupt-changeset".to_string(),
             })
@@ -456,6 +459,7 @@ mod tests {
             .put_blob(PutBlob {
                 logical_name: "corrupt-certificate".to_string(),
                 bytes: serde_json::to_vec_pretty(&value).unwrap(),
+                boundary_values: Vec::new(),
                 region_id: "local".to_string(),
                 mutation_id: "corrupt-certificate".to_string(),
             })

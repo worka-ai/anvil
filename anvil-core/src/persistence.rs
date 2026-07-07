@@ -2597,6 +2597,7 @@ impl Persistence {
                             tenant_id, bucket_id, version_id
                         ),
                         bytes: payload,
+                        boundary_values: Vec::new(),
                         region_id: self.region.clone(),
                         mutation_id: mutation_id.to_string(),
                     })

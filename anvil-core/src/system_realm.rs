@@ -545,6 +545,7 @@ async fn write_bootstrap_marker(storage: &Storage, mesh_id: &str) -> Result<()> 
         .put_blob(crate::core_store::PutBlob {
             logical_name: bootstrap_marker_ref(mesh_id),
             bytes: serde_json::to_vec_pretty(&marker)?,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!("system-realm-bootstrap:{}", uuid::Uuid::new_v4().simple()),
         })

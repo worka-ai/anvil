@@ -284,6 +284,7 @@ async fn write_derived_index_proof_ref(
         .put_blob(PutBlob {
             logical_name: ref_name.to_string(),
             bytes: serde_json::to_vec_pretty(proof)?,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!(
                 "derived-index-proof:{}:{}",
@@ -438,6 +439,7 @@ mod tests {
             .put_blob(PutBlob {
                 logical_name: "derived-index-proof-tamper".to_string(),
                 bytes: serde_json::to_vec_pretty(&value).unwrap(),
+                boundary_values: Vec::new(),
                 region_id: "local".to_string(),
                 mutation_id: "derived-index-proof-tamper".to_string(),
             })

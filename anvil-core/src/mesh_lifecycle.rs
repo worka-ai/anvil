@@ -286,6 +286,7 @@ async fn write_state(storage: &Storage, state: &MeshLifecycleState) -> Lifecycle
         .put_blob(PutBlob {
             logical_name: MESH_LIFECYCLE_STATE_REF.to_string(),
             bytes: serde_json::to_vec_pretty(state)?,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!("mesh-lifecycle-state:{}", uuid::Uuid::new_v4()),
         })

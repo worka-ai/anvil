@@ -15,6 +15,7 @@ pub const CORE_BOUNDARY_SCHEMA_SCHEMA: &str = "anvil.core.boundary_schema.v1";
 pub struct PutBlob {
     pub logical_name: String,
     pub bytes: Vec<u8>,
+    pub boundary_values: Vec<CoreBoundaryValue>,
     pub region_id: String,
     pub mutation_id: String,
 }
@@ -89,6 +90,17 @@ pub struct CoreBoundaryDimension {
     pub shared_ranges_allowed: bool,
     pub shared_record_kinds: Vec<String>,
     pub deprecated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CoreBoundaryValue {
+    pub schema_generation: u64,
+    pub name: String,
+    pub value_type: String,
+    pub value: String,
+    pub categories: Vec<String>,
+    pub source_kind: String,
+    pub required: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

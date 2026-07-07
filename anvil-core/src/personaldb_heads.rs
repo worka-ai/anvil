@@ -390,6 +390,7 @@ async fn write_json_ref_with_preconditions<T: Serialize>(
         .put_blob(PutBlob {
             logical_name: ref_name.to_string(),
             bytes: serde_json::to_vec_pretty(value)?,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!("personaldb-head:{}", uuid::Uuid::new_v4().simple()),
         })
@@ -610,6 +611,7 @@ mod tests {
             .put_blob(PutBlob {
                 logical_name: "personaldb-head-tamper".to_string(),
                 bytes: serde_json::to_vec_pretty(&value).unwrap(),
+                boundary_values: Vec::new(),
                 region_id: "local".to_string(),
                 mutation_id: "personaldb-head-tamper".to_string(),
             })

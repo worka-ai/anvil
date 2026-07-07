@@ -103,6 +103,7 @@ async fn write_authz_tuple_segment_inner(
         .put_blob(PutBlob {
             logical_name: ref_name.clone(),
             bytes,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!("authz-tuple-segment:{tenant_id}:{generation}"),
         })

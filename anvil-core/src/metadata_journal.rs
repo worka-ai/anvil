@@ -1558,6 +1558,7 @@ async fn write_segment_file(
         .put_blob(PutBlob {
             logical_name: ref_name.clone(),
             bytes,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!(
                 "metadata-segment:{}:{}:{}",
@@ -1668,6 +1669,7 @@ async fn write_partition_manifest(
         .put_blob(PutBlob {
             logical_name: manifest_ref.clone(),
             bytes: encoded,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!(
                 "metadata-manifest:{}:{}:{}",
@@ -2884,6 +2886,7 @@ mod tests {
             .put_blob(PutBlob {
                 logical_name: ref_name.to_string(),
                 bytes: corrupted_metadata,
+                boundary_values: Vec::new(),
                 region_id: "local".to_string(),
                 mutation_id: "corrupt-metadata-segment-test".to_string(),
             })

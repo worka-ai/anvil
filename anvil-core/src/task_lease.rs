@@ -477,6 +477,7 @@ async fn write_task_lease_state(
         .put_blob(PutBlob {
             logical_name: ref_name.clone(),
             bytes: serde_json::to_vec_pretty(lease)?,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!(
                 "task-lease:{}:{}:{}",
@@ -779,6 +780,7 @@ mod tests {
             .put_blob(PutBlob {
                 logical_name: "task-lease-tamper".to_string(),
                 bytes: serde_json::to_vec_pretty(&value).unwrap(),
+                boundary_values: Vec::new(),
                 region_id: "local".to_string(),
                 mutation_id: "task-lease-tamper".to_string(),
             })

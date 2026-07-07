@@ -1769,6 +1769,7 @@ async fn write_descriptor_ref<T: Serialize>(
         .put_blob(PutBlob {
             logical_name: ref_name.clone(),
             bytes: serde_json::to_vec_pretty(descriptor)?,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!("mesh-directory:{descriptor_key}:{}", uuid::Uuid::new_v4()),
         })

@@ -400,6 +400,7 @@ pub async fn put_gateway_blob(
         .put_blob(PutBlob {
             logical_name: ref_name.clone(),
             bytes: bytes.to_vec(),
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!(
                 "gateway-blob:{tenant_id}:{gateway}:{registry_instance_id}:{repository}:{digest}"
@@ -621,6 +622,7 @@ pub async fn create_gateway_upload_session(
         .put_blob(PutBlob {
             logical_name: session_ref_name.clone(),
             bytes: serde_json::to_vec_pretty(&record)?,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!(
                 "gateway-upload-start:{}:{}",
@@ -942,6 +944,7 @@ pub async fn append_gateway_upload_part(
                 record.gateway, record.registry_instance_id, record.repository, record.upload_id
             ),
             bytes: bytes.to_vec(),
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!(
                 "gateway-upload-part:{tenant_id}:{}:{}:{}:{}:{part_id}:{idempotency_key_hash}",
@@ -1099,6 +1102,7 @@ pub async fn finalise_gateway_upload_session(
         .put_blob(PutBlob {
             logical_name: blob_ref_name.clone(),
             bytes: payload,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!(
                 "gateway-upload-finalise:{tenant_id}:{gateway}:{registry_instance_id}:{repository}:{target_digest}"
@@ -1124,6 +1128,7 @@ pub async fn finalise_gateway_upload_session(
         .put_blob(PutBlob {
             logical_name: blob_ref_name.clone(),
             bytes: serde_json::to_vec_pretty(&blob_record)?,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!(
                 "gateway-blob-record:{blob_ref_name}:{}",
@@ -1620,6 +1625,7 @@ async fn commit_upload_session_record(
         .put_blob(PutBlob {
             logical_name: session_ref_name.clone(),
             bytes: serde_json::to_vec_pretty(&session)?,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!(
                 "gateway-upload-commit:{}:{}",
@@ -1727,6 +1733,7 @@ async fn put_record_ref<T: Serialize>(
         .put_blob(PutBlob {
             logical_name: ref_name.to_string(),
             bytes: serde_json::to_vec_pretty(record)?,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!("gateway-record:{ref_name}:{}", Uuid::new_v4().simple()),
         })

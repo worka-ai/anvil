@@ -690,6 +690,7 @@ pub async fn write_control_checkpoint(
         .put_blob(PutBlob {
             logical_name: ref_name.clone(),
             bytes,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!(
                 "mesh-control-checkpoint:{}:{}:{}:{}",
@@ -1475,6 +1476,7 @@ mod tests {
             .put_blob(PutBlob {
                 logical_name: ref_name.clone(),
                 bytes: serde_json::to_vec_pretty(&mismatched_body).unwrap(),
+                boundary_values: Vec::new(),
                 region_id: "local".to_string(),
                 mutation_id: "mismatched-checkpoint-test".to_string(),
             })

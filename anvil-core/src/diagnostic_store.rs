@@ -213,6 +213,7 @@ async fn write_diagnostic_ref(storage: &Storage, diagnostic: &DiagnosticObject) 
         .put_blob(PutBlob {
             logical_name: ref_name.clone(),
             bytes: serde_json::to_vec(diagnostic)?,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!("diagnostic:{}", diagnostic.diagnostic_id),
         })
@@ -487,6 +488,7 @@ mod tests {
             .put_blob(PutBlob {
                 logical_name: ref_name.clone(),
                 bytes: serde_json::to_vec(&value).unwrap(),
+                boundary_values: Vec::new(),
                 region_id: "local".to_string(),
                 mutation_id: "tamper-diagnostic-test".to_string(),
             })

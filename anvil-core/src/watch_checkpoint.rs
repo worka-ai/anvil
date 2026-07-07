@@ -256,6 +256,7 @@ async fn write_watch_checkpoint(storage: &Storage, checkpoint: &WatchCheckpoint)
         .put_blob(PutBlob {
             logical_name: ref_name.clone(),
             bytes: serde_json::to_vec(checkpoint)?,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!(
                 "watch-checkpoint:{}:{}",
@@ -494,6 +495,7 @@ mod tests {
             .put_blob(PutBlob {
                 logical_name: ref_name.clone(),
                 bytes: serde_json::to_vec(&value).unwrap(),
+                boundary_values: Vec::new(),
                 region_id: "local".to_string(),
                 mutation_id: "tamper-watch-checkpoint-test".to_string(),
             })

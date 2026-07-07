@@ -282,6 +282,7 @@ async fn write_namespace_schema_ref(
         .put_blob(PutBlob {
             logical_name: ref_name.clone(),
             bytes: serde_json::to_vec_pretty(record)?,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!(
                 "authz-namespace-schema:{}:{}:{}",

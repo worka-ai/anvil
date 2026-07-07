@@ -90,6 +90,7 @@ pub async fn write_git_source_index(
         .put_blob(PutBlob {
             logical_name: ref_name.clone(),
             bytes,
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: format!(
                 "git-source-index:{}:{}:{}",

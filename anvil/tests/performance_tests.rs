@@ -193,6 +193,7 @@ async fn performance_native_api_smoke() {
                     .put_blob(PutBlob {
                         logical_name: "perf/blob/64k".to_string(),
                         bytes: payload.clone(),
+                        boundary_values: Vec::new(),
                         region_id: "perf-region-1".to_string(),
                         mutation_id: format!("perf-put-blob-{}", uuid::Uuid::new_v4()),
                     })

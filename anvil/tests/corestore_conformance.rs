@@ -542,6 +542,7 @@ async fn rfc_0006_root_catalog_is_signed_generationed_and_recoverable() {
         .put_blob(PutBlob {
             logical_name: "mesh:rfc0006/system/mesh/root-segment/head".to_string(),
             bytes: br#"{"refs":[],"streams":[]}"#.to_vec(),
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: "rfc-0006-root-segment-1".to_string(),
         })
@@ -683,6 +684,7 @@ async fn rfc_0006_corestore_transactions_gate_ref_stream_and_watch_visibility() 
         .put_blob(PutBlob {
             logical_name: "mesh:rfc0006/tenant:t/bucket:b/object:alpha/payload".to_string(),
             bytes: br#"{"name":"alpha"}"#.to_vec(),
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: "payload-alpha".to_string(),
         })
@@ -833,6 +835,7 @@ async fn rfc_0007_coreobject_manifests_are_reconstructed_from_shard_placement() 
         .put_blob(PutBlob {
             logical_name: "mesh:rfc0006/tenant:t/bucket:b/object:manifest/payload".to_string(),
             bytes: br#"{"manifest":"quorum"}"#.to_vec(),
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: "payload-manifest-quorum".to_string(),
         })

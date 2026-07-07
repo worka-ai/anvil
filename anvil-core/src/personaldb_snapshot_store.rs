@@ -236,6 +236,7 @@ async fn put_immutable_ref_bytes(
         .put_blob(PutBlob {
             logical_name: format!("{logical_name}:{ref_name}"),
             bytes: bytes.to_vec(),
+            boundary_values: Vec::new(),
             region_id: "local".to_string(),
             mutation_id: mutation_id.to_string(),
         })
@@ -388,6 +389,7 @@ mod tests {
             .put_blob(PutBlob {
                 logical_name: "corrupt-snapshot".to_string(),
                 bytes: b"corrupt".to_vec(),
+                boundary_values: Vec::new(),
                 region_id: "local".to_string(),
                 mutation_id: "corrupt-snapshot".to_string(),
             })
