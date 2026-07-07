@@ -444,6 +444,7 @@ impl CoreStore {
         }
         let shards = encode_erasure_shards(materialised_bytes, profile)?;
         let placements = plan_local_shard_placements(profile)?;
+        let block_id = local_block_id_for_object_hash(hash);
 
         for (shard_index, shard) in shards.iter().enumerate() {
             let placement = placements.get(shard_index).ok_or_else(|| {
@@ -455,7 +456,7 @@ impl CoreStore {
             let logical_offset = shard_index as u64 * shard.len() as u64;
             let shard_file = encode_block_shard_file(
                 BlockShardHeaderInput {
-                    block_id: format!("sha256:{hash}"),
+                    block_id: block_id.clone(),
                     erasure_set_id: "local-erasure-set".to_string(),
                     shard_index: shard_index as u16,
                     erasure_profile_id: profile.id.to_string(),
@@ -554,7 +555,7 @@ impl CoreStore {
                 placement.shard_index,
                 shard_hash,
             );
-            let expected_block_id = format!("sha256:{expected_hash}");
+            let expected_block_id = local_block_id_for_object_hash(expected_hash);
             let shard_bytes = match read_block_shard_file(
                 &shard_path,
                 BlockShardExpectation {
@@ -668,7 +669,7 @@ impl CoreStore {
                 placement.shard_index,
                 shard_hash,
             );
-            let expected_block_id = format!("sha256:{expected_hash}");
+            let expected_block_id = local_block_id_for_object_hash(expected_hash);
             let shard_bytes = match read_block_shard_file(
                 &shard_path,
                 BlockShardExpectation {
@@ -3481,7 +3482,7 @@ impl CoreStore {
                 let Some((shard_index, shard_hash)) = parse_shard_file_name(&file_name) else {
                     continue;
                 };
-                let expected_block_id = format!("sha256:{object_hash}");
+                let expected_block_id = local_block_id_for_object_hash(object_hash);
                 let expected_payload_hash = format!("sha256:{shard_hash}");
                 let decoded = match read_block_shard_file_dynamic(
                     &entry.path(),
@@ -3939,6 +3940,16 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+fn local_block_id_for_object_hash(hash: &str) -> String {
+    let hash = hash.strip_prefix("sha256:").unwrap_or(hash);
+    let mut hasher = Sha256::new();
+    for part in ["anvil.block.id.v1", "object_blob", "0", hash] {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    format!("blk_{}", hex::encode(hasher.finalize()))
+}
+
 fn encode_erasure_shards(bytes: &[u8], profile: LocalErasureProfile) -> Result<Vec<Vec<u8>>> {
     let shard_len = bytes.len().div_ceil(profile.data_shards).max(1);
     let total_shards = profile.total_shards();
@@ -4176,7 +4187,8 @@ fn logical_file_manifest_from_object_manifest(
         data_shards as usize,
         parity_shards as usize,
     )?;
-    let block_id = object_manifest.object_hash.clone();
+    let block_id =
+        local_block_id_for_object_hash(strip_sha256_prefix(&object_manifest.object_hash)?);
     let block_ids = vec![block_id.clone()];
     let boundary_schema_generation = request
         .boundary_values
@@ -7647,7 +7659,7 @@ mod tests {
                 shard_file.starts_with(CORE_BLOCK_SHARD_MAGIC),
                 "physical shard files must use the RFC block-shard container"
             );
-            let expected_block_id = format!("sha256:{object_hash}");
+            let expected_block_id = local_block_id_for_object_hash(&object_hash);
             let payload = read_block_shard_file(
                 &path,
                 BlockShardExpectation {
