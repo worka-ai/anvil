@@ -1763,6 +1763,81 @@ impl CoreStore {
                 .await?;
                 Ok("committed")
             }
+            "ref.compare_and_swap" => {
+                let ref_name = json_required_string(&record.target, "ref_name")?;
+                let new_target = json_required_string(&record.target, "new_target")?;
+                let expected_generation = json_optional_u64(&record.target, "expected_generation")?;
+                let expected_target = json_optional_string(&record.target, "expected_target")?;
+                let require_absent = json_required_bool(&record.target, "require_absent")?;
+                let require_present = json_required_bool(&record.target, "require_present")?;
+                let transaction_id = json_optional_string(&record.target, "transaction_id")?;
+                let current = self.read_ref(&ref_name).await?;
+                if current
+                    .as_ref()
+                    .is_some_and(|value| value.target == new_target)
+                {
+                    return Ok("committed");
+                }
+                let precondition = CoreMutationPrecondition::Ref {
+                    ref_name: ref_name.clone(),
+                    expected_generation,
+                    expected_target,
+                    require_absent,
+                    require_present,
+                    fence: None,
+                    authz_revision: None,
+                    source_watch_cursor: None,
+                };
+                self.apply_ref_update_unlocked(
+                    &ref_name,
+                    &new_target,
+                    transaction_id,
+                    Some(&precondition),
+                )
+                .await?;
+                Ok("committed")
+            }
+            "ref.delete" => {
+                let ref_name = json_required_string(&record.target, "ref_name")?;
+                let expected_generation = json_optional_u64(&record.target, "expected_generation")?;
+                let expected_target = json_optional_string(&record.target, "expected_target")?;
+                let require_present = json_required_bool(&record.target, "require_present")?;
+                let transaction_id = json_optional_string(&record.target, "transaction_id")?;
+                let current = self.read_ref(&ref_name).await?;
+                let Some(previous) = current else {
+                    return Ok("committed");
+                };
+                validate_ref_precondition(
+                    Some(&previous),
+                    &ref_name,
+                    expected_generation,
+                    expected_target.as_deref(),
+                    false,
+                    require_present,
+                )?;
+                let update = CoreRefUpdateRecord {
+                    schema: CORE_REF_UPDATE_SCHEMA.to_string(),
+                    ref_name: ref_name.clone(),
+                    previous_generation: Some(previous.generation),
+                    new_generation: None,
+                    previous_target: Some(previous.target.clone()),
+                    new_target: None,
+                    preconditions: CoreRefUpdatePreconditions {
+                        expected_generation,
+                        expected_target,
+                        require_absent: false,
+                        require_present,
+                        fence_token: None,
+                        authz_revision: None,
+                        source_watch_cursor: None,
+                    },
+                    mutation_id: record.mutation_id.clone(),
+                    transaction_id,
+                    committed_at: now_rfc3339(),
+                };
+                self.append_ref_update_unlocked(&update).await?;
+                Ok("committed")
+            }
             other => bail!(
                 "CoreStore WAL recovery does not support operation family {other}; refusing startup with unfinalised WAL"
             ),
@@ -1957,6 +2032,7 @@ impl CoreStore {
                     "expected_target": expected_target.clone(),
                     "require_absent": require_absent,
                     "require_present": require_present,
+                    "transaction_id": transaction_id.clone(),
                 }),
                 transaction_id
                     .clone()
@@ -2058,6 +2134,7 @@ impl CoreStore {
                         "expected_generation": expected_generation,
                         "expected_target": expected_target,
                         "require_present": require_present,
+                        "transaction_id": null,
                     }),
                     format!("core-ref-delete:{ref_name}:{}", previous.generation),
                     None,
@@ -3951,6 +4028,23 @@ fn json_optional_string(value: &serde_json::Value, field: &str) -> Result<Option
     }
 }
 
+fn json_optional_u64(value: &serde_json::Value, field: &str) -> Result<Option<u64>> {
+    match value.get(field) {
+        Some(serde_json::Value::Number(value)) => value.as_u64().map(Some).ok_or_else(|| {
+            anyhow!("CoreStore WAL target field {field} must be an unsigned integer")
+        }),
+        Some(serde_json::Value::Null) | None => Ok(None),
+        Some(_) => bail!("CoreStore WAL target field {field} must be an unsigned integer or null"),
+    }
+}
+
+fn json_required_bool(value: &serde_json::Value, field: &str) -> Result<bool> {
+    value
+        .get(field)
+        .and_then(|value| value.as_bool())
+        .ok_or_else(|| anyhow!("CoreStore WAL target is missing boolean field {field}"))
+}
+
 fn read_exact<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> Result<&'a [u8]> {
     let end = offset
         .checked_add(len)
@@ -4311,6 +4405,102 @@ mod tests {
         assert!(
             decode_wal_records(&wal_bytes).unwrap().is_empty(),
             "startup recovery must checkpoint recovered stream WAL records"
+        );
+    }
+
+    #[tokio::test]
+    async fn core_store_recovers_unfinalised_ref_cas_wal_on_startup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        store
+            .admit_core_mutation(
+                "ref.compare_and_swap",
+                "core-control",
+                serde_json::json!({
+                    "ref_name": "tenant/t/bucket/b/object/recovered/current",
+                    "new_target": "core-object-ref:sha256:aaaaaaaa",
+                    "expected_generation": null,
+                    "expected_target": null,
+                    "require_absent": true,
+                    "require_present": false,
+                    "transaction_id": null,
+                }),
+                "recover-ref-cas-from-wal".to_string(),
+                None,
+                CoreWalPayload::Empty,
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let recovered = CoreStore::new(storage).await.unwrap();
+        let current = recovered
+            .read_ref("tenant/t/bucket/b/object/recovered/current")
+            .await
+            .unwrap()
+            .expect("recovered ref");
+        assert_eq!(current.generation, 1);
+        assert_eq!(current.target, "core-object-ref:sha256:aaaaaaaa");
+        let wal_bytes = tokio::fs::read(recovered.active_wal_path()).await.unwrap();
+        assert!(
+            decode_wal_records(&wal_bytes).unwrap().is_empty(),
+            "startup recovery must checkpoint recovered ref CAS WAL records"
+        );
+    }
+
+    #[tokio::test]
+    async fn core_store_recovers_unfinalised_ref_delete_wal_on_startup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        store
+            .compare_and_swap_ref(CompareAndSwapRef {
+                ref_name: "tenant/t/bucket/b/object/delete-recovered/current".to_string(),
+                expected_generation: None,
+                expected_target: None,
+                require_absent: true,
+                require_present: false,
+                fence: None,
+                authz_revision: None,
+                source_watch_cursor: None,
+                new_target: "core-object-ref:sha256:bbbbbbbb".to_string(),
+                transaction_id: None,
+            })
+            .await
+            .unwrap();
+        store
+            .admit_core_mutation(
+                "ref.delete",
+                "core-control",
+                serde_json::json!({
+                    "ref_name": "tenant/t/bucket/b/object/delete-recovered/current",
+                    "expected_generation": 1,
+                    "expected_target": "core-object-ref:sha256:bbbbbbbb",
+                    "require_present": true,
+                    "transaction_id": null,
+                }),
+                "recover-ref-delete-from-wal".to_string(),
+                None,
+                CoreWalPayload::Empty,
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let recovered = CoreStore::new(storage).await.unwrap();
+        assert!(
+            recovered
+                .read_ref("tenant/t/bucket/b/object/delete-recovered/current")
+                .await
+                .unwrap()
+                .is_none(),
+            "startup recovery must apply admitted ref delete records"
+        );
+        let wal_bytes = tokio::fs::read(recovered.active_wal_path()).await.unwrap();
+        assert!(
+            decode_wal_records(&wal_bytes).unwrap().is_empty(),
+            "startup recovery must checkpoint recovered ref delete WAL records"
         );
     }
 
