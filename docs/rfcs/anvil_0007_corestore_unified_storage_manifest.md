@@ -303,8 +303,8 @@ collectable.
 
 ### 8.3 WAL Does Not Store Large Bytes
 
-The WAL MUST store references to landed byte files or final CoreStore object
-refs. It MUST NOT inline large payloads. The hard default maximum WAL record body
+The WAL MUST store references to landed byte files or final CoreStore manifest
+locators/ranges. It MUST NOT inline large payloads. The hard default maximum WAL record body
 is 64 KiB. Implementations MAY set a lower limit. Raising the limit requires an
 RFC update.
 
@@ -332,13 +332,13 @@ pub enum WriteBody {
     Empty,
     Bytes(Bytes),
     Stream(Box<dyn AsyncRead + Send + Unpin>),
-    ExistingCoreRef(CoreRef),
+    ExistingCoreObject { locator: ManifestLocator, range: ByteRange },
 }
 
 pub enum WritePrecondition {
     ObjectVersionEquals(ObjectVersionId),
     ObjectAbsent,
-    LinkTargetEquals(CoreRef),
+    LinkTargetEquals(ManifestRef),
     LeaseFence {
         lease_id: LeaseId,
         fence_token: u64,
@@ -975,10 +975,12 @@ root_key_hash = blake3("anvil-root-key-v1" || canonical_utf8(RootAnchorKey))
 shard headers, cohort hashes, failover votes, root owner epoch rows, trace
 fields, and metrics. Implementations must not hash display/debug variants.
 
-Root anchors are stored in the CoreStore control writer family and replicated
-through the same erasure-coded block substrate. Implementations may keep a local
-root cache, but the durable root value must be recoverable from CoreStore blocks
-and WAL replay.
+Root anchor records are stored in the root-register shard protocol defined in
+sections 13.8-13.12. Root history, ownership, failover evidence, and mesh
+control rows are stored by the core/control writer family through the normal
+CoreStore block substrate. Implementations may keep a local root cache, but the
+durable root value must be recoverable from root-register shards plus committed
+CoreStore manifests and WAL replay.
 
 ### 13.2 Root Anchor Record Format
 
@@ -1000,8 +1002,8 @@ schema                  = "anvil.core.root_anchor.v1"
 root_anchor_key         = RootAnchorKey
 root_generation         = u64
 previous_root_hash      = sha256 or null
-transaction_manifest    = ManifestRef or null only for genesis generation 0
-checkpoint_manifest     = ManifestRef or null only for genesis generation 0
+transaction_manifest    = ManifestLocator or null only for genesis generation 0
+checkpoint_manifest     = ManifestLocator or null only for genesis generation 0
 publisher_node_id       = NodeId
 publisher_epoch         = u64
 partition_owner_fence   = u64
@@ -1047,7 +1049,7 @@ mutation_ids            = [MutationId]
 idempotency_key_hashes  = [Hash]
 pre_root_generation     = u64
 post_root_generation    = u64
-logical_manifests       = [ManifestRef]
+logical_manifests       = [ManifestLocator]
 ref_updates             = [RefUpdate]
 tombstones              = [Tombstone]
 writer_checkpoints      = [WriterCheckpoint]
@@ -1060,10 +1062,92 @@ boundary_schema_refs    = [BoundarySchemaRef]
 RefUpdate = {
   ref_key: string,
   expected_ref: ManifestRef | null,
-  new_ref: ManifestRef | null,
+  new_ref: ManifestLocator | null,
   update_kind: "put" | "delete" | "link" | "checkpoint"
 }
 ```
+
+
+### 13.3a Manifest Location and Resolution
+
+`ManifestRef` is an identity. It is not a locator. Any record that requires a
+reader to fetch manifest bytes MUST store a `ManifestLocator`. Implementations
+MUST NOT invent a sidecar manifest index to resolve `ManifestRef` values.
+
+A `ManifestLocator` is the immutable, self-contained description needed to read a
+manifest logical file from CoreStore blocks:
+
+```text
+ManifestLocator =
+  manifest_ref            ManifestRef
+  manifest_encoding       "canonical-cbor" | "writer-segment"
+  manifest_length         u64-le
+  manifest_hash           Hash
+  block_count             u32-le
+  block_locator*          sorted by logical_start
+
+BlockLocator =
+  logical_start           u64-le
+  logical_end             u64-le       # exclusive
+  block_id                BlockId
+  block_plain_hash        Hash
+  block_encoded_hash      Hash
+  erasure_profile_id      string
+  placement_epoch         u64-le
+  shard_receipt_count     u16-le
+  shard_receipts          repeated ShardReceiptSummary
+
+ShardReceiptSummary =
+  node_id                 NodeId
+  region_id               RegionId
+  cell_id                 CellId
+  shard_index             u16-le
+  shard_hash              Hash
+  shard_length            u64-le
+  fsync_sequence          u64-le
+  written_at_unix_nanos   u64-le
+  signed_payload_hash     Hash
+  signature_algorithm     string
+  receipt_signature       bytes
+```
+
+A locator is valid only when:
+
+1. `manifest_ref.manifest_hash == manifest_hash`;
+2. block ranges cover `[0, manifest_length)` exactly with no gaps or overlap;
+3. every `BlockLocator` uses the same erasure profile rules as the logical file
+   manifest it locates;
+4. each block has enough valid shard receipts to satisfy the erasure profile;
+5. reading and decoding the blocks yields bytes whose hash equals
+   `manifest_hash`.
+
+Resolution is therefore deterministic and non-recursive:
+
+```text
+resolve_manifest(locator):
+  validate locator shape and block range coverage
+  for each block locator in order:
+    choose shard receipts according to placement and failure-domain policy
+    fetch enough shards through the internal block service
+    verify shard hash, fsync sequence, placement epoch, and receipt signature
+    erasure-decode the requested range
+    verify decoded block_plain_hash
+  concatenate decoded block ranges
+  verify manifest_hash and manifest_length
+  parse manifest bytes according to manifest_encoding
+```
+
+The root-register record is the bootstrapping exception. It stores the current
+`CoreRootAnchorRecord` directly in root-register shards. That root anchor then
+contains a `ManifestLocator` for the transaction manifest. The transaction
+manifest contains `ManifestLocator` values for writer logical manifests. Writer
+logical manifests contain range/block maps for feature data. No step requires a
+local JSON manifest directory, a database row, or a display-path lookup.
+
+Caches MAY map `ManifestRef -> ManifestLocator` or `ManifestRef -> decoded
+manifest` for speed, but caches are Class C local operational state. Recovery
+must be able to rebuild them by reading root anchors and walking committed
+transaction manifests.
 
 ### 13.4 Publication Protocol
 
@@ -1455,6 +1539,25 @@ ManifestRef =
   writer_family          WriterFamily
   writer_generation      u64
 
+ManifestLocator =
+  manifest_ref           ManifestRef
+  manifest_encoding      ManifestEncoding
+  manifest_length        u64
+  manifest_hash          Hash
+  block_locators         [BlockLocator]
+
+ManifestEncoding = "canonical-cbor" | "writer-segment"
+
+BlockLocator =
+  logical_start          u64
+  logical_end            u64
+  block_id               BlockId
+  block_plain_hash       Hash
+  block_encoded_hash     Hash
+  erasure_profile_id     string
+  placement_epoch        u64
+  shard_receipts         [ShardReceiptSummary]
+
 LogicalFileId = "lf_" 1*96(id-char)
 BlockId       = "blk_" 1*96(id-char)
 NodeId        = node-id
@@ -1473,7 +1576,7 @@ BoundaryValue =
 
 ByteSource =
   InlineBytes(bytes) | LandedBytes(landing_id, hash, length) |
-  TempFile(path, hash, length) | ExistingCoreRef(ManifestRef)
+  TempFile(path, hash, length) | ExistingCoreObject(ManifestLocator, byte_start, byte_end)
 
 PipelinePolicy =
   erasure_profile_id     string
@@ -1760,6 +1863,198 @@ Required properties:
 - public APIs cannot read/write reserved Anvil system realms;
 - admin APIs are authorised through the system realm.
 
+#### 15.6.1 Built-In System Realm Schema
+
+Anvil uses one authz engine. The same writer stores Anvil's reserved system realm
+and user-defined realms. There is not a second admin permission system.
+
+The reserved system realm id is `_anvil/system`. It is created during genesis
+bootstrap and can be modified only by authenticated principals that already have
+the required system relation. Public APIs MUST reject any request that attempts
+to read, write, bind, list, or query a realm whose id starts with `_anvil/` with
+`UnauthorizedReservedNamespace`, unless the request entered through the internal
+admin plane and passed the system realm check below.
+
+Built-in namespaces and relations are normative:
+
+```text
+namespace system
+  relation bootstrap_admin
+  relation admin
+  relation auditor
+  relation operator
+  relation support
+  permission manage_system = bootstrap_admin or admin
+  permission view_system = manage_system or auditor
+  permission manage_admin_principals = bootstrap_admin
+  permission rotate_secret_keys = bootstrap_admin or admin
+  permission manage_regions = admin or operator
+  permission manage_cells = admin or operator
+  permission manage_nodes = admin or operator
+  permission manage_partitions = admin or operator
+  permission view_diagnostics = view_system or operator or support
+
+namespace storage_tenant
+  relation owner
+  relation admin
+  relation writer
+  relation reader
+  relation auditor
+  permission manage_tenant = owner or admin
+  permission create_bucket = manage_tenant
+  permission list_buckets = manage_tenant or auditor
+  permission read_tenant = manage_tenant or auditor
+
+namespace bucket
+  relation parent_tenant
+  relation owner
+  relation admin
+  relation writer
+  relation reader
+  relation auditor
+  permission manage_bucket = owner or admin or parent_tenant->manage_tenant
+  permission put_object = manage_bucket or writer
+  permission get_object = manage_bucket or reader
+  permission list_objects = manage_bucket or reader or auditor
+  permission delete_object = manage_bucket or writer
+  permission manage_links = manage_bucket or writer
+  permission manage_indexes = manage_bucket or admin
+  permission query_indexes = manage_bucket or reader
+  permission manage_boundary_schema = manage_bucket or admin
+
+namespace object
+  relation parent_bucket
+  relation owner
+  relation reader
+  relation writer
+  permission get = owner or reader or parent_bucket->get_object
+  permission put = owner or writer or parent_bucket->put_object
+  permission delete = owner or writer or parent_bucket->delete_object
+  permission link = owner or writer or parent_bucket->manage_links
+
+namespace stream
+  relation parent_bucket
+  relation owner
+  relation producer
+  relation consumer
+  permission append = owner or producer or parent_bucket->put_object
+  permission read = owner or consumer or parent_bucket->get_object
+  permission seal_segment = owner or parent_bucket->manage_bucket
+
+namespace index
+  relation parent_bucket
+  relation owner
+  relation reader
+  relation writer
+  permission define = owner or parent_bucket->manage_indexes
+  permission query = owner or reader or parent_bucket->query_indexes
+  permission repair = owner or parent_bucket->manage_indexes
+
+namespace authz_realm
+  relation parent_tenant
+  relation owner
+  relation schema_admin
+  relation tuple_writer
+  relation checker
+  relation auditor
+  permission put_schema = owner or schema_admin or parent_tenant->manage_tenant
+  permission bind_schema = owner or schema_admin or parent_tenant->manage_tenant
+  permission write_tuples = owner or tuple_writer or parent_tenant->manage_tenant
+  permission check = owner or checker or auditor or parent_tenant->read_tenant
+  permission list = owner or auditor or parent_tenant->read_tenant
+
+namespace registry_namespace
+  relation parent_tenant
+  relation owner
+  relation publisher
+  relation reader
+  permission publish = owner or publisher or parent_tenant->manage_tenant
+  permission read = owner or reader or parent_tenant->read_tenant
+  permission manage_refs = owner or publisher or parent_tenant->manage_tenant
+
+namespace personaldb_group
+  relation parent_tenant
+  relation owner
+  relation writer
+  relation reader
+  relation witness
+  permission apply_changeset = owner or writer
+  permission get_snapshot = owner or reader
+  permission watch = owner or reader
+  permission witness = owner or witness
+
+namespace region
+  relation system
+  permission manage = system->manage_regions
+  permission view = system->view_system
+
+namespace cell
+  relation parent_region
+  permission manage = parent_region->manage
+  permission view = parent_region->view
+
+namespace node
+  relation parent_cell
+  permission manage = parent_cell->manage
+  permission drain = parent_cell->manage
+  permission view = parent_cell->view
+
+namespace partition
+  relation system
+  permission move = system->manage_partitions
+  permission view = system->view_system
+```
+
+`X->permission` means tuple-to-userset using the relation named `X` on the object
+and the target permission on the referenced object.
+
+Bootstrap creates exactly one system subject from local bootstrap material and
+writes this tuple in generation zero:
+
+```text
+object:  system:_anvil
+relation: bootstrap_admin
+subject: principal:<bootstrap-principal-id>
+```
+
+After bootstrap, every admin operation MUST be authorised by the system realm.
+There are no `has_admin_capability`, static-token, JWT-claim, filesystem-write,
+or CLI-local bypasses in higher API layers.
+
+Required admin/public enforcement matrix:
+
+```text
+Operation family                     Required check
+PutRegion/PutCell/PutNode             system:_anvil manage_regions/manage_cells/manage_nodes
+DrainNode/DrainCell                   node:<id>/cell:<id> drain/manage
+MoveBucket                            partition:<id> move and bucket:<id> manage_bucket
+GetPartitionMap                       partition:<id> view
+Key rotation                          system:_anvil rotate_secret_keys
+Diagnostics/repair listing            system:_anvil view_diagnostics
+Repair execution                      system:_anvil manage_system or index/bucket repair as scoped
+Create storage tenant                 system:_anvil manage_system, then grant storage_tenant:<id> owner
+Create bucket                         storage_tenant:<id> create_bucket
+PutObject                             bucket:<id> put_object and object:<id> put when object ACL exists
+GetObject/HeadObject                  object:<id> get or bucket:<id> get_object
+ListObjects                           bucket:<id> list_objects, then authz-aware candidate pruning
+DeleteObject                          object:<id> delete or bucket:<id> delete_object
+PutLink/ResolveLink                   bucket:<id> manage_links / object:<target> get
+PutIndexDefinition                    index:<id> define
+QueryIndex/HybridSearch               index:<id> query plus per-object authz pruning
+PutBoundarySchema/Migration           bucket:<id> manage_boundary_schema
+AppendRecord/ReadStream               stream:<id> append/read
+PutSchema/BindSchema                  authz_realm:<id> put_schema/bind_schema
+WriteTuples                           authz_realm:<id> write_tuples
+CheckPermission/ListObjects/ListSubjects authz_realm:<id> check/list
+PersonalDB apply/snapshot/watch       personaldb_group:<id> apply_changeset/get_snapshot/watch
+Registry publish/read/ref             registry_namespace:<id> publish/read/manage_refs
+```
+
+Tokens identify principals only. A request body MUST NOT be allowed to choose its
+own principal, tenant, or admin relation. Service-to-service internal calls carry
+node identity and are authorised against system realm node/cell/partition
+relations before mutating control state.
+
 ### 15.7 PersonalDB Writer
 
 The PersonalDB writer stores changesets, snapshots, witness state, and projection
@@ -1956,8 +2251,7 @@ BoundaryValueRef =
   value_bytes            bytes       # canonical encoding for value_type
 
 ManifestRangeRef =
-  manifest_ref_len       u16-le
-  manifest_ref           bytes
+  manifest_ref_hash      Hash
   range_id_len           u16-le
   range_id               bytes
   byte_start             u64-le
@@ -1973,6 +2267,219 @@ Canonical typed value ordering is bytewise over `(type_id, normalized value)`,
 where signed integers are biased by flipping the high bit, floating point values
 use sortable IEEE-754 encoding with NaN rejected, timestamps are signed
 nanoseconds, UUIDs are 16 raw bytes, and strings are UTF-8 NFC normalized.
+
+#### 15.11.1 Table Page Magic and Body Ordering
+
+`TablePage.magic` is deterministic and MUST NOT be chosen per implementation:
+
+```text
+TablePage.magic = "ANTP" || table_id:u16-be || version:u16-be
+```
+
+For table `0x0101` version `1`, the eight bytes are:
+
+```text
+41 4e 54 50 01 01 00 01
+```
+
+`WriterBodyTableDirectory.table_entry*` is sorted by unsigned `table_id`. The
+physical table bytes in `body_bytes` MUST appear in the same order as the table
+directory. A body with table bytes in a different order is invalid even when all
+offsets point to valid pages. This gives byte-for-byte deterministic output for
+two writers receiving the same logical rows.
+
+Each table body is:
+
+```text
+TableBody =
+  page_count             u32-le
+  page_directory*        page_count entries sorted by min_key
+  page_bytes*            in the same order as page_directory
+  table_crc32c           u32-le over page_count..page_bytes
+
+PageDirectoryEntry =
+  min_key_len            u16-le
+  min_key                bytes
+  max_key_len            u16-le
+  max_key                bytes
+  page_offset            u64-le      # from start of TableBody
+  page_length            u64-le
+  row_count              u32-le
+  page_hash              Hash
+```
+
+`TableDirectoryEntry.offset` points to `TableBody`, not directly to the first
+page. `TableDirectoryEntry.page_count` MUST equal `TableBody.page_count`.
+
+#### 15.11.2 Canonical Row Encoding
+
+Rows are encoded as a key followed by a value. The key is repeated in the row so
+corrupt page directories can be detected by table-level validation.
+
+```text
+TableRow =
+  key_len                uleb128
+  key_bytes              bytes
+  value_len              uleb128
+  value_bytes            bytes
+  row_crc32c             u32-le over key_len..value_bytes
+```
+
+`key_bytes` is the table-specific key tuple encoded with `KeyTuple`:
+
+```text
+KeyTuple =
+  component_count        u8
+  component*             sorted in declared tuple order
+
+KeyComponent =
+  type_id                u8
+  value_len              uleb128
+  value_bytes            canonical TypedValue payload bytes, not including outer type_id
+  separator              0x00 except omitted after final component
+```
+
+`value_bytes` is the row schema encoded field-by-field in the exact field order
+shown in section 15.20. Field encodings are:
+
+```text
+u8/u16/u32/u64/i64       little-endian fixed width
+f64                     sortable IEEE-754 encoding; NaN rejected
+string                  uleb128 byte_len + UTF-8 NFC bytes
+bytes                   uleb128 byte_len + raw bytes
+hash                    algorithm u8 + 32 raw bytes
+TypedValue              type_id u8 + value_len uleb128 + canonical payload bytes
+optional<T>             0x00 absent | 0x01 + T
+repeated<T>             uleb128 count + T repeated in declared order
+map<string,string>      uleb128 count + entries sorted by UTF-8 key bytes
+revision_range          start_generation u64-le + end_generation u64-le
+ManifestRangeRef        manifest locator hash + range id + byte_start + byte_end
+```
+
+`ManifestRangeRef` does not inline a full `ManifestLocator` in every row. It
+stores `manifest_ref_hash` and `range_id`; the segment header MUST contain a
+`manifest_locator_table` mapping each referenced manifest hash to a
+`ManifestLocator`. This avoids recursive sidecar indexes while keeping rows
+compact.
+The common `header_cbor` for any segment containing `ManifestRangeRef` rows MUST
+include:
+
+```text
+manifest_locator_table = [
+  { manifest_ref_hash: Hash, manifest_locator: ManifestLocator }
+]
+```
+
+#### 15.11.3 Required Table Keys
+
+The key tuple for each table is normative:
+
+```text
+0x0101 ObjectHeader                         bucket,key,object_version
+0x0102 ObjectChunkEntry                     bucket,key,object_version,logical_offset
+0x0103 LinkRecord                           bucket,link_name,visible_from_generation
+0x0201 FieldCatalogRow                      field_id
+0x0202 AnalyserCatalogRow                   analyser_id
+0x0203 TermDictionaryRow                    field_id,term
+0x0204 PostingsBlockRefRow                  field_id,term,block_min_doc_id
+0x0205 PositionBlockRow                     field_id,term,doc_id
+0x0206 DocValueRow                          field_id,value,doc_id
+0x0207 StoredFieldRow                       doc_id,field_id
+0x0208 DeleteBitmapRow                      generation
+0x0301 VectorHeaderRow                      index_id
+0x0302 VectorBlockRow                       vector_id_start
+0x0303 HnswAdjacencyRow                     layer,vector_id
+0x0304 EntrypointRow                        layer,vector_id
+0x0305 IdMapRow                             external_id
+0x0306 TypedFilterBlockRow                  field_id,value
+0x0307 DeleteBitmapRow                      generation
+0x0401 FieldCatalogRow                      field_id
+0x0402 SortedColumnRow                      field_id,value,object_id
+0x0403 BitmapBlockRow                       field_id,value
+0x0404 RangeIndexEntry                      logical_start
+0x0405 OrderTupleRow                        order_tuple,object_id
+0x0406 DeleteBitmapRow                      generation
+0x0501 SchemaDescriptorRow                  realm_id,schema_generation
+0x0502 AuthzTupleRow                        realm_id,object_key,relation,subject_key,revision_start
+0x0503 RelationRuleRow                      realm_id,schema_generation,namespace,relation
+0x0504 UsersetEdgeRow                       realm_id,from_object,relation,to_subject,revision_start
+0x0505 CaveatDescriptorRow                  caveat_id,schema_generation
+0x0506 RevisionLogRow                       revision
+0x0507 ListObjectsIndexRow                  realm_id,subject_key,relation,object_key,revision_start
+0x0508 ListSubjectsIndexRow                 realm_id,object_key,relation,subject_key,revision_start
+0x0601 GroupDescriptorRow                   group_id
+0x0602 PersonalDbChangesetRow               group_id,sequence
+0x0603 SnapshotPageRow                      group_id,page_no
+0x0604 ProjectionPageRow                    group_id,projection_name,page_key
+0x0605 WitnessRecordRow                     group_id,change_id
+0x0606 OwnerTransferRow                     group_id,revision
+0x0701 NamespaceRow                         registry_kind,namespace
+0x0702 PackageRow                           registry_kind,namespace,package_name
+0x0703 PackageVersionRow                    registry_kind,namespace,package_name,version
+0x0704 BlobDescriptorRow                    digest
+0x0705 RegistryRefRow                       registry_kind,namespace,package_name,ref_name
+0x0706 CredentialPolicyRow                  registry_kind,namespace,principal,relation
+0x0801 RegionRow                            region_id
+0x0802 CellRow                              region_id,cell_id
+0x0803 NodeRow                              node_id
+0x0804 PartitionMapRow                      partition_id,effective_epoch
+0x0805 RootOwnerEpochRow                    root_key_hash,effective_epoch
+0x0806 LifecycleEventRow                    event_id
+0x0807 RepairFindingRow                     finding_id
+0x0808 AntiEntropyCheckpointRow             partition_id,scanner_node_id
+```
+
+#### 15.11.4 Missing Row Layouts
+
+The following row layouts complete the registry from section 15.20. These are in
+addition to the layouts already named there.
+
+```text
+TermDictionaryRow =
+  field_id u32-le, term bytes, doc_freq u64-le, postings_ref ManifestRangeRef, positions_ref optional<ManifestRangeRef>, visible_revision_range revision_range
+
+PostingsBlockRefRow =
+  field_id u32-le, term bytes, block_min_doc_id u64-le, block_max_doc_id u64-le, postings_ref ManifestRangeRef, doc_count u32-le, visible_revision_range revision_range
+
+VectorBlockRow =
+  vector_id_start u64-le, vector_count u32-le, dimension u16-le, element_type u8, vector_bytes_ref ManifestRangeRef, quantizer_ref optional<ManifestRangeRef>, visible_revision_range revision_range
+
+HnswAdjacencyRow =
+  layer u16-le, vector_id u64-le, neighbour_count u16-le, neighbours repeated<u64-le>, visible_revision_range revision_range
+
+SortedColumnRow =
+  field_id u32-le, value TypedValue, object_id string, object_ref ManifestRangeRef, visible_revision_range revision_range
+
+BitmapBlockRow =
+  field_id u32-le, value TypedValue, roaring_bitmap_bytes bytes, object_count u64-le, visible_revision_range revision_range
+
+OrderTupleRow =
+  order_tuple repeated<TypedValue>, object_id string, object_ref ManifestRangeRef, visible_revision_range revision_range
+
+AuthzTupleRow =
+  realm_id string, object_key string, relation string, subject_key string, caveat_id optional<string>, revision_range revision_range
+
+PersonalDbChangesetRow =
+  group_id string, sequence u64-le, actor_id string, base_snapshot_hash hash, changeset_hash hash, changeset_ref ManifestRangeRef, committed_at_unix_nanos u64-le
+
+WitnessRecordRow =
+  group_id string, change_id string, actor_id string, decision u8, fence u64-le, evidence_hash hash, committed_revision u64-le
+
+PackageVersionRow =
+  registry_kind u8, namespace string, package_name string, version string, manifest_ref ManifestRangeRef, published_at_unix_nanos u64-le, visible_revision_range revision_range
+
+RegistryRefRow =
+  registry_kind u8, namespace string, package_name string, ref_name string, target_version string, visible_revision_range revision_range
+
+NodeRow =
+  node_id string, region_id string, cell_id string, advertise_addr string, state u8, capacity_json_hash hash, effective_epoch u64-le
+
+PartitionMapRow =
+  partition_id u64-le, root_kind string, owner_node_id string, owner_fence u64-le, replica_node_ids repeated<string>, effective_epoch u64-le
+
+RootOwnerEpochRow =
+  root_key_hash hash, owner_node_id string, membership_epoch u64-le, owner_fence u64-le, state u8
+```
 
 ### 15.12 Object Segment Format
 
@@ -2602,7 +3109,7 @@ Any writer adding a new table must extend this registry before implementation.
 ## 16. Unified Byte Pipeline
 
 The byte pipeline accepts `LogicalFileWrite` values from writers and returns a
-`LogicalFileManifestRef`.
+`ManifestLocator`.
 
 ```mermaid
 flowchart TD
@@ -2720,13 +3227,25 @@ ShardReceipt = {
   shard_length: u64,
   shard_hash: Hash,
   fsync_sequence: u64,
-  written_at_unix_nanos: u64
+  written_at_unix_nanos: u64,
+  signed_payload_hash: Hash,
+  signature_algorithm: string,
+  receipt_signature: bytes
 }
 ```
 
-Receipts are included in the logical file manifest. A node must not issue a
-receipt before the shard file and containing directory fsync required by section
-16.9 have completed.
+`signed_payload_hash` is `blake3(canonical(ShardReceipt without
+receipt_signature))`. `receipt_signature` is produced by the node key registered
+in the system realm for `node_id`. A verifier MUST check the node key, cell and
+region membership, placement epoch, fsync sequence, signed payload hash, and
+signature before trusting the receipt.
+
+Receipts are included in logical file manifests and in `ManifestLocator` block
+locators as `ShardReceiptSummary` values. A locator is self-contained for normal
+reads. `GetShardReceipt` exists for repair/audit and for refreshing caches, not
+for completing ordinary manifest resolution. A node must not issue a receipt
+before the shard file and containing directory fsync required by section 16.9
+have completed.
 
 ### 16.6.2 Degraded Read and Repair
 
@@ -2905,7 +3424,7 @@ pub struct WriteLogicalFileRequest {
 }
 
 pub struct ReadLogicalRangeRequest {
-    pub manifest_ref: ManifestRef,
+    pub manifest_locator: ManifestLocator,
     pub ranges: Vec<ByteRange>,
     pub authz_scope: AuthzScope,
     pub expected_boundary: Option<BoundaryPredicate>,
@@ -2967,18 +3486,20 @@ message PutBoundarySchemaRequest {
   string bucket = 1;
   uint64 expected_generation = 2;
   repeated BoundaryDimension dimensions = 3;
+  WriteOptions options = 4;
 }
 
 message BoundaryDimension {
-  string name = 1;
-  BoundarySource source = 2;
-  BoundaryValueType value_type = 3;
-  repeated BoundaryCategory categories = 4;
-  bool required = 5;
-  CardinalityHint cardinality = 6;
-  optional uint32 max_values_per_block = 7;
-  PlacementAffinity placement_affinity = 8;
-  CompactionScope compaction_scope = 9;
+  uint32 dimension_id = 1;             // stable within bucket schema history
+  string name = 2;
+  BoundarySource source = 3;
+  BoundaryValueType value_type = 4;
+  repeated BoundaryCategory categories = 5;
+  bool required = 6;
+  CardinalityHint cardinality = 7;
+  optional uint32 max_values_per_block = 8;
+  PlacementAffinity placement_affinity = 9;
+  CompactionScope compaction_scope = 10;
 }
 
 message BoundarySource {
@@ -2989,6 +3510,56 @@ message BoundarySource {
     BodyJsonPointer body_json_pointer = 4;
     WriterSuppliedBoundary writer_supplied = 5;
   }
+}
+
+message UserMetadataJsonPointer { string pointer = 1; }
+message SystemMetadataField { string field = 1; }
+message PathTemplate { string template = 1; }
+message BodyJsonPointer { string pointer = 1; uint64 max_body_bytes = 2; }
+message WriterSuppliedBoundary { string writer_family = 1; string field = 2; }
+
+enum BoundaryValueType {
+  BOUNDARY_VALUE_TYPE_UNSPECIFIED = 0;
+  STRING = 1;
+  BYTES = 2;
+  BOOL = 3;
+  I64 = 4;
+  U64 = 5;
+  TIMESTAMP = 6;
+  UUID = 7;
+}
+
+enum BoundaryCategory {
+  BOUNDARY_CATEGORY_UNSPECIFIED = 0;
+  SECURITY_REALM = 1;
+  STORAGE_PARTITION = 2;
+  QUERY_PRUNE = 3;
+  PLACEMENT_AFFINITY = 4;
+  COMPACTION_GROUP = 5;
+  RETENTION_GROUP = 6;
+  OBSERVABILITY_GROUP = 7;
+}
+
+enum CardinalityHint {
+  CARDINALITY_HINT_UNSPECIFIED = 0;
+  LOW = 1;
+  MEDIUM = 2;
+  HIGH = 3;
+  EXTREME = 4;
+}
+
+enum PlacementAffinity {
+  PLACEMENT_AFFINITY_UNSPECIFIED = 0;
+  IGNORE = 1;
+  PREFER_COLOCATE = 2;
+  PREFER_SPREAD = 3;
+}
+
+enum CompactionScope {
+  COMPACTION_SCOPE_UNSPECIFIED = 0;
+  IGNORE = 1;
+  PREFER_SAME_VALUE = 2;
+  REQUIRE_SAME_VALUE = 3;
 }
 ```
 
@@ -3164,9 +3735,10 @@ the retention window.
 
 ### 17.9 Boundary Authorisation
 
-Updating a boundary schema requires authz relation `boundary_schema.manage` on
-the bucket or internal namespace. Reading a boundary schema requires
-`bucket.view` or the equivalent internal relation. A tenant may define boundary
+Updating a boundary schema requires authz permission `manage_boundary_schema` on
+the bucket or the equivalent internal system relation. Reading a boundary schema
+requires `bucket.list_objects`, `bucket.manage_bucket`, or the equivalent
+internal relation. A tenant may define boundary
 dimensions for its own buckets, but cannot define dimensions under Anvil reserved
 internal namespaces.
 
@@ -3380,6 +3952,11 @@ service MeshControlService {
 Required request and response shapes for this RFC. Implementations may add optional fields in later versions, but must not omit these fields or weaken their semantics:
 
 ```protobuf
+message ByteRange {
+  uint64 start = 1;
+  uint64 end_exclusive = 2;
+}
+
 message PutObjectRequest {
   string bucket = 1;
   string key = 2;
@@ -3559,6 +4136,24 @@ message WriteOptions {
   repeated BoundaryValue boundary_values = 5;
 }
 
+message WritePrecondition {
+  WritePreconditionKind kind = 1;
+  optional string object_version = 2;
+  optional string link_target_ref = 3;
+  optional string lease_id = 4;
+  optional uint64 fence_token = 5;
+  optional string authz_revision = 6;
+}
+
+enum WritePreconditionKind {
+  WRITE_PRECONDITION_KIND_UNSPECIFIED = 0;
+  OBJECT_VERSION_EQUALS = 1;
+  OBJECT_ABSENT = 2;
+  LINK_TARGET_EQUALS = 3;
+  LEASE_FENCE = 4;
+  AUTHZ_REVISION_AT_LEAST = 5;
+}
+
 enum ConsistencyMode {
   CONSISTENCY_UNSPECIFIED = 0;
   COMMITTED = 1;
@@ -3687,6 +4282,626 @@ Anvil internal namespaces, including `_anvil/authz` and root-register internals.
 
 Gateways must map their protocol-specific errors to this envelope internally so
 tracing, metrics, retries, and release gates can classify failures consistently.
+### 20.2 Complete Native Message Contract
+
+Every request is evaluated in a server-derived `RequestContext`. The context is
+created from the authenticated transport/session and is not accepted from the
+request body.
+
+```protobuf
+message RequestContext {
+  string principal_id = 1;          // authenticated principal, server-derived
+  string authz_subject = 2;         // canonical subject key used by authz engine
+  string storage_tenant = 3;        // Anvil storage tenant selected by routing/authn
+  string plane = 4;                 // public,admin,internal,s3,registry
+  string request_id = 5;
+  string trace_id = 6;
+}
+```
+
+Request messages below omit `RequestContext` because transports carry it out of
+band. Implementations MUST reject any client-supplied field that attempts to
+override `principal_id`, `authz_subject`, or system realm membership.
+
+```protobuf
+message DeleteObjectRequest {
+  string bucket = 1;
+  string key = 2;
+  optional string object_version = 3;
+  bool create_delete_marker = 4;
+  WriteOptions options = 5;
+}
+
+message PutLinkRequest {
+  string bucket = 1;
+  string link = 2;
+  string target_key = 3;
+  optional string target_version = 4;
+  bool replace_existing = 5;
+  WriteOptions options = 6;
+}
+
+message ResolveLinkRequest {
+  string bucket = 1;
+  string link = 2;
+  ReadConsistency consistency = 3;
+}
+
+message HeadObjectRequest {
+  string bucket = 1;
+  string key_or_link = 2;
+  optional string object_version = 3;
+  ReadConsistency consistency = 4;
+}
+
+message SealSegmentRequest {
+  string stream = 1;
+  string partition = 2;
+  uint64 expected_last_sequence = 3;
+  WriteOptions options = 4;
+}
+
+message ReadStreamRequest {
+  string stream = 1;
+  string partition = 2;
+  uint64 after_sequence = 3;
+  uint32 limit = 4;
+  ReadConsistency consistency = 5;
+  string page_token = 6;
+}
+
+message PutIndexDefinitionRequest {
+  string bucket = 1;
+  string index_name = 2;
+  IndexKind kind = 3;
+  string selector_json = 4;
+  string extractor_json = 5;
+  string options_json = 6;
+  WriteOptions options = 7;
+}
+
+enum IndexKind {
+  INDEX_KIND_UNSPECIFIED = 0;
+  PATH = 1;
+  METADATA = 2;
+  TYPED = 3;
+  FULL_TEXT = 4;
+  VECTOR = 5;
+  HYBRID = 6;
+}
+
+message HybridSearchRequest {
+  string bucket = 1;
+  repeated string index_names = 2;
+  string query_json = 3;
+  string fusion_json = 4;
+  ReadConsistency consistency = 5;
+  uint32 limit = 6;
+  string page_token = 7;
+}
+
+message PutSchemaRequest {
+  string realm = 1;
+  uint64 expected_generation = 2;
+  string schema_json = 3;
+  WriteOptions options = 4;
+}
+
+message BindSchemaRequest {
+  string realm = 1;
+  uint64 schema_generation = 2;
+  bool make_default = 3;
+  WriteOptions options = 4;
+}
+
+message TupleMutation {
+  TupleMutationKind kind = 1;
+  string object = 2;
+  string relation = 3;
+  string subject = 4;
+  optional string caveat_id = 5;
+  optional string caveat_context_json = 6;
+}
+
+enum TupleMutationKind {
+  TUPLE_MUTATION_KIND_UNSPECIFIED = 0;
+  WRITE = 1;
+  DELETE = 2;
+}
+
+message ListAuthzObjectsRequest {
+  string realm = 1;
+  string subject = 2;
+  string relation = 3;
+  string object_namespace = 4;
+  ReadConsistency consistency = 5;
+  uint32 limit = 6;
+  string page_token = 7;
+}
+
+message ListAuthzSubjectsRequest {
+  string realm = 1;
+  string object = 2;
+  string relation = 3;
+  string subject_namespace = 4;
+  ReadConsistency consistency = 5;
+  uint32 limit = 6;
+  string page_token = 7;
+}
+
+message GetSnapshotRequest {
+  string group_id = 1;
+  optional string checkpoint = 2;
+  ReadConsistency consistency = 3;
+}
+
+message WatchGroupRequest {
+  string group_id = 1;
+  string after_checkpoint = 2;
+  uint32 batch_limit = 3;
+}
+
+// PutBoundarySchemaRequest and BoundaryDimension are defined normatively in section 17.2.
+
+message GetBoundarySchemaRequest {
+  string bucket = 1;
+  optional uint64 generation = 2;
+  ReadConsistency consistency = 3;
+}
+
+message BoundaryValue {
+  uint32 dimension_id = 1;
+  string name = 2;
+  BoundaryValueType value_type = 3;
+  bytes canonical_value = 4;
+}
+
+message GetBoundaryMigrationRequest {
+  string bucket = 1;
+  string migration_id = 2;
+}
+
+message PutPackageBlobRequest {
+  string registry_kind = 1;
+  string namespace = 2;
+  string digest = 3;
+  bytes inline_body = 4;
+  string media_type = 5;
+  WriteOptions options = 6;
+}
+
+message PutPackageVersionRequest {
+  string registry_kind = 1;
+  string namespace = 2;
+  string package_name = 3;
+  string version = 4;
+  string manifest_json = 5;
+  repeated string blob_digests = 6;
+  WriteOptions options = 7;
+}
+
+message PutRegistryRefRequest {
+  string registry_kind = 1;
+  string namespace = 2;
+  string package_name = 3;
+  string ref_name = 4;
+  string target_version = 5;
+  WriteOptions options = 6;
+}
+
+message GetPackageVersionRequest {
+  string registry_kind = 1;
+  string namespace = 2;
+  string package_name = 3;
+  string version = 4;
+  ReadConsistency consistency = 5;
+}
+
+message ListPackageVersionsRequest {
+  string registry_kind = 1;
+  string namespace = 2;
+  string package_name = 3;
+  ReadConsistency consistency = 4;
+  uint32 limit = 5;
+  string page_token = 6;
+}
+
+message PutRegionRequest { string region_id = 1; string endpoint = 2; string state = 3; WriteOptions options = 4; }
+message PutCellRequest { string region_id = 1; string cell_id = 2; string failure_domain = 3; string state = 4; WriteOptions options = 5; }
+message PutNodeRequest { string node_id = 1; string region_id = 2; string cell_id = 3; string advertise_addr = 4; string state = 5; string capacity_json = 6; WriteOptions options = 7; }
+message DrainNodeRequest { string node_id = 1; string checkpoint_ref = 2; WriteOptions options = 3; }
+message DrainCellRequest { string region_id = 1; string cell_id = 2; string checkpoint_ref = 3; WriteOptions options = 4; }
+message MoveBucketRequest { string bucket = 1; string target_region_id = 2; string target_cell_id = 3; string checkpoint_ref = 4; WriteOptions options = 5; }
+message GetPartitionMapRequest { optional uint64 epoch = 1; ReadConsistency consistency = 2; }
+```
+
+All request types that list or query data MUST use authenticated page tokens from
+section 20. Reusing a token across any changed field in the request messages
+above is `PageTokenScopeMismatch`.
+
+### 20.3 Internal CoreStore Service Protocols
+
+Internal services are not public APIs. They are still normative because they are
+the only permitted distributed data/control paths. Every internal request carries
+node mTLS identity or an equivalent signed node credential. The receiving node
+MUST verify that identity against the system realm node/cell/partition relations
+from section 15.6.1 before accepting the request.
+
+```protobuf
+service AdmissionMirrorInternal {
+  rpc BeginMirror(BeginMirrorRequest) returns (BeginMirrorResponse);
+  rpc PutMirrorChunk(PutMirrorChunkRequest) returns (MirrorChunkAck);
+  rpc CommitMirror(CommitMirrorRequest) returns (MirrorReceipt);
+  rpc AbortMirror(AbortMirrorRequest) returns (MirrorReceipt);
+  rpc GetMirrorEvidence(GetMirrorEvidenceRequest) returns (MirrorEvidence);
+}
+
+service BlockStoreInternal {
+  rpc PutShard(PutShardRequest) returns (ShardReceipt);
+  rpc GetShard(GetShardRequest) returns (stream ShardChunk);
+  rpc GetShardReceipt(GetShardReceiptRequest) returns (ShardReceipt);
+  rpc RepairShard(RepairShardRequest) returns (ShardReceipt);
+}
+
+service RootRegisterInternal {
+  rpc ReadRoot(ReadRootRequest) returns (RootAnchorRead);
+  rpc CompareAndSwapRoot(CompareAndSwapRootRequest) returns (RootAnchorWrite);
+  rpc VoteFailover(VoteFailoverRequest) returns (FailoverVoteReceipt);
+  rpc ExchangeRootInventory(ExchangeRootInventoryRequest) returns (RootInventory);
+}
+
+service AntiEntropyInternal {
+  rpc ExchangeInventory(ExchangeInventoryRequest) returns (InventoryDiff);
+  rpc PublishRepairFinding(PublishRepairFindingRequest) returns (WriteResponse);
+  rpc ClaimRepair(ClaimRepairRequest) returns (RepairClaim);
+}
+
+service CrossRegionProxyInternal {
+  rpc ProxyNative(ProxyNativeRequest) returns (ProxyNativeResponse);
+  rpc ProxyObjectRead(ProxyObjectReadRequest) returns (stream ObjectChunk);
+  rpc ProxyShardRange(ProxyShardRangeRequest) returns (stream ShardChunk);
+}
+```
+
+Core internal messages:
+
+```protobuf
+message InternalRequestHeader {
+  string request_id = 1;
+  string trace_id = 2;
+  string source_node_id = 3;
+  uint64 membership_epoch = 4;
+  uint64 source_node_fence = 5;
+  bytes signature = 6;              // over canonical request minus signature
+}
+
+message BeginMirrorRequest { InternalRequestHeader header = 1; string mutation_id = 2; string request_hash = 3; uint64 expected_bytes = 4; string admission_profile = 5; }
+message BeginMirrorResponse { string mirror_id = 1; bool accepted = 2; optional AnvilError error = 3; }
+message PutMirrorChunkRequest { InternalRequestHeader header = 1; string mirror_id = 2; uint64 offset = 3; bytes chunk = 4; string chunk_hash = 5; }
+message MirrorChunkAck { string mirror_id = 1; uint64 offset = 2; string chunk_hash = 3; uint64 fsync_sequence = 4; }
+message CommitMirrorRequest { InternalRequestHeader header = 1; string mirror_id = 2; string final_content_hash = 3; uint64 length = 4; }
+message AbortMirrorRequest { InternalRequestHeader header = 1; string mirror_id = 2; string reason = 3; }
+message MirrorReceipt { string mirror_id = 1; string request_hash = 2; string final_content_hash = 3; uint64 fsync_sequence = 4; bytes receipt_signature = 5; }
+message GetMirrorEvidenceRequest { InternalRequestHeader header = 1; string mutation_id = 2; }
+message MirrorEvidence { repeated MirrorReceipt receipts = 1; }
+
+message PutShardRequest { InternalRequestHeader header = 1; string block_id = 2; uint32 shard_index = 3; string erasure_profile_id = 4; uint64 placement_epoch = 5; bytes shard_bytes = 6; string shard_hash = 7; }
+message GetShardRequest { InternalRequestHeader header = 1; string block_id = 2; uint32 shard_index = 3; optional ByteRange range = 4; }
+message GetShardReceiptRequest { InternalRequestHeader header = 1; string block_id = 2; uint32 shard_index = 3; }
+message RepairShardRequest { InternalRequestHeader header = 1; string block_id = 2; uint32 shard_index = 3; string repair_evidence_hash = 4; bytes shard_bytes = 5; }
+message ShardChunk { string block_id = 1; uint32 shard_index = 2; uint64 offset = 3; bytes bytes = 4; string chunk_hash = 5; }
+message ShardReceipt { string block_id = 1; string shard_id = 2; uint32 shard_index = 3; string erasure_profile = 4; string node_id = 5; string region_id = 6; string cell_id = 7; uint64 placement_epoch = 8; uint64 shard_length = 9; string shard_hash = 10; uint64 fsync_sequence = 11; uint64 written_at_unix_nanos = 12; string signed_payload_hash = 13; string signature_algorithm = 14; bytes receipt_signature = 15; }
+
+message ReadRootRequest { InternalRequestHeader header = 1; string root_key_hash = 2; ReadConsistency consistency = 3; }
+message RootAnchorRead { string root_key_hash = 1; uint64 generation = 2; bytes root_anchor_record = 3; string root_anchor_hash = 4; }
+message CompareAndSwapRootRequest { InternalRequestHeader header = 1; string root_key_hash = 2; uint64 expected_generation = 3; string expected_root_hash = 4; bytes new_root_anchor_record = 5; uint64 partition_owner_fence = 6; }
+message RootAnchorWrite { bool committed = 1; RootAnchorRead current = 2; optional AnvilError error = 3; }
+message VoteFailoverRequest { InternalRequestHeader header = 1; string root_key_hash = 2; uint64 observed_generation = 3; string failed_owner_node_id = 4; string evidence_hash = 5; }
+message FailoverVoteReceipt { string root_key_hash = 1; bool granted = 2; string reason = 3; uint64 voter_epoch = 4; bytes signature = 5; }
+message ExchangeRootInventoryRequest { InternalRequestHeader header = 1; uint64 since_membership_epoch = 2; }
+message RootInventory { repeated string root_key_hashes = 1; repeated uint64 generations = 2; string inventory_hash = 3; }
+
+message ExchangeInventoryRequest { InternalRequestHeader header = 1; string inventory_kind = 2; uint64 since_generation = 3; string partition_id = 4; }
+message InventoryDiff { string inventory_kind = 1; repeated string missing_hashes = 2; repeated string divergent_hashes = 3; string diff_hash = 4; }
+message PublishRepairFindingRequest { InternalRequestHeader header = 1; string finding_kind = 2; string target_ref = 3; string severity = 4; string evidence_hash = 5; }
+message ClaimRepairRequest { InternalRequestHeader header = 1; string finding_id = 2; uint64 expected_generation = 3; }
+message RepairClaim { string finding_id = 1; string owner_node_id = 2; uint64 fence = 3; uint64 expires_at_unix_nanos = 4; }
+
+message ProxyNativeRequest { InternalRequestHeader header = 1; string original_method = 2; bytes canonical_request = 3; string original_principal_hash = 4; }
+message ProxyNativeResponse { bytes canonical_response = 1; optional AnvilError error = 2; }
+message ProxyObjectReadRequest { InternalRequestHeader header = 1; GetObjectRequest request = 2; string original_principal_hash = 3; }
+message ProxyShardRangeRequest { InternalRequestHeader header = 1; string block_id = 2; uint32 shard_index = 3; optional ByteRange range = 4; }
+```
+
+Retry and idempotency rules:
+
+```text
+BeginMirror          idempotent by mutation_id + request_hash; mismatch rejects.
+PutMirrorChunk       idempotent by mirror_id + offset + chunk_hash; mismatch rejects.
+CommitMirror         idempotent by mirror_id + final_content_hash; mismatch rejects.
+PutShard             idempotent by block_id + shard_index + shard_hash; mismatch rejects.
+CompareAndSwapRoot   single-winner by root_key_hash + expected_generation.
+VoteFailover         one vote per voter/root/generation/evidence hash.
+ProxyNative          preserves original request id/idempotency key; proxy cannot rewrite principal.
+```
+
+Internal range reads use `ProxyShardRange` only when placement says the remote
+region/cell owns the requested shard or when a repair/degraded read policy asks
+for it. Cross-region proxying MUST NOT create a second persistence path; it only
+forwards native requests or shard-range reads to the owning region.
+### 20.4 Index Definition and Query JSON Grammars
+
+JSON fields in native requests are protocol payloads, not arbitrary implementation
+hooks. They MUST use canonical UTF-8 JSON, MUST include a `schema` field, MUST
+reject unknown required fields, and MUST NOT contain executable code. Object
+member order is insignificant, but hashes are computed over canonical JSON with
+sorted object keys and no insignificant whitespace.
+
+#### 20.4.1 `selector_json`
+
+`selector_json` selects which objects or records feed an index.
+
+```json
+{
+  "schema": "anvil.index.selector.v1",
+  "source": "object",
+  "bucket_prefix": "/invoices/",
+  "content_types": ["application/json"],
+  "boundary_required": ["customer_tenant", "project"],
+  "include_delete_markers": false
+}
+```
+
+Normative shape:
+
+```text
+selector.schema                must equal "anvil.index.selector.v1"
+selector.source                "object" | "stream" | "personaldb" | "registry"
+selector.bucket_prefix         optional string prefix for object keys
+selector.stream                optional stream name when source == "stream"
+selector.content_types         optional array of MIME strings
+selector.boundary_required     optional array of boundary dimension names
+selector.include_delete_markers optional bool, default false
+```
+
+A selector matches only records the authenticated principal is allowed to index.
+For bucket-owned indexes, the `PutIndexDefinition` caller must have
+`index.define`; background index builders run under an internal system principal
+and still emit authz-aware query structures.
+
+#### 20.4.2 `extractor_json`
+
+`extractor_json` defines fields extracted into an index. It is shared by typed,
+metadata, full-text, vector, and hybrid indexes.
+
+```json
+{
+  "schema": "anvil.index.extractor.v1",
+  "fields": [
+    {
+      "name": "state",
+      "source": "json_body",
+      "path": "/state/state",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "available_at",
+      "source": "json_body",
+      "path": "/state/available_at",
+      "type": "timestamp",
+      "required": true
+    },
+    {
+      "name": "body",
+      "source": "json_body",
+      "path": "/body",
+      "type": "text",
+      "analyser": "unicode_words_v1"
+    }
+  ]
+}
+```
+
+Normative field shape:
+
+```text
+field.name          ALPHA *(ALPHA / DIGIT / "_")
+field.source        "json_body" | "user_metadata" | "system_metadata" | "path" | "writer_field"
+field.path          JSON Pointer for json_body/user_metadata, field name for system_metadata, path-template capture for path
+field.type          "string" | "bytes" | "bool" | "i64" | "u64" | "f64" | "decimal" | "timestamp" | "uuid" | "hash" | "text" | "vector"
+field.required      bool, default false
+field.multi_value   bool, default false
+field.analyser      required for text unless index kind supplies a default
+field.vector        required for vector fields: { dimensions, element_type, metric, model_id }
+field.normalizer    optional string normalizer id for string/text
+```
+
+Extraction failure rules:
+
+```text
+required field missing      -> object is rejected from the index and diagnostic emitted
+optional field missing      -> field omitted for that object
+wrong type                  -> object rejected unless coercion is explicitly configured
+body too large to extract   -> object rejected with BoundaryExtractorBodyTooLarge or IndexUnavailable diagnostic
+unknown analyser/model      -> PutIndexDefinition rejected
+```
+
+Path syntax uses JSON Pointer RFC 6901 for JSON sources. Path-template captures
+use the ABNF from section 17.7. No regex or user code is permitted in extractor
+paths for this RFC.
+
+#### 20.4.3 `options_json`
+
+`options_json` configures index construction. It has one common section and one
+kind-specific section. Unknown kind-specific fields are rejected.
+
+```json
+{
+  "schema": "anvil.index.options.v1",
+  "refresh": {"mode": "watch", "max_lag_ms": 2000},
+  "retention": {"keep_delete_markers": true, "max_generations": 3},
+  "typed": {"page_size": 4096, "bitmap_threshold": 128},
+  "full_text": {"default_analyser": "unicode_words_v1", "store_positions": true},
+  "vector": {"algorithm": "hnsw", "m": 32, "ef_construction": 200, "ef_search_default": 80}
+}
+```
+
+Normative shape:
+
+```text
+options.schema                         must equal "anvil.index.options.v1"
+options.refresh.mode                   "watch" | "batch"; release default "watch"
+options.refresh.max_lag_ms             positive u64; required for watch mode
+options.retention.keep_delete_markers  bool, default true
+options.retention.max_generations      positive u32, default 3
+options.typed.page_size                512..65536 rows
+options.typed.bitmap_threshold         positive u32; values with at least this many docs get bitmap rows
+options.full_text.default_analyser     analyser id from FieldCatalog/AnalyserCatalog
+options.full_text.store_positions      bool; phrase queries require true
+options.vector.algorithm               "hnsw" for this RFC
+options.vector.m                       4..64
+options.vector.ef_construction         >= m and <= 4096
+options.vector.ef_search_default       >= k and <= 4096
+options.hybrid.allowed_inputs          optional array of index names allowed for HybridSearch
+```
+
+An implementation MUST reject an index definition whose options cannot support
+the query operators implied by its kind. For example, a full-text index with
+`store_positions=false` rejects phrase queries with `IndexDoesNotSupportQuery`; a
+vector index without HNSW parameters rejects `knn` queries.
+
+#### 20.4.4 `predicate_json`
+
+`predicate_json` is a boolean expression tree over extracted fields and system
+fields.
+
+```json
+{
+  "schema": "anvil.query.predicate.v1",
+  "and": [
+    {"eq": {"field": "state", "value": "pending"}},
+    {"range": {"field": "available_at", "lte": "2026-07-07T12:00:00Z"}},
+    {"in": {"field": "priority", "values": [50, 100]}}
+  ]
+}
+```
+
+Allowed predicate nodes:
+
+```text
+{"and": [predicate, ...]}             all children must match
+{"or": [predicate, ...]}              any child may match
+{"not": predicate}                    negation; planner must avoid full scan unless supported
+{"eq": {field, value}}                exact typed equality
+{"in": {field, values[]}}             exact membership, values all same type
+{"range": {field, gt?, gte?, lt?, lte?}} typed ordered range
+{"prefix": {field, value}}            string/path prefix
+{"exists": {field}}                   field exists
+{"term": {field, value}}              full-text term query
+{"phrase": {field, value, slop?}}     full-text phrase query
+{"match": {field, query, operator?}}  analysed full-text query; operator "and"|"or"
+{"knn": {field, vector, k, ef?}}      vector nearest-neighbour query
+```
+
+Planner requirements:
+
+- `eq`, `in`, `range`, `prefix`, and `exists` use typed/metadata/path indexes.
+- `term`, `phrase`, and `match` use full-text dictionary/postings/doc-value
+  ranges.
+- `knn` uses vector index graph/vector ranges and may combine with boundary and
+  authz pruning.
+- Full-scan fallback is forbidden outside explicit diagnostic mode.
+- Every query returns candidate counts before boundary pruning, after boundary
+  pruning, before authz pruning, and after authz pruning in traces/metrics.
+
+#### 20.4.5 `order_json`
+
+`order_json` defines stable ordering for list and query pages.
+
+```json
+{
+  "schema": "anvil.query.order.v1",
+  "fields": [
+    {"field": "available_at", "direction": "asc", "nulls": "last"},
+    {"field": "priority", "direction": "desc", "nulls": "last"},
+    {"field": "object_id", "direction": "asc"}
+  ],
+  "tie_breaker": "object_version"
+}
+```
+
+Rules:
+
+```text
+field.direction       "asc" | "desc"
+field.nulls           "first" | "last", default last
+tie_breaker           required unless object key/version is already the last field
+page token            stores last encoded sort tuple, root generation, index generation, authz subject hash, predicate hash, and order hash
+```
+
+A query using a page token with a different `order_json` canonical hash MUST
+fail with `PageTokenScopeMismatch`.
+
+#### 20.4.6 `query_json` and `fusion_json`
+
+`HybridSearchRequest.query_json` supplies the per-input queries. It does not
+replace `predicate_json`; it embeds one predicate or vector/text query per input
+index so the planner can use each writer family correctly.
+
+```json
+{
+  "schema": "anvil.query.hybrid.v1",
+  "inputs": [
+    {"index": "docs_text", "predicate": {"match": {"field": "body", "query": "invoice overdue", "operator": "and"}}},
+    {"index": "docs_vector", "predicate": {"knn": {"field": "embedding", "vector": [0.1, 0.2], "k": 20}}},
+    {"index": "docs_due", "predicate": {"range": {"field": "available_at", "lte": "2026-07-07T12:00:00Z"}}}
+  ],
+  "global_filter": {"eq": {"field": "state", "value": "published"}}
+}
+```
+
+Normative shape:
+
+```text
+query.schema                 must equal "anvil.query.hybrid.v1"
+query.inputs                 non-empty array; each input.index must appear in request.index_names
+query.inputs[].predicate     predicate_json node from section 20.4.4
+query.global_filter          optional predicate_json node applied to all inputs before fusion
+query.limit_per_input        optional positive u32, default max(request.limit * 4, 100)
+```
+
+`fusion_json` defines how hybrid search combines those typed/full-text/vector
+result sets.
+
+```json
+{
+  "schema": "anvil.query.fusion.v1",
+  "method": "rrf",
+  "rank_constant": 60,
+  "inputs": [
+    {"index": "docs_text", "weight": 1.0},
+    {"index": "docs_vector", "weight": 0.8},
+    {"index": "docs_due", "weight": 0.3}
+  ]
+}
+```
+
+Supported methods:
+
+```text
+rrf
+  reciprocal-rank fusion. score = sum(weight / (rank_constant + rank)).
+
+weighted_sum
+  each input score is min-max normalised per page using deterministic bounds
+  recorded in the trace; score = sum(weight * normalised_score).
+```
+
+Hybrid search MUST apply boundary and authz pruning before fetching payload
+bytes. It may retrieve index candidates from multiple writer families, but final
+result visibility is decided exactly once by the authz evaluator for the selected
+read revision.
 
 ## 21. Read Path
 
@@ -3718,7 +4933,7 @@ The erasure range API must support:
 
 ```rust
 pub async fn read_logical_range(
-    manifest_ref: LogicalFileManifestRef,
+    manifest_locator: ManifestLocator,
     range: ByteRange,
     options: RangeReadOptions,
 ) -> Result<Bytes>;
