@@ -889,6 +889,30 @@ impl CoreStore {
         Ok(core_object_ref_from_logical_file_manifest(&manifest))
     }
 
+    async fn write_control_logical_file_ref(
+        &self,
+        writer_family: &str,
+        generation: u64,
+        logical_file_id: String,
+        bytes: Vec<u8>,
+        mutation_id: String,
+        region_id: String,
+    ) -> Result<CoreObjectRef> {
+        self.write_logical_file_ref(WriteLogicalFileRequest {
+            writer_family: writer_family.to_string(),
+            generation,
+            logical_file_id,
+            source: bytes,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
+            boundary_values: Vec::new(),
+            mutation_id,
+            region_id,
+        })
+        .await
+    }
+
     pub async fn read_logical_range(&self, request: ReadLogicalRangeRequest) -> Result<Vec<u8>> {
         let _perf_guard = crate::perf::guard(
             "anvil_core_store_op",
@@ -1065,16 +1089,17 @@ impl CoreStore {
         let bytes = serde_json::to_vec(&schema)?;
         let schema_hash = format!("sha256:{}", sha256_hex(&bytes));
         let object_ref = self
-            .put_blob(PutBlob {
-                logical_name: format!(
+            .write_control_logical_file_ref(
+                "core_control",
+                schema.generation,
+                format!(
                     "boundary_schema/bucket:{}/generation:{}",
                     schema.bucket, schema.generation
                 ),
                 bytes,
-                boundary_values: Vec::new(),
-                region_id: "local".to_string(),
-                mutation_id: input.mutation_id.clone(),
-            })
+                input.mutation_id.clone(),
+                "local".to_string(),
+            )
             .await?;
         let ref_name = boundary_schema_ref_name(&schema.bucket);
         let receipt = self
@@ -1511,16 +1536,17 @@ impl CoreStore {
         let record_bytes = serde_json::to_vec(&record)?;
         let record_hash = sha256_hex(&record_bytes);
         let object_ref = self
-            .put_blob(PutBlob {
-                logical_name: ref_name.clone(),
-                bytes: record_bytes,
-                boundary_values: Vec::new(),
-                region_id: "local".to_string(),
-                mutation_id: format!(
+            .write_control_logical_file_ref(
+                "core_control",
+                next_token,
+                ref_name.clone(),
+                record_bytes,
+                format!(
                     "core-fence:{}:{}:{}",
                     input.fence_name, next_token, record_hash
                 ),
-            })
+                "local".to_string(),
+            )
             .await?;
         self.compare_and_swap_ref(CompareAndSwapRef {
             ref_name,
@@ -1573,16 +1599,17 @@ impl CoreStore {
             updated_at: now_rfc3339(),
         };
         let object_ref = self
-            .put_blob(PutBlob {
-                logical_name: ref_name.clone(),
-                bytes: serde_json::to_vec(&released)?,
-                boundary_values: Vec::new(),
-                region_id: "local".to_string(),
-                mutation_id: format!(
+            .write_control_logical_file_ref(
+                "core_control",
+                input.fence_token,
+                ref_name.clone(),
+                serde_json::to_vec(&released)?,
+                format!(
                     "core-fence-release:{}:{}",
                     input.fence_name, input.fence_token
                 ),
-            })
+                "local".to_string(),
+            )
             .await?;
         self.compare_and_swap_ref(CompareAndSwapRef {
             ref_name,
@@ -1649,16 +1676,17 @@ impl CoreStore {
         verify_root_catalog(&catalog, signing_key)?;
         let catalog_hash = hash_root_catalog(&catalog)?;
         let object_ref = self
-            .put_blob(PutBlob {
-                logical_name: format!("mesh:{}/system/mesh/root_catalog", catalog.mesh_id),
-                bytes: serde_json::to_vec(&catalog)?,
-                boundary_values: Vec::new(),
-                region_id: root_catalog_region(&catalog),
-                mutation_id: format!(
+            .write_control_logical_file_ref(
+                "mesh_control",
+                catalog.generation,
+                format!("mesh:{}/system/mesh/root_catalog", catalog.mesh_id),
+                serde_json::to_vec(&catalog)?,
+                format!(
                     "root-catalog:{}:{}:{}",
                     catalog.mesh_id, catalog.generation, catalog_hash
                 ),
-            })
+                root_catalog_region(&catalog),
+            )
             .await?;
         let ref_name = root_catalog_ref_name(&catalog.mesh_id);
         let prior_ref = self.read_ref(&ref_name).await?;
@@ -1761,19 +1789,20 @@ impl CoreStore {
 
         let profile_hash = format!("sha256:{}", sha256_hex(&serde_json::to_vec(&profile)?));
         let object_ref = self
-            .put_blob(PutBlob {
-                logical_name: format!(
+            .write_control_logical_file_ref(
+                "core_control",
+                profile.epoch,
+                format!(
                     "mesh:local/system/quorum/{}/epoch:{}",
                     profile.placement_group, profile.epoch
                 ),
-                bytes: serde_json::to_vec(&profile)?,
-                boundary_values: Vec::new(),
-                region_id: "local".to_string(),
-                mutation_id: format!(
+                serde_json::to_vec(&profile)?,
+                format!(
                     "quorum-profile:{}:{}:{profile_hash}",
                     profile.placement_group, profile.epoch
                 ),
-            })
+                "local".to_string(),
+            )
             .await?;
         let ref_name = quorum_profile_ref_name(&profile.placement_group);
         let prior_ref = self.read_ref(&ref_name).await?;
