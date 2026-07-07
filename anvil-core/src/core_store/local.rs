@@ -503,10 +503,19 @@ impl CoreStore {
                 wal_payload,
             )
             .await?;
-        let receipt = self.append_stream_unlocked(input).await?;
-        self.mark_core_wal_finalised_unlocked(&admission, "committed")
-            .await?;
-        Ok(receipt)
+        match self.append_stream_unlocked(input).await {
+            Ok(receipt) => {
+                self.mark_core_wal_finalised_unlocked(&admission, "committed")
+                    .await?;
+                Ok(receipt)
+            }
+            Err(error) => {
+                self.mark_core_wal_finalised_unlocked(&admission, "aborted")
+                    .await
+                    .with_context(|| "mark failed CoreStore stream append admission as aborted")?;
+                Err(error)
+            }
+        }
     }
 
     pub(crate) async fn read_raw_stream(&self, stream_id: &str) -> Result<Vec<StreamRecord>> {
@@ -1517,6 +1526,98 @@ impl CoreStore {
             )),
         })
         .await?;
+        self.checkpoint_core_wal_unlocked().await?;
+        Ok(())
+    }
+
+    async fn checkpoint_core_wal_unlocked(&self) -> Result<()> {
+        let _wal_guard = self.acquire_named_lock("wal", "active").await?;
+        self.ensure_wal_file_header().await?;
+
+        let path = self.active_wal_path();
+        let bytes = match read_file(&path, "core_store", "wal_read_for_checkpoint").await {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err).with_context(|| "read CoreStore admission WAL"),
+        };
+        let (first_sequence, records) = decode_wal_file(&bytes)?;
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let finalised = self.read_core_wal_finalisation_keys().await?;
+        let max_sequence = records
+            .iter()
+            .map(|(record, _)| record.sequence)
+            .max()
+            .unwrap_or(first_sequence.saturating_sub(1));
+        let finalised_prefix_len = records
+            .iter()
+            .take_while(|(record, _)| finalised.contains(&CoreWalRecordKey::from(record)))
+            .count();
+        if finalised_prefix_len == 0 {
+            return Ok(());
+        }
+
+        let next_sequence = max_sequence.saturating_add(1);
+        let finalised_records: Vec<_> = records
+            .iter()
+            .take(finalised_prefix_len)
+            .map(|(record, _)| record.clone())
+            .collect();
+        let retained = records
+            .into_iter()
+            .skip(finalised_prefix_len)
+            .collect::<Vec<_>>();
+        let compacted_first_sequence = retained
+            .first()
+            .map(|(record, _)| record.sequence)
+            .unwrap_or(next_sequence);
+        let mut compacted =
+            encode_wal_file_header(CORE_WAL_NODE_ID, CORE_WAL_EPOCH, compacted_first_sequence)?;
+        for (record, payload) in &retained {
+            let header_json = serde_json::to_vec(record)?;
+            compacted.extend_from_slice(&encode_wal_frame(&header_json, payload)?);
+        }
+
+        write_file_atomic(&path, &compacted).await?;
+        for record in finalised_records {
+            self.remove_finalised_landed_bytes(&record).await?;
+        }
+        Ok(())
+    }
+
+    async fn remove_finalised_landed_bytes(&self, record: &CoreWalAdmissionRecord) -> Result<()> {
+        for landed in &record.landed_bytes {
+            let landed_path = self
+                .storage
+                .resolve_relative_storage_path(&landed.relative_path)?;
+            match fs::remove_file(&landed_path).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "remove finalised CoreStore landed bytes {}",
+                            landed_path.display()
+                        )
+                    });
+                }
+            }
+            let meta_path = landed_path.with_extension("meta");
+            match fs::remove_file(&meta_path).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "remove finalised CoreStore landed metadata {}",
+                            meta_path.display()
+                        )
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1582,7 +1683,13 @@ impl CoreStore {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(1),
             Err(err) => return Err(err).with_context(|| "read CoreStore admission WAL"),
         };
-        Ok(decode_wal_records(&bytes)?.len() as u64 + 1)
+        let (first_sequence, records) = decode_wal_file(&bytes)?;
+        Ok(records
+            .iter()
+            .map(|(record, _)| record.sequence)
+            .max()
+            .map(|sequence| sequence.saturating_add(1))
+            .unwrap_or(first_sequence))
     }
 
     pub async fn list_stream_ids(&self, prefix: &str) -> Result<Vec<String>> {
@@ -3615,6 +3722,10 @@ fn encode_wal_frame(header_json: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn decode_wal_records(bytes: &[u8]) -> Result<Vec<(CoreWalAdmissionRecord, Vec<u8>)>> {
+    decode_wal_file(bytes).map(|(_, records)| records)
+}
+
+fn decode_wal_file(bytes: &[u8]) -> Result<(u64, Vec<(CoreWalAdmissionRecord, Vec<u8>)>)> {
     let mut offset = 0usize;
     let magic = read_exact(bytes, &mut offset, CORE_WAL_FILE_MAGIC.len())?;
     if magic != CORE_WAL_FILE_MAGIC {
@@ -3627,7 +3738,7 @@ fn decode_wal_records(bytes: &[u8]) -> Result<Vec<(CoreWalAdmissionRecord, Vec<u
     let node_id_len = read_u16_le(bytes, &mut offset)? as usize;
     let _node_id = read_exact(bytes, &mut offset, node_id_len)?;
     let _wal_epoch = read_u64_le(bytes, &mut offset)?;
-    let _first_sequence = read_u64_le(bytes, &mut offset)?;
+    let first_sequence = read_u64_le(bytes, &mut offset)?;
     let _created_at = read_u64_le(bytes, &mut offset)?;
     let expected_header_crc = read_u32_le(bytes, &mut offset)?;
     let actual_header_crc = crc32c(&bytes[..offset - 4]);
@@ -3660,7 +3771,7 @@ fn decode_wal_records(bytes: &[u8]) -> Result<Vec<(CoreWalAdmissionRecord, Vec<u
         }
         records.push((record, payload.to_vec()));
     }
-    Ok(records)
+    Ok((first_sequence, records))
 }
 
 fn write_u16_len_prefixed_bytes(out: &mut Vec<u8>, bytes: &[u8], label: &str) -> Result<()> {
@@ -3895,20 +4006,53 @@ mod tests {
             .unwrap();
         let wal_bytes = tokio::fs::read(store.active_wal_path()).await.unwrap();
         let wal_records = decode_wal_records(&wal_bytes).unwrap();
+        assert!(
+            wal_records.is_empty(),
+            "finalised put_blob records must be checkpointed out of the active WAL"
+        );
+        assert_eq!(
+            store.admission_landed_bytes().await.unwrap(),
+            0,
+            "finalised put_blob landed bytes must be reclaimed after CoreStore shards are durable"
+        );
+        let bytes = store.get_blob(GetBlob { object_ref }).await.unwrap();
+        assert_eq!(bytes, b"hello corestore");
+    }
+
+    #[tokio::test]
+    async fn core_store_wal_records_never_inline_large_payloads_before_finalisation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        let bytes = vec![b'x'; CORE_WAL_MAX_INLINE_PAYLOAD_BYTES + 1];
+        store
+            .admit_core_mutation(
+                "object.put",
+                "object_blob",
+                serde_json::json!({"logical_name":"tenant:t/bucket:b/object:large"}),
+                "large-payload-admission".to_string(),
+                None,
+                CoreWalPayload::Landed(&bytes),
+            )
+            .await
+            .unwrap();
+
+        let wal_bytes = tokio::fs::read(store.active_wal_path()).await.unwrap();
+        let wal_records = decode_wal_records(&wal_bytes).unwrap();
         assert_eq!(wal_records.len(), 1);
-        assert_eq!(wal_records[0].0.operation_family, "object.put");
-        assert_eq!(wal_records[0].0.writer_family, "object_blob");
-        assert!(wal_records[0].1.is_empty());
+        assert!(
+            wal_records[0].1.is_empty(),
+            "large payloads must never be embedded in WAL frame payloads"
+        );
         let landed = wal_records[0].0.landed_bytes.first().unwrap();
-        assert_eq!(landed.length, b"hello corestore".len() as u64);
+        assert_eq!(landed.length, bytes.len() as u64);
         assert!(
             storage
                 .resolve_relative_storage_path(&landed.relative_path)
                 .unwrap()
-                .exists()
+                .exists(),
+            "large payload bytes must land outside the WAL and be referenced by hash/length"
         );
-        let bytes = store.get_blob(GetBlob { object_ref }).await.unwrap();
-        assert_eq!(bytes, b"hello corestore");
     }
 
     #[tokio::test]
@@ -4047,6 +4191,39 @@ mod tests {
             )
             .await
             .unwrap();
+        let wal_bytes = tokio::fs::read(store.active_wal_path()).await.unwrap();
+        assert!(
+            decode_wal_records(&wal_bytes).unwrap().is_empty(),
+            "a fully finalised WAL prefix must be checkpointed out of the active WAL"
+        );
+        assert_eq!(store.next_core_wal_sequence().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn core_store_wal_checkpoint_preserves_high_watermark_when_prefix_is_unfinalised() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        let first = test_wal_record("unfinalised-prefix", unix_timestamp_nanos(), 1);
+        let second = test_wal_record("finalised-after-gap", unix_timestamp_nanos(), 2);
+        write_test_wal_records(&store, vec![first, second.clone()]).await;
+        store
+            .mark_core_wal_finalised_unlocked(&second, "committed")
+            .await
+            .unwrap();
+
+        let wal_bytes = tokio::fs::read(store.active_wal_path()).await.unwrap();
+        let wal_records = decode_wal_records(&wal_bytes).unwrap();
+        assert_eq!(
+            wal_records.len(),
+            2,
+            "checkpointing must not remove finalised records after an unfinalised prefix"
+        );
+        assert_eq!(
+            store.next_core_wal_sequence().await.unwrap(),
+            3,
+            "WAL sequence allocation must not reuse a finalised sequence that remains after an unfinalised prefix"
+        );
     }
 
     #[tokio::test]
@@ -4218,9 +4395,10 @@ mod tests {
         assert_eq!(stream_ids, vec!["object_metadata:tenant:b".to_string()]);
         let wal_bytes = tokio::fs::read(store.active_wal_path()).await.unwrap();
         let wal_records = decode_wal_records(&wal_bytes).unwrap();
-        assert_eq!(wal_records.len(), 2);
-        assert_eq!(wal_records[0].0.operation_family, "stream.append");
-        assert_eq!(wal_records[0].1, br#"{"key":"a"}"#);
+        assert!(
+            wal_records.is_empty(),
+            "finalised stream appends must be checkpointed out of the active WAL"
+        );
         for node_id in local_control_node_ids() {
             assert!(
                 !tmp.path()
