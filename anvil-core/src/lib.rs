@@ -8,8 +8,12 @@ use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, broadcast};
 
 pub(crate) fn emit_test_timing(label: impl AsRef<str>, elapsed: Duration) {
+    let label = label.as_ref();
     if std::env::var_os("ANVIL_TEST_TIMINGS").is_some() {
-        eprintln!("[timing] {}={elapsed:?}", label.as_ref());
+        eprintln!("[timing] {label}={elapsed:?}");
+    }
+    if crate::perf::enabled() {
+        crate::perf::record_duration("anvil_internal_span", &[("span", label)], elapsed);
     }
 }
 
@@ -70,6 +74,7 @@ pub mod object_links;
 pub mod object_manager;
 pub mod observability;
 pub mod partition_fence;
+pub mod perf;
 pub mod permissions;
 pub mod persistence;
 pub mod personaldb_catchup;

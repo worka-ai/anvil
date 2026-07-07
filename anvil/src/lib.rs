@@ -1,6 +1,7 @@
 use anyhow::Result;
 use axum::ServiceExt;
 use once_cell::sync::OnceCell;
+use std::time::Instant;
 use tonic::service;
 use tower::ServiceExt as TowerServiceExt;
 use tracing::{error, info};
@@ -96,13 +97,21 @@ pub async fn start_node_with_admin_listener(
         let s3_router = s3_app.clone();
 
         async move {
+            let started_at = Instant::now();
+            let method = req.method().to_string();
+            let path = req.uri().path().to_string();
             let content_type = req
                 .headers()
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
 
-            if content_type.starts_with("application/grpc") {
+            let plane = if content_type.starts_with("application/grpc") {
+                "public-grpc"
+            } else {
+                "s3"
+            };
+            let response = if content_type.starts_with("application/grpc") {
                 grpc_router.oneshot(req).await
             } else {
                 tracing::info!(
@@ -110,7 +119,22 @@ pub async fn start_node_with_admin_listener(
                     content_type
                 );
                 s3_router.oneshot(req).await
-            }
+            };
+            let status = response
+                .as_ref()
+                .map(|response| response.status().as_u16().to_string())
+                .unwrap_or_else(|_| "service_error".to_string());
+            anvil_core::perf::record_duration(
+                "anvil_request_mux",
+                &[
+                    ("plane", plane),
+                    ("method", method.as_str()),
+                    ("path", path.as_str()),
+                    ("status", status.as_str()),
+                ],
+                started_at.elapsed(),
+            );
+            response
         }
     });
 

@@ -1,6 +1,7 @@
 use crate::{AppState, auth::AuthenticatedBearerToken};
 use axum::{http::HeaderMap, http::HeaderValue, response::Response};
 use http::Uri;
+use std::time::Instant;
 use tonic::{Request, Status};
 
 pub const ANVIL_REQUEST_ID_HEADER: &str = "x-anvil-request-id";
@@ -114,11 +115,32 @@ pub async fn request_id_mw(
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    let started_at = Instant::now();
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let plane = if path.starts_with("/anvil.AdminService/") {
+        "admin"
+    } else if path.starts_with("/anvil.") {
+        "public-grpc"
+    } else {
+        "public-http"
+    };
     let request_id = uuid::Uuid::new_v4().simple().to_string();
     req.extensions_mut()
         .insert(AnvilRequestId(request_id.clone()));
 
     let mut response = next.run(req).await;
+    let status = response.status().as_u16().to_string();
+    crate::perf::record_duration(
+        "anvil_request",
+        &[
+            ("plane", plane),
+            ("method", method.as_str()),
+            ("path", path.as_str()),
+            ("status", status.as_str()),
+        ],
+        started_at.elapsed(),
+    );
     if let Ok(header_value) = HeaderValue::from_str(&request_id) {
         response
             .headers_mut()

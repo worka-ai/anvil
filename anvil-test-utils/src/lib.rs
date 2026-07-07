@@ -42,8 +42,12 @@ pub fn test_timing_enabled() -> bool {
 }
 
 pub fn emit_test_timing(label: impl AsRef<str>, elapsed: Duration) {
+    let label = label.as_ref();
     if test_timing_enabled() {
-        eprintln!("[timing] {}={elapsed:?}", label.as_ref());
+        eprintln!("[timing] {label}={elapsed:?}");
+    }
+    if anvil_core::perf::enabled() {
+        anvil_core::perf::record_duration("anvil_test_span", &[("span", label)], elapsed);
     }
 }
 
