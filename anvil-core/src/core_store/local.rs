@@ -135,12 +135,6 @@ struct StoredStreamSegmentTrailer {
     sealed_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredRefDirectoryEntry {
-    ref_name: String,
-    updated_at: String,
-}
-
 struct CoreStoreLock {
     path: PathBuf,
 }
@@ -1095,15 +1089,7 @@ impl CoreStore {
             .or(latest_stream_generation)
             .unwrap_or(0)
             .saturating_add(1);
-        let value = CoreRefValue {
-            schema: CORE_REF_SCHEMA.to_string(),
-            ref_name: input.ref_name.clone(),
-            generation: next_generation,
-            target: input.new_target.clone(),
-            transaction_id: input.transaction_id,
-            updated_at: now_rfc3339(),
-        };
-        self.write_ref(&value).await?;
+        let committed_at = now_rfc3339();
         let previous_generation = current.as_ref().map(|value| value.generation);
         let previous_target = current.as_ref().map(|value| value.target.clone());
         let update = CoreRefUpdateRecord {
@@ -1126,7 +1112,7 @@ impl CoreStore {
                 .clone()
                 .unwrap_or_else(|| format!("core-ref-update:{ref_name}:{next_generation}")),
             transaction_id: transaction_id.clone(),
-            committed_at: value.updated_at.clone(),
+            committed_at,
         };
         self.append_ref_update_unlocked(&update).await?;
         Ok(CasRefReceipt {
@@ -1173,9 +1159,6 @@ impl CoreStore {
         }
         if current.is_some() {
             let previous = current.as_ref().expect("current checked above");
-            self.delete_ref_from_quorum(ref_name).await?;
-            self.delete_ref_directory_entry_from_quorum(ref_name)
-                .await?;
             let update = CoreRefUpdateRecord {
                 schema: CORE_REF_UPDATE_SCHEMA.to_string(),
                 ref_name: ref_name.to_string(),
@@ -1203,51 +1186,24 @@ impl CoreStore {
 
     pub async fn read_ref(&self, ref_name: &str) -> Result<Option<CoreRefValue>> {
         validate_logical_id(ref_name, "ref name")?;
-        self.read_ref_from_quorum(ref_name).await
+        self.recover_ref_from_updates(ref_name).await
     }
 
     pub async fn list_ref_names(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut votes: BTreeMap<String, usize> = BTreeMap::new();
-        for node_id in local_control_node_ids() {
-            let dir = self.ref_names_replica_dir(&node_id);
-            let mut entries = match fs::read_dir(&dir).await {
-                Ok(entries) => entries,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => {
-                    return Err(err)
-                        .with_context(|| format!("read CoreStore ref directory {node_id}"));
-                }
-            };
-            while let Some(entry) = entries.next_entry().await? {
-                if is_core_store_temp_entry(&entry.file_name()) {
-                    continue;
-                }
-                let file_type = match entry.file_type().await {
-                    Ok(file_type) => file_type,
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(err) => return Err(err).with_context(|| "read CoreStore ref entry type"),
-                };
-                if !file_type.is_file() {
-                    continue;
-                }
-                let bytes = match fs::read(entry.path()).await {
-                    Ok(bytes) => bytes,
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(err) => return Err(err).with_context(|| "read CoreStore ref name entry"),
-                };
-                let stored: StoredRefDirectoryEntry = serde_json::from_slice(&bytes)?;
-                if stored.ref_name.starts_with(prefix) {
-                    *votes.entry(stored.ref_name).or_default() += 1;
-                }
-            }
-        }
-        let mut names = votes
+        let stream_prefix = ref_update_stream_id(prefix);
+        let mut names = self
+            .list_stream_ids(&stream_prefix)
+            .await?
             .into_iter()
-            .filter_map(|(ref_name, count)| {
-                (count >= LOCAL_CONTROL_READ_QUORUM).then_some(ref_name)
+            .filter_map(|stream_id| {
+                stream_id
+                    .strip_prefix("core_ref_update:")
+                    .map(str::to_string)
             })
+            .filter(|ref_name| ref_name.starts_with(prefix))
             .collect::<Vec<_>>();
         names.sort();
+        names.dedup();
         Ok(names)
     }
 
@@ -1527,13 +1483,6 @@ impl CoreStore {
         }
     }
 
-    async fn core_ref_is_visible(&self, value: &CoreRefValue) -> Result<bool> {
-        match value.transaction_id.as_deref() {
-            Some(transaction_id) => self.transaction_is_committed(transaction_id).await,
-            None => Ok(true),
-        }
-    }
-
     async fn filter_committed_stream_records(
         &self,
         records: Vec<StreamRecord>,
@@ -1703,15 +1652,7 @@ impl CoreStore {
             .or(latest_stream_generation)
             .unwrap_or(0)
             .saturating_add(1);
-        let value = CoreRefValue {
-            schema: CORE_REF_SCHEMA.to_string(),
-            ref_name: ref_name.to_string(),
-            generation: next_generation,
-            target: new_target.to_string(),
-            transaction_id: transaction_id.clone(),
-            updated_at: now_rfc3339(),
-        };
-        self.write_ref(&value).await?;
+        let committed_at = now_rfc3339();
         let update = CoreRefUpdateRecord {
             schema: CORE_REF_UPDATE_SCHEMA.to_string(),
             ref_name: ref_name.to_string(),
@@ -1732,7 +1673,7 @@ impl CoreStore {
                 .clone()
                 .unwrap_or_else(|| format!("core-ref-update:{ref_name}:{next_generation}")),
             transaction_id,
-            committed_at: value.updated_at,
+            committed_at,
         };
         self.append_ref_update_unlocked(&update).await?;
         Ok(CasRefReceipt {
@@ -1913,130 +1854,6 @@ impl CoreStore {
         .await
     }
 
-    async fn read_ref_from_quorum(&self, ref_name: &str) -> Result<Option<CoreRefValue>> {
-        for attempt in 0..CORE_CONTROL_READ_RETRY_ATTEMPTS {
-            let mut votes: BTreeMap<String, (CoreRefValue, usize)> = BTreeMap::new();
-            let mut found = 0usize;
-            for node_id in local_control_node_ids() {
-                let path = self.ref_replica_path(&node_id, ref_name);
-                let bytes = match fs::read(&path).await {
-                    Ok(bytes) => bytes,
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(err) => {
-                        return Err(err).with_context(|| {
-                            format!("read CoreStore ref replica {node_id}/{ref_name}")
-                        });
-                    }
-                };
-                let value: CoreRefValue = serde_json::from_slice(&bytes)?;
-                if value.schema != CORE_REF_SCHEMA {
-                    bail!("CoreStore ref replica {node_id}/{ref_name} has invalid schema");
-                }
-                if value.ref_name != ref_name {
-                    bail!("CoreStore ref replica {node_id}/{ref_name} scope mismatch");
-                }
-                found += 1;
-                let hash = sha256_hex(&bytes);
-                let entry = votes.entry(hash).or_insert((value, 0));
-                entry.1 += 1;
-            }
-
-            if found == 0 {
-                return Ok(None);
-            }
-            let Some((_, (value, count))) = votes.iter().max_by_key(|(_, (_, count))| *count)
-            else {
-                return Ok(None);
-            };
-            if *count >= LOCAL_CONTROL_READ_QUORUM {
-                if self.core_ref_is_visible(value).await? {
-                    return Ok(Some(value.clone()));
-                }
-                return Ok(None);
-            }
-            if attempt + 1 == CORE_CONTROL_READ_RETRY_ATTEMPTS {
-                bail!(
-                    "CoreStore ref {ref_name} did not reach read quorum: {} matching replicas, {} required",
-                    count,
-                    LOCAL_CONTROL_READ_QUORUM
-                );
-            }
-            tokio::time::sleep(CORE_REF_LOCK_RETRY_DELAY).await;
-        }
-        unreachable!("CoreStore control read retry loop must return")
-    }
-
-    async fn write_ref_to_quorum(&self, value: &CoreRefValue) -> Result<()> {
-        let bytes = serde_json::to_vec(value)?;
-        let mut acks = 0usize;
-        let mut errors = Vec::new();
-        for node_id in local_control_node_ids() {
-            let path = self.ref_replica_path(&node_id, &value.ref_name);
-            match write_file_atomic(&path, &bytes).await {
-                Ok(()) => acks += 1,
-                Err(err) => errors.push(format!("{node_id}: {err:#}")),
-            }
-        }
-        if acks < LOCAL_CONTROL_WRITE_QUORUM {
-            bail!(
-                "CoreStore ref {} write quorum failed: {} acks, {} required; errors={:?}",
-                value.ref_name,
-                acks,
-                LOCAL_CONTROL_WRITE_QUORUM,
-                errors
-            );
-        }
-        Ok(())
-    }
-
-    async fn delete_ref_from_quorum(&self, ref_name: &str) -> Result<()> {
-        let mut acks = 0usize;
-        let mut errors = Vec::new();
-        for node_id in local_control_node_ids() {
-            let path = self.ref_replica_path(&node_id, ref_name);
-            match fs::remove_file(&path).await {
-                Ok(()) => acks += 1,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => acks += 1,
-                Err(err) => errors.push(format!("{node_id}: {err:#}")),
-            }
-        }
-        if acks < LOCAL_CONTROL_WRITE_QUORUM {
-            bail!(
-                "CoreStore ref {ref_name} delete quorum failed: {} acks, {} required; errors={:?}",
-                acks,
-                LOCAL_CONTROL_WRITE_QUORUM,
-                errors
-            );
-        }
-        Ok(())
-    }
-
-    async fn write_ref(&self, value: &CoreRefValue) -> Result<()> {
-        self.write_ref_to_quorum(value).await?;
-        self.write_ref_directory_entry(&value.ref_name).await
-    }
-
-    async fn write_ref_directory_entry(&self, ref_name: &str) -> Result<()> {
-        let bytes = serde_json::to_vec(&StoredRefDirectoryEntry {
-            ref_name: ref_name.to_string(),
-            updated_at: now_rfc3339(),
-        })?;
-        self.write_bytes_to_quorum(
-            &format!("CoreStore ref directory entry {ref_name}"),
-            &bytes,
-            |store, node_id| store.ref_name_replica_path(node_id, ref_name),
-        )
-        .await
-    }
-
-    async fn delete_ref_directory_entry_from_quorum(&self, ref_name: &str) -> Result<()> {
-        self.delete_file_from_quorum(
-            &format!("CoreStore ref directory entry {ref_name}"),
-            |store, node_id| store.ref_name_replica_path(node_id, ref_name),
-        )
-        .await
-    }
-
     async fn acquire_batch_locks(&self, batch: &CoreMutationBatch) -> Result<Vec<CoreStoreLock>> {
         let mut locks = BTreeSet::new();
         for precondition in &batch.preconditions {
@@ -2148,25 +1965,6 @@ impl CoreStore {
             .join(format!("{}.json", logical_file_name(stream_id)))
     }
 
-    fn ref_replica_path(&self, node_id: &str, ref_name: &str) -> PathBuf {
-        self.storage
-            .core_store_replica_path(node_id)
-            .join("refs")
-            .join(format!("{}.json", logical_file_name(ref_name)))
-    }
-
-    fn ref_names_replica_dir(&self, node_id: &str) -> PathBuf {
-        self.storage
-            .core_store_replica_path(node_id)
-            .join("refs")
-            .join("_names")
-    }
-
-    fn ref_name_replica_path(&self, node_id: &str, ref_name: &str) -> PathBuf {
-        self.ref_names_replica_dir(node_id)
-            .join(format!("{}.json", logical_file_name(ref_name)))
-    }
-
     async fn read_bytes_from_quorum<F>(
         &self,
         label: &str,
@@ -2236,31 +2034,6 @@ impl CoreStore {
         if acks < LOCAL_CONTROL_WRITE_QUORUM {
             bail!(
                 "{label} write quorum failed: {} acks, {} required; errors={:?}",
-                acks,
-                LOCAL_CONTROL_WRITE_QUORUM,
-                errors
-            );
-        }
-        Ok(())
-    }
-
-    async fn delete_file_from_quorum<F>(&self, label: &str, mut replica_path: F) -> Result<()>
-    where
-        F: FnMut(&Self, &str) -> PathBuf,
-    {
-        let mut acks = 0usize;
-        let mut errors = Vec::new();
-        for node_id in local_control_node_ids() {
-            let path = replica_path(self, &node_id);
-            match fs::remove_file(&path).await {
-                Ok(()) => acks += 1,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => acks += 1,
-                Err(err) => errors.push(format!("{node_id}: {err:#}")),
-            }
-        }
-        if acks < LOCAL_CONTROL_WRITE_QUORUM {
-            bail!(
-                "{label} delete quorum failed: {} acks, {} required; errors={:?}",
                 acks,
                 LOCAL_CONTROL_WRITE_QUORUM,
                 errors
@@ -3371,14 +3144,6 @@ mod tests {
         assert_eq!(updates[1].previous_generation, Some(1));
         assert_eq!(updates[1].new_generation, Some(2));
         let ref_name = "tenant/t/bucket/b/object/a/current";
-        for node_id in local_control_node_ids()
-            .into_iter()
-            .take(LOCAL_CONTROL_REPLICA_COUNT - LOCAL_CONTROL_READ_QUORUM)
-        {
-            tokio::fs::remove_file(store.ref_replica_path(&node_id, ref_name))
-                .await
-                .unwrap();
-        }
         assert_eq!(
             store
                 .read_ref(ref_name)
@@ -3388,14 +3153,21 @@ mod tests {
                 .target,
             "sha256:second"
         );
+        assert_eq!(
+            store.list_ref_names("tenant/t").await.unwrap(),
+            vec![ref_name.to_string()]
+        );
         for node_id in local_control_node_ids() {
-            match tokio::fs::remove_file(store.ref_replica_path(&node_id, ref_name)).await {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => panic!("remove ref replica: {err}"),
-            }
+            assert!(
+                !tmp.path()
+                    .join("_core")
+                    .join("replicas")
+                    .join(&node_id)
+                    .join("refs")
+                    .exists(),
+                "CoreStore refs must not use final JSON sidecars"
+            );
         }
-        assert!(store.read_ref(ref_name).await.unwrap().is_none());
         let recovered = store
             .recover_ref_from_updates(ref_name)
             .await
@@ -3403,7 +3175,6 @@ mod tests {
             .expect("recover ref from update stream");
         assert_eq!(recovered.generation, 2);
         assert_eq!(recovered.target, "sha256:second");
-        store.write_ref(&recovered).await.unwrap();
 
         let deleted = store
             .delete_ref(
@@ -3423,6 +3194,7 @@ mod tests {
         assert_eq!(updates.len(), 3);
         assert_eq!(updates[2].previous_generation, Some(2));
         assert_eq!(updates[2].new_generation, None);
+        assert!(store.read_ref(ref_name).await.unwrap().is_none());
     }
 
     #[tokio::test]
