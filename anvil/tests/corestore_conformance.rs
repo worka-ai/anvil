@@ -425,6 +425,17 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+fn count_manifest_sidecar_dirs(root: &Path) -> usize {
+    let replicas = root.join("_core").join("replicas");
+    let Ok(entries) = fs::read_dir(replicas) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.path().join("manifests").exists())
+        .count()
+}
+
 #[test]
 fn rfc_0006_protected_writers_use_commit_time_partition_preconditions() {
     let protected_writers = [
@@ -763,7 +774,7 @@ async fn rfc_0006_corestore_transactions_gate_ref_stream_and_watch_visibility() 
 }
 
 #[tokio::test]
-async fn rfc_0006_coreobject_manifests_are_quorum_replicated_control_records() {
+async fn rfc_0007_coreobject_manifests_are_reconstructed_from_shard_placement() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();
     let store = CoreStore::new(storage.clone()).await.unwrap();
@@ -778,43 +789,56 @@ async fn rfc_0006_coreobject_manifests_are_quorum_replicated_control_records() {
         .unwrap();
     assert!(
         object_ref.manifest_ref.starts_with("core-manifest-sha256:"),
-        "manifest_ref must be a CoreStore logical manifest reference, not a local file path"
+        "manifest_ref must be a CoreStore logical manifest identity, not a local file path"
     );
     assert!(
-        !tmp.path().join("_core").join("manifests").exists(),
-        "manifests must not use a single-copy top-level local manifest directory"
+        count_manifest_sidecar_dirs(tmp.path()) == 0,
+        "object manifests must not be stored as final sidecar JSON replicas"
     );
 
-    let manifest_hash = object_ref
-        .manifest_ref
-        .strip_prefix("core-manifest-sha256:")
-        .unwrap();
-    let manifest_file = format!("{manifest_hash}.json");
-    let manifest_path = |index: usize| {
-        storage
-            .core_store_replica_path(&format!("local-control-node-{index}"))
-            .join("manifests")
-            .join("sha256")
-            .join(&manifest_hash[0..2])
-            .join(&manifest_file)
-    };
-    for index in 1..=5 {
-        assert!(
-            manifest_path(index).exists(),
-            "manifest replica {index} should exist"
-        );
-    }
-
-    for index in 1..=2 {
-        fs::remove_file(manifest_path(index)).unwrap();
-    }
     let manifest = store.read_object_manifest(&object_ref).await.unwrap();
     assert_eq!(manifest.object_hash, object_ref.hash);
+    assert_eq!(manifest.placements.len(), 6);
 
-    fs::remove_file(manifest_path(3)).unwrap();
+    for placement in manifest.placements.iter().take(2) {
+        let object_hash = object_ref.hash.strip_prefix("sha256:").unwrap();
+        let shard_hash = placement.shard_hash.strip_prefix("sha256:").unwrap();
+        let shard_path = storage
+            .core_store_replica_path(&placement.node_id)
+            .join("blobs")
+            .join("sha256")
+            .join(&object_hash[0..2])
+            .join(object_hash)
+            .join(format!(
+                "shard-{:05}-{shard_hash}.bin",
+                placement.shard_index
+            ));
+        fs::remove_file(shard_path).unwrap();
+    }
+    let degraded_manifest = store.read_object_manifest(&object_ref).await.unwrap();
+    assert_eq!(
+        degraded_manifest.placements.len(),
+        4,
+        "manifest reconstruction should use remaining erasure shard placement"
+    );
+
+    let placement = &manifest.placements[2];
+    let object_hash = object_ref.hash.strip_prefix("sha256:").unwrap();
+    let shard_hash = placement.shard_hash.strip_prefix("sha256:").unwrap();
+    let shard_path = storage
+        .core_store_replica_path(&placement.node_id)
+        .join("blobs")
+        .join("sha256")
+        .join(&object_hash[0..2])
+        .join(object_hash)
+        .join(format!(
+            "shard-{:05}-{shard_hash}.bin",
+            placement.shard_index
+        ));
+    fs::remove_file(shard_path).unwrap();
     assert!(
         store.read_object_manifest(&object_ref).await.is_err(),
-        "manifest reads must fail closed without read quorum"
+        "manifest reconstruction must fail closed without enough erasure shard placement"
     );
 }
 

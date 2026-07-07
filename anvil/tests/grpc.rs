@@ -55,9 +55,7 @@ fn count_shard_files(root: &Path) -> usize {
     count
 }
 
-fn count_corestore_manifest_replicas(root: &Path, object_hash: &str) -> usize {
-    let object_hash = object_hash.strip_prefix("sha256:").unwrap_or(object_hash);
-    let prefix = object_hash.get(0..2).unwrap_or_default();
+fn count_corestore_object_manifest_sidecars(root: &Path) -> usize {
     let replicas_root = root.join("_core").join("replicas");
     let Ok(entries) = std::fs::read_dir(&replicas_root) else {
         return 0;
@@ -65,15 +63,7 @@ fn count_corestore_manifest_replicas(root: &Path, object_hash: &str) -> usize {
 
     entries
         .flatten()
-        .filter(|entry| {
-            entry
-                .path()
-                .join("manifests")
-                .join("sha256")
-                .join(prefix)
-                .join(format!("{object_hash}.json"))
-                .is_file()
-        })
+        .filter(|entry| entry.path().join("manifests").exists())
         .count()
 }
 
@@ -184,15 +174,16 @@ async fn test_distributed_put_and_get() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     let shards_found = count_corestore_shard_files(&cluster.storage_path, &object_hash);
-    let manifest_replicas = count_corestore_manifest_replicas(&cluster.storage_path, &object_hash);
+    let manifest_sidecars = count_corestore_object_manifest_sidecars(&cluster.storage_path);
     assert!(
         shards_found >= 6,
         "expected CoreStore erasure shards for {object_hash} under {}",
         cluster.storage_path.display()
     );
-    assert!(
-        manifest_replicas >= 3,
-        "expected CoreStore manifest quorum for {object_hash} under {}",
+    assert_eq!(
+        manifest_sidecars,
+        0,
+        "CoreStore object manifests must be reconstructed from shard placement, not final sidecar JSON under {}",
         cluster.storage_path.display()
     );
 }
