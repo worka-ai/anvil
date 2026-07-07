@@ -208,6 +208,20 @@ pub struct CoreLogicalFileVerificationReport {
     pub content_hash: String,
 }
 
+pub fn core_object_ref_from_logical_file_manifest(
+    manifest: &CoreLogicalFileManifest,
+) -> CoreObjectRef {
+    let manifest_hash = manifest
+        .content_hash
+        .strip_prefix("sha256:")
+        .unwrap_or(&manifest.content_hash);
+    CoreObjectRef {
+        hash: manifest.content_hash.clone(),
+        logical_size: manifest.logical_size,
+        manifest_ref: format!("core-manifest-sha256:{manifest_hash}"),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoreObjectRef {
     pub hash: String,

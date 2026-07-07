@@ -1,4 +1,7 @@
-use crate::core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob};
+use crate::core_store::{
+    CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
+    WriteLogicalFileRequest, core_object_ref_from_logical_file_manifest,
+};
 use crate::formats::{
     BinaryEnvelopeHeader, BinaryFileFooter, COMMON_FOOTER_LEN, COMMON_HEADER_LEN, FileFamily,
     Hash32, hash32,
@@ -102,18 +105,24 @@ pub async fn write_personaldb_log_segment(
     bytes.extend_from_slice(&body);
     bytes.extend_from_slice(&footer.encode());
     let store = CoreStore::new(storage.clone()).await?;
-    let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.clone(),
-            bytes,
+    let manifest = store
+        .write_logical_file(WriteLogicalFileRequest {
+            writer_family: "personaldb".to_string(),
+            generation: end_log_index,
+            logical_file_id: ref_name.clone(),
+            source: bytes,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!(
                 "personaldb-log-segment:{}:{}:{}:{}",
                 input.tenant_id, input.database_id, start_log_index, end_log_index
             ),
+            region_id: "local".to_string(),
         })
         .await?;
+    let object_ref = core_object_ref_from_logical_file_manifest(&manifest);
     store
         .compare_and_swap_ref(CompareAndSwapRef {
             ref_name: ref_name.clone(),

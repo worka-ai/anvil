@@ -3987,11 +3987,7 @@ fn object_ref_from_logical_file_manifest(
     manifest: &CoreLogicalFileManifest,
 ) -> Result<CoreObjectRef> {
     validate_logical_file_manifest_shape(manifest)?;
-    Ok(CoreObjectRef {
-        hash: manifest.content_hash.clone(),
-        logical_size: manifest.logical_size,
-        manifest_ref: encode_manifest_ref(strip_sha256_prefix(&manifest.content_hash)?),
-    })
+    Ok(core_object_ref_from_logical_file_manifest(manifest))
 }
 
 fn ensure_range_is_inside_expected_boundary(

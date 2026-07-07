@@ -179,7 +179,7 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
                 "path",
                 "write_typed_field_segment",
             ],
-            corestore_terms: &["CoreStore", ".put_blob", ".compare_and_swap_ref"],
+            corestore_terms: &["CoreStore", ".write_logical_file", ".compare_and_swap_ref"],
         },
         DurableFeatureFamily {
             name: "typed_field_index",
@@ -192,7 +192,7 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
                 "write_typed_field_segment",
                 "EncodedTypedValue",
             ],
-            corestore_terms: &["CoreStore", ".put_blob", ".compare_and_swap_ref"],
+            corestore_terms: &["CoreStore", ".write_logical_file", ".compare_and_swap_ref"],
         },
         DurableFeatureFamily {
             name: "full_text_index",
@@ -205,7 +205,7 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
                 "write_full_text_segment",
                 "FullTextSegment",
             ],
-            corestore_terms: &["CoreStore", ".put_blob", ".compare_and_swap_ref"],
+            corestore_terms: &["CoreStore", ".write_logical_file", ".compare_and_swap_ref"],
         },
         DurableFeatureFamily {
             name: "vector_index",
@@ -218,7 +218,7 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
                 "write_vector_segment",
                 "VectorSegment",
             ],
-            corestore_terms: &["CoreStore", ".put_blob", ".compare_and_swap_ref"],
+            corestore_terms: &["CoreStore", ".write_logical_file", ".compare_and_swap_ref"],
         },
         DurableFeatureFamily {
             name: "package_repository",

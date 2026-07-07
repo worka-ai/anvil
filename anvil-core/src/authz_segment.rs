@@ -1,5 +1,8 @@
 use crate::{
-    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    core_store::{
+        CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
+        WriteLogicalFileRequest, core_object_ref_from_logical_file_manifest,
+    },
     formats::{
         BinaryEnvelopeHeader, BinaryFileFooter, COMMON_FOOTER_LEN, COMMON_HEADER_LEN, FileFamily,
         Hash32,
@@ -99,15 +102,21 @@ async fn write_authz_tuple_segment_inner(
     bytes.extend_from_slice(&footer.encode());
 
     let store = CoreStore::new(storage.clone()).await?;
-    let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.clone(),
-            bytes,
+    let manifest = store
+        .write_logical_file(WriteLogicalFileRequest {
+            writer_family: "authz".to_string(),
+            generation,
+            logical_file_id: ref_name.clone(),
+            source: bytes,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!("authz-tuple-segment:{tenant_id}:{generation}"),
+            region_id: "local".to_string(),
         })
         .await?;
+    let object_ref = core_object_ref_from_logical_file_manifest(&manifest);
     store
         .compare_and_swap_ref(CompareAndSwapRef {
             ref_name: ref_name.clone(),
