@@ -1,5 +1,8 @@
 use crate::{
-    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    core_store::{
+        CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
+        WriteLogicalFileRequest,
+    },
     formats::hash32,
     storage::Storage,
 };
@@ -132,20 +135,28 @@ pub async fn write_projection_definition(
         projection_definition_ref_name(tenant_id, database_id, &definition.projection_id)?;
     let bytes = serde_json::to_vec_pretty(definition)?;
     let store = CoreStore::new(storage.clone()).await?;
+    let current = store.read_ref(&ref_name).await?;
     let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.clone(),
-            bytes,
+        .write_logical_file_ref(WriteLogicalFileRequest {
+            writer_family: "personaldb".to_string(),
+            generation: current
+                .as_ref()
+                .map(|value| value.generation + 1)
+                .unwrap_or(1),
+            logical_file_id: ref_name.clone(),
+            source: bytes,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!(
                 "personaldb-projection-definition:{tenant_id}:{database_id}:{}",
                 definition.projection_id
             ),
+            region_id: "local".to_string(),
         })
         .await?;
     let new_target = encode_core_object_ref_target(&object_ref)?;
-    let current = store.read_ref(&ref_name).await?;
     store
         .compare_and_swap_ref(CompareAndSwapRef {
             ref_name,

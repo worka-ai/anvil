@@ -263,7 +263,7 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
                 "anvil-core/src/personaldb_snapshot_builder.rs",
             ],
             required_terms: &["write_personaldb_snapshot", "personaldb_snapshot_object"],
-            corestore_terms: &["CoreStore", ".put_blob", ".compare_and_swap_ref"],
+            corestore_terms: &["CoreStore", ".write_logical_file", ".compare_and_swap_ref"],
         },
         DurableFeatureFamily {
             name: "embedded_database_changeset",
@@ -275,7 +275,7 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
                 "write_personaldb_changeset_payload",
                 "personaldb_changeset_payload",
             ],
-            corestore_terms: &["CoreStore", ".put_blob", ".compare_and_swap_ref"],
+            corestore_terms: &["CoreStore", ".write_logical_file", ".compare_and_swap_ref"],
         },
         DurableFeatureFamily {
             name: "audit_record",

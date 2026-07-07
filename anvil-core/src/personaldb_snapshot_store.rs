@@ -1,5 +1,8 @@
 use crate::{
-    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    core_store::{
+        CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
+        WriteLogicalFileRequest,
+    },
     formats::{Hash32, hash32},
     personaldb_control::PersonalDbSnapshotManifest,
     storage::Storage,
@@ -233,12 +236,17 @@ async fn put_immutable_ref_bytes(
     mutation_id: &str,
 ) -> Result<()> {
     let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: format!("{logical_name}:{ref_name}"),
-            bytes: bytes.to_vec(),
+        .write_logical_file_ref(WriteLogicalFileRequest {
+            writer_family: "personaldb".to_string(),
+            generation: 1,
+            logical_file_id: format!("{logical_name}:{ref_name}"),
+            source: bytes.to_vec(),
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: mutation_id.to_string(),
+            region_id: "local".to_string(),
         })
         .await?;
     let target = encode_core_object_ref_target(&object_ref)?;
@@ -293,6 +301,7 @@ fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core_store::PutBlob;
     use tempfile::tempdir;
 
     const KEY: &[u8] = b"personaldb snapshot signing key";

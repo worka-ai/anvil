@@ -1,5 +1,8 @@
 use crate::{
-    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    core_store::{
+        CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
+        WriteLogicalFileRequest,
+    },
     formats::{Hash32, hash32},
     personaldb_control::PersonalDbCommitCertificate,
     storage::Storage,
@@ -44,14 +47,19 @@ pub async fn write_personaldb_changeset_payload(
 
     let store = CoreStore::new(storage.clone()).await?;
     let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: by_hash_ref.clone(),
-            bytes: changeset_bytes.to_vec(),
+        .write_logical_file_ref(WriteLogicalFileRequest {
+            writer_family: "personaldb".to_string(),
+            generation: log_index,
+            logical_file_id: by_hash_ref.clone(),
+            source: changeset_bytes.to_vec(),
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!(
                 "personaldb-changeset-payload:{tenant_id}:{database_id}:{log_index}:{payload_hash_hex}"
             ),
+            region_id: "local".to_string(),
         })
         .await?;
     put_immutable_ref_target(&store, &by_hash_ref, changeset_bytes, &object_ref).await?;
@@ -136,15 +144,20 @@ pub async fn write_personaldb_commit_certificate(
     let bytes = serde_json::to_vec_pretty(certificate)?;
     let store = CoreStore::new(storage.clone()).await?;
     let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.clone(),
-            bytes: bytes.clone(),
+        .write_logical_file_ref(WriteLogicalFileRequest {
+            writer_family: "personaldb".to_string(),
+            generation: certificate.log_index,
+            logical_file_id: ref_name.clone(),
+            source: bytes.clone(),
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!(
                 "personaldb-commit-certificate:{tenant_id}:{database_id}:{}:{}",
                 certificate.log_index, certificate.entry_hash
             ),
+            region_id: "local".to_string(),
         })
         .await?;
     put_immutable_ref_target(&store, &ref_name, &bytes, &object_ref).await?;
@@ -320,6 +333,7 @@ fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core_store::PutBlob;
     use tempfile::tempdir;
 
     const KEY: &[u8] = b"personaldb commit signing key";

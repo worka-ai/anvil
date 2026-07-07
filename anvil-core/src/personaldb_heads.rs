@@ -1,9 +1,9 @@
 #[cfg(test)]
-use crate::core_store::CompareAndSwapRef;
+use crate::core_store::{CompareAndSwapRef, PutBlob};
 use crate::{
     core_store::{
         CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreObjectRef,
-        CoreStore, GetBlob, PutBlob,
+        CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob, WriteLogicalFileRequest,
     },
     formats::hash32,
     personaldb_control::PersonalDbGroupManifest,
@@ -387,12 +387,20 @@ async fn write_json_ref_with_preconditions<T: Serialize>(
     let store = CoreStore::new(storage.clone()).await?;
     let current = store.read_ref(ref_name).await?;
     let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.to_string(),
-            bytes: serde_json::to_vec_pretty(value)?,
+        .write_logical_file_ref(WriteLogicalFileRequest {
+            writer_family: "personaldb".to_string(),
+            generation: current
+                .as_ref()
+                .map(|value| value.generation + 1)
+                .unwrap_or(1),
+            logical_file_id: ref_name.to_string(),
+            source: serde_json::to_vec_pretty(value)?,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!("personaldb-head:{}", uuid::Uuid::new_v4().simple()),
+            region_id: "local".to_string(),
         })
         .await?;
     preconditions.push(CoreMutationPrecondition::Ref {

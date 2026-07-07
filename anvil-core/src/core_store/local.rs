@@ -671,6 +671,14 @@ impl CoreStore {
         logical_file_manifest_from_object_manifest(&request, &object_manifest)
     }
 
+    pub async fn write_logical_file_ref(
+        &self,
+        request: WriteLogicalFileRequest,
+    ) -> Result<CoreObjectRef> {
+        let manifest = self.write_logical_file(request).await?;
+        Ok(core_object_ref_from_logical_file_manifest(&manifest))
+    }
+
     pub async fn read_logical_range(&self, request: ReadLogicalRangeRequest) -> Result<Vec<u8>> {
         let _perf_guard = crate::perf::guard(
             "anvil_core_store_op",

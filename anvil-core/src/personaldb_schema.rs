@@ -1,6 +1,9 @@
 use crate::{
     anvil_personaldb_sqlite_changeset::DecodedSqliteChangesetChange,
-    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    core_store::{
+        CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
+        WriteLogicalFileRequest,
+    },
     formats::hash32,
     storage::Storage,
 };
@@ -24,12 +27,17 @@ pub async fn write_personaldb_schema_sql(
     let ref_name = personaldb_schema_ref_name(tenant_id, database_id)?;
     let store = CoreStore::new(storage.clone()).await?;
     let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.clone(),
-            bytes: schema_sql.as_bytes().to_vec(),
+        .write_logical_file_ref(WriteLogicalFileRequest {
+            writer_family: "personaldb".to_string(),
+            generation: 1,
+            logical_file_id: ref_name.clone(),
+            source: schema_sql.as_bytes().to_vec(),
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!("personaldb-schema:{tenant_id}:{database_id}:{schema_hash}"),
+            region_id: "local".to_string(),
         })
         .await?;
     store
