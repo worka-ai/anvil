@@ -22,3 +22,4 @@ clients/python/*.egg-info/
 clients/python/src/anvil_storage_client.egg-info/
 clients/python/src/anvil_storage_client/anvil_pb2.py
 clients/python/src/anvil_storage_client/anvil_pb2_grpc.py
+tmp
