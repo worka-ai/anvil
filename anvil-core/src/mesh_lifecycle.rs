@@ -1,4 +1,7 @@
-use crate::core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob};
+use crate::core_store::{
+    CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
+    WriteLogicalFileRequest, core_object_ref_from_logical_file_manifest,
+};
 use crate::mesh_control_stream::{
     ControlRecordDigest, ControlStreamFrame, ControlStreamSequence, read_control_checkpoint,
     read_control_stream_log,
@@ -282,15 +285,24 @@ pub async fn read_state(storage: &Storage) -> LifecycleResult<MeshLifecycleState
 async fn write_state(storage: &Storage, state: &MeshLifecycleState) -> LifecycleResult<()> {
     let store = CoreStore::new(storage.clone()).await?;
     let current = store.read_ref(MESH_LIFECYCLE_STATE_REF).await?;
-    let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: MESH_LIFECYCLE_STATE_REF.to_string(),
-            bytes: serde_json::to_vec_pretty(state)?,
+    let manifest = store
+        .write_logical_file(WriteLogicalFileRequest {
+            writer_family: "mesh_control".to_string(),
+            generation: current
+                .as_ref()
+                .map(|value| value.generation + 1)
+                .unwrap_or(1),
+            logical_file_id: MESH_LIFECYCLE_STATE_REF.to_string(),
+            source: serde_json::to_vec_pretty(state)?,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!("mesh-lifecycle-state:{}", uuid::Uuid::new_v4()),
+            region_id: "local".to_string(),
         })
         .await?;
+    let object_ref = core_object_ref_from_logical_file_manifest(&manifest);
     store
         .compare_and_swap_ref(CompareAndSwapRef {
             ref_name: MESH_LIFECYCLE_STATE_REF.to_string(),

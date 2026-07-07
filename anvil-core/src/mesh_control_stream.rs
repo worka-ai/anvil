@@ -1,6 +1,7 @@
 use crate::core_store::{
     CompareAndSwapRef, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CoreObjectRef, CoreStore, CoreTransactionUpdate, GetBlob, PutBlob, ReadStream,
+    CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, CoreTransactionUpdate, GetBlob,
+    ReadStream, WriteLogicalFileRequest, core_object_ref_from_logical_file_manifest,
 };
 use crate::storage::Storage;
 use anyhow::{Context, Result as AnyhowResult, anyhow};
@@ -686,12 +687,19 @@ pub async fn write_control_checkpoint(
     let store = CoreStore::new(storage.clone()).await?;
     let current = store.read_ref(&ref_name).await?;
     let bytes = serde_json::to_vec_pretty(checkpoint)?;
-    let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.clone(),
-            bytes,
+    let manifest = store
+        .write_logical_file(WriteLogicalFileRequest {
+            writer_family: "mesh_control".to_string(),
+            generation: current
+                .as_ref()
+                .map(|value| value.generation + 1)
+                .unwrap_or(1),
+            logical_file_id: ref_name.clone(),
+            source: bytes,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            region_id: "local".to_string(),
             mutation_id: format!(
                 "mesh-control-checkpoint:{}:{}:{}:{}",
                 checkpoint.mesh_id,
@@ -699,8 +707,10 @@ pub async fn write_control_checkpoint(
                 checkpoint.stream_family,
                 checkpoint.partition
             ),
+            region_id: "local".to_string(),
         })
         .await?;
+    let object_ref = core_object_ref_from_logical_file_manifest(&manifest);
     store
         .compare_and_swap_ref(CompareAndSwapRef {
             ref_name,
@@ -1235,6 +1245,7 @@ fn decode_core_object_ref_target(target: &str) -> AnyhowResult<CoreObjectRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core_store::PutBlob;
     use tempfile::tempdir;
 
     fn sample_header(sequence: u64) -> Vec<u8> {

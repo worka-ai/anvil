@@ -242,19 +242,19 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
             name: "mesh_route",
             source_files: &["anvil-core/src/mesh_directory.rs"],
             required_terms: &["BucketLocatorDescriptor", "append_control_mutation"],
-            corestore_terms: &["CoreStore", ".put_blob", ".compare_and_swap_ref"],
+            corestore_terms: &["CoreStore", ".write_logical_file", ".compare_and_swap_ref"],
         },
         DurableFeatureFamily {
             name: "node_lifecycle",
             source_files: &["anvil-core/src/mesh_lifecycle.rs"],
             required_terms: &["NodeDescriptor", "NodeDrainDescriptor"],
-            corestore_terms: &["CoreStore", ".put_blob", ".compare_and_swap_ref"],
+            corestore_terms: &["CoreStore", ".write_logical_file", ".compare_and_swap_ref"],
         },
         DurableFeatureFamily {
             name: "region_lifecycle",
             source_files: &["anvil-core/src/mesh_lifecycle.rs"],
             required_terms: &["RegionDescriptor", "region_drain"],
-            corestore_terms: &["CoreStore", ".put_blob", ".compare_and_swap_ref"],
+            corestore_terms: &["CoreStore", ".write_logical_file", ".compare_and_swap_ref"],
         },
         DurableFeatureFamily {
             name: "embedded_database_snapshot",
