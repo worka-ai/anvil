@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const CORE_OBJECT_MANIFEST_SCHEMA: &str = "anvil.core.object_manifest.v1";
+pub const CORE_LOGICAL_FILE_MANIFEST_SCHEMA: &str = "anvil.core.logical_file_manifest.v1";
 pub const CORE_REF_SCHEMA: &str = "anvil.core.ref_value.v1";
 pub const CORE_REF_UPDATE_SCHEMA: &str = "anvil.core.ref_update.v1";
 pub const CORE_TRANSACTION_SCHEMA: &str = "anvil.core.transaction.v1";
@@ -35,6 +36,176 @@ pub struct CoreByteRange {
 pub struct GetBlobRange {
     pub object_ref: CoreObjectRef,
     pub range: CoreByteRange,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WriteLogicalFileRequest {
+    pub writer_family: String,
+    pub generation: u64,
+    pub logical_file_id: String,
+    pub source: Vec<u8>,
+    pub range_hints: Vec<CoreLogicalRangeHint>,
+    pub pipeline_policy: CorePipelinePolicy,
+    pub trace_context: CoreTraceContext,
+    pub boundary_values: Vec<CoreBoundaryValue>,
+    pub mutation_id: String,
+    pub region_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadLogicalRangeRequest {
+    pub manifest: CoreLogicalFileManifest,
+    pub ranges: Vec<CoreByteRange>,
+    pub authz_scope: AuthzScopeRef,
+    pub expected_boundary: Option<Vec<CoreBoundaryValue>>,
+    pub prefetch_policy: CorePrefetchPolicy,
+    pub trace_context: CoreTraceContext,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreLogicalRangeHint {
+    pub range_id: String,
+    pub byte_start: u64,
+    pub byte_end: u64,
+    pub writer_record_kind: String,
+    pub boundary_values: Vec<CoreBoundaryValue>,
+    pub writer_statistics: Vec<u8>,
+    pub prefetch_next_range_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CorePipelinePolicy {
+    pub compression: String,
+    pub encryption: String,
+    pub erasure_profile_id: String,
+    pub placement_scope: String,
+}
+
+impl Default for CorePipelinePolicy {
+    fn default() -> Self {
+        Self {
+            compression: "none".to_string(),
+            encryption: "none".to_string(),
+            erasure_profile_id: "ec-4-2".to_string(),
+            placement_scope: "region".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CoreTraceContext {
+    pub trace_id: Option<String>,
+    pub span_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CorePrefetchPolicy {
+    pub enabled: bool,
+    pub max_ranges: u32,
+}
+
+impl Default for CorePrefetchPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_ranges: 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreLogicalFileManifest {
+    pub schema: String,
+    pub logical_file_id: String,
+    pub writer_family: String,
+    pub writer_generation: u64,
+    pub logical_size: u64,
+    pub content_hash: String,
+    pub boundary_schema_generation: u64,
+    pub ranges: Vec<CoreLogicalRange>,
+    pub blocks: Vec<CoreLogicalBlockRef>,
+    pub compression: CoreCompressionDescriptor,
+    pub encryption: CoreEncryptionDescriptor,
+    pub erasure_profile_id: String,
+    pub placement_epoch: u64,
+    pub created_by_mutation_id: String,
+    pub codec_id: String,
+    pub data_shards: u32,
+    pub parity_shards: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreLogicalRange {
+    pub range_id: String,
+    pub byte_start: u64,
+    pub byte_end: u64,
+    pub writer_record_kind: String,
+    pub boundary_values: Vec<CoreBoundaryValue>,
+    pub writer_statistics: Vec<u8>,
+    pub block_ids: Vec<String>,
+    pub prefetch_next_range_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreLogicalBlockRef {
+    pub block_id: String,
+    pub logical_offset: u64,
+    pub logical_length: u64,
+    pub compressed_length: u64,
+    pub encrypted_length: u64,
+    pub content_hash: String,
+    pub erasure_set_id: String,
+    pub shards: Vec<CoreLogicalShardRef>,
+    pub codec_id: String,
+    pub data_shards: u32,
+    pub parity_shards: u32,
+    pub plaintext_block_len: u64,
+    pub shard_payload_len: u64,
+    pub padding_len: u64,
+    pub block_encoded_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreLogicalShardRef {
+    pub node_id: String,
+    pub region_id: String,
+    pub cell_id: String,
+    pub shard_index: u32,
+    pub shard_hash: String,
+    pub stored_length: u64,
+    pub generation: u64,
+    pub placement_epoch: u64,
+    pub fsync_sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreCompressionDescriptor {
+    pub algorithm: String,
+    pub level: u32,
+    pub uncompressed_length: u64,
+    pub compressed_length: u64,
+    pub dictionary_id: String,
+    pub descriptor_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreEncryptionDescriptor {
+    pub algorithm: String,
+    pub key_id: String,
+    pub nonce: Vec<u8>,
+    pub aad_hash: String,
+    pub plaintext_hash: String,
+    pub ciphertext_hash: String,
+    pub descriptor_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreLogicalFileVerificationReport {
+    pub verified: bool,
+    pub logical_file_id: String,
+    pub checked_blocks: u64,
+    pub checked_shards: u64,
+    pub content_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

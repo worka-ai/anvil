@@ -633,6 +633,103 @@ impl CoreStore {
         Ok(full[start..end].to_vec())
     }
 
+    pub async fn write_logical_file(
+        &self,
+        mut request: WriteLogicalFileRequest,
+    ) -> Result<CoreLogicalFileManifest> {
+        let _perf_guard = crate::perf::guard(
+            "anvil_core_store_op",
+            &[("operation", "write_logical_file")],
+        );
+        validate_logical_id(&request.writer_family, "writer family")?;
+        validate_logical_id(&request.logical_file_id, "logical file id")?;
+        validate_logical_id(&request.mutation_id, "logical file mutation id")?;
+        if request.pipeline_policy.erasure_profile_id != LOCAL_ERASURE_PROFILE_ID {
+            bail!(
+                "CoreStore logical file erasure profile {} is unsupported by this backend",
+                request.pipeline_policy.erasure_profile_id
+            );
+        }
+        if request.pipeline_policy.compression != "none" {
+            bail!("CoreStore logical file compression policy is not implemented for local backend");
+        }
+        if request.pipeline_policy.encryption != "none" {
+            bail!("CoreStore logical file encryption policy is not implemented for local backend");
+        }
+
+        let source = std::mem::take(&mut request.source);
+        let object_ref = self
+            .put_blob(PutBlob {
+                logical_name: request.logical_file_id.clone(),
+                bytes: source,
+                boundary_values: request.boundary_values.clone(),
+                region_id: request.region_id.clone(),
+                mutation_id: request.mutation_id.clone(),
+            })
+            .await?;
+        let object_manifest = self.read_object_manifest(&object_ref).await?;
+        logical_file_manifest_from_object_manifest(&request, &object_manifest)
+    }
+
+    pub async fn read_logical_range(&self, request: ReadLogicalRangeRequest) -> Result<Vec<u8>> {
+        let _perf_guard = crate::perf::guard(
+            "anvil_core_store_op",
+            &[("operation", "read_logical_range")],
+        );
+        self.verify_logical_file_manifest(&request.manifest).await?;
+        let object_ref = object_ref_from_logical_file_manifest(&request.manifest)?;
+        let mut out = Vec::new();
+        for range in request.ranges {
+            if let Some(expected_boundary) = request.expected_boundary.as_ref() {
+                ensure_range_is_inside_expected_boundary(
+                    &request.manifest,
+                    &range,
+                    expected_boundary,
+                )?;
+            }
+            out.extend(
+                self.get_blob_range(GetBlobRange {
+                    object_ref: object_ref.clone(),
+                    range,
+                })
+                .await?,
+            );
+        }
+        Ok(out)
+    }
+
+    pub async fn verify_logical_file_manifest(
+        &self,
+        manifest: &CoreLogicalFileManifest,
+    ) -> Result<CoreLogicalFileVerificationReport> {
+        let _perf_guard = crate::perf::guard(
+            "anvil_core_store_op",
+            &[("operation", "verify_logical_file_manifest")],
+        );
+        validate_logical_file_manifest_shape(manifest)?;
+        let object_ref = object_ref_from_logical_file_manifest(manifest)?;
+        let bytes = self.get_blob(GetBlob { object_ref }).await?;
+        let actual_hash = format!("sha256:{}", sha256_hex(&bytes));
+        if actual_hash != manifest.content_hash {
+            bail!(
+                "CoreStore logical file content hash mismatch: expected {}, got {}",
+                manifest.content_hash,
+                actual_hash
+            );
+        }
+        Ok(CoreLogicalFileVerificationReport {
+            verified: true,
+            logical_file_id: manifest.logical_file_id.clone(),
+            checked_blocks: manifest.blocks.len() as u64,
+            checked_shards: manifest
+                .blocks
+                .iter()
+                .map(|block| block.shards.len() as u64)
+                .sum(),
+            content_hash: manifest.content_hash.clone(),
+        })
+    }
+
     pub async fn put_boundary_schema(
         &self,
         input: PutBoundarySchema,
@@ -3703,6 +3800,230 @@ fn required_data_shard_indices_for_range(
     Ok(indices)
 }
 
+fn logical_file_manifest_from_object_manifest(
+    request: &WriteLogicalFileRequest,
+    object_manifest: &CoreObjectManifest,
+) -> Result<CoreLogicalFileManifest> {
+    validate_manifest_for_object_ref(
+        object_manifest,
+        &CoreObjectRef {
+            hash: object_manifest.object_hash.clone(),
+            logical_size: object_manifest.logical_size,
+            manifest_ref: encode_manifest_ref(strip_sha256_prefix(&object_manifest.object_hash)?),
+        },
+        strip_sha256_prefix(&object_manifest.object_hash)?,
+    )?;
+
+    let shard_payload_len = object_manifest
+        .placements
+        .iter()
+        .map(|placement| placement.stored_size)
+        .max()
+        .unwrap_or(0);
+    let data_shards = u32::from(object_manifest.encoding.data_shards);
+    let parity_shards = u32::from(object_manifest.encoding.parity_shards);
+    let block_id = object_manifest.object_hash.clone();
+    let block_ids = vec![block_id.clone()];
+    let boundary_schema_generation = request
+        .boundary_values
+        .iter()
+        .map(|value| value.schema_generation)
+        .max()
+        .unwrap_or(0);
+    let ranges = if request.range_hints.is_empty() {
+        vec![CoreLogicalRange {
+            range_id: "full".to_string(),
+            byte_start: 0,
+            byte_end: object_manifest.logical_size,
+            writer_record_kind: request.writer_family.clone(),
+            boundary_values: request.boundary_values.clone(),
+            writer_statistics: Vec::new(),
+            block_ids: block_ids.clone(),
+            prefetch_next_range_ids: Vec::new(),
+        }]
+    } else {
+        request
+            .range_hints
+            .iter()
+            .map(|hint| {
+                if hint.byte_start > hint.byte_end {
+                    bail!("CoreStore logical range hint start must be <= end");
+                }
+                if hint.byte_end > object_manifest.logical_size {
+                    bail!("CoreStore logical range hint exceeds logical file size");
+                }
+                Ok(CoreLogicalRange {
+                    range_id: hint.range_id.clone(),
+                    byte_start: hint.byte_start,
+                    byte_end: hint.byte_end,
+                    writer_record_kind: hint.writer_record_kind.clone(),
+                    boundary_values: hint.boundary_values.clone(),
+                    writer_statistics: hint.writer_statistics.clone(),
+                    block_ids: block_ids.clone(),
+                    prefetch_next_range_ids: hint.prefetch_next_range_ids.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    Ok(CoreLogicalFileManifest {
+        schema: CORE_LOGICAL_FILE_MANIFEST_SCHEMA.to_string(),
+        logical_file_id: request.logical_file_id.clone(),
+        writer_family: request.writer_family.clone(),
+        writer_generation: request.generation,
+        logical_size: object_manifest.logical_size,
+        content_hash: object_manifest.object_hash.clone(),
+        boundary_schema_generation,
+        ranges,
+        blocks: vec![CoreLogicalBlockRef {
+            block_id,
+            logical_offset: 0,
+            logical_length: object_manifest.logical_size,
+            compressed_length: object_manifest.logical_size,
+            encrypted_length: object_manifest.logical_size,
+            content_hash: object_manifest.object_hash.clone(),
+            erasure_set_id: "local-erasure-set".to_string(),
+            shards: object_manifest
+                .placements
+                .iter()
+                .map(|placement| CoreLogicalShardRef {
+                    node_id: placement.node_id.clone(),
+                    region_id: placement.region_id.clone(),
+                    cell_id: placement.cell_id.clone(),
+                    shard_index: u32::from(placement.shard_index),
+                    shard_hash: placement.shard_hash.clone(),
+                    stored_length: placement.stored_size,
+                    generation: placement.generation,
+                    placement_epoch: placement.placement_epoch,
+                    fsync_sequence: placement.fsync_sequence,
+                })
+                .collect(),
+            codec_id: "reed-solomon-galois-8".to_string(),
+            data_shards,
+            parity_shards,
+            plaintext_block_len: object_manifest.logical_size,
+            shard_payload_len,
+            padding_len: shard_payload_len
+                .saturating_mul(u64::from(data_shards))
+                .saturating_sub(object_manifest.logical_size),
+            block_encoded_hash: object_manifest.object_hash.clone(),
+        }],
+        compression: CoreCompressionDescriptor {
+            algorithm: "none".to_string(),
+            level: 0,
+            uncompressed_length: object_manifest.logical_size,
+            compressed_length: object_manifest.logical_size,
+            dictionary_id: String::new(),
+            descriptor_hash: descriptor_hash(&[
+                "compression",
+                "none",
+                &object_manifest.logical_size.to_string(),
+            ]),
+        },
+        encryption: CoreEncryptionDescriptor {
+            algorithm: object_manifest.encoding.encryption.clone(),
+            key_id: String::new(),
+            nonce: Vec::new(),
+            aad_hash: String::new(),
+            plaintext_hash: object_manifest.object_hash.clone(),
+            ciphertext_hash: object_manifest.object_hash.clone(),
+            descriptor_hash: descriptor_hash(&[
+                "encryption",
+                &object_manifest.encoding.encryption,
+                &object_manifest.object_hash,
+            ]),
+        },
+        erasure_profile_id: object_manifest.encoding.profile_id.clone(),
+        placement_epoch: LOCAL_PLACEMENT_EPOCH,
+        created_by_mutation_id: request.mutation_id.clone(),
+        codec_id: "reed-solomon-galois-8".to_string(),
+        data_shards,
+        parity_shards,
+    })
+}
+
+fn validate_logical_file_manifest_shape(manifest: &CoreLogicalFileManifest) -> Result<()> {
+    if manifest.schema != CORE_LOGICAL_FILE_MANIFEST_SCHEMA {
+        bail!("CoreStore logical file manifest has invalid schema");
+    }
+    validate_logical_id(&manifest.logical_file_id, "logical file id")?;
+    validate_logical_id(&manifest.writer_family, "writer family")?;
+    if manifest.erasure_profile_id != LOCAL_ERASURE_PROFILE_ID {
+        bail!(
+            "CoreStore logical file manifest has unsupported erasure profile {}",
+            manifest.erasure_profile_id
+        );
+    }
+    if manifest.data_shards != LOCAL_DATA_SHARDS as u32
+        || manifest.parity_shards != LOCAL_PARITY_SHARDS as u32
+    {
+        bail!("CoreStore logical file manifest shard counts do not match the local EC profile");
+    }
+    if manifest.blocks.is_empty() {
+        bail!("CoreStore logical file manifest must contain at least one block");
+    }
+    for block in &manifest.blocks {
+        if block.data_shards != manifest.data_shards
+            || block.parity_shards != manifest.parity_shards
+        {
+            bail!("CoreStore logical file block shard counts mismatch manifest");
+        }
+        if block.shards.len() < LOCAL_DATA_SHARDS {
+            bail!("CoreStore logical file block does not contain enough shard receipts");
+        }
+        for shard in &block.shards {
+            if shard.placement_epoch != LOCAL_PLACEMENT_EPOCH {
+                bail!("CoreStore logical file shard has stale placement epoch");
+            }
+            if shard.fsync_sequence == 0 {
+                bail!("CoreStore logical file shard is missing fsync evidence");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn object_ref_from_logical_file_manifest(
+    manifest: &CoreLogicalFileManifest,
+) -> Result<CoreObjectRef> {
+    validate_logical_file_manifest_shape(manifest)?;
+    Ok(CoreObjectRef {
+        hash: manifest.content_hash.clone(),
+        logical_size: manifest.logical_size,
+        manifest_ref: encode_manifest_ref(strip_sha256_prefix(&manifest.content_hash)?),
+    })
+}
+
+fn ensure_range_is_inside_expected_boundary(
+    manifest: &CoreLogicalFileManifest,
+    range: &CoreByteRange,
+    expected_boundary: &[CoreBoundaryValue],
+) -> Result<()> {
+    if expected_boundary.is_empty() {
+        return Ok(());
+    }
+    let matching_range = manifest.ranges.iter().any(|candidate| {
+        candidate.byte_start <= range.start
+            && range.end_exclusive <= candidate.byte_end
+            && expected_boundary
+                .iter()
+                .all(|expected| candidate.boundary_values.contains(expected))
+    });
+    if !matching_range {
+        bail!("CoreStore logical range is outside expected boundary values");
+    }
+    Ok(())
+}
+
+fn descriptor_hash(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MinimalCborValue {
     Text(String),
@@ -5638,6 +5959,82 @@ mod tests {
             store.get_blob(GetBlob { object_ref }).await.is_err(),
             "a full read must fail after unrelated data shards are corrupted; the range read above proves it did not materialise the full object"
         );
+    }
+
+    #[tokio::test]
+    async fn core_store_logical_file_api_writes_verifies_and_reads_ranges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        let payload = b"alpha beta gamma delta epsilon zeta".to_vec();
+        let boundary = CoreBoundaryValue {
+            schema_generation: 7,
+            name: "customer_tenant".to_string(),
+            value_type: "string".to_string(),
+            value: "tenant-a".to_string(),
+            categories: vec!["query_pruning".to_string()],
+            source_kind: "user_metadata".to_string(),
+            required: true,
+        };
+        let manifest = store
+            .write_logical_file(WriteLogicalFileRequest {
+                writer_family: "full_text".to_string(),
+                generation: 3,
+                logical_file_id: "index/full-text/main/segment-3".to_string(),
+                source: payload.clone(),
+                range_hints: vec![CoreLogicalRangeHint {
+                    range_id: "postings-a".to_string(),
+                    byte_start: 6,
+                    byte_end: 16,
+                    writer_record_kind: "postings".to_string(),
+                    boundary_values: vec![boundary.clone()],
+                    writer_statistics: Vec::new(),
+                    prefetch_next_range_ids: vec!["postings-b".to_string()],
+                }],
+                pipeline_policy: CorePipelinePolicy::default(),
+                trace_context: CoreTraceContext::default(),
+                boundary_values: vec![boundary.clone()],
+                mutation_id: "logical-file-api-mut-1".to_string(),
+                region_id: "local".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(manifest.schema, CORE_LOGICAL_FILE_MANIFEST_SCHEMA);
+        assert_eq!(manifest.writer_family, "full_text");
+        assert_eq!(manifest.writer_generation, 3);
+        assert_eq!(manifest.boundary_schema_generation, 7);
+        assert_eq!(manifest.blocks.len(), 1);
+        assert_eq!(
+            manifest.blocks[0].shards.len(),
+            LOCAL_DATA_SHARDS + LOCAL_PARITY_SHARDS
+        );
+
+        let report = store.verify_logical_file_manifest(&manifest).await.unwrap();
+        assert!(report.verified);
+        assert_eq!(report.checked_blocks, 1);
+        assert_eq!(
+            report.checked_shards,
+            (LOCAL_DATA_SHARDS + LOCAL_PARITY_SHARDS) as u64
+        );
+
+        let slice = store
+            .read_logical_range(ReadLogicalRangeRequest {
+                manifest,
+                ranges: vec![CoreByteRange {
+                    start: 6,
+                    end_exclusive: 16,
+                }],
+                authz_scope: AuthzScopeRef {
+                    anvil_storage_tenant_id: "local".to_string(),
+                    authz_realm_id: "system".to_string(),
+                },
+                expected_boundary: Some(vec![boundary]),
+                prefetch_policy: CorePrefetchPolicy::default(),
+                trace_context: CoreTraceContext::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(slice, payload[6..16].to_vec());
     }
 
     #[tokio::test]
