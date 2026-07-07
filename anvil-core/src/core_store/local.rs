@@ -486,6 +486,84 @@ impl CoreStore {
         Ok(data)
     }
 
+    pub async fn put_boundary_schema(
+        &self,
+        input: PutBoundarySchema,
+    ) -> Result<BoundarySchemaReceipt> {
+        let _perf_guard = crate::perf::guard(
+            "anvil_core_store_op",
+            &[("operation", "put_boundary_schema")],
+        );
+        validate_logical_id(&input.mutation_id, "boundary schema mutation id")?;
+        let mut schema = input.schema;
+        if schema.created_at.is_empty() {
+            schema.created_at = now_rfc3339();
+        }
+        let current_ref = self
+            .read_ref(&boundary_schema_ref_name(&schema.bucket))
+            .await?;
+        let current_schema = if let Some(ref_value) = current_ref.as_ref() {
+            let object_ref = decode_core_object_ref_target(&ref_value.target)?;
+            let bytes = self.get_blob(GetBlob { object_ref }).await?;
+            Some(serde_json::from_slice::<CoreBoundarySchema>(&bytes)?)
+        } else {
+            None
+        };
+        validate_boundary_schema(&schema, current_schema.as_ref(), input.expected_generation)?;
+
+        let bytes = serde_json::to_vec(&schema)?;
+        let schema_hash = format!("sha256:{}", sha256_hex(&bytes));
+        let object_ref = self
+            .put_blob(PutBlob {
+                logical_name: format!(
+                    "boundary_schema/bucket:{}/generation:{}",
+                    schema.bucket, schema.generation
+                ),
+                bytes,
+                region_id: "local".to_string(),
+                mutation_id: input.mutation_id.clone(),
+            })
+            .await?;
+        let ref_name = boundary_schema_ref_name(&schema.bucket);
+        let receipt = self
+            .compare_and_swap_ref(CompareAndSwapRef {
+                ref_name,
+                expected_generation: current_ref.as_ref().map(|value| value.generation),
+                expected_target: current_ref.as_ref().map(|value| value.target.clone()),
+                require_absent: current_ref.is_none(),
+                require_present: current_ref.is_some(),
+                fence: None,
+                authz_revision: None,
+                source_watch_cursor: None,
+                new_target: encode_core_object_ref_target(&object_ref)?,
+                transaction_id: None,
+            })
+            .await?;
+        Ok(BoundarySchemaReceipt {
+            bucket: schema.bucket,
+            generation: schema.generation,
+            ref_generation: receipt.generation,
+            schema_hash,
+        })
+    }
+
+    pub async fn read_boundary_schema(&self, bucket: &str) -> Result<Option<CoreBoundarySchema>> {
+        validate_logical_id(bucket, "boundary schema bucket")?;
+        let Some(ref_value) = self.read_ref(&boundary_schema_ref_name(bucket)).await? else {
+            return Ok(None);
+        };
+        let object_ref = decode_core_object_ref_target(&ref_value.target)?;
+        let bytes = self.get_blob(GetBlob { object_ref }).await?;
+        let schema: CoreBoundarySchema = serde_json::from_slice(&bytes)?;
+        if schema.schema != CORE_BOUNDARY_SCHEMA_SCHEMA {
+            bail!("CoreStore boundary schema has invalid schema");
+        }
+        if schema.bucket != bucket {
+            bail!("CoreStore boundary schema bucket mismatch");
+        }
+        Ok(Some(schema))
+    }
+
     pub async fn append_stream(&self, input: AppendStreamRecord) -> Result<StreamAppendReceipt> {
         let _perf_guard =
             crate::perf::guard("anvil_core_store_op", &[("operation", "append_stream")]);
@@ -3307,6 +3385,203 @@ fn local_shard_node_ids() -> Vec<String> {
         .collect()
 }
 
+fn boundary_schema_ref_name(bucket: &str) -> String {
+    format!("boundary_schema/bucket/{bucket}/current")
+}
+
+fn validate_boundary_schema(
+    schema: &CoreBoundarySchema,
+    current: Option<&CoreBoundarySchema>,
+    expected_generation: Option<u64>,
+) -> Result<()> {
+    if schema.schema != CORE_BOUNDARY_SCHEMA_SCHEMA {
+        bail!("CoreStore boundary schema has invalid schema");
+    }
+    validate_logical_id(&schema.bucket, "boundary schema bucket")?;
+    if schema.dimensions.is_empty() {
+        bail!("CoreStore boundary schema must include at least one dimension");
+    }
+    let mut names = BTreeSet::new();
+    for dimension in &schema.dimensions {
+        validate_boundary_dimension(dimension)?;
+        if !names.insert(&dimension.name) {
+            bail!(
+                "CoreStore boundary schema dimension {} is duplicated",
+                dimension.name
+            );
+        }
+    }
+
+    match current {
+        Some(current) => {
+            if current.bucket != schema.bucket {
+                bail!("CoreStore boundary schema bucket mismatch");
+            }
+            if expected_generation != Some(current.generation) {
+                bail!(
+                    "{}: CoreStore boundary schema generation conflict",
+                    AnvilErrorCode::BoundarySchemaGenerationConflict.as_str()
+                );
+            }
+            if schema.generation != current.generation.saturating_add(1) {
+                bail!(
+                    "{}: CoreStore boundary schema generation must increment by one",
+                    AnvilErrorCode::BoundarySchemaGenerationConflict.as_str()
+                );
+            }
+            validate_boundary_schema_evolution(current, schema)?;
+        }
+        None => {
+            if expected_generation.is_some() || schema.generation != 1 {
+                bail!(
+                    "{}: CoreStore boundary schema genesis generation must be 1",
+                    AnvilErrorCode::BoundarySchemaGenerationConflict.as_str()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_boundary_dimension(dimension: &CoreBoundaryDimension) -> Result<()> {
+    validate_logical_id(&dimension.name, "boundary dimension name")?;
+    validate_boundary_value_type(&dimension.value_type)?;
+    validate_boundary_source(&dimension.source, &dimension.value_type)?;
+    if dimension.categories.is_empty() {
+        bail!("CoreStore boundary dimension must include at least one category");
+    }
+    for category in &dimension.categories {
+        validate_boundary_category(category)?;
+    }
+    validate_boundary_hint(
+        &dimension.cardinality,
+        &["low", "medium", "high", "extreme"],
+        "cardinality",
+    )?;
+    validate_boundary_hint(
+        &dimension.placement_affinity,
+        &["none", "prefer_colocate", "prefer_spread"],
+        "placement affinity",
+    )?;
+    validate_boundary_hint(
+        &dimension.compaction_scope,
+        &["none", "prefer_same_value", "require_same_value"],
+        "compaction scope",
+    )?;
+    if dimension.max_values_per_block == 0 {
+        bail!("CoreStore boundary max_values_per_block must be positive");
+    }
+    if dimension.shared_ranges_allowed && dimension.shared_record_kinds.is_empty() {
+        bail!("CoreStore boundary shared ranges must list shared record kinds");
+    }
+    Ok(())
+}
+
+fn validate_boundary_schema_evolution(
+    current: &CoreBoundarySchema,
+    next: &CoreBoundarySchema,
+) -> Result<()> {
+    let current_dimensions = current
+        .dimensions
+        .iter()
+        .map(|dimension| (dimension.name.as_str(), dimension))
+        .collect::<BTreeMap<_, _>>();
+    for dimension in &next.dimensions {
+        let Some(existing) = current_dimensions.get(dimension.name.as_str()) else {
+            if dimension.required {
+                bail!(
+                    "{}: CoreStore boundary schema cannot add required dimension {}",
+                    AnvilErrorCode::BoundarySchemaIncompatibleChange.as_str(),
+                    dimension.name
+                );
+            }
+            continue;
+        };
+        if existing.value_type != dimension.value_type {
+            bail!(
+                "{}: CoreStore boundary schema cannot change value type for {}",
+                AnvilErrorCode::BoundarySchemaIncompatibleChange.as_str(),
+                dimension.name
+            );
+        }
+        if has_boundary_category(existing, "security_realm")
+            != has_boundary_category(dimension, "security_realm")
+        {
+            bail!(
+                "{}: CoreStore boundary schema cannot change security_realm category for {}",
+                AnvilErrorCode::BoundarySchemaIncompatibleChange.as_str(),
+                dimension.name
+            );
+        }
+    }
+    Ok(())
+}
+
+fn has_boundary_category(dimension: &CoreBoundaryDimension, category: &str) -> bool {
+    dimension
+        .categories
+        .iter()
+        .any(|candidate| candidate == category)
+}
+
+fn validate_boundary_source(source: &CoreBoundarySource, value_type: &str) -> Result<()> {
+    match source {
+        CoreBoundarySource::UserMetadataJsonPointer { pointer }
+        | CoreBoundarySource::BodyJsonPointer { pointer, .. } => {
+            if !pointer.starts_with('/') {
+                bail!(
+                    "{}: CoreStore boundary JSON pointer must start with /",
+                    AnvilErrorCode::BoundaryTypeMismatch.as_str()
+                );
+            }
+        }
+        CoreBoundarySource::PathTemplate { template } => validate_boundary_path_template(template)?,
+    }
+    validate_boundary_value_type(value_type)
+}
+
+fn validate_boundary_path_template(template: &str) -> Result<()> {
+    if !template.starts_with('/') {
+        bail!("CoreStore boundary path template must start with /");
+    }
+    if template.contains("//") || template.contains("..") {
+        bail!("CoreStore boundary path template contains an invalid path component");
+    }
+    Ok(())
+}
+
+fn validate_boundary_value_type(value_type: &str) -> Result<()> {
+    validate_boundary_hint(
+        value_type,
+        &["string", "uuid", "u64", "i64", "date", "timestamp"],
+        "value type",
+    )
+}
+
+fn validate_boundary_category(category: &str) -> Result<()> {
+    validate_boundary_hint(
+        category,
+        &[
+            "security_realm",
+            "storage_partition",
+            "query_prune",
+            "placement_affinity",
+            "compaction_group",
+            "retention_group",
+            "observability_group",
+        ],
+        "category",
+    )
+}
+
+fn validate_boundary_hint(value: &str, allowed: &[&str], label: &str) -> Result<()> {
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        bail!("CoreStore boundary {label} {value:?} is not supported")
+    }
+}
+
 fn parse_shard_file_name(file_name: &str) -> Option<(u16, String)> {
     let file_name = file_name.strip_prefix("shard-")?;
     let file_name = file_name.strip_suffix(".bin")?;
@@ -4369,6 +4644,35 @@ mod tests {
         fs::write(store.active_wal_path(), bytes).await.unwrap();
     }
 
+    fn sample_boundary_schema(bucket: &str, generation: u64) -> CoreBoundarySchema {
+        CoreBoundarySchema {
+            schema: CORE_BOUNDARY_SCHEMA_SCHEMA.to_string(),
+            bucket: bucket.to_string(),
+            generation,
+            dimensions: vec![CoreBoundaryDimension {
+                name: "customer_tenant".to_string(),
+                source: CoreBoundarySource::UserMetadataJsonPointer {
+                    pointer: "/customer_tenant_id".to_string(),
+                },
+                value_type: "uuid".to_string(),
+                categories: vec![
+                    "security_realm".to_string(),
+                    "storage_partition".to_string(),
+                    "query_prune".to_string(),
+                ],
+                required: true,
+                cardinality: "extreme".to_string(),
+                max_values_per_block: 1,
+                placement_affinity: "prefer_colocate".to_string(),
+                compaction_scope: "require_same_value".to_string(),
+                shared_ranges_allowed: false,
+                shared_record_kinds: Vec::new(),
+                deprecated: false,
+            }],
+            created_at: String::new(),
+        }
+    }
+
     #[tokio::test]
     async fn core_store_put_get_blob_verifies_hash() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4396,6 +4700,144 @@ mod tests {
         );
         let bytes = store.get_blob(GetBlob { object_ref }).await.unwrap();
         assert_eq!(bytes, b"hello corestore");
+    }
+
+    #[tokio::test]
+    async fn core_store_boundary_schema_round_trips_through_corestore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        let receipt = store
+            .put_boundary_schema(PutBoundarySchema {
+                schema: sample_boundary_schema("customer-documents", 1),
+                expected_generation: None,
+                mutation_id: "boundary-schema-genesis".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(receipt.bucket, "customer-documents");
+        assert_eq!(receipt.generation, 1);
+        assert!(receipt.schema_hash.starts_with("sha256:"));
+
+        let schema = store
+            .read_boundary_schema("customer-documents")
+            .await
+            .unwrap()
+            .expect("boundary schema");
+        assert_eq!(schema.generation, 1);
+        assert_eq!(schema.dimensions[0].name, "customer_tenant");
+        assert_eq!(schema.dimensions[0].categories[0], "security_realm");
+    }
+
+    #[tokio::test]
+    async fn core_store_boundary_schema_allows_optional_dimension_evolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        store
+            .put_boundary_schema(PutBoundarySchema {
+                schema: sample_boundary_schema("customer-documents", 1),
+                expected_generation: None,
+                mutation_id: "boundary-schema-genesis".to_string(),
+            })
+            .await
+            .unwrap();
+        let mut next = sample_boundary_schema("customer-documents", 2);
+        next.dimensions.push(CoreBoundaryDimension {
+            name: "project".to_string(),
+            source: CoreBoundarySource::PathTemplate {
+                template: "/customers/{customer_tenant}/projects/{project}/**".to_string(),
+            },
+            value_type: "string".to_string(),
+            categories: vec!["storage_partition".to_string(), "query_prune".to_string()],
+            required: false,
+            cardinality: "high".to_string(),
+            max_values_per_block: 8,
+            placement_affinity: "prefer_colocate".to_string(),
+            compaction_scope: "prefer_same_value".to_string(),
+            shared_ranges_allowed: false,
+            shared_record_kinds: Vec::new(),
+            deprecated: false,
+        });
+
+        store
+            .put_boundary_schema(PutBoundarySchema {
+                schema: next,
+                expected_generation: Some(1),
+                mutation_id: "boundary-schema-add-project".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .read_boundary_schema("customer-documents")
+                .await
+                .unwrap()
+                .unwrap()
+                .dimensions
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn core_store_boundary_schema_rejects_incompatible_evolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        store
+            .put_boundary_schema(PutBoundarySchema {
+                schema: sample_boundary_schema("customer-documents", 1),
+                expected_generation: None,
+                mutation_id: "boundary-schema-genesis".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let mut required_addition = sample_boundary_schema("customer-documents", 2);
+        required_addition.dimensions.push(CoreBoundaryDimension {
+            name: "project".to_string(),
+            source: CoreBoundarySource::PathTemplate {
+                template: "/customers/{customer_tenant}/projects/{project}/**".to_string(),
+            },
+            value_type: "string".to_string(),
+            categories: vec!["query_prune".to_string()],
+            required: true,
+            cardinality: "high".to_string(),
+            max_values_per_block: 8,
+            placement_affinity: "prefer_colocate".to_string(),
+            compaction_scope: "prefer_same_value".to_string(),
+            shared_ranges_allowed: false,
+            shared_record_kinds: Vec::new(),
+            deprecated: false,
+        });
+        let err = store
+            .put_boundary_schema(PutBoundarySchema {
+                schema: required_addition,
+                expected_generation: Some(1),
+                mutation_id: "boundary-schema-add-required".to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(AnvilErrorCode::BoundarySchemaIncompatibleChange.as_str())
+        );
+
+        let mut type_change = sample_boundary_schema("customer-documents", 2);
+        type_change.dimensions[0].value_type = "string".to_string();
+        let err = store
+            .put_boundary_schema(PutBoundarySchema {
+                schema: type_change,
+                expected_generation: Some(1),
+                mutation_id: "boundary-schema-type-change".to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(AnvilErrorCode::BoundarySchemaIncompatibleChange.as_str())
+        );
     }
 
     #[tokio::test]

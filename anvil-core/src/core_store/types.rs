@@ -9,6 +9,7 @@ pub const CORE_WATCH_EVENT_SCHEMA: &str = "anvil.core.watch_event.v1";
 pub const CORE_FENCE_SCHEMA: &str = "anvil.core.fence.v1";
 pub const CORE_ROOT_CATALOG_SCHEMA: &str = "anvil.core.root_catalog.v1";
 pub const CORE_QUORUM_PROFILE_SCHEMA: &str = "anvil.core.quorum_profile.v1";
+pub const CORE_BOUNDARY_SCHEMA_SCHEMA: &str = "anvil.core.boundary_schema.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PutBlob {
@@ -63,6 +64,61 @@ pub struct CoreObjectPlacement {
     pub shard_hash: String,
     pub stored_size: u64,
     pub generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreBoundarySchema {
+    pub schema: String,
+    pub bucket: String,
+    pub generation: u64,
+    pub dimensions: Vec<CoreBoundaryDimension>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreBoundaryDimension {
+    pub name: String,
+    pub source: CoreBoundarySource,
+    pub value_type: String,
+    pub categories: Vec<String>,
+    pub required: bool,
+    pub cardinality: String,
+    pub max_values_per_block: u32,
+    pub placement_affinity: String,
+    pub compaction_scope: String,
+    pub shared_ranges_allowed: bool,
+    pub shared_record_kinds: Vec<String>,
+    pub deprecated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CoreBoundarySource {
+    UserMetadataJsonPointer {
+        pointer: String,
+    },
+    PathTemplate {
+        template: String,
+    },
+    BodyJsonPointer {
+        pointer: String,
+        max_body_bytes: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PutBoundarySchema {
+    pub schema: CoreBoundarySchema,
+    pub expected_generation: Option<u64>,
+    pub mutation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BoundarySchemaReceipt {
+    pub bucket: String,
+    pub generation: u64,
+    pub ref_generation: u64,
+    pub schema_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

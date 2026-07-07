@@ -30,10 +30,19 @@ pub enum AnvilErrorCode {
     LeaseOwnerMismatch,
     LeaseCasConflict,
     ResourceExhaustedWalBacklog,
+    BoundaryRequiredMissing,
+    BoundaryTypeMismatch,
+    BoundaryExtractorUnsupportedContentType,
+    BoundaryExtractorBodyTooLarge,
+    BoundarySchemaGenerationConflict,
+    BoundarySchemaIncompatibleChange,
+    BoundaryMigrationRequired,
+    BoundaryMigrationInProgress,
+    BoundaryMigrationFailed,
 }
 
 impl AnvilErrorCode {
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 39] = [
         Self::Unauthorized,
         Self::UnauthorizedReservedNamespace,
         Self::ForbiddenByPolicy,
@@ -64,6 +73,15 @@ impl AnvilErrorCode {
         Self::LeaseOwnerMismatch,
         Self::LeaseCasConflict,
         Self::ResourceExhaustedWalBacklog,
+        Self::BoundaryRequiredMissing,
+        Self::BoundaryTypeMismatch,
+        Self::BoundaryExtractorUnsupportedContentType,
+        Self::BoundaryExtractorBodyTooLarge,
+        Self::BoundarySchemaGenerationConflict,
+        Self::BoundarySchemaIncompatibleChange,
+        Self::BoundaryMigrationRequired,
+        Self::BoundaryMigrationInProgress,
+        Self::BoundaryMigrationFailed,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -100,6 +118,17 @@ impl AnvilErrorCode {
             Self::LeaseOwnerMismatch => "LeaseOwnerMismatch",
             Self::LeaseCasConflict => "LeaseCasConflict",
             Self::ResourceExhaustedWalBacklog => "ResourceExhaustedWalBacklog",
+            Self::BoundaryRequiredMissing => "BoundaryRequiredMissing",
+            Self::BoundaryTypeMismatch => "BoundaryTypeMismatch",
+            Self::BoundaryExtractorUnsupportedContentType => {
+                "BoundaryExtractorUnsupportedContentType"
+            }
+            Self::BoundaryExtractorBodyTooLarge => "BoundaryExtractorBodyTooLarge",
+            Self::BoundarySchemaGenerationConflict => "BoundarySchemaGenerationConflict",
+            Self::BoundarySchemaIncompatibleChange => "BoundarySchemaIncompatibleChange",
+            Self::BoundaryMigrationRequired => "BoundaryMigrationRequired",
+            Self::BoundaryMigrationInProgress => "BoundaryMigrationInProgress",
+            Self::BoundaryMigrationFailed => "BoundaryMigrationFailed",
         }
     }
 }
@@ -165,6 +194,15 @@ mod tests {
                 "LeaseOwnerMismatch",
                 "LeaseCasConflict",
                 "ResourceExhaustedWalBacklog",
+                "BoundaryRequiredMissing",
+                "BoundaryTypeMismatch",
+                "BoundaryExtractorUnsupportedContentType",
+                "BoundaryExtractorBodyTooLarge",
+                "BoundarySchemaGenerationConflict",
+                "BoundarySchemaIncompatibleChange",
+                "BoundaryMigrationRequired",
+                "BoundaryMigrationInProgress",
+                "BoundaryMigrationFailed",
             ]
         );
     }
