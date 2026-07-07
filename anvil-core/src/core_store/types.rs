@@ -70,7 +70,17 @@ pub struct CoreLogicalRangeHint {
     pub writer_record_kind: String,
     pub boundary_values: Vec<CoreBoundaryValue>,
     pub writer_statistics: Vec<u8>,
+    pub preferred_block_boundary: String,
+    pub boundary_dimension_ids: Vec<u32>,
     pub prefetch_next_range_ids: Vec<String>,
+    pub shared_range: Option<CoreSharedRangeMarker>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreSharedRangeMarker {
+    pub record_kind: String,
+    pub reason: String,
+    pub boundary_dimension_ids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,6 +89,8 @@ pub struct CorePipelinePolicy {
     pub encryption: String,
     pub erasure_profile_id: String,
     pub placement_scope: String,
+    pub target_block_size: u64,
+    pub boundary_mode: String,
 }
 
 impl Default for CorePipelinePolicy {
@@ -88,6 +100,8 @@ impl Default for CorePipelinePolicy {
             encryption: "none".to_string(),
             erasure_profile_id: "ec-4-2".to_string(),
             placement_scope: "region".to_string(),
+            target_block_size: 64 * 1024 * 1024,
+            boundary_mode: "honour".to_string(),
         }
     }
 }
@@ -144,6 +158,9 @@ pub struct CoreLogicalRange {
     pub writer_statistics: Vec<u8>,
     pub block_ids: Vec<String>,
     pub prefetch_next_range_ids: Vec<String>,
+    pub preferred_block_boundary: String,
+    pub boundary_dimension_ids: Vec<u32>,
+    pub shared_range: Option<CoreSharedRangeMarker>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

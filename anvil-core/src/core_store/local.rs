@@ -733,6 +733,7 @@ impl CoreStore {
         if request.pipeline_policy.encryption != "none" {
             bail!("CoreStore logical file encryption policy is not implemented for local backend");
         }
+        validate_pipeline_policy(&request.pipeline_policy, profile)?;
 
         let source = std::mem::take(&mut request.source);
         let plaintext_hash = format!("sha256:{}", sha256_hex(&source));
@@ -4255,12 +4256,16 @@ fn logical_file_manifest_from_object_manifest(
             writer_statistics: Vec::new(),
             block_ids: block_ids.clone(),
             prefetch_next_range_ids: Vec::new(),
+            preferred_block_boundary: "writer_defined".to_string(),
+            boundary_dimension_ids: Vec::new(),
+            shared_range: None,
         }]
     } else {
         request
             .range_hints
             .iter()
             .map(|hint| {
+                validate_logical_range_hint(hint)?;
                 if hint.byte_start > hint.byte_end {
                     bail!("CoreStore logical range hint start must be <= end");
                 }
@@ -4276,6 +4281,9 @@ fn logical_file_manifest_from_object_manifest(
                     writer_statistics: hint.writer_statistics.clone(),
                     block_ids: block_ids.clone(),
                     prefetch_next_range_ids: hint.prefetch_next_range_ids.clone(),
+                    preferred_block_boundary: hint.preferred_block_boundary.clone(),
+                    boundary_dimension_ids: hint.boundary_dimension_ids.clone(),
+                    shared_range: hint.shared_range.clone(),
                 })
             })
             .collect::<Result<Vec<_>>>()?
@@ -4496,6 +4504,55 @@ fn decode_logical_file_source(compression: &str, stored: Vec<u8>) -> Result<Vec<
         "zstd" => Ok(zstd::stream::decode_all(Cursor::new(stored))?),
         other => bail!("CoreStore unsupported logical file compression descriptor {other}"),
     }
+}
+
+fn validate_pipeline_policy(
+    policy: &CorePipelinePolicy,
+    profile: LocalErasureProfile,
+) -> Result<()> {
+    match policy.compression.as_str() {
+        "none" | "zstd" => {}
+        other => bail!("CoreStore unsupported logical file compression policy {other}"),
+    }
+    match policy.encryption.as_str() {
+        "none" | "aes_gcm_siv" => {}
+        other => bail!("CoreStore unsupported logical file encryption policy {other}"),
+    }
+    match policy.boundary_mode.as_str() {
+        "honour" | "prefer" | "ignore_for_diagnostic_only" => {}
+        other => bail!("CoreStore unsupported boundary mode {other}"),
+    }
+    if policy.target_block_size == 0 {
+        bail!("CoreStore target_block_size must be greater than zero");
+    }
+    if policy.target_block_size > profile.logical_block_target_bytes {
+        bail!(
+            "CoreStore target_block_size {} exceeds profile {} target {}",
+            policy.target_block_size,
+            profile.id,
+            profile.logical_block_target_bytes
+        );
+    }
+    Ok(())
+}
+
+fn validate_logical_range_hint(hint: &CoreLogicalRangeHint) -> Result<()> {
+    validate_logical_id(&hint.range_id, "logical range id")?;
+    validate_logical_id(&hint.writer_record_kind, "logical range writer record kind")?;
+    match hint.preferred_block_boundary.as_str() {
+        "required" | "preferred" | "writer_defined" | "none" => {}
+        other => bail!("CoreStore unsupported preferred block boundary {other}"),
+    }
+    if let Some(shared) = &hint.shared_range {
+        validate_logical_id(&shared.record_kind, "shared range record kind")?;
+        if shared.reason.trim().is_empty() {
+            bail!("CoreStore shared range marker reason must not be empty");
+        }
+        if shared.boundary_dimension_ids.is_empty() {
+            bail!("CoreStore shared range marker must name crossed dimensions");
+        }
+    }
+    Ok(())
 }
 
 fn descriptor_hash(parts: &[&str]) -> String {
@@ -6702,7 +6759,10 @@ mod tests {
                     writer_record_kind: "postings".to_string(),
                     boundary_values: vec![boundary.clone()],
                     writer_statistics: Vec::new(),
+                    preferred_block_boundary: "preferred".to_string(),
+                    boundary_dimension_ids: vec![1],
                     prefetch_next_range_ids: vec!["postings-b".to_string()],
+                    shared_range: None,
                 }],
                 pipeline_policy: CorePipelinePolicy::default(),
                 trace_context: CoreTraceContext::default(),
@@ -6717,6 +6777,8 @@ mod tests {
         assert_eq!(manifest.writer_generation, 3);
         assert_eq!(manifest.boundary_schema_generation, 7);
         assert_eq!(manifest.blocks.len(), 1);
+        assert_eq!(manifest.ranges[0].preferred_block_boundary, "preferred");
+        assert_eq!(manifest.ranges[0].boundary_dimension_ids, vec![1]);
         assert_eq!(
             manifest.blocks[0].shards.len(),
             LOCAL_DATA_SHARDS + LOCAL_PARITY_SHARDS
@@ -6770,7 +6832,10 @@ mod tests {
                     writer_record_kind: "postings".to_string(),
                     boundary_values: Vec::new(),
                     writer_statistics: Vec::new(),
+                    preferred_block_boundary: "preferred".to_string(),
+                    boundary_dimension_ids: Vec::new(),
                     prefetch_next_range_ids: Vec::new(),
+                    shared_range: None,
                 }],
                 pipeline_policy: CorePipelinePolicy {
                     compression: "zstd".to_string(),
