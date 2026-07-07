@@ -1,4 +1,5 @@
 use super::types::*;
+use crate::error_codes::AnvilErrorCode;
 use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -60,6 +61,11 @@ const CORE_ACTIVE_STREAM_VERSION: u16 = 1;
 const CORE_WAL_VERSION: u16 = 1;
 const CORE_WAL_EPOCH: u64 = 1;
 const CORE_WAL_MAX_INLINE_PAYLOAD_BYTES: usize = 64 * 1024;
+const CORE_WAL_SOFT_LIMIT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const CORE_WAL_HARD_LIMIT_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+const CORE_LANDED_BYTES_SOFT_LIMIT_BYTES: u64 = 2 * CORE_WAL_SOFT_LIMIT_BYTES;
+const CORE_LANDED_BYTES_HARD_LIMIT_BYTES: u64 = 3 * CORE_WAL_SOFT_LIMIT_BYTES;
+const CORE_WAL_SOFT_BACKPRESSURE_DELAY: Duration = Duration::from_millis(1);
 const CORE_WAL_NODE_ID: &str = "local-node";
 const CORE_STREAM_SEGMENT_HEADER_SCHEMA: &str = "anvil.core.stream_segment_header.v1";
 const CORE_STREAM_RECORD_HEADER_SCHEMA: &str = "anvil.core.stream_record_header.v1";
@@ -70,6 +76,25 @@ const CORE_TRANSACTION_PARTITION_ID: &str = "core-control";
 const CORE_TRANSACTION_RECORD_KIND: &str = "core_transaction";
 
 type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Debug, Clone, Copy)]
+struct CoreAdmissionCapacityLimits {
+    wal_soft_limit_bytes: u64,
+    wal_hard_limit_bytes: u64,
+    landed_bytes_soft_limit_bytes: u64,
+    landed_bytes_hard_limit_bytes: u64,
+}
+
+impl CoreAdmissionCapacityLimits {
+    const fn production() -> Self {
+        Self {
+            wal_soft_limit_bytes: CORE_WAL_SOFT_LIMIT_BYTES,
+            wal_hard_limit_bytes: CORE_WAL_HARD_LIMIT_BYTES,
+            landed_bytes_soft_limit_bytes: CORE_LANDED_BYTES_SOFT_LIMIT_BYTES,
+            landed_bytes_hard_limit_bytes: CORE_LANDED_BYTES_HARD_LIMIT_BYTES,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct CoreStore {
@@ -1137,6 +1162,7 @@ impl CoreStore {
         }
         let _wal_guard = self.acquire_named_lock("wal", "active").await?;
         self.ensure_wal_file_header().await?;
+        self.enforce_admission_capacity(0, 0).await?;
         let sequence = self.next_core_wal_sequence().await?;
         let record = CoreWalAdmissionRecord {
             schema: CORE_WAL_RECORD_SCHEMA.to_string(),
@@ -1158,6 +1184,8 @@ impl CoreStore {
         };
         let header_json = serde_json::to_vec(&record)?;
         let frame = encode_wal_frame(&header_json, payload)?;
+        self.enforce_admission_capacity(frame.len() as u64, 0)
+            .await?;
         let path = self.active_wal_path();
         let started_at = Instant::now();
         let mut file = OpenOptions::new().append(true).open(&path).await?;
@@ -1193,49 +1221,63 @@ impl CoreStore {
         let hash = sha256_hex(bytes);
         let final_path = self.landed_bytes_path(&hash);
         let landing_id = format!("{mutation_id}:{hash}");
-        if fs::metadata(&final_path).await.is_err() {
-            if let Some(parent) = final_path.parent() {
-                fs::create_dir_all(parent).await?;
+        match fs::metadata(&final_path).await {
+            Ok(metadata) => {
+                if metadata.len() != bytes.len() as u64 {
+                    bail!("CoreStore landed bytes existing length mismatch");
+                }
             }
-            let tmp_path =
-                final_path.with_extension(format!("landed.{}.tmp", uuid::Uuid::new_v4()));
-            let started_at = Instant::now();
-            let mut file = fs::File::create(&tmp_path).await?;
-            crate::perf::record_io_duration(
-                "core_store",
-                "landed_file_create",
-                &tmp_path,
-                0,
-                started_at.elapsed(),
-            );
-            let started_at = Instant::now();
-            file.write_all(bytes).await?;
-            crate::perf::record_io_duration(
-                "core_store",
-                "landed_file_write",
-                &tmp_path,
-                bytes.len() as u64,
-                started_at.elapsed(),
-            );
-            let started_at = Instant::now();
-            file.sync_all().await?;
-            crate::perf::record_io_duration(
-                "core_store",
-                "landed_file_sync",
-                &tmp_path,
-                bytes.len() as u64,
-                started_at.elapsed(),
-            );
-            drop(file);
-            let started_at = Instant::now();
-            fs::rename(&tmp_path, &final_path).await?;
-            crate::perf::record_io_duration(
-                "core_store",
-                "landed_file_rename",
-                &final_path,
-                bytes.len() as u64,
-                started_at.elapsed(),
-            );
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.enforce_admission_capacity(0, bytes.len() as u64)
+                    .await?;
+                if let Some(parent) = final_path.parent() {
+                    fs::create_dir_all(parent).await?;
+                }
+                let tmp_path =
+                    final_path.with_extension(format!("landed.{}.tmp", uuid::Uuid::new_v4()));
+                let started_at = Instant::now();
+                let mut file = fs::File::create(&tmp_path).await?;
+                crate::perf::record_io_duration(
+                    "core_store",
+                    "landed_file_create",
+                    &tmp_path,
+                    0,
+                    started_at.elapsed(),
+                );
+                let started_at = Instant::now();
+                file.write_all(bytes).await?;
+                crate::perf::record_io_duration(
+                    "core_store",
+                    "landed_file_write",
+                    &tmp_path,
+                    bytes.len() as u64,
+                    started_at.elapsed(),
+                );
+                let started_at = Instant::now();
+                file.sync_all().await?;
+                crate::perf::record_io_duration(
+                    "core_store",
+                    "landed_file_sync",
+                    &tmp_path,
+                    bytes.len() as u64,
+                    started_at.elapsed(),
+                );
+                drop(file);
+                let started_at = Instant::now();
+                fs::rename(&tmp_path, &final_path).await?;
+                crate::perf::record_io_duration(
+                    "core_store",
+                    "landed_file_rename",
+                    &final_path,
+                    bytes.len() as u64,
+                    started_at.elapsed(),
+                );
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("inspect CoreStore landed bytes {}", final_path.display())
+                });
+            }
         }
         let relative_path = self.storage.relative_storage_path(&final_path)?;
         let meta_path = final_path.with_extension("meta");
@@ -1254,6 +1296,81 @@ impl CoreStore {
             landing_id,
             relative_path,
         })
+    }
+
+    async fn enforce_admission_capacity(
+        &self,
+        incoming_wal_bytes: u64,
+        incoming_landed_bytes: u64,
+    ) -> Result<()> {
+        self.enforce_admission_capacity_with_limits(
+            incoming_wal_bytes,
+            incoming_landed_bytes,
+            CoreAdmissionCapacityLimits::production(),
+        )
+        .await
+    }
+
+    async fn enforce_admission_capacity_with_limits(
+        &self,
+        incoming_wal_bytes: u64,
+        incoming_landed_bytes: u64,
+        limits: CoreAdmissionCapacityLimits,
+    ) -> Result<()> {
+        let wal_bytes = self.admission_wal_bytes().await?;
+        let landed_bytes = self.admission_landed_bytes().await?;
+        let projected_wal_bytes = wal_bytes.saturating_add(incoming_wal_bytes);
+        let projected_landed_bytes = landed_bytes.saturating_add(incoming_landed_bytes);
+
+        if projected_wal_bytes > limits.wal_hard_limit_bytes {
+            bail!(
+                "{}: CoreStore admission WAL hard limit exceeded: current={}, incoming={}, hard={}",
+                AnvilErrorCode::ResourceExhaustedWalBacklog.as_str(),
+                wal_bytes,
+                incoming_wal_bytes,
+                limits.wal_hard_limit_bytes
+            );
+        }
+
+        if projected_landed_bytes > limits.landed_bytes_hard_limit_bytes {
+            bail!(
+                "{}: CoreStore landed bytes hard limit exceeded: current={}, incoming={}, hard={}",
+                AnvilErrorCode::ResourceExhaustedWalBacklog.as_str(),
+                landed_bytes,
+                incoming_landed_bytes,
+                limits.landed_bytes_hard_limit_bytes
+            );
+        }
+
+        if projected_wal_bytes > limits.wal_soft_limit_bytes
+            || projected_landed_bytes > limits.landed_bytes_soft_limit_bytes
+        {
+            tokio::time::sleep(CORE_WAL_SOFT_BACKPRESSURE_DELAY).await;
+        }
+
+        Ok(())
+    }
+
+    async fn admission_wal_bytes(&self) -> Result<u64> {
+        sum_files_with_extension(&self.admission_wal_dir(), &["anwal", "anw"])
+            .await
+            .with_context(|| {
+                format!(
+                    "measure CoreStore admission WAL bytes under {}",
+                    self.admission_wal_dir().display()
+                )
+            })
+    }
+
+    async fn admission_landed_bytes(&self) -> Result<u64> {
+        sum_files_with_extension(&self.admission_landed_bytes_root(), &["landed"])
+            .await
+            .with_context(|| {
+                format!(
+                    "measure CoreStore admission landed bytes under {}",
+                    self.admission_landed_bytes_root().display()
+                )
+            })
     }
 
     async fn read_landed_bytes(&self, landed: &CoreWalLandedByte) -> Result<Vec<u8>> {
@@ -3521,6 +3638,41 @@ async fn write_file_atomic(path: &PathBuf, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+async fn sum_files_with_extension(root: &PathBuf, extensions: &[&str]) -> Result<u64> {
+    let mut total = 0_u64;
+    let mut pending = vec![root.clone()];
+
+    while let Some(path) = pending.pop() {
+        let mut entries = match fs::read_dir(&path).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("read directory {}", path.display()));
+            }
+        };
+
+        while let Some(entry) = entries.next_entry().await? {
+            let entry_path = entry.path();
+            let metadata = entry.metadata().await?;
+            if metadata.is_dir() {
+                pending.push(entry_path);
+                continue;
+            }
+            if !metadata.is_file() {
+                continue;
+            }
+            let Some(extension) = entry_path.extension().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if extensions.contains(&extension) {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3555,6 +3707,70 @@ mod tests {
         );
         let bytes = store.get_blob(GetBlob { object_ref }).await.unwrap();
         assert_eq!(bytes, b"hello corestore");
+    }
+
+    #[tokio::test]
+    async fn core_store_admission_rejects_when_wal_hard_limit_would_be_exceeded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        fs::create_dir_all(store.admission_wal_dir()).await.unwrap();
+        fs::write(store.active_wal_path(), vec![0_u8; 32])
+            .await
+            .unwrap();
+
+        let err = store
+            .enforce_admission_capacity_with_limits(
+                16,
+                0,
+                CoreAdmissionCapacityLimits {
+                    wal_soft_limit_bytes: 32,
+                    wal_hard_limit_bytes: 40,
+                    landed_bytes_soft_limit_bytes: 1024,
+                    landed_bytes_hard_limit_bytes: 2048,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains(AnvilErrorCode::ResourceExhaustedWalBacklog.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn core_store_admission_rejects_when_landed_hard_limit_would_be_exceeded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        let landed_dir = store
+            .admission_landed_bytes_root()
+            .join("sha256")
+            .join("aa");
+        fs::create_dir_all(&landed_dir).await.unwrap();
+        fs::write(landed_dir.join("aa-existing.landed"), vec![0_u8; 64])
+            .await
+            .unwrap();
+
+        let err = store
+            .enforce_admission_capacity_with_limits(
+                0,
+                64,
+                CoreAdmissionCapacityLimits {
+                    wal_soft_limit_bytes: 1024,
+                    wal_hard_limit_bytes: 2048,
+                    landed_bytes_soft_limit_bytes: 96,
+                    landed_bytes_hard_limit_bytes: 100,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains(AnvilErrorCode::ResourceExhaustedWalBacklog.as_str())
+        );
     }
 
     #[tokio::test]

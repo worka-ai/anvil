@@ -29,10 +29,11 @@ pub enum AnvilErrorCode {
     StaleFence,
     LeaseOwnerMismatch,
     LeaseCasConflict,
+    ResourceExhaustedWalBacklog,
 }
 
 impl AnvilErrorCode {
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::Unauthorized,
         Self::UnauthorizedReservedNamespace,
         Self::ForbiddenByPolicy,
@@ -62,6 +63,7 @@ impl AnvilErrorCode {
         Self::StaleFence,
         Self::LeaseOwnerMismatch,
         Self::LeaseCasConflict,
+        Self::ResourceExhaustedWalBacklog,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -97,6 +99,7 @@ impl AnvilErrorCode {
             Self::StaleFence => "StaleFence",
             Self::LeaseOwnerMismatch => "LeaseOwnerMismatch",
             Self::LeaseCasConflict => "LeaseCasConflict",
+            Self::ResourceExhaustedWalBacklog => "ResourceExhaustedWalBacklog",
         }
     }
 }
@@ -161,6 +164,7 @@ mod tests {
                 "StaleFence",
                 "LeaseOwnerMismatch",
                 "LeaseCasConflict",
+                "ResourceExhaustedWalBacklog",
             ]
         );
     }
