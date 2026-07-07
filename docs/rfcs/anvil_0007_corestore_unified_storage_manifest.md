@@ -71,6 +71,93 @@ only as non-final implementation mechanisms with explicit recovery semantics.
 
 The words MUST, MUST NOT, REQUIRED, SHOULD, SHOULD NOT, and MAY are normative.
 
+## 4.1 Canonical Encoding, Hashing, and Signing Profile
+
+All hashes, signatures, receipts, manifests, root records, WAL records, writer
+segments, and page tokens in this RFC use one canonical profile. Any section that
+says `canonical(...)`, `canonical CBOR`, `deterministic protobuf`,
+`signed_payload_hash`, `root_hash`, `segment_hash`, `manifest_hash`, or
+`receipt_hash` refers to this profile unless that section explicitly defines a
+more restrictive byte format. Implementations MUST NOT choose alternate encodings
+per subsystem.
+
+Canonical scalar rules:
+
+```text
+integers                  little-endian fixed width in binary records; shortest valid integer in CBOR/JSON
+strings                   UTF-8, Unicode NFC, no embedded NUL for identifiers
+bytes                     length-prefixed raw bytes in binary records; base64url without padding in JSON
+hashes                    algorithm id + raw digest in binary records; "algorithm:hex" in JSON/diagnostics
+time                      unix nanoseconds as u64 unless a field says signed timestamp
+bools                     0x00 false, 0x01 true in binary records
+optional<T>               absent fields omitted in CBOR/protobuf canonical hash input; binary uses 0x00/0x01
+repeated<T>               semantic order is the order declared by the section; sets are sorted before hashing
+maps                      sorted by canonical encoded key bytes
+unknown fields            rejected in signed or hashed protocol payloads
+default fields            included only when the field is explicitly present in the schema's hash input
+```
+
+Canonical JSON is RFC 8785-style canonical JSON: object keys sorted by Unicode
+codepoint, no insignificant whitespace, shortest numeric representation, and NFC
+strings. JSON is used for operator-facing policy/query documents and a few
+explicit WAL/header payloads only.
+
+Canonical CBOR is deterministic CBOR with definite lengths, shortest integer
+forms, sorted map keys by encoded key bytes, and no indefinite containers. CBOR
+maps MUST NOT contain duplicate keys.
+
+Deterministic protobuf is allowed only for messages whose schema is fixed in this
+RFC. It uses deterministic serialization, numeric field order, no unknown fields,
+no implicit default-field hashing, and repeated fields in the exact order declared
+by the enclosing data structure. Before a deterministic protobuf message is
+accepted from disk or network, the receiver MUST decode it and re-encode it
+deterministically; the bytes must match exactly.
+
+Domain-separated hashes:
+
+```text
+Hash(domain, bytes...) = blake3(domain || 0x00 || len(bytes_0) || bytes_0 || ...)
+```
+
+Normative domains:
+
+```text
+anvil.request_hash.v1
+anvil.wal.frame_hash.v1
+anvil.admission.receipt.v1
+anvil.admission.commit_certificate.v1
+anvil.root.key.v1
+anvil.root.anchor_record.v1
+anvil.transaction_manifest.v1
+anvil.logical_file_manifest.v1
+anvil.writer.segment.v1
+anvil.block.plain.v1
+anvil.block.encoded.v1
+anvil.shard.receipt.v1
+anvil.page_token.v1
+anvil.query.plan.v1
+anvil.admission.chunk.v1
+anvil.admission.descriptor.v1
+anvil.admission.abort_certificate.v1
+anvil.admission.negative_receipt.v1
+anvil.admission.replay_claim.v1
+anvil.admission.gc_certificate.v1
+anvil.root.cohort.v1
+anvil.root.genesis_config.v1
+anvil.block.id.v1
+```
+
+Signatures use Ed25519 unless a later RFC updates this profile. A signature field
+MUST sign exactly the domain-separated hash named by the message. Node signing
+keys, partition-owner signing keys, and admin/service principal keys are looked
+up from the system authz realm at the revision carried by the signed message. A
+receiver MUST reject a signature when the key is absent, revoked at that revision,
+not authorised for the message role, or not bound to the claimed node/principal.
+
+The byte form used for a hash is always the stored wire form after canonical
+encoding, not a debug string or display path. Diagnostic paths are never hash
+input.
+
 ## 5. Architecture Overview
 
 ```text
@@ -375,11 +462,22 @@ Committed
 Finalised
   the mutation is represented by final erasure-coded CoreStore blocks and a
   committed root anchor generation.
+
+FinalisationFailed
+  the mutation was admitted and remains recoverable evidence, but materialisation
+  rejected it before root publication because a deterministic finalisation rule
+  failed, such as boundary enforcement, corrupt landed bytes, or unsupported
+  writer output. The mutation is not visible in any committed root generation.
 ```
 
 Default public write APIs return only after `Committed`. A caller may request
-`wait_for_finalization=true`; then the response returns only after `Finalised` or
-an explicit timeout while preserving idempotency.
+`wait_for_finalization=true`; then the response returns only after `Finalised`,
+`FinalisationFailed`, or an explicit timeout while preserving idempotency. A retry
+with the same idempotency key returns the same terminal finalisation state. A
+retry with corrected data must use a new idempotency key and mutation id. Reads
+never expose `FinalisationFailed` mutations because they have no root anchor
+publication. Status APIs return `FinalisationFailed` with the stable Anvil error
+that caused finalisation to fail.
 
 ### 8.6 Admission Profiles
 
@@ -407,14 +505,9 @@ references landed bytes, the node must:
 5. fsync the landed directory;
 6. mirror and verify according to the admission profile.
 
-Mirror protocol:
+Admission evidence record schema:
 
 ```protobuf
-service AdmissionMirrorService {
-  rpc MirrorLandedBytes(MirrorLandedBytesRequest) returns (AdmissionMirrorReceipt);
-  rpc MirrorWalFrame(MirrorWalFrameRequest) returns (AdmissionMirrorReceipt);
-}
-
 message AdmissionAttemptId {
   string mutation_id = 1;
   string root_anchor_key = 2;
@@ -462,28 +555,6 @@ message LocalAdmissionReceipt {
   bytes source_signature = 9;
 }
 
-message MirrorLandedBytesRequest {
-  AdmissionAttemptId attempt_id = 1;
-  repeated LandedByteDescriptor landed_bytes = 2;
-  string landing_id = 3;              // identifies which descriptor this chunk belongs to
-  string descriptor_hash = 4;
-  string chunk_hash = 5;
-  uint64 chunk_ordinal = 6;
-  bytes chunk = 7;                    // streaming transports send repeated chunks
-  uint64 chunk_offset = 8;
-  bool final_chunk = 9;
-  bytes source_signature = 10;
-}
-
-message MirrorWalFrameRequest {
-  AdmissionAttemptId attempt_id = 1;
-  bytes wal_frame = 2;
-  string wal_frame_hash = 3;
-  repeated string landed_byte_hashes = 4;
-  repeated string descriptor_hashes = 5;
-  bytes source_signature = 6;
-}
-
 message LandedByteDescriptor {
   string landing_id = 1;
   string sha256 = 2;
@@ -522,7 +593,7 @@ updates directly.
 `request_hash` is:
 
 ```text
-request_hash = blake3(canonical(
+request_hash = Hash(anvil.request_hash.v1, canonical(
   operation_family,
   writer_family,
   target,
@@ -541,18 +612,18 @@ Signed payload rules are fixed and non-recursive:
 
 ```text
 AdmissionMirrorReceipt.signed_payload_hash =
-  blake3(canonical(fields 1..9 of AdmissionMirrorReceipt))
+  Hash(anvil.admission.receipt.v1, canonical(fields 1..9 of AdmissionMirrorReceipt))
 
 LocalAdmissionReceipt.signed_payload_hash =
-  blake3(canonical(fields 1..7 of LocalAdmissionReceipt))
+  Hash(anvil.admission.receipt.v1, canonical(fields 1..7 of LocalAdmissionReceipt))
 
 LocalAdmissionAbortReceipt.signed_payload_hash =
-  blake3(canonical(fields 1..4 of LocalAdmissionAbortReceipt))
+  Hash(anvil.admission.negative_receipt.v1, canonical(fields 1..4 of LocalAdmissionAbortReceipt))
 
 AdmissionCommitCertificate.signed_payload_hash =
-  blake3(canonical(attempt_id,
-                   blake3(canonical(local_receipt fields 1..8)),
-                   sorted blake3(canonical(mirror_receipt fields 1..10)),
+  Hash(anvil.admission.commit_certificate.v1, canonical(attempt_id,
+                   Hash(anvil.admission.receipt.v1, canonical(local_receipt fields 1..8)),
+                   sorted Hash(anvil.admission.receipt.v1, canonical(mirror_receipt fields 1..10)),
                    committed_at_unix_nanos))
 ```
 
@@ -568,6 +639,62 @@ admission/mirrors/<source-node-id>/<wal-epoch>/landed/<sha256>.landed
 admission/mirrors/<source-node-id>/<wal-epoch>/wal/<20-digit-sequence>.awf
 admission/mirrors/<source-node-id>/<wal-epoch>/receipts/<20-digit-sequence>.receipt
 ```
+
+Canonical admission mirror wire protocol:
+
+Section 20.3 `AdmissionMirrorInternal` is the only normative wire protocol for
+mirroring. The `AdmissionMirrorReceipt`, `LocalAdmissionReceipt`,
+`AdmissionCommitCertificate`, `ReplayClaim`, and GC/abort records in this section
+are persisted evidence records. Landed byte descriptors, WAL frame bytes, chunk
+hashes, and descriptor hashes flow through the canonical `BeginMirror` ->
+`PutMirrorChunk` -> `CommitMirror` protocol; they are not additional RPCs and
+MUST NOT be implemented as a second distributed path.
+
+```text
+BeginMirror
+  creates admission/mirrors/<source>/<epoch>/attempts/<sequence>.state
+  stores attempt id, request hash, expected landed descriptors, expected WAL hash
+  state becomes begun
+
+PutMirrorChunk(kind=landed_byte)
+  writes chunk into attempts/<sequence>/chunks/<landing_id>/<offset>.chunk.tmp
+  verifies chunk hash and source signature
+  fsyncs chunk file and attempt directory according to mirror policy
+  state remains begun until every descriptor range is complete
+
+PutMirrorChunk(kind=wal_frame)
+  writes WAL frame bytes into attempts/<sequence>/wal-frame.tmp
+  verifies wal_frame_hash
+  fsyncs WAL frame temp file and attempt directory
+
+CommitMirror
+  assembles landed bytes, verifies length/hash/descriptors
+  renames complete landed bytes to landed/<sha256>.landed
+  renames WAL frame to wal/<20-digit-sequence>.awf
+  fsyncs all final files and parent directories
+  emits AdmissionMirrorReceipt under receipts/<20-digit-sequence>.receipt
+  state becomes committed
+
+AbortMirror
+  writes signed abort evidence and leaves chunks available for repair inspection
+  state becomes aborted
+```
+
+Allowed mirror states are:
+
+```text
+absent -> begun -> committed
+absent -> begun -> aborted
+begun  -> begun     # idempotent chunk retry
+committed -> committed # idempotent replay with identical hashes
+aborted -> aborted     # idempotent abort retry
+```
+
+All other transitions fail with `InvalidMirrorState`. A committed mirror attempt
+MUST contain exactly one WAL frame hash and all landed byte descriptors referenced
+by that frame. GC evidence is valid only after the committed/aborted state has
+been persisted and signed. Replay claims operate over the committed evidence
+records, not over transient chunk files.
 
 Mirror operations are idempotent. A duplicate chunk or WAL frame with the same
 hash returns the original receipt. A duplicate with different bytes fails with
@@ -599,8 +726,8 @@ Chunk ordering/idempotency:
 
 ```text
 chunk key = (source_node_id, wal_epoch, wal_sequence, landing_id, chunk_ordinal)
-chunk_hash = blake3(landing_id || chunk_offset || chunk_len || final_chunk || chunk bytes)
-descriptor_hash = blake3(landing_id || sha256 || length || content_class)
+chunk_hash = Hash(anvil.admission.chunk.v1, canonical(landing_id, chunk_offset, chunk_len, final_chunk, chunk bytes))
+descriptor_hash = Hash(anvil.admission.descriptor.v1, canonical(landing_id, sha256, length, content_class))
 ```
 
 A mirror accepts chunks in any order, writes each to a temporary chunk file, and
@@ -614,9 +741,9 @@ verifies the descriptor hash and total length. Duplicate chunks with identical
 Receipt hash input:
 
 ```text
-receipt_hash = blake3(canonical(AdmissionMirrorReceipt without mirror_signature))
-local_receipt_hash = blake3(canonical(LocalAdmissionReceipt without source_signature))
-commit_certificate_hash = blake3(canonical(AdmissionCommitCertificate without source_signature))
+receipt_hash = Hash(anvil.admission.receipt.v1, canonical(AdmissionMirrorReceipt without mirror_signature))
+local_receipt_hash = Hash(anvil.admission.receipt.v1, canonical(LocalAdmissionReceipt without source_signature))
+commit_certificate_hash = Hash(anvil.admission.commit_certificate.v1, canonical(AdmissionCommitCertificate without source_signature))
 ```
 
 The source must persist the `AdmissionCommitCertificate` before returning
@@ -684,26 +811,26 @@ Replay, GC, negative receipt, and abort signatures use these payload hashes:
 
 ```text
 NegativeAdmissionReceipt.signed_payload_hash =
-  blake3(canonical(fields 1..4 of NegativeAdmissionReceipt))
+  Hash(anvil.admission.negative_receipt.v1, canonical(fields 1..4 of NegativeAdmissionReceipt))
 
 AdmissionAbortCertificate.signed_payload_hash =
-  blake3(canonical(attempt_id,
-                   optional blake3(canonical(local_abort_receipt fields 1..5)),
-                   sorted blake3(canonical(negative_receipt fields 1..5)),
+  Hash(anvil.admission.abort_certificate.v1, canonical(attempt_id,
+                   optional Hash(anvil.admission.negative_receipt.v1, canonical(local_abort_receipt fields 1..5)),
+                   sorted Hash(anvil.admission.negative_receipt.v1, canonical(negative_receipt fields 1..5)),
                    reason))
 
 ReplayClaim owner_signature payload =
-  blake3(canonical(attempt_id, claimant_node_id, replay_fence,
+  Hash(anvil.admission.replay_claim.v1, canonical(attempt_id, claimant_node_id, replay_fence,
                    expires_at_unix_nanos, commit_certificate_hash))
 
 AdmissionMirrorGcCertificate owner_signature payload =
-  blake3(canonical(attempt_id, decision, finalised_root_generation,
+  Hash(anvil.admission.gc_certificate.v1, canonical(attempt_id, decision, finalised_root_generation,
                    transaction_manifest_ref,
                    optional commit_certificate_hash,
                    optional abort_certificate_hash))
 ```
 
-`abort_certificate_hash` is `blake3(canonical(AdmissionAbortCertificate fields
+`abort_certificate_hash` is `Hash(anvil.admission.abort_certificate.v1, canonical(AdmissionAbortCertificate fields
 1..5))`. `commit_certificate_hash` is the value defined above. Owner signatures
 must be verified against these exact hashes.
 
@@ -968,7 +1095,7 @@ RootAnchorKey = realm_id "/" root_kind "/" partition_id
 root_kind     = "objects" | "streams" | "indexes" | "authz" | "personaldb" |
                 "registry" | "mesh" | "core-control"
 partition_id  = u64 decimal, assigned by the mesh partition map
-root_key_hash = blake3("anvil-root-key-v1" || canonical_utf8(RootAnchorKey))
+root_key_hash = Hash(anvil.root.key.v1, canonical_utf8(RootAnchorKey))
 ```
 
 `root_key_hash` is the canonical 32-byte key used in register paths, register
@@ -1074,42 +1201,13 @@ RefUpdate = {
 reader to fetch manifest bytes MUST store a `ManifestLocator`. Implementations
 MUST NOT invent a sidecar manifest index to resolve `ManifestRef` values.
 
-A `ManifestLocator` is the immutable, self-contained description needed to read a
-manifest logical file from CoreStore blocks:
-
-```text
-ManifestLocator =
-  manifest_ref            ManifestRef
-  manifest_encoding       "canonical-cbor" | "writer-segment"
-  manifest_length         u64-le
-  manifest_hash           Hash
-  block_count             u32-le
-  block_locator*          sorted by logical_start
-
-BlockLocator =
-  logical_start           u64-le
-  logical_end             u64-le       # exclusive
-  block_id                BlockId
-  block_plain_hash        Hash
-  block_encoded_hash      Hash
-  erasure_profile_id      string
-  placement_epoch         u64-le
-  shard_receipt_count     u16-le
-  shard_receipts          repeated ShardReceiptSummary
-
-ShardReceiptSummary =
-  node_id                 NodeId
-  region_id               RegionId
-  cell_id                 CellId
-  shard_index             u16-le
-  shard_hash              Hash
-  shard_length            u64-le
-  fsync_sequence          u64-le
-  written_at_unix_nanos   u64-le
-  signed_payload_hash     Hash
-  signature_algorithm     string
-  receipt_signature       bytes
-```
+The authoritative `ManifestLocator`, `BlockLocator`, and
+`ShardReceiptSummary` wire schemas are defined in section 18.0. This section
+describes how those locators are used during root and transaction resolution; it
+does not define a second locator format. Any transaction manifest field named
+`ManifestLocator` MUST use the section 18.0 schema, including codec id, shard
+counts, plaintext length, shard payload length, padding, compression/encryption
+descriptors, placement epoch, and shard receipt summaries.
 
 A locator is valid only when:
 
@@ -1264,7 +1362,7 @@ The `header_cbor` includes:
 root_key_hash           Hash
 root_generation         u64
 register_cohort_nodes   [NodeId] sorted by shard_index
-register_cohort_hash    blake3(canonical(root_key_hash, root_generation, register_cohort_nodes))
+register_cohort_hash    Hash(anvil.root.cohort.v1, canonical(root_key_hash, root_generation, register_cohort_nodes))
 placement_epoch         u64
 created_at_unix_nanos   u64
 ```
@@ -1340,7 +1438,7 @@ owner. The bootstrap configuration defines:
 genesis_cluster_id
 bootstrap_node_ids sorted bytewise
 root_register_nodes = first three bootstrap nodes by rendezvous(genesis_cluster_id)
-genesis_config_hash = blake3(canonical bootstrap config)
+genesis_config_hash = Hash(anvil.root.genesis_config.v1, canonical bootstrap config)
 ```
 
 Any bootstrap node may propose generation `0` for the system `core-control` root.
@@ -1546,14 +1644,22 @@ ManifestLocator =
   manifest_hash          Hash
   block_locators         [BlockLocator]
 
-ManifestEncoding = "canonical-cbor" | "writer-segment"
+ManifestEncoding = "deterministic-protobuf" | "canonical-cbor" | "writer-segment"
 
 BlockLocator =
   logical_start          u64
   logical_end            u64
   block_id               BlockId
+  codec_id               string
+  data_shards            u32
+  parity_shards          u32
+  plaintext_block_len    u64
+  shard_payload_len      u64
+  padding_len            u64
   block_plain_hash       Hash
   block_encoded_hash     Hash
+  compression            CompressionDescriptor
+  encryption             EncryptionDescriptor
   erasure_profile_id     string
   placement_epoch        u64
   shard_receipts         [ShardReceiptSummary]
@@ -1634,6 +1740,13 @@ pub struct LogicalRangeHint {
     pub statistics: RangeStatistics,
     pub preferred_block_boundary: BoundaryStrength,
     pub prefetch_group: Option<String>,
+    pub shared_range: Option<SharedRangeMarker>,
+}
+
+pub struct SharedRangeMarker {
+    pub record_kind: String,
+    pub reason: String,
+    pub boundary_dimension_ids: Vec<u32>,
 }
 ```
 
@@ -2340,7 +2453,7 @@ KeyComponent =
 ```
 
 `value_bytes` is the row schema encoded field-by-field in the exact field order
-shown in section 15.20. Field encodings are:
+shown in section 15.21. Field encodings are:
 
 ```text
 u8/u16/u32/u64/i64       little-endian fixed width
@@ -2429,57 +2542,14 @@ The key tuple for each table is normative:
 0x0808 AntiEntropyCheckpointRow             partition_id,scanner_node_id
 ```
 
-#### 15.11.4 Missing Row Layouts
+### 15.11.4 Row Definition Authority
 
-The following row layouts complete the registry from section 15.20. These are in
-addition to the layouts already named there.
-
-```text
-TermDictionaryRow =
-  field_id u32-le, term bytes, doc_freq u64-le, postings_ref ManifestRangeRef, positions_ref optional<ManifestRangeRef>, visible_revision_range revision_range
-
-PostingsBlockRefRow =
-  field_id u32-le, term bytes, block_min_doc_id u64-le, block_max_doc_id u64-le, postings_ref ManifestRangeRef, doc_count u32-le, visible_revision_range revision_range
-
-VectorBlockRow =
-  vector_id_start u64-le, vector_count u32-le, dimension u16-le, element_type u8, vector_bytes_ref ManifestRangeRef, quantizer_ref optional<ManifestRangeRef>, visible_revision_range revision_range
-
-HnswAdjacencyRow =
-  layer u16-le, vector_id u64-le, neighbour_count u16-le, neighbours repeated<u64-le>, visible_revision_range revision_range
-
-SortedColumnRow =
-  field_id u32-le, value TypedValue, object_id string, object_ref ManifestRangeRef, visible_revision_range revision_range
-
-BitmapBlockRow =
-  field_id u32-le, value TypedValue, roaring_bitmap_bytes bytes, object_count u64-le, visible_revision_range revision_range
-
-OrderTupleRow =
-  order_tuple repeated<TypedValue>, object_id string, object_ref ManifestRangeRef, visible_revision_range revision_range
-
-AuthzTupleRow =
-  realm_id string, object_key string, relation string, subject_key string, caveat_id optional<string>, revision_range revision_range
-
-PersonalDbChangesetRow =
-  group_id string, sequence u64-le, actor_id string, base_snapshot_hash hash, changeset_hash hash, changeset_ref ManifestRangeRef, committed_at_unix_nanos u64-le
-
-WitnessRecordRow =
-  group_id string, change_id string, actor_id string, decision u8, fence u64-le, evidence_hash hash, committed_revision u64-le
-
-PackageVersionRow =
-  registry_kind u8, namespace string, package_name string, version string, manifest_ref ManifestRangeRef, published_at_unix_nanos u64-le, visible_revision_range revision_range
-
-RegistryRefRow =
-  registry_kind u8, namespace string, package_name string, ref_name string, target_version string, visible_revision_range revision_range
-
-NodeRow =
-  node_id string, region_id string, cell_id string, advertise_addr string, state u8, capacity_json_hash hash, effective_epoch u64-le
-
-PartitionMapRow =
-  partition_id u64-le, root_kind string, owner_node_id string, owner_fence u64-le, replica_node_ids repeated<string>, effective_epoch u64-le
-
-RootOwnerEpochRow =
-  root_key_hash hash, owner_node_id string, membership_epoch u64-le, owner_fence u64-le, state u8
-```
+Sections 15.12-15.19 may show row-shaped examples while explaining how a writer
+serves reads. Those examples are not independent wire encodings. The only
+normative row wire encodings, table ids, key tuples, visibility fields, and
+required/optional table rules are in sections 15.20 and 15.21. If a row-shaped
+example in sections 15.12-15.19 omits a field or differs from section 15.21, the
+section 15.21 layout wins and the shorter example is a reader/planner view.
 
 ### 15.12 Object Segment Format
 
@@ -2860,7 +2930,89 @@ assign root anchor ownership, placement responsibility, and routing. Draining a
 node, draining a cell, adding a region, and moving a bucket are lifecycle events
 stored in this format and published through root anchor CAS.
 
-### 15.20 Writer Table Row Registry
+### 15.20 Canonical Writer Table Contract
+
+Sections 15.12-15.19 describe writer intent and reader behaviour. The table ids,
+key tuples, field order, required/optional status, visibility fields, and version
+rules in this section are definitive. If prose in a writer-family section shows a
+shorter row shape, the shorter shape is explanatory and MUST be expanded to the
+row layout in this section. Implementations MUST NOT choose between competing row
+layouts.
+
+Every writer segment body MUST be encoded as `WriterBodyTableDirectory` followed
+by `TableBody` values from section 15.11. The names such as
+`FullTextBody.term_dictionary_block` and `VectorBody.vector_block_table` are
+logical table names mapped to fixed numeric table ids below. A writer may omit an
+optional table only when the segment header flags say the capability is absent and
+the reader can answer the requested operation without it. Missing required tables
+make the segment unreadable.
+
+Canonical family profiles:
+
+```text
+object_blob
+  magic: ANOBJM1\0
+  required tables: 0x0101,0x0102
+  optional tables: 0x0103
+  visibility: ObjectHeader/LinkRecord revision_range
+  body encoding: table directory only; object_header/chunk_entry/link_record names map to table ids
+
+full_text
+  magic: ANFTSG1\0
+  required tables: 0x0201,0x0202,0x0203,0x0204
+  optional tables: 0x0205,0x0206,0x0207,0x0208
+  visibility: all posting/doc/stored/delete rows carry revision_range or generation tombstone
+  body encoding: table directory only; dictionary/postings/positions/doc-values are tables
+
+vector
+  magic: ANVECG1\0
+  required tables: 0x0301,0x0302,0x0303,0x0304,0x0305
+  optional tables: 0x0306,0x0307
+  visibility: vector/id-map/filter rows carry revision_range; delete bitmap by generation
+  body encoding: table directory only; HNSW layers are adjacency rows, not sidecar graph files
+
+typed_index
+  magic: ANTIDX1\0
+  required tables: 0x0401,0x0402,0x0404
+  optional tables: 0x0403,0x0405,0x0406
+  visibility: sorted/bitmap/order/delete rows carry revision_range or generation
+  body encoding: table directory only; range fence table is table 0x0404
+
+authz
+  magic: ANAUTH1\0
+  required tables: 0x0501,0x0502,0x0503,0x0504,0x0506,0x0507,0x0508
+  optional tables: 0x0505
+  visibility: tuple/userset/list rows carry revision_range; schema rows keyed by schema_generation
+  body encoding: table directory only; applies to system and user realms
+
+personaldb
+  magic: ANPDB1\0
+  required tables: 0x0601,0x0602,0x0605,0x0606
+  optional tables: 0x0603,0x0604
+  visibility: changesets immutable by sequence; snapshots/projections by generation
+  body encoding: table directory only
+
+registry
+  magic: ANREG1\0
+  required tables: 0x0701,0x0702,0x0703,0x0704,0x0705
+  optional tables: 0x0706
+  visibility: package/ref/blob rows carry revision_range
+  body encoding: table directory only
+
+mesh_control
+  magic: ANMESH1\0
+  required tables: 0x0801,0x0802,0x0803,0x0804,0x0805,0x0806
+  optional tables: 0x0807,0x0808
+  visibility: rows keyed by effective epoch or event id; old rows retained until no root generation references them
+  body encoding: table directory only
+```
+
+Version rule: table ids are never reused. A backward-compatible row extension may
+append optional fields only after adding a row-version byte inside `value_bytes`
+and documenting the default. A required field change, key tuple change, or sort
+order change requires a new table id and a migration writer.
+
+### 15.21 Writer Table Row Registry
 
 Every table named in writer body diagrams uses `TablePage` from section 15.11.
 The row schemas are:
@@ -2868,6 +3020,15 @@ The row schemas are:
 ```text
 ObjectHeader =
   bucket string, key string, object_version string, content_type string, content_length u64-le, user_metadata_hash Hash, created_at_unix_nanos u64-le, visible_revision_range revision_range
+
+ObjectChunkEntry =
+  bucket string, key string, object_version string, logical_offset u64-le, logical_length u64-le, plaintext_hash hash, pipeline_block_id bytes, compression_id u8, encryption_id u8, dedupe_generation u64-le, block_ref_count_hint u32-le, visible_revision_range revision_range
+
+LinkRecord =
+  bucket string, link_name string, target_object_version string, target_manifest_ref ManifestRangeRef, visible_revision_range revision_range
+
+RangeIndexEntry =
+  logical_start u64-le, logical_end u64-le, record_count u64-le, boundary_values repeated<BoundaryValueRef>, min_key bytes, max_key bytes, stats_ref bytes, visible_revision_range revision_range
 
 PositionBlockRow =
   field_id u32-le, term bytes, doc_id u64-le, positions uleb128 repeated, visible_revision_range revision_range
@@ -3090,6 +3251,58 @@ makes the segment unreadable.
 0x0808 MeshControlBody.anti_entropy_checkpoint_table AntiEntropyCheckpointRow  optional
 ```
 
+#### 15.21.1 Complete Row Layout Registry
+
+The following row layouts are part of the definitive registry. Together with the rows immediately above in section 15.21, they are the only normative row encodings.
+
+```text
+TermDictionaryRow =
+  field_id u32-le, term bytes, doc_freq u64-le, postings_ref ManifestRangeRef, positions_ref optional<ManifestRangeRef>, visible_revision_range revision_range
+
+PostingsBlockRefRow =
+  field_id u32-le, term bytes, block_min_doc_id u64-le, block_max_doc_id u64-le, postings_ref ManifestRangeRef, doc_count u32-le, visible_revision_range revision_range
+
+VectorBlockRow =
+  vector_id_start u64-le, vector_count u32-le, dimension u16-le, element_type u8, vector_bytes_ref ManifestRangeRef, quantizer_ref optional<ManifestRangeRef>, visible_revision_range revision_range
+
+HnswAdjacencyRow =
+  layer u16-le, vector_id u64-le, neighbour_count u16-le, neighbours repeated<u64-le>, visible_revision_range revision_range
+
+SortedColumnRow =
+  field_id u32-le, value TypedValue, object_id string, object_ref ManifestRangeRef, visible_revision_range revision_range
+
+BitmapBlockRow =
+  field_id u32-le, value TypedValue, roaring_bitmap_bytes bytes, object_count u64-le, visible_revision_range revision_range
+
+OrderTupleRow =
+  order_tuple repeated<TypedValue>, object_id string, object_ref ManifestRangeRef, visible_revision_range revision_range
+
+AuthzTupleRow =
+  realm_id string, object_key string, relation string, subject_key string, caveat_id optional<string>, revision_range revision_range
+
+PersonalDbChangesetRow =
+  group_id string, sequence u64-le, actor_id string, base_snapshot_hash hash, changeset_hash hash, changeset_ref ManifestRangeRef, committed_at_unix_nanos u64-le
+
+WitnessRecordRow =
+  group_id string, change_id string, actor_id string, decision u8, fence u64-le, evidence_hash hash, committed_revision u64-le
+
+PackageVersionRow =
+  registry_kind u8, namespace string, package_name string, version string, manifest_ref ManifestRangeRef, published_at_unix_nanos u64-le, visible_revision_range revision_range
+
+RegistryRefRow =
+  registry_kind u8, namespace string, package_name string, ref_name string, target_version string, visible_revision_range revision_range
+
+NodeRow =
+  node_id string, region_id string, cell_id string, advertise_addr string, state u8, capacity_json_hash hash, effective_epoch u64-le
+
+PartitionMapRow =
+  partition_id u64-le, root_kind string, owner_node_id string, owner_fence u64-le, replica_node_ids repeated<string>, effective_epoch u64-le
+
+RootOwnerEpochRow =
+  root_key_hash hash, owner_node_id string, membership_epoch u64-le, owner_fence u64-le, state u8
+```
+
+
 Table row keys are the tuple shown in the writer table mapping sections. The key
 encoding is concatenated `TypedValue` encodings with field separators `0x00` and
 is stored as `min_key`/`max_key` in `TableDirectoryEntry` and `TablePage`.
@@ -3200,7 +3413,7 @@ rules.
 Shard ordering is deterministic:
 
 ```text
-block_id       = blake3(logical_file_id || writer_generation || block_ordinal || plaintext_hash)
+block_id       = Hash(anvil.block.id.v1, canonical(logical_file_id, writer_generation, block_ordinal, plaintext_hash))
 data_shard_i   = reed_solomon_encode(block_bytes)[i] for i in 0..k
 parity_shard_j = reed_solomon_encode(block_bytes)[k+j] for j in 0..m
 shard_id       = block_id || ":" || shard_index
@@ -3234,7 +3447,7 @@ ShardReceipt = {
 }
 ```
 
-`signed_payload_hash` is `blake3(canonical(ShardReceipt without
+`signed_payload_hash` is `Hash(anvil.shard.receipt.v1, canonical(ShardReceipt without
 receipt_signature))`. `receipt_signature` is produced by the node key registered
 in the system realm for `node_id`. A verifier MUST check the node key, cell and
 region membership, placement epoch, fsync sequence, signed payload hash, and
@@ -3500,6 +3713,8 @@ message BoundaryDimension {
   optional uint32 max_values_per_block = 8;
   PlacementAffinity placement_affinity = 9;
   CompactionScope compaction_scope = 10;
+  bool shared_ranges_allowed = 11;
+  repeated string shared_record_kinds = 12;
 }
 
 message BoundarySource {
@@ -3562,6 +3777,14 @@ enum CompactionScope {
   REQUIRE_SAME_VALUE = 3;
 }
 ```
+
+`shared_ranges_allowed` defaults to `false`. When it is `true`,
+`shared_record_kinds` MUST list every writer record kind that may cross values
+for that dimension. A writer marks an exact range as shared by setting
+`LogicalRangeHint.shared_range` before byte-pipeline admission; the marker is
+persisted into `LogicalRange.shared_range` in the logical file manifest. A shared
+marker is valid only when every crossed dimension has `shared_ranges_allowed=true`
+and the marker's `record_kind` is in that dimension's `shared_record_kinds`.
 
 JSON example:
 
@@ -3758,7 +3981,191 @@ BoundaryMigrationInProgress
 BoundaryMigrationFailed
 ```
 
+## 17.11 Boundary Enforcement Order
+
+The byte pipeline MUST enforce boundary constraints in this order. Later rules may
+only refine placement inside the partitions created by earlier rules.
+
+```text
+1. security_realm dimensions
+2. compaction_scope = REQUIRE_SAME_VALUE
+3. max_values_per_block
+4. writer-declared hard range boundaries
+5. encryption range independence
+6. erasure stripe sizing
+7. target block size
+8. placement affinity and observed hotness
+9. preferred compaction/locality hints
+```
+
+`security_realm` is hard. A final block MUST NOT contain two different
+`security_realm` values unless the boundary schema explicitly marks that
+dimension as `shared_ranges_allowed=true` and the writer marks the exact range as
+shared. Shared ranges are allowed only for public catalogue/control data that is
+not tenant-private. Object payloads, user documents, authz tuples, PersonalDB
+changesets, registry credentials, and private indexes MUST NOT use shared
+security ranges.
+
+`compaction_scope=REQUIRE_SAME_VALUE` is hard for compaction and materialisation.
+The writer or byte pipeline must split before merging two different values. If a
+single logical record itself contains multiple values for a required same-value
+dimension, the write fails with `BoundaryRequiredSingleValueViolation` unless the
+record kind is listed as shared in the boundary schema.
+
+`max_values_per_block` is hard for dimensions whose category includes
+`SECURITY_REALM`, `STORAGE_PARTITION`, or `QUERY_PRUNE`. If the selector cannot
+produce blocks within the limit without splitting a writer record, the write
+fails with `BoundaryBlockLimitUnsatisfied`. For `PLACEMENT_AFFINITY`,
+`RETENTION_GROUP`, and `OBSERVABILITY_GROUP`, `max_values_per_block` is a best
+effort hint unless the dimension also has `REQUIRE_SAME_VALUE`.
+
+Split/merge behaviour:
+
+```text
+writer range is smaller than pipeline block
+  -> pipeline may merge adjacent ranges only if hard dimensions match and max-values limits remain valid
+
+writer range is larger than pipeline block
+  -> pipeline may split by byte range only at writer-declared safe split points
+
+no safe split point and hard boundary cannot be satisfied
+  -> reject write before final publication
+
+compaction wants to merge old blocks
+  -> compactor applies the same rules as materialisation and must preserve query-prune statistics
+```
+
+Boundary violations are deterministic failures. Violations detected before WAL
+admission reject the request directly. Violations detected during materialisation
+after client-visible `Committed` transition the mutation to `FinalisationFailed`;
+the mutation remains recoverable evidence for audit/idempotency, is never visible
+to readers, and returns the same failed state on idempotent retry.
+
 ## 18. Logical File Manifest
+
+### 18.0 Canonical Manifest and Locator Schema
+
+This section is the authoritative manifest/locator schema for reads. Any earlier
+section that names `ManifestLocator`, `BlockLocator`, `LogicalFileManifest`,
+`BlockRef`, `ShardRef`, or `ShardReceiptSummary` refers to the structures in this
+section. Earlier diagrams are explanatory only when they omit fields from this
+section. An implementation MUST NOT create a second manifest schema for a writer
+family, gateway, cache, or repair subsystem.
+
+A reader can reconstruct every byte of a logical file using only:
+
+```text
+RootAnchorRecord -> TransactionManifest -> ManifestLocator -> LogicalFileManifest -> BlockLocator -> ShardReceiptSummary
+```
+
+No database row, sidecar file, display path, or feature-specific index may be
+required to resolve this chain.
+
+Canonical locator wire shapes:
+
+```protobuf
+message ManifestRef {
+  string logical_file_id = 1;
+  string writer_family = 2;
+  uint64 writer_generation = 3;
+  string manifest_hash = 4;          // Hash(anvil.logical_file_manifest.v1, stored manifest bytes)
+}
+
+message ManifestLocator {
+  ManifestRef manifest_ref = 1;
+  string manifest_encoding = 2;      // deterministic-protobuf, canonical-cbor, writer-segment
+  uint64 manifest_length = 3;
+  string manifest_hash = 4;
+  repeated BlockLocator block_locators = 5; // sorted by logical_start
+}
+
+message BlockLocator {
+  uint64 logical_start = 1;
+  uint64 logical_end = 2;            // exclusive plaintext logical bytes
+  string block_id = 3;
+  string codec_id = 4;
+  uint32 data_shards = 5;
+  uint32 parity_shards = 6;
+  uint64 plaintext_block_len = 7;
+  uint64 shard_payload_len = 8;
+  uint64 padding_len = 9;
+  string block_plain_hash = 10;
+  string block_encoded_hash = 11;
+  CompressionDescriptor compression = 12;
+  EncryptionDescriptor encryption = 13;
+  string erasure_profile_id = 14;
+  uint64 placement_epoch = 15;
+  repeated ShardReceiptSummary shard_receipts = 16;
+}
+
+message ShardReceiptSummary {
+  string node_id = 1;
+  string region_id = 2;
+  string cell_id = 3;
+  uint32 shard_index = 4;
+  string shard_hash = 5;
+  uint64 shard_length = 6;
+  uint64 fsync_sequence = 7;
+  uint64 written_at_unix_nanos = 8;
+  string signed_payload_hash = 9;
+  string signature_algorithm = 10;
+  bytes receipt_signature = 11;
+}
+```
+
+`codec_id`, `data_shards`, `parity_shards`, `plaintext_block_len`,
+`shard_payload_len`, and `padding_len` MUST match section 16.7.1. A block locator
+with inconsistent codec parameters is corrupt even if enough shard receipts are
+present. Compression and encryption descriptors are per block because compaction
+may rewrite different block ranges with different policies across generations.
+
+Manifest hash rules:
+
+```text
+manifest_hash        = Hash(anvil.logical_file_manifest.v1, deterministic manifest bytes)
+block_plain_hash     = Hash(anvil.block.plain.v1, plaintext block bytes before compression/encryption/EC)
+block_encoded_hash   = Hash(anvil.block.encoded.v1, encoded block bytes after compression/encryption before EC)
+shard_hash           = Hash(anvil.shard.receipt.v1, shard payload bytes)
+```
+
+Compression and encryption descriptors are part of the manifest wire contract:
+
+```protobuf
+message CompressionDescriptor {
+  string algorithm = 1;              // none,zstd
+  uint32 level = 2;                  // 0 for none, zstd level otherwise
+  uint64 uncompressed_length = 3;
+  uint64 compressed_length = 4;
+  string dictionary_id = 5;          // empty when not used
+  string descriptor_hash = 6;        // Hash(anvil.logical_file_manifest.v1, canonical fields 1..5)
+}
+
+message EncryptionDescriptor {
+  string algorithm = 1;              // none,aes-gcm-siv
+  string key_id = 2;                 // empty when algorithm=none
+  bytes nonce = 3;                   // 96-bit for aes-gcm-siv, empty for none
+  string aad_hash = 4;               // hash of authenticated associated data
+  string plaintext_hash = 5;
+  string ciphertext_hash = 6;
+  string descriptor_hash = 7;        // Hash(anvil.logical_file_manifest.v1, canonical fields 1..6)
+}
+```
+
+Per-block descriptors override manifest-level descriptors for the exact block.
+Manifest-level descriptors are defaults for blocks that omit their own descriptor.
+A block with encryption `none` must have empty `key_id`, empty `nonce`, and empty
+`aad_hash`. Encrypted blocks use AAD:
+
+```text
+AAD = canonical(logical_file_id, block_id, logical_start, logical_end,
+                writer_family, manifest_hash, boundary_schema_generation,
+                placement_epoch)
+```
+
+Readers MUST verify descriptor hashes, AAD hash, plaintext/ciphertext hashes,
+nonce length, and key authorisation before returning bytes. Key material is never
+stored in manifests; `key_id` resolves through the authorised key-management path
+for the bucket/realm.
 
 A logical file manifest describes writer output after the byte pipeline has
 chunked, transformed, erasure-coded, and placed it. The manifest itself is
@@ -3780,6 +4187,9 @@ message LogicalFileManifest {
   string erasure_profile_id = 12;
   uint64 placement_epoch = 13;
   string created_by_mutation_id = 14;
+  string codec_id = 15;
+  uint32 data_shards = 16;
+  uint32 parity_shards = 17;
 }
 
 message LogicalRange {
@@ -3791,6 +4201,13 @@ message LogicalRange {
   bytes writer_statistics = 6;
   repeated string block_ids = 7;
   repeated string prefetch_next_range_ids = 8;
+  optional SharedRangeMarker shared_range = 9;
+}
+
+message SharedRangeMarker {
+  string record_kind = 1;
+  string reason = 2;
+  repeated uint32 boundary_dimension_ids = 3;
 }
 
 message BlockRef {
@@ -3802,6 +4219,13 @@ message BlockRef {
   string content_hash = 6;
   string erasure_set_id = 7;
   repeated ShardRef shards = 8;
+  string codec_id = 9;
+  uint32 data_shards = 10;
+  uint32 parity_shards = 11;
+  uint64 plaintext_block_len = 12;
+  uint64 shard_payload_len = 13;
+  uint64 padding_len = 14;
+  string block_encoded_hash = 15;
 }
 
 message ShardRef {
@@ -4168,18 +4592,22 @@ message WriteResponse {
   optional string transaction_manifest_ref = 5;
   string idempotency_outcome = 6;
   optional string retry_after_hint = 7;
+  optional AnvilError finalisation_error = 8;
 }
 
 enum WriteState {
   WRITE_STATE_UNSPECIFIED = 0;
   WRITE_STATE_COMMITTED = 1;
   WRITE_STATE_FINALISED = 2;
+  WRITE_STATE_FINALISATION_FAILED = 3;
 }
 ```
 
 For `WRITE_STATE_COMMITTED`, `root_generation` and `transaction_manifest_ref` are
 empty unless the write finalised before the response was sent. For
-`WRITE_STATE_FINALISED`, both fields are required.
+`WRITE_STATE_FINALISED`, both fields are required. For
+`WRITE_STATE_FINALISATION_FAILED`, both fields are empty and
+`finalisation_error` is required; it names the deterministic finalisation failure.
 
 All list/query requests include a consistency selector and page token:
 
@@ -4266,6 +4694,13 @@ BoundaryMigrationInProgress
 BoundaryMigrationFailed
 ResourceExhaustedWalBacklog
 PageTokenScopeMismatch
+PageTokenGenerationExpired
+InvalidMirrorState
+BoundaryRequiredSingleValueViolation
+BoundaryBlockLimitUnsatisfied
+IndexGenerationMismatch
+IndexCapabilityMissing
+IndexLagNotCaughtUp
 RootGenerationConflict
 RootGenerationInDoubt
 InsufficientPlacementCapacity
@@ -4279,6 +4714,38 @@ The stable wire value is the PascalCase string name. Existing stable names from
 be added to that same stable list before implementation. `UnauthorizedReservedNamespace`
 is the required error for any external read or write attempt against reserved
 Anvil internal namespaces, including `_anvil/authz` and root-register internals.
+
+New RFC-specific error details:
+
+```text
+InvalidMirrorState
+  retryable: false unless details.expected_state includes current state
+  details: mirror_id,current_state,attempt_id
+
+BoundaryRequiredSingleValueViolation
+  retryable: false with same payload
+  details: dimension_id,record_kind,range_id
+
+BoundaryBlockLimitUnsatisfied
+  retryable: false with same payload
+  details: dimension_id,max_values_per_block,observed_values,range_id
+
+IndexGenerationMismatch
+  retryable: true after index catch-up
+  details: requested_generation,available_generation,index_id
+
+IndexCapabilityMissing
+  retryable: false until index definition changes
+  details: index_id,query_operator,required_table
+
+PageTokenGenerationExpired
+  retryable: false for the same token; caller restarts query
+  details: token_generation,oldest_retained_generation
+
+IndexLagNotCaughtUp
+  retryable: true after retry_after_hint
+  details: index_id,required_generation,current_generation,watch_cursor
+```
 
 Gateways must map their protocol-specific errors to this envelope internally so
 tracing, metrics, retries, and release gates can classify failures consistently.
@@ -4575,15 +5042,45 @@ message InternalRequestHeader {
   bytes signature = 6;              // over canonical request minus signature
 }
 
-message BeginMirrorRequest { InternalRequestHeader header = 1; string mutation_id = 2; string request_hash = 3; uint64 expected_bytes = 4; string admission_profile = 5; }
+enum MirrorChunkKind {
+  MIRROR_CHUNK_KIND_UNSPECIFIED = 0;
+  LANDED_BYTE = 1;
+  WAL_FRAME = 2;
+}
+
+message BeginMirrorRequest {
+  InternalRequestHeader header = 1;
+  AdmissionAttemptId attempt_id = 2;
+  string request_hash = 3;
+  repeated LandedByteDescriptor landed_bytes = 4;
+  string expected_wal_frame_hash = 5;
+  string admission_profile = 6;
+}
 message BeginMirrorResponse { string mirror_id = 1; bool accepted = 2; optional AnvilError error = 3; }
-message PutMirrorChunkRequest { InternalRequestHeader header = 1; string mirror_id = 2; uint64 offset = 3; bytes chunk = 4; string chunk_hash = 5; }
-message MirrorChunkAck { string mirror_id = 1; uint64 offset = 2; string chunk_hash = 3; uint64 fsync_sequence = 4; }
-message CommitMirrorRequest { InternalRequestHeader header = 1; string mirror_id = 2; string final_content_hash = 3; uint64 length = 4; }
-message AbortMirrorRequest { InternalRequestHeader header = 1; string mirror_id = 2; string reason = 3; }
-message MirrorReceipt { string mirror_id = 1; string request_hash = 2; string final_content_hash = 3; uint64 fsync_sequence = 4; bytes receipt_signature = 5; }
-message GetMirrorEvidenceRequest { InternalRequestHeader header = 1; string mutation_id = 2; }
-message MirrorEvidence { repeated MirrorReceipt receipts = 1; }
+message PutMirrorChunkRequest {
+  InternalRequestHeader header = 1;
+  string mirror_id = 2;
+  MirrorChunkKind kind = 3;
+  string landing_id = 4;              // required for LANDED_BYTE
+  uint64 offset = 5;
+  bytes chunk = 6;
+  string chunk_hash = 7;
+  uint64 chunk_ordinal = 8;
+  bool final_chunk = 9;
+}
+message MirrorChunkAck { string mirror_id = 1; MirrorChunkKind kind = 2; string landing_id = 3; uint64 offset = 4; string chunk_hash = 5; uint64 fsync_sequence = 6; }
+message CommitMirrorRequest {
+  InternalRequestHeader header = 1;
+  string mirror_id = 2;
+  AdmissionAttemptId attempt_id = 3;
+  string wal_frame_hash = 4;
+  repeated string landed_byte_hashes = 5;
+  repeated string descriptor_hashes = 6;
+}
+message AbortMirrorRequest { InternalRequestHeader header = 1; string mirror_id = 2; AdmissionAttemptId attempt_id = 3; string reason = 4; }
+message MirrorReceipt { AdmissionMirrorReceipt receipt = 1; }
+message GetMirrorEvidenceRequest { InternalRequestHeader header = 1; AdmissionAttemptId attempt_id = 2; }
+message MirrorEvidence { repeated AdmissionMirrorReceipt receipts = 1; optional AdmissionCommitCertificate commit_certificate = 2; optional AdmissionAbortCertificate abort_certificate = 3; }
 
 message PutShardRequest { InternalRequestHeader header = 1; string block_id = 2; uint32 shard_index = 3; string erasure_profile_id = 4; uint64 placement_epoch = 5; bytes shard_bytes = 6; string shard_hash = 7; }
 message GetShardRequest { InternalRequestHeader header = 1; string block_id = 2; uint32 shard_index = 3; optional ByteRange range = 4; }
@@ -4949,21 +5446,225 @@ pub async fn read_logical_range(
 
 ## 22. Query Planning and Authz-Aware Filtering
 
-Query and index reads must be permission-aware before expensive data access.
+Query and index reads must be permission-aware before expensive data access. The
+planner is a shared CoreStore component, not a feature-specific shortcut inside
+one index writer.
 
 ```text
 query predicate
   + boundary filters
   + authz subject/relation/object namespace
+  + root generation / index generation / authz revision
   + index statistics
-  -> candidate range set
+  -> candidate set
+  -> range plan
   -> erasure range reads
-  -> final result verification
+  -> final authz verification
+  -> response page
 ```
 
 Anvil must avoid the failure mode where it scans billions of records and then
 filters nearly all results by authz. Authz writer outputs and index writer outputs
-must be joinable at planning time through revision-aware candidate sets.
+MUST be joinable at planning time through revision-aware candidate sets.
+
+### 22.1 Shared Object and Document Identity
+
+Every searchable or listable record has a stable `CoreDocId` within the index
+partition that produced it. Object blobs, stream records, registry packages,
+PersonalDB groups, and internal control rows all map to `CoreDocId` values when
+they enter an index.
+
+```text
+CoreDocId = u128
+high 64 bits = stable index partition id
+low  64 bits = writer-assigned monotonic document ordinal within that partition
+```
+
+The writer must persist the mapping from external object identity to `CoreDocId`
+in the relevant id-map or stored-field table. The mapping is immutable for a
+visible version. A new object version may receive a new `CoreDocId`, but the
+previous version remains visible for readers pinned to its generation.
+
+Authz rows use `ObjectAuthzKey` rather than raw storage paths:
+
+```text
+ObjectAuthzKey = namespace ":" canonical_object_id
+canonical_object_id for objects = bucket_id "/" object_key "/" version_or_latest_marker
+canonical_object_id for index docs = index_id "/" CoreDocId
+canonical_object_id for registry = registry_kind "/" namespace "/" package "/" version_or_digest
+```
+
+Index writers MUST store enough metadata to map each `CoreDocId` to its
+`ObjectAuthzKey` without fetching the payload.
+
+### 22.2 Candidate Set Representation
+
+Planner components exchange candidate sets in this form:
+
+```text
+CandidateSet =
+  Empty | AllWithinPartition(partition_id, generation) |
+  Bitmap(partition_id, generation, roaring_bitmap_bytes) |
+  SortedDocIdRanges(partition_id, generation, range_count, ranges) |
+  OrderedTuples(partition_id, generation, order_tuple*, doc_id*)
+
+DocIdRange = start_doc_id inclusive, end_doc_id exclusive
+```
+
+`CandidateSet` values carry:
+
+```text
+root_key_hash
+root_generation
+index_id
+index_generation
+authz_realm_id
+authz_revision
+boundary_schema_generation_hash
+predicate_hash
+order_hash
+```
+
+Two candidate sets may be intersected only when these compatibility fields match
+or when an explicit conversion is defined below. If generations differ, the
+planner must either advance the older set by reading its delete/visibility bitmap
+or reject the request with `IndexGenerationMismatch`. Silent mixing is forbidden.
+
+### 22.3 Planner Sequence
+
+The planner MUST execute in this order:
+
+```text
+1. authenticate request and resolve principal
+2. resolve read root generation according to consistency option
+3. resolve authz revision at or before that root generation
+4. validate page token scope if present
+5. compile boundary predicates and select boundary candidate set
+6. ask authz writer for an authz candidate set for subject/relation/object namespace
+7. ask the target index writer for predicate/order candidate sets
+8. intersect boundary, authz, and index candidate sets before payload fetch
+9. choose range reads from writer segment manifests
+10. fetch only required ranges through CoreStore range API
+11. decode rows and perform final authz verification for returned objects
+12. emit page token bound to the same scope fields
+```
+
+Boundary pruning comes before authz when a boundary predicate can discard whole
+segments without reading authz rows. Authz pruning comes before payload/stored
+field fetch. Index predicate pruning may run before or after authz candidate
+retrieval, but the first payload read MUST operate on the intersection of all
+available pruning sets.
+
+### 22.4 Reader Interfaces
+
+The planner talks to writers through these interfaces. Implementations may expose
+them in Rust traits, internal RPC, or in-process services, but semantics are
+fixed.
+
+```rust
+pub trait AuthzCandidateReader {
+    async fn candidate_set(
+        &self,
+        scope: AuthzScope,
+        subject: SubjectKey,
+        relation: RelationKey,
+        object_namespace: ObjectNamespace,
+        revision: AuthzRevision,
+        root_generation: RootGeneration,
+        trace: TraceContext,
+    ) -> Result<CandidateSet>;
+
+    async fn verify_page(
+        &self,
+        scope: AuthzScope,
+        subject: SubjectKey,
+        relation: RelationKey,
+        object_keys: Vec<ObjectAuthzKey>,
+        revision: AuthzRevision,
+        trace: TraceContext,
+    ) -> Result<Vec<AuthzDecision>>;
+}
+
+pub trait IndexCandidateReader {
+    async fn predicate_candidates(
+        &self,
+        index: IndexRef,
+        predicate: QueryPredicate,
+        order: Option<QueryOrder>,
+        generation: IndexGeneration,
+        boundary: Option<BoundaryPredicate>,
+        trace: TraceContext,
+    ) -> Result<CandidateSet>;
+
+    async fn range_plan(
+        &self,
+        candidates: CandidateSet,
+        limit: u32,
+        page_token: Option<PageToken>,
+        trace: TraceContext,
+    ) -> Result<Vec<ReadLogicalRangeRequest>>;
+}
+```
+
+A writer that cannot produce `predicate_candidates` for a supported query shape
+MUST report `IndexCapabilityMissing`; it MUST NOT perform a hidden full scan.
+Full scans are allowed only when the request explicitly sets
+`diagnostic_allow_full_scan=true` and the caller is authorised for index repair or
+diagnostics.
+
+### 22.5 Page Token Contract
+
+Page tokens are canonical, signed, and bound to the query plan.
+
+```text
+PageToken = {
+  schema: "anvil.query.page_token.v1",
+  tenant_scope_hash,
+  bucket_or_namespace_hash,
+  root_key_hash,
+  root_generation,
+  index_id,
+  index_generation,
+  authz_realm_id,
+  authz_revision,
+  boundary_schema_generation_hash,
+  predicate_hash,
+  order_hash,
+  last_sort_tuple,
+  last_doc_id,
+  expires_at_unix_nanos,
+  issued_by_node_id
+}
+page_token_hash = Hash(anvil.page_token.v1, canonical(PageToken without signature))
+```
+
+A token with a different predicate, order, authz revision, index generation, root
+generation, or boundary generation fails with `PageTokenScopeMismatch`. A token
+whose referenced generation has been compacted away fails with
+`PageTokenGenerationExpired`; the caller must restart the query.
+
+### 22.6 Metrics and Failure Modes
+
+Each query plan emits:
+
+```text
+input_candidate_count
+boundary_candidate_count
+authz_candidate_count
+index_candidate_count
+intersection_candidate_count
+payload_ranges_planned
+payload_bytes_planned
+payload_bytes_read
+full_scan_forbidden_count
+```
+
+If authz candidate retrieval fails, the query fails closed. If an index candidate
+set is stale relative to the requested root generation, the planner attempts a
+watch-driven catch-up. If catch-up cannot reach the required generation within
+the request deadline, it fails with `IndexLagNotCaughtUp` unless the request
+explicitly accepts stale results. Stale results are never allowed for authz
+checks.
 
 ## 23. Compaction, Tombstones, and Deletes
 
@@ -5511,6 +6212,170 @@ cluster profile:    MinIO distributed with the same node count and disks as Anvi
 version:            pinned in ops/perf/baseline-manifest.json
 bucket versioning:  enabled when comparing versioned Anvil operations
 ```
+
+### 26.1a Baseline Manifest Schema
+
+Every baseline run is driven by `ops/perf/baseline-manifest.json`. The manifest
+is part of the release contract. A release gate MUST record the exact manifest in
+`target/anvil/perf/<run-id>/baseline-manifest.json` and include its hash in the
+summary.
+
+```json
+{
+  "schema": "anvil.perf.baseline_manifest.v1",
+  "dataset_id": "anvil-corestore-baseline-v1",
+  "seed": "anvil-corestore-baseline-v1-seed-42",
+  "hardware_profile": {
+    "name": "release-10-node-nvme",
+    "nodes": 10,
+    "cells": 5,
+    "regions": 1,
+    "disk_class": "nvme",
+    "network_gbps": 10
+  },
+  "warmup": {"duration_seconds": 300, "discard_metrics": true},
+  "run": {"duration_seconds": 1800, "sample_traces_per_scenario": 1000},
+  "object_distribution": {
+    "tenant_count": 100000,
+    "project_count": 1000,
+    "small_weights": {"1KiB": 40, "4KiB": 35, "16KiB": 20, "64KiB": 5},
+    "medium_weights": {"256KiB": 50, "1MiB": 35, "4MiB": 15},
+    "large_weights": {"128MiB": 80, "1GiB": 19, "5GiB": 1},
+    "key_algorithm": "corestore-key-fixed-v1 mapped to /tenant/{tenant}/project/{project}/object/{ordinal}",
+    "metadata_algorithm": "deterministic tenant/project/content_type/day from seed and ordinal"
+  },
+  "query_corpus": {
+    "text_generator": "markov-fixed-v1",
+    "query_selector": "query-selector-fixed-v1",
+    "term_queries": 1000,
+    "boolean_queries": 1000,
+    "phrase_queries": 500,
+    "field_queries": 500,
+    "selectivity_buckets": [0.0001, 0.001, 0.01, 0.1]
+  },
+  "vector_corpus": {
+    "generator": "deterministic-normalized-random-v1",
+    "dimensions": [384, 768],
+    "oracle_sample_size": 100000,
+    "recall_k": 20,
+    "distance": "cosine"
+  },
+  "authz_graph": {
+    "generator": "authz-graph-fixed-v1",
+    "tenants": 100000,
+    "subjects": 1000000,
+    "objects": 10000000,
+    "direct_relation_ratio": 0.55,
+    "computed_userset_ratio": 0.30,
+    "tuple_to_userset_ratio": 0.15,
+    "max_traversal_depth": 8
+  },
+  "personaldb": {
+    "generator": "personaldb-changeset-fixed-v1",
+    "groups": 10000,
+    "actors_per_group": 8,
+    "changeset_size_weights": {"1KiB": 40, "4KiB": 40, "16KiB": 15, "64KiB": 5},
+    "conflict_ratio": 0.03,
+    "snapshot_every_changesets": 1000
+  },
+  "references": {
+    "minio": {
+      "image": "minio/minio:RELEASE.2026-06-13T11-33-47Z",
+      "config": "single-node-nvme-or-distributed-matching-anvil",
+      "versioning": true
+    },
+    "external_comparisons": [
+      {"name": "s3-compatible-cloud", "required": false, "skip_reason_required_when_absent": true}
+    ]
+  },
+  "pass_fail": {
+    "object_thresholds": "section-26.2",
+    "non_object_thresholds": "section-26.3",
+    "regression_threshold_percent": 10,
+    "minimum_valid_samples_per_metric": 1000
+  }
+}
+```
+
+Generator algorithms MUST be deterministic from `(dataset_id, seed, scenario,
+ordinal)`. The manifest MUST name every distribution weight used by the generator
+so a release run can be reproduced on another cluster. `Where hardware permits`
+means the release manifest may define a smaller laptop smoke profile, but the
+production release profile must either run the full counts in section 26.1 or
+record an explicit signed release exception.
+
+Generator definitions:
+
+```text
+base_prng
+  algorithm: ChaCha20Rng
+  seed: first 32 bytes of Hash(anvil.query.plan.v1, canonical(dataset_id, seed, scenario))
+  draws: little-endian u64 values; floating draws are u64 / 2^64
+
+weighted_choice
+  sum integer weights in manifest order; draw u64 % sum; choose first cumulative bucket greater than draw
+
+key_algorithm
+  tenant_no = ordinal % tenant_count
+  project_no = (ordinal / tenant_count) % project_count
+  suffix = hex(Hash(anvil.query.plan.v1, canonical(seed, scenario, ordinal)))[0..24]
+  key = "/tenant/" tenant_no "/project/" project_no "/object/" suffix
+
+metadata_algorithm
+  tenant_count = manifest.object_distribution.tenant_count
+  project_count = manifest.object_distribution.project_count
+  tenant_no = ordinal % tenant_count
+  project_no = (ordinal / tenant_count) % project_count
+  uuid namespace = first 16 bytes of Hash(anvil.query.plan.v1, canonical(dataset_id, "tenant-uuid-namespace"))
+  customer_tenant = RFC 4122 UUIDv5(namespace, decimal tenant_no)
+  project = "project-" + zero-padded 6 digit project_no
+  content_type chosen by weighted_choice({application/json:40,text/plain:30,application/octet-stream:30})
+  created_day = 2026-01-01 + (ordinal % 365) days
+
+markov-fixed-v1
+  corpus: checked-in ops/perf/corpus/english-technical-100k.txt
+  tokenizer: lowercase Unicode words, NFC, split on non-alphanumeric
+  model: order-2 Markov transitions built deterministically from corpus order
+  transition choice: weighted_choice over next-token counts, ties by UTF-8 byte order
+  document length: weighted_choice({64:30,256:40,1024:25,4096:5}) words
+
+query-selector-fixed-v1
+  term query i: choose document ordinal (i * 7919) % document_count, choose token ordinal from PRNG, use that token
+  boolean query i: choose three term queries 3i,3i+1,3i+2; operator pattern cycles AND,OR,AND_NOT
+  phrase query i: choose document ordinal (i * 104729) % document_count, span length = 2 + (PRNG % 4), start = PRNG % (doc_len - span_len + 1)
+  field query i: field cycles title,body,tenant,project; predicate value from generated document metadata at ordinal (i * 15485863) % document_count
+  selectivity bucket: query i uses bucket i % len(selectivity_buckets); regenerate by advancing PRNG until measured oracle selectivity is within bucket tolerance +/- 20%
+
+deterministic-normalized-random-v1
+  distribution: PRNG draws f32 in [-1,1]
+  normalization: L2 normalize; zero vector is regenerated
+  dimensions: exactly manifest dimension
+  oracle: brute-force cosine over oracle_sample_size documents selected by ordinal stride max(1, floor(vector_count / oracle_sample_size))
+
+authz-graph-fixed-v1
+  tenant id: tenant-<zero-padded ordinal>
+  subject id: user-<zero-padded ordinal>
+  object id: object CoreDocId from object generator ordinal
+  direct tuple for object ordinal O: subject (O * 1103515245 + 12345) % subjects has reader on object O when PRNG draw < direct_relation_ratio
+  computed userset: every tenant has groups group-0..group-31; subject joins group (subject_no % 32); object grants group reader when PRNG draw < computed_userset_ratio
+  tuple-to-userset: project relation maps project:<project_no>#member to objects in project when PRNG draw < tuple_to_userset_ratio
+  traversal depth capped at max_traversal_depth; tuples beyond cap are not generated
+
+personaldb-changeset-fixed-v1
+  group id: pdb-<zero-padded group ordinal>
+  actor id: actor-<group ordinal>-<actor ordinal>
+  sequence: monotonically increasing per actor
+  operation mix by PRNG: insert 45%, update 35%, delete 10%, schema-metadata 10%
+  key: /table/<0..15>/row/<Hash(anvil.query.plan.v1, canonical(seed, group, actor, sequence))[0..16]>
+  value bytes: markov-fixed-v1 JSON string for text fields plus deterministic integer/timestamp fields
+  conflict generation: conflict_ratio of changesets reuse a key written by another actor in same group within previous 128 sequences
+  snapshot boundary: every snapshot_every_changesets committed group changesets
+```
+
+Pass/fail calculation uses p95 and throughput from the steady-state run window
+after warmup. A scenario is invalid when it has fewer than the required samples,
+missing required trace spans, missing required metric series, or reference-store
+configuration drift from the manifest. Invalid scenarios fail the release gate.
 
 ### 26.2 Object Store Baselines
 
