@@ -129,11 +129,18 @@ pub async fn request_id_mw(
     req.extensions_mut()
         .insert(AnvilRequestId(request_id.clone()));
 
-    let mut response = next.run(req).await;
+    let context = vec![
+        ("request_id".to_string(), request_id.clone()),
+        ("plane".to_string(), plane.to_string()),
+        ("method".to_string(), method.clone()),
+        ("path".to_string(), path.clone()),
+    ];
+    let mut response = crate::perf::with_context(context, next.run(req)).await;
     let status = response.status().as_u16().to_string();
     crate::perf::record_duration(
         "anvil_request",
         &[
+            ("request_id", request_id.as_str()),
             ("plane", plane),
             ("method", method.as_str()),
             ("path", path.as_str()),

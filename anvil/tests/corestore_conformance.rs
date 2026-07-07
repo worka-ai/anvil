@@ -368,6 +368,9 @@ fn rfc_0006_local_storage_guard_prevents_authoritative_feature_file_writes() {
         "anvil-core/src/system_realm.rs",
         // Snapshot builder uses SQLite scratch files before writing snapshots through CoreStore.
         "anvil-core/src/personaldb_snapshot_builder.rs",
+        // Performance tracing writes optional external telemetry files and never owns
+        // authoritative Anvil state.
+        "anvil-core/src/perf.rs",
     ]);
 
     let forbidden_write_patterns = [

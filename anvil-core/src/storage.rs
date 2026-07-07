@@ -1,6 +1,7 @@
 use anyhow::Result;
 use futures_util::StreamExt;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tracing::info;
@@ -93,18 +94,55 @@ impl Storage {
         info!("stream_to_temp_file called");
         let upload_id = uuid::Uuid::new_v4().to_string();
         let temp_path = self.get_temp_payload_path(&upload_id);
+        let started_at = Instant::now();
         let mut file = fs::File::create(&temp_path).await?;
+        crate::perf::record_io_duration(
+            "storage",
+            "temp_file_create",
+            &temp_path,
+            0,
+            started_at.elapsed(),
+        );
 
         let mut overall_hasher = blake3::Hasher::new();
         let mut total_bytes = 0;
+        let mut chunk_count = 0u64;
+        let mut write_duration = std::time::Duration::ZERO;
 
         while let Some(chunk_result) = data_stream.next().await {
             let chunk = chunk_result.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let started_at = Instant::now();
             file.write_all(&chunk).await?;
+            write_duration += started_at.elapsed();
             overall_hasher.update(&chunk);
             total_bytes += chunk.len() as i64;
+            chunk_count = chunk_count.saturating_add(1);
         }
+        crate::perf::record_io_duration(
+            "storage",
+            "temp_file_write_all_chunks",
+            &temp_path,
+            total_bytes as u64,
+            write_duration,
+        );
+        crate::perf::record_counter(
+            "anvil_file_io_chunks",
+            &[
+                ("component", "storage"),
+                ("operation", "temp_file_write_all_chunks"),
+                ("file_path", temp_path.to_string_lossy().as_ref()),
+            ],
+            chunk_count,
+        );
+        let started_at = Instant::now();
         file.flush().await?;
+        crate::perf::record_io_duration(
+            "storage",
+            "temp_file_flush",
+            &temp_path,
+            total_bytes as u64,
+            started_at.elapsed(),
+        );
 
         let content_hash = overall_hasher.finalize().to_hex().to_string();
         info!(

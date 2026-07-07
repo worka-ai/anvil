@@ -18,6 +18,7 @@ use crate::{
 use futures_util::{Stream, StreamExt};
 use serde_json::Value as JsonValue;
 use std::pin::Pin;
+use std::time::Instant;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
@@ -229,12 +230,28 @@ impl ObjectManager {
             step_start.elapsed(),
         );
         let step_start = std::time::Instant::now();
+        let io_start = Instant::now();
         let payload = tokio::fs::read(&temp_path)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        crate::perf::record_io_duration(
+            "object_manager",
+            "read_temp_payload",
+            &temp_path,
+            payload.len() as u64,
+            io_start.elapsed(),
+        );
+        let io_start = Instant::now();
         tokio::fs::remove_file(&temp_path)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        crate::perf::record_io_duration(
+            "object_manager",
+            "remove_temp_payload",
+            &temp_path,
+            total_bytes as u64,
+            io_start.elapsed(),
+        );
         crate::emit_test_timing(
             "object_manager.put_object read_and_remove_temp_file",
             step_start.elapsed(),
@@ -341,12 +358,28 @@ impl ObjectManager {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        let io_start = Instant::now();
         let payload = tokio::fs::read(&temp_path)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        crate::perf::record_io_duration(
+            "object_manager",
+            "read_temp_multipart_part",
+            &temp_path,
+            payload.len() as u64,
+            io_start.elapsed(),
+        );
+        let io_start = Instant::now();
         tokio::fs::remove_file(&temp_path)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        crate::perf::record_io_duration(
+            "object_manager",
+            "remove_temp_multipart_part",
+            &temp_path,
+            bytes as u64,
+            io_start.elapsed(),
+        );
         let object_ref = self
             .core_store
             .put_blob(PutBlob {

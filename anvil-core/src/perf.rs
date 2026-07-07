@@ -1,4 +1,6 @@
 use std::fmt::Write as _;
+use std::future::Future;
+use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -27,6 +29,10 @@ struct PerfSink {
 }
 
 static PERF_SINK: OnceLock<Option<PerfSink>> = OnceLock::new();
+
+tokio::task_local! {
+    static PERF_CONTEXT: Vec<(String, String)>;
+}
 
 enum PerfMessage {
     Event(PerfEvent),
@@ -79,6 +85,38 @@ pub fn record_duration(measurement: &str, labels: &[(&str, &str)], duration: Dur
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect(),
         fields,
+        timestamp_ns: unix_timestamp_nanos(),
+    });
+}
+
+pub fn record_io_duration(
+    component: &str,
+    operation: &str,
+    path: &Path,
+    bytes: u64,
+    duration: Duration,
+) {
+    if !enabled() {
+        return;
+    }
+    emit(PerfEvent {
+        measurement: "anvil_file_io".to_string(),
+        labels: vec![
+            ("component".to_string(), component.to_string()),
+            ("operation".to_string(), operation.to_string()),
+            ("file_path".to_string(), path.to_string_lossy().into_owned()),
+        ],
+        fields: vec![
+            (
+                "duration_nanos".to_string(),
+                PerfField::U128(duration.as_nanos()),
+            ),
+            (
+                "duration_ms".to_string(),
+                PerfField::F64(duration.as_secs_f64() * 1000.0),
+            ),
+            ("bytes".to_string(), PerfField::U64(bytes)),
+        ],
         timestamp_ns: unix_timestamp_nanos(),
     });
 }
@@ -136,6 +174,15 @@ pub async fn flush() {
     }
 }
 
+pub async fn with_context<F, T>(labels: Vec<(String, String)>, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    let mut combined = PERF_CONTEXT.try_with(Clone::clone).unwrap_or_default();
+    merge_labels(&mut combined, labels);
+    PERF_CONTEXT.scope(combined, future).await
+}
+
 impl Drop for PerfGuard {
     fn drop(&mut self) {
         let labels = self
@@ -147,11 +194,36 @@ impl Drop for PerfGuard {
     }
 }
 
-fn emit(event: PerfEvent) {
+fn emit(mut event: PerfEvent) {
     let Some(sink) = PERF_SINK.get_or_init(init_sink).as_ref() else {
         return;
     };
+    event.labels = labels_with_context(event.labels);
     let _ = sink.tx.send(PerfMessage::Event(event));
+}
+
+fn labels_with_context(mut labels: Vec<(String, String)>) -> Vec<(String, String)> {
+    if let Ok(context) = PERF_CONTEXT.try_with(Clone::clone) {
+        for (key, value) in context {
+            if !labels.iter().any(|(existing, _)| existing == &key) {
+                labels.push((key, value));
+            }
+        }
+    }
+    labels
+}
+
+fn merge_labels(target: &mut Vec<(String, String)>, labels: Vec<(String, String)>) {
+    for (key, value) in labels {
+        if let Some((_, existing)) = target
+            .iter_mut()
+            .find(|(existing_key, _)| existing_key == &key)
+        {
+            *existing = value;
+        } else {
+            target.push((key, value));
+        }
+    }
 }
 
 fn init_sink() -> Option<PerfSink> {
@@ -310,5 +382,40 @@ mod tests {
         assert!(line.contains("duration_nanos=42i"));
         assert!(line.contains("note=\"a \\\"quoted\\\" value\""));
         assert!(line.ends_with(" 7"));
+    }
+
+    #[tokio::test]
+    async fn context_labels_are_added_without_overriding_event_labels() {
+        let event = with_context(
+            vec![
+                ("request_id".to_string(), "req-1".to_string()),
+                ("path".to_string(), "/outer".to_string()),
+            ],
+            async {
+                PerfEvent {
+                    measurement: "anvil_request".to_string(),
+                    labels: labels_with_context(vec![("path".to_string(), "/event".to_string())]),
+                    fields: vec![("duration_nanos".to_string(), PerfField::U64(42))],
+                    timestamp_ns: 7,
+                }
+            },
+        )
+        .await;
+
+        assert!(
+            event
+                .labels
+                .contains(&("request_id".to_string(), "req-1".to_string()))
+        );
+        assert!(
+            event
+                .labels
+                .contains(&("path".to_string(), "/event".to_string()))
+        );
+        assert!(
+            !event
+                .labels
+                .contains(&("path".to_string(), "/outer".to_string()))
+        );
     }
 }

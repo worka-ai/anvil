@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
@@ -135,7 +135,15 @@ struct CoreStoreLock {
 
 impl Drop for CoreStoreLock {
     fn drop(&mut self) {
+        let started_at = Instant::now();
         let _ = std::fs::remove_file(&self.path);
+        crate::perf::record_io_duration(
+            "core_store",
+            "lock_remove_on_drop",
+            &self.path,
+            0,
+            started_at.elapsed(),
+        );
     }
 }
 
@@ -196,10 +204,12 @@ impl CoreStore {
     }
 
     pub async fn put_blob(&self, input: PutBlob) -> Result<CoreObjectRef> {
+        let _perf_guard = crate::perf::guard("anvil_core_store_op", &[("operation", "put_blob")]);
         self.ensure_layout().await?;
         validate_logical_id(&input.logical_name, "blob logical name")?;
         let hash = sha256_hex(&input.bytes);
         let shards = encode_erasure_shards(&input.bytes)?;
+
         for (shard_index, shard) in shards.iter().enumerate() {
             let node_id = format!("{LOCAL_NODE_ID_PREFIX}-{}", shard_index + 1);
             let shard_hash = sha256_hex(shard);
@@ -218,6 +228,7 @@ impl CoreStore {
     }
 
     pub async fn get_blob(&self, input: GetBlob) -> Result<Vec<u8>> {
+        let _perf_guard = crate::perf::guard("anvil_core_store_op", &[("operation", "get_blob")]);
         let expected_hash = strip_sha256_prefix(&input.object_ref.hash)?;
         let manifest = self.read_object_manifest(&input.object_ref).await?;
         if manifest.object_hash != input.object_ref.hash {
@@ -289,7 +300,7 @@ impl CoreStore {
                 placement.shard_index,
                 shard_hash,
             );
-            let shard_bytes = match fs::read(&shard_path).await {
+            let shard_bytes = match read_file(&shard_path, "core_store", "read_blob_shard").await {
                 Ok(bytes) => bytes,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => {
@@ -340,6 +351,8 @@ impl CoreStore {
     }
 
     pub async fn append_stream(&self, input: AppendStreamRecord) -> Result<StreamAppendReceipt> {
+        let _perf_guard =
+            crate::perf::guard("anvil_core_store_op", &[("operation", "append_stream")]);
         validate_logical_id(&input.stream_id, "stream id")?;
         validate_logical_id(&input.partition_id, "partition id")?;
         let _stream_guard = self.acquire_stream_lock(&input.stream_id).await?;
@@ -433,6 +446,8 @@ impl CoreStore {
     }
 
     pub async fn read_stream(&self, input: ReadStream) -> Result<Vec<StreamRecord>> {
+        let _perf_guard =
+            crate::perf::guard("anvil_core_store_op", &[("operation", "read_stream")]);
         validate_logical_id(&input.stream_id, "stream id")?;
         let mut records = self.read_all_stream_records(&input.stream_id).await?;
         records = self.filter_committed_stream_records(records).await?;
@@ -588,6 +603,8 @@ impl CoreStore {
     }
 
     pub async fn acquire_fence(&self, input: AcquireFence) -> Result<FencedPermit> {
+        let _perf_guard =
+            crate::perf::guard("anvil_core_store_op", &[("operation", "acquire_fence")]);
         validate_logical_id(&input.fence_name, "fence name")?;
         validate_logical_id(
             &input.authenticated_principal,
@@ -662,6 +679,8 @@ impl CoreStore {
     }
 
     pub async fn release_fence(&self, input: ReleaseFence) -> Result<()> {
+        let _perf_guard =
+            crate::perf::guard("anvil_core_store_op", &[("operation", "release_fence")]);
         validate_logical_id(&input.fence_name, "fence name")?;
         validate_logical_id(
             &input.authenticated_principal,
@@ -1004,7 +1023,7 @@ impl CoreStore {
                 if path.extension().and_then(|value| value.to_str()) != Some("anstream") {
                     continue;
                 }
-                let bytes = match fs::read(&path).await {
+                let bytes = match read_file(&path, "core_store", "read_stream_id_from_data").await {
                     Ok(bytes) => bytes,
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(err) => {
@@ -1028,6 +1047,10 @@ impl CoreStore {
     }
 
     pub async fn compare_and_swap_ref(&self, input: CompareAndSwapRef) -> Result<CasRefReceipt> {
+        let _perf_guard = crate::perf::guard(
+            "anvil_core_store_op",
+            &[("operation", "compare_and_swap_ref")],
+        );
         validate_logical_id(&input.ref_name, "ref name")?;
         let ref_name = input.ref_name.clone();
         let expected_generation = input.expected_generation;
@@ -1284,6 +1307,10 @@ impl CoreStore {
         &self,
         batch: CoreMutationBatch,
     ) -> Result<CoreMutationBatchReceipt> {
+        let _perf_guard = crate::perf::guard(
+            "anvil_core_store_op",
+            &[("operation", "commit_mutation_batch")],
+        );
         let total_start = std::time::Instant::now();
         let timing_name = batch.transaction_id.clone();
         validate_logical_id(&batch.transaction_id, "transaction id")?;
@@ -1689,7 +1716,15 @@ impl CoreStore {
             self.storage.core_store_replicas_path(),
             self.storage.core_store_staging_path(),
         ] {
-            fs::create_dir_all(path).await?;
+            let started_at = Instant::now();
+            fs::create_dir_all(&path).await?;
+            crate::perf::record_io_duration(
+                "core_store",
+                "ensure_layout_create_dir_all",
+                &path,
+                0,
+                started_at.elapsed(),
+            );
         }
         Ok(())
     }
@@ -1890,15 +1925,31 @@ impl CoreStore {
             .join(kind)
             .join(format!("{}.lock", logical_file_name(id)));
         if let Some(parent) = lock_path.parent() {
+            let started_at = Instant::now();
             fs::create_dir_all(parent).await?;
+            crate::perf::record_io_duration(
+                "core_store",
+                "lock_create_dir_all",
+                parent,
+                0,
+                started_at.elapsed(),
+            );
         }
         for _ in 0..CORE_REF_LOCK_RETRY_ATTEMPTS {
-            match OpenOptions::new()
+            let started_at = Instant::now();
+            let open_result = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&lock_path)
-                .await
-            {
+                .await;
+            crate::perf::record_io_duration(
+                "core_store",
+                "lock_create_new",
+                &lock_path,
+                0,
+                started_at.elapsed(),
+            );
+            match open_result {
                 Ok(_) => return Ok(CoreStoreLock { path: lock_path }),
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                     tokio::time::sleep(CORE_REF_LOCK_RETRY_DELAY).await;
@@ -1955,7 +2006,7 @@ impl CoreStore {
             let mut found = 0usize;
             for node_id in local_control_node_ids() {
                 let path = replica_path(self, &node_id);
-                let bytes = match fs::read(&path).await {
+                let bytes = match read_file(&path, "core_store", "read_quorum_replica").await {
                     Ok(bytes) => bytes,
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(err) => {
@@ -2857,21 +2908,82 @@ fn crc32c(bytes: &[u8]) -> u32 {
     !crc
 }
 
+async fn read_file(
+    path: &PathBuf,
+    component: &'static str,
+    operation: &'static str,
+) -> std::io::Result<Vec<u8>> {
+    let started_at = Instant::now();
+    let result = fs::read(path).await;
+    let bytes = result.as_ref().map(|bytes| bytes.len() as u64).unwrap_or(0);
+    crate::perf::record_io_duration(component, operation, path, bytes, started_at.elapsed());
+    result
+}
+
 async fn write_file_atomic(path: &PathBuf, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
+        let started_at = Instant::now();
         fs::create_dir_all(parent).await?;
+        crate::perf::record_io_duration(
+            "core_store",
+            "create_dir_all",
+            parent,
+            0,
+            started_at.elapsed(),
+        );
     }
     let file_name = path
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| anyhow!("CoreStore atomic write path has no file name"))?;
     let tmp_path = path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+    let started_at = Instant::now();
     let mut file = fs::File::create(&tmp_path).await?;
+    crate::perf::record_io_duration(
+        "core_store",
+        "file_create",
+        &tmp_path,
+        0,
+        started_at.elapsed(),
+    );
+    let started_at = Instant::now();
     file.write_all(bytes).await?;
+    crate::perf::record_io_duration(
+        "core_store",
+        "write_all",
+        &tmp_path,
+        bytes.len() as u64,
+        started_at.elapsed(),
+    );
+    let started_at = Instant::now();
     file.sync_all().await?;
+    crate::perf::record_io_duration(
+        "core_store",
+        "sync_all",
+        &tmp_path,
+        bytes.len() as u64,
+        started_at.elapsed(),
+    );
     drop(file);
-    if let Err(err) = fs::rename(&tmp_path, path).await {
+    let started_at = Instant::now();
+    let rename_result = fs::rename(&tmp_path, path).await;
+    crate::perf::record_io_duration(
+        "core_store",
+        "rename",
+        path,
+        bytes.len() as u64,
+        started_at.elapsed(),
+    );
+    if let Err(err) = rename_result {
+        let started_at = Instant::now();
         let _ = fs::remove_file(&tmp_path).await;
+        crate::perf::record_io_duration(
+            "core_store",
+            "remove_temp_after_failed_rename",
+            &tmp_path,
+            bytes.len() as u64,
+            started_at.elapsed(),
+        );
         return Err(err).with_context(|| {
             format!(
                 "commit CoreStore atomic write {} -> {}",

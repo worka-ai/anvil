@@ -104,22 +104,33 @@ pub async fn start_node_with_admin_listener(
                 .headers()
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
+                .unwrap_or("")
+                .to_string();
 
             let plane = if content_type.starts_with("application/grpc") {
                 "public-grpc"
             } else {
                 "s3"
             };
-            let response = if content_type.starts_with("application/grpc") {
-                grpc_router.oneshot(req).await
-            } else {
-                tracing::info!(
-                    "[gRPC Mux] Routing to S3 gateway for content-type: {}",
-                    content_type
-                );
-                s3_router.oneshot(req).await
-            };
+            let mux_request_id = uuid::Uuid::new_v4().simple().to_string();
+            let context = vec![
+                ("mux_request_id".to_string(), mux_request_id.clone()),
+                ("plane".to_string(), plane.to_string()),
+                ("method".to_string(), method.clone()),
+                ("path".to_string(), path.clone()),
+            ];
+            let response = anvil_core::perf::with_context(context, async move {
+                if content_type.starts_with("application/grpc") {
+                    grpc_router.oneshot(req).await
+                } else {
+                    tracing::info!(
+                        "[gRPC Mux] Routing to S3 gateway for content-type: {}",
+                        content_type
+                    );
+                    s3_router.oneshot(req).await
+                }
+            })
+            .await;
             let status = response
                 .as_ref()
                 .map(|response| response.status().as_u16().to_string())
@@ -127,6 +138,7 @@ pub async fn start_node_with_admin_listener(
             anvil_core::perf::record_duration(
                 "anvil_request_mux",
                 &[
+                    ("mux_request_id", mux_request_id.as_str()),
                     ("plane", plane),
                     ("method", method.as_str()),
                     ("path", path.as_str()),

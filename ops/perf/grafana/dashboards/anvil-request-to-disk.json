@@ -1,6 +1,6 @@
 {
-  "uid": "anvil-performance",
-  "title": "Anvil Performance",
+  "uid": "anvil-request-to-disk",
+  "title": "Anvil Request To Disk",
   "tags": [
     "anvil",
     "performance"
@@ -16,71 +16,13 @@
   "panels": [
     {
       "id": 1,
-      "type": "table",
-      "title": "Slowest performance cases",
-      "gridPos": {
-        "x": 0,
-        "y": 0,
-        "w": 12,
-        "h": 8
-      },
-      "datasource": {
-        "type": "mysql",
-        "uid": "greptime"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "mysql",
-            "uid": "greptime"
-          },
-          "format": "table",
-          "rawSql": "SELECT `case`, COUNT(*) AS samples, AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms FROM anvil_perf_case GROUP BY `case` ORDER BY max_ms DESC LIMIT 30",
-          "rawQuery": true
-        }
-      ],
-      "options": {},
-      "description": "High-level test case duration. Start here to see which end-to-end operation is slow."
-    },
-    {
-      "id": 2,
-      "type": "table",
-      "title": "Request latency by route",
-      "gridPos": {
-        "x": 12,
-        "y": 0,
-        "w": 12,
-        "h": 8
-      },
-      "datasource": {
-        "type": "mysql",
-        "uid": "greptime"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "mysql",
-            "uid": "greptime"
-          },
-          "format": "table",
-          "rawSql": "SELECT path, status, COUNT(*) AS requests, AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms FROM anvil_request GROUP BY path, status ORDER BY max_ms DESC LIMIT 30",
-          "rawQuery": true
-        }
-      ],
-      "options": {},
-      "description": "Public/admin request latency after route middleware, grouped by route and status."
-    },
-    {
-      "id": 3,
       "type": "timeseries",
-      "title": "Request latency over time",
+      "title": "Mux latency over time",
       "gridPos": {
         "x": 0,
-        "y": 8,
+        "y": 0,
         "w": 24,
-        "h": 8
+        "h": 7
       },
       "datasource": {
         "type": "mysql",
@@ -94,11 +36,12 @@
             "uid": "greptime"
           },
           "format": "time_series",
-          "rawSql": "SELECT greptime_timestamp AS time, CONCAT(path, ' ', status) AS metric, duration_ms FROM anvil_request ORDER BY greptime_timestamp",
+          "rawSql": "SELECT greptime_timestamp AS time, CONCAT(plane, ' ', method, ' ', path, ' ', status) AS metric, duration_ms FROM anvil_request_mux ORDER BY greptime_timestamp",
           "rawQuery": true
         }
       ],
       "options": {},
+      "description": "Outer public listener dispatch latency before/through gRPC or S3 routing.",
       "fieldConfig": {
         "defaults": {
           "unit": "ms"
@@ -107,14 +50,14 @@
       }
     },
     {
-      "id": 4,
+      "id": 2,
       "type": "table",
-      "title": "CoreStore operation latency",
+      "title": "Request-correlated CoreStore calls",
       "gridPos": {
         "x": 0,
-        "y": 16,
+        "y": 7,
         "w": 12,
-        "h": 8
+        "h": 10
       },
       "datasource": {
         "type": "mysql",
@@ -128,22 +71,86 @@
             "uid": "greptime"
           },
           "format": "table",
-          "rawSql": "SELECT operation, COUNT(*) AS calls, AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms FROM anvil_core_store_op GROUP BY operation ORDER BY max_ms DESC LIMIT 30",
+          "rawSql": "SELECT request_id, mux_request_id, plane, method, path, operation, duration_ms FROM anvil_core_store_op WHERE request_id IS NOT NULL ORDER BY greptime_timestamp DESC LIMIT 200",
           "rawQuery": true
         }
       ],
       "options": {},
-      "description": "Top-level CoreStore operations such as put_blob, append_stream, mutation batches, CAS and fences."
+      "description": "Correlates public/admin request IDs with CoreStore calls made while serving the request."
+    },
+    {
+      "id": 3,
+      "type": "table",
+      "title": "Request-correlated file I/O",
+      "gridPos": {
+        "x": 12,
+        "y": 7,
+        "w": 12,
+        "h": 10
+      },
+      "datasource": {
+        "type": "mysql",
+        "uid": "greptime"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "mysql",
+            "uid": "greptime"
+          },
+          "format": "table",
+          "rawSql": "SELECT request_id, mux_request_id, plane, method, path, component, operation, bytes, duration_ms, file_path FROM anvil_file_io WHERE request_id IS NOT NULL ORDER BY greptime_timestamp DESC LIMIT 300",
+          "rawQuery": true
+        }
+      ],
+      "options": {},
+      "description": "Correlates public/admin request IDs with disk operations beneath that request."
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "fsync/sync_all latency over time",
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "mysql",
+        "uid": "greptime"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "mysql",
+            "uid": "greptime"
+          },
+          "format": "time_series",
+          "rawSql": "SELECT greptime_timestamp AS time, file_path AS metric, duration_ms FROM anvil_file_io WHERE operation = 'sync_all' ORDER BY greptime_timestamp",
+          "rawQuery": true
+        }
+      ],
+      "options": {},
+      "description": "Each CoreStore atomic write calls sync_all on the temp file before rename. This panel isolates those waits.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      }
     },
     {
       "id": 5,
       "type": "table",
-      "title": "Internal spans",
+      "title": "Bytes written/read by operation",
       "gridPos": {
         "x": 12,
-        "y": 16,
+        "y": 17,
         "w": 12,
-        "h": 8
+        "h": 7
       },
       "datasource": {
         "type": "mysql",
@@ -157,17 +164,16 @@
             "uid": "greptime"
           },
           "format": "table",
-          "rawSql": "SELECT span, COUNT(*) AS samples, AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms FROM anvil_internal_span GROUP BY span ORDER BY max_ms DESC LIMIT 50",
+          "rawSql": "SELECT component, operation, COUNT(*) AS calls, SUM(bytes) AS total_bytes, AVG(bytes) AS avg_bytes, MAX(bytes) AS max_bytes FROM anvil_file_io GROUP BY component, operation ORDER BY total_bytes DESC LIMIT 50",
           "rawQuery": true
         }
       ],
-      "options": {},
-      "description": "Manually emitted internal spans from release/perf gates and focused code paths."
+      "options": {}
     },
     {
       "id": 6,
       "type": "table",
-      "title": "File I/O phases by max latency",
+      "title": "Slowest individual file I/O events",
       "gridPos": {
         "x": 0,
         "y": 24,
@@ -186,12 +192,11 @@
             "uid": "greptime"
           },
           "format": "table",
-          "rawSql": "SELECT component, operation, COUNT(*) AS calls, SUM(bytes) AS bytes, AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms FROM anvil_file_io GROUP BY component, operation ORDER BY max_ms DESC LIMIT 50",
+          "rawSql": "SELECT greptime_timestamp, request_id, component, operation, duration_ms, bytes, file_path FROM anvil_file_io ORDER BY duration_ms DESC LIMIT 100",
           "rawQuery": true
         }
       ],
-      "options": {},
-      "description": "Disk operations measured at file-operation level, including write_all, sync_all, rename, reads, lock files and temp payload files."
+      "options": {}
     }
   ]
 }
