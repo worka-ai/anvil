@@ -53,11 +53,18 @@ const ZERO_HASH: &str = "sha256:000000000000000000000000000000000000000000000000
 const MAX_CORE_FENCE_TTL_MS: u64 = 120_000;
 const CORE_STREAM_SEGMENT_MAGIC: &[u8; 8] = b"ANSEG001";
 const CORE_ACTIVE_STREAM_MAGIC: &[u8; 8] = b"ANASTR1\0";
+const CORE_WAL_FILE_MAGIC: &[u8; 6] = b"ANWAL\n";
+const CORE_WAL_FRAME_MAGIC: &[u8; 4] = b"AWF1";
 const CORE_STREAM_SEGMENT_VERSION: u16 = 1;
 const CORE_ACTIVE_STREAM_VERSION: u16 = 1;
+const CORE_WAL_VERSION: u16 = 1;
+const CORE_WAL_EPOCH: u64 = 1;
+const CORE_WAL_MAX_INLINE_PAYLOAD_BYTES: usize = 64 * 1024;
+const CORE_WAL_NODE_ID: &str = "local-node";
 const CORE_STREAM_SEGMENT_HEADER_SCHEMA: &str = "anvil.core.stream_segment_header.v1";
 const CORE_STREAM_RECORD_HEADER_SCHEMA: &str = "anvil.core.stream_record_header.v1";
 const CORE_STREAM_SEGMENT_TRAILER_SCHEMA: &str = "anvil.core.stream_segment_trailer.v1";
+const CORE_WAL_RECORD_SCHEMA: &str = "anvil.core.wal_record.v1";
 const CORE_TRANSACTION_STREAM_ID: &str = "core_transactions";
 const CORE_TRANSACTION_PARTITION_ID: &str = "core-control";
 const CORE_TRANSACTION_RECORD_KIND: &str = "core_transaction";
@@ -127,6 +134,39 @@ struct StoredStreamSegmentTrailer {
     record_count: u64,
     payload_hash: String,
     sealed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CoreWalLandedByte {
+    sha256: String,
+    length: u64,
+    landing_id: String,
+    relative_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CoreWalAdmissionRecord {
+    schema: String,
+    node_id: String,
+    wal_epoch: u64,
+    sequence: u64,
+    mutation_id: String,
+    idempotency_key_hash: Option<String>,
+    anvil_storage_tenant_id: String,
+    authz_scope: serde_json::Value,
+    operation_family: String,
+    writer_family: String,
+    target: serde_json::Value,
+    preconditions: serde_json::Value,
+    boundary_values: Vec<serde_json::Value>,
+    landed_bytes: Vec<CoreWalLandedByte>,
+    created_at_unix_nanos: u64,
+}
+
+enum CoreWalPayload<'a> {
+    Empty,
+    Inline(&'a [u8]),
+    Landed(&'a [u8]),
 }
 
 struct CoreStoreLock {
@@ -207,8 +247,26 @@ impl CoreStore {
         let _perf_guard = crate::perf::guard("anvil_core_store_op", &[("operation", "put_blob")]);
         self.ensure_layout().await?;
         validate_logical_id(&input.logical_name, "blob logical name")?;
-        let hash = sha256_hex(&input.bytes);
-        let shards = encode_erasure_shards(&input.bytes)?;
+        let landed = self
+            .admit_core_mutation(
+                "object.put",
+                "object_blob",
+                serde_json::json!({
+                    "logical_name": input.logical_name.clone(),
+                    "region_id": input.region_id.clone(),
+                }),
+                input.mutation_id.clone(),
+                None,
+                CoreWalPayload::Landed(&input.bytes),
+            )
+            .await?
+            .landed_bytes
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("CoreStore put_blob admission did not produce landed bytes"))?;
+        let materialised_bytes = self.read_landed_bytes(&landed).await?;
+        let hash = strip_sha256_prefix(&landed.sha256)?.to_string();
+        let shards = encode_erasure_shards(&materialised_bytes)?;
 
         for (shard_index, shard) in shards.iter().enumerate() {
             let node_id = format!("{LOCAL_NODE_ID_PREFIX}-{}", shard_index + 1);
@@ -222,7 +280,7 @@ impl CoreStore {
 
         Ok(CoreObjectRef {
             hash: format!("sha256:{hash}"),
-            logical_size: input.bytes.len() as u64,
+            logical_size: materialised_bytes.len() as u64,
             manifest_ref: encode_manifest_ref(&hash),
         })
     }
@@ -357,6 +415,30 @@ impl CoreStore {
         validate_logical_id(&input.partition_id, "partition id")?;
         let _stream_guard = self.acquire_stream_lock(&input.stream_id).await?;
         let _guard = self.write_lock.lock().await;
+        if let Some(receipt) = self.stream_idempotent_replay_unlocked(&input).await? {
+            return Ok(receipt);
+        }
+        let wal_payload = if input.payload.len() <= CORE_WAL_MAX_INLINE_PAYLOAD_BYTES {
+            CoreWalPayload::Inline(&input.payload)
+        } else {
+            CoreWalPayload::Landed(&input.payload)
+        };
+        self.admit_core_mutation(
+            "stream.append",
+            "stream",
+            serde_json::json!({
+                "stream_id": input.stream_id.clone(),
+                "partition_id": input.partition_id.clone(),
+                "record_kind": input.record_kind.clone(),
+            }),
+            input
+                .transaction_id
+                .clone()
+                .unwrap_or_else(|| format!("stream-append:{}", uuid::Uuid::new_v4())),
+            input.idempotency_key.clone(),
+            wal_payload,
+        )
+        .await?;
         self.append_stream_unlocked(input).await
     }
 
@@ -377,33 +459,15 @@ impl CoreStore {
         if let Some(fence) = input.fence.as_ref() {
             self.validate_fence_precondition_unlocked(fence).await?;
         }
+        if let Some(receipt) = self.stream_idempotent_replay_unlocked(&input).await? {
+            return Ok(receipt);
+        }
         let mut records = self.read_all_stream_records(&input.stream_id).await?;
         let idempotency_key_hash = match input.idempotency_key.as_deref() {
             Some(key) => Some(format!("sha256:{}", sha256_hex(key.as_bytes()))),
             None => None,
         };
         let payload_hash = format!("sha256:{}", sha256_hex(&input.payload));
-
-        if let Some(idempotency_key_hash) = idempotency_key_hash.as_deref() {
-            if let Some(existing) = records
-                .iter()
-                .find(|record| record.idempotency_key_hash.as_deref() == Some(idempotency_key_hash))
-            {
-                if existing.payload_hash != payload_hash {
-                    bail!(
-                        "CoreStore stream idempotency conflict for stream {}",
-                        input.stream_id
-                    );
-                }
-                return Ok(StreamAppendReceipt {
-                    stream_id: existing.stream_id.clone(),
-                    sequence: existing.sequence,
-                    cursor: existing.cursor.clone(),
-                    event_hash: existing.event_hash.clone(),
-                    idempotent_replay: true,
-                });
-            }
-        }
 
         let sequence = records
             .last()
@@ -443,6 +507,37 @@ impl CoreStore {
             event_hash: record.event_hash,
             idempotent_replay: false,
         })
+    }
+
+    async fn stream_idempotent_replay_unlocked(
+        &self,
+        input: &AppendStreamRecord,
+    ) -> Result<Option<StreamAppendReceipt>> {
+        let Some(idempotency_key) = input.idempotency_key.as_deref() else {
+            return Ok(None);
+        };
+        let idempotency_key_hash = format!("sha256:{}", sha256_hex(idempotency_key.as_bytes()));
+        let payload_hash = format!("sha256:{}", sha256_hex(&input.payload));
+        let records = self.read_all_stream_records(&input.stream_id).await?;
+        if let Some(existing) = records
+            .iter()
+            .find(|record| record.idempotency_key_hash.as_deref() == Some(&idempotency_key_hash))
+        {
+            if existing.payload_hash != payload_hash {
+                bail!(
+                    "CoreStore stream idempotency conflict for stream {}",
+                    input.stream_id
+                );
+            }
+            return Ok(Some(StreamAppendReceipt {
+                stream_id: existing.stream_id.clone(),
+                sequence: existing.sequence,
+                cursor: existing.cursor.clone(),
+                event_hash: existing.event_hash.clone(),
+                idempotent_replay: true,
+            }));
+        }
+        Ok(None)
     }
 
     pub async fn read_stream(&self, input: ReadStream) -> Result<Vec<StreamRecord>> {
@@ -992,6 +1087,240 @@ impl CoreStore {
         Ok(profiles)
     }
 
+    async fn admit_core_mutation(
+        &self,
+        operation_family: &str,
+        writer_family: &str,
+        target: serde_json::Value,
+        mutation_id: String,
+        idempotency_key: Option<String>,
+        payload: CoreWalPayload<'_>,
+    ) -> Result<CoreWalAdmissionRecord> {
+        validate_logical_id(&mutation_id, "wal mutation id")?;
+        let (inline_payload, landed_bytes) = match payload {
+            CoreWalPayload::Empty => (Vec::new(), Vec::new()),
+            CoreWalPayload::Inline(bytes) if bytes.len() <= CORE_WAL_MAX_INLINE_PAYLOAD_BYTES => {
+                (bytes.to_vec(), Vec::new())
+            }
+            CoreWalPayload::Inline(bytes) | CoreWalPayload::Landed(bytes) => {
+                let landed = self.land_core_bytes(bytes, &mutation_id).await?;
+                (Vec::new(), vec![landed])
+            }
+        };
+        self.append_core_wal_record(
+            operation_family,
+            writer_family,
+            target,
+            mutation_id,
+            idempotency_key,
+            landed_bytes,
+            &inline_payload,
+        )
+        .await
+    }
+
+    async fn append_core_wal_record(
+        &self,
+        operation_family: &str,
+        writer_family: &str,
+        target: serde_json::Value,
+        mutation_id: String,
+        idempotency_key: Option<String>,
+        landed_bytes: Vec<CoreWalLandedByte>,
+        payload: &[u8],
+    ) -> Result<CoreWalAdmissionRecord> {
+        if payload.len() > CORE_WAL_MAX_INLINE_PAYLOAD_BYTES {
+            bail!(
+                "CoreStore WAL payload exceeds {} bytes",
+                CORE_WAL_MAX_INLINE_PAYLOAD_BYTES
+            );
+        }
+        let _wal_guard = self.acquire_named_lock("wal", "active").await?;
+        self.ensure_wal_file_header().await?;
+        let sequence = self.next_core_wal_sequence().await?;
+        let record = CoreWalAdmissionRecord {
+            schema: CORE_WAL_RECORD_SCHEMA.to_string(),
+            node_id: CORE_WAL_NODE_ID.to_string(),
+            wal_epoch: CORE_WAL_EPOCH,
+            sequence,
+            mutation_id,
+            idempotency_key_hash: idempotency_key
+                .map(|value| format!("sha256:{}", sha256_hex(value.as_bytes()))),
+            anvil_storage_tenant_id: "local".to_string(),
+            authz_scope: serde_json::json!({"realm_id":"system","revision":null}),
+            operation_family: operation_family.to_string(),
+            writer_family: writer_family.to_string(),
+            target,
+            preconditions: serde_json::json!([]),
+            boundary_values: Vec::new(),
+            landed_bytes,
+            created_at_unix_nanos: unix_timestamp_nanos(),
+        };
+        let header_json = serde_json::to_vec(&record)?;
+        let frame = encode_wal_frame(&header_json, payload)?;
+        let path = self.active_wal_path();
+        let started_at = Instant::now();
+        let mut file = OpenOptions::new().append(true).open(&path).await?;
+        crate::perf::record_io_duration(
+            "core_store",
+            "wal_open_append",
+            &path,
+            0,
+            started_at.elapsed(),
+        );
+        let started_at = Instant::now();
+        file.write_all(&frame).await?;
+        crate::perf::record_io_duration(
+            "core_store",
+            "wal_write_frame",
+            &path,
+            frame.len() as u64,
+            started_at.elapsed(),
+        );
+        let started_at = Instant::now();
+        file.sync_all().await?;
+        crate::perf::record_io_duration(
+            "core_store",
+            "wal_sync_frame",
+            &path,
+            frame.len() as u64,
+            started_at.elapsed(),
+        );
+        Ok(record)
+    }
+
+    async fn land_core_bytes(&self, bytes: &[u8], mutation_id: &str) -> Result<CoreWalLandedByte> {
+        let hash = sha256_hex(bytes);
+        let final_path = self.landed_bytes_path(&hash);
+        let landing_id = format!("{mutation_id}:{hash}");
+        if fs::metadata(&final_path).await.is_err() {
+            if let Some(parent) = final_path.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            let tmp_path =
+                final_path.with_extension(format!("landed.{}.tmp", uuid::Uuid::new_v4()));
+            let started_at = Instant::now();
+            let mut file = fs::File::create(&tmp_path).await?;
+            crate::perf::record_io_duration(
+                "core_store",
+                "landed_file_create",
+                &tmp_path,
+                0,
+                started_at.elapsed(),
+            );
+            let started_at = Instant::now();
+            file.write_all(bytes).await?;
+            crate::perf::record_io_duration(
+                "core_store",
+                "landed_file_write",
+                &tmp_path,
+                bytes.len() as u64,
+                started_at.elapsed(),
+            );
+            let started_at = Instant::now();
+            file.sync_all().await?;
+            crate::perf::record_io_duration(
+                "core_store",
+                "landed_file_sync",
+                &tmp_path,
+                bytes.len() as u64,
+                started_at.elapsed(),
+            );
+            drop(file);
+            let started_at = Instant::now();
+            fs::rename(&tmp_path, &final_path).await?;
+            crate::perf::record_io_duration(
+                "core_store",
+                "landed_file_rename",
+                &final_path,
+                bytes.len() as u64,
+                started_at.elapsed(),
+            );
+        }
+        let relative_path = self.storage.relative_storage_path(&final_path)?;
+        let meta_path = final_path.with_extension("meta");
+        let meta = serde_json::json!({
+            "schema": "anvil.core.landed_bytes_meta.v1",
+            "landing_id": landing_id,
+            "sha256": format!("sha256:{hash}"),
+            "length": bytes.len() as u64,
+            "mutation_id": mutation_id,
+            "created_at_unix_nanos": unix_timestamp_nanos(),
+        });
+        write_file_atomic(&meta_path, &serde_json::to_vec(&meta)?).await?;
+        Ok(CoreWalLandedByte {
+            sha256: format!("sha256:{hash}"),
+            length: bytes.len() as u64,
+            landing_id,
+            relative_path,
+        })
+    }
+
+    async fn read_landed_bytes(&self, landed: &CoreWalLandedByte) -> Result<Vec<u8>> {
+        validate_hash(&landed.sha256, "landed bytes hash")?;
+        let path = self
+            .storage
+            .resolve_relative_storage_path(&landed.relative_path)?;
+        let bytes = read_file(&path, "core_store", "read_landed_bytes").await?;
+        if bytes.len() as u64 != landed.length {
+            bail!("CoreStore landed bytes length mismatch");
+        }
+        let actual = format!("sha256:{}", sha256_hex(&bytes));
+        if actual != landed.sha256 {
+            bail!("CoreStore landed bytes hash mismatch");
+        }
+        Ok(bytes)
+    }
+
+    async fn ensure_wal_file_header(&self) -> Result<()> {
+        let path = self.active_wal_path();
+        if fs::metadata(&path).await.is_ok() {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let header = encode_wal_file_header(CORE_WAL_NODE_ID, CORE_WAL_EPOCH, 1)?;
+        let started_at = Instant::now();
+        let mut file = fs::File::create(&path).await?;
+        crate::perf::record_io_duration(
+            "core_store",
+            "wal_header_create",
+            &path,
+            0,
+            started_at.elapsed(),
+        );
+        let started_at = Instant::now();
+        file.write_all(&header).await?;
+        crate::perf::record_io_duration(
+            "core_store",
+            "wal_header_write",
+            &path,
+            header.len() as u64,
+            started_at.elapsed(),
+        );
+        let started_at = Instant::now();
+        file.sync_all().await?;
+        crate::perf::record_io_duration(
+            "core_store",
+            "wal_header_sync",
+            &path,
+            header.len() as u64,
+            started_at.elapsed(),
+        );
+        Ok(())
+    }
+
+    async fn next_core_wal_sequence(&self) -> Result<u64> {
+        let path = self.active_wal_path();
+        let bytes = match read_file(&path, "core_store", "wal_read_for_sequence").await {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(1),
+            Err(err) => return Err(err).with_context(|| "read CoreStore admission WAL"),
+        };
+        Ok(decode_wal_records(&bytes)?.len() as u64 + 1)
+    }
+
     pub async fn list_stream_ids(&self, prefix: &str) -> Result<Vec<String>> {
         let mut votes: BTreeMap<String, usize> = BTreeMap::new();
         for node_id in local_control_node_ids() {
@@ -1099,6 +1428,24 @@ impl CoreStore {
         if let Some(cursor) = source_watch_cursor.as_deref() {
             self.validate_source_watch_cursor_unlocked(cursor).await?;
         }
+        self.admit_core_mutation(
+            "ref.compare_and_swap",
+            "core-control",
+            serde_json::json!({
+                "ref_name": ref_name.clone(),
+                "new_target": new_target.clone(),
+                "expected_generation": expected_generation,
+                "expected_target": expected_target.clone(),
+                "require_absent": require_absent,
+                "require_present": require_present,
+            }),
+            transaction_id
+                .clone()
+                .unwrap_or_else(|| format!("ref-cas:{ref_name}:{}", uuid::Uuid::new_v4())),
+            None,
+            CoreWalPayload::Empty,
+        )
+        .await?;
 
         let latest_stream_generation = if current.is_none() {
             self.latest_ref_update_generation(&input.ref_name).await?
@@ -1181,6 +1528,20 @@ impl CoreStore {
         }
         if current.is_some() {
             let previous = current.as_ref().expect("current checked above");
+            self.admit_core_mutation(
+                "ref.delete",
+                "core-control",
+                serde_json::json!({
+                    "ref_name": ref_name,
+                    "expected_generation": expected_generation,
+                    "expected_target": expected_target,
+                    "require_present": require_present,
+                }),
+                format!("core-ref-delete:{ref_name}:{}", previous.generation),
+                None,
+                CoreWalPayload::Empty,
+            )
+            .await?;
             let update = CoreRefUpdateRecord {
                 schema: CORE_REF_UPDATE_SCHEMA.to_string(),
                 ref_name: ref_name.to_string(),
@@ -1358,6 +1719,25 @@ impl CoreStore {
             format!("core_store.commit_mutation_batch validate_preconditions tx={timing_name}"),
             step_start.elapsed(),
         );
+        let batch_payload = serde_json::to_vec(&batch)?;
+        let wal_payload = if batch_payload.len() <= CORE_WAL_MAX_INLINE_PAYLOAD_BYTES {
+            CoreWalPayload::Inline(&batch_payload)
+        } else {
+            CoreWalPayload::Landed(&batch_payload)
+        };
+        self.admit_core_mutation(
+            "mutation.batch",
+            "core-control",
+            serde_json::json!({
+                "transaction_id": batch.transaction_id.clone(),
+                "scope_partition": batch.scope_partition.clone(),
+                "operation_count": batch.operations.len(),
+            }),
+            batch.transaction_id.clone(),
+            Some(batch.transaction_id.clone()),
+            wal_payload,
+        )
+        .await?;
 
         let mut visible_updates = Vec::with_capacity(batch.operations.len());
         let step_start = std::time::Instant::now();
@@ -1715,6 +2095,8 @@ impl CoreStore {
             self.storage.core_store_root_path(),
             self.storage.core_store_replicas_path(),
             self.storage.core_store_staging_path(),
+            self.admission_wal_dir(),
+            self.admission_landed_bytes_root(),
         ] {
             let started_at = Instant::now();
             fs::create_dir_all(&path).await?;
@@ -1979,6 +2361,29 @@ impl CoreStore {
             .join(prefix)
             .join(object_hash)
             .join(format!("shard-{shard_index:05}-{shard_hash}.bin"))
+    }
+
+    fn admission_root(&self) -> PathBuf {
+        self.storage.core_store_root_path().join("admission")
+    }
+
+    fn admission_wal_dir(&self) -> PathBuf {
+        self.admission_root().join("wal").join(CORE_WAL_NODE_ID)
+    }
+
+    fn active_wal_path(&self) -> PathBuf {
+        self.admission_wal_dir().join("active.anwal")
+    }
+
+    fn admission_landed_bytes_root(&self) -> PathBuf {
+        self.admission_root().join("landed-bytes")
+    }
+
+    fn landed_bytes_path(&self, hash: &str) -> PathBuf {
+        self.admission_landed_bytes_root()
+            .join("sha256")
+            .join(&hash[0..2])
+            .join(format!("{hash}.landed"))
     }
 
     fn stream_data_replica_dir(&self, node_id: &str) -> PathBuf {
@@ -2866,6 +3271,100 @@ fn write_u32_le(out: &mut Vec<u8>, value: usize) -> Result<()> {
     Ok(())
 }
 
+fn encode_wal_file_header(node_id: &str, wal_epoch: u64, first_sequence: u64) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(CORE_WAL_FILE_MAGIC);
+    bytes.extend_from_slice(&CORE_WAL_VERSION.to_le_bytes());
+    write_u16_len_prefixed_bytes(&mut bytes, node_id.as_bytes(), "wal node id")?;
+    bytes.extend_from_slice(&wal_epoch.to_le_bytes());
+    bytes.extend_from_slice(&first_sequence.to_le_bytes());
+    bytes.extend_from_slice(&unix_timestamp_nanos().to_le_bytes());
+    let crc = crc32c(&bytes);
+    bytes.extend_from_slice(&crc.to_le_bytes());
+    Ok(bytes)
+}
+
+fn encode_wal_frame(header_json: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
+    if payload.len() > CORE_WAL_MAX_INLINE_PAYLOAD_BYTES {
+        bail!(
+            "CoreStore WAL payload exceeds {} bytes",
+            CORE_WAL_MAX_INLINE_PAYLOAD_BYTES
+        );
+    }
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(CORE_WAL_FRAME_MAGIC);
+    write_u32_le(&mut bytes, header_json.len())?;
+    bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(header_json);
+    bytes.extend_from_slice(payload);
+    let crc = crc32c(&bytes);
+    bytes.extend_from_slice(&crc.to_le_bytes());
+    Ok(bytes)
+}
+
+fn decode_wal_records(bytes: &[u8]) -> Result<Vec<(CoreWalAdmissionRecord, Vec<u8>)>> {
+    let mut offset = 0usize;
+    let magic = read_exact(bytes, &mut offset, CORE_WAL_FILE_MAGIC.len())?;
+    if magic != CORE_WAL_FILE_MAGIC {
+        bail!("CoreStore WAL has invalid magic");
+    }
+    let version = read_u16_le(bytes, &mut offset)?;
+    if version != CORE_WAL_VERSION {
+        bail!("CoreStore WAL has unsupported version {version}");
+    }
+    let node_id_len = read_u16_le(bytes, &mut offset)? as usize;
+    let _node_id = read_exact(bytes, &mut offset, node_id_len)?;
+    let _wal_epoch = read_u64_le(bytes, &mut offset)?;
+    let _first_sequence = read_u64_le(bytes, &mut offset)?;
+    let _created_at = read_u64_le(bytes, &mut offset)?;
+    let expected_header_crc = read_u32_le(bytes, &mut offset)?;
+    let actual_header_crc = crc32c(&bytes[..offset - 4]);
+    if expected_header_crc != actual_header_crc {
+        bail!("CoreStore WAL header checksum mismatch");
+    }
+
+    let mut records = Vec::new();
+    while offset < bytes.len() {
+        let frame_start = offset;
+        let frame_magic = read_exact(bytes, &mut offset, CORE_WAL_FRAME_MAGIC.len())?;
+        if frame_magic != CORE_WAL_FRAME_MAGIC {
+            bail!("CoreStore WAL frame has invalid magic");
+        }
+        let header_len = read_u32_le(bytes, &mut offset)? as usize;
+        let payload_len = read_u64_le(bytes, &mut offset)? as usize;
+        if payload_len > CORE_WAL_MAX_INLINE_PAYLOAD_BYTES {
+            bail!("CoreStore WAL frame payload exceeds inline limit");
+        }
+        let header_json = read_exact(bytes, &mut offset, header_len)?;
+        let payload = read_exact(bytes, &mut offset, payload_len)?;
+        let expected_crc = read_u32_le(bytes, &mut offset)?;
+        let actual_crc = crc32c(&bytes[frame_start..offset - 4]);
+        if expected_crc != actual_crc {
+            bail!("CoreStore WAL frame checksum mismatch");
+        }
+        let record: CoreWalAdmissionRecord = serde_json::from_slice(header_json)?;
+        if record.schema != CORE_WAL_RECORD_SCHEMA {
+            bail!("CoreStore WAL record has invalid schema");
+        }
+        records.push((record, payload.to_vec()));
+    }
+    Ok(records)
+}
+
+fn write_u16_len_prefixed_bytes(out: &mut Vec<u8>, bytes: &[u8], label: &str) -> Result<()> {
+    let len = u16::try_from(bytes.len()).map_err(|_| anyhow!("CoreStore {label} exceeds u16"))?;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn unix_timestamp_nanos() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    u64::try_from(now.as_nanos()).unwrap_or(u64::MAX)
+}
+
 fn read_exact<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> Result<&'a [u8]> {
     let end = offset
         .checked_add(len)
@@ -3013,6 +3512,20 @@ mod tests {
             })
             .await
             .unwrap();
+        let wal_bytes = tokio::fs::read(store.active_wal_path()).await.unwrap();
+        let wal_records = decode_wal_records(&wal_bytes).unwrap();
+        assert_eq!(wal_records.len(), 1);
+        assert_eq!(wal_records[0].0.operation_family, "object.put");
+        assert_eq!(wal_records[0].0.writer_family, "object_blob");
+        assert!(wal_records[0].1.is_empty());
+        let landed = wal_records[0].0.landed_bytes.first().unwrap();
+        assert_eq!(landed.length, b"hello corestore".len() as u64);
+        assert!(
+            storage
+                .resolve_relative_storage_path(&landed.relative_path)
+                .unwrap()
+                .exists()
+        );
         let bytes = store.get_blob(GetBlob { object_ref }).await.unwrap();
         assert_eq!(bytes, b"hello corestore");
     }
@@ -3184,6 +3697,11 @@ mod tests {
             .await
             .expect("list stream ids");
         assert_eq!(stream_ids, vec!["object_metadata:tenant:b".to_string()]);
+        let wal_bytes = tokio::fs::read(store.active_wal_path()).await.unwrap();
+        let wal_records = decode_wal_records(&wal_bytes).unwrap();
+        assert_eq!(wal_records.len(), 2);
+        assert_eq!(wal_records[0].0.operation_family, "stream.append");
+        assert_eq!(wal_records[0].1, br#"{"key":"a"}"#);
         for node_id in local_control_node_ids() {
             assert!(
                 !tmp.path()
