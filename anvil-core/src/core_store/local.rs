@@ -336,6 +336,18 @@ struct CoreRootAnchorRecord {
     writer_families: Vec<String>,
     manifest_count: u64,
     final_block_count: u64,
+    genesis_bundle: Option<CoreGenesisBundle>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CoreGenesisBundle {
+    schema: String,
+    genesis_config_hash: String,
+    mesh_control_segment: Vec<u8>,
+    authz_reserved_schema_segment: Vec<u8>,
+    initial_root_keys: Vec<String>,
+    initial_partition_map: Vec<serde_json::Value>,
+    created_at_unix_nanos: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -5082,6 +5094,7 @@ impl CoreStore {
             writer_families,
             manifest_count: 1,
             final_block_count,
+            genesis_bundle: None,
         };
         self.write_root_register_anchor(&anchor).await
     }
@@ -5103,16 +5116,21 @@ impl CoreStore {
             previous_root_hash: ZERO_HASH.to_string(),
             transaction_manifest: None,
             checkpoint_manifest: None,
-            publisher_node_id: CORE_WAL_NODE_ID.to_string(),
-            publisher_epoch: LOCAL_PLACEMENT_EPOCH,
-            partition_owner_fence: LOCAL_PLACEMENT_EPOCH,
-            created_at_unix_nanos: unix_timestamp_nanos(),
+            publisher_node_id: "genesis".to_string(),
+            publisher_epoch: 0,
+            partition_owner_fence: 0,
+            created_at_unix_nanos: 0,
             root_state: "committed".to_string(),
-            mutation_first: None,
-            mutation_last: None,
-            writer_families: vec!["core_control".to_string()],
+            mutation_first: Some("genesis".to_string()),
+            mutation_last: Some("genesis".to_string()),
+            writer_families: vec![
+                "mesh_control".to_string(),
+                "authz".to_string(),
+                "core_control".to_string(),
+            ],
             manifest_count: 0,
             final_block_count: 0,
+            genesis_bundle: Some(build_core_genesis_bundle(root_anchor_key)?),
         };
         self.write_root_register_anchor(&anchor).await
     }
@@ -8269,6 +8287,83 @@ fn root_key_hash(root_anchor_key: &str) -> String {
     descriptor_hash(&["anvil.root.key.v1", root_anchor_key])
 }
 
+fn build_core_genesis_bundle(root_anchor_key: &str) -> Result<CoreGenesisBundle> {
+    let mesh_control_segment = canonical_json_bytes(&serde_json::json!({
+        "schema": "anvil.core.genesis_mesh_control.v1",
+        "root_partitions": [{
+            "root_anchor_key": root_anchor_key,
+            "root_partition_id": CORE_TRANSACTION_ROOT_PARTITION_ID,
+            "owner_node_id": "genesis",
+            "owner_epoch": 0_u64,
+            "owner_fence": 0_u64,
+        }],
+        "created_at_unix_nanos": 0_u64,
+    }))?;
+    let authz_reserved_schema_segment = canonical_json_bytes(&serde_json::json!({
+        "schema": "anvil.core.genesis_authz_reserved_schema.v1",
+        "realm_id": "system",
+        "reserved": true,
+        "created_at_unix_nanos": 0_u64,
+    }))?;
+    let initial_partition_map = vec![serde_json::json!({
+        "root_anchor_key": root_anchor_key,
+        "root_partition_id": CORE_TRANSACTION_ROOT_PARTITION_ID,
+        "owner_node_id": "genesis",
+        "owner_epoch": 0_u64,
+        "owner_fence": 0_u64,
+    })];
+    let config = serde_json::json!({
+        "schema": "anvil.core.genesis_config.v1",
+        "initial_root_keys": [root_anchor_key],
+        "initial_partition_map": initial_partition_map,
+        "mesh_control_segment_hash": domain_hash_bytes(
+            "anvil.core.genesis_mesh_control.v1",
+            &mesh_control_segment,
+        ),
+        "authz_reserved_schema_segment_hash": domain_hash_bytes(
+            "anvil.core.genesis_authz_reserved_schema.v1",
+            &authz_reserved_schema_segment,
+        ),
+        "created_at_unix_nanos": 0_u64,
+    });
+    Ok(CoreGenesisBundle {
+        schema: "anvil.core.genesis_bundle.v1".to_string(),
+        genesis_config_hash: domain_hash_bytes(
+            "anvil.root.genesis_config.v1",
+            &canonical_json_bytes(&config)?,
+        ),
+        mesh_control_segment,
+        authz_reserved_schema_segment,
+        initial_root_keys: vec![root_anchor_key.to_string()],
+        initial_partition_map,
+        created_at_unix_nanos: 0,
+    })
+}
+
+fn validate_core_genesis_bundle(bundle: &CoreGenesisBundle, root_anchor_key: &str) -> Result<()> {
+    if bundle.schema != "anvil.core.genesis_bundle.v1" {
+        bail!("CoreStore genesis bundle has invalid schema");
+    }
+    validate_hash(&bundle.genesis_config_hash, "genesis config hash")?;
+    if bundle.created_at_unix_nanos != 0 {
+        bail!("CoreStore genesis bundle timestamp must be zero");
+    }
+    if bundle.mesh_control_segment.is_empty() || bundle.authz_reserved_schema_segment.is_empty() {
+        bail!("CoreStore genesis bundle must include embedded mesh and authz segments");
+    }
+    if bundle.initial_root_keys != vec![root_anchor_key.to_string()] {
+        bail!("CoreStore genesis bundle initial root keys mismatch");
+    }
+    if bundle.initial_partition_map.is_empty() {
+        bail!("CoreStore genesis bundle must include an initial partition map");
+    }
+    let expected = build_core_genesis_bundle(root_anchor_key)?;
+    if bundle != &expected {
+        bail!("CoreStore genesis bundle does not match canonical bootstrap config");
+    }
+    Ok(())
+}
+
 fn validate_root_anchor_record(anchor: &CoreRootAnchorRecord) -> Result<()> {
     if anchor.schema != "anvil.core.root_anchor.v1" {
         bail!("CoreStore root anchor has invalid schema");
@@ -8288,17 +8383,59 @@ fn validate_root_anchor_record(anchor: &CoreRootAnchorRecord) -> Result<()> {
     if anchor.root_state != "committed" {
         bail!("CoreStore root anchor state must be committed");
     }
-    if anchor.publisher_node_id.is_empty() {
-        bail!("CoreStore root anchor publisher node id must not be empty");
+    if anchor.root_generation == 0 {
+        if anchor.previous_root_hash != ZERO_HASH {
+            bail!("CoreStore genesis root anchor previous hash must be zero");
+        }
+        if anchor.transaction_manifest.is_some() || anchor.checkpoint_manifest.is_some() {
+            bail!("CoreStore genesis root anchor must not include manifest refs");
+        }
+        if anchor.publisher_node_id != "genesis"
+            || anchor.publisher_epoch != 0
+            || anchor.partition_owner_fence != 0
+            || anchor.created_at_unix_nanos != 0
+        {
+            bail!("CoreStore genesis root anchor must use canonical sentinel values");
+        }
+        if anchor.mutation_first.as_deref() != Some("genesis")
+            || anchor.mutation_last.as_deref() != Some("genesis")
+        {
+            bail!("CoreStore genesis root anchor must use genesis mutation sentinels");
+        }
+        if anchor.writer_families
+            != vec![
+                "mesh_control".to_string(),
+                "authz".to_string(),
+                "core_control".to_string(),
+            ]
+        {
+            bail!("CoreStore genesis root anchor writer families are invalid");
+        }
+        if anchor.manifest_count != 0 || anchor.final_block_count != 0 {
+            bail!("CoreStore genesis root anchor manifest counters must be zero");
+        }
+        let bundle = anchor
+            .genesis_bundle
+            .as_ref()
+            .ok_or_else(|| anyhow!("CoreStore genesis root anchor must include genesis bundle"))?;
+        validate_core_genesis_bundle(bundle, &anchor.root_anchor_key)?;
+        return Ok(());
+    }
+
+    if anchor.transaction_manifest.is_none() {
+        bail!("CoreStore non-genesis root anchor must include a transaction manifest");
+    }
+    if anchor.genesis_bundle.is_some() {
+        bail!("CoreStore non-genesis root anchor must not include a genesis bundle");
+    }
+    if anchor.publisher_node_id.is_empty() || anchor.publisher_node_id == "genesis" {
+        bail!("CoreStore non-genesis root anchor publisher node id is invalid");
     }
     if anchor.publisher_epoch == 0 || anchor.partition_owner_fence == 0 {
         bail!("CoreStore root anchor publisher epoch and owner fence must be nonzero");
     }
-    if anchor.root_generation > 0 && anchor.transaction_manifest.is_none() {
-        bail!("CoreStore non-genesis root anchor must include a transaction manifest");
-    }
-    if anchor.root_generation == 0 && anchor.transaction_manifest.is_some() {
-        bail!("CoreStore genesis root anchor must not include a transaction manifest");
+    if anchor.created_at_unix_nanos == 0 {
+        bail!("CoreStore non-genesis root anchor timestamp must be nonzero");
     }
     if let Some(locator) = &anchor.transaction_manifest {
         validate_manifest_locator(locator)?;
@@ -8429,6 +8566,7 @@ fn encode_root_anchor_record(anchor: &CoreRootAnchorRecord) -> Result<Vec<u8>> {
         "writer_families": &anchor.writer_families,
         "manifest_count": anchor.manifest_count,
         "final_block_count": anchor.final_block_count,
+        "genesis_bundle": &anchor.genesis_bundle,
     });
     let header_cbor = encode_canonical_cbor_json(&header)?;
     let body_cbor = encode_canonical_cbor_json(&body)?;
@@ -8513,6 +8651,11 @@ fn decode_root_anchor_record(bytes: &[u8]) -> Result<CoreRootAnchorRecord> {
         )?,
         manifest_count: json_required_u64(&body, "manifest_count")?,
         final_block_count: json_required_u64(&body, "final_block_count")?,
+        genesis_bundle: body
+            .get("genesis_bundle")
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?,
     };
     validate_root_anchor_record(&anchor)?;
     Ok(anchor)
@@ -12485,6 +12628,18 @@ mod tests {
             .expect("genesis root anchor");
         assert_eq!(genesis.root_generation, 0);
         assert!(genesis.transaction_manifest.is_none());
+        assert!(genesis.checkpoint_manifest.is_none());
+        assert_eq!(genesis.publisher_node_id, "genesis");
+        assert_eq!(genesis.publisher_epoch, 0);
+        assert_eq!(genesis.partition_owner_fence, 0);
+        assert_eq!(genesis.created_at_unix_nanos, 0);
+        assert_eq!(genesis.mutation_first.as_deref(), Some("genesis"));
+        assert_eq!(genesis.mutation_last.as_deref(), Some("genesis"));
+        let genesis_bundle = genesis
+            .genesis_bundle
+            .as_ref()
+            .expect("genesis root anchor must embed genesis bundle");
+        validate_core_genesis_bundle(genesis_bundle, core_transaction_root_anchor_key()).unwrap();
 
         drop(store);
         let reopened = CoreStore::new(storage).await.unwrap();
@@ -12669,9 +12824,20 @@ mod tests {
             writer_families: vec!["core_control".to_string()],
             manifest_count: 1,
             final_block_count: 1,
+            genesis_bundle: None,
         };
         let anchor_a = anchor("root-cas-a", locator_a);
         let anchor_b = anchor("root-cas-b", locator_b);
+        let mut invalid_non_genesis = anchor_a.clone();
+        invalid_non_genesis.genesis_bundle =
+            Some(build_core_genesis_bundle(core_transaction_root_anchor_key()).unwrap());
+        assert!(
+            validate_root_anchor_record(&invalid_non_genesis)
+                .unwrap_err()
+                .to_string()
+                .contains("genesis bundle"),
+            "non-genesis roots must not carry the embedded genesis bundle"
+        );
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
 
         let task_a = {
