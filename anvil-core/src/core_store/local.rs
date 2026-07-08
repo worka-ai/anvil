@@ -11591,6 +11591,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn core_store_root_register_has_single_concurrent_winner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = Arc::new(CoreStore::new(storage).await.unwrap());
+        let genesis = store
+            .read_latest_root_anchor(core_transaction_root_anchor_key())
+            .await
+            .unwrap()
+            .expect("genesis root anchor");
+        let previous_root_hash = hash_root_anchor_record(&genesis).unwrap();
+
+        let locator_a = store
+            .write_logical_bytes_direct(
+                "core_control",
+                "lf_root_cas_a".to_string(),
+                1,
+                b"root cas contender a".to_vec(),
+                "root_cas_a".to_string(),
+                "local".to_string(),
+            )
+            .await
+            .unwrap();
+        let locator_b = store
+            .write_logical_bytes_direct(
+                "core_control",
+                "lf_root_cas_b".to_string(),
+                1,
+                b"root cas contender b".to_vec(),
+                "root_cas_b".to_string(),
+                "local".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let anchor = |mutation_id: &str, locator: CoreManifestLocator| CoreRootAnchorRecord {
+            schema: "anvil.core.root_anchor.v1".to_string(),
+            root_anchor_key: core_transaction_root_anchor_key().to_string(),
+            root_key_hash: root_key_hash(core_transaction_root_anchor_key()),
+            root_generation: 1,
+            previous_root_hash: previous_root_hash.clone(),
+            transaction_manifest: Some(locator),
+            checkpoint_manifest: None,
+            publisher_node_id: CORE_WAL_NODE_ID.to_string(),
+            publisher_epoch: LOCAL_PLACEMENT_EPOCH,
+            partition_owner_fence: LOCAL_PLACEMENT_EPOCH,
+            created_at_unix_nanos: unix_timestamp_nanos(),
+            root_state: "committed".to_string(),
+            mutation_first: Some(mutation_id.to_string()),
+            mutation_last: Some(mutation_id.to_string()),
+            writer_families: vec!["core_control".to_string()],
+            manifest_count: 1,
+            final_block_count: 1,
+        };
+        let anchor_a = anchor("root-cas-a", locator_a);
+        let anchor_b = anchor("root-cas-b", locator_b);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let task_a = {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store.write_root_register_anchor(&anchor_a).await
+            })
+        };
+        let task_b = {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store.write_root_register_anchor(&anchor_b).await
+            })
+        };
+        let results = vec![task_a.await.unwrap(), task_b.await.unwrap()];
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "root register create-new CAS must produce exactly one winner"
+        );
+        assert_eq!(
+            results.iter().filter(|result| result.is_err()).count(),
+            1,
+            "root register create-new CAS must reject the loser"
+        );
+
+        let latest = store
+            .read_latest_root_anchor(core_transaction_root_anchor_key())
+            .await
+            .unwrap()
+            .expect("winner root anchor");
+        assert_eq!(latest.root_generation, 1);
+        assert!(matches!(
+            latest.mutation_first.as_deref(),
+            Some("root-cas-a") | Some("root-cas-b")
+        ));
+    }
+
+    #[tokio::test]
     async fn core_store_refs_are_compare_and_swap() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = Storage::new_at(tmp.path()).await.unwrap();
