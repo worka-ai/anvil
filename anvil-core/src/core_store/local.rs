@@ -4967,7 +4967,7 @@ impl CoreStore {
             };
             let bytes = encode_root_register_shard_file(&header, &anchor_bytes)?;
             let shard_path = generation_dir.join(format!("shard-{index}.anr"));
-            write_file_atomic(&shard_path, &bytes).await?;
+            write_file_create_new_or_same(&shard_path, &bytes).await?;
         }
         Ok(())
     }
@@ -8704,6 +8704,71 @@ async fn write_file_atomic(path: &PathBuf, bytes: &[u8]) -> Result<()> {
         });
     }
     sync_parent_dir(path, "atomic_write_sync_parent_dir").await?;
+    Ok(())
+}
+
+async fn write_file_create_new_or_same(path: &PathBuf, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        let started_at = Instant::now();
+        fs::create_dir_all(parent).await?;
+        crate::perf::record_io_duration(
+            "core_store",
+            "create_dir_all",
+            parent,
+            0,
+            started_at.elapsed(),
+        );
+    }
+
+    let started_at = Instant::now();
+    let create_result = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await;
+    crate::perf::record_io_duration(
+        "core_store",
+        "create_new",
+        path,
+        bytes.len() as u64,
+        started_at.elapsed(),
+    );
+    let mut file = match create_result {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = read_file(path, "core_store", "create_new_existing_read").await?;
+            if existing == bytes {
+                return Ok(());
+            }
+            bail!(
+                "CoreStore create_new detected conflicting existing file {}",
+                path.display()
+            );
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("create CoreStore file {}", path.display()));
+        }
+    };
+    let started_at = Instant::now();
+    file.write_all(bytes).await?;
+    crate::perf::record_io_duration(
+        "core_store",
+        "write_all",
+        path,
+        bytes.len() as u64,
+        started_at.elapsed(),
+    );
+    let started_at = Instant::now();
+    file.sync_all().await?;
+    crate::perf::record_io_duration(
+        "core_store",
+        "sync_all",
+        path,
+        bytes.len() as u64,
+        started_at.elapsed(),
+    );
+    drop(file);
+    sync_parent_dir(path, "create_new_sync_parent_dir").await?;
     Ok(())
 }
 
