@@ -2820,6 +2820,11 @@ impl CoreStore {
                 if metadata.len() != bytes.len() as u64 {
                     bail!("CoreStore landed bytes existing length mismatch");
                 }
+                let existing =
+                    read_file(&final_path, "core_store", "landed_file_verify_existing").await?;
+                if sha256_hex(&existing) != hash {
+                    bail!("CoreStore landed bytes existing hash mismatch");
+                }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 self.enforce_admission_capacity(0, bytes.len() as u64)
@@ -11225,6 +11230,45 @@ mod tests {
                 .unwrap()
                 .exists(),
             "large payload bytes must land outside the WAL and be referenced by hash/length"
+        );
+    }
+
+    #[tokio::test]
+    async fn core_store_landed_bytes_existing_file_must_match_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        let bytes = b"expected landed bytes".to_vec();
+        let hash = sha256_hex(&bytes);
+        let final_path = store.landed_bytes_path(&hash);
+        fs::create_dir_all(final_path.parent().unwrap())
+            .await
+            .unwrap();
+        fs::write(&final_path, vec![0x55; bytes.len()])
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .admit_core_mutation(
+                    "stream.append",
+                    "stream",
+                    serde_json::json!({
+                        "stream_id": "tenant:t/bucket:b/corrupt-landed",
+                        "partition_id": "tenant:t/bucket:b",
+                        "record_kind": "event.created",
+                        "transaction_id": null,
+                    }),
+                    "corrupt-existing-landed".to_string(),
+                    None,
+                    CoreWalPayload::Landed(&bytes),
+                    Vec::new(),
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("existing hash mismatch"),
+            "admission must verify existing landed bytes by hash before referencing them from WAL"
         );
     }
 
