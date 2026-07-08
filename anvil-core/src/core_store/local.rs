@@ -710,6 +710,8 @@ impl CoreStore {
                     encryption: encryption_algorithm.to_string(),
                     placement_epoch: LOCAL_PLACEMENT_EPOCH,
                     boundary_summary_hash: boundary_summary_hash(boundary_values)?,
+                    boundary_values_b64: URL_SAFE_NO_PAD
+                        .encode(serde_json::to_vec(boundary_values)?),
                     writer_family: writer_family.to_string(),
                     created_by_mutation_id: mutation_id.to_string(),
                 },
@@ -4269,6 +4271,7 @@ impl CoreStore {
             bail!("CoreStore object ref encoding profile does not match manifest ref");
         }
         let mut placements = Vec::new();
+        let mut boundary_values = None::<Vec<CoreBoundaryValue>>;
         let mut stripe_size = 0u64;
         let expected_block_id = object_ref.encoding.block_id.clone();
         validate_logical_id(&expected_block_id, "CoreStore object block id")?;
@@ -4296,6 +4299,9 @@ impl CoreStore {
             };
             if decoded.erasure_profile_id != profile.id {
                 continue;
+            }
+            if boundary_values.is_none() {
+                boundary_values = Some(decoded.boundary_values.clone());
             }
             stripe_size = stripe_size
                 .max((decoded.payload.len() as u64).saturating_mul(profile.data_shards as u64));
@@ -4331,9 +4337,7 @@ impl CoreStore {
             );
         }
 
-        let boundary_values = self
-            .object_boundary_values_from_finalisation_records(object_ref)
-            .await?;
+        let boundary_values = boundary_values.unwrap_or_default();
         Ok(CoreObjectManifest {
             schema: CORE_OBJECT_MANIFEST_SCHEMA.to_string(),
             mesh_id: "local-mesh".to_string(),
@@ -4357,36 +4361,6 @@ impl CoreStore {
             created_at: "reconstructed-from-shards".to_string(),
             mutation_id: format!("reconstructed:{}", object_ref.hash),
         })
-    }
-
-    async fn object_boundary_values_from_finalisation_records(
-        &self,
-        object_ref: &CoreObjectRef,
-    ) -> Result<Vec<CoreBoundaryValue>> {
-        let mut values = Vec::new();
-        for record in self
-            .read_direct_stream_records(CORE_TRANSACTION_STREAM_ID)
-            .await?
-        {
-            if record.record_kind != CORE_WAL_FINALISATION_RECORD_KIND {
-                continue;
-            }
-            let finalisation: CoreWalFinalisationRecord = serde_json::from_slice(&record.payload)?;
-            if finalisation.schema != CORE_WAL_FINALISATION_SCHEMA {
-                bail!("CoreStore WAL finalisation record has invalid schema");
-            }
-            if finalisation.operation_family != "object.put" || finalisation.state != "committed" {
-                continue;
-            }
-            if finalisation
-                .landed_bytes
-                .iter()
-                .any(|landed| landed.sha256 == object_ref.hash)
-            {
-                values = finalisation.boundary_values;
-            }
-        }
-        Ok(values)
     }
 
     async fn verify_embedded_manifest_readable(&self, manifest: &CoreObjectManifest) -> Result<()> {
@@ -6096,6 +6070,7 @@ struct BlockShardHeaderInput {
     encryption: String,
     placement_epoch: u64,
     boundary_summary_hash: String,
+    boundary_values_b64: String,
     writer_family: String,
     created_by_mutation_id: String,
 }
@@ -6113,6 +6088,7 @@ struct BlockShardExpectation<'a> {
 #[derive(Debug)]
 struct DecodedBlockShard {
     erasure_profile_id: String,
+    boundary_values: Vec<CoreBoundaryValue>,
     payload: Vec<u8>,
 }
 
@@ -6190,6 +6166,7 @@ async fn read_block_shard_file_dynamic(
     expect_cbor_u64(&header, "placement_epoch", LOCAL_PLACEMENT_EPOCH)?;
     expect_cbor_text(&header, "payload_stored_hash", expected_payload_hash)?;
     expect_cbor_text(&header, "payload_plain_hash", expected_payload_hash)?;
+    let boundary_values = decode_shard_boundary_values(&header)?;
     let actual_hash = format!("sha256:{}", sha256_hex(&payload));
     if actual_hash != expected_payload_hash {
         bail!(
@@ -6200,8 +6177,22 @@ async fn read_block_shard_file_dynamic(
     }
     Ok(DecodedBlockShard {
         erasure_profile_id: cbor_text_value(&header, "erasure_profile_id")?.to_string(),
+        boundary_values,
         payload,
     })
+}
+
+fn decode_shard_boundary_values(
+    header: &BTreeMap<String, MinimalCborValue>,
+) -> Result<Vec<CoreBoundaryValue>> {
+    let encoded = cbor_text_value(header, "boundary_values_b64")?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .context("decode CoreStore shard boundary values")?;
+    let values: Vec<CoreBoundaryValue> = serde_json::from_slice(&bytes)?;
+    let expected_hash = boundary_summary_hash(&values)?;
+    expect_cbor_text(header, "boundary_summary_hash", &expected_hash)?;
+    Ok(values)
 }
 
 fn decode_block_shard_file(bytes: &[u8]) -> Result<(BTreeMap<String, MinimalCborValue>, Vec<u8>)> {
@@ -6301,6 +6292,10 @@ fn block_shard_header_map(
     map.insert(
         "boundary_summary_hash".to_string(),
         MinimalCborValue::Text(header.boundary_summary_hash),
+    );
+    map.insert(
+        "boundary_values_b64".to_string(),
+        MinimalCborValue::Text(header.boundary_values_b64),
     );
     map.insert(
         "writer_family".to_string(),
