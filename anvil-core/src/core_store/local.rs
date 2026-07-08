@@ -1,4 +1,5 @@
 use super::types::*;
+use crate::cluster_identity;
 use crate::error_codes::AnvilErrorCode;
 use crate::storage::Storage;
 use aes_gcm_siv::aead::{Aead, AeadCore, OsRng, Payload};
@@ -8,6 +9,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
 use hmac::{Hmac, Mac};
+use libp2p::identity;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -200,6 +202,7 @@ pub struct CoreStore {
     storage: Storage,
     write_lock: Arc<Mutex<()>>,
     pipeline_keyring: Option<Arc<CorePipelineKeyring>>,
+    node_signing_keypair: Arc<identity::Keypair>,
 }
 
 #[derive(Debug, Clone)]
@@ -511,10 +514,16 @@ impl CoreStore {
         storage: Storage,
         pipeline_keyring: Option<Arc<CorePipelineKeyring>>,
     ) -> Result<Self> {
+        let node_signing_keypair = Arc::new(cluster_identity::load_or_create_cluster_keypair(
+            storage
+                .core_store_root_path()
+                .join("node-signing-keypair.pb"),
+        )?);
         let store = Self {
             storage,
             write_lock: Arc::new(Mutex::new(())),
             pipeline_keyring,
+            node_signing_keypair,
         };
         store.ensure_layout().await?;
         store.recover_core_wal().await?;
@@ -523,6 +532,12 @@ impl CoreStore {
 
     pub fn storage(&self) -> &Storage {
         &self.storage
+    }
+
+    fn sign_core_receipt(&self, signed_payload_hash: &str) -> Result<Vec<u8>> {
+        self.node_signing_keypair
+            .sign(signed_payload_hash.as_bytes())
+            .map_err(|error| anyhow!("sign CoreStore shard receipt: {error}"))
     }
 
     pub async fn put_blob(&self, input: PutBlob) -> Result<CoreObjectRef> {
@@ -723,6 +738,21 @@ impl CoreStore {
             write_file_atomic(&shard_path, &shard_file).await?;
             stripe_size =
                 stripe_size.max((shard.len() as u64).saturating_mul(profile.data_shards as u64));
+            let written_at_unix_nanos = unix_timestamp_nanos();
+            let signed_payload_hash = shard_receipt_payload_hash(ShardReceiptPayloadInput {
+                block_id: &block_id,
+                shard_index: shard_index as u16,
+                erasure_profile: profile.id,
+                node_id: &placement.node_id,
+                region_id: &placement.region_id,
+                cell_id: &placement.cell_id,
+                placement_epoch: LOCAL_PLACEMENT_EPOCH,
+                shard_length: shard.len() as u64,
+                shard_hash: &format!("sha256:{shard_hash}"),
+                fsync_sequence: LOCAL_SHARD_FSYNC_SEQUENCE,
+                written_at_unix_nanos,
+            });
+            let receipt_signature = self.sign_core_receipt(&signed_payload_hash)?;
             object_placements.push(CoreObjectPlacement {
                 shard_index: shard_index as u16,
                 node_id: placement.node_id.clone(),
@@ -733,6 +763,10 @@ impl CoreStore {
                 generation: 1,
                 placement_epoch: LOCAL_PLACEMENT_EPOCH,
                 fsync_sequence: LOCAL_SHARD_FSYNC_SEQUENCE,
+                written_at_unix_nanos,
+                signed_payload_hash,
+                signature_algorithm: "ed25519-libp2p".to_string(),
+                receipt_signature,
             });
         }
 
@@ -5289,6 +5323,10 @@ fn logical_block_ref_from_materialized_block(
                 generation: placement.generation,
                 placement_epoch: placement.placement_epoch,
                 fsync_sequence: placement.fsync_sequence,
+                written_at_unix_nanos: placement.written_at_unix_nanos,
+                signed_payload_hash: placement.signed_payload_hash.clone(),
+                signature_algorithm: placement.signature_algorithm.clone(),
+                receipt_signature: placement.receipt_signature.clone(),
             })
             .collect(),
         codec_id: profile.codec_id.to_string(),
@@ -5563,6 +5601,10 @@ fn object_ref_from_logical_block_ref(
                 generation: shard.generation,
                 placement_epoch: shard.placement_epoch,
                 fsync_sequence: shard.fsync_sequence,
+                written_at_unix_nanos: shard.written_at_unix_nanos,
+                signed_payload_hash: shard.signed_payload_hash.clone(),
+                signature_algorithm: shard.signature_algorithm.clone(),
+                receipt_signature: shard.receipt_signature.clone(),
             })
             .collect(),
     })
@@ -5655,6 +5697,37 @@ fn validate_manifest_locator(locator: &CoreManifestLocator) -> Result<()> {
     }
     for receipt in &block.shard_receipts {
         validate_hash(&receipt.shard_hash, "manifest locator shard receipt hash")?;
+        validate_hash(
+            &receipt.signed_payload_hash,
+            "manifest locator shard receipt payload hash",
+        )?;
+        if receipt.signature_algorithm != "ed25519-libp2p" {
+            bail!(
+                "CoreStore manifest locator shard receipt uses unsupported signature algorithm {}",
+                receipt.signature_algorithm
+            );
+        }
+        if receipt.receipt_signature.is_empty() {
+            bail!("CoreStore manifest locator shard receipt signature must not be empty");
+        }
+        let shard_index = u16::try_from(receipt.shard_index)
+            .map_err(|_| anyhow!("CoreStore manifest locator shard index exceeds u16"))?;
+        let expected_signed_payload_hash = shard_receipt_payload_hash(ShardReceiptPayloadInput {
+            block_id: &block.block_id,
+            shard_index,
+            erasure_profile: &block.erasure_profile_id,
+            node_id: &receipt.node_id,
+            region_id: &receipt.region_id,
+            cell_id: &receipt.cell_id,
+            placement_epoch: block.placement_epoch,
+            shard_length: receipt.shard_length,
+            shard_hash: &receipt.shard_hash,
+            fsync_sequence: receipt.fsync_sequence,
+            written_at_unix_nanos: receipt.written_at_unix_nanos,
+        });
+        if receipt.signed_payload_hash != expected_signed_payload_hash {
+            bail!("CoreStore manifest locator shard receipt signed payload hash mismatch");
+        }
     }
     Ok(())
 }
@@ -5694,6 +5767,10 @@ fn object_ref_from_manifest_locator(locator: &CoreManifestLocator) -> Result<Cor
                 generation: 1,
                 placement_epoch: block.placement_epoch,
                 fsync_sequence: receipt.fsync_sequence,
+                written_at_unix_nanos: receipt.written_at_unix_nanos,
+                signed_payload_hash: receipt.signed_payload_hash.clone(),
+                signature_algorithm: receipt.signature_algorithm.clone(),
+                receipt_signature: receipt.receipt_signature.clone(),
             })
             .collect(),
     })
@@ -5748,16 +5825,19 @@ fn shard_receipt_summary_from_object_placement(
     shard: &CoreObjectPlacement,
 ) -> Result<CoreShardReceiptSummary> {
     validate_hash(&shard.shard_hash, "logical shard hash")?;
-    let signed_payload_hash = descriptor_hash(&[
-        "shard_receipt_summary",
-        &shard.node_id,
-        &shard.region_id,
-        &shard.cell_id,
-        &shard.shard_index.to_string(),
-        &shard.shard_hash,
-        &shard.stored_size.to_string(),
-        &shard.fsync_sequence.to_string(),
-    ]);
+    validate_hash(
+        &shard.signed_payload_hash,
+        "logical shard receipt payload hash",
+    )?;
+    if shard.signature_algorithm != "ed25519-libp2p" {
+        bail!(
+            "CoreStore shard receipt uses unsupported signature algorithm {}",
+            shard.signature_algorithm
+        );
+    }
+    if shard.receipt_signature.is_empty() {
+        bail!("CoreStore shard receipt signature must not be empty");
+    }
     Ok(CoreShardReceiptSummary {
         node_id: shard.node_id.clone(),
         region_id: shard.region_id.clone(),
@@ -5766,10 +5846,10 @@ fn shard_receipt_summary_from_object_placement(
         shard_hash: shard.shard_hash.clone(),
         shard_length: shard.stored_size,
         fsync_sequence: shard.fsync_sequence,
-        written_at_unix_nanos: 0,
-        signed_payload_hash,
-        signature_algorithm: "local-dev-unsigned".to_string(),
-        receipt_signature: Vec::new(),
+        written_at_unix_nanos: shard.written_at_unix_nanos,
+        signed_payload_hash: shard.signed_payload_hash.clone(),
+        signature_algorithm: shard.signature_algorithm.clone(),
+        receipt_signature: shard.receipt_signature.clone(),
     })
 }
 
@@ -6090,6 +6170,40 @@ struct DecodedBlockShard {
     erasure_profile_id: String,
     boundary_values: Vec<CoreBoundaryValue>,
     payload: Vec<u8>,
+}
+
+struct ShardReceiptPayloadInput<'a> {
+    block_id: &'a str,
+    shard_index: u16,
+    erasure_profile: &'a str,
+    node_id: &'a str,
+    region_id: &'a str,
+    cell_id: &'a str,
+    placement_epoch: u64,
+    shard_length: u64,
+    shard_hash: &'a str,
+    fsync_sequence: u64,
+    written_at_unix_nanos: u64,
+}
+
+fn shard_receipt_payload_hash(input: ShardReceiptPayloadInput<'_>) -> String {
+    let shard_id = format!("{}:{}", input.block_id, input.shard_index);
+    descriptor_hash(&[
+        "anvil.shard.receipt.v1",
+        "anvil.core.shard_receipt.v1",
+        input.block_id,
+        &shard_id,
+        &input.shard_index.to_string(),
+        input.erasure_profile,
+        input.node_id,
+        input.region_id,
+        input.cell_id,
+        &input.placement_epoch.to_string(),
+        &input.shard_length.to_string(),
+        input.shard_hash,
+        &input.fsync_sequence.to_string(),
+        &input.written_at_unix_nanos.to_string(),
+    ])
 }
 
 fn encode_block_shard_file(header: BlockShardHeaderInput, payload: &[u8]) -> Result<Vec<u8>> {
@@ -8171,16 +8285,40 @@ mod tests {
             let placement = &placements[shard_index];
             stripe_size =
                 stripe_size.max((shard.len() as u64).saturating_mul(profile.data_shards as u64));
+            let written_at_unix_nanos = unix_timestamp_nanos();
+            let shard_hash = format!("sha256:{shard_hash}");
+            let signed_payload_hash = shard_receipt_payload_hash(ShardReceiptPayloadInput {
+                block_id: &local_block_id_for_logical_block(
+                    logical_file_id,
+                    0,
+                    0,
+                    &format!("sha256:{hash}"),
+                ),
+                shard_index: shard_index as u16,
+                erasure_profile: profile.id,
+                node_id: &placement.node_id,
+                region_id: &placement.region_id,
+                cell_id: &placement.cell_id,
+                placement_epoch: LOCAL_PLACEMENT_EPOCH,
+                shard_length: shard.len() as u64,
+                shard_hash: &shard_hash,
+                fsync_sequence: LOCAL_SHARD_FSYNC_SEQUENCE,
+                written_at_unix_nanos,
+            });
             object_placements.push(CoreObjectPlacement {
                 shard_index: shard_index as u16,
                 node_id: placement.node_id.clone(),
                 region_id: placement.region_id.clone(),
                 cell_id: placement.cell_id.clone(),
-                shard_hash: format!("sha256:{shard_hash}"),
+                shard_hash,
                 stored_size: shard.len() as u64,
                 generation: 1,
                 placement_epoch: LOCAL_PLACEMENT_EPOCH,
                 fsync_sequence: LOCAL_SHARD_FSYNC_SEQUENCE,
+                written_at_unix_nanos,
+                signed_payload_hash,
+                signature_algorithm: "ed25519-libp2p".to_string(),
+                receipt_signature: b"test-core-shard-receipt-signature".to_vec(),
             });
         }
         CoreObjectRef {
@@ -8585,6 +8723,12 @@ mod tests {
             block.shard_receipts.len(),
             LOCAL_DATA_SHARDS + LOCAL_PARITY_SHARDS
         );
+        for receipt in &block.shard_receipts {
+            assert_ne!(receipt.written_at_unix_nanos, 0);
+            assert!(receipt.signed_payload_hash.starts_with("sha256:"));
+            assert_eq!(receipt.signature_algorithm, "ed25519-libp2p");
+            assert!(!receipt.receipt_signature.is_empty());
+        }
         assert_ne!(
             block.block_id, write.manifest.blocks[0].block_id,
             "manifest locator must point at the published manifest bytes, not the data block"
@@ -9333,6 +9477,12 @@ mod tests {
 
         let manifest = store.read_object_manifest(&object_ref).await.unwrap();
         assert_eq!(manifest.boundary_values, vec![boundary_value]);
+        for placement in &manifest.placements {
+            assert_ne!(placement.written_at_unix_nanos, 0);
+            assert!(placement.signed_payload_hash.starts_with("sha256:"));
+            assert_eq!(placement.signature_algorithm, "ed25519-libp2p");
+            assert!(!placement.receipt_signature.is_empty());
+        }
     }
 
     #[tokio::test]

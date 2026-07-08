@@ -252,6 +252,10 @@ pub struct CoreLogicalShardRef {
     pub generation: u64,
     pub placement_epoch: u64,
     pub fsync_sequence: u64,
+    pub written_at_unix_nanos: u64,
+    pub signed_payload_hash: String,
+    pub signature_algorithm: String,
+    pub receipt_signature: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -346,6 +350,10 @@ pub fn core_object_ref_from_logical_file_manifest(
                         generation: shard.generation,
                         placement_epoch: shard.placement_epoch,
                         fsync_sequence: shard.fsync_sequence,
+                        written_at_unix_nanos: shard.written_at_unix_nanos,
+                        signed_payload_hash: shard.signed_payload_hash.clone(),
+                        signature_algorithm: shard.signature_algorithm.clone(),
+                        receipt_signature: shard.receipt_signature.clone(),
                     })
                     .collect()
             })
@@ -425,6 +433,10 @@ pub struct CoreObjectPlacement {
     pub generation: u64,
     pub placement_epoch: u64,
     pub fsync_sequence: u64,
+    pub written_at_unix_nanos: u64,
+    pub signed_payload_hash: String,
+    pub signature_algorithm: String,
+    pub receipt_signature: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
