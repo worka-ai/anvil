@@ -564,6 +564,7 @@ impl CoreStore {
             node_signing_keypair,
         };
         store.ensure_layout().await?;
+        store.bootstrap_system_root_anchor().await?;
         store.recover_core_wal().await?;
         Ok(store)
     }
@@ -4749,6 +4750,37 @@ impl CoreStore {
             writer_families,
             manifest_count: 1,
             final_block_count,
+        };
+        self.write_root_register_anchor(&anchor).await
+    }
+
+    async fn bootstrap_system_root_anchor(&self) -> Result<()> {
+        let root_anchor_key = core_transaction_root_anchor_key();
+        if self
+            .read_latest_root_anchor(root_anchor_key)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let anchor = CoreRootAnchorRecord {
+            schema: "anvil.core.root_anchor.v1".to_string(),
+            root_anchor_key: root_anchor_key.to_string(),
+            root_key_hash: root_key_hash(root_anchor_key),
+            root_generation: 0,
+            previous_root_hash: ZERO_HASH.to_string(),
+            transaction_manifest: None,
+            checkpoint_manifest: None,
+            publisher_node_id: CORE_WAL_NODE_ID.to_string(),
+            publisher_epoch: LOCAL_PLACEMENT_EPOCH,
+            partition_owner_fence: LOCAL_PLACEMENT_EPOCH,
+            created_at_unix_nanos: unix_timestamp_nanos(),
+            root_state: "committed".to_string(),
+            mutation_first: None,
+            mutation_last: None,
+            writer_families: vec!["core_control".to_string()],
+            manifest_count: 0,
+            final_block_count: 0,
         };
         self.write_root_register_anchor(&anchor).await
     }
@@ -10733,6 +10765,46 @@ mod tests {
                 .iter()
                 .any(|record| record.record_kind == CORE_WAL_FINALISATION_RECORD_KIND),
             "CoreStore must recover transaction stream records from the latest root anchor"
+        );
+    }
+
+    #[tokio::test]
+    async fn core_store_bootstraps_system_root_anchor_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        let register_root = tmp
+            .path()
+            .join("_core")
+            .join("blocks")
+            .join("register")
+            .join(CORE_TRANSACTION_ROOT_PARTITION_ID.to_string());
+        assert_eq!(
+            count_files_with_extension(&register_root, "anr"),
+            3,
+            "startup bootstrap must write exactly one root-register-r3 genesis generation"
+        );
+        let genesis = store
+            .read_latest_root_anchor(core_transaction_root_anchor_key())
+            .await
+            .unwrap()
+            .expect("genesis root anchor");
+        assert_eq!(genesis.root_generation, 0);
+        assert!(genesis.transaction_manifest.is_none());
+
+        drop(store);
+        let reopened = CoreStore::new(storage).await.unwrap();
+        assert_eq!(
+            count_files_with_extension(&register_root, "anr"),
+            3,
+            "bootstrap must be idempotent after restart"
+        );
+        assert!(
+            reopened
+                .read_direct_stream_records(CORE_TRANSACTION_STREAM_ID)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
