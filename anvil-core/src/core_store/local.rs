@@ -346,6 +346,20 @@ struct CoreRootRegisterHeader {
     root_anchor_hash: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CoreTransactionManifestRecord {
+    schema: String,
+    mutation_ids: Vec<String>,
+    idempotency_key_hashes: Vec<String>,
+    pre_root_generation: u64,
+    post_root_generation: u64,
+    logical_manifests: Vec<CoreManifestLocator>,
+    ref_updates: Vec<serde_json::Value>,
+    tombstones: Vec<serde_json::Value>,
+    writer_checkpoints: Vec<serde_json::Value>,
+    boundary_schema_refs: Vec<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredStreamSegmentHeader {
     schema: String,
@@ -4676,11 +4690,25 @@ impl CoreStore {
         else {
             return Ok(Vec::new());
         };
-        let Some(locator) = anchor.transaction_manifest else {
+        let Some(transaction_manifest_locator) = anchor.transaction_manifest else {
             return Ok(Vec::new());
         };
-        validate_manifest_locator(&locator)?;
-        let manifest = self.read_logical_file_manifest(&locator).await?;
+        validate_manifest_locator(&transaction_manifest_locator)?;
+        let transaction_manifest = self
+            .read_logical_file_manifest(&transaction_manifest_locator)
+            .await?;
+        let transaction_manifest_bytes = self
+            .read_logical_file_plaintext(&transaction_manifest)
+            .await?;
+        let transaction: CoreTransactionManifestRecord =
+            serde_json::from_slice(&transaction_manifest_bytes)?;
+        validate_transaction_manifest_record(&transaction, anchor.root_generation)?;
+        let state_locator = transaction
+            .logical_manifests
+            .first()
+            .ok_or_else(|| anyhow!("CoreStore transaction manifest has no logical manifests"))?;
+        validate_manifest_locator(state_locator)?;
+        let manifest = self.read_logical_file_manifest(state_locator).await?;
         let bytes = self.read_logical_file_plaintext(&manifest).await?;
         decode_active_stream_records(CORE_TRANSACTION_STREAM_ID, &bytes)
             .with_context(|| "decode root-anchored CoreStore transaction stream")
@@ -4691,27 +4719,60 @@ impl CoreStore {
         records: &[StreamRecord],
         bytes: Vec<u8>,
     ) -> Result<()> {
-        let locator = self
+        let root_anchor_key = core_transaction_root_anchor_key();
+        let current = self.read_latest_root_anchor(root_anchor_key).await?;
+        let pre_root_generation = current
+            .as_ref()
+            .map(|anchor| anchor.root_generation)
+            .unwrap_or(0);
+        let post_root_generation = pre_root_generation.saturating_add(1);
+        let state_locator = self
             .write_stream_state_logical_file(CORE_TRANSACTION_STREAM_ID, records, bytes)
             .await?;
-        self.publish_core_transaction_root_anchor(records, locator)
-            .await
+        let transaction = CoreTransactionManifestRecord {
+            schema: "anvil.core.transaction_manifest.v1".to_string(),
+            mutation_ids: records.iter().map(|record| record.cursor.clone()).collect(),
+            idempotency_key_hashes: records
+                .iter()
+                .filter_map(|record| record.idempotency_key_hash.clone())
+                .collect(),
+            pre_root_generation,
+            post_root_generation,
+            logical_manifests: vec![state_locator],
+            ref_updates: Vec::new(),
+            tombstones: Vec::new(),
+            writer_checkpoints: Vec::new(),
+            boundary_schema_refs: Vec::new(),
+        };
+        let transaction_manifest = self
+            .write_logical_bytes_direct(
+                "core_control",
+                format!("lf_core_transaction_manifest_{post_root_generation:020}"),
+                post_root_generation,
+                serde_json::to_vec(&transaction)?,
+                format!("core_transaction_manifest_{post_root_generation:020}"),
+                "local".to_string(),
+            )
+            .await?;
+        self.publish_core_transaction_root_anchor(
+            records,
+            transaction_manifest,
+            current.as_ref(),
+            post_root_generation,
+        )
+        .await
     }
 
     async fn publish_core_transaction_root_anchor(
         &self,
         records: &[StreamRecord],
         transaction_manifest: CoreManifestLocator,
+        current: Option<&CoreRootAnchorRecord>,
+        root_generation: u64,
     ) -> Result<()> {
         let root_anchor_key = core_transaction_root_anchor_key();
         let root_key_hash = root_key_hash(root_anchor_key);
-        let current = self.read_latest_root_anchor(root_anchor_key).await?;
-        let root_generation = current
-            .as_ref()
-            .map(|anchor| anchor.root_generation.saturating_add(1))
-            .unwrap_or(0);
         let previous_root_hash = current
-            .as_ref()
             .map(hash_root_anchor_record)
             .transpose()?
             .unwrap_or_else(|| ZERO_HASH.to_string());
@@ -4943,7 +5004,6 @@ impl CoreStore {
         let last_sequence = records.last().map(|record| record.sequence).unwrap_or(0);
         let state_hash = format!("sha256:{}", sha256_hex(&bytes));
         let state_hash_hex = strip_sha256_prefix(&state_hash)?;
-        let profile = local_erasure_profile(LOCAL_ERASURE_PROFILE_ID)?;
         let (writer_family, logical_file_id, mutation_id) =
             if stream_id == CORE_TRANSACTION_STREAM_ID {
                 (
@@ -4961,10 +5021,33 @@ impl CoreStore {
                     format!("stream_state_{}", sha256_hex(stream_id.as_bytes())),
                 )
             };
+        self.write_logical_bytes_direct(
+            writer_family,
+            logical_file_id,
+            last_sequence,
+            bytes,
+            mutation_id,
+            "local".to_string(),
+        )
+        .await
+    }
+
+    async fn write_logical_bytes_direct(
+        &self,
+        writer_family: &str,
+        logical_file_id: String,
+        generation: u64,
+        bytes: Vec<u8>,
+        mutation_id: String,
+        region_id: String,
+    ) -> Result<CoreManifestLocator> {
+        let state_hash = format!("sha256:{}", sha256_hex(&bytes));
+        let state_hash_hex = strip_sha256_prefix(&state_hash)?;
+        let profile = local_erasure_profile(LOCAL_ERASURE_PROFILE_ID)?;
         let object_ref = self
             .materialise_object_blob_bytes(
                 &logical_file_id,
-                last_sequence,
+                generation,
                 0,
                 &state_hash,
                 state_hash_hex,
@@ -4987,7 +5070,7 @@ impl CoreStore {
         };
         let request = WriteLogicalFileRequest {
             writer_family: writer_family.to_string(),
-            generation: last_sequence,
+            generation,
             logical_file_id,
             source: Vec::new(),
             range_hints: Vec::new(),
@@ -4995,7 +5078,7 @@ impl CoreStore {
             trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
             mutation_id,
-            region_id: "local".to_string(),
+            region_id,
         };
         let manifest = logical_file_manifest_from_object_manifests(
             &request,
@@ -7505,6 +7588,28 @@ fn validate_root_anchor_record(anchor: &CoreRootAnchorRecord) -> Result<()> {
         validate_manifest_locator(locator)?;
     }
     if let Some(locator) = &anchor.checkpoint_manifest {
+        validate_manifest_locator(locator)?;
+    }
+    Ok(())
+}
+
+fn validate_transaction_manifest_record(
+    transaction: &CoreTransactionManifestRecord,
+    expected_root_generation: u64,
+) -> Result<()> {
+    if transaction.schema != "anvil.core.transaction_manifest.v1" {
+        bail!("CoreStore transaction manifest has invalid schema");
+    }
+    if transaction.post_root_generation != expected_root_generation {
+        bail!("CoreStore transaction manifest post_root_generation does not match root anchor");
+    }
+    if transaction.post_root_generation != transaction.pre_root_generation.saturating_add(1) {
+        bail!("CoreStore transaction manifest root generations must be contiguous");
+    }
+    if transaction.logical_manifests.is_empty() {
+        bail!("CoreStore transaction manifest must include logical manifests");
+    }
+    for locator in &transaction.logical_manifests {
         validate_manifest_locator(locator)?;
     }
     Ok(())
@@ -10756,6 +10861,30 @@ mod tests {
 
         drop(store);
         let recovered = CoreStore::new(storage).await.unwrap();
+        let latest_anchor = recovered
+            .read_latest_root_anchor(core_transaction_root_anchor_key())
+            .await
+            .unwrap()
+            .expect("latest transaction root anchor");
+        let transaction_manifest_locator = latest_anchor
+            .transaction_manifest
+            .clone()
+            .expect("root anchor transaction manifest locator");
+        let transaction_manifest = recovered
+            .read_logical_file_manifest(&transaction_manifest_locator)
+            .await
+            .unwrap();
+        let transaction_manifest_bytes = recovered
+            .read_logical_file_plaintext(&transaction_manifest)
+            .await
+            .unwrap();
+        let transaction_manifest: CoreTransactionManifestRecord =
+            serde_json::from_slice(&transaction_manifest_bytes).unwrap();
+        assert_eq!(
+            transaction_manifest.post_root_generation,
+            latest_anchor.root_generation
+        );
+        assert_eq!(transaction_manifest.logical_manifests.len(), 1);
         let records = recovered
             .read_direct_stream_records(CORE_TRANSACTION_STREAM_ID)
             .await
