@@ -346,6 +346,10 @@ struct CoreRootRegisterHeader {
     placement_epoch: u64,
     created_at_unix_nanos: u64,
     root_anchor_hash: String,
+    fsync_sequence: u64,
+    signed_payload_hash: String,
+    signature_algorithm: String,
+    receipt_signature: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -670,6 +674,22 @@ impl CoreStore {
                     &receipt.receipt_signature,
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    fn verify_root_register_header_receipt(&self, header: &CoreRootRegisterHeader) -> Result<()> {
+        let node_id = root_register_header_node_id(header)?;
+        if !is_local_control_node_id(node_id) {
+            bail!("CoreStore root register receipt references unknown node {node_id}");
+        }
+        if !self.node_signing_keypair.public().verify(
+            header.signed_payload_hash.as_bytes(),
+            &header.receipt_signature,
+        ) {
+            bail!(
+                "CoreStore root register receipt signature verification failed for node {node_id}"
+            );
         }
         Ok(())
     }
@@ -5017,14 +5037,25 @@ impl CoreStore {
             {
                 continue;
             }
-            let bytes = read_file(&entry.path(), "core_store", "read_root_register_shard").await?;
-            let (header, anchor) = decode_root_register_shard_file(&bytes)?;
+            let Ok(bytes) =
+                read_file(&entry.path(), "core_store", "read_root_register_shard").await
+            else {
+                continue;
+            };
+            let Ok((header, anchor)) = decode_root_register_shard_file(&bytes) else {
+                continue;
+            };
+            if self.verify_root_register_header_receipt(&header).is_err() {
+                continue;
+            }
             if header.root_key_hash != root_key_hash || header.root_generation != generation {
                 continue;
             }
-            let anchor_hash = hash_root_anchor_record(&anchor)?;
+            let Ok(anchor_hash) = hash_root_anchor_record(&anchor) else {
+                continue;
+            };
             if anchor_hash != header.root_anchor_hash {
-                bail!("CoreStore root register shard anchor hash mismatch");
+                continue;
             }
             by_hash
                 .entry((anchor_hash, header.register_cohort_hash.clone()))
@@ -5102,7 +5133,7 @@ impl CoreStore {
         let generation_dir =
             self.root_register_generation_dir(&anchor.root_key_hash, anchor.root_generation)?;
         for (index, _node_id) in cohort_nodes.iter().enumerate() {
-            let header = CoreRootRegisterHeader {
+            let mut header = CoreRootRegisterHeader {
                 schema: "anvil.core.root_register_shard.v1".to_string(),
                 root_partition_id: CORE_TRANSACTION_ROOT_PARTITION_ID,
                 root_key_hash: anchor.root_key_hash.clone(),
@@ -5113,7 +5144,13 @@ impl CoreStore {
                 placement_epoch: LOCAL_PLACEMENT_EPOCH,
                 created_at_unix_nanos,
                 root_anchor_hash: root_anchor_hash.clone(),
+                fsync_sequence: LOCAL_SHARD_FSYNC_SEQUENCE,
+                signed_payload_hash: String::new(),
+                signature_algorithm: "ed25519-libp2p".to_string(),
+                receipt_signature: Vec::new(),
             };
+            header.signed_payload_hash = root_register_receipt_payload_hash(&header)?;
+            header.receipt_signature = self.sign_core_receipt(&header.signed_payload_hash)?;
             let bytes = encode_root_register_shard_file(&header, &anchor_bytes)?;
             let shard_path = generation_dir.join(format!("shard-{index}.anr"));
             write_file_create_new_or_same(&shard_path, &bytes).await?;
@@ -6101,6 +6138,13 @@ fn manifest_locator_from_manifest_and_ref(
 fn is_local_shard_node_id(node_id: &str) -> bool {
     node_id
         .strip_prefix(LOCAL_NODE_ID_PREFIX)
+        .and_then(|suffix| suffix.strip_prefix('-'))
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn is_local_control_node_id(node_id: &str) -> bool {
+    node_id
+        .strip_prefix(LOCAL_CONTROL_NODE_ID_PREFIX)
         .and_then(|suffix| suffix.strip_prefix('-'))
         .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()))
 }
@@ -8235,6 +8279,33 @@ fn decode_root_anchor_record(bytes: &[u8]) -> Result<CoreRootAnchorRecord> {
     Ok(anchor)
 }
 
+fn root_register_header_node_id(header: &CoreRootRegisterHeader) -> Result<&str> {
+    header
+        .register_cohort_nodes
+        .get(usize::from(header.shard_index))
+        .map(String::as_str)
+        .ok_or_else(|| anyhow!("CoreStore root register shard index exceeds cohort nodes"))
+}
+
+fn root_register_receipt_payload_hash(header: &CoreRootRegisterHeader) -> Result<String> {
+    let node_id = root_register_header_node_id(header)?;
+    Ok(descriptor_hash(&[
+        "anvil.root_register.receipt.v1",
+        &header.schema,
+        &header.root_partition_id.to_string(),
+        &header.root_key_hash,
+        &header.root_generation.to_string(),
+        &header.shard_index.to_string(),
+        node_id,
+        &header.register_cohort_nodes.join(","),
+        &header.register_cohort_hash,
+        &header.placement_epoch.to_string(),
+        &header.created_at_unix_nanos.to_string(),
+        &header.root_anchor_hash,
+        &header.fsync_sequence.to_string(),
+    ]))
+}
+
 fn validate_root_register_header(header: &CoreRootRegisterHeader) -> Result<()> {
     if header.schema != "anvil.core.root_register_shard.v1" {
         bail!("CoreStore root register shard header has invalid schema");
@@ -8253,6 +8324,22 @@ fn validate_root_register_header(header: &CoreRootRegisterHeader) -> Result<()> 
     if header.created_at_unix_nanos == 0 {
         bail!("CoreStore root register timestamp must be nonzero");
     }
+    if header.fsync_sequence == 0 {
+        bail!("CoreStore root register fsync sequence must be nonzero");
+    }
+    validate_hash(
+        &header.signed_payload_hash,
+        "root register receipt payload hash",
+    )?;
+    if header.signature_algorithm != "ed25519-libp2p" {
+        bail!(
+            "CoreStore root register receipt uses unsupported signature algorithm {}",
+            header.signature_algorithm
+        );
+    }
+    if header.receipt_signature.is_empty() {
+        bail!("CoreStore root register receipt signature must not be empty");
+    }
     let unique_nodes = header.register_cohort_nodes.iter().collect::<BTreeSet<_>>();
     if header.register_cohort_nodes.len() != 3 || unique_nodes.len() != 3 {
         bail!("CoreStore root register cohort must contain three distinct nodes");
@@ -8265,6 +8352,10 @@ fn validate_root_register_header(header: &CoreRootRegisterHeader) -> Result<()> 
     ]);
     if header.register_cohort_hash != expected_cohort_hash {
         bail!("CoreStore root register cohort hash mismatch");
+    }
+    let expected_receipt_hash = root_register_receipt_payload_hash(header)?;
+    if header.signed_payload_hash != expected_receipt_hash {
+        bail!("CoreStore root register receipt signed payload hash mismatch");
     }
     Ok(())
 }
@@ -11789,6 +11880,52 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "root register majority must require distinct shard receipt indices"
+        );
+    }
+
+    #[tokio::test]
+    async fn core_store_root_register_requires_valid_receipt_majority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        let root_key_hash = root_key_hash(core_transaction_root_anchor_key());
+        let generation_dir = store
+            .root_register_generation_dir(&root_key_hash, 0)
+            .unwrap();
+
+        let shard_1 = generation_dir.join("shard-1.anr");
+        let shard_2 = generation_dir.join("shard-2.anr");
+        let shard_1_bytes = read_file(&shard_1, "core_store", "test_root_register_shard")
+            .await
+            .unwrap();
+        let (mut header, anchor) = decode_root_register_shard_file(&shard_1_bytes).unwrap();
+        assert_eq!(header.fsync_sequence, LOCAL_SHARD_FSYNC_SEQUENCE);
+        assert!(header.signed_payload_hash.starts_with("sha256:"));
+        assert_eq!(header.signature_algorithm, "ed25519-libp2p");
+        assert!(!header.receipt_signature.is_empty());
+
+        header.receipt_signature[0] ^= 0x01;
+        let anchor_bytes = encode_root_anchor_record(&anchor).unwrap();
+        let corrupted = encode_root_register_shard_file(&header, &anchor_bytes).unwrap();
+        write_file_atomic(&shard_1, &corrupted).await.unwrap();
+
+        assert!(
+            store
+                .read_committed_root_anchor_generation(&root_key_hash, 0)
+                .await
+                .unwrap()
+                .is_some(),
+            "root discovery must ignore a corrupted shard when two valid receipt-bearing shards remain"
+        );
+
+        tokio::fs::remove_file(shard_2).await.unwrap();
+        assert!(
+            store
+                .read_committed_root_anchor_generation(&root_key_hash, 0)
+                .await
+                .unwrap()
+                .is_none(),
+            "root discovery must not commit a generation without two valid receipt-bearing shards"
         );
     }
 
