@@ -595,6 +595,85 @@ impl CoreStore {
             .map_err(|error| anyhow!("sign CoreStore shard receipt: {error}"))
     }
 
+    fn verify_core_receipt_signature(
+        &self,
+        node_id: &str,
+        signed_payload_hash: &str,
+        receipt_signature: &[u8],
+    ) -> Result<()> {
+        if !is_local_shard_node_id(node_id) {
+            bail!("CoreStore shard receipt references unknown node {node_id}");
+        }
+        if !self
+            .node_signing_keypair
+            .public()
+            .verify(signed_payload_hash.as_bytes(), receipt_signature)
+        {
+            bail!("CoreStore shard receipt signature verification failed for node {node_id}");
+        }
+        Ok(())
+    }
+
+    fn verify_object_placement_receipt(
+        &self,
+        block_id: &str,
+        profile_id: &str,
+        placement: &CoreObjectPlacement,
+    ) -> Result<()> {
+        let profile = local_erasure_profile(profile_id)?;
+        validate_local_shard_receipt_placement(
+            profile,
+            usize::from(placement.shard_index),
+            &placement.node_id,
+            &placement.region_id,
+            &placement.cell_id,
+        )?;
+        let expected = shard_receipt_payload_hash(ShardReceiptPayloadInput {
+            block_id,
+            shard_index: placement.shard_index,
+            erasure_profile: profile_id,
+            node_id: &placement.node_id,
+            region_id: &placement.region_id,
+            cell_id: &placement.cell_id,
+            placement_epoch: placement.placement_epoch,
+            shard_length: placement.stored_size,
+            shard_hash: &placement.shard_hash,
+            fsync_sequence: placement.fsync_sequence,
+            written_at_unix_nanos: placement.written_at_unix_nanos,
+        });
+        validate_shard_receipt_common(
+            &placement.node_id,
+            &placement.region_id,
+            &placement.cell_id,
+            &placement.shard_hash,
+            placement.stored_size,
+            placement.fsync_sequence,
+            placement.written_at_unix_nanos,
+            &placement.signed_payload_hash,
+            &placement.signature_algorithm,
+            &placement.receipt_signature,
+            &expected,
+        )?;
+        self.verify_core_receipt_signature(
+            &placement.node_id,
+            &placement.signed_payload_hash,
+            &placement.receipt_signature,
+        )
+    }
+
+    fn verify_manifest_locator_receipts(&self, locator: &CoreManifestLocator) -> Result<()> {
+        for block in &locator.block_locators {
+            for receipt in &block.shard_receipts {
+                self.verify_core_receipt_signature(
+                    &receipt.node_id,
+                    &receipt.signed_payload_hash,
+                    &receipt.receipt_signature,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn put_blob(&self, input: PutBlob) -> Result<CoreObjectRef> {
         self.put_blob_with_profile(input, local_erasure_profile(LOCAL_ERASURE_PROFILE_ID)?)
             .await
@@ -1497,6 +1576,7 @@ impl CoreStore {
             &[("operation", "read_logical_file_manifest")],
         );
         validate_manifest_locator(locator)?;
+        self.verify_manifest_locator_receipts(locator)?;
         let object_ref = object_ref_from_manifest_locator(locator)?;
         let bytes = self.get_blob(GetBlob { object_ref }).await?;
         if bytes.len() as u64 != locator.manifest_length {
@@ -4368,6 +4448,7 @@ impl CoreStore {
             if usize::from(placement.shard_index) >= profile.total_shards() {
                 bail!("CoreStore object ref contains shard index outside profile");
             }
+            self.verify_object_placement_receipt(&expected_block_id, profile.id, placement)?;
             let path = self.shard_path(
                 &placement.node_id,
                 &expected_block_id,
@@ -5974,6 +6055,79 @@ fn manifest_locator_from_manifest_and_ref(
     })
 }
 
+fn is_local_shard_node_id(node_id: &str) -> bool {
+    node_id
+        .strip_prefix(LOCAL_NODE_ID_PREFIX)
+        .and_then(|suffix| suffix.strip_prefix('-'))
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn validate_shard_receipt_common(
+    node_id: &str,
+    region_id: &str,
+    cell_id: &str,
+    shard_hash: &str,
+    _shard_length: u64,
+    fsync_sequence: u64,
+    written_at_unix_nanos: u64,
+    signed_payload_hash: &str,
+    signature_algorithm: &str,
+    receipt_signature: &[u8],
+    expected_signed_payload_hash: &str,
+) -> Result<()> {
+    validate_logical_id(node_id, "shard receipt node id")?;
+    validate_logical_id(region_id, "shard receipt region id")?;
+    validate_logical_id(cell_id, "shard receipt cell id")?;
+    validate_hash(shard_hash, "shard receipt hash")?;
+    if fsync_sequence == 0 {
+        bail!("CoreStore shard receipt fsync sequence must be nonzero");
+    }
+    if written_at_unix_nanos == 0 {
+        bail!("CoreStore shard receipt timestamp must be nonzero");
+    }
+    validate_hash(signed_payload_hash, "shard receipt payload hash")?;
+    if signature_algorithm != "ed25519-libp2p" {
+        bail!(
+            "CoreStore shard receipt uses unsupported signature algorithm {}",
+            signature_algorithm
+        );
+    }
+    if receipt_signature.is_empty() {
+        bail!("CoreStore shard receipt signature must not be empty");
+    }
+    if signed_payload_hash != expected_signed_payload_hash {
+        bail!("CoreStore shard receipt signed payload hash mismatch");
+    }
+    Ok(())
+}
+
+fn validate_local_shard_receipt_placement(
+    profile: LocalErasureProfile,
+    shard_index: usize,
+    node_id: &str,
+    region_id: &str,
+    cell_id: &str,
+) -> Result<()> {
+    let expected = plan_local_shard_placements(profile)?
+        .into_iter()
+        .nth(shard_index)
+        .ok_or_else(|| anyhow!("CoreStore shard receipt index exceeds placement plan"))?;
+    if expected.node_id != node_id || expected.region_id != region_id || expected.cell_id != cell_id
+    {
+        bail!(
+            "CoreStore shard receipt placement mismatch for shard {}: expected {}/{}/{}, got {}/{}/{}",
+            shard_index,
+            expected.region_id,
+            expected.cell_id,
+            expected.node_id,
+            region_id,
+            cell_id,
+            node_id
+        );
+    }
+    Ok(())
+}
+
 fn validate_manifest_locator(locator: &CoreManifestLocator) -> Result<()> {
     validate_logical_id(
         &locator.manifest_ref.logical_file_id,
@@ -6027,34 +6181,23 @@ fn validate_manifest_locator(locator: &CoreManifestLocator) -> Result<()> {
         if !seen_shards.insert(receipt.shard_index) {
             bail!("CoreStore manifest locator shard receipt index is duplicated");
         }
-        validate_logical_id(&receipt.node_id, "manifest locator receipt node id")?;
-        validate_logical_id(&receipt.region_id, "manifest locator receipt region id")?;
-        validate_logical_id(&receipt.cell_id, "manifest locator receipt cell id")?;
-        validate_hash(&receipt.shard_hash, "manifest locator shard receipt hash")?;
+        let shard_index = u16::try_from(receipt.shard_index)
+            .map_err(|_| anyhow!("CoreStore manifest locator shard index exceeds u16"))?;
         if receipt.shard_length == 0 && locator.manifest_length != 0 {
             bail!("CoreStore manifest locator shard receipt length must be nonzero");
         }
-        if receipt.fsync_sequence == 0 {
-            bail!("CoreStore manifest locator shard receipt fsync sequence must be nonzero");
-        }
-        if receipt.written_at_unix_nanos == 0 {
-            bail!("CoreStore manifest locator shard receipt timestamp must be nonzero");
-        }
-        validate_hash(
-            &receipt.signed_payload_hash,
-            "manifest locator shard receipt payload hash",
+        let profile = local_erasure_profile_for_counts(
+            &block.erasure_profile_id,
+            block.data_shards as usize,
+            block.parity_shards as usize,
         )?;
-        if receipt.signature_algorithm != "ed25519-libp2p" {
-            bail!(
-                "CoreStore manifest locator shard receipt uses unsupported signature algorithm {}",
-                receipt.signature_algorithm
-            );
-        }
-        if receipt.receipt_signature.is_empty() {
-            bail!("CoreStore manifest locator shard receipt signature must not be empty");
-        }
-        let shard_index = u16::try_from(receipt.shard_index)
-            .map_err(|_| anyhow!("CoreStore manifest locator shard index exceeds u16"))?;
+        validate_local_shard_receipt_placement(
+            profile,
+            usize::from(shard_index),
+            &receipt.node_id,
+            &receipt.region_id,
+            &receipt.cell_id,
+        )?;
         let expected_signed_payload_hash = shard_receipt_payload_hash(ShardReceiptPayloadInput {
             block_id: &block.block_id,
             shard_index,
@@ -6068,9 +6211,19 @@ fn validate_manifest_locator(locator: &CoreManifestLocator) -> Result<()> {
             fsync_sequence: receipt.fsync_sequence,
             written_at_unix_nanos: receipt.written_at_unix_nanos,
         });
-        if receipt.signed_payload_hash != expected_signed_payload_hash {
-            bail!("CoreStore manifest locator shard receipt signed payload hash mismatch");
-        }
+        validate_shard_receipt_common(
+            &receipt.node_id,
+            &receipt.region_id,
+            &receipt.cell_id,
+            &receipt.shard_hash,
+            receipt.shard_length,
+            receipt.fsync_sequence,
+            receipt.written_at_unix_nanos,
+            &receipt.signed_payload_hash,
+            &receipt.signature_algorithm,
+            &receipt.receipt_signature,
+            &expected_signed_payload_hash,
+        )?;
     }
     Ok(())
 }
@@ -9004,6 +9157,7 @@ mod tests {
     }
 
     fn test_object_ref_for_payload(
+        store: &CoreStore,
         logical_file_id: &str,
         bytes: &[u8],
         profile: LocalErasureProfile,
@@ -9049,9 +9203,9 @@ mod tests {
                 placement_epoch: LOCAL_PLACEMENT_EPOCH,
                 fsync_sequence: LOCAL_SHARD_FSYNC_SEQUENCE,
                 written_at_unix_nanos,
+                receipt_signature: store.sign_core_receipt(&signed_payload_hash).unwrap(),
                 signed_payload_hash,
                 signature_algorithm: "ed25519-libp2p".to_string(),
-                receipt_signature: b"test-core-shard-receipt-signature".to_vec(),
             });
         }
         CoreObjectRef {
@@ -9517,6 +9671,28 @@ mod tests {
         bad_hash.block_locators[0].shard_receipts[0].shard_hash =
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
         assert!(store.read_logical_file_manifest(&bad_hash).await.is_err());
+
+        let mut bad_signature = write.locator.clone();
+        bad_signature.block_locators[0].shard_receipts[0].receipt_signature[0] ^= 0x01;
+        assert!(
+            store
+                .read_logical_file_manifest(&bad_signature)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("signature verification failed")
+        );
+
+        let mut wrong_node = write.locator.clone();
+        wrong_node.block_locators[0].shard_receipts[0].node_id = "local-node-999".to_string();
+        assert!(
+            store
+                .read_logical_file_manifest(&wrong_node)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("placement mismatch")
+        );
 
         let mut duplicate = write.locator.clone();
         duplicate.block_locators[0].shard_receipts[1].shard_index =
@@ -10266,6 +10442,19 @@ mod tests {
             assert_eq!(placement.signature_algorithm, "ed25519-libp2p");
             assert!(!placement.receipt_signature.is_empty());
         }
+
+        let mut bad_ref = object_ref.clone();
+        bad_ref.placements[0].receipt_signature[0] ^= 0x01;
+        assert!(
+            store
+                .get_blob(GetBlob {
+                    object_ref: bad_ref
+                })
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("signature verification failed")
+        );
     }
 
     #[tokio::test]
@@ -10299,7 +10488,8 @@ mod tests {
         drop(store);
 
         let recovered = CoreStore::new(storage).await.unwrap();
-        let object_ref = test_object_ref_for_payload(logical_name, &bytes, LOCAL_EC_4_2_PROFILE);
+        let object_ref =
+            test_object_ref_for_payload(&recovered, logical_name, &bytes, LOCAL_EC_4_2_PROFILE);
         assert_eq!(
             recovered
                 .get_blob(GetBlob {
