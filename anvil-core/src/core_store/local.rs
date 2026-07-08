@@ -519,22 +519,64 @@ impl CoreStore {
         request: &WriteLogicalFileRequest,
         block_index: usize,
         bytes: Vec<u8>,
+        block_plain_hash: String,
         encryption_algorithm: String,
         profile: LocalErasureProfile,
     ) -> Result<CoreObjectRef> {
-        self.put_blob_with_profile_and_encoding(
-            PutBlob {
-                logical_name: format!("{}/block-{block_index:06}", request.logical_file_id),
-                bytes,
-                boundary_values: request.boundary_values.clone(),
-                region_id: request.region_id.clone(),
-                mutation_id: format!("{}-block-{block_index:06}", request.mutation_id),
-            },
-            profile,
-            &encryption_algorithm,
-            &request.writer_family,
-        )
-        .await
+        let input = PutBlob {
+            logical_name: format!("{}/block-{block_index:06}", request.logical_file_id),
+            bytes,
+            boundary_values: request.boundary_values.clone(),
+            region_id: request.region_id.clone(),
+            mutation_id: format!("{}-block-{block_index:06}", request.mutation_id),
+        };
+        let _perf_guard = crate::perf::guard("anvil_core_store_op", &[("operation", "put_blob")]);
+        self.ensure_layout().await?;
+        validate_logical_id(&input.logical_name, "blob logical name")?;
+        validate_logical_id(&request.writer_family, "blob writer family")?;
+        let admission = self
+            .admit_core_mutation(
+                "object.put",
+                &request.writer_family,
+                serde_json::json!({
+                    "logical_name": input.logical_name.clone(),
+                    "region_id": input.region_id.clone(),
+                    "erasure_profile_id": profile.id,
+                    "encryption": encryption_algorithm.clone(),
+                    "block_plain_hash": block_plain_hash.clone(),
+                    "writer_generation": request.generation,
+                    "block_ordinal": block_index as u64,
+                }),
+                input.mutation_id.clone(),
+                None,
+                CoreWalPayload::Landed(&input.bytes),
+                input.boundary_values,
+            )
+            .await?;
+        let landed =
+            admission.landed_bytes.first().cloned().ok_or_else(|| {
+                anyhow!("CoreStore put_blob admission did not produce landed bytes")
+            })?;
+        let materialised_bytes = self.read_landed_bytes(&landed).await?;
+        let hash = strip_sha256_prefix(&landed.sha256)?.to_string();
+        let object_ref = self
+            .materialise_object_blob_bytes(
+                &input.logical_name,
+                request.generation,
+                block_index as u64,
+                &block_plain_hash,
+                &hash,
+                &materialised_bytes,
+                &admission.boundary_values,
+                &admission.mutation_id,
+                profile,
+                &encryption_algorithm,
+                &request.writer_family,
+            )
+            .await?;
+        self.mark_core_wal_finalised_unlocked(&admission, "committed")
+            .await?;
+        Ok(object_ref)
     }
 
     async fn put_blob_with_profile_and_encoding(
@@ -557,6 +599,9 @@ impl CoreStore {
                     "region_id": input.region_id.clone(),
                     "erasure_profile_id": profile.id,
                     "encryption": encryption_algorithm,
+                    "block_plain_hash": format!("sha256:{}", sha256_hex(&input.bytes)),
+                    "writer_generation": 0_u64,
+                    "block_ordinal": 0_u64,
                 }),
                 input.mutation_id.clone(),
                 None,
@@ -572,6 +617,10 @@ impl CoreStore {
         let hash = strip_sha256_prefix(&landed.sha256)?.to_string();
         let object_ref = self
             .materialise_object_blob_bytes(
+                &input.logical_name,
+                0,
+                0,
+                &landed.sha256,
                 &hash,
                 &materialised_bytes,
                 &admission.boundary_values,
@@ -588,6 +637,10 @@ impl CoreStore {
 
     async fn materialise_object_blob_bytes(
         &self,
+        logical_file_id: &str,
+        writer_generation: u64,
+        block_ordinal: u64,
+        block_plain_hash: &str,
         hash: &str,
         materialised_bytes: &[u8],
         boundary_values: &[CoreBoundaryValue],
@@ -599,9 +652,14 @@ impl CoreStore {
         if sha256_hex(materialised_bytes) != hash {
             bail!("CoreStore object materialisation hash mismatch");
         }
+        let block_id = local_block_id_for_logical_block(
+            logical_file_id,
+            writer_generation,
+            block_ordinal,
+            block_plain_hash,
+        );
         let shards = encode_erasure_shards(materialised_bytes, profile)?;
         let placements = plan_local_shard_placements(profile)?;
-        let block_id = local_block_id_for_object_hash(hash);
         let mut object_placements = Vec::with_capacity(shards.len());
         let mut stripe_size = 0u64;
 
@@ -610,8 +668,7 @@ impl CoreStore {
                 anyhow!("CoreStore missing local placement for shard {shard_index}")
             })?;
             let shard_hash = sha256_hex(shard);
-            let shard_path =
-                self.shard_path(&placement.node_id, hash, shard_index as u16, &shard_hash);
+            let shard_path = self.shard_path(&placement.node_id, &block_id, shard_index as u16);
             let logical_offset = shard_index as u64 * shard.len() as u64;
             let shard_file = encode_block_shard_file(
                 BlockShardHeaderInput {
@@ -619,7 +676,7 @@ impl CoreStore {
                     erasure_set_id: LOCAL_ERASURE_SET_ID.to_string(),
                     shard_index: shard_index as u16,
                     erasure_profile_id: profile.id.to_string(),
-                    logical_file_id: format!("sha256:{hash}"),
+                    logical_file_id: logical_file_id.to_string(),
                     logical_offset,
                     logical_length: shard.len() as u64,
                     payload_plain_hash: format!("sha256:{shard_hash}"),
@@ -657,6 +714,7 @@ impl CoreStore {
             logical_size: materialised_bytes.len() as u64,
             manifest_ref: encode_manifest_ref_with_profile(hash, profile.id),
             encoding: CoreObjectEncoding {
+                block_id,
                 profile_id: profile.id.to_string(),
                 data_shards: profile.data_shards as u16,
                 parity_shards: profile.parity_shards as u16,
@@ -732,18 +790,15 @@ impl CoreStore {
                     total_shards
                 );
             }
-            let shard_hash = strip_sha256_prefix(&placement.shard_hash)?;
             let shard_path = self.shard_path(
                 &placement.node_id,
-                expected_hash,
+                &manifest.encoding.block_id,
                 placement.shard_index,
-                shard_hash,
             );
-            let expected_block_id = local_block_id_for_object_hash(expected_hash);
             let shard_bytes = match read_block_shard_file(
                 &shard_path,
                 BlockShardExpectation {
-                    block_id: &expected_block_id,
+                    block_id: &manifest.encoding.block_id,
                     shard_index: placement.shard_index,
                     erasure_profile_id: profile.id,
                     placement_epoch: placement.placement_epoch,
@@ -846,18 +901,15 @@ impl CoreStore {
             else {
                 return self.get_blob_range_via_full_reconstruction(input).await;
             };
-            let shard_hash = strip_sha256_prefix(&placement.shard_hash)?;
             let shard_path = self.shard_path(
                 &placement.node_id,
-                expected_hash,
+                &manifest.encoding.block_id,
                 placement.shard_index,
-                shard_hash,
             );
-            let expected_block_id = local_block_id_for_object_hash(expected_hash);
             let shard_bytes = match read_block_shard_file(
                 &shard_path,
                 BlockShardExpectation {
-                    block_id: &expected_block_id,
+                    block_id: &manifest.encoding.block_id,
                     shard_index: placement.shard_index,
                     erasure_profile_id: &manifest.encoding.profile_id,
                     placement_epoch: placement.placement_epoch,
@@ -943,6 +995,7 @@ impl CoreStore {
                     &request,
                     0,
                     pipeline_block.stored,
+                    block_plain_hash.clone(),
                     pipeline_block.encryption.algorithm.clone(),
                     profile,
                 )
@@ -997,6 +1050,7 @@ impl CoreStore {
                     request,
                     0,
                     pipeline_block.stored,
+                    empty_hash.clone(),
                     pipeline_block.encryption.algorithm.clone(),
                     profile,
                 )
@@ -1036,6 +1090,7 @@ impl CoreStore {
                     request,
                     index,
                     pipeline_block.stored,
+                    chunk_hash.clone(),
                     pipeline_block.encryption.algorithm.clone(),
                     profile,
                 )
@@ -2852,6 +2907,10 @@ impl CoreStore {
             "object.put" => {
                 let profile_id = json_required_string(&record.target, "erasure_profile_id")?;
                 let profile = local_erasure_profile(&profile_id)?;
+                let logical_name = json_required_string(&record.target, "logical_name")?;
+                let block_plain_hash = json_required_string(&record.target, "block_plain_hash")?;
+                let writer_generation = json_required_u64(&record.target, "writer_generation")?;
+                let block_ordinal = json_required_u64(&record.target, "block_ordinal")?;
                 let encryption = json_optional_string(&record.target, "encryption")?
                     .unwrap_or_else(|| "none".to_string());
                 let materialised_bytes = self.core_wal_payload_bytes(record, payload).await?;
@@ -2863,6 +2922,10 @@ impl CoreStore {
                     }
                 }
                 self.materialise_object_blob_bytes(
+                    &logical_name,
+                    writer_generation,
+                    block_ordinal,
+                    &block_plain_hash,
                     &hash,
                     &materialised_bytes,
                     &record.boundary_values,
@@ -3992,7 +4055,7 @@ impl CoreStore {
         if object_hash != manifest_hash {
             bail!("CoreStore object manifest ref/hash mismatch");
         }
-        self.reconstruct_object_manifest_from_shards(object_ref, manifest_hash)
+        self.reconstruct_object_manifest_from_shards(object_ref)
             .await
     }
 
@@ -4016,7 +4079,6 @@ impl CoreStore {
         let manifest = self
             .reconstruct_object_manifest_from_shards_with_required_indices(
                 object_ref,
-                manifest_hash,
                 Some(&required_indices),
             )
             .await?;
@@ -4042,20 +4104,14 @@ impl CoreStore {
     async fn reconstruct_object_manifest_from_shards(
         &self,
         object_ref: &CoreObjectRef,
-        object_hash: &str,
     ) -> Result<CoreObjectManifest> {
-        self.reconstruct_object_manifest_from_shards_with_required_indices(
-            object_ref,
-            object_hash,
-            None,
-        )
-        .await
+        self.reconstruct_object_manifest_from_shards_with_required_indices(object_ref, None)
+            .await
     }
 
     async fn reconstruct_object_manifest_from_shards_with_required_indices(
         &self,
         object_ref: &CoreObjectRef,
-        object_hash: &str,
         required_indices: Option<&BTreeSet<u16>>,
     ) -> Result<CoreObjectManifest> {
         let profile = local_erasure_profile_for_counts(
@@ -4068,17 +4124,16 @@ impl CoreStore {
         }
         let mut placements = Vec::new();
         let mut stripe_size = 0u64;
-        let expected_block_id = local_block_id_for_object_hash(object_hash);
+        let expected_block_id = object_ref.encoding.block_id.clone();
+        validate_logical_id(&expected_block_id, "CoreStore object block id")?;
         for placement in &object_ref.placements {
             if usize::from(placement.shard_index) >= profile.total_shards() {
                 bail!("CoreStore object ref contains shard index outside profile");
             }
-            let shard_hash = strip_sha256_prefix(&placement.shard_hash)?;
             let path = self.shard_path(
                 &placement.node_id,
-                object_hash,
+                &expected_block_id,
                 placement.shard_index,
-                shard_hash,
             );
             let decoded = match read_block_shard_file_dynamic(
                 &path,
@@ -4141,6 +4196,7 @@ impl CoreStore {
             logical_size: object_ref.logical_size,
             boundary_values,
             encoding: CoreObjectEncoding {
+                block_id: object_ref.encoding.block_id.clone(),
                 profile_id: profile.id.to_string(),
                 data_shards: profile.data_shards as u16,
                 parity_shards: profile.parity_shards as u16,
@@ -4361,24 +4417,19 @@ impl CoreStore {
         bail!("CoreStore {kind} {id} lock was not acquired")
     }
 
-    fn shard_path(
-        &self,
-        node_id: &str,
-        object_hash: &str,
-        shard_index: u16,
-        shard_hash: &str,
-    ) -> PathBuf {
-        let prefix = &object_hash[0..2];
+    fn shard_path(&self, node_id: &str, block_id: &str, shard_index: u16) -> PathBuf {
+        let block_path_hash = sha256_hex(block_id.as_bytes());
+        let prefix = &block_path_hash[0..2];
         self.storage
             .core_store_root_path()
             .join("blocks")
             .join("local-cache")
             .join(LOCAL_ERASURE_SET_ID)
             .join(node_id)
-            .join("sha256")
+            .join("block-id")
             .join(prefix)
-            .join(object_hash)
-            .join(format!("shard-{shard_index:05}-{shard_hash}.anb"))
+            .join(block_path_hash)
+            .join(format!("shard-{shard_index:05}-{block_id}.anb"))
     }
 
     fn admission_root(&self) -> PathBuf {
@@ -4504,10 +4555,20 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn local_block_id_for_object_hash(hash: &str) -> String {
-    let hash = hash.strip_prefix("sha256:").unwrap_or(hash);
+fn local_block_id_for_logical_block(
+    logical_file_id: &str,
+    writer_generation: u64,
+    block_ordinal: u64,
+    plaintext_hash: &str,
+) -> String {
     let mut hasher = Sha256::new();
-    for part in ["anvil.block.id.v1", "object_blob", "0", hash] {
+    for part in [
+        "anvil.block.id.v1",
+        logical_file_id,
+        &writer_generation.to_string(),
+        &block_ordinal.to_string(),
+        plaintext_hash,
+    ] {
         hasher.update((part.len() as u64).to_le_bytes());
         hasher.update(part.as_bytes());
     }
@@ -4842,7 +4903,6 @@ fn logical_block_ref_from_materialized_block(
     profile: LocalErasureProfile,
 ) -> Result<CoreLogicalBlockRef> {
     let object_manifest = &block.object_manifest;
-    let object_hash = strip_sha256_prefix(&object_manifest.object_hash)?;
     let shard_payload_len = object_manifest
         .placements
         .iter()
@@ -4852,7 +4912,7 @@ fn logical_block_ref_from_materialized_block(
     let data_shards = u32::from(object_manifest.encoding.data_shards);
     let parity_shards = u32::from(object_manifest.encoding.parity_shards);
     Ok(CoreLogicalBlockRef {
-        block_id: local_block_id_for_object_hash(object_hash),
+        block_id: object_manifest.encoding.block_id.clone(),
         logical_offset: block.logical_offset,
         logical_length: block.logical_length,
         compressed_length: block.compressed_length,
@@ -5121,6 +5181,7 @@ fn object_ref_from_logical_block_ref(
             erasure_profile_id,
         ),
         encoding: CoreObjectEncoding {
+            block_id: block.block_id.clone(),
             profile_id: erasure_profile_id.to_string(),
             data_shards: block.data_shards as u16,
             parity_shards: block.parity_shards as u16,
@@ -5864,6 +5925,14 @@ fn validate_manifest_for_object_ref(
             "CoreStore manifest size mismatch: ref {}, manifest {}",
             object_ref.logical_size,
             manifest.logical_size
+        );
+    }
+    validate_logical_id(&manifest.encoding.block_id, "CoreStore manifest block id")?;
+    if manifest.encoding.block_id != object_ref.encoding.block_id {
+        bail!(
+            "CoreStore manifest block id mismatch: ref {}, manifest {}",
+            object_ref.encoding.block_id,
+            manifest.encoding.block_id
         );
     }
     let manifest_ref_profile = decode_manifest_ref_profile(&object_ref.manifest_ref)?;
@@ -7291,6 +7360,11 @@ fn json_optional_u64(value: &serde_json::Value, field: &str) -> Result<Option<u6
     }
 }
 
+fn json_required_u64(value: &serde_json::Value, field: &str) -> Result<u64> {
+    json_optional_u64(value, field)?
+        .ok_or_else(|| anyhow!("CoreStore WAL target is missing unsigned integer field {field}"))
+}
+
 fn json_required_bool(value: &serde_json::Value, field: &str) -> Result<bool> {
     value
         .get(field)
@@ -7528,7 +7602,11 @@ mod tests {
         }
     }
 
-    fn test_object_ref_for_payload(bytes: &[u8], profile: LocalErasureProfile) -> CoreObjectRef {
+    fn test_object_ref_for_payload(
+        logical_file_id: &str,
+        bytes: &[u8],
+        profile: LocalErasureProfile,
+    ) -> CoreObjectRef {
         let hash = sha256_hex(bytes);
         let shards = encode_erasure_shards(bytes, profile).unwrap();
         let placements = plan_local_shard_placements(profile).unwrap();
@@ -7556,6 +7634,12 @@ mod tests {
             logical_size: bytes.len() as u64,
             manifest_ref: encode_manifest_ref(&hash),
             encoding: CoreObjectEncoding {
+                block_id: local_block_id_for_logical_block(
+                    logical_file_id,
+                    0,
+                    0,
+                    &format!("sha256:{hash}"),
+                ),
                 profile_id: profile.id.to_string(),
                 data_shards: profile.data_shards as u16,
                 parity_shards: profile.parity_shards as u16,
@@ -7787,19 +7871,15 @@ mod tests {
             .await
             .unwrap();
         let manifest = store.read_object_manifest(&object_ref).await.unwrap();
-        let object_hash = object_ref.hash.strip_prefix("sha256:").unwrap();
-
         for placement in manifest
             .placements
             .iter()
             .filter(|placement| (1..LOCAL_DATA_SHARDS as u16).contains(&placement.shard_index))
         {
-            let shard_hash = placement.shard_hash.strip_prefix("sha256:").unwrap();
             let shard_path = store.shard_path(
                 &placement.node_id,
-                object_hash,
+                &manifest.encoding.block_id,
                 placement.shard_index,
-                shard_hash,
             );
             fs::write(&shard_path, vec![0xee; placement.stored_size as usize])
                 .await
@@ -8056,9 +8136,7 @@ mod tests {
             .iter()
             .find(|placement| placement.shard_index == 0)
             .unwrap();
-        let shard_hash = strip_sha256_prefix(&placement.shard_hash).unwrap();
-        let object_hash = strip_sha256_prefix(&unrelated_ref.hash).unwrap();
-        let shard_path = store.shard_path(&placement.node_id, object_hash, 0, shard_hash);
+        let shard_path = store.shard_path(&placement.node_id, &unrelated_ref.encoding.block_id, 0);
         fs::write(&shard_path, vec![0xee; placement.stored_size as usize])
             .await
             .unwrap();
@@ -8650,14 +8728,20 @@ mod tests {
         let storage = Storage::new_at(tmp.path()).await.unwrap();
         let store = CoreStore::new(storage.clone()).await.unwrap();
         let bytes = b"recover object from wal".to_vec();
+        let logical_name = "tenant:t/bucket:b/object:recovered";
+        let payload_hash = format!("sha256:{}", sha256_hex(&bytes));
         store
             .admit_core_mutation(
                 "object.put",
                 "object_blob",
                 serde_json::json!({
-                    "logical_name": "tenant:t/bucket:b/object:recovered",
+                    "logical_name": logical_name,
                     "region_id": "local",
                     "erasure_profile_id": LOCAL_ERASURE_PROFILE_ID,
+                    "encryption": "none",
+                    "block_plain_hash": payload_hash,
+                    "writer_generation": 0_u64,
+                    "block_ordinal": 0_u64,
                 }),
                 "recover-object-from-wal".to_string(),
                 None,
@@ -8669,7 +8753,7 @@ mod tests {
         drop(store);
 
         let recovered = CoreStore::new(storage).await.unwrap();
-        let object_ref = test_object_ref_for_payload(&bytes, LOCAL_EC_4_2_PROFILE);
+        let object_ref = test_object_ref_for_payload(logical_name, &bytes, LOCAL_EC_4_2_PROFILE);
         assert_eq!(
             recovered
                 .get_blob(GetBlob {
@@ -9141,7 +9225,6 @@ mod tests {
             .await
             .unwrap();
         let manifest = store.read_object_manifest(&object_ref).await.unwrap();
-        let object_hash = strip_sha256_prefix(&object_ref.hash).unwrap().to_string();
         assert_eq!(manifest.encoding.profile_id, LOCAL_ERASURE_PROFILE_ID);
         assert_eq!(manifest.encoding.data_shards, LOCAL_DATA_SHARDS as u16);
         assert_eq!(manifest.encoding.parity_shards, LOCAL_PARITY_SHARDS as u16);
@@ -9167,12 +9250,10 @@ mod tests {
             );
             assert_eq!(placement.placement_epoch, LOCAL_PLACEMENT_EPOCH);
             assert_eq!(placement.fsync_sequence, LOCAL_SHARD_FSYNC_SEQUENCE);
-            let shard_hash = strip_sha256_prefix(&placement.shard_hash).unwrap();
             let path = store.shard_path(
                 &placement.node_id,
-                &object_hash,
+                &object_ref.encoding.block_id,
                 placement.shard_index,
-                shard_hash,
             );
             assert!(
                 path.starts_with(
@@ -9199,7 +9280,7 @@ mod tests {
                 shard_file.starts_with(CORE_BLOCK_SHARD_MAGIC),
                 "physical shard files must use the RFC block-shard container"
             );
-            let expected_block_id = local_block_id_for_object_hash(&object_hash);
+            let expected_block_id = object_ref.encoding.block_id.clone();
             let payload = read_block_shard_file(
                 &path,
                 BlockShardExpectation {
@@ -9235,12 +9316,10 @@ mod tests {
         }
 
         for placement in manifest.placements.iter().take(LOCAL_PARITY_SHARDS) {
-            let shard_hash = strip_sha256_prefix(&placement.shard_hash).unwrap();
             let path = store.shard_path(
                 &placement.node_id,
-                &object_hash,
+                &object_ref.encoding.block_id,
                 placement.shard_index,
-                shard_hash,
             );
             tokio::fs::remove_file(path).await.unwrap();
         }
@@ -9270,14 +9349,11 @@ mod tests {
             .await
             .unwrap();
         let manifest = store.read_object_manifest(&object_ref).await.unwrap();
-        let object_hash = strip_sha256_prefix(&object_ref.hash).unwrap().to_string();
         for placement in manifest.placements.iter().take(LOCAL_PARITY_SHARDS + 1) {
-            let shard_hash = strip_sha256_prefix(&placement.shard_hash).unwrap();
             let path = store.shard_path(
                 &placement.node_id,
-                &object_hash,
+                &object_ref.encoding.block_id,
                 placement.shard_index,
-                shard_hash,
             );
             tokio::fs::remove_file(path).await.unwrap();
         }

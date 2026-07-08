@@ -248,6 +248,11 @@ pub fn core_object_ref_from_logical_file_manifest(
             manifest.erasure_profile_id
         ),
         encoding: CoreObjectEncoding {
+            block_id: manifest
+                .blocks
+                .first()
+                .map(|block| block.block_id.clone())
+                .unwrap_or_default(),
             profile_id: manifest.erasure_profile_id.clone(),
             data_shards: manifest.data_shards as u16,
             parity_shards: manifest.parity_shards as u16,
@@ -307,6 +312,7 @@ impl CoreObjectRef {
             logical_size,
             manifest_ref,
             encoding: CoreObjectEncoding {
+                block_id: String::new(),
                 profile_id: "ec-4-2".to_string(),
                 data_shards: 4,
                 parity_shards: 2,
@@ -338,6 +344,7 @@ pub struct CoreObjectManifest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoreObjectEncoding {
+    pub block_id: String,
     pub profile_id: String,
     pub data_shards: u16,
     pub parity_shards: u16,

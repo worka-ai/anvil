@@ -13,6 +13,7 @@ use anvil::gateway_store::{
     resolve_gateway_mount,
 };
 use anvil::storage::Storage;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug)]
 struct DurableFeatureFamily {
@@ -32,6 +33,20 @@ fn workspace_root() -> PathBuf {
 fn read_workspace_file(relative: &str) -> String {
     let path = workspace_root().join(relative);
     fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+}
+
+fn block_shard_path(storage: &Storage, node_id: &str, block_id: &str, shard_index: u16) -> PathBuf {
+    let block_path_hash = hex::encode(Sha256::digest(block_id.as_bytes()));
+    storage
+        .core_store_root_path()
+        .join("blocks")
+        .join("local-cache")
+        .join("local-erasure-set")
+        .join(node_id)
+        .join("block-id")
+        .join(&block_path_hash[0..2])
+        .join(block_path_hash)
+        .join(format!("shard-{shard_index:05}-{block_id}.anb"))
 }
 
 fn production_source(relative: &str) -> String {
@@ -897,21 +912,12 @@ async fn rfc_0007_coreobject_manifests_are_reconstructed_from_shard_placement() 
     assert_eq!(manifest.placements.len(), 6);
 
     for placement in manifest.placements.iter().take(2) {
-        let object_hash = object_ref.hash.strip_prefix("sha256:").unwrap();
-        let shard_hash = placement.shard_hash.strip_prefix("sha256:").unwrap();
-        let shard_path = storage
-            .core_store_root_path()
-            .join("blocks")
-            .join("local-cache")
-            .join("local-erasure-set")
-            .join(&placement.node_id)
-            .join("sha256")
-            .join(&object_hash[0..2])
-            .join(object_hash)
-            .join(format!(
-                "shard-{:05}-{shard_hash}.anb",
-                placement.shard_index
-            ));
+        let shard_path = block_shard_path(
+            &storage,
+            &placement.node_id,
+            &manifest.encoding.block_id,
+            placement.shard_index,
+        );
         fs::remove_file(shard_path).unwrap();
     }
     let degraded_manifest = store.read_object_manifest(&object_ref).await.unwrap();
@@ -922,21 +928,12 @@ async fn rfc_0007_coreobject_manifests_are_reconstructed_from_shard_placement() 
     );
 
     let placement = &manifest.placements[2];
-    let object_hash = object_ref.hash.strip_prefix("sha256:").unwrap();
-    let shard_hash = placement.shard_hash.strip_prefix("sha256:").unwrap();
-    let shard_path = storage
-        .core_store_root_path()
-        .join("blocks")
-        .join("local-cache")
-        .join("local-erasure-set")
-        .join(&placement.node_id)
-        .join("sha256")
-        .join(&object_hash[0..2])
-        .join(object_hash)
-        .join(format!(
-            "shard-{:05}-{shard_hash}.anb",
-            placement.shard_index
-        ));
+    let shard_path = block_shard_path(
+        &storage,
+        &placement.node_id,
+        &manifest.encoding.block_id,
+        placement.shard_index,
+    );
     fs::remove_file(shard_path).unwrap();
     assert!(
         store.read_object_manifest(&object_ref).await.is_err(),
