@@ -5156,10 +5156,45 @@ impl CoreStore {
                 if anchor.root_anchor_key != root_anchor_key {
                     bail!("CoreStore root register anchor key mismatch");
                 }
-                return Ok(Some(anchor));
+                if self
+                    .verify_root_anchor_chain(&root_key_hash, root_anchor_key, &anchor)
+                    .await?
+                {
+                    return Ok(Some(anchor));
+                }
             }
         }
         Ok(None)
+    }
+
+    async fn verify_root_anchor_chain(
+        &self,
+        root_key_hash: &str,
+        root_anchor_key: &str,
+        anchor: &CoreRootAnchorRecord,
+    ) -> Result<bool> {
+        if anchor.root_generation == 0 {
+            return Ok(anchor.previous_root_hash == ZERO_HASH);
+        }
+
+        let mut expected_child = anchor.clone();
+        for generation in (0..anchor.root_generation).rev() {
+            let Some(previous) = self
+                .read_committed_root_anchor_generation(root_key_hash, generation)
+                .await?
+            else {
+                return Ok(false);
+            };
+            if previous.root_anchor_key != root_anchor_key {
+                bail!("CoreStore root register chain anchor key mismatch");
+            }
+            let previous_hash = hash_root_anchor_record(&previous)?;
+            if expected_child.previous_root_hash != previous_hash {
+                return Ok(false);
+            }
+            expected_child = previous;
+        }
+        Ok(expected_child.previous_root_hash == ZERO_HASH)
     }
 
     async fn read_committed_root_anchor_generation(
@@ -12677,6 +12712,48 @@ mod tests {
             latest.mutation_first.as_deref(),
             Some("root-cas-a") | Some("root-cas-b")
         ));
+    }
+
+    #[tokio::test]
+    async fn core_store_root_discovery_requires_previous_hash_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        store
+            .append_stream(AppendStreamRecord {
+                stream_id: "tenant:t/bucket:b/root-chain".to_string(),
+                partition_id: "tenant:t/bucket:b".to_string(),
+                record_kind: "event.created".to_string(),
+                payload: b"root chain".to_vec(),
+                fence: None,
+                transaction_id: None,
+                idempotency_key: Some("root-chain-event".to_string()),
+            })
+            .await
+            .unwrap();
+        let root_key_hash = root_key_hash(core_transaction_root_anchor_key());
+        assert!(
+            store
+                .read_latest_root_anchor(core_transaction_root_anchor_key())
+                .await
+                .unwrap()
+                .unwrap()
+                .root_generation
+                > 0
+        );
+
+        let genesis_dir = store
+            .root_register_generation_dir(&root_key_hash, 0)
+            .unwrap();
+        tokio::fs::remove_dir_all(genesis_dir).await.unwrap();
+        assert!(
+            store
+                .read_latest_root_anchor(core_transaction_root_anchor_key())
+                .await
+                .unwrap()
+                .is_none(),
+            "root discovery must not serve a higher generation whose previous_root_hash chain cannot be verified"
+        );
     }
 
     #[tokio::test]
