@@ -955,8 +955,18 @@ impl CoreStore {
 
     pub async fn write_logical_file(
         &self,
-        mut request: WriteLogicalFileRequest,
+        request: WriteLogicalFileRequest,
     ) -> Result<CoreLogicalFileManifest> {
+        Ok(self
+            .write_logical_file_with_locator(request)
+            .await?
+            .manifest)
+    }
+
+    pub async fn write_logical_file_with_locator(
+        &self,
+        mut request: WriteLogicalFileRequest,
+    ) -> Result<CoreLogicalFileWrite> {
         let _perf_guard = crate::perf::guard(
             "anvil_core_store_op",
             &[("operation", "write_logical_file")],
@@ -1013,13 +1023,17 @@ impl CoreStore {
                 compression,
             )
         };
-        logical_file_manifest_from_object_manifests(
+        let manifest = logical_file_manifest_from_object_manifests(
             &request,
             &blocks,
             plaintext_hash,
             plaintext_len,
             compression,
-        )
+        )?;
+        let locator = self
+            .publish_logical_file_manifest(&manifest, &request.pipeline_policy)
+            .await?;
+        Ok(CoreLogicalFileWrite { manifest, locator })
     }
 
     async fn write_uncompressed_logical_file_blocks(
@@ -1112,8 +1126,42 @@ impl CoreStore {
         &self,
         request: WriteLogicalFileRequest,
     ) -> Result<CoreObjectRef> {
-        let manifest = self.write_logical_file(request).await?;
+        let manifest = self
+            .write_logical_file_with_locator(request)
+            .await?
+            .manifest;
         Ok(core_object_ref_from_logical_file_manifest(&manifest))
+    }
+
+    async fn publish_logical_file_manifest(
+        &self,
+        manifest: &CoreLogicalFileManifest,
+        policy: &CorePipelinePolicy,
+    ) -> Result<CoreManifestLocator> {
+        validate_logical_file_manifest_shape(manifest)?;
+        let manifest_bytes = serde_json::to_vec(manifest)?;
+        let manifest_hash = format!("sha256:{}", sha256_hex(&manifest_bytes));
+        let manifest_hash_hex = strip_sha256_prefix(&manifest_hash)?;
+        let profile = local_erasure_profile(&policy.erasure_profile_id)?;
+        let manifest_block_ref = self
+            .materialise_object_blob_bytes(
+                &format!("lf_manifest_{manifest_hash_hex}"),
+                manifest.writer_generation,
+                0,
+                &manifest_hash,
+                manifest_hash_hex,
+                &manifest_bytes,
+                &[],
+                &format!(
+                    "manifest_{}",
+                    sha256_hex(manifest.created_by_mutation_id.as_bytes())
+                ),
+                profile,
+                "none",
+                "core_control",
+            )
+            .await?;
+        manifest_locator_from_manifest_and_ref(manifest, &manifest_block_ref, &manifest_hash)
     }
 
     fn encrypt_pipeline_block(
@@ -5225,6 +5273,107 @@ fn object_ref_from_object_manifest(manifest: &CoreObjectManifest) -> Result<Core
     })
 }
 
+fn manifest_locator_from_manifest_and_ref(
+    manifest: &CoreLogicalFileManifest,
+    manifest_object_ref: &CoreObjectRef,
+    manifest_hash: &str,
+) -> Result<CoreManifestLocator> {
+    validate_hash(manifest_hash, "logical file manifest hash")?;
+    let manifest_bytes_len = manifest_object_ref.logical_size;
+    let block_locators = vec![block_locator_from_manifest_object_ref(
+        manifest,
+        manifest_object_ref,
+        manifest_hash,
+    )?];
+
+    Ok(CoreManifestLocator {
+        manifest_ref: CoreManifestRef {
+            logical_file_id: manifest.logical_file_id.clone(),
+            writer_family: manifest.writer_family.clone(),
+            writer_generation: manifest.writer_generation,
+            manifest_hash: manifest_hash.to_string(),
+        },
+        manifest_encoding: "writer-segment".to_string(),
+        manifest_length: manifest_bytes_len,
+        manifest_hash: manifest_hash.to_string(),
+        block_locators,
+    })
+}
+
+fn block_locator_from_manifest_object_ref(
+    manifest: &CoreLogicalFileManifest,
+    manifest_object_ref: &CoreObjectRef,
+    manifest_hash: &str,
+) -> Result<CoreBlockLocator> {
+    validate_hash(manifest_hash, "logical file manifest hash")?;
+    validate_hash(&manifest_object_ref.hash, "logical manifest block hash")?;
+    Ok(CoreBlockLocator {
+        logical_start: 0,
+        logical_end: manifest_object_ref.logical_size,
+        block_id: manifest_object_ref.encoding.block_id.clone(),
+        codec_id: format!(
+            "reed-solomon-{}+{}",
+            manifest_object_ref.encoding.data_shards, manifest_object_ref.encoding.parity_shards
+        ),
+        data_shards: u32::from(manifest_object_ref.encoding.data_shards),
+        parity_shards: u32::from(manifest_object_ref.encoding.parity_shards),
+        plaintext_block_len: manifest_object_ref.logical_size,
+        shard_payload_len: manifest_object_ref
+            .placements
+            .iter()
+            .map(|placement| placement.stored_size)
+            .max()
+            .unwrap_or(0),
+        padding_len: manifest_object_ref
+            .encoding
+            .stripe_size
+            .saturating_sub(manifest_object_ref.logical_size),
+        block_plain_hash: manifest_hash.to_string(),
+        block_encoded_hash: manifest_object_ref.hash.clone(),
+        compression: none_compression_descriptor_from_hash(
+            manifest_object_ref.logical_size,
+            manifest_hash,
+        ),
+        encryption: none_encryption_descriptor(manifest_hash, &manifest_object_ref.hash),
+        erasure_profile_id: manifest_object_ref.encoding.profile_id.clone(),
+        placement_epoch: manifest.placement_epoch,
+        shard_receipts: manifest_object_ref
+            .placements
+            .iter()
+            .map(shard_receipt_summary_from_object_placement)
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
+fn shard_receipt_summary_from_object_placement(
+    shard: &CoreObjectPlacement,
+) -> Result<CoreShardReceiptSummary> {
+    validate_hash(&shard.shard_hash, "logical shard hash")?;
+    let signed_payload_hash = descriptor_hash(&[
+        "shard_receipt_summary",
+        &shard.node_id,
+        &shard.region_id,
+        &shard.cell_id,
+        &shard.shard_index.to_string(),
+        &shard.shard_hash,
+        &shard.stored_size.to_string(),
+        &shard.fsync_sequence.to_string(),
+    ]);
+    Ok(CoreShardReceiptSummary {
+        node_id: shard.node_id.clone(),
+        region_id: shard.region_id.clone(),
+        cell_id: shard.cell_id.clone(),
+        shard_index: u32::from(shard.shard_index),
+        shard_hash: shard.shard_hash.clone(),
+        shard_length: shard.stored_size,
+        fsync_sequence: shard.fsync_sequence,
+        written_at_unix_nanos: 0,
+        signed_payload_hash,
+        signature_algorithm: "local-dev-unsigned".to_string(),
+        receipt_signature: Vec::new(),
+    })
+}
+
 fn ensure_range_is_inside_expected_boundary(
     manifest: &CoreLogicalFileManifest,
     range: &CoreByteRange,
@@ -5301,6 +5450,13 @@ fn encode_logical_file_source(
 fn none_compression_descriptor(source: &[u8]) -> CoreCompressionDescriptor {
     let uncompressed_length = source.len() as u64;
     let uncompressed_hash = format!("sha256:{}", sha256_hex(source));
+    none_compression_descriptor_from_hash(uncompressed_length, &uncompressed_hash)
+}
+
+fn none_compression_descriptor_from_hash(
+    uncompressed_length: u64,
+    uncompressed_hash: &str,
+) -> CoreCompressionDescriptor {
     CoreCompressionDescriptor {
         algorithm: "none".to_string(),
         level: 0,
@@ -7982,6 +8138,104 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(slice, payload[6..16].to_vec());
+    }
+
+    #[tokio::test]
+    async fn core_store_logical_file_publish_returns_self_contained_manifest_locator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        let write = store
+            .write_logical_file_with_locator(WriteLogicalFileRequest {
+                writer_family: "object_blob".to_string(),
+                generation: 9,
+                logical_file_id: "objects/reports/report-9".to_string(),
+                source: b"manifest locator payload".to_vec(),
+                range_hints: Vec::new(),
+                pipeline_policy: CorePipelinePolicy::default(),
+                trace_context: CoreTraceContext::default(),
+                boundary_values: Vec::new(),
+                mutation_id: "logical-file-locator-mut-1".to_string(),
+                region_id: "local".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            write.locator.manifest_ref.logical_file_id,
+            write.manifest.logical_file_id
+        );
+        assert_eq!(
+            write.locator.manifest_ref.writer_family,
+            write.manifest.writer_family
+        );
+        assert_eq!(
+            write.locator.manifest_ref.writer_generation,
+            write.manifest.writer_generation
+        );
+        assert_eq!(
+            write.locator.manifest_hash,
+            write.locator.manifest_ref.manifest_hash
+        );
+        assert_eq!(write.locator.manifest_encoding, "writer-segment");
+        assert_eq!(write.locator.block_locators.len(), 1);
+        let block = &write.locator.block_locators[0];
+        assert_eq!(block.logical_start, 0);
+        assert_eq!(block.logical_end, write.locator.manifest_length);
+        assert_eq!(block.block_plain_hash, write.locator.manifest_hash);
+        assert_eq!(
+            block.shard_receipts.len(),
+            LOCAL_DATA_SHARDS + LOCAL_PARITY_SHARDS
+        );
+        assert_ne!(
+            block.block_id, write.manifest.blocks[0].block_id,
+            "manifest locator must point at the published manifest bytes, not the data block"
+        );
+
+        let manifest_object_ref = CoreObjectRef {
+            hash: block.block_encoded_hash.clone(),
+            logical_size: write.locator.manifest_length,
+            manifest_ref: encode_manifest_ref_with_profile(
+                strip_sha256_prefix(&block.block_encoded_hash).unwrap(),
+                &block.erasure_profile_id,
+            ),
+            encoding: CoreObjectEncoding {
+                block_id: block.block_id.clone(),
+                profile_id: block.erasure_profile_id.clone(),
+                data_shards: block.data_shards as u16,
+                parity_shards: block.parity_shards as u16,
+                minimum_read_shards: block.data_shards as u16,
+                minimum_write_ack_shards: (block.data_shards + block.parity_shards) as u16,
+                stripe_size: block.shard_payload_len * u64::from(block.data_shards),
+                placement_scope: "region".to_string(),
+                repair_priority: "normal".to_string(),
+                encryption: block.encryption.algorithm.clone(),
+            },
+            placements: block
+                .shard_receipts
+                .iter()
+                .map(|receipt| CoreObjectPlacement {
+                    shard_index: receipt.shard_index as u16,
+                    node_id: receipt.node_id.clone(),
+                    region_id: receipt.region_id.clone(),
+                    cell_id: receipt.cell_id.clone(),
+                    shard_hash: receipt.shard_hash.clone(),
+                    stored_size: receipt.shard_length,
+                    generation: 1,
+                    placement_epoch: block.placement_epoch,
+                    fsync_sequence: receipt.fsync_sequence,
+                })
+                .collect(),
+        };
+        let manifest_bytes = store
+            .get_blob(GetBlob {
+                object_ref: manifest_object_ref,
+            })
+            .await
+            .unwrap();
+        let stored_manifest: CoreLogicalFileManifest =
+            serde_json::from_slice(&manifest_bytes).unwrap();
+        assert_eq!(stored_manifest, write.manifest);
     }
 
     #[tokio::test]

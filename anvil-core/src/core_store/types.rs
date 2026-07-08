@@ -149,6 +149,64 @@ pub struct CoreLogicalFileManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreLogicalFileWrite {
+    pub manifest: CoreLogicalFileManifest,
+    pub locator: CoreManifestLocator,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreManifestRef {
+    pub logical_file_id: String,
+    pub writer_family: String,
+    pub writer_generation: u64,
+    pub manifest_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreManifestLocator {
+    pub manifest_ref: CoreManifestRef,
+    pub manifest_encoding: String,
+    pub manifest_length: u64,
+    pub manifest_hash: String,
+    pub block_locators: Vec<CoreBlockLocator>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreBlockLocator {
+    pub logical_start: u64,
+    pub logical_end: u64,
+    pub block_id: String,
+    pub codec_id: String,
+    pub data_shards: u32,
+    pub parity_shards: u32,
+    pub plaintext_block_len: u64,
+    pub shard_payload_len: u64,
+    pub padding_len: u64,
+    pub block_plain_hash: String,
+    pub block_encoded_hash: String,
+    pub compression: CoreCompressionDescriptor,
+    pub encryption: CoreEncryptionDescriptor,
+    pub erasure_profile_id: String,
+    pub placement_epoch: u64,
+    pub shard_receipts: Vec<CoreShardReceiptSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreShardReceiptSummary {
+    pub node_id: String,
+    pub region_id: String,
+    pub cell_id: String,
+    pub shard_index: u32,
+    pub shard_hash: String,
+    pub shard_length: u64,
+    pub fsync_sequence: u64,
+    pub written_at_unix_nanos: u64,
+    pub signed_payload_hash: String,
+    pub signature_algorithm: String,
+    pub receipt_signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoreLogicalRange {
     pub range_id: String,
     pub byte_start: u64,
