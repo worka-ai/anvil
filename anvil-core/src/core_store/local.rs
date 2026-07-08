@@ -6212,10 +6212,32 @@ fn validate_manifest_locator(locator: &CoreManifestLocator) -> Result<()> {
         if block.data_shards == 0 {
             bail!("CoreStore manifest locator block must include data shards");
         }
+        let profile = local_erasure_profile_for_counts(
+            &block.erasure_profile_id,
+            block.data_shards as usize,
+            block.parity_shards as usize,
+        )?;
+        if block.codec_id != profile.codec_id {
+            bail!("CoreStore manifest locator block codec id does not match erasure profile");
+        }
+        let block_len = block.logical_end - block.logical_start;
+        if block.plaintext_block_len != block_len {
+            bail!("CoreStore manifest locator plaintext block length mismatch");
+        }
+        if block.shard_payload_len == 0 {
+            bail!("CoreStore manifest locator shard payload length must be nonzero");
+        }
+        let expected_padding = block
+            .shard_payload_len
+            .saturating_mul(u64::from(block.data_shards))
+            .saturating_sub(block.plaintext_block_len);
+        if block.padding_len != expected_padding {
+            bail!("CoreStore manifest locator padding length mismatch");
+        }
         if block.placement_epoch == 0 {
             bail!("CoreStore manifest locator block placement epoch must be nonzero");
         }
-        if block.shard_receipts.len() < block.data_shards as usize {
+        if block.shard_receipts.len() < profile.minimum_write_ack_shards {
             bail!("CoreStore manifest locator block has too few shard receipts");
         }
         let mut seen_shards = BTreeSet::new();
@@ -6228,11 +6250,6 @@ fn validate_manifest_locator(locator: &CoreManifestLocator) -> Result<()> {
             if receipt.shard_length == 0 && block.logical_end != block.logical_start {
                 bail!("CoreStore manifest locator shard receipt length must be nonzero");
             }
-            let profile = local_erasure_profile_for_counts(
-                &block.erasure_profile_id,
-                block.data_shards as usize,
-                block.parity_shards as usize,
-            )?;
             validate_local_shard_receipt_placement(
                 profile,
                 usize::from(shard_index),
@@ -6328,10 +6345,13 @@ fn block_locator_from_manifest_object_ref(
         logical_start: 0,
         logical_end: manifest_object_ref.logical_size,
         block_id: manifest_object_ref.encoding.block_id.clone(),
-        codec_id: format!(
-            "reed-solomon-{}+{}",
-            manifest_object_ref.encoding.data_shards, manifest_object_ref.encoding.parity_shards
-        ),
+        codec_id: local_erasure_profile_for_counts(
+            &manifest_object_ref.encoding.profile_id,
+            usize::from(manifest_object_ref.encoding.data_shards),
+            usize::from(manifest_object_ref.encoding.parity_shards),
+        )?
+        .codec_id
+        .to_string(),
         data_shards: u32::from(manifest_object_ref.encoding.data_shards),
         parity_shards: u32::from(manifest_object_ref.encoding.parity_shards),
         plaintext_block_len: manifest_object_ref.logical_size,
@@ -9894,6 +9914,17 @@ mod tests {
                 .read_logical_file_manifest(&stale_epoch)
                 .await
                 .is_err()
+        );
+
+        let mut bad_codec = write.locator.clone();
+        bad_codec.block_locators[0].codec_id = "wrong-codec".to_string();
+        assert!(
+            store
+                .read_logical_file_manifest(&bad_codec)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("codec id")
         );
 
         let mut missing_fsync = write.locator.clone();
