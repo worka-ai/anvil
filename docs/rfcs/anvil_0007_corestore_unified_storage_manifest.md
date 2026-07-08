@@ -6,25 +6,31 @@ Scope: CoreStore storage architecture, file formats, write/read paths, observabi
 
 ## 1. Summary
 
-Anvil must have one durable storage substrate. Every durable byte, whether it is
-an object payload, a mutable reference head, a stream record, a transaction, an
-index segment, an authz tuple page, a PersonalDB snapshot, registry metadata, or
-mesh control state, must eventually land in the same erasure-coded distributed
-CoreStore block layer.
+Anvil must have one durable storage substrate: CoreStore. CoreStore is split
+like a BlueStore-style engine: RocksDB is the local metadata plane, and the
+CoreStore byte pipeline is the blob/shard plane. Object bodies, stream payloads,
+index segment bytes, PersonalDB snapshots, registry blobs, and every other large
+byte range are stored outside RocksDB as landed bytes or erasure-coded block
+shards. RocksDB stores only compact metadata: refs, heads, manifests or manifest
+locators, root cache rows, boundary rows, index keys, authz tuple pages, lease
+fences, mesh rows, registry catalogue rows, observability checkpoints, and
+materialisation state.
 
 Feature-specific writers are allowed and required. They decide how to arrange
 bytes for their own read paths. They do not own separate durability,
-replication, quorum, or distribution systems. They emit logical binary files and
-range metadata into the CoreStore byte pipeline. The byte pipeline performs
-chunking, dedupe, compression, optional encryption, erasure coding, placement,
-and manifest publication.
+replication, quorum, or distribution systems. They emit compact metadata rows
+into the CoreStore RocksDB plane and emit large binary outputs into the CoreStore
+byte pipeline. The byte pipeline performs chunking, dedupe, compression,
+optional encryption, erasure coding, placement, and manifest publication.
 
-Fast writes are admitted through a bounded WAL plus landed byte files. The WAL is
-for recovery and ordering, not for storing terabyte-scale payloads and not for
-serving normal reads. Large bytes land locally once, are referenced by WAL
-records, and are later materialised into final erasure-coded CoreStore blocks.
-Recent WAL state is mirrored in memory so hot reads do not have to scan the disk
-WAL.
+Fast writes are admitted through RocksDB-backed pending mutation records plus
+landed byte files. RocksDB's own WAL is the only metadata WAL. Anvil does not
+define a second metadata WAL file format. Large bytes land locally once, are
+referenced by pending mutation records, and are later materialised into final
+erasure-coded CoreStore blocks. Compact refs, heads, manifests, indexes, root
+state, transaction state, leases, fences, and materialisation cursors are
+committed to RocksDB. Recent RocksDB state is mirrored in memory so hot reads do
+not rescan metadata tables or blob files.
 
 Anvil tenants may store data for many application tenants, organisations,
 customers, projects, or legal realms inside one bucket. Anvil therefore exposes a
@@ -35,23 +41,28 @@ inputs. They are not authorisation grants.
 
 This RFC is prescriptive. Implementors must not introduce sidecar durable JSON
 files, feature-specific local stores, or independent replication mechanisms for
-subsystems. Local temporary files, lock files, WAL files, and caches are allowed
-only as non-final implementation mechanisms with explicit recovery semantics.
+subsystems. RocksDB is the only local metadata store. Local temporary files, lock
+files, RocksDB's own WAL/SST/MANIFEST files, and caches are allowed only as
+implementation artifacts with explicit recovery semantics.
 
 ## 2. Goals
 
 - Provide one final durable storage system for all Anvil features.
-- Support very fast writes without putting large payloads inside the WAL.
+- Use RocksDB as the CoreStore local metadata plane and never as a large blob
+  store.
+- Support very fast writes without putting large payloads inside RocksDB or its
+  WAL.
 - Recover safely after process, node, or machine failure.
 - Allow format-aware writers to optimise binary structures for their readers.
-- Route every writer output through one byte pipeline.
+- Route every writer's large binary output through one byte pipeline and every
+  writer's durable metadata through one RocksDB metadata plane.
 - Support object-level and range-level user-defined boundary metadata.
 - Preserve efficient range reads over erasure-coded blocks.
 - Support search, vector, log, authz, PersonalDB, registry, and mesh data without
   separate durable storage stacks.
-- Include tracing and metrics from request entry through WAL, materialisation,
-  writer output, byte pipeline, erasure coding, block placement, reads, and
-  fsync.
+- Include tracing and metrics from request entry through RocksDB write batches,
+  landed-byte fsync, materialisation, writer output, byte pipeline, erasure
+  coding, block placement, reads, and fsync.
 - Define a repeatable performance baseline comparable to MinIO, S3-compatible
   object systems, and specialised systems used for logs/search where applicable.
 
@@ -64,8 +75,10 @@ only as non-final implementation mechanisms with explicit recovery semantics.
   binary structures; the final storage substrate is unified.
 - Treat S3 semantics as the core Anvil data model. S3 is one gateway.
 - Use boundary metadata as an authorisation mechanism.
-- Allow unbounded WAL growth.
+- Allow unbounded RocksDB pending-mutation or landed-byte growth.
 - Allow durable feature state outside CoreStore final storage.
+- Store large object, stream, index, PersonalDB, or registry payloads in
+  RocksDB.
 
 ## 4. Normative Language
 
@@ -73,9 +86,9 @@ The words MUST, MUST NOT, REQUIRED, SHOULD, SHOULD NOT, and MAY are normative.
 
 ## 4.1 Canonical Encoding, Hashing, and Signing Profile
 
-All hashes, signatures, receipts, manifests, root records, WAL records, writer
-segments, and page tokens in this RFC use one canonical profile. Any section that
-says `canonical(...)`, `canonical CBOR`, `deterministic protobuf`,
+All hashes, signatures, receipts, manifests, root records, pending mutation
+records, writer segments, and page tokens in this RFC use one canonical profile.
+Any section that says `canonical(...)`, `deterministic protobuf`,
 `signed_payload_hash`, `root_hash`, `segment_hash`, `manifest_hash`, or
 `receipt_hash` refers to this profile unless that section explicitly defines a
 more restrictive byte format. Implementations MUST NOT choose alternate encodings
@@ -84,13 +97,13 @@ per subsystem.
 Canonical scalar rules:
 
 ```text
-integers                  little-endian fixed width in binary records; shortest valid integer in CBOR/JSON
+integers                  little-endian fixed width in binary records; shortest valid integer in JSON
 strings                   UTF-8, Unicode NFC, no embedded NUL for identifiers
 bytes                     length-prefixed raw bytes in binary records; base64url without padding in JSON
 hashes                    algorithm id + raw digest in binary records; "algorithm:hex" in JSON/diagnostics
 time                      unix nanoseconds as u64 unless a field says signed timestamp
 bools                     0x00 false, 0x01 true in binary records
-optional<T>               absent fields omitted in CBOR/protobuf canonical hash input; binary uses 0x00/0x01
+optional<T>               absent fields omitted in deterministic protobuf canonical hash input; binary uses 0x00/0x01
 repeated<T>               semantic order is the order declared by the section; sets are sorted before hashing
 maps                      sorted by canonical encoded key bytes
 unknown fields            rejected in signed or hashed protocol payloads
@@ -99,12 +112,11 @@ default fields            included only when the field is explicitly present in 
 
 Canonical JSON is RFC 8785-style canonical JSON: object keys sorted by Unicode
 codepoint, no insignificant whitespace, shortest numeric representation, and NFC
-strings. JSON is used for operator-facing policy/query documents and a few
-explicit WAL/header payloads only.
-
-Canonical CBOR is deterministic CBOR with definite lengths, shortest integer
-forms, sorted map keys by encoded key bytes, and no indefinite containers. CBOR
-maps MUST NOT contain duplicate keys.
+strings. JSON is used only for operator-facing policy/query documents, object
+payloads whose application content type is JSON, and gateway payloads that are
+already specified as JSON by their public protocol. CoreStore internal pending
+mutation, stream, transaction, root, and metadata records MUST NOT use JSON as
+their structured storage format.
 
 Deterministic protobuf is allowed only for messages whose schema is fixed in this
 RFC. It uses deterministic serialization, numeric field order, no unknown fields,
@@ -123,9 +135,7 @@ Normative domains:
 
 ```text
 anvil.request_hash.v1
-anvil.wal.frame_hash.v1
-anvil.admission.receipt.v1
-anvil.admission.commit_certificate.v1
+anvil.pending_mutation.row.v1
 anvil.root.key.v1
 anvil.root.anchor_record.v1
 anvil.transaction_manifest.v1
@@ -136,16 +146,61 @@ anvil.block.encoded.v1
 anvil.shard.receipt.v1
 anvil.page_token.v1
 anvil.query.plan.v1
-anvil.admission.chunk.v1
-anvil.admission.descriptor.v1
-anvil.admission.abort_certificate.v1
-anvil.admission.negative_receipt.v1
-anvil.admission.replay_claim.v1
-anvil.admission.gc_certificate.v1
 anvil.root.cohort.v1
 anvil.root.genesis_config.v1
 anvil.block.id.v1
+anvil.coremeta.row.v1
+anvil.coremeta.pending_batch.v1
+anvil.coremeta.committed_batch.v1
+anvil.coremeta.batch_receipt.v1
+anvil.coremeta.commit_certificate.v1
+anvil.coremeta.certificate_persist_receipt.v1
 ```
+
+CoreMeta hash inputs are exact:
+
+```text
+CoreMetaRowHash =
+  Hash(anvil.coremeta.row.v1,
+       canonical(column_family), CoreMetaKey, CoreMetaValue)
+
+CoreMetaPendingBatchHash =
+  Hash(anvil.coremeta.pending_batch.v1,
+       root_key_hash, expected_root_generation, post_root_generation,
+       transaction_id, sorted(CoreMetaRowHash))
+
+CoreMetaPrepareReceiptHash =
+  Hash(anvil.coremeta.batch_receipt.v1,
+       replica_node_id, write_sequence, pending_batch_hash, root_key_hash,
+       expected_root_generation, post_root_generation, transaction_id)
+
+CoreMetaCommittedBatchHash =
+  Hash(anvil.coremeta.committed_batch.v1,
+       root_key_hash, expected_root_generation, post_root_generation,
+       transaction_id, pending_batch_hash,
+       sorted(CoreMetaRowHash with visibility_state=committed))
+
+CoreMetaCommitCertificateHash =
+  Hash(anvil.coremeta.commit_certificate.v1,
+       root_key_hash, expected_root_generation, post_root_generation,
+       transaction_id, pending_batch_hash, sorted(CoreMetaPrepareReceiptHash))
+
+CoreMetaCertificatePersistReceiptHash =
+  Hash(anvil.coremeta.certificate_persist_receipt.v1,
+       replica_node_id, write_sequence, certificate_hash,
+       committed_batch_hash, root_key_hash, post_root_generation,
+       transaction_id)
+```
+
+CoreMeta prepare receipt signatures sign `CoreMetaPrepareReceiptHash`.
+Certificate persistence receipt signatures sign
+`CoreMetaCertificatePersistReceiptHash`. Commit certificate hashes are unsigned
+aggregate identities over signed prepare receipts. A certificate is valid only
+when every included receipt signature verifies, the receipt set satisfies the
+metadata quorum profile, and the computed certificate hash equals the carried
+certificate hash. A receiver MUST verify the signed receipt hashes, each node's
+membership in the metadata replica set for the root
+partition, and each node key's validity at the root generation being published.
 
 Signatures use Ed25519 unless a later RFC updates this profile. A signature field
 MUST sign exactly the domain-separated hash named by the message. Node signing
@@ -175,16 +230,17 @@ input.
 | - validate request preconditions                                           |
 | - extract and validate boundary values                                     |
 | - stream large bytes into landed byte files                                |
-| - append compact WAL records referencing landed bytes                      |
+| - write RocksDB pending mutation rows referencing landed bytes             |
+| - store eligible tiny payloads in cf_inline_payloads                       |
 | - update in-memory active state                                            |
 +----------------------------------------------------------------------------+
                                       |
                     +-----------------+------------------+
                     |                                    |
                     v                                    v
-        Bounded WAL records                     Landed byte files
-        small, fsynced, replayable              content-addressed, checked
-        no large payload bodies                 referenced by WAL records
+        RocksDB pending metadata rows           Landed byte files
+        fsynced through RocksDB WAL             content-addressed, checked
+        no large payload bodies                 referenced by pending rows
                     |                                    |
                     +-----------------+------------------+
                                       |
@@ -197,33 +253,40 @@ input.
 +----------------------------------------------------------------------------+
 | Materialisation engine                                                     |
 |----------------------------------------------------------------------------|
-| - reads admitted WAL records                                               |
+| - reads staged/pending CoreMeta rows                                       |
 | - consumes landed byte refs                                                |
 | - invokes the responsible format-aware writer                              |
-| - sends writer output to the unified byte pipeline                         |
+| - writes compact metadata using RocksDB WriteBatch                         |
+| - sends large writer output to the unified byte pipeline                    |
 | - publishes final manifests/refs/checkpoints                               |
-| - truncates WAL only after final storage is durable                        |
+| - marks staged rows committed/rolled back only after final storage is safe  |
 +----------------------------------------------------------------------------+
                                       |
+                    +-----------------+------------------+
+                    |                                    |
+                    v                                    v
++-----------------------------------------+  +-------------------------------+
+| CoreMeta RocksDB metadata plane         |  | Format-aware large outputs    |
+| refs, heads, manifest locators, authz,  |  | object blobs, stream segment  |
+| indexes, leases, mesh, registry rows    |  | payloads, index segments,     |
+| inline payload cap; no large blobs      |  | snapshots, registry blobs     |
++-----------------------------------------+  +-------------------------------+
+                    |                                    |
+                    |                                    v
+                    |                  +-------------------------------------+
+                    |                  | Unified byte pipeline              |
+                    |                  |-------------------------------------|
+                    |                  | boundary-aware block selection ->  |
+                    |                  | content-defined chunking -> dedupe |
+                    |                  | -> compression -> optional         |
+                    |                  | encryption -> erasure coding ->    |
+                    |                  | placement -> manifest publication |
+                    |                  +-------------------------------------+
+                    |                                    |
+                    +-----------------+------------------+
                                       v
-+----------------------------------------------------------------------------+
-| Format-aware writers                                                       |
-|----------------------------------------------------------------------------|
-| object blob | log stream | full text | vector | typed index | authz |       |
-| PersonalDB | registry | mesh/control | future writer families              |
-+----------------------------------------------------------------------------+
-                                      |
-                                      v
-+----------------------------------------------------------------------------+
-| Unified byte pipeline                                                      |
-|----------------------------------------------------------------------------|
-| boundary-aware block selection -> content-defined chunking -> dedupe ->     |
-| compression -> optional encryption -> erasure coding -> placement ->        |
-| final manifest publication                                                 |
-+----------------------------------------------------------------------------+
-                                      |
-                                      v
-                       Erasure-coded distributed block store
+                        CoreStore final storage engine
+                   RocksDB metadata + erasure-coded block shards
 ```
 
 ## 6. Storage Responsibility Boundary
@@ -233,21 +296,24 @@ CoreStore has three durability classes.
 ```text
 Class A: final durable storage
   Everything that must survive and be queryable after materialisation.
-  MUST be stored through the unified byte pipeline and erasure-coded block store.
+  Compact metadata MUST be stored in CoreMeta RocksDB. Large byte ranges MUST be
+  stored through the unified byte pipeline and erasure-coded block store.
 
 Class B: recovery/admission storage
-  WAL records and landed byte files. Used to recover admitted writes before
-  final materialisation. Bounded and eventually truncatable/deletable.
+  Landed byte files for large payload admission. Pending mutation metadata is
+  Class A CoreMeta data in RocksDB. Landed bytes are bounded and eventually
+  materialised or garbage-collected.
 
 Class C: local operational storage
   locks, pid files, local caches, process telemetry buffers, temporary build or
   upload scratch. Never authoritative.
 ```
 
-Only Class A is the final source of truth. Class B may temporarily contain the
-latest admitted writes, but only until materialisation checkpoints make the
-corresponding final CoreStore state durable. Class C must be rebuildable or
-expendable.
+Only Class A is the final source of truth. Class B may temporarily contain large
+payload bytes that are already represented by RocksDB pending mutation rows, but
+only until materialisation checkpoints make the corresponding final CoreStore
+state durable in RocksDB metadata rows and/or CoreStore block shards. Class C
+must be rebuildable or expendable.
 
 ## 7. Local Directory Model
 
@@ -257,14 +323,6 @@ semantics are normative.
 ```text
 <anvil-data>/
   admission/
-    wal/
-      active/
-        wal-<node-id>-<epoch>-<seq>.anw
-      sealed/
-        wal-<node-id>-<epoch>-<seq>.anw
-      checkpoints/
-        checkpoint-<node-id>-<epoch>.json
-
     landed-bytes/
       sha256/
         <hh>/
@@ -272,6 +330,16 @@ semantics are normative.
           <hash>.meta
 
   corestore/
+    meta/
+      rocksdb/
+        CURRENT
+        MANIFEST-*
+        *.sst
+        *.log
+        OPTIONS-*
+      # authoritative local metadata engine for this node
+      # includes RocksDB WAL, MANIFEST, SST, OPTIONS, and compaction artifacts
+
     blocks/
       local-cache/
         <erasure-set-id>/
@@ -299,42 +367,538 @@ corestore/streams/*.jsonl
 corestore/transactions/*.json
 corestore/manifests/*.json as the source of truth
 feature-specific journals outside the unified substrate
+additional embedded KV stores besides CoreMeta RocksDB
+large payload bytes inside CoreMeta RocksDB values
 ```
 
-A developer may use JSON inside WAL records, manifests, or writer payloads if the
-format explicitly says so. The prohibition is on sidecar JSON files acting as a
-separate final storage system.
+A developer may use JSON inside public/operator policy documents, query
+documents, manifests whose schema explicitly says JSON, or object/application
+payloads whose content type is JSON. The prohibition is on sidecar JSON files
+acting as a separate final storage system and on internal CoreStore control
+records using JSON where this RFC defines deterministic protobuf.
 
-### 7.1 Authoritative File/Record Inventory
+### 7.1 CoreMeta RocksDB Plane
+
+`corestore/meta/rocksdb/` is the only persistent local metadata database. It is
+part of CoreStore, not a feature-specific sidecar. Every column family and every
+record type must be declared in this RFC and covered by conformance tests before
+use.
+
+CoreMeta records use this key shape:
+
+```text
+CoreMetaKey =
+  version                u8          # initial value 1
+  table_id               u16-le      # globally assigned table id
+  partition_id           u64-le      # CoreStore partition id, 0 when unpartitioned
+  tuple_key_len          u16-le
+  tuple_key              tuple_key_len bytes, CoreMetaTupleKey
+
+CoreMetaTupleKey =
+  part_count             u16-le
+  part*                  CoreMetaTupleKeyPart, in table-declared order
+
+CoreMetaTupleKeyPart =
+  kind                   u8
+  flags                  u8          # initial value 0; non-zero rejected unless defined by a later RFC
+  value_len              u16-le
+  value                  value_len bytes
+
+kind =
+  0x01 utf8_nfc_string   # UTF-8 NFC bytes, no embedded NUL
+  0x02 u64_sortable      # u64 big-endian, 8 bytes
+  0x03 i64_sortable      # i64 mapped with sign-bit flip, then big-endian, 8 bytes
+  0x04 hash_string       # ASCII "algorithm:hex"
+  0x05 raw_bytes         # uninterpreted bytes
+  0x06 bool              # one byte 0x00 or 0x01
+```
+
+The tuple-key type is intentionally independent of protobuf because it is the
+RocksDB ordering key. Table definitions below list tuple-key parts by name; the
+encoded key MUST contain those parts in exactly that order with the kind implied
+by the field type. Unknown kinds, overlong values, non-NFC strings, and tuple
+keys with extra or missing parts are corrupt and MUST be rejected before any row
+is visible to readers.
+
+CoreMeta values use this deterministic protobuf envelope:
+
+```protobuf
+message CoreMetaValueEnvelope {
+  uint32 table_id = 1;               // values > 65535 are rejected
+  uint32 schema_version = 2;
+  bytes payload = 3;                 // table-specific deterministic protobuf
+  string payload_hash = 4;           // blake3 hex over payload bytes
+}
+```
+
+The envelope bytes are the `CoreMetaValue` hash input. A row MUST decode the
+envelope, verify `table_id`, verify `schema_version`, recompute
+`payload_hash`, decode the table-specific payload using the fixed schema below,
+and re-encode both payload and envelope deterministically before acceptance.
+
+CoreMeta value limits are normative. A value MUST NOT exceed 64 KiB after
+envelope encoding. Stream-record index rows and high-cardinality index rows MUST
+NOT exceed 16 KiB. Inline object payload eligibility is measured against the raw
+payload bytes accepted by Anvil before RocksDB compression. The default
+`max_inline_payload_bytes` is 32 KiB, implementations MAY lower it, and the
+absolute maximum is 64 KiB including the CoreMeta envelope and row overhead.
+RocksDB compression is an internal storage optimisation and MUST NOT be used to
+make a large logical payload inline-eligible. If a manifest, stream record, index
+segment, PersonalDB page, registry blob, authz page, mesh record, or object body
+exceeds the relevant limit, the large bytes MUST be written through the byte
+pipeline and CoreMeta MUST store only a locator, hash, length, generation, and
+any small query keys required for point or range lookup.
+
+Active RocksDB files MUST NOT be erasure-coded as the primary replication model.
+RocksDB WAL, SST, MANIFEST, CURRENT, OPTIONS, and compaction output are local
+materialisation artifacts for one metadata replica. Replication happens at the
+logical CoreMeta row level. RocksDB checkpoints or backups MAY be sealed and
+stored through the erasure-coded byte pipeline as cold recovery artifacts, but
+they are not the live consistency mechanism.
+
+Initial column families:
+
+```text
+cf_meta_version          metadata schema version and upgrade fence
+cf_root_cache            local cache of root anchors and root checkpoints
+cf_transactions          transaction manifest locator rows and commit evidence
+cf_object_heads          current object/link/delete heads
+cf_object_versions       object version metadata and manifest locators
+cf_inline_payloads       bounded tiny object payload bodies
+cf_stream_heads          stream head metadata
+cf_stream_records        stream record index rows and payload locators
+cf_index_defs            index definitions and extractor metadata
+cf_index_rows            typed/path/full-text/vector/hybrid index keys and segment locators
+cf_boundary              boundary schema generations and extracted boundary values
+cf_authz                 Zanzibar schema, tuple page, caveat, and revision rows
+cf_personaldb            PersonalDB group, snapshot, changeset, projection rows/locators
+cf_registry              registry catalogue, version, credential, and blob locator rows
+cf_mesh                  region, cell, node, partition, root-owner, signing-key rows
+cf_leases_fences         task lease and mutation fence rows
+cf_materialisation       pending-mutation cursor, landed-byte, and materialisation checkpoints
+cf_refcounts             landed/block/blob reference counts and tombstone state
+cf_observability         durable trace cursor and metric checkpoint rows
+```
+
+Initial CoreMeta table registry:
+
+| Table id | Column family | Tuple key | Payload schema | Visibility |
+|---:|---|---|---|---|
+| `0x8001` | `cf_meta_version` | `schema` | `CoreMetaSchemaVersionRow` | immediately visible after DB open |
+| `0x8002` | `cf_root_cache` | `root_key_hash` | `CoreRootCacheRow` | committed root generation only |
+| `0x8003` | `cf_transactions` | `root_key_hash / post_generation / mutation_id` | `CoreTransactionLocatorRow` | pending until root CAS commits |
+| `0x8004` | `cf_transactions` | `mutation_id` | `CoreTransactionCommitEvidenceRow` | pending until root CAS commits |
+| `0x8005` | `cf_transactions` | `manifest_hash` | `InlineManifestBodyRow` | committed root generation only |
+| `0x8006` | `cf_transactions` | `transaction_id` | `ExplicitTransactionRow` | transaction lifecycle state |
+| `0x8007` | `cf_transactions` | `transaction_id / mutation_id` | `PendingMutationRow` | staged until commit or rollback |
+| `0x8101` | `cf_object_heads` | `realm / bucket / object_key` | `ObjectHeadRow` | committed root generation only |
+| `0x8102` | `cf_object_versions` | `realm / bucket / object_key / version_id` | `ObjectVersionMetaRow` | committed root generation only |
+| `0x8103` | `cf_inline_payloads` | `realm / bucket / object_key / version_id` | `InlinePayloadRow` | committed root generation only |
+| `0x8201` | `cf_stream_heads` | `realm / stream_id` | `StreamHeadRow` | committed root generation only |
+| `0x8202` | `cf_stream_records` | `realm / stream_id / sequence` | `StreamRecordIndexRow` | committed root generation only |
+| `0x8301` | `cf_index_defs` | `realm / bucket / index_id` | `IndexDefinitionRow` | committed root generation only |
+| `0x8302` | `cf_index_rows` | `realm / bucket / index_id / encoded_sort_key / object_ref` | `IndexRow` | committed root generation only |
+| `0x8401` | `cf_boundary` | `realm / bucket / generation` | `BoundarySchemaRow` | committed root generation only |
+| `0x8402` | `cf_boundary` | `realm / bucket / dimension_id / encoded_value / object_ref` | `BoundaryValueRow` | committed root generation only |
+| `0x8501` | `cf_authz` | `realm / schema_generation` | `AuthzSchemaRow` | committed authz root generation only |
+| `0x8502` | `cf_authz` | `realm / revision / tuple_hash` | `AuthzTuplePageRow` | committed authz root generation only |
+| `0x8601` | `cf_personaldb` | `realm / group_id / generation` | `PersonalDbGroupRow` | committed root generation only |
+| `0x8602` | `cf_personaldb` | `realm / group_id / snapshot_or_changeset_id` | `PersonalDbDataLocatorRow` | committed root generation only |
+| `0x8701` | `cf_registry` | `realm / registry_kind / namespace / package / version` | `RegistryVersionRow` | committed root generation only |
+| `0x8702` | `cf_registry` | `realm / registry_kind / blob_hash` | `RegistryBlobLocatorRow` | committed root generation only |
+| `0x8801` | `cf_mesh` | `region / cell / node_id` | `MeshNodeRow` | committed mesh root generation only |
+| `0x8802` | `cf_mesh` | `partition_id / epoch` | `MeshPartitionRow` | committed mesh root generation only |
+| `0x8d01` | `cf_mesh` | `principal_or_node_id / key_id` | `NodeSigningKeyRow` | committed mesh root generation only |
+| `0x8901` | `cf_leases_fences` | `realm / lease_id` | `LeaseFenceRow` | committed root generation only |
+| `0x8a01` | `cf_materialisation` | `node_id / materialisation_epoch` | `MaterialisationCursorRow` | local committed metadata |
+| `0x8b02` | `cf_materialisation` | `landing_id` | `LandedByteRefRow` | local committed metadata |
+| `0x8b01` | `cf_refcounts` | `ref_kind / ref_id` | `RefCountRow` | committed root generation only |
+| `0x8c01` | `cf_observability` | `stream / cursor_id` | `ObservabilityCursorRow` | local committed metadata |
+
+Every payload schema named above MUST use deterministic protobuf with the exact
+field numbers below. Unknown protobuf fields are corrupt. All row payloads carry
+`CoreMetaRowCommon common = 1`; local-only tables set `realm_id` and
+`root_key_hash` to the empty string and `root_generation` to zero. Readers MUST
+ignore `VISIBILITY_PENDING`, `VISIBILITY_ABORTED`, and
+`VISIBILITY_ROLLED_BACK` rows unless they are executing recovery for the owning
+materialisation transaction.
+
+```protobuf
+enum CoreMetaVisibilityState {
+  VISIBILITY_UNSPECIFIED = 0;
+  VISIBILITY_PENDING = 1;
+  VISIBILITY_COMMITTED = 2;
+  VISIBILITY_ABORTED = 3;
+  VISIBILITY_ROLLED_BACK = 4;
+}
+
+message CoreMetaRowCommon {
+  string realm_id = 1;
+  string root_key_hash = 2;
+  uint64 root_generation = 3;
+  string transaction_id = 4;
+  CoreMetaVisibilityState visibility_state = 5;
+  uint64 created_at_unix_nanos = 6;
+  uint32 payload_schema_version = 7;
+}
+
+message CoreMetaLocator {
+  string storage_kind = 1;           // coremeta-inline, corestore-blocks
+  string manifest_hash = 2;
+  string root_key_hash = 3;
+  uint64 root_generation = 4;
+  string locator_hash = 5;
+  bytes encoded_locator = 6;         // deterministic wire bytes of the locator type named by storage_kind
+}
+
+message CoreMetaInlineOrLocator {
+  bytes inline_payload = 1;
+  CoreMetaLocator locator = 2;
+}
+
+message CoreMetaSchemaVersionRow {
+  CoreMetaRowCommon common = 1;
+  uint32 core_meta_schema_version = 2;
+  string created_by_binary_version = 3;
+  string minimum_supported_binary_version = 4;
+  string column_family_set_hash = 5;
+}
+
+message CoreRootCacheRow {
+  CoreMetaRowCommon common = 1;
+  string root_anchor_key = 2;
+  string root_anchor_record_hash = 3;
+  uint64 cached_root_generation = 4;
+  CoreMetaLocator transaction_manifest_locator = 5;
+  CoreMetaLocator checkpoint_manifest_locator = 6;
+  string core_meta_commit_certificate_hash = 7;
+}
+
+message CoreTransactionLocatorRow {
+  CoreMetaRowCommon common = 1;
+  uint64 pre_root_generation = 2;
+  uint64 post_root_generation = 3;
+  repeated string mutation_ids = 4;
+  CoreMetaLocator transaction_manifest_locator = 5;
+  repeated CoreMetaLocator logical_manifest_locators = 6;
+  uint64 core_meta_mutation_count = 7; // exact count of CoreMeta rows in the pending batch
+  repeated string byte_pipeline_receipt_hashes = 8;
+}
+
+message CoreTransactionCommitEvidenceRow {
+  CoreMetaRowCommon common = 1;
+  string mutation_id = 2;
+  string transaction_payload_hash = 3;
+  string pending_batch_hash = 4;
+  string committed_batch_hash = 5;
+  bytes core_meta_commit_certificate = 6;
+  string root_anchor_hash = 7;
+  uint64 core_meta_row_count = 8;     // exact count of committed CoreMeta rows covered by committed_batch_hash
+}
+
+message InlineManifestBodyRow {
+  CoreMetaRowCommon common = 1;
+  string manifest_hash = 2;
+  bytes manifest_bytes = 3;          // deterministic manifest wire bytes; hash(manifest_bytes) == manifest_hash
+  string referenced_by_transaction_id = 4;
+}
+
+message ExplicitTransactionRow {
+  CoreMetaRowCommon common = 1;
+  string transaction_id = 2;
+  string idempotency_key_hash = 3;
+  string root_anchor_key = 4;
+  string root_key_hash = 5;
+  string state = 6;                  // open, committing, committed, rolled_back, expired, failed
+  uint64 opened_at_unix_nanos = 7;
+  uint64 expires_at_unix_nanos = 8;
+  repeated string staged_mutation_ids = 9;
+  repeated string precondition_hashes = 10;
+  string terminal_error_code = 11;
+}
+
+message ObjectHeadRow {
+  CoreMetaRowCommon common = 1;
+  string bucket_id = 2;
+  string object_key = 3;
+  string head_kind = 4;              // object, link, delete_marker
+  string version_id = 5;
+  CoreMetaLocator manifest_locator = 6;
+  string etag = 7;
+  string content_type = 8;
+  string user_metadata_hash = 9;
+  bool delete_marker = 10;
+}
+
+message ObjectVersionMetaRow {
+  CoreMetaRowCommon common = 1;
+  string bucket_id = 2;
+  string object_key = 3;
+  string version_id = 4;
+  string payload_hash = 5;
+  uint64 payload_length = 6;
+  CoreMetaLocator manifest_locator = 7;
+  string boundary_value_hash = 8;
+  string created_by_mutation_id = 9;
+}
+
+message InlinePayloadRow {
+  CoreMetaRowCommon common = 1;
+  string bucket_id = 2;
+  string object_key = 3;
+  string version_id = 4;
+  string payload_hash = 5;
+  uint64 raw_payload_length = 6;
+  string content_type = 7;
+  string user_metadata_hash = 8;
+  bytes payload_bytes = 9;           // raw accepted payload bytes; never pre-compressed by Anvil
+}
+
+message StreamHeadRow {
+  CoreMetaRowCommon common = 1;
+  string stream_id = 2;
+  uint64 last_sequence = 3;
+  uint64 record_count = 4;
+  CoreMetaLocator tail_segment_locator = 5;
+  string open_segment_id = 6;
+  uint64 sealed_through_sequence = 7;
+}
+
+message StreamRecordIndexRow {
+  CoreMetaRowCommon common = 1;
+  string stream_id = 2;
+  uint64 sequence = 3;
+  string idempotency_key_hash = 4;
+  int64 timestamp_nanos = 5;
+  string payload_hash = 6;
+  uint64 payload_len = 7;
+  CoreMetaInlineOrLocator inline_payload_or_locator = 8;
+  CoreMetaLocator segment_locator = 9;
+}
+
+message IndexDefinitionRow {
+  CoreMetaRowCommon common = 1;
+  string bucket_id = 2;
+  string index_id = 3;
+  string index_kind = 4;
+  string extractor_hash = 5;
+  uint64 schema_generation = 6;
+  string segment_policy = 7;
+  string authz_filter_policy = 8;
+}
+
+message IndexRow {
+  CoreMetaRowCommon common = 1;
+  string bucket_id = 2;
+  string index_id = 3;
+  bytes encoded_sort_key = 4;
+  string object_ref = 5;
+  uint64 source_revision = 6;
+  CoreMetaLocator segment_locator = 7;
+  string authz_scope_hash = 8;
+}
+
+message BoundarySchemaRow {
+  CoreMetaRowCommon common = 1;
+  string bucket_id = 2;
+  uint64 generation = 3;
+  repeated string dimensions = 4;
+  string dimension_hash = 5;
+  uint64 activation_root_generation = 6;
+}
+
+message BoundaryValueRow {
+  CoreMetaRowCommon common = 1;
+  string bucket_id = 2;
+  string dimension_id = 3;
+  bytes encoded_value = 4;
+  string object_ref = 5;
+  string range_ref = 6;
+  string boundary_strength = 7;
+}
+
+message AuthzSchemaRow {
+  CoreMetaRowCommon common = 1;
+  uint64 schema_generation = 2;
+  string namespace_config_hash = 3;
+  CoreMetaInlineOrLocator schema_locator_or_inline_payload = 4;
+  uint64 activated_at_revision = 5;
+}
+
+message AuthzTuplePageRow {
+  CoreMetaRowCommon common = 1;
+  uint64 revision = 2;
+  string tuple_page_hash = 3;
+  CoreMetaInlineOrLocator tuple_page_locator_or_inline_payload = 4;
+  repeated string caveat_hashes = 5;
+  repeated string derived_index_keys = 6;
+}
+
+message PersonalDbGroupRow {
+  CoreMetaRowCommon common = 1;
+  string group_id = 2;
+  string replica_set_hash = 3;
+  string witness_policy_hash = 4;
+  string latest_commit = 5;
+  CoreMetaLocator snapshot_locator = 6;
+}
+
+message PersonalDbDataLocatorRow {
+  CoreMetaRowCommon common = 1;
+  string group_id = 2;
+  string data_id = 3;
+  string data_kind = 4;
+  string sqlite_changeset_hash = 5;
+  CoreMetaLocator payload_locator = 6;
+  repeated string projection_keys = 7;
+}
+
+message RegistryVersionRow {
+  CoreMetaRowCommon common = 1;
+  string registry_kind = 2;
+  string namespace = 3;
+  string package_name = 4;
+  string version = 5;
+  string manifest_hash = 6;
+  CoreMetaLocator manifest_locator = 7;
+  string published_by_principal = 8;
+}
+
+message RegistryBlobLocatorRow {
+  CoreMetaRowCommon common = 1;
+  string registry_kind = 2;
+  string blob_hash = 3;
+  uint64 blob_length = 4;
+  CoreMetaLocator blob_locator = 5;
+  string media_type = 6;
+  string refcount_key = 7;
+}
+
+message MeshNodeRow {
+  CoreMetaRowCommon common = 1;
+  string region_id = 2;
+  string cell_id = 3;
+  string node_id = 4;
+  repeated string node_role_set = 5;
+  repeated string advertised_endpoints = 6;
+  string drain_state = 7;
+  repeated string signing_key_ids = 8;
+}
+
+message MeshPartitionRow {
+  CoreMetaRowCommon common = 1;
+  uint64 partition_id = 2;
+  uint64 epoch = 3;
+  string owner_node_id = 4;
+  repeated string replica_node_ids = 5;
+  repeated string root_key_ranges = 6;
+  uint64 fence_token = 7;
+}
+
+message NodeSigningKeyRow {
+  CoreMetaRowCommon common = 1;
+  string principal_or_node_id = 2;
+  string key_id = 3;
+  bytes public_key = 4;
+  CoreMetaInlineOrLocator private_key_locator_or_inline_secret = 5;
+  uint64 valid_from_revision = 6;
+  uint64 revoked_at_revision = 7;
+}
+
+message LeaseFenceRow {
+  CoreMetaRowCommon common = 1;
+  string lease_id = 2;
+  string owner_principal = 3;
+  uint64 fence_token = 4;
+  uint64 expires_at_unix_nanos = 5;
+  string checkpoint_hash = 6;
+  string force_release_evidence = 7;
+}
+
+message MaterialisationCursorRow {
+  CoreMetaRowCommon common = 1;
+  string node_id = 2;
+  uint64 materialisation_epoch = 3;
+  uint64 last_scanned_pending_sequence = 4;
+  uint64 last_finalised_sequence = 5;
+  uint64 last_root_generation = 6;
+  string lag_metrics = 7;
+}
+
+message LandedByteRefRow {
+  CoreMetaRowCommon common = 1;
+  string landing_id = 2;
+  string hash = 3;
+  uint64 length = 4;
+  string local_path_hash = 5;
+  uint64 fsync_sequence = 6;
+  uint64 refcount = 7;
+  CoreMetaLocator materialised_locator = 8;
+}
+
+message RefCountRow {
+  CoreMetaRowCommon common = 1;
+  string ref_kind = 2;
+  string ref_id = 3;
+  uint64 count = 4;
+  uint64 last_increment_generation = 5;
+  uint64 tombstone_generation = 6;
+  string compaction_state = 7;
+}
+
+message ObservabilityCursorRow {
+  CoreMetaRowCommon common = 1;
+  string stream = 2;
+  string cursor_id = 3;
+  uint64 last_exported_sequence = 4;
+  string last_exported_trace_id = 5;
+  string export_checkpoint_hash = 6;
+}
+```
+
+Rows that contain a `CoreMetaInlineOrLocator` field MUST use the inline form only
+when the encoded payload fits the table's CoreMeta value limit. Otherwise the
+field stores a locator and the payload bytes live in CoreStore blocks.
+`InlineManifestBodyRow` is the only row whose `manifest_bytes` field contains a
+transaction manifest body directly; `manifest_hash` is computed over
+`manifest_bytes`, not over the whole row payload, and the row is allowed only when
+the body fits within the CoreMeta value limit.
+
+RocksDB write batches are the only allowed mechanism for atomic local metadata
+updates. A local metadata update that also creates block shards must be ordered as:
+write/fsync landed or shard bytes, validate hashes, write the CoreMeta batch with
+locators, then publish or advance the root/register state. The reverse order is
+forbidden because it can expose metadata pointing at missing bytes.
+
+### 7.2 Authoritative File/Record Inventory
 
 Implementors must classify every persistent artifact in code review. The
 following inventory is normative.
 
 | Artifact | Class | Location | Authoritative? | Replicated? | Notes |
 |---|---:|---|---:|---:|---|
-| WAL frame file | B | `admission/wal/*` | temporary | by admission policy only | Recovery and ordering until materialised. |
-| Landed byte file | B | `admission/landed-bytes/*` | temporary | no, unless policy elects mirrored landing | Large payload admission before final blocks. |
-| WAL checkpoint | B | `admission/wal/checkpoints/*` | temporary | no | Derived from WAL and final manifests. |
-| Logical file manifest | A | CoreStore block store | yes | yes | Stored as a CoreStore object, not as final local JSON. |
+| Landed byte file | B | `admission/landed-bytes/*` | temporary | no | Large payload admission before final blocks; always referenced by RocksDB pending mutation rows. |
+| CoreMeta RocksDB database | A | `corestore/meta/rocksdb/*` | yes for local metadata | replicated by partition/root protocol | Single metadata plane; no large blobs. |
+| Logical file manifest locator | A | `cf_transactions`, `cf_object_versions`, writer CFs | yes | replicated by partition/root protocol | Compact locator, hash, length, and generation. |
+| Logical file manifest body | A | CoreStore block store when > CoreMeta limit | yes | yes | Large manifest bodies are blobs, not RocksDB values. |
 | Block shard file | A | `corestore/blocks/local-cache/*` or node-owned block path | yes for local shard | yes via erasure set | Physical shard for one erasure-coded block. |
-| Object version manifest | A | writer logical file in CoreStore | yes | yes | Emitted by object writer. |
-| Stream segment | A | writer logical file in CoreStore | yes | yes | Emitted by stream writer. |
-| Index segment | A | writer logical file in CoreStore | yes | yes | Covers full-text, vector, typed metadata. |
-| Authz tuple/revision segment | A | writer logical file in CoreStore | yes | yes | Same Zanzibar engine, reserved Anvil schema plus user schemas. |
-| Registry catalog/blob metadata | A | writer logical file in CoreStore | yes | yes | Gateway state is data in CoreStore. |
-| Mesh/region/node control state | A | writer logical file in CoreStore | yes | yes | No sidecar cluster database. |
+| Object version metadata | A | `cf_object_versions` | yes | replicated by partition/root protocol | Object writer metadata and payload locator. |
+| Inline payload row | A | `cf_inline_payloads` | yes for bounded tiny payloads | replicated by CoreMeta quorum | Full-copy metadata replication, not erasure-coded. |
+| Stream head/record index | A | `cf_stream_heads`, `cf_stream_records` | yes | replicated by partition/root protocol | Payload in CoreStore blocks when not inline-small. |
+| Index definition/row metadata | A | `cf_index_defs`, `cf_index_rows` | yes | replicated by partition/root protocol | Segment bytes in CoreStore blocks. |
+| Authz tuple/revision page metadata | A | `cf_authz` | yes | replicated by partition/root protocol | Same Zanzibar engine, reserved Anvil schema plus user schemas. |
+| Registry catalog/blob metadata | A | `cf_registry` | yes | replicated by partition/root protocol | Gateway catalogue in metadata, blobs in block store. |
+| Mesh/region/node control metadata | A | `cf_mesh` | yes | replicated by partition/root protocol | No sidecar cluster database. |
 | Root register shard | A-root | `corestore/blocks/register/*/generation-*/*.anr` | yes, pointer only | yes, root-register-r3 | Only mutable CoreStore anchor primitive; never feature payload/state. |
 | Failover vote record | A-root | `corestore/blocks/register/*/votes/*/*.anfv` | yes for failover decision | yes, root-register quorum | Votes are control-plane safety records for root ownership. |
-| Admission local receipt | B | `admission/wal/*` receipt metadata | temporary | profile-dependent | Required before commit certificate. |
-| Admission mirror receipt | B | `admission/mirrors/*/receipts/*` | temporary | on mirror node | Required evidence for committed admission. |
-| Replay claim | B | `admission/mirrors/*/receipts/*` | temporary | on claimant/mirror | Grants one replay fence after source loss. |
-| Admission commit certificate | B | `admission/mirrors/*/receipts/*` and source WAL metadata | temporary | profile-dependent | Mandatory before a client-visible committed response. |
-| Admission abort certificate | B | `admission/mirrors/*/receipts/*` | temporary | profile-dependent | Valid only when quorum proves the mutation never committed. |
-| Admission mirror GC certificate | B | `admission/mirrors/*/receipts/*` | temporary | profile-dependent | Authorises deletion of mirror recovery artifacts. |
+| CoreMeta prepare receipt | A | `cf_transactions` | yes | replicated by CoreMeta quorum | Replica-signed evidence that a pending metadata batch was fsynced. |
+| CoreMeta commit certificate | A | `cf_transactions` | yes | replicated by CoreMeta quorum | Aggregate proof persisted before root publication. |
+| Shard receipt/certificate | A | manifest rows or manifest body | yes | via CoreMeta for manifest evidence | Aggregate proof for erasure-coded byte durability. |
 | Local cache | C | `corestore/*-cache`, `telemetry/*` | no | no | Rebuildable and expendable. |
 
 Any new persistent artifact not listed here must be added to this table before
-implementation. If the artifact is Class A, it must be written through the
+implementation. If the artifact is Class A metadata, it must be stored in
+CoreMeta RocksDB. If it is Class A large bytes, it must be written through the
 unified byte pipeline. The only exception is Class A-root, the minimal root
 register primitive that makes the first and latest CoreStore roots discoverable;
 it is not available to feature writers and cannot store feature payloads, indexes,
@@ -349,7 +913,7 @@ sequenceDiagram
     participant C as Client/Gateway
     participant A as Admission
     participant L as Landed Bytes
-    participant W as WAL
+    participant R as CoreMeta RocksDB
     participant M as Memory State
     participant Q as Materialiser
     participant F as Format Writer
@@ -359,21 +923,28 @@ sequenceDiagram
     C->>A: write request + metadata + payload stream
     A->>A: authn/authz/preconditions
     A->>A: extract boundary values
-    A->>L: stream payload to landed file if large
-    A->>W: append compact WAL record
-    W-->>A: fsync acknowledged
-    A->>M: update active state
-    A-->>C: admitted/committed response as API semantics require
-    Q->>W: read admitted record
+    A->>L: stream payload to landed file if larger than inline cap
+    L-->>A: hash/length/fsync receipt
+    A->>R: WriteBatch pending mutation rows + landed refs
+    R-->>A: RocksDB WAL/fsync acknowledged
+    A->>M: update active cache from committed RocksDB rows
+    Q->>R: read pending CoreMeta rows
     Q->>L: open landed byte refs
     Q->>F: build writer output
     F->>B: logical file + ranges + boundary metadata
     B->>E: write erasure-coded blocks
-    E-->>B: block/shard receipts
+    E-->>B: shard receipts
     B->>Q: final logical manifest refs
-    Q->>M: publish checkpoint/ref update
-    Q->>W: checkpoint WAL prefix as truncatable
+    Q->>R: WriteBatch final rows + commit evidence
+    R-->>Q: local fsync acknowledged
 ```
+
+Anvil admission is RocksDB-backed. The local crash-recovery boundary for
+metadata is RocksDB's WAL and MANIFEST/SST state. Anvil MUST NOT maintain a
+second metadata WAL. Pending mutation records, transaction records, landed-byte
+references, idempotency rows, and materialisation cursors are CoreMeta rows.
+Large bytes are staged as landed byte files outside RocksDB and referenced from
+those rows by hash, length, and landing id.
 
 ### 8.2 Admission Atomicity
 
@@ -381,19 +952,34 @@ A write is admitted only when:
 
 1. request-level validation succeeds;
 2. boundary extraction succeeds for all required dimensions;
-3. landed bytes, if any, have been fully written and hash-verified;
-4. the WAL record has reached the configured admission durability rule;
-5. in-memory active state has been updated or can be rebuilt from the WAL.
+3. large landed bytes, if any, have been fully written, fsynced, and
+   hash-verified;
+4. the RocksDB `WriteBatch` containing the pending mutation rows has been
+   durably written through RocksDB's configured WAL/fsync policy;
+5. the in-memory active cache has been updated from the same row set or can be
+   rebuilt from RocksDB.
 
 If any of those fail, the write is not admitted. Partial landed bytes are garbage
-collectable.
+collectable because no durable pending mutation row can reference them.
 
-### 8.3 WAL Does Not Store Large Bytes
+### 8.3 RocksDB Does Not Store Large Bytes
 
-The WAL MUST store references to landed byte files or final CoreStore manifest
-locators/ranges. It MUST NOT inline large payloads. The hard default maximum WAL record body
-is 64 KiB. Implementations MAY set a lower limit. Raising the limit requires an
-RFC update.
+RocksDB stores metadata and bounded small payloads only. Object payloads are
+inline-eligible only when the raw payload bytes accepted by Anvil are at or below
+`max_inline_payload_bytes`. RocksDB compression MUST NOT affect eligibility. A
+payload that is 5 MiB before RocksDB compression is a large payload even if it
+would compress to 20 KiB in an SST file.
+
+```text
+max_inline_payload_bytes default: 32 KiB
+max_inline_payload_bytes minimum recommended: 16 KiB
+max_inline_payload_bytes absolute maximum: 64 KiB including row/envelope overhead
+```
+
+Inline payloads are stored in `cf_inline_payloads`, replicated as full CoreMeta
+rows, and sized as metadata-plane capacity. Large payloads MUST use landed bytes
+and the erasure-coded byte pipeline. This keeps RocksDB WAL, memtables,
+compaction, cache, recovery, and CoreMeta replication bounded.
 
 ### 8.4 Native Write API Sketch
 
@@ -412,6 +998,7 @@ pub struct CoreWriteRequest {
     pub user_metadata: BTreeMap<String, String>,
     pub boundary_values: Vec<BoundaryValue>,
     pub preconditions: Vec<WritePrecondition>,
+    pub transaction_id: Option<TransactionId>,
     pub body: WriteBody,
 }
 
@@ -435,445 +1022,134 @@ pub enum WritePrecondition {
 }
 ```
 
-The admission layer must convert each `CoreWriteRequest` into exactly one
-admitted mutation or a clear rejection. It must not let a gateway bypass
-boundary extraction, WAL admission, or writer selection.
-
+The admission layer must convert each `CoreWriteRequest` into exactly one staged
+or implicit mutation or a clear rejection. It must not let a gateway bypass
+boundary extraction, RocksDB pending mutation admission, transaction scoping, or
+writer selection.
 
 ### 8.5 Response States and Durability
 
-Anvil distinguishes internal admission from externally visible durability.
+Anvil distinguishes internal staging from externally visible durability.
 
 ```text
 Received
   request entered the server, no durability promised.
 
-Admitted
-  internal state only. The local node has validated the request, written landed
-  bytes, appended the WAL frame, and updated memory. No client-visible success
-  may be returned at this state.
+Staged
+  durable only as pending CoreMeta state. The local node has validated the
+  request, written any landed bytes, and written RocksDB pending rows. Normal
+  readers ignore this state.
 
 Committed
-  safe response state for normal writes. Local WAL and landed bytes are fsynced,
-  admission mirrors have returned durable receipts, and the mutation is
-  recoverable after the loss tolerated by the configured admission profile, even
-  if final materialisation has not completed.
+  safe response state for writes. Required byte-plane receipts exist, the
+  CoreMeta batch and CoreMeta commit certificate have reached the configured
+  metadata quorum, and the root generation has been published.
 
 Finalised
-  the mutation is represented by final erasure-coded CoreStore blocks and a
-  committed root anchor generation.
+  all post-commit materialisation and repair obligations are complete. For large
+  byte writes this means every required shard or configured repair completion
+  condition has been satisfied.
 
 FinalisationFailed
-  the mutation was admitted and remains recoverable evidence, but materialisation
-  rejected it before root publication because a deterministic finalisation rule
-  failed, such as boundary enforcement, corrupt landed bytes, or unsupported
-  writer output. The mutation is not visible in any committed root generation.
+  the mutation was staged but deterministic materialisation rejected it before
+  root publication, or an explicit transaction was rolled back/expired. It is not
+  visible in any committed root generation.
 ```
 
 Default public write APIs return only after `Committed`. A caller may request
 `wait_for_finalization=true`; then the response returns only after `Finalised`,
 `FinalisationFailed`, or an explicit timeout while preserving idempotency. A retry
-with the same idempotency key returns the same terminal finalisation state. A
-retry with corrected data must use a new idempotency key and mutation id. Reads
-never expose `FinalisationFailed` mutations because they have no root anchor
-publication. Status APIs return `FinalisationFailed` with the stable Anvil error
-that caused finalisation to fail.
+with the same idempotency key returns the same terminal state. Reads never expose
+`FinalisationFailed` mutations because they have no root anchor publication.
 
-### 8.6 Admission Profiles
+### 8.6 CoreMeta Replication Profiles
 
-The default production admission profile is `regional-2-of-3`:
+CoreMeta replication is logical Anvil-row replication. The owner sends
+CoreMeta mutation batches to the metadata replica set. It never ships RocksDB WAL
+bytes, SST files, MANIFEST files, or compaction output.
 
-```text
-local WAL frame fsynced:           required
-local landed bytes fsynced:        required for large bodies
-remote WAL mirrors acknowledged:   1 of 2 peers
-remote landed byte mirrors:        1 of 2 peers for referenced landed bytes
-machine-loss guarantee:            survives loss of any one admission replica
-```
-
-Single-node admission is allowed only when `unsafe_single_node_admission=true` is
-set in a development profile. Production builds and release tests must reject
-that profile.
-
-Landed byte durability is not optional for committed writes. Before a WAL frame
-references landed bytes, the node must:
-
-1. write the landed temp file;
-2. verify length and hash;
-3. fsync the landed temp file;
-4. atomically rename to the final landed path;
-5. fsync the landed directory;
-6. mirror and verify according to the admission profile.
-
-Admission evidence record schema:
-
-```protobuf
-message AdmissionAttemptId {
-  string mutation_id = 1;
-  string root_anchor_key = 2;
-  string root_key_hash = 3;
-  string source_node_id = 4;
-  uint64 source_wal_epoch = 5;
-  uint64 source_wal_sequence = 6;
-  string request_hash = 7;
-  string admission_profile = 8;
-  uint64 admission_profile_epoch = 9;
-  repeated string selected_mirror_node_ids = 10;
-}
-
-enum AdmissionReceiptKind {
-  ADMISSION_RECEIPT_UNSPECIFIED = 0;
-  LOCAL = 1;
-  MIRROR_LANDED_BYTES = 2;
-  MIRROR_WAL_FRAME = 3;
-  MIRROR_COMBINED = 4;
-}
-
-message AdmissionMirrorReceipt {
-  string schema = 1;                 // anvil.admission.mirror_receipt.v1
-  AdmissionAttemptId attempt_id = 2;
-  AdmissionReceiptKind receipt_kind = 3;
-  string mirror_node_id = 4;
-  repeated string landed_byte_hashes = 5;
-  repeated string descriptor_hashes = 6;
-  string wal_frame_hash = 7;
-  uint64 mirror_fsync_sequence = 8;
-  uint64 received_at_unix_nanos = 9;
-  string signed_payload_hash = 10;    // hash over attempt + receipt fields except signature
-  bytes mirror_signature = 11;
-}
-
-message LocalAdmissionReceipt {
-  string schema = 1;                 // anvil.admission.local_receipt.v1
-  AdmissionAttemptId attempt_id = 2;
-  repeated string landed_byte_hashes = 3;
-  repeated string descriptor_hashes = 4;
-  string wal_frame_hash = 5;
-  uint64 local_wal_fsync_sequence = 6;
-  uint64 local_landed_fsync_sequence = 7;
-  string signed_payload_hash = 8;
-  bytes source_signature = 9;
-}
-
-message LandedByteDescriptor {
-  string landing_id = 1;
-  string sha256 = 2;
-  uint64 length = 3;
-  string content_class = 4;
-  string descriptor_hash = 5;
-}
-
-message AdmissionCommitCertificate {
-  AdmissionAttemptId attempt_id = 1;
-  LocalAdmissionReceipt local_receipt = 2;
-  repeated AdmissionMirrorReceipt mirror_receipts = 3;
-  uint64 committed_at_unix_nanos = 4;
-  string signed_payload_hash = 5;
-  bytes source_signature = 6;
-}
-
-message LocalAdmissionAbortReceipt {
-  string schema = 1;                 // anvil.admission.local_abort_receipt.v1
-  AdmissionAttemptId attempt_id = 2;
-  string reason = 3;
-  uint64 aborted_at_unix_nanos = 4;
-  string signed_payload_hash = 5;
-  bytes source_signature = 6;
-}
-```
-
-A `Committed` response requires a signed `LocalAdmissionReceipt`, the remote
-receipt count required by the admission profile, and a signed
-`AdmissionCommitCertificate`. If the admitting node dies after `Committed` and
-before `Finalised`, any mirror with the WAL frame, landed bytes, and commit
-certificate may replay the mutation. Replay ownership is assigned by the mesh
-partition owner for the affected root key; other mirrors must not publish root
-updates directly.
-
-`request_hash` is:
+The default production metadata profile is `metadata-r3-q2`:
 
 ```text
-request_hash = Hash(anvil.request_hash.v1, canonical(
-  operation_family,
-  writer_family,
-  target,
-  preconditions,
-  user_metadata,
-  boundary_values,
-  body_descriptor_hashes,
-  idempotency_key_hash))
+metadata replicas:              3 full logical CoreMeta replicas
+prepare quorum:                 2 durable prepare receipts
+commit-certificate quorum:       2 durable commit-evidence receipts
+machine-loss guarantee:          survives loss of any one metadata replica
 ```
 
-The request hash includes hashes/descriptors for body bytes, not the body bytes
-themselves. The same logical write through different gateways must produce the
-same request hash after gateway normalisation.
+Operators MAY define stricter named profiles such as `metadata-r5-q3` or
+`metadata-r3-all`. Profile selection is operator/admin controlled by realm,
+bucket storage class, or root class. Tenants MAY choose only from storage classes
+explicitly exposed by the operator and MUST NOT weaken durability below the
+operator-defined minimum.
 
-Signed payload rules are fixed and non-recursive:
+Metadata commit is a two-step quorum protocol:
+
+1. the owner validates authz, root ownership, fences, preconditions, and storage
+   class;
+2. the owner builds a deterministic CoreMeta pending batch;
+3. each selected replica writes the pending batch into local RocksDB using a
+   `WriteBatch`, fsyncs according to profile, and returns a signed
+   `CoreMetaPrepareReceipt`;
+4. once prepare quorum is reached, the owner builds a
+   `CoreMetaCommitCertificate` over the signed prepare receipts;
+5. the owner sends the commit certificate back to the metadata replica set;
+6. quorum replicas persist a commit-evidence row containing the certificate and
+   return signed certificate-persisted receipts;
+7. only then may the owner publish the root generation referencing the CoreMeta
+   commit certificate hash.
+
+If two of three replicas persist the batch under `metadata-r3-q2` and the third
+fails, the write may commit after certificate persistence quorum and root
+publication. The stale replica catches up from logical CoreMeta history or
+snapshots and MUST NOT serve current reads for that root until it is caught up.
+If quorum is not reached, no valid commit certificate exists, no root publication
+occurs, the client receives failure/timeout, and pending rows/files are ignored
+then garbage-collected.
+
+### 8.7 Erasure-Coded Byte Replication
+
+Large payloads use the byte-plane protocol before their metadata becomes visible.
+The owner stages bytes, applies chunking/dedupe/compression/encryption according
+to policy, erasure-codes each encoded block, assigns shard placement, and sends
+shards to the selected nodes/cells.
+
+Shard nodes receive `ShardWrite` requests, validate placement and epoch, write
+and fsync shard bytes, record local shard metadata in RocksDB, and return signed
+`ShardReceipt` values. The owner waits for the storage-class-defined receipt
+threshold, builds a manifest containing the erasure profile, block ids, shard ids,
+shard hashes, placements, receipt hashes, compression/encryption settings,
+plaintext and encoded hashes, and repair obligation if committed below full `N`.
+That manifest locator/hash is then committed through CoreMeta. Root publication
+happens only after the CoreMeta commit certificate is durably replicated.
+
+The read reconstruction threshold is `K`. The write commit threshold is storage
+class controlled and may be stricter than `K`, for example `12-of-14` or
+`14-of-14` for an `ec-10-4` profile. A manifest committed below full `N` MUST
+record repair scheduling state and MUST expose repair lag metrics.
+
+### 8.8 Pending State Capacity and Backpressure
+
+Pending mutation state is bounded by RocksDB pending-row count, raw pending-row
+bytes, landed-byte bytes, materialisation lag, and transaction expiry lag.
 
 ```text
-AdmissionMirrorReceipt.signed_payload_hash =
-  Hash(anvil.admission.receipt.v1, canonical(fields 1..9 of AdmissionMirrorReceipt))
-
-LocalAdmissionReceipt.signed_payload_hash =
-  Hash(anvil.admission.receipt.v1, canonical(fields 1..7 of LocalAdmissionReceipt))
-
-LocalAdmissionAbortReceipt.signed_payload_hash =
-  Hash(anvil.admission.negative_receipt.v1, canonical(fields 1..4 of LocalAdmissionAbortReceipt))
-
-AdmissionCommitCertificate.signed_payload_hash =
-  Hash(anvil.admission.commit_certificate.v1, canonical(attempt_id,
-                   Hash(anvil.admission.receipt.v1, canonical(local_receipt fields 1..8)),
-                   sorted Hash(anvil.admission.receipt.v1, canonical(mirror_receipt fields 1..10)),
-                   committed_at_unix_nanos))
-```
-
-Signatures sign exactly the corresponding `signed_payload_hash`. Verifiers must
-recompute each signed payload hash before checking signatures. Nested receipt
-signatures remain embedded as evidence, but are not recursively included in the
-parent certificate hash except through their signed payload hashes.
-
-Mirror storage paths:
-
-```text
-admission/mirrors/<source-node-id>/<wal-epoch>/landed/<sha256>.landed
-admission/mirrors/<source-node-id>/<wal-epoch>/wal/<20-digit-sequence>.awf
-admission/mirrors/<source-node-id>/<wal-epoch>/receipts/<20-digit-sequence>.receipt
-```
-
-Canonical admission mirror wire protocol:
-
-Section 20.3 `AdmissionMirrorInternal` is the only normative wire protocol for
-mirroring. The `AdmissionMirrorReceipt`, `LocalAdmissionReceipt`,
-`AdmissionCommitCertificate`, `ReplayClaim`, and GC/abort records in this section
-are persisted evidence records. Landed byte descriptors, WAL frame bytes, chunk
-hashes, and descriptor hashes flow through the canonical `BeginMirror` ->
-`PutMirrorChunk` -> `CommitMirror` protocol; they are not additional RPCs and
-MUST NOT be implemented as a second distributed path.
-
-```text
-BeginMirror
-  creates admission/mirrors/<source>/<epoch>/attempts/<sequence>.state
-  stores attempt id, request hash, expected landed descriptors, expected WAL hash
-  state becomes begun
-
-PutMirrorChunk(kind=landed_byte)
-  writes chunk into attempts/<sequence>/chunks/<landing_id>/<offset>.chunk.tmp
-  verifies chunk hash and source signature
-  fsyncs chunk file and attempt directory according to mirror policy
-  state remains begun until every descriptor range is complete
-
-PutMirrorChunk(kind=wal_frame)
-  writes WAL frame bytes into attempts/<sequence>/wal-frame.tmp
-  verifies wal_frame_hash
-  fsyncs WAL frame temp file and attempt directory
-
-CommitMirror
-  assembles landed bytes, verifies length/hash/descriptors
-  renames complete landed bytes to landed/<sha256>.landed
-  renames WAL frame to wal/<20-digit-sequence>.awf
-  fsyncs all final files and parent directories
-  emits AdmissionMirrorReceipt under receipts/<20-digit-sequence>.receipt
-  state becomes committed
-
-AbortMirror
-  writes signed abort evidence and leaves chunks available for repair inspection
-  state becomes aborted
-```
-
-Allowed mirror states are:
-
-```text
-absent -> begun -> committed
-absent -> begun -> aborted
-begun  -> begun     # idempotent chunk retry
-committed -> committed # idempotent replay with identical hashes
-aborted -> aborted     # idempotent abort retry
-```
-
-All other transitions fail with `InvalidMirrorState`. A committed mirror attempt
-MUST contain exactly one WAL frame hash and all landed byte descriptors referenced
-by that frame. GC evidence is valid only after the committed/aborted state has
-been persisted and signed. Replay claims operate over the committed evidence
-records, not over transient chunk files.
-
-Mirror operations are idempotent. A duplicate chunk or WAL frame with the same
-hash returns the original receipt. A duplicate with different bytes fails with
-`IdempotencyConflict`. Mirrors fsync landed bytes, WAL frame files, and parent
-directories before issuing a receipt. Receipts are signed by the mirror node key
-and validated by the source before the write reaches `Committed`.
-
-Peer selection uses rendezvous hashing over
-`(attempt_id.mutation_id, attempt_id.root_key_hash, attempt_id.source_node_id,
-attempt_id.source_wal_epoch, attempt_id.admission_profile_epoch)` and the current
-healthy admission-mirror node set, excluding the source node. The selected peer
-set is stored in `AdmissionAttemptId.selected_mirror_node_ids` and signed in
-every receipt/certificate. Mirror GC may delete mirrored landed bytes and WAL frames only after
-observing either a finalised root generation covering the mutation or a signed GC
-certificate from the partition owner.
-
-Replay claim after source loss:
-
-```text
-1. mirror detects source unavailable or receives recovery assignment;
-2. mirror asks root partition owner for ReplayClaim with the full signed commit certificate;
-3. owner verifies local receipt, mirror receipts, selected peer set, and committed quorum;
-4. owner grants exactly one replay fence;
-5. claimant materialises and publishes through normal root CAS;
-6. other mirrors reject replay without the current replay fence.
-```
-
-Chunk ordering/idempotency:
-
-```text
-chunk key = (source_node_id, wal_epoch, wal_sequence, landing_id, chunk_ordinal)
-chunk_hash = Hash(anvil.admission.chunk.v1, canonical(landing_id, chunk_offset, chunk_len, final_chunk, chunk bytes))
-descriptor_hash = Hash(anvil.admission.descriptor.v1, canonical(landing_id, sha256, length, content_class))
-```
-
-A mirror accepts chunks in any order, writes each to a temporary chunk file, and
-assembles the landed byte only after all byte ranges from `0..length` are present,
-non-overlapping, and contiguous. Before issuing a receipt, the mirror recomputes
-the assembled byte hash and verifies it equals the descriptor `sha256`; it also
-verifies the descriptor hash and total length. Duplicate chunks with identical
-`chunk_hash` are accepted idempotently; duplicates with different bytes fail with
-`IdempotencyConflict`.
-
-Receipt hash input:
-
-```text
-receipt_hash = Hash(anvil.admission.receipt.v1, canonical(AdmissionMirrorReceipt without mirror_signature))
-local_receipt_hash = Hash(anvil.admission.receipt.v1, canonical(LocalAdmissionReceipt without source_signature))
-commit_certificate_hash = Hash(anvil.admission.commit_certificate.v1, canonical(AdmissionCommitCertificate without source_signature))
-```
-
-The source must persist the `AdmissionCommitCertificate` before returning
-`Committed` to the client. A replay claim must include that certificate with full
-embedded signed local and mirror receipts. The partition owner verifies the local
-receipt signature, every mirror receipt signature, the selected mirror peer set,
-the admission profile quorum rule, the request hash, the root key hash, and the
-mutation id before issuing a `ReplayClaim`. A replay claim without this full
-evidence is rejected with `ForbiddenByPolicy`.
-
-Replay and GC messages:
-
-```protobuf
-message ReplayClaimRequest {
-  AdmissionAttemptId attempt_id = 1;
-  AdmissionCommitCertificate commit_certificate = 2;
-  string claimant_node_id = 3;
-}
-
-message ReplayClaim {
-  AdmissionAttemptId attempt_id = 1;
-  string claimant_node_id = 2;
-  uint64 replay_fence = 3;
-  uint64 expires_at_unix_nanos = 4;
-  string commit_certificate_hash = 5;
-  bytes owner_signature = 6;
-}
-
-message AdmissionMirrorGcCertificate {
-  AdmissionAttemptId attempt_id = 1;
-  GcDecision decision = 2;
-  optional uint64 finalised_root_generation = 3;
-  optional string transaction_manifest_ref = 4;
-  optional AdmissionCommitCertificate commit_certificate = 5;
-  optional AdmissionAbortCertificate abort_certificate = 6;
-  bytes owner_signature = 7;
-}
-
-enum GcDecision {
-  GC_DECISION_UNSPECIFIED = 0;
-  FINALISED = 1;
-  ABORTED_BEFORE_COMMIT = 2;
-}
-
-message NegativeAdmissionReceipt {
-  AdmissionAttemptId attempt_id = 1;
-  string mirror_node_id = 2;
-  uint64 checked_after_unix_nanos = 3;
-  string reason = 4;              // no_wal_frame, no_landed_bytes, source_abort_seen
-  string signed_payload_hash = 5;
-  bytes mirror_signature = 6;
-}
-
-message AdmissionAbortCertificate {
-  AdmissionAttemptId attempt_id = 1;
-  optional LocalAdmissionAbortReceipt local_abort_receipt = 2;
-  repeated NegativeAdmissionReceipt negative_receipts = 3;
-  string reason = 4;
-  string signed_payload_hash = 5;
-  bytes partition_owner_signature = 6;
-}
-```
-
-Replay, GC, negative receipt, and abort signatures use these payload hashes:
-
-```text
-NegativeAdmissionReceipt.signed_payload_hash =
-  Hash(anvil.admission.negative_receipt.v1, canonical(fields 1..4 of NegativeAdmissionReceipt))
-
-AdmissionAbortCertificate.signed_payload_hash =
-  Hash(anvil.admission.abort_certificate.v1, canonical(attempt_id,
-                   optional Hash(anvil.admission.negative_receipt.v1, canonical(local_abort_receipt fields 1..5)),
-                   sorted Hash(anvil.admission.negative_receipt.v1, canonical(negative_receipt fields 1..5)),
-                   reason))
-
-ReplayClaim owner_signature payload =
-  Hash(anvil.admission.replay_claim.v1, canonical(attempt_id, claimant_node_id, replay_fence,
-                   expires_at_unix_nanos, commit_certificate_hash))
-
-AdmissionMirrorGcCertificate owner_signature payload =
-  Hash(anvil.admission.gc_certificate.v1, canonical(attempt_id, decision, finalised_root_generation,
-                   transaction_manifest_ref,
-                   optional commit_certificate_hash,
-                   optional abort_certificate_hash))
-```
-
-`abort_certificate_hash` is `Hash(anvil.admission.abort_certificate.v1, canonical(AdmissionAbortCertificate fields
-1..5))`. `commit_certificate_hash` is the value defined above. Owner signatures
-must be verified against these exact hashes.
-
-Mirrors store replay claims, commit certificates, abort certificates, and GC
-certificates under the mirror receipt path. A mirror may delete mirrored WAL or
-landed bytes only after:
-
-1. a valid GC certificate with `FINALISED` and the final transaction manifest; or
-2. a valid GC certificate with `ABORTED_BEFORE_COMMIT` and an
-   `AdmissionAbortCertificate` proving that no `AdmissionCommitCertificate` can
-   exist for the configured profile.
-
-Abort proof rule: for `regional-2-of-3`, an abort certificate requires a source
-local abort receipt created before client-visible commit plus negative receipts
-from both selected mirror peers, or equivalent evidence that fewer than the
-required mirror receipts could ever have existed. If the source node is lost
-before it emits either a commit certificate or a local abort receipt, the mutation
-is indeterminate and mirror artifacts must be retained for replay/repair; they
-must not be garbage-collected by timeout.
-
-A retention timeout alone is not sufficient to delete a mirrored mutation that
-may have contributed to a committed quorum.
-
-### 8.7 WAL Capacity and Backpressure
-
-
-The WAL is bounded by both bytes and materialisation lag.
-
-```text
-wal_soft_limit_bytes        default 8 GiB per node
-wal_hard_limit_bytes        default 12 GiB per node
-wal_soft_lag_seconds        default 60 s
-wal_hard_lag_seconds        default 300 s
-landed_bytes_soft_limit     default 2x wal_soft_limit_bytes
-landed_bytes_hard_limit     default 3x wal_soft_limit_bytes
+pending_mutation_soft_limit_rows      default 1,000,000 per node
+pending_mutation_hard_limit_rows      default 2,000,000 per node
+pending_coremeta_soft_limit_bytes     default 2 GiB per node
+pending_coremeta_hard_limit_bytes     default 4 GiB per node
+landed_bytes_soft_limit               default 16 GiB per node
+landed_bytes_hard_limit               default 24 GiB per node
+pending_lag_soft_seconds              default 60 s
+pending_lag_hard_seconds              default 300 s
 ```
 
 At the soft limit, admission must apply backpressure by delaying or shedding
 low-priority writes. At the hard limit, admission must reject new writes with
-`ResourceExhaustedWalBacklog` until materialisation catches up. It must not
-allow unbounded WAL or landed-byte growth.
+`ResourceExhaustedPendingBacklog` until materialisation catches up. It must not
+allow unbounded RocksDB pending rows or landed-byte growth.
 
-### 8.8 Idempotency Outcomes
+### 8.9 Idempotency Outcomes
 
 For a repeated idempotency key within the retention window:
 
@@ -881,120 +1157,81 @@ For a repeated idempotency key within the retention window:
 same request hash, state committed/finalised
   -> return the original successful response state.
 
-same request hash, state in progress
+same request hash, state staged/in progress
   -> return in-progress with retry-after or wait if the API mode requested wait.
 
 different request hash
   -> reject with IdempotencyConflict.
 
-original transaction failed before admission
+original transaction failed before staging
   -> allow retry as a new admission attempt.
 ```
 
-The idempotency table is CoreStore data materialised by the control writer; the
-hot in-memory copy is only a cache.
+The idempotency table is CoreMeta data. The hot in-memory copy is only a cache.
+## 9. Pending Mutation Records and RocksDB Recovery
 
-## 9. WAL Format
+Anvil does not define a custom metadata WAL. RocksDB's WAL, MANIFEST, SST, and
+recovery logic are the only local metadata recovery mechanism. Anvil defines the
+logical rows that must be present in RocksDB and the validation rules that run
+after RocksDB has recovered.
 
-The WAL is a sequence of length-delimited frames. The frame format is binary so
-recovery does not depend on line delimiters or partial JSON parsing.
+### 9.1 Pending Mutation Rows
 
-```text
-WAL file magic:  41 4e 57 41 4c 0a        # "ANWAL\n"
-WAL version:     u16 little-endian         # initial value 1
-File header:     WalFileHeader
-Frames:          WalFrame*
-File trailer:    optional WalFileTrailer when sealed
-```
+Pending mutation records are CoreMeta rows in `cf_transactions` and related
+writer column families. They are written by RocksDB `WriteBatch` and carry enough
+information to recover, complete, abort, or garbage-collect the mutation without
+reading any sidecar log.
 
-Frame layout:
+```protobuf
+message PendingBoundaryValue {
+  string dimension = 1;
+  string value_type = 2;
+  bytes encoded_value = 3;
+}
 
-```text
-WalFrame =
-  frame_magic        4 bytes     # "AWF1"
-  header_len         u32-le
-  payload_len        u64-le
-  header_json        header_len bytes, UTF-8 JSON
-  payload            payload_len bytes, usually empty or small
-  crc32c             u32-le over frame_magic..payload
-```
+message PendingLandedByte {
+  string sha256 = 1;
+  uint64 length = 2;
+  string landing_id = 3;
+}
 
-`payload_len` MUST be <= 64 KiB. Most records SHOULD have empty payload and put
-all structured data in `header_json`.
-
-Required `header_json` fields:
-
-```json
-{
-  "schema": "anvil.core.wal_record.v1",
-  "node_id": "node-a",
-  "wal_epoch": 12,
-  "sequence": 49152,
-  "mutation_id": "01J...",
-  "idempotency_key_hash": "sha256:...",
-  "anvil_storage_tenant_id": "ast_...",
-  "authz_scope": {"realm_id": "realm_...", "revision": "..."},
-  "operation_family": "object.put",
-  "writer_family": "object_blob",
-  "target": {"bucket": "documents", "key": "2026/report.pdf"},
-  "preconditions": [],
-  "boundary_values": [
-    {"dimension": "customer_tenant", "type": "uuid", "value": "..."}
-  ],
-  "landed_bytes": [
-    {"sha256": "sha256:...", "length": 104857600, "landing_id": "..."}
-  ],
-  "created_at_unix_nanos": 1783426157854397000
+message PendingMutationRow {
+  CoreMetaRowCommon common = 1;       // visibility_state = VISIBILITY_PENDING
+  string mutation_id = 2;
+  string idempotency_key_hash = 3;
+  string request_hash = 4;
+  string writer_family = 5;
+  string target_root_key_hash = 6;
+  repeated string precondition_hashes = 7;
+  repeated PendingBoundaryValue boundary_values = 8;
+  repeated PendingLandedByte landed_bytes = 9;
+  repeated CoreMetaLocator provisional_locators = 10;
+  uint64 expires_at_unix_nanos = 11;
 }
 ```
 
-Recovery MUST reject frames with invalid checksums, unknown required schema
-versions, missing landed byte files for unmaterialised mutations, or invalid
-boundary values.
+`PendingBoundaryValue` and `PendingLandedByte` are compact field schemas defined in this RFC. There is no Anvil WAL file. Implementations MAY rename the protobuf messages in code, but the wire fields and semantics are normative.
 
+### 9.2 RocksDB Recovery Algorithm
 
-### 9.1 WAL Header and Trailer
+After process restart, a node MUST:
 
-`WalFileHeader` layout:
+1. let RocksDB complete normal WAL/MANIFEST/SST recovery;
+2. scan `cf_transactions` for `VISIBILITY_PENDING` rows owned by the local node
+   or assigned to the node by current mesh ownership;
+3. validate every referenced landed byte by hash and length;
+4. validate every referenced provisional locator and shard receipt;
+5. finish materialisation when all evidence exists and the mutation remains
+   valid for the current root generation;
+6. mark the mutation rolled back or failed when deterministic validation proves
+   it cannot commit;
+7. leave indeterminate mutations pending until ownership/fence recovery decides
+   whether another node may complete them.
 
-```text
-WalFileHeader =
-  magic                 6 bytes      # "ANWAL\n"
-  version               u16-le       # 1
-  node_id_len           u16-le
-  node_id               node_id_len UTF-8 bytes
-  wal_epoch             u64-le
-  first_sequence        u64-le
-  created_at_unix_nanos u64-le
-  header_crc32c         u32-le over all previous header bytes
-```
+Recovery MUST NOT infer committed visibility from pending rows. A row becomes
+visible only through the CoreMeta commit-certificate and root-publication path.
 
-`WalFileTrailer` layout when sealed:
-
-```text
-WalFileTrailer =
-  magic                 8 bytes      # "ANWALT1\0"
-  last_sequence         u64-le
-  frame_count           u64-le
-  wal_payload_bytes     u64-le
-  sealed_at_unix_nanos  u64-le
-  file_crc32c           u32-le over file header and frames
-```
-
-A WAL file without a valid trailer is active or crashed-open. Recovery must scan
-frames until the first invalid or partial frame and truncate to the last valid
-frame after quarantine metadata is recorded.
-
-### 9.2 Canonical Record Encoding
-
-WAL `header_json` uses canonical JSON:
-
-- UTF-8 only;
-- object keys sorted bytewise;
-- no insignificant whitespace;
-- integers encoded as decimal strings when wider than signed 53-bit;
-- timestamps as unsigned nanoseconds since Unix epoch;
-- hashes as lowercase `algorithm:hex` strings.
+### 9.3 Canonical Identifiers
 
 IDs and hashes follow this grammar:
 
@@ -1014,7 +1251,8 @@ Validation failures use the common error envelope in section 20.1.
 
 ## 10. Landed Bytes
 
-Landed bytes are written before WAL admission for large payloads.
+Landed bytes are written before a pending mutation row can reference a large
+payload.
 
 ```text
 incoming payload stream
@@ -1022,56 +1260,56 @@ incoming payload stream
   -> rolling hash and length verification
   -> atomic rename to <hash>.landed
   -> write <hash>.meta with source request and boundary summary
-  -> WAL references landing id/hash/length
+  -> RocksDB pending mutation row references landing id/hash/length
 ```
 
 The `.meta` file is recovery metadata, not final object metadata. It MUST include
-only information needed to validate and clean landed bytes. The WAL remains the
-admission source.
+only information needed to validate and clean landed bytes. RocksDB pending
+mutation rows are the admission source.
 
 Garbage collection rules:
 
-- landed bytes with no WAL reference after the recovery safety window MAY be
-  deleted;
-- landed bytes whose WAL mutation is fully materialised MAY be deleted;
-- landed bytes whose hash or length does not match WAL MUST be quarantined and
-  reported.
+- landed bytes with no RocksDB pending or committed reference after the recovery
+  safety window MAY be deleted;
+- landed bytes whose mutation is fully materialised MAY be deleted;
+- landed bytes whose hash or length does not match the referencing CoreMeta row
+  MUST be quarantined and reported.
 
 ## 11. In-Memory State
 
-The in-memory active state is the hot view of admitted but not necessarily fully
-materialised data.
+The in-memory active state is a hot cache over RocksDB CoreMeta rows and selected
+committed root snapshots.
 
-It MUST include:
+It MUST include, when useful for latency:
 
-- latest admitted ref values;
+- current committed ref values;
 - stream heads and recent stream records;
 - recent object versions and delete markers;
 - landed-byte materialisation cursors;
 - recent boundary value maps;
 - pending index/authz/personaldb projection updates;
-- WAL checkpoint position.
+- explicit transaction status summaries.
 
-It MUST be rebuildable from WAL plus final manifests. It MUST NOT be the only
-copy of committed state.
+It MUST be rebuildable from RocksDB CoreMeta rows, root anchors, and committed
+manifests. It MUST NOT be the only copy of committed state.
 
 ## 12. Materialisation Engine
 
-The materialiser converts admitted mutations into final CoreStore structures.
+The materialiser converts RocksDB pending mutation rows into final CoreStore
+structures.
 
 ```text
-WAL cursor -> mutation planner -> writer invocation -> byte pipeline ->
-manifest publication -> checkpoint -> WAL truncation
+pending CoreMeta row -> mutation planner -> writer invocation -> byte pipeline ->
+manifest publication -> CoreMeta commit evidence -> root publication
 ```
 
-Materialisation MUST be idempotent. Replaying the same WAL mutation after a crash
-must produce the same final logical result or detect the existing result by
+Materialisation MUST be idempotent. Replaying the same pending mutation after a
+crash must produce the same final logical result or detect the existing result by
 mutation id/content hash.
 
 Materialisation MUST expose backpressure to admission. If final storage cannot
-keep up, admission must slow down or reject writes before WAL capacity is
-exhausted.
-
+keep up, admission must slow down or reject writes before pending CoreMeta or
+landed-byte capacity is exhausted.
 
 ## 13. CoreStore Root, Transactions, and Atomic Publication
 
@@ -1080,8 +1318,9 @@ root anchor is the only mutable CoreStore primitive. It is not a feature store;
 it is the CoreStore commit pointer used by all writer families.
 
 ```text
-logical files and manifests are immutable
-  -> transaction manifest references new immutable files
+logical files and large manifest bodies are immutable
+  -> CoreMeta transaction rows reference new immutable files
+  -> CoreMeta writer rows update compact refs/heads/locators atomically
   -> root anchor CAS publishes the transaction
   -> readers select a committed root generation
 ```
@@ -1104,10 +1343,11 @@ fields, and metrics. Implementations must not hash display/debug variants.
 
 Root anchor records are stored in the root-register shard protocol defined in
 sections 13.8-13.12. Root history, ownership, failover evidence, and mesh
-control rows are stored by the core/control writer family through the normal
-CoreStore block substrate. Implementations may keep a local root cache, but the
-durable root value must be recoverable from root-register shards plus committed
-CoreStore manifests and WAL replay.
+control rows are stored in CoreMeta RocksDB by the core/control writer family;
+large control snapshots or evidence bundles use CoreStore block locators.
+Implementations may keep a local root cache in `cf_root_cache`, but the durable
+root value must be recoverable from root-register shards plus committed CoreMeta
+rows, CoreStore manifests, RocksDB recovered pending rows, and CoreMeta catch-up.
 
 ### 13.2 Root Anchor Record Format
 
@@ -1117,12 +1357,12 @@ CoreRootAnchorRecord =
   version                u16-le        # initial value 1
   header_len             u32-le
   body_len               u64-le
-  header_cbor            header_len bytes, canonical CBOR map
-  body_cbor              body_len bytes, canonical CBOR map
-  crc32c                 u32-le over magic..body_cbor
+  header_proto            header_len bytes, deterministic protobuf message
+  body_proto              body_len bytes, deterministic protobuf message
+  crc32c                 u32-le over magic..body_proto
 ```
 
-Required `header_cbor` keys:
+Required `header_proto` fields:
 
 ```text
 schema                  = "anvil.core.root_anchor.v1"
@@ -1131,19 +1371,21 @@ root_generation         = u64
 previous_root_hash      = sha256 or null
 transaction_manifest    = ManifestLocator or null only for genesis generation 0
 checkpoint_manifest     = ManifestLocator or null only for genesis generation 0
+core_meta_commit_certificate_hash = Hash or null only for genesis generation 0
 publisher_node_id       = NodeId
 publisher_epoch         = u64
 partition_owner_fence   = u64
 created_at_unix_nanos   = u64
 ```
 
-Required `body_cbor` keys:
+Required `body_proto` fields:
 
 ```text
 root_state              = "committed"
 mutation_range          = { first: MutationId, last: MutationId }
 writer_families         = [WriterFamily]
 manifest_count          = u64
+core_meta_row_count      = u64
 final_block_count       = u64
 ```
 
@@ -1164,8 +1406,8 @@ TransactionManifest =
   version                u16-le
   header_len             u32-le
   body_len               u64-le
-  header_cbor            canonical CBOR
-  body_cbor              canonical CBOR
+  header_proto            deterministic protobuf
+  body_proto              deterministic protobuf
   crc32c                 u32-le
 ```
 
@@ -1212,27 +1454,39 @@ descriptors, placement epoch, and shard receipt summaries.
 A locator is valid only when:
 
 1. `manifest_ref.manifest_hash == manifest_hash`;
-2. block ranges cover `[0, manifest_length)` exactly with no gaps or overlap;
-3. every `BlockLocator` uses the same erasure profile rules as the logical file
-   manifest it locates;
-4. each block has enough valid shard receipts to satisfy the erasure profile;
-5. reading and decoding the blocks yields bytes whose hash equals
-   `manifest_hash`.
+2. `storage_kind` is `coremeta-inline` or `corestore-blocks`;
+3. for `corestore-blocks`, block ranges cover `[0, manifest_length)` exactly with
+   no gaps or overlap;
+4. for `corestore-blocks`, every `BlockLocator` uses the same erasure profile
+   rules as the logical file manifest it locates;
+5. for `corestore-blocks`, each block has enough valid shard receipts to satisfy
+   the erasure profile;
+6. for `coremeta-inline`, `core_meta_location` is present, `block_locators` is
+   empty, the target CoreMeta row is committed at the selected root snapshot, and
+   the envelope payload length is `manifest_length`;
+7. reading and decoding either the blocks or CoreMeta payload yields bytes whose
+   hash equals `manifest_hash`.
 
 Resolution is therefore deterministic and non-recursive:
 
 ```text
 resolve_manifest(locator):
-  validate locator shape and block range coverage
-  for each block locator in order:
-    choose shard receipts according to placement and failure-domain policy
-    fetch enough shards through the internal block service
-    verify shard hash, fsync sequence, placement epoch, and receipt signature
-    erasure-decode the requested range
-    verify decoded block_plain_hash
-  concatenate decoded block ranges
-  verify manifest_hash and manifest_length
-  parse manifest bytes according to manifest_encoding
+  validate locator shape and selected root snapshot visibility
+  if locator.storage_kind == coremeta-inline:
+    read the committed CoreMeta row named by core_meta_location
+    verify payload_hash, manifest_hash, and manifest_length
+    parse manifest bytes according to manifest_encoding
+  if locator.storage_kind == corestore-blocks:
+    validate block range coverage
+    for each block locator in order:
+      choose shard receipts according to placement and failure-domain policy
+      fetch enough shards through the internal block service
+      verify shard hash, fsync sequence, placement epoch, and receipt signature
+      erasure-decode the requested range
+      verify decoded block_plain_hash
+    concatenate decoded block ranges
+    verify manifest_hash and manifest_length
+    parse manifest bytes according to manifest_encoding
 ```
 
 The root-register record is the bootstrapping exception. It stores the current
@@ -1240,12 +1494,16 @@ The root-register record is the bootstrapping exception. It stores the current
 contains a `ManifestLocator` for the transaction manifest. The transaction
 manifest contains `ManifestLocator` values for writer logical manifests. Writer
 logical manifests contain range/block maps for feature data. No step requires a
-local JSON manifest directory, a database row, or a display-path lookup.
+local JSON manifest directory, a feature-specific sidecar index, or a display-path
+lookup. CoreMeta rows are the allowed database rows for locator, root, and
+manifest metadata.
 
-Caches MAY map `ManifestRef -> ManifestLocator` or `ManifestRef -> decoded
-manifest` for speed, but caches are Class C local operational state. Recovery
-must be able to rebuild them by reading root anchors and walking committed
-transaction manifests.
+CoreMeta MAY map `ManifestRef -> ManifestLocator` as Class A metadata when that
+mapping is part of the committed root or materialisation state. Decoded-manifest
+caches MAY map `ManifestRef -> decoded manifest` for speed, but decoded caches
+are Class C local operational state. Recovery must be able to rebuild decoded
+caches by reading root anchors, CoreMeta rows, and committed transaction
+manifests.
 
 ### 13.4 Publication Protocol
 
@@ -1253,25 +1511,53 @@ transaction manifests.
 sequenceDiagram
     participant Q as Materialiser
     participant B as Byte Pipeline
+    participant M as CoreMeta Replica Quorum
     participant R as Root Partition Owner
     participant A as Root Anchor Store
 
-    Q->>B: write logical files
+    Q->>B: write logical files and large manifest bodies
     B-->>Q: logical manifest refs + shard receipts
-    Q->>B: write transaction manifest
-    B-->>Q: transaction manifest ref
-    Q->>R: publish(root_key, expected_generation, tx_ref, fence)
-    R->>R: validate owner epoch/fence and serialize root key
-    R->>A: CAS root generation N -> N+1
+    Q->>M: replicate pending CoreMeta batch for tx N+1
+    M-->>Q: prepare receipt quorum
+    Q->>Q: build CoreMetaCommitCertificate from prepare receipts
+    Q->>M: persist commit certificate + committed rows
+    M-->>Q: certificate-persisted receipt quorum
+    Q->>R: prepare_publish(root_key, expected_generation, tx_ref, fence, commit_certificate)
+    R->>R: validate owner epoch/fence and reserve generation N+1
+    R-->>Q: prepared(root_generation=N+1)
+    Q->>R: commit_publish(root_key, generation=N+1, commit_certificate)
+    R->>A: CAS visible root generation N -> N+1
     A-->>R: committed root anchor record
     R-->>Q: committed(root_generation=N+1)
-    Q->>Q: checkpoint WAL mutation as finalised
+    Q->>Q: mark pending mutation finalised in RocksDB
 ```
 
 The CAS must be linearizable per `RootAnchorKey`. Two publishers racing on the
-same root key must produce exactly one winner. The loser must re-read the current
-root, re-plan against the new generation, and retry only if the operation remains
-valid and idempotency permits it.
+same root key must produce exactly one visible winner. The root partition owner
+may reserve generation `N+1` during `prepare_publish`, but it MUST NOT expose that
+generation to readers until the CoreMeta commit certificate has itself reached
+quorum persistence and the visible root CAS succeeds. Pending CoreMeta rows are
+invisible to normal readers.
+The loser must mark its pending CoreMeta rows aborted or delete them, release any
+reserved generation, re-read the current root, re-plan against the new generation,
+and retry only if the operation remains valid and idempotency permits it. A retry
+MUST reuse the same mutation id only when the transaction content is
+byte-identical.
+
+CoreMeta transaction rows are committed in two replicated steps. First, the
+materialiser writes a quorum batch whose rows carry `visibility_state=pending`,
+the expected root generation, the post-commit root generation, the transaction
+id, and every locator/hash referenced by the transaction. Quorum replicas return
+signed prepare receipts. Second, the materialiser aggregates those receipts into
+a `CoreMetaCommitCertificate`, sends that certificate and the committed row
+updates back to the metadata replica set, and waits for quorum
+certificate-persisted receipts. The visible root anchor MUST include the commit
+certificate hash and the root publication request MUST carry the
+certificate-persisted receipts. Readers at a root snapshot may only observe rows
+whose state is `committed`, whose committed root generation is less than or equal
+to the selected snapshot, and whose commit certificate hash matches the selected
+root anchor. Recovery may inspect pending rows for the local materialiser only to
+finish, abort, or replay the transaction.
 
 ### 13.5 Partition Ownership and Fencing
 
@@ -1308,15 +1594,26 @@ must not create an alternative system realm.
 Prepared logical files, no transaction manifest
   -> garbage collect after safety window unless referenced by a later tx.
 
+CoreMeta pending rows exist, root CAS absent
+  -> verify all referenced bytes and locators exist; retry publication if
+     preconditions still hold; otherwise mark the rows aborted and keep audit
+     evidence.
+
 Transaction manifest exists, root CAS absent
   -> if mutation not acknowledged as finalised, retry publication;
      if preconditions no longer hold, mark failed and keep audit record.
 
+Visible root committed, local CoreMeta rows missing or stale
+  -> read `core_meta_commit_certificate_hash` from the visible root, fetch missing
+     CoreMeta batch frames from quorum replicas with `CatchUpPartition`, verify
+     the certificate and batch hashes, then install the committed rows locally.
+
 Root CAS committed, acknowledgement lost
   -> idempotency lookup returns committed success.
 
-Root CAS committed, WAL checkpoint absent
-  -> rebuild checkpoint from root and transaction manifests, then truncate WAL.
+Root CAS committed, local finalisation marker absent
+  -> rebuild finalisation state from root, CoreMeta committed rows, and
+     transaction manifests, then mark the pending mutation finalised in RocksDB.
 ```
 
 
@@ -1350,13 +1647,13 @@ RootRegisterShard =
   shard_index           u16-le        # 0..2 for root-register-r3
   header_len            u32-le
   root_anchor_len       u64-le
-  header_cbor           canonical CBOR
+  header_proto           deterministic protobuf
   root_anchor_record    CoreRootAnchorRecord bytes
   crc32c                u32-le over magic..root_anchor_record
   sha256                32 bytes over all previous bytes
 ```
 
-The `header_cbor` includes:
+The `header_proto` includes these fields:
 
 ```text
 root_key_hash           Hash
@@ -1383,14 +1680,22 @@ For `RootAnchorKey K`, partition owner `O` publishes generation `N+1` as follows
 2. verify request.expected_generation == N
 3. verify request.previous_root_hash == H
 4. verify owner_epoch and partition_owner_fence are current
-5. build CoreRootAnchorRecord for N+1
-6. choose three register nodes using rendezvous(K, owner_epoch)
-7. compute register_cohort_hash from root_key_hash, N+1, and selected nodes
-8. write RootRegisterShard with create_new semantics to all three nodes
-9. require two matching durable shard receipts
-10. record committed generation N+1 in memory
-11. return root_generation N+1 and root_anchor_hash
+5. verify CoreMetaCommitCertificate for K, N+1, transaction_id
+6. verify certificate-persisted receipt quorum for that certificate hash
+7. reserve generation N+1 locally without exposing it to readers
+8. verify committed rows sign the same logical transaction and locators
+9. build CoreRootAnchorRecord for N+1 including core_meta_commit_certificate_hash
+10. choose three register nodes using rendezvous(K, owner_epoch)
+11. compute register_cohort_hash from root_key_hash, N+1, and selected nodes
+12. write RootRegisterShard with create_new semantics to all three nodes
+13. require two matching durable shard receipts
+14. record visible committed generation N+1 in memory
+15. return root_generation N+1 and root_anchor_hash
 ```
+
+Steps 5-8 are mandatory. A root generation without a matching
+`CoreMetaCommitCertificate` and quorum certificate-persisted receipts is not
+committed, even if root-register shards exist.
 
 If a `create_new` detects an existing different shard for the same generation,
 the owner reads all shards for that generation. If a majority exists, that
@@ -1409,13 +1714,16 @@ On restart with empty memory:
 4. group shards by root_key_hash and generation;
 5. choose highest generation with two matching valid shards;
 6. verify previous_root_hash chain back to the latest checkpoint or genesis;
-7. load transaction/checkpoint manifests referenced by the root;
-8. rebuild in-memory root cache and partition-owner fences.
+7. verify the root's `core_meta_commit_certificate_hash` unless generation is genesis;
+8. run `CatchUpPartition` until all committed CoreMeta rows through the selected
+   root generation are installed locally and their batch/certificate hashes verify;
+9. load transaction/checkpoint manifests referenced by the root;
+10. rebuild in-memory root cache and partition-owner fences.
 ```
 
-A node must not serve latest reads for a root key until step 6 succeeds. It may
-serve reads at an explicitly requested older verified generation if policy allows
-stale reads.
+A node must not serve latest reads for a root key until steps 6-8 succeed. It may
+serve reads at an explicitly requested older verified generation only after the
+CoreMeta rows for that older generation have also been caught up and verified.
 
 ### 13.11 Fence Issuance and Failover
 
@@ -1457,7 +1765,7 @@ mutation_range            = { first: "genesis", last: "genesis" }
 writer_families           = ["mesh_control", "authz", "core_control"]
 manifest_count            = 0
 final_block_count         = 0
-body_cbor.genesis_bundle  = canonical genesis bundle
+body_proto.genesis_bundle  = canonical genesis bundle
 ```
 
 The genesis bundle must also use `created_at_unix_nanos = 0`; runtime wall-clock
@@ -1487,7 +1795,7 @@ same canonical config. A different config cannot silently fork the system.
 
 Generation `0` of the system `core-control` root uses an embedded genesis bundle
 instead of normal `transaction_manifest` and `checkpoint_manifest` refs. This is
-the only allowed null-manifest root record. The `body_cbor` includes:
+the only allowed null-manifest root record. The `body_proto` includes:
 
 ```text
 genesis_bundle = {
@@ -1642,9 +1950,16 @@ ManifestLocator =
   manifest_encoding      ManifestEncoding
   manifest_length        u64
   manifest_hash          Hash
+  storage_kind           ManifestStorageKind
+  core_meta_location     optional<CoreMetaLocation>
   block_locators         [BlockLocator]
 
-ManifestEncoding = "deterministic-protobuf" | "canonical-cbor" | "writer-segment"
+ManifestEncoding = "deterministic-protobuf" | "writer-segment"
+ManifestStorageKind = "coremeta-inline" | "corestore-blocks"
+
+CoreMetaLocation =
+  column_family          CoreMetaColumnFamily
+  key                    CoreMetaKey
 
 BlockLocator =
   logical_start          u64
@@ -1696,6 +2011,19 @@ TraceContext =
   parent_span_id         optional<string>
   request_id             string
   sampled                bool
+
+CoreMetaRecord =
+  key                    CoreMetaKey
+  value                  CoreMetaValue
+  column_family          CoreMetaColumnFamily
+
+CoreMetaColumnFamily =
+  cf_meta_version | cf_root_cache | cf_transactions | cf_object_heads |
+  cf_object_versions | cf_inline_payloads | cf_stream_heads |
+  cf_stream_records | cf_index_defs | cf_index_rows | cf_boundary |
+  cf_authz | cf_personaldb | cf_registry | cf_mesh | cf_leases_fences |
+  cf_materialisation | cf_refcounts |
+  cf_observability
 ```
 
 ### 14.2 Writer Interface
@@ -1708,9 +2036,18 @@ pub trait CoreFormatWriter {
 
     fn plan(&self, input: WriterPlanInput) -> Result<WriterPlan>;
 
-    fn build(&self, input: WriterBuildInput) -> Result<Vec<LogicalFileWrite>>;
+    fn build(&self, input: WriterBuildInput) -> Result<WriterBuildOutput>;
 
     fn recover(&self, input: WriterRecoveryInput) -> Result<WriterRecoveryPlan>;
+}
+```
+
+`WriterBuildOutput` separates compact metadata from large bytes:
+
+```rust
+pub struct WriterBuildOutput {
+    pub logical_files: Vec<LogicalFileWrite>,
+    pub core_meta_mutations: Vec<CoreMetaMutation>,
 }
 ```
 
@@ -1748,11 +2085,30 @@ pub struct SharedRangeMarker {
     pub reason: String,
     pub boundary_dimension_ids: Vec<u32>,
 }
+
+pub struct CoreMetaMutation {
+    pub column_family: CoreMetaColumnFamily,
+    pub table_id: u16,
+    pub tuple_key: Vec<u8>,
+    pub payload: Vec<u8>,
+    pub visibility_state: CoreMetaVisibilityState,
+    pub root_key_hash: Hash,
+    pub post_root_generation: u64,
+    pub transaction_id: MutationId,
+}
+
+pub enum CoreMetaVisibilityState {
+    Pending,
+    Committed,
+    Aborted,
+}
 ```
 
 A writer MUST NOT write authoritative files directly to local disk. It may create
-temporary build files as Class C operational storage, but final writer output
-must enter the byte pipeline as a `LogicalFileWrite`.
+temporary build files as Class C operational storage. Large final writer output
+must enter the byte pipeline as a `LogicalFileWrite`. Compact final metadata must
+enter CoreMeta as `CoreMetaMutation` values and must obey the CoreMeta value
+limits.
 
 ## 15. Writer Families
 
@@ -1797,7 +2153,7 @@ indexes, and cursor-based reads.
 
 ```text
 stream family / partition
-  -> active segment descriptor in memory + WAL
+  -> active segment descriptor in memory + RocksDB stream head rows
   -> append records
   -> sparse sequence index
   -> sparse timestamp index
@@ -1812,7 +2168,7 @@ Required operations:
 - tail stream;
 - seal segment;
 - compact stream family where configured;
-- recover active head from WAL and sealed segment manifests.
+- recover active head from RocksDB stream head rows and sealed segment manifests.
 
 Segment binary layout:
 
@@ -1821,13 +2177,13 @@ StreamSegment =
   magic              8 bytes   # "ANSTRM\n\0"
   version            u16-le
   header_len         u32-le
-  header_json        header_len bytes
+  header_proto       header_len bytes, deterministic StreamSegmentHeader protobuf
   record_count       u64-le
   record_frame*      repeated
   index_len          u64-le
   index_bytes        StreamSparseIndex bytes
   trailer_len        u32-le
-  trailer_json       trailer_len bytes
+  trailer_proto      trailer_len bytes, deterministic StreamSegmentTrailer protobuf
   segment_sha256     32 bytes over all previous bytes
 ```
 
@@ -1839,9 +2195,43 @@ RecordFrame =
   timestamp_nanos    i64-le
   header_len         u32-le
   payload_len        u64-le
-  header_json        header_len bytes
+  header_proto       header_len bytes, deterministic StreamRecordHeader protobuf
   payload            payload_len bytes
   crc32c             u32-le
+```
+
+Stream structured headers and trailers are fixed deterministic protobuf:
+
+```protobuf
+message StreamSegmentHeader {
+  string schema = 1;                 // "anvil.stream.segment.v1"
+  string realm_id = 2;
+  string stream_id = 3;
+  string segment_id = 4;
+  uint64 first_sequence = 5;
+  uint64 writer_epoch = 6;
+  string writer_node_id = 7;
+  uint64 created_at_unix_nanos = 8;
+  string authz_scope_hash = 9;
+}
+
+message StreamRecordHeader {
+  string schema = 1;                 // "anvil.stream.record.v1"
+  string idempotency_key_hash = 2;
+  string payload_hash = 3;
+  string content_type = 4;
+  repeated PendingBoundaryValue boundary_values = 5;
+  repeated string index_hint_hashes = 6;
+}
+
+message StreamSegmentTrailer {
+  string schema = 1;                 // "anvil.stream.segment_trailer.v1"
+  uint64 last_sequence = 2;
+  uint64 record_count = 3;
+  string sparse_index_hash = 4;
+  uint64 sealed_at_unix_nanos = 5;
+  string segment_payload_hash = 6;
+}
 ```
 
 Sparse stream index layout:
@@ -2236,14 +2626,14 @@ WriterSegment =
   body_len              u64-le
   range_index_len       u64-le
   trailer_len           u32-le
-  header_cbor           canonical CBOR
+  header_proto           deterministic protobuf
   body_bytes            writer-specific bytes
   range_index_bytes     canonical binary range index
-  trailer_cbor          canonical CBOR
-  segment_hash          32 bytes blake3 over magic..trailer_cbor
+  trailer_proto          deterministic protobuf
+  segment_hash          32 bytes blake3 over magic..trailer_proto
 ```
 
-Common `header_cbor` fields:
+Common `header_proto` fields:
 
 ```text
 schema                  writer schema string
@@ -2474,7 +2864,7 @@ stores `manifest_ref_hash` and `range_id`; the segment header MUST contain a
 `manifest_locator_table` mapping each referenced manifest hash to a
 `ManifestLocator`. This avoids recursive sidecar indexes while keeping rows
 compact.
-The common `header_cbor` for any segment containing `ManifestRangeRef` rows MUST
+The common `header_proto` for any segment containing `ManifestRangeRef` rows MUST
 include:
 
 ```text
@@ -2562,7 +2952,7 @@ ObjectVersionBody =
   chunk_entry_count u64-le
   chunk_entry*      sorted by logical offset
   metadata_len      u32-le
-  metadata_cbor     canonical CBOR
+  metadata_proto     deterministic protobuf
   link_count        u32-le
   link_record*
 ```
@@ -3394,13 +3784,14 @@ Every final block has:
 - parity shard count;
 - read quorum;
 - write acknowledgement requirement;
+- optional full-repair requirement when write acknowledgement is below total shard count;
 - placement epoch;
 - shard refs.
 
 
 The initial production profiles are fixed:
 
-| Profile | Data shards | Parity shards | Logical block target | Max shard size | Read quorum | Write publish rule |
+| Profile | Data shards | Parity shards | Logical block target | Max shard size | Read quorum | Default write publish rule |
 |---|---:|---:|---:|---:|---:|---|
 | `ec-4-2` | 4 | 2 | 64 MiB | 16 MiB | 4 | all 6 durable receipts |
 | `ec-8-3` | 8 | 3 | 128 MiB | 16 MiB | 8 | all 11 durable receipts |
@@ -3419,10 +3810,13 @@ parity_shard_j = reed_solomon_encode(block_bytes)[k+j] for j in 0..m
 shard_id       = block_id || ":" || shard_index
 ```
 
-A final manifest may reference a block only after the write publish rule returns
-receipts for all required shards. Degraded publication is forbidden. Degraded
-reads are allowed after publication when at least `read_quorum` valid shards are
-available.
+A final manifest may reference a block only after the storage-class write publish
+rule returns receipts for the required shards. The default release profiles use
+all shard receipts before publication. Operators MAY define availability-oriented
+profiles whose write publish rule is stricter than read quorum but lower than
+the total shard count. Such profiles MUST record the missing shard repair
+obligation in the manifest and expose repair lag metrics. Degraded reads are
+allowed after publication when at least `read_quorum` valid shards are available.
 
 ### 16.6.1 Shard Receipt Format
 
@@ -3656,8 +4050,9 @@ logical file unless the requested range is the whole file.
 Every path that claims durability must name the fsync boundary.
 
 ```text
-WAL admission durability
-  fsync WAL file data and directory entry when a new WAL file is created.
+RocksDB metadata durability
+  write through RocksDB WriteBatch and configured WAL/fsync policy before a
+  metadata row is treated as durable.
 
 Landed byte durability
   fsync landed temp file before rename when policy requires crash-safe landing;
@@ -3863,7 +4258,7 @@ request metadata/body/path
   -> extract each declared dimension
   -> normalise by value type
   -> validate required dimensions
-  -> attach boundary vector to WAL record
+  -> attach boundary vector to the RocksDB pending mutation row
   -> expose vector to writer
   -> pass range-level vector to byte pipeline
 ```
@@ -4035,8 +4430,8 @@ compaction wants to merge old blocks
   -> compactor applies the same rules as materialisation and must preserve query-prune statistics
 ```
 
-Boundary violations are deterministic failures. Violations detected before WAL
-admission reject the request directly. Violations detected during materialisation
+Boundary violations are deterministic failures. Violations detected before
+RocksDB pending mutation admission reject the request directly. Violations detected during materialisation
 after client-visible `Committed` transition the mutation to `FinalisationFailed`;
 the mutation remains recoverable evidence for audit/idempotency, is never visible
 to readers, and returns the same failed state on idempotent retry.
@@ -4058,8 +4453,17 @@ A reader can reconstruct every byte of a logical file using only:
 RootAnchorRecord -> TransactionManifest -> ManifestLocator -> LogicalFileManifest -> BlockLocator -> ShardReceiptSummary
 ```
 
-No database row, sidecar file, display path, or feature-specific index may be
-required to resolve this chain.
+No sidecar file, display path, or feature-specific index may be required to
+resolve this chain. CoreMeta rows may hold any committed locator or manifest
+metadata named by the chain; no database other than CoreMeta may participate in
+resolution.
+
+When `storage_kind=corestore-blocks`, `block_locators` MUST be non-empty and must
+cover `[0, manifest_length)` exactly. When `storage_kind=coremeta-inline`,
+`core_meta_location` MUST point to a CoreMeta row whose payload bytes hash to
+`manifest_hash`, `block_locators` MUST be empty, and `manifest_length` MUST be
+within the CoreMeta value limit. Implementations MUST reject locators that mix
+inline CoreMeta storage with block locators.
 
 Canonical locator wire shapes:
 
@@ -4073,10 +4477,17 @@ message ManifestRef {
 
 message ManifestLocator {
   ManifestRef manifest_ref = 1;
-  string manifest_encoding = 2;      // deterministic-protobuf, canonical-cbor, writer-segment
+  string manifest_encoding = 2;      // deterministic-protobuf or writer-segment
   uint64 manifest_length = 3;
   string manifest_hash = 4;
-  repeated BlockLocator block_locators = 5; // sorted by logical_start
+  repeated BlockLocator block_locators = 5; // sorted by logical_start when storage_kind=corestore-blocks
+  string storage_kind = 6;           // coremeta-inline or corestore-blocks
+  optional CoreMetaLocation core_meta_location = 7;
+}
+
+message CoreMetaLocation {
+  string column_family = 1;
+  bytes core_meta_key = 2;           // full CoreMetaKey: version, table_id, partition_id, tuple key
 }
 
 message BlockLocator {
@@ -4096,6 +4507,7 @@ message BlockLocator {
   string erasure_profile_id = 14;
   uint64 placement_epoch = 15;
   repeated ShardReceiptSummary shard_receipts = 16;
+  RepairObligation repair_obligation = 17;
 }
 
 message ShardReceiptSummary {
@@ -4111,6 +4523,27 @@ message ShardReceiptSummary {
   string signature_algorithm = 10;
   bytes receipt_signature = 11;
 }
+
+enum RepairObligationStatus {
+  REPAIR_OBLIGATION_STATUS_UNSPECIFIED = 0;
+  NONE = 1;
+  REQUIRED = 2;
+  QUEUED = 3;
+  IN_PROGRESS = 4;
+  COMPLETE = 5;
+  FAILED = 6;
+}
+
+message RepairObligation {
+  RepairObligationStatus status = 1;
+  uint32 publish_receipt_threshold = 2;
+  uint32 total_shard_count = 3;
+  repeated uint32 missing_shard_indexes = 4;
+  bool full_repair_required = 5;
+  uint64 repair_deadline_unix_nanos = 6;
+  string repair_queue_id = 7;
+  string repair_policy_id = 8;
+}
 ```
 
 `codec_id`, `data_shards`, `parity_shards`, `plaintext_block_len`,
@@ -4118,6 +4551,13 @@ message ShardReceiptSummary {
 with inconsistent codec parameters is corrupt even if enough shard receipts are
 present. Compression and encryption descriptors are per block because compaction
 may rewrite different block ranges with different policies across generations.
+When a storage class allows publication below the total shard count, every
+affected `BlockLocator` MUST include `repair_obligation.status=REQUIRED` or
+`QUEUED`, `publish_receipt_threshold`, `total_shard_count`,
+`missing_shard_indexes`, `full_repair_required=true`, and a repair deadline. A
+block locator with fewer receipts than total shards and no repair obligation is
+corrupt. Default all-shard publication profiles set
+`repair_obligation.status=NONE`.
 
 Manifest hash rules:
 
@@ -4169,7 +4609,10 @@ for the bucket/realm.
 
 A logical file manifest describes writer output after the byte pipeline has
 chunked, transformed, erasure-coded, and placed it. The manifest itself is
-CoreStore data and must be stored through CoreStore.
+CoreStore data. A manifest whose encoded envelope fits within the CoreMeta value
+limit MAY be stored directly in CoreMeta. A larger manifest MUST be written
+through the byte pipeline, and CoreMeta MUST store only its locator, hash, length,
+generation, and query keys.
 
 ```protobuf
 message LogicalFileManifest {
@@ -4190,6 +4633,7 @@ message LogicalFileManifest {
   string codec_id = 15;
   uint32 data_shards = 16;
   uint32 parity_shards = 17;
+  repeated RepairObligation repair_obligations = 18;
 }
 
 message LogicalRange {
@@ -4226,6 +4670,7 @@ message BlockRef {
   uint64 shard_payload_len = 13;
   uint64 padding_len = 14;
   string block_encoded_hash = 15;
+  RepairObligation repair_obligation = 16;
 }
 
 message ShardRef {
@@ -4243,6 +4688,10 @@ The protobuf schema is the semantic contract. On disk, the manifest is stored in
 the common writer segment envelope with magic `ANLMAN1\0`; the protobuf message
 is encoded with deterministic protobuf serialization. Implementations must reject
 manifests whose deterministic re-encoding does not match the stored bytes.
+`LogicalFileManifest.repair_obligations` is the union of non-`NONE` block repair
+obligations in the manifest. It exists so repair scanners can discover required
+work without decoding every block locator. It MUST exactly match the
+`repair_obligation` values attached to `BlockLocator` and `BlockRef` entries.
 
 Manifest limits:
 
@@ -4267,10 +4716,10 @@ AnvilBlockShard =
   magic             8 bytes     # "ANBLK\n\0\0"
   version           u16-le      # initial value 1
   header_len        u32-le
-  header_cbor       header_len bytes, canonical CBOR
+  header_proto       header_len bytes, deterministic protobuf
   payload_len       u64-le
   payload           payload_len bytes
-  crc32c            u32-le over header_cbor + payload
+  crc32c            u32-le over header_proto + payload
   sha256            32 bytes over all previous bytes
 ```
 
@@ -4298,7 +4747,7 @@ created_by_mutation_id  = MutationId
 The shard header may contain a compact boundary summary hash. Full boundary
 metadata lives in logical manifests and range indexes.
 
-Shard validation must verify magic, version, CBOR canonical form, CRC32C,
+Shard validation must verify magic, version, deterministic protobuf re-encoding, CRC32C,
 SHA-256, shard hash in the receipt, erasure profile, and placement epoch before
 returning bytes to a decoder.
 
@@ -4318,6 +4767,13 @@ service ObjectService {
   rpc DeleteObject(DeleteObjectRequest) returns (WriteResponse);
   rpc PutLink(PutLinkRequest) returns (WriteResponse);
   rpc ResolveLink(ResolveLinkRequest) returns (ResolveLinkResponse);
+}
+
+service TransactionService {
+  rpc BeginTransaction(BeginTransactionRequest) returns (BeginTransactionResponse);
+  rpc CommitTransaction(CommitTransactionRequest) returns (WriteResponse);
+  rpc RollbackTransaction(RollbackTransactionRequest) returns (RollbackTransactionResponse);
+  rpc GetTransaction(GetTransactionRequest) returns (TransactionStatus);
 }
 
 service StreamService {
@@ -4379,6 +4835,57 @@ Required request and response shapes for this RFC. Implementations may add optio
 message ByteRange {
   uint64 start = 1;
   uint64 end_exclusive = 2;
+}
+
+message TransactionScope {
+  string root_anchor_key = 1;        // canonical RootAnchorKey
+  string root_key_hash = 2;          // Hash(anvil.root.key.v1, root_anchor_key)
+}
+
+message BeginTransactionRequest {
+  string idempotency_key = 1;
+  TransactionScope scope = 2;
+  repeated WritePrecondition preconditions = 4;
+  repeated BoundaryValue boundary_values = 5;
+  uint64 ttl_ms = 6;
+  string purpose = 7;
+}
+
+message BeginTransactionResponse {
+  string request_id = 1;
+  string transaction_id = 2;
+  uint64 expires_at_unix_nanos = 3;
+  string state = 4;                  // open
+}
+
+message CommitTransactionRequest {
+  string transaction_id = 1;
+  ConsistencyMode consistency = 2;
+  bool wait_for_finalization = 3;
+  repeated WritePrecondition final_preconditions = 4;
+}
+
+message RollbackTransactionRequest {
+  string transaction_id = 1;
+  string reason = 2;
+}
+
+message RollbackTransactionResponse {
+  string request_id = 1;
+  string transaction_id = 2;
+  string state = 3;                  // rolled_back
+}
+
+message GetTransactionRequest {
+  string transaction_id = 1;
+}
+
+message TransactionStatus {
+  string transaction_id = 1;
+  string state = 2;                  // open, committing, committed, rolled_back, expired, failed
+  string root_key_hash = 3;
+  optional uint64 committed_root_generation = 4;
+  optional AnvilError error = 5;
 }
 
 message PutObjectRequest {
@@ -4543,6 +5050,7 @@ S3 GET/HEAD object     -> GetObjectRequest / HeadObjectRequest
 Docker manifest PUT    -> registry writer via PutObjectRequest-equivalent registry call
 npm dist-tag update    -> registry writer tag/ref update with WriteOptions
 admin tuple grant      -> AuthzService.WriteTuples on reserved or user realm
+client transaction     -> TransactionService explicit begin/commit/rollback
 ```
 
 Gateways must not introduce their own persistence, idempotency, pagination, or
@@ -4558,6 +5066,7 @@ message WriteOptions {
   bool wait_for_finalization = 3;
   repeated WritePrecondition preconditions = 4;
   repeated BoundaryValue boundary_values = 5;
+  optional string transaction_id = 6;
 }
 
 message WritePrecondition {
@@ -4600,13 +5109,54 @@ enum WriteState {
   WRITE_STATE_COMMITTED = 1;
   WRITE_STATE_FINALISED = 2;
   WRITE_STATE_FINALISATION_FAILED = 3;
+  WRITE_STATE_STAGED = 4;
 }
 ```
 
-For `WRITE_STATE_COMMITTED`, `root_generation` and `transaction_manifest_ref` are
-empty unless the write finalised before the response was sent. For
-`WRITE_STATE_FINALISED`, both fields are required. For
-`WRITE_STATE_FINALISATION_FAILED`, both fields are empty and
+Transaction semantics:
+
+- A write whose `WriteOptions.transaction_id` is absent uses an implicit
+  transaction. The server begins, commits, and finalises according to
+  `WriteOptions.consistency` before returning the write response.
+- `BeginTransaction` creates an explicit transaction in the caller's authorised
+  single-root scope. It is visible to the caller through `GetTransaction`, but
+  none of its writes are visible to ordinary readers until `CommitTransaction`
+  succeeds.
+- Writes that carry `WriteOptions.transaction_id` are staged into that explicit
+  transaction and return `WRITE_STATE_STAGED`. They still pass authz, boundary,
+  quota, precondition, landed byte, and CoreMeta validation at admission time.
+  They do not advance a visible root generation and the write response must not
+  include `root_generation` or `transaction_manifest_ref`.
+- An explicit transaction is scoped to exactly one `RootAnchorKey`. A staged
+  write whose resolved target root differs from the transaction scope MUST fail
+  with `TransactionScopeMismatch`. This RFC intentionally does not define
+  cross-root ACID transactions.
+- `CommitTransaction` materialises the staged mutations and publishes exactly one
+  root generation for the transaction's root key. The commit uses the same
+  CoreMeta pending batch, CoreMeta commit-certificate persistence, and root
+  publication protocol as implicit writes. If publication fails before
+  visibility, no root generation becomes visible and the transaction remains open
+  or moves to `failed` with deterministic evidence.
+- `RollbackTransaction` aborts an open explicit transaction. It marks staged
+  CoreMeta rows aborted, releases landed byte references that are not reachable
+  from any committed root, and returns `rolled_back`. Rollback of a committed
+  transaction is forbidden; compensating application behaviour must be expressed
+  as a new transaction.
+- Expired transactions are rollback-only. The server may abort them during
+  recovery or maintenance, but it must preserve idempotency evidence for the
+  original begin/commit/rollback requests.
+- Explicit transactions are the public form of the same transaction machinery
+  used internally. They are required for higher-level workflows such as
+  sagas that need controlled visibility of multiple writes. Multi-root or
+  cross-region sagas are built from multiple single-root Anvil transactions plus
+  application-level compensation; Anvil does not claim atomic visibility across
+  multiple root keys in this RFC.
+
+For `WRITE_STATE_STAGED`, `root_generation` and `transaction_manifest_ref` are
+empty because the transaction is not visible yet. For `WRITE_STATE_COMMITTED`,
+`root_generation` and `transaction_manifest_ref` are empty unless the write
+finalised before the response was sent. For `WRITE_STATE_FINALISED`, both fields
+are required. For `WRITE_STATE_FINALISATION_FAILED`, both fields are empty and
 `finalisation_error` is required; it names the deterministic finalisation failure.
 
 All list/query requests include a consistency selector and page token:
@@ -4660,6 +5210,12 @@ BucketNotFound
 ObjectNotFound
 VersionNotFound
 PreconditionFailed
+TransactionNotFound
+TransactionClosed
+TransactionConflict
+TransactionExpired
+TransactionScopeMismatch
+TransactionTooLarge
 PartitionNotOwned
 StaleFenceToken
 ManifestInvalid
@@ -4692,10 +5248,9 @@ BoundarySchemaIncompatibleChange
 BoundaryMigrationRequired
 BoundaryMigrationInProgress
 BoundaryMigrationFailed
-ResourceExhaustedWalBacklog
+ResourceExhaustedPendingBacklog
 PageTokenScopeMismatch
 PageTokenGenerationExpired
-InvalidMirrorState
 BoundaryRequiredSingleValueViolation
 BoundaryBlockLimitUnsatisfied
 IndexGenerationMismatch
@@ -4718,10 +5273,6 @@ Anvil internal namespaces, including `_anvil/authz` and root-register internals.
 New RFC-specific error details:
 
 ```text
-InvalidMirrorState
-  retryable: false unless details.expected_state includes current state
-  details: mirror_id,current_state,attempt_id
-
 BoundaryRequiredSingleValueViolation
   retryable: false with same payload
   details: dimension_id,record_kind,range_id
@@ -4995,14 +5546,6 @@ MUST verify that identity against the system realm node/cell/partition relations
 from section 15.6.1 before accepting the request.
 
 ```protobuf
-service AdmissionMirrorInternal {
-  rpc BeginMirror(BeginMirrorRequest) returns (BeginMirrorResponse);
-  rpc PutMirrorChunk(PutMirrorChunkRequest) returns (MirrorChunkAck);
-  rpc CommitMirror(CommitMirrorRequest) returns (MirrorReceipt);
-  rpc AbortMirror(AbortMirrorRequest) returns (MirrorReceipt);
-  rpc GetMirrorEvidence(GetMirrorEvidenceRequest) returns (MirrorEvidence);
-}
-
 service BlockStoreInternal {
   rpc PutShard(PutShardRequest) returns (ShardReceipt);
   rpc GetShard(GetShardRequest) returns (stream ShardChunk);
@@ -5012,9 +5555,19 @@ service BlockStoreInternal {
 
 service RootRegisterInternal {
   rpc ReadRoot(ReadRootRequest) returns (RootAnchorRead);
+  rpc PrepareRoot(PrepareRootRequest) returns (RootPrepareReceipt);
   rpc CompareAndSwapRoot(CompareAndSwapRootRequest) returns (RootAnchorWrite);
   rpc VoteFailover(VoteFailoverRequest) returns (FailoverVoteReceipt);
   rpc ExchangeRootInventory(ExchangeRootInventoryRequest) returns (RootInventory);
+}
+
+service CoreMetaReplicationInternal {
+  rpc ReplicatePendingBatch(CoreMetaBatchRequest) returns (CoreMetaPrepareReceipt);
+  rpc PersistCommitCertificate(CoreMetaPersistCommitRequest) returns (CoreMetaCertificatePersistReceipt);
+  rpc AbortPendingBatch(CoreMetaAbortRequest) returns (CoreMetaPrepareReceipt);
+  rpc ReadRows(CoreMetaReadRowsRequest) returns (CoreMetaReadRowsResponse);
+  rpc CatchUpPartition(CoreMetaCatchUpRequest) returns (stream CoreMetaBatchFrame);
+  rpc ExchangeCoreMetaInventory(CoreMetaInventoryRequest) returns (CoreMetaInventory);
 }
 
 service AntiEntropyInternal {
@@ -5030,6 +5583,33 @@ service CrossRegionProxyInternal {
 }
 ```
 
+CoreMeta replication semantics:
+
+- The root partition owner chooses the CoreMeta replica set from the mesh
+  partition map for the target `RootAnchorKey` and membership epoch.
+- The initial CoreMeta quorum profile is `metadata-r3-q2`: three metadata
+  replicas selected by rendezvous hashing over `(root_key_hash,
+  membership_epoch)` with one replica per cell where at least three cells are
+  available, otherwise one replica per distinct node. A write is durable when at
+  least two of the three selected replicas return matching signed receipts for
+  both the pending batch and the commit-certificate persistence step. If fewer
+  than two replicas are available, the metadata partition is unavailable for
+  writes.
+- A pending CoreMeta batch is durable only after quorum replicas sign the same
+  `pending_batch_hash` for the same root key, expected generation, post
+  generation, and transaction id.
+- A `CoreMetaCommitCertificate` is not considered durable when it exists only on
+  the owner. The owner MUST send it back to the CoreMeta replica set and receive
+  quorum `CoreMetaCertificatePersistReceipt` values before root publication.
+- A root generation becomes visible only when the root anchor references a
+  durable CoreMeta commit certificate hash.
+- A node that misses CoreMeta batches catches up with `CatchUpPartition` from the
+  last committed root generation it has locally. Anti-entropy compares CoreMeta
+  inventory hashes per partition, column family, and generation range.
+- CoreMeta replication is metadata-only. Large payload bytes are replicated by
+  the erasure-coded block store. Inline payload rows are the bounded exception:
+  they are replicated as full CoreMeta rows under the inline size cap.
+
 Core internal messages:
 
 ```protobuf
@@ -5042,47 +5622,140 @@ message InternalRequestHeader {
   bytes signature = 6;              // over canonical request minus signature
 }
 
-enum MirrorChunkKind {
-  MIRROR_CHUNK_KIND_UNSPECIFIED = 0;
-  LANDED_BYTE = 1;
-  WAL_FRAME = 2;
+message CoreMetaRowMutation {
+  string column_family = 1;
+  bytes core_meta_key = 2;
+  bytes value_envelope = 3;
+  string row_hash = 4;
 }
 
-message BeginMirrorRequest {
+message CoreMetaBatchRequest {
   InternalRequestHeader header = 1;
-  AdmissionAttemptId attempt_id = 2;
-  string request_hash = 3;
-  repeated LandedByteDescriptor landed_bytes = 4;
-  string expected_wal_frame_hash = 5;
-  string admission_profile = 6;
+  string root_key_hash = 2;
+  uint64 expected_root_generation = 3;
+  uint64 post_root_generation = 4;
+  string transaction_id = 5;
+  string visibility_state = 6;       // pending
+  repeated CoreMetaRowMutation mutations = 7;
+  string pending_batch_hash = 8;
 }
-message BeginMirrorResponse { string mirror_id = 1; bool accepted = 2; optional AnvilError error = 3; }
-message PutMirrorChunkRequest {
-  InternalRequestHeader header = 1;
-  string mirror_id = 2;
-  MirrorChunkKind kind = 3;
-  string landing_id = 4;              // required for LANDED_BYTE
-  uint64 offset = 5;
-  bytes chunk = 6;
-  string chunk_hash = 7;
-  uint64 chunk_ordinal = 8;
-  bool final_chunk = 9;
-}
-message MirrorChunkAck { string mirror_id = 1; MirrorChunkKind kind = 2; string landing_id = 3; uint64 offset = 4; string chunk_hash = 5; uint64 fsync_sequence = 6; }
-message CommitMirrorRequest {
-  InternalRequestHeader header = 1;
-  string mirror_id = 2;
-  AdmissionAttemptId attempt_id = 3;
-  string wal_frame_hash = 4;
-  repeated string landed_byte_hashes = 5;
-  repeated string descriptor_hashes = 6;
-}
-message AbortMirrorRequest { InternalRequestHeader header = 1; string mirror_id = 2; AdmissionAttemptId attempt_id = 3; string reason = 4; }
-message MirrorReceipt { AdmissionMirrorReceipt receipt = 1; }
-message GetMirrorEvidenceRequest { InternalRequestHeader header = 1; AdmissionAttemptId attempt_id = 2; }
-message MirrorEvidence { repeated AdmissionMirrorReceipt receipts = 1; optional AdmissionCommitCertificate commit_certificate = 2; optional AdmissionAbortCertificate abort_certificate = 3; }
 
-message PutShardRequest { InternalRequestHeader header = 1; string block_id = 2; uint32 shard_index = 3; string erasure_profile_id = 4; uint64 placement_epoch = 5; bytes shard_bytes = 6; string shard_hash = 7; }
+message CoreMetaPrepareReceipt {
+  string replica_node_id = 1;
+  uint64 write_sequence = 2;
+  string pending_batch_hash = 3;
+  string root_key_hash = 4;
+  uint64 expected_root_generation = 5;
+  uint64 post_root_generation = 6;
+  string transaction_id = 7;
+  bytes signature = 8;
+}
+
+message CoreMetaCommitCertificate {
+  string root_key_hash = 1;
+  uint64 expected_root_generation = 2;
+  uint64 post_root_generation = 3;
+  string transaction_id = 4;
+  string pending_batch_hash = 5;
+  repeated CoreMetaPrepareReceipt prepare_receipts = 6;
+  string certificate_hash = 7;
+}
+
+message CoreMetaPersistCommitRequest {
+  InternalRequestHeader header = 1;
+  CoreMetaCommitCertificate commit_certificate = 2;
+  repeated CoreMetaRowMutation committed_rows = 3; // same logical rows with VISIBILITY_COMMITTED
+  string committed_batch_hash = 4;
+}
+
+message CoreMetaCertificatePersistReceipt {
+  string replica_node_id = 1;
+  uint64 write_sequence = 2;
+  string certificate_hash = 3;
+  string committed_batch_hash = 4;
+  string root_key_hash = 5;
+  uint64 post_root_generation = 6;
+  string transaction_id = 7;
+  bytes signature = 8;
+}
+
+message CoreMetaAbortRequest {
+  InternalRequestHeader header = 1;
+  string root_key_hash = 2;
+  uint64 post_root_generation = 3;
+  string transaction_id = 4;
+  string pending_batch_hash = 5;
+  string abort_reason = 6;
+}
+
+message CoreMetaReadRowsRequest {
+  InternalRequestHeader header = 1;
+  string root_key_hash = 2;
+  uint64 snapshot_root_generation = 3;
+  string column_family = 4;
+  bytes key_prefix = 5;
+  uint32 limit = 6;
+}
+
+message CoreMetaReadRowsResponse {
+  repeated CoreMetaRowMutation rows = 1;
+  optional string next_page_token = 2;
+}
+
+message CoreMetaCatchUpRequest {
+  InternalRequestHeader header = 1;
+  string root_key_hash = 2;
+  uint64 after_root_generation = 3;
+  uint64 through_root_generation = 4;
+}
+
+message CoreMetaBatchFrame {
+  uint64 root_generation = 1;
+  CoreMetaCommitCertificate commit_certificate = 2;
+  repeated CoreMetaCertificatePersistReceipt certificate_persist_receipts = 3;
+  repeated CoreMetaRowMutation committed_rows = 4;
+}
+
+message CoreMetaInventoryRequest {
+  InternalRequestHeader header = 1;
+  string root_key_hash = 2;
+  uint64 first_root_generation = 3;
+  uint64 last_root_generation = 4;
+}
+
+message CoreMetaInventory {
+  string root_key_hash = 1;
+  uint64 first_root_generation = 2;
+  uint64 last_root_generation = 3;
+  repeated string column_family_hashes = 4;
+}
+
+message PrepareRootRequest {
+  InternalRequestHeader header = 1;
+  string root_key_hash = 2;
+  uint64 expected_root_generation = 3;
+  uint64 post_root_generation = 4;
+  string transaction_id = 5;
+  CoreMetaCommitCertificate commit_certificate = 6;
+  repeated CoreMetaCertificatePersistReceipt certificate_persist_receipts = 7;
+}
+
+message RootPrepareReceipt {
+  string root_key_hash = 1;
+  uint64 reserved_root_generation = 2;
+  string transaction_id = 3;
+  bytes owner_signature = 4;
+}
+
+message PutShardRequest {
+  InternalRequestHeader header = 1;
+  string block_id = 2;
+  uint32 shard_index = 3;
+  string erasure_profile_id = 4;
+  uint64 placement_epoch = 5;
+  bytes shard_bytes = 6;
+  string shard_hash = 7;
+}
 message GetShardRequest { InternalRequestHeader header = 1; string block_id = 2; uint32 shard_index = 3; optional ByteRange range = 4; }
 message GetShardReceiptRequest { InternalRequestHeader header = 1; string block_id = 2; uint32 shard_index = 3; }
 message RepairShardRequest { InternalRequestHeader header = 1; string block_id = 2; uint32 shard_index = 3; string repair_evidence_hash = 4; bytes shard_bytes = 5; }
@@ -5091,7 +5764,7 @@ message ShardReceipt { string block_id = 1; string shard_id = 2; uint32 shard_in
 
 message ReadRootRequest { InternalRequestHeader header = 1; string root_key_hash = 2; ReadConsistency consistency = 3; }
 message RootAnchorRead { string root_key_hash = 1; uint64 generation = 2; bytes root_anchor_record = 3; string root_anchor_hash = 4; }
-message CompareAndSwapRootRequest { InternalRequestHeader header = 1; string root_key_hash = 2; uint64 expected_generation = 3; string expected_root_hash = 4; bytes new_root_anchor_record = 5; uint64 partition_owner_fence = 6; }
+message CompareAndSwapRootRequest { InternalRequestHeader header = 1; string root_key_hash = 2; uint64 expected_generation = 3; string expected_root_hash = 4; bytes new_root_anchor_record = 5; uint64 partition_owner_fence = 6; CoreMetaCommitCertificate core_meta_commit_certificate = 7; string core_meta_commit_certificate_hash = 8; repeated CoreMetaCertificatePersistReceipt certificate_persist_receipts = 9; }
 message RootAnchorWrite { bool committed = 1; RootAnchorRead current = 2; optional AnvilError error = 3; }
 message VoteFailoverRequest { InternalRequestHeader header = 1; string root_key_hash = 2; uint64 observed_generation = 3; string failed_owner_node_id = 4; string evidence_hash = 5; }
 message FailoverVoteReceipt { string root_key_hash = 1; bool granted = 2; string reason = 3; uint64 voter_epoch = 4; bytes signature = 5; }
@@ -5113,13 +5786,13 @@ message ProxyShardRangeRequest { InternalRequestHeader header = 1; string block_
 Retry and idempotency rules:
 
 ```text
-BeginMirror          idempotent by mutation_id + request_hash; mismatch rejects.
-PutMirrorChunk       idempotent by mirror_id + offset + chunk_hash; mismatch rejects.
-CommitMirror         idempotent by mirror_id + final_content_hash; mismatch rejects.
-PutShard             idempotent by block_id + shard_index + shard_hash; mismatch rejects.
-CompareAndSwapRoot   single-winner by root_key_hash + expected_generation.
-VoteFailover         one vote per voter/root/generation/evidence hash.
-ProxyNative          preserves original request id/idempotency key; proxy cannot rewrite principal.
+ReplicatePendingBatch        idempotent by transaction_id + pending_batch_hash; mismatch rejects.
+PersistCommitCertificate     idempotent by transaction_id + certificate_hash; mismatch rejects.
+AbortPendingBatch            idempotent by transaction_id + pending_batch_hash + abort_reason; mismatch rejects.
+PutShard                     idempotent by block_id + shard_index + shard_hash; mismatch rejects.
+CompareAndSwapRoot           single-winner by root_key_hash + expected_generation.
+VoteFailover                 one vote per voter/root/generation/evidence hash.
+ProxyNative                  preserves original request id/idempotency key; proxy cannot rewrite principal.
 ```
 
 Internal range reads use `ProxyShardRange` only when placement says the remote
@@ -5672,8 +6345,8 @@ Updates and deletes are immutable mutations plus reachability changes.
 
 ```text
 update/delete
-  -> WAL record
-  -> memory state update
+  -> RocksDB pending mutation row
+  -> memory cache update
   -> writer emits tombstone/replacement structures
   -> byte pipeline stores new immutable data
   -> manifest/ref update changes reachability
@@ -5695,23 +6368,25 @@ Recovery sequence:
 ```text
 node starts
   -> load durable final root/checkpoint refs
-  -> scan WAL from last checkpoint
+  -> let RocksDB recover WAL/MANIFEST/SST state
+  -> scan pending CoreMeta rows
   -> validate landed byte references
   -> rebuild in-memory active state
   -> resume unfinished materialisation
   -> verify final manifests/refs/checkpoints
-  -> truncate WAL prefixes proven durable
+  -> mark recovered mutations finalised/aborted and garbage collect obsolete
+     landed bytes
 ```
 
 Recovery must handle:
 
-- complete WAL record, missing final manifest: rematerialise;
-- complete WAL record, final manifest exists: mark complete and truncate when
-  safe;
-- WAL record references missing landed bytes: fail/quarantine unless final
-  manifest proves completion;
-- partial WAL frame: truncate to last valid frame;
-- landed bytes without WAL: garbage collect after safety window;
+- pending CoreMeta row, missing final manifest: rematerialise;
+- pending CoreMeta row, final manifest exists: mark complete when safe;
+- pending CoreMeta row references missing landed bytes: fail/quarantine unless
+  final manifest proves completion;
+- RocksDB recovery reports corruption: fail closed for affected partitions and
+  require repair/catch-up from CoreMeta replicas;
+- landed bytes without RocksDB reference: garbage collect after safety window;
 - final blocks without reachable manifests: repair or collect after safety
   window according to policy.
 
@@ -5731,11 +6406,11 @@ API entry
   -> admission validation
   -> boundary extraction
   -> landed byte writes
-  -> WAL append/fsync
-  -> memory state update
+  -> RocksDB WriteBatch/fsync
+  -> memory cache update
   -> materialisation queue
   -> writer planning/building
-  -> admission mirror write/fsync/quorum
+  -> CoreMeta replication/quorum
   -> byte pipeline stages
   -> shard write/fsync
   -> root-register CAS/quorum
@@ -5759,11 +6434,11 @@ anvil_request_duration_ms
 anvil_admission_duration_ms
   labels: operation_family, writer_family, bucket, boundary_schema_generation
 
-anvil_wal_append_duration_ms
-  labels: node_id, wal_epoch, fsync_mode, status
+anvil_rocksdb_write_batch_duration_ms
+  labels: node_id, column_family_group, fsync_mode, status
 
-anvil_wal_bytes_total
-  labels: node_id, wal_epoch
+anvil_rocksdb_pending_bytes
+  labels: node_id, root_kind
 
 anvil_landed_bytes_duration_ms
   labels: operation, content_class, status
@@ -5807,10 +6482,10 @@ anvil_compaction_duration_ms
 anvil_recovery_duration_ms
   labels: phase, status
 
-anvil_admission_mirror_duration_ms
-  labels: operation, source_node_id, mirror_node_id, status
+anvil_coremeta_replication_duration_ms
+  labels: operation, root_kind, profile, status
 
-anvil_admission_mirror_quorum_total
+anvil_coremeta_quorum_total
   labels: profile, outcome
 
 anvil_root_register_cas_duration_ms
@@ -5830,18 +6505,6 @@ anvil_repair_queue_depth
 
 anvil_repair_duration_ms
   labels: repair_kind, writer_family, status
-anvil_mirror_chunk_receive_duration_ms
-  labels: source_node_id, mirror_node_id, status
-
-anvil_mirror_chunk_assemble_duration_ms
-  labels: source_node_id, mirror_node_id, status
-
-anvil_mirror_gc_total
-  labels: decision, status
-
-anvil_replay_claim_total
-  labels: outcome, reason
-
 anvil_failover_vote_total
   labels: decision, reason
 
@@ -5870,7 +6533,7 @@ Greptime line protocol shape:
 
 ```text
 anvil_request_duration_ms,plane=public,method=PutObject,status=ok value=12.4,bytes=4096i,trace_sampled=true 1783426157854397000
-anvil_fsync_duration_ms,component=wal,file_class=wal,operation=append value=1.8 1783426157854398000
+anvil_fsync_duration_ms,component=rocksdb,file_class=metadata,operation=write_batch value=1.8 1783426157854398000
 anvil_byte_pipeline_stage_duration_ms,stage=erasure,writer_family=object_blob,erasure_profile=ec-4-2 value=3.1,bytes_in=67108864i,bytes_out=100663296i 1783426157854399000
 ```
 
@@ -5897,10 +6560,10 @@ Required dashboards:
 
 ```text
 Anvil Performance Overview
-  request latency, error rate, throughput, WAL lag, materialisation lag
+  request latency, error rate, throughput, pending-mutation lag, materialisation lag
 
 Request To Disk
-  per request sampled path from API entry to WAL fsync and block fsync
+  per request sampled path from API entry to RocksDB fsync and block fsync
 
 CoreStore Byte Pipeline
   chunking, dedupe, compression, encryption, erasure coding, placement costs
@@ -5908,8 +6571,8 @@ CoreStore Byte Pipeline
 Index And Query
   query latency, boundary pruning, authz pruning, range reads, result counts
 
-WAL And Recovery
-  WAL size, truncation lag, replay duration, landed byte backlog
+RocksDB Pending State And Recovery
+  pending-row bytes, pending-row count, recovery duration, landed byte backlog
 
 Compaction And Repair
   compaction backlog, bytes rewritten, tombstone debt, repair queue
@@ -5940,7 +6603,7 @@ target/anvil/perf/<run-id>/slow-spans.json
 - per-scenario p50/p90/p95/p99;
 - throughput;
 - bytes written/read;
-- WAL bytes;
+- RocksDB pending bytes;
 - final CoreStore bytes;
 - dedupe ratio;
 - compression ratio;
@@ -5986,20 +6649,14 @@ admission.validate
 admission.boundary_extract
 admission.landed_write
 admission.landed_fsync
-admission.wal_append
-admission.wal_fsync
-admission.mirror_landed_send
-admission.mirror_wal_send
-admission.mirror_quorum_wait
-mirror.chunk_receive
-mirror.chunk_assemble
-mirror.chunk_fsync
-mirror.gc_certificate_validate
-mirror.gc_delete
+admission.rocksdb_write_batch
+admission.rocksdb_fsync
+coremeta.replicate_pending
+coremeta.persist_commit_certificate
+coremeta.quorum_wait
 failover.vote_grant
 failover.vote_reject
 failover.in_doubt
-admission.replay_claim
 materialiser.plan
 writer.build
 byte_pipeline.chunk
@@ -6028,7 +6685,7 @@ response.stream
 ```
 
 Release gates must assert that the relevant operation names appear for scenarios
-that exercise admission mirroring, root CAS, owner failover, degraded reads,
+that exercise CoreMeta replication, root CAS, owner failover, degraded reads,
 repair, and query pruning.
 
 ### 25.6 Dashboard Contract
@@ -6041,11 +6698,11 @@ Anvil Performance Overview
   P50/P95/P99 request latency by plane and method
   request throughput and error rate
   admitted writes vs materialised writes
-  WAL bytes, truncation lag, and landed-byte backlog
+  pending CoreMeta bytes, pending row count, and landed-byte backlog
 
 Request To Disk
   sampled request waterfall by trace id
-  WAL append duration and WAL fsync duration
+  RocksDB WriteBatch duration and RocksDB fsync duration
   landed byte write duration
   final shard write duration and shard fsync duration
   manifest publish duration
@@ -6070,11 +6727,9 @@ Compaction And Repair
   repair queue depth
   repair success/failure count
 
-Admission And Root Protocols
-  admission mirror latency and quorum outcomes
-  mirror chunk receive/assemble/fsync latency
-  replay claim grants, rejects, and single-fence conflicts
-  mirror GC certificate validation and delete counts
+CoreMeta And Root Protocols
+  CoreMeta replication latency and quorum outcomes
+  commit-certificate persistence latency and failures
   root-register CAS latency and conflict rate
   failover vote grants/rejects/in-doubt counts
   root generation in-doubt count
@@ -6093,16 +6748,16 @@ The implementation must include these named tests or release-gate steps:
 
 ```text
 corestore_no_final_sidecar_files
-corestore_wal_records_never_inline_large_payloads
+corestore_no_custom_metadata_wal
+corestore_rocksdb_values_never_inline_large_payloads
+corestore_inline_payload_size_cap_enforced_before_compression
 corestore_landed_bytes_recover_after_crash
-corestore_admission_mirror_committed_replay
-corestore_mirror_descriptor_hash_mismatch_rejected
-corestore_mirror_final_content_hash_mismatch_rejected
-corestore_replay_evidence_reconstructed_from_signed_receipts
-corestore_gc_evidence_reconstructed_from_signed_receipts
-corestore_admission_gc_finalised_certificate
-corestore_admission_gc_abort_certificate
-corestore_replay_claim_single_fence_conflict
+corestore_coremeta_prepare_quorum_required
+corestore_coremeta_commit_certificate_persisted_before_root
+corestore_coremeta_missing_replica_catches_up_before_serving_current_reads
+corestore_transaction_scope_mismatch_rejected
+corestore_transaction_rollback_hides_staged_rows
+corestore_transaction_expiry_aborts_staged_rows
 corestore_root_anchor_cas_single_winner
 corestore_stale_partition_fence_rejected
 corestore_core_control_owner_loss_failover
@@ -6440,7 +7095,7 @@ was skipped.
 
 ### 26.4 Regression Policy
 
-A PR touching CoreStore, writers, WAL, byte pipeline, indexes, authz, or query
+A PR touching CoreStore, writers, RocksDB metadata, byte pipeline, indexes, authz, or query
 planning must run the relevant focused performance suite. A release must run the
 full baseline. Any regression over 10% in p95 or throughput requires either a fix
 or an explicit written exception.
@@ -6452,10 +7107,10 @@ architecture.
 
 Allowed temporary state:
 
-- WAL and landed byte files;
+- RocksDB pending CoreMeta rows and landed byte files;
 - local caches;
 - feature writer build scratch;
-- in-memory indexes rebuilt from WAL/final manifests.
+- in-memory indexes rebuilt from CoreMeta rows and final manifests.
 
 Forbidden temporary shortcuts:
 
@@ -6463,29 +7118,51 @@ Forbidden temporary shortcuts:
 - final streams as JSONL sidecar files;
 - final transactions as JSON sidecar files;
 - feature-specific durable directories with their own replication;
-- query indexes stored outside CoreStore final manifests/blocks;
+- query indexes stored outside CoreMeta or CoreStore final manifests/blocks;
 - authz tuple stores outside CoreStore;
 - hidden compatibility paths that bypass the byte pipeline.
 
 ## 28. Acceptance Criteria
 
+### 28.0 RocksDB Metadata Plane Acceptance
+
+- `corestore/meta/rocksdb/` is the only persistent metadata database.
+- No feature owns a sidecar JSON, JSONL, sled, redb, sqlite, or custom metadata
+  store outside CoreMeta.
+- CoreMeta column families match section 7.1 or the RFC has been updated before
+  implementation.
+- CoreMeta values reject payloads larger than 64 KiB.
+- Stream record and high-cardinality index rows reject payloads larger than
+  16 KiB.
+- Object payloads, stream payloads, index segment bytes, registry blobs,
+  PersonalDB snapshots, and other large bytes never enter RocksDB values.
+- Tests prove large stream records and object payloads are represented in
+  RocksDB only by hash, length, locator, generation, and small query keys.
+- Tests prove CoreMeta write ordering never exposes metadata pointing to missing
+  landed bytes or block shards.
+
 The RFC is implemented only when all criteria are met.
 
 ### 28.1 Storage Unification
 
-- All final durable feature state is stored through the unified byte pipeline.
-- No final durable sidecar JSON/control files exist outside CoreStore blocks.
+- All final durable compact metadata is stored in CoreMeta RocksDB.
+- All final durable large bytes are stored through the unified byte pipeline.
+- No final durable sidecar JSON/control files exist outside CoreMeta or
+  CoreStore blocks.
 - Tests scan the data directory and fail on forbidden final file families.
-- Temporary/WAL/cache paths are documented and classified.
+- Temporary/cache paths are documented and classified.
 
-### 28.2 WAL and Recovery
+### 28.2 RocksDB Pending State and Recovery
 
-- WAL records are bounded and do not inline large payloads.
+- No Anvil-defined custom metadata WAL exists.
+- RocksDB pending rows are bounded and do not inline large payloads.
 - Large bytes land separately and are referenced by hash/length.
-- Recovery can replay WAL and complete materialisation.
-- WAL truncates after final storage checkpoints.
-- Backpressure triggers before WAL capacity is exhausted.
-- Public writes return `Committed` only after the production admission profile is
+- Recovery can scan pending CoreMeta rows and complete materialisation.
+- RocksDB recovered state is sufficient to decide finalise/abort/quarantine.
+- Backpressure triggers before pending CoreMeta or landed-byte capacity is
+  exhausted.
+- Public writes return `Committed` only after byte-plane receipt thresholds,
+  CoreMeta quorum, commit-certificate persistence, and root publication are
   satisfied.
 - `wait_for_finalization=true` proves the write reached final CoreStore blocks
   and a committed root anchor generation.
@@ -6519,8 +7196,8 @@ The RFC is implemented only when all criteria are met.
 
 - API supports boundary schema creation/update/read.
 - Writes validate required boundaries.
-- Boundary values appear in WAL, writer ranges, logical manifests, and query
-  planning.
+- Boundary values appear in RocksDB pending rows, writer ranges, logical
+  manifests, and query planning.
 - Boundary metadata supports application tenant boundaries inside one Anvil
   bucket.
 - Boundary metadata is never accepted as an authorisation grant.
@@ -6536,8 +7213,8 @@ The RFC is implemented only when all criteria are met.
 
 - Metrics and traces cover request-to-fsync paths.
 - Greptime/Grafana local perf stack is documented and checked into the repo.
-- Dashboards show WAL, byte pipeline, CoreStore, query, compaction, and recovery
-  metrics.
+- Dashboards show RocksDB pending state, byte pipeline, CoreStore, query,
+  compaction, and recovery metrics.
 - CI emits performance summary artifacts.
 - Required metric series and trace events are validated by automated tests.
 - Grafana dashboard provisioning is tested from a clean Docker Compose stack.
@@ -6561,7 +7238,7 @@ Before writing code for a CoreStore feature, answer these questions in the PR:
 4. Which boundary dimensions affect layout/query planning?
 5. Which byte pipeline stages apply?
 6. What is the read path and which ranges does it fetch?
-7. What WAL records are needed for recovery?
+7. What CoreMeta pending rows are needed for recovery?
 8. What metrics and spans prove request-to-fsync behaviour?
 9. Which performance baseline scenario covers it?
 10. Which tests prove no sidecar durable storage was introduced?
