@@ -1,0 +1,490 @@
+use super::*;
+
+impl Persistence {
+    pub async fn create_multipart_upload(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        key: &str,
+    ) -> Result<MultipartUploadMutation> {
+        let permit = self
+            .multipart_metadata_write_permit(tenant_id, bucket_id)
+            .await?;
+        multipart_journal::create_multipart_upload_with_permit(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            key,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub async fn get_active_multipart_upload(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        key: &str,
+        upload_id: uuid::Uuid,
+    ) -> Result<Option<MultipartUpload>> {
+        multipart_journal::get_active_multipart_upload(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            key,
+            upload_id,
+        )
+        .await
+    }
+
+    pub async fn upsert_multipart_part(
+        &self,
+        upload_row_id: i64,
+        part_number: i32,
+        object_ref: CoreObjectRef,
+        size: i64,
+        etag: &str,
+    ) -> Result<MultipartUploadPartMutation> {
+        let (tenant_id, bucket_id) =
+            multipart_journal::find_multipart_upload_partition(&self.storage, upload_row_id)
+                .await?
+                .ok_or_else(|| anyhow!("multipart upload not found"))?;
+        let permit = self
+            .multipart_metadata_write_permit(tenant_id, bucket_id)
+            .await?;
+        multipart_journal::upsert_multipart_part_with_permit(
+            &self.storage,
+            upload_row_id,
+            part_number,
+            object_ref,
+            size,
+            etag,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub async fn list_multipart_parts(
+        &self,
+        upload_row_id: i64,
+    ) -> Result<Vec<MultipartUploadPart>> {
+        multipart_journal::list_multipart_parts(&self.storage, upload_row_id).await
+    }
+
+    pub async fn list_multipart_parts_page(
+        &self,
+        upload_row_id: i64,
+        part_number_marker: i32,
+        limit: i32,
+    ) -> Result<MultipartPartsPage> {
+        multipart_journal::list_multipart_parts_page(
+            &self.storage,
+            upload_row_id,
+            part_number_marker,
+            limit,
+        )
+        .await
+    }
+
+    pub async fn list_active_multipart_uploads(
+        &self,
+        bucket_id: i64,
+        prefix: &str,
+        key_marker: &str,
+        upload_id_marker: Option<uuid::Uuid>,
+        limit: i32,
+    ) -> Result<MultipartUploadsPage> {
+        multipart_journal::list_active_multipart_uploads(
+            &self.storage,
+            bucket_id,
+            prefix,
+            key_marker,
+            upload_id_marker,
+            limit,
+        )
+        .await
+    }
+
+    pub async fn complete_multipart_upload(
+        &self,
+        upload_row_id: i64,
+    ) -> Result<MultipartCompletionMutation> {
+        let Some((tenant_id, bucket_id)) =
+            multipart_journal::find_multipart_upload_partition(&self.storage, upload_row_id)
+                .await?
+        else {
+            return Ok(MultipartCompletionMutation {
+                completed: false,
+                receipt: None,
+            });
+        };
+        let permit = self
+            .multipart_metadata_write_permit(tenant_id, bucket_id)
+            .await?;
+        multipart_journal::complete_multipart_upload_with_permit(
+            &self.storage,
+            upload_row_id,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub async fn abort_multipart_upload(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        key: &str,
+        upload_id: uuid::Uuid,
+    ) -> Result<MultipartAbortMutation> {
+        let permit = self
+            .multipart_metadata_write_permit(tenant_id, bucket_id)
+            .await?;
+        multipart_journal::abort_multipart_upload_with_permit(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            key,
+            upload_id,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub async fn create_object_watch_event(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        bucket_name: &str,
+        object: &Object,
+        event_type: &str,
+        is_delete_marker: bool,
+    ) -> Result<ObjectWatchEvent> {
+        let id = self
+            .latest_object_watch_cursor(tenant_id, bucket_id)
+            .await?
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("object watch cursor overflow"))?;
+        Ok(ObjectWatchEvent {
+            id,
+            tenant_id,
+            bucket_id,
+            bucket_name: bucket_name.to_string(),
+            key: object.key.clone(),
+            event_type: event_type.to_string(),
+            version_id: Some(object.version_id),
+            mutation_id: object.mutation_id,
+            payload_hash: object.content_hash.clone(),
+            etag: Some(object.etag.clone()),
+            size: object.size,
+            is_delete_marker,
+            created_at: Utc::now(),
+        })
+    }
+
+    pub async fn latest_object_watch_cursor(&self, tenant_id: i64, bucket_id: i64) -> Result<i64> {
+        Ok(
+            watch_log::list_object_watch_events(&self.storage, tenant_id, bucket_id, "", 0, 0)
+                .await?
+                .into_iter()
+                .map(|event| event.id)
+                .max()
+                .unwrap_or(0),
+        )
+    }
+
+    pub async fn list_object_watch_events(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        prefix: &str,
+        after_cursor: i64,
+        limit: i32,
+    ) -> Result<Vec<ObjectWatchEvent>> {
+        watch_log::list_object_watch_events(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            prefix,
+            after_cursor,
+            if limit == 0 {
+                1000
+            } else {
+                limit.max(1) as usize
+            },
+        )
+        .await
+    }
+
+    pub async fn create_append_stream(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        bucket_name: &str,
+        stream_key: &str,
+    ) -> Result<AppendStreamMutation> {
+        let permit = self
+            .append_metadata_write_permit(tenant_id, bucket_id)
+            .await?;
+        append_journal::create_append_stream_with_permit(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            bucket_name,
+            stream_key,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub async fn get_active_append_stream(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        stream_key: &str,
+        stream_id: uuid::Uuid,
+    ) -> Result<Option<AppendStream>> {
+        append_journal::get_active_append_stream(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            stream_key,
+            stream_id,
+        )
+        .await
+    }
+
+    pub async fn append_stream_record(
+        &self,
+        stream_row_id: i64,
+        payload_object_ref: CoreObjectRef,
+        payload_size: i64,
+        content_type: Option<String>,
+        user_meta: Option<JsonValue>,
+    ) -> Result<AppendStreamRecordMutation> {
+        let (tenant_id, bucket_id) =
+            append_journal::find_append_stream_partition(&self.storage, stream_row_id)
+                .await?
+                .ok_or_else(|| anyhow!("append stream not found"))?;
+        let permit = self
+            .append_metadata_write_permit(tenant_id, bucket_id)
+            .await?;
+        append_journal::append_stream_record_with_permit(
+            &self.storage,
+            stream_row_id,
+            payload_object_ref,
+            payload_size,
+            content_type,
+            user_meta,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub async fn list_append_stream_records(
+        &self,
+        stream_row_id: i64,
+    ) -> Result<Vec<AppendStreamRecord>> {
+        append_journal::list_append_stream_records(&self.storage, stream_row_id).await
+    }
+
+    pub async fn list_append_stream_records_for_bucket(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+    ) -> Result<Vec<(AppendStream, AppendStreamRecord)>> {
+        append_journal::list_append_stream_records_for_bucket(&self.storage, tenant_id, bucket_id)
+            .await
+    }
+
+    pub async fn seal_append_stream(
+        &self,
+        stream_row_id: i64,
+        segment_hash: &str,
+    ) -> Result<SealAppendStreamMutation> {
+        let Some((tenant_id, bucket_id)) =
+            append_journal::find_append_stream_partition(&self.storage, stream_row_id).await?
+        else {
+            return Ok(SealAppendStreamMutation {
+                sealed: false,
+                receipt: None,
+            });
+        };
+        let permit = self
+            .append_metadata_write_permit(tenant_id, bucket_id)
+            .await?;
+        append_journal::seal_append_stream_with_permit(
+            &self.storage,
+            stream_row_id,
+            segment_hash,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub async fn compare_and_swap_manifest(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        _bucket_name: &str,
+        object_key: &str,
+        expected_revision: i64,
+        manifest: JsonValue,
+        manifest_hash: &str,
+    ) -> Result<Option<ManifestCasResult>> {
+        let permit = self.manifest_cas_write_permit(tenant_id, bucket_id).await?;
+        manifest_journal::compare_and_swap_manifest_with_permit(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            object_key,
+            expected_revision,
+            manifest,
+            manifest_hash,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_authz_tuple(
+        &self,
+        tenant_id: i64,
+        namespace: &str,
+        object_id: &str,
+        relation: &str,
+        subject_kind: &str,
+        subject_id: &str,
+        caveat_hash: &str,
+        operation: &str,
+        written_by: &str,
+        reason: &str,
+    ) -> Result<AuthzTupleRecord> {
+        let permit = self.authz_write_permit(tenant_id).await?;
+        authz_journal::write_authz_tuple_with_permit(
+            &self.storage,
+            authz_journal::AuthzTupleWrite {
+                tenant_id,
+                namespace,
+                object_id,
+                relation,
+                subject_kind,
+                subject_id,
+                caveat_hash,
+                operation,
+                written_by,
+                reason,
+            },
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub async fn write_authz_tuple_batch(
+        &self,
+        tenant_id: i64,
+        mutations: Vec<AuthzTupleBatchMutation>,
+        written_by: &str,
+    ) -> Result<Vec<AuthzTupleRecord>> {
+        let permit = self.authz_write_permit(tenant_id).await?;
+        let writes = mutations
+            .iter()
+            .map(|mutation| authz_journal::AuthzTupleWrite {
+                tenant_id,
+                namespace: mutation.namespace.as_str(),
+                object_id: mutation.object_id.as_str(),
+                relation: mutation.relation.as_str(),
+                subject_kind: mutation.subject_kind.as_str(),
+                subject_id: mutation.subject_id.as_str(),
+                caveat_hash: mutation.caveat_hash.as_str(),
+                operation: mutation.operation.as_str(),
+                written_by,
+                reason: mutation.reason.as_str(),
+            })
+            .collect();
+        authz_journal::write_authz_tuple_batch_with_permit(
+            &self.storage,
+            writes,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub async fn check_authz_tuple(
+        &self,
+        tenant_id: i64,
+        namespace: &str,
+        object_id: &str,
+        relation: &str,
+        subject_kind: &str,
+        subject_id: &str,
+        caveat_hash: &str,
+    ) -> Result<Option<AuthzTupleRecord>> {
+        authz_journal::check_authz_tuple(
+            &self.storage,
+            tenant_id,
+            namespace,
+            object_id,
+            relation,
+            subject_kind,
+            subject_id,
+            caveat_hash,
+        )
+        .await
+    }
+
+    pub async fn check_authz_tuple_at_revision(
+        &self,
+        tenant_id: i64,
+        namespace: &str,
+        object_id: &str,
+        relation: &str,
+        subject_kind: &str,
+        subject_id: &str,
+        caveat_hash: &str,
+        revision: i64,
+    ) -> Result<Option<AuthzTupleRecord>> {
+        authz_journal::check_authz_tuple_at_revision(
+            &self.storage,
+            tenant_id,
+            namespace,
+            object_id,
+            relation,
+            subject_kind,
+            subject_id,
+            caveat_hash,
+            revision,
+        )
+        .await
+    }
+
+    pub async fn list_authz_tuple_log(
+        &self,
+        tenant_id: i64,
+        after_revision: i64,
+        namespace: &str,
+        limit: i32,
+    ) -> Result<Vec<AuthzTupleRecord>> {
+        authz_journal::list_authz_tuple_log(
+            &self.storage,
+            tenant_id,
+            after_revision,
+            namespace,
+            if limit == 0 {
+                1000
+            } else {
+                limit.max(1) as usize
+            },
+        )
+        .await
+    }
+}
