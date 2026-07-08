@@ -4774,7 +4774,10 @@ impl CoreStore {
             return Ok(Vec::new());
         };
         let Some(transaction_manifest_locator) = anchor.transaction_manifest else {
-            return Ok(Vec::new());
+            if anchor.root_generation == 0 {
+                return Ok(Vec::new());
+            }
+            bail!("CoreStore non-genesis root anchor is missing transaction manifest");
         };
         validate_manifest_locator(&transaction_manifest_locator)?;
         let transaction_manifest = self
@@ -7945,6 +7948,12 @@ fn validate_root_anchor_record(anchor: &CoreRootAnchorRecord) -> Result<()> {
     }
     if anchor.publisher_epoch == 0 || anchor.partition_owner_fence == 0 {
         bail!("CoreStore root anchor publisher epoch and owner fence must be nonzero");
+    }
+    if anchor.root_generation > 0 && anchor.transaction_manifest.is_none() {
+        bail!("CoreStore non-genesis root anchor must include a transaction manifest");
+    }
+    if anchor.root_generation == 0 && anchor.transaction_manifest.is_some() {
+        bail!("CoreStore genesis root anchor must not include a transaction manifest");
     }
     if let Some(locator) = &anchor.transaction_manifest {
         validate_manifest_locator(locator)?;
@@ -11557,6 +11566,19 @@ mod tests {
         assert!(
             store.write_root_register_anchor(&conflict).await.is_err(),
             "same root generation with different bytes must fail create-new CAS"
+        );
+
+        let mut missing_manifest = genesis.clone();
+        missing_manifest.root_generation = 1;
+        missing_manifest.previous_root_hash = hash_root_anchor_record(&genesis).unwrap();
+        assert!(
+            store
+                .write_root_register_anchor(&missing_manifest)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("transaction manifest"),
+            "non-genesis roots must not be published without transaction evidence"
         );
 
         let mut skipped = genesis.clone();
