@@ -1577,8 +1577,7 @@ impl CoreStore {
         );
         validate_manifest_locator(locator)?;
         self.verify_manifest_locator_receipts(locator)?;
-        let object_ref = object_ref_from_manifest_locator(locator)?;
-        let bytes = self.get_blob(GetBlob { object_ref }).await?;
+        let bytes = self.read_manifest_locator_bytes(locator).await?;
         if bytes.len() as u64 != locator.manifest_length {
             bail!("CoreStore manifest locator length mismatch");
         }
@@ -1596,6 +1595,24 @@ impl CoreStore {
             bail!("CoreStore manifest locator identity mismatch");
         }
         Ok(manifest)
+    }
+
+    async fn read_manifest_locator_bytes(&self, locator: &CoreManifestLocator) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(locator.manifest_length as usize);
+        for block in &locator.block_locators {
+            let object_ref = object_ref_from_manifest_block_locator(block)?;
+            let block_bytes = self.get_blob(GetBlob { object_ref }).await?;
+            let expected_len = block.logical_end.saturating_sub(block.logical_start);
+            if block_bytes.len() as u64 != expected_len {
+                bail!("CoreStore manifest locator block length mismatch");
+            }
+            let block_hash = format!("sha256:{}", sha256_hex(&block_bytes));
+            if block_hash != block.block_plain_hash {
+                bail!("CoreStore manifest locator block plain hash mismatch");
+            }
+            out.extend_from_slice(&block_bytes);
+        }
+        Ok(out)
     }
 
     async fn read_uncompressed_logical_range(
@@ -6155,88 +6172,90 @@ fn validate_manifest_locator(locator: &CoreManifestLocator) -> Result<()> {
     if locator.manifest_length == 0 {
         bail!("CoreStore manifest locator length must be nonzero");
     }
-    if locator.block_locators.len() != 1 {
-        bail!("CoreStore local manifest locator expects exactly one block locator");
+    if locator.block_locators.is_empty() {
+        bail!("CoreStore manifest locator must include block locators");
     }
-    let block = &locator.block_locators[0];
-    if block.logical_start != 0 || block.logical_end != locator.manifest_length {
-        bail!("CoreStore manifest locator block range must cover the manifest bytes exactly");
-    }
-    validate_hash(&block.block_plain_hash, "manifest locator block plain hash")?;
-    validate_hash(
-        &block.block_encoded_hash,
-        "manifest locator block encoded hash",
-    )?;
-    if block.block_plain_hash != locator.manifest_hash {
-        bail!("CoreStore manifest locator block plain hash must match manifest hash");
-    }
-    if block.data_shards == 0 {
-        bail!("CoreStore manifest locator block must include data shards");
-    }
-    if block.placement_epoch == 0 {
-        bail!("CoreStore manifest locator block placement epoch must be nonzero");
-    }
-    if block.shard_receipts.len() < block.data_shards as usize {
-        bail!("CoreStore manifest locator block has too few shard receipts");
-    }
-    let mut seen_shards = BTreeSet::new();
-    for receipt in &block.shard_receipts {
-        if !seen_shards.insert(receipt.shard_index) {
-            bail!("CoreStore manifest locator shard receipt index is duplicated");
+    let mut expected_start = 0u64;
+    for block in &locator.block_locators {
+        if block.logical_start != expected_start || block.logical_end <= block.logical_start {
+            bail!("CoreStore manifest locator block ranges must be contiguous and non-empty");
         }
-        let shard_index = u16::try_from(receipt.shard_index)
-            .map_err(|_| anyhow!("CoreStore manifest locator shard index exceeds u16"))?;
-        if receipt.shard_length == 0 && locator.manifest_length != 0 {
-            bail!("CoreStore manifest locator shard receipt length must be nonzero");
+        expected_start = block.logical_end;
+        validate_hash(&block.block_plain_hash, "manifest locator block plain hash")?;
+        validate_hash(
+            &block.block_encoded_hash,
+            "manifest locator block encoded hash",
+        )?;
+        if block.data_shards == 0 {
+            bail!("CoreStore manifest locator block must include data shards");
         }
-        let profile = local_erasure_profile_for_counts(
-            &block.erasure_profile_id,
-            block.data_shards as usize,
-            block.parity_shards as usize,
-        )?;
-        validate_local_shard_receipt_placement(
-            profile,
-            usize::from(shard_index),
-            &receipt.node_id,
-            &receipt.region_id,
-            &receipt.cell_id,
-        )?;
-        let expected_signed_payload_hash = shard_receipt_payload_hash(ShardReceiptPayloadInput {
-            block_id: &block.block_id,
-            shard_index,
-            erasure_profile: &block.erasure_profile_id,
-            node_id: &receipt.node_id,
-            region_id: &receipt.region_id,
-            cell_id: &receipt.cell_id,
-            placement_epoch: block.placement_epoch,
-            shard_length: receipt.shard_length,
-            shard_hash: &receipt.shard_hash,
-            fsync_sequence: receipt.fsync_sequence,
-            written_at_unix_nanos: receipt.written_at_unix_nanos,
-        });
-        validate_shard_receipt_common(
-            &receipt.node_id,
-            &receipt.region_id,
-            &receipt.cell_id,
-            &receipt.shard_hash,
-            receipt.shard_length,
-            receipt.fsync_sequence,
-            receipt.written_at_unix_nanos,
-            &receipt.signed_payload_hash,
-            &receipt.signature_algorithm,
-            &receipt.receipt_signature,
-            &expected_signed_payload_hash,
-        )?;
+        if block.placement_epoch == 0 {
+            bail!("CoreStore manifest locator block placement epoch must be nonzero");
+        }
+        if block.shard_receipts.len() < block.data_shards as usize {
+            bail!("CoreStore manifest locator block has too few shard receipts");
+        }
+        let mut seen_shards = BTreeSet::new();
+        for receipt in &block.shard_receipts {
+            if !seen_shards.insert(receipt.shard_index) {
+                bail!("CoreStore manifest locator shard receipt index is duplicated");
+            }
+            let shard_index = u16::try_from(receipt.shard_index)
+                .map_err(|_| anyhow!("CoreStore manifest locator shard index exceeds u16"))?;
+            if receipt.shard_length == 0 && block.logical_end != block.logical_start {
+                bail!("CoreStore manifest locator shard receipt length must be nonzero");
+            }
+            let profile = local_erasure_profile_for_counts(
+                &block.erasure_profile_id,
+                block.data_shards as usize,
+                block.parity_shards as usize,
+            )?;
+            validate_local_shard_receipt_placement(
+                profile,
+                usize::from(shard_index),
+                &receipt.node_id,
+                &receipt.region_id,
+                &receipt.cell_id,
+            )?;
+            let expected_signed_payload_hash =
+                shard_receipt_payload_hash(ShardReceiptPayloadInput {
+                    block_id: &block.block_id,
+                    shard_index,
+                    erasure_profile: &block.erasure_profile_id,
+                    node_id: &receipt.node_id,
+                    region_id: &receipt.region_id,
+                    cell_id: &receipt.cell_id,
+                    placement_epoch: block.placement_epoch,
+                    shard_length: receipt.shard_length,
+                    shard_hash: &receipt.shard_hash,
+                    fsync_sequence: receipt.fsync_sequence,
+                    written_at_unix_nanos: receipt.written_at_unix_nanos,
+                });
+            validate_shard_receipt_common(
+                &receipt.node_id,
+                &receipt.region_id,
+                &receipt.cell_id,
+                &receipt.shard_hash,
+                receipt.shard_length,
+                receipt.fsync_sequence,
+                receipt.written_at_unix_nanos,
+                &receipt.signed_payload_hash,
+                &receipt.signature_algorithm,
+                &receipt.receipt_signature,
+                &expected_signed_payload_hash,
+            )?;
+        }
+    }
+    if expected_start != locator.manifest_length {
+        bail!("CoreStore manifest locator block ranges must cover the manifest bytes exactly");
     }
     Ok(())
 }
 
-fn object_ref_from_manifest_locator(locator: &CoreManifestLocator) -> Result<CoreObjectRef> {
-    validate_manifest_locator(locator)?;
-    let block = &locator.block_locators[0];
+fn object_ref_from_manifest_block_locator(block: &CoreBlockLocator) -> Result<CoreObjectRef> {
     Ok(CoreObjectRef {
         hash: block.block_encoded_hash.clone(),
-        logical_size: locator.manifest_length,
+        logical_size: block.plaintext_block_len,
         manifest_ref: encode_manifest_ref_with_profile(
             strip_sha256_prefix(&block.block_encoded_hash)?,
             &block.erasure_profile_id,
@@ -9860,6 +9879,78 @@ mod tests {
         duplicate.block_locators[0].shard_receipts[1].shard_index =
             duplicate.block_locators[0].shard_receipts[0].shard_index;
         assert!(store.read_logical_file_manifest(&duplicate).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn core_store_manifest_locator_reads_multiple_contiguous_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        let write = store
+            .write_logical_file_with_locator(WriteLogicalFileRequest {
+                writer_family: "object_blob".to_string(),
+                generation: 11,
+                logical_file_id: "objects/reports/report-11".to_string(),
+                source: b"manifest locator split block proof".to_vec(),
+                range_hints: Vec::new(),
+                pipeline_policy: CorePipelinePolicy::default(),
+                trace_context: CoreTraceContext::default(),
+                boundary_values: Vec::new(),
+                mutation_id: "logical-file-locator-mut-11".to_string(),
+                region_id: "local".to_string(),
+            })
+            .await
+            .unwrap();
+        let manifest_bytes = serde_json::to_vec(&write.manifest).unwrap();
+        let split_at = manifest_bytes.len() / 2;
+        let chunks = [&manifest_bytes[..split_at], &manifest_bytes[split_at..]];
+        let profile = local_erasure_profile(LOCAL_ERASURE_PROFILE_ID).unwrap();
+        let mut block_locators = Vec::new();
+        let mut logical_start = 0u64;
+        for (index, chunk) in chunks.iter().enumerate() {
+            let chunk_hash = format!("sha256:{}", sha256_hex(chunk));
+            let chunk_hash_hex = strip_sha256_prefix(&chunk_hash).unwrap();
+            let object_ref = store
+                .materialise_object_blob_bytes(
+                    &format!("lf_manifest_split_{index}"),
+                    write.manifest.writer_generation,
+                    index as u64,
+                    &chunk_hash,
+                    chunk_hash_hex,
+                    chunk,
+                    &[],
+                    &format!("manifest_split_{index}"),
+                    profile,
+                    "none",
+                    "core_control",
+                )
+                .await
+                .unwrap();
+            let mut block =
+                block_locator_from_manifest_object_ref(&write.manifest, &object_ref, &chunk_hash)
+                    .unwrap();
+            block.logical_start = logical_start;
+            block.logical_end = logical_start + chunk.len() as u64;
+            logical_start = block.logical_end;
+            block_locators.push(block);
+        }
+        let split_locator = CoreManifestLocator {
+            manifest_ref: write.locator.manifest_ref.clone(),
+            manifest_encoding: write.locator.manifest_encoding.clone(),
+            manifest_length: manifest_bytes.len() as u64,
+            manifest_hash: write.locator.manifest_hash.clone(),
+            block_locators,
+        };
+
+        let manifest = store
+            .read_logical_file_manifest(&split_locator)
+            .await
+            .unwrap();
+        assert_eq!(manifest, write.manifest);
+
+        let mut gap = split_locator.clone();
+        gap.block_locators[1].logical_start += 1;
+        assert!(store.read_logical_file_manifest(&gap).await.is_err());
     }
 
     #[tokio::test]
