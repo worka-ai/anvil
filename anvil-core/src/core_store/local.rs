@@ -2959,10 +2959,16 @@ impl CoreStore {
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
                 Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
             };
-            match decode_wal_records(&bytes)
+            match decode_wal_file_with_valid_len(&bytes)
                 .with_context(|| format!("decode CoreStore admission WAL {}", path.display()))
             {
-                Ok(records) => return Ok(records),
+                Ok((_first_sequence, records, valid_len)) => {
+                    if valid_len < bytes.len() {
+                        truncate_file_to_len(&path, valid_len as u64, "wal_truncate_partial_frame")
+                            .await?;
+                    }
+                    return Ok(records);
+                }
                 Err(error)
                     if is_incomplete_core_frame_error(&error)
                         && attempt + 1 < CORE_CONTROL_READ_RETRY_ATTEMPTS =>
@@ -9122,11 +9128,19 @@ fn encode_wal_frame(header_json: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn decode_wal_records(bytes: &[u8]) -> Result<Vec<(CoreWalAdmissionRecord, Vec<u8>)>> {
     decode_wal_file(bytes).map(|(_, records)| records)
 }
 
 fn decode_wal_file(bytes: &[u8]) -> Result<(u64, Vec<(CoreWalAdmissionRecord, Vec<u8>)>)> {
+    decode_wal_file_with_valid_len(bytes)
+        .map(|(first_sequence, records, _valid_len)| (first_sequence, records))
+}
+
+fn decode_wal_file_with_valid_len(
+    bytes: &[u8],
+) -> Result<(u64, Vec<(CoreWalAdmissionRecord, Vec<u8>)>, usize)> {
     let mut offset = 0usize;
     let magic = read_exact(bytes, &mut offset, CORE_WAL_FILE_MAGIC.len())?;
     if magic != CORE_WAL_FILE_MAGIC {
@@ -9148,9 +9162,11 @@ fn decode_wal_file(bytes: &[u8]) -> Result<(u64, Vec<(CoreWalAdmissionRecord, Ve
     }
 
     let mut records = Vec::new();
+    let mut valid_len = offset;
     while offset < bytes.len() {
         let frame_start = offset;
         if bytes.len().saturating_sub(offset) < CORE_WAL_FRAME_MAGIC.len() {
+            valid_len = frame_start;
             break;
         }
         let frame_magic = read_exact(bytes, &mut offset, CORE_WAL_FRAME_MAGIC.len())?;
@@ -9158,6 +9174,7 @@ fn decode_wal_file(bytes: &[u8]) -> Result<(u64, Vec<(CoreWalAdmissionRecord, Ve
             bail!("CoreStore WAL frame has invalid magic");
         }
         if bytes.len().saturating_sub(offset) < 12 {
+            valid_len = frame_start;
             break;
         }
         let header_len = read_u32_le(bytes, &mut offset)? as usize;
@@ -9170,6 +9187,7 @@ fn decode_wal_file(bytes: &[u8]) -> Result<(u64, Vec<(CoreWalAdmissionRecord, Ve
             .and_then(|value| value.checked_add(4))
             .ok_or_else(|| anyhow!("CoreStore WAL frame length overflow"))?;
         if bytes.len().saturating_sub(offset) < required_tail {
+            valid_len = frame_start;
             break;
         }
         let header_json = read_exact(bytes, &mut offset, header_len)?;
@@ -9184,8 +9202,9 @@ fn decode_wal_file(bytes: &[u8]) -> Result<(u64, Vec<(CoreWalAdmissionRecord, Ve
             bail!("CoreStore WAL record has invalid schema");
         }
         records.push((record, payload.to_vec()));
+        valid_len = offset;
     }
-    Ok((first_sequence, records))
+    Ok((first_sequence, records, valid_len))
 }
 
 fn write_u16_len_prefixed_bytes(out: &mut Vec<u8>, bytes: &[u8], label: &str) -> Result<()> {
@@ -9462,6 +9481,27 @@ async fn sync_parent_dir(path: &PathBuf, operation: &'static str) -> Result<()> 
     .await
     .map_err(|err| anyhow!("CoreStore directory fsync task failed: {err}"))??;
     crate::perf::record_io_duration("core_store", operation, &parent, 0, started_at.elapsed());
+    Ok(())
+}
+
+async fn truncate_file_to_len(path: &PathBuf, len: u64, operation: &'static str) -> Result<()> {
+    let started_at = Instant::now();
+    let file = OpenOptions::new().write(true).open(path).await?;
+    crate::perf::record_io_duration("core_store", "truncate_open", path, 0, started_at.elapsed());
+    let started_at = Instant::now();
+    file.set_len(len).await?;
+    crate::perf::record_io_duration("core_store", operation, path, len, started_at.elapsed());
+    let started_at = Instant::now();
+    file.sync_all().await?;
+    crate::perf::record_io_duration(
+        "core_store",
+        "truncate_sync",
+        path,
+        len,
+        started_at.elapsed(),
+    );
+    drop(file);
+    sync_parent_dir(path, "truncate_sync_parent_dir").await?;
     Ok(())
 }
 
@@ -10939,6 +10979,49 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&header_json).starts_with("{\"anvil_storage_tenant_id\":"),
             "WAL header JSON keys must be sorted bytewise"
+        );
+    }
+
+    #[tokio::test]
+    async fn core_store_wal_reader_truncates_partial_tail_frame() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        store
+            .admit_core_mutation(
+                "stream.append",
+                "stream",
+                serde_json::json!({
+                    "stream_id": "tenant:t/bucket:b/partial-wal",
+                    "partition_id": "tenant:t/bucket:b",
+                    "record_kind": "event.created",
+                    "transaction_id": null,
+                }),
+                "partial-tail-wal".to_string(),
+                None,
+                CoreWalPayload::Inline(br#"{"ok":true}"#),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let path = store.active_wal_path();
+        let before_tail_len = tokio::fs::metadata(&path).await.unwrap().len();
+        let mut file = OpenOptions::new().append(true).open(&path).await.unwrap();
+        file.write_all(&CORE_WAL_FRAME_MAGIC[..3]).await.unwrap();
+        file.sync_all().await.unwrap();
+        drop(file);
+        assert!(
+            tokio::fs::metadata(&path).await.unwrap().len() > before_tail_len,
+            "test setup must append a partial frame tail"
+        );
+
+        let records = store.read_core_wal_records_with_payload().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            tokio::fs::metadata(&path).await.unwrap().len(),
+            before_tail_len,
+            "WAL reader must truncate the partial frame to the last valid frame boundary"
         );
     }
 
