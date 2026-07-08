@@ -1334,7 +1334,7 @@ impl CoreStore {
         policy: &CorePipelinePolicy,
     ) -> Result<CoreManifestLocator> {
         validate_logical_file_manifest_shape(manifest)?;
-        let manifest_bytes = serde_json::to_vec(manifest)?;
+        let manifest_bytes = encode_logical_file_manifest_bytes(manifest)?;
         let manifest_hash = format!("sha256:{}", sha256_hex(&manifest_bytes));
         let manifest_hash_hex = strip_sha256_prefix(&manifest_hash)?;
         let profile = local_erasure_profile(&policy.erasure_profile_id)?;
@@ -1586,7 +1586,7 @@ impl CoreStore {
         {
             bail!("CoreStore manifest locator hash mismatch");
         }
-        let manifest: CoreLogicalFileManifest = serde_json::from_slice(&bytes)?;
+        let manifest = decode_logical_file_manifest_bytes(&bytes, &locator.manifest_encoding)?;
         validate_logical_file_manifest_shape(&manifest)?;
         if manifest.logical_file_id != locator.manifest_ref.logical_file_id
             || manifest.writer_family != locator.manifest_ref.writer_family
@@ -6048,6 +6048,20 @@ fn object_ref_from_object_manifest(manifest: &CoreObjectManifest) -> Result<Core
     })
 }
 
+fn encode_logical_file_manifest_bytes(manifest: &CoreLogicalFileManifest) -> Result<Vec<u8>> {
+    encode_canonical_cbor_json(&serde_json::to_value(manifest)?)
+}
+
+fn decode_logical_file_manifest_bytes(
+    bytes: &[u8],
+    manifest_encoding: &str,
+) -> Result<CoreLogicalFileManifest> {
+    match manifest_encoding {
+        "canonical-cbor" => Ok(serde_json::from_value(decode_canonical_cbor_json(bytes)?)?),
+        other => bail!("CoreStore unsupported logical file manifest encoding {other}"),
+    }
+}
+
 fn manifest_locator_from_manifest_and_ref(
     manifest: &CoreLogicalFileManifest,
     manifest_object_ref: &CoreObjectRef,
@@ -6068,7 +6082,7 @@ fn manifest_locator_from_manifest_and_ref(
             writer_generation: manifest.writer_generation,
             manifest_hash: manifest_hash.to_string(),
         },
-        manifest_encoding: "writer-segment".to_string(),
+        manifest_encoding: "canonical-cbor".to_string(),
         manifest_length: manifest_bytes_len,
         manifest_hash: manifest_hash.to_string(),
         block_locators,
@@ -9781,7 +9795,7 @@ mod tests {
             write.locator.manifest_hash,
             write.locator.manifest_ref.manifest_hash
         );
-        assert_eq!(write.locator.manifest_encoding, "writer-segment");
+        assert_eq!(write.locator.manifest_encoding, "canonical-cbor");
         assert_eq!(write.locator.block_locators.len(), 1);
         let block = &write.locator.block_locators[0];
         assert_eq!(block.logical_start, 0);
@@ -9901,7 +9915,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let manifest_bytes = serde_json::to_vec(&write.manifest).unwrap();
+        let manifest_bytes = encode_logical_file_manifest_bytes(&write.manifest).unwrap();
         let split_at = manifest_bytes.len() / 2;
         let chunks = [&manifest_bytes[..split_at], &manifest_bytes[split_at..]];
         let profile = local_erasure_profile(LOCAL_ERASURE_PROFILE_ID).unwrap();
