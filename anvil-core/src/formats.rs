@@ -53,16 +53,16 @@ impl FileFamily {
     pub fn expected_magic(self) -> &'static [u8; 8] {
         match self {
             Self::MetadataJournal => b"ANVJRN1\0",
-            Self::MetadataSegment => b"ANVSEG1\0",
-            Self::DirectorySegment => b"ANVDIR1\0",
-            Self::FullTextSegment => b"ANVFTS1\0",
-            Self::VectorSegment => b"ANVVEC1\0",
-            Self::AuthzTupleSegment => b"ANVAUTH1",
+            Self::MetadataSegment => b"ANOBJM1\0",
+            Self::DirectorySegment => b"ANTDIR1\0",
+            Self::FullTextSegment => b"ANFTSG1\0",
+            Self::VectorSegment => b"ANVECG1\0",
+            Self::AuthzTupleSegment => b"ANAUTH1\0",
             Self::WatchSegment => b"ANVWAT1\0",
-            Self::PersonalDbLogSegment => b"ANVPDB1\0",
+            Self::PersonalDbLogSegment => b"ANPDB1\0\0",
             Self::PersonalDbRowIndex => b"ANVROW1\0",
             Self::GitSourceIndex => b"ANVGIT1\0",
-            Self::TypedFieldSegment => b"ANVTYP1\0",
+            Self::TypedFieldSegment => b"ANTIDX1\0",
         }
     }
 }
@@ -530,6 +530,20 @@ mod tests {
 
     fn sample_hash(seed: u8) -> Hash32 {
         [seed; 32]
+    }
+
+    #[test]
+    fn file_family_magic_matches_corestore_rfc() {
+        assert_eq!(FileFamily::MetadataSegment.expected_magic(), b"ANOBJM1\0");
+        assert_eq!(FileFamily::DirectorySegment.expected_magic(), b"ANTDIR1\0");
+        assert_eq!(FileFamily::FullTextSegment.expected_magic(), b"ANFTSG1\0");
+        assert_eq!(FileFamily::VectorSegment.expected_magic(), b"ANVECG1\0");
+        assert_eq!(FileFamily::AuthzTupleSegment.expected_magic(), b"ANAUTH1\0");
+        assert_eq!(
+            FileFamily::PersonalDbLogSegment.expected_magic(),
+            b"ANPDB1\0\0"
+        );
+        assert_eq!(FileFamily::TypedFieldSegment.expected_magic(), b"ANTIDX1\0");
     }
 
     #[test]

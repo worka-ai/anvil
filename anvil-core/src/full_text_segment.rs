@@ -22,7 +22,7 @@ use std::convert::TryInto;
 const FULL_TEXT_SEGMENT_REF_PREFIX: &str = "full_text_segment:";
 const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
-const FULL_TEXT_POSTINGS_BLOCK_MAGIC: &[u8; 8] = b"ANVFTSPB";
+const FULL_TEXT_POSTINGS_BLOCK_MAGIC: &[u8; 8] = b"ANPOST1\0";
 const FULL_TEXT_POSTINGS_BLOCK_VERSION: u16 = 1;
 const FULL_TEXT_POSTINGS_SKIP_STRIDE: u32 = 128;
 const FULL_TEXT_POSTINGS_BLOCK_HEADER_LEN: usize = 8 + 2 + 2 + 4 + 8 + 8 + 4;
