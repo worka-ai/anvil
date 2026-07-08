@@ -34,8 +34,6 @@ const LOCAL_DATA_SHARDS: usize = 4;
 const LOCAL_PARITY_SHARDS: usize = 2;
 const LOCAL_NODE_ID_PREFIX: &str = "local-node";
 const LOCAL_CONTROL_REPLICA_COUNT: usize = 5;
-const LOCAL_CONTROL_WRITE_QUORUM: usize = 3;
-const LOCAL_CONTROL_READ_QUORUM: usize = 3;
 const LOCAL_CONTROL_NODE_ID_PREFIX: &str = "local-control-node";
 const LOCAL_ERASURE_SET_ID: &str = "local-erasure-set";
 
@@ -72,11 +70,15 @@ const MAX_CORE_FENCE_TTL_MS: u64 = 120_000;
 const CORE_STREAM_SEGMENT_MAGIC: &[u8; 8] = b"ANSTRM\n\0";
 const CORE_STREAM_SPARSE_INDEX_MAGIC: &[u8; 8] = b"ANSSIX1\0";
 const CORE_ACTIVE_STREAM_MAGIC: &[u8; 8] = b"ANASTR1\0";
+const CORE_ROOT_ANCHOR_MAGIC: &[u8; 8] = b"ANROOT1\0";
+const CORE_ROOT_REGISTER_MAGIC: &[u8; 8] = b"ANREGRT1";
 const CORE_BLOCK_SHARD_MAGIC: &[u8; 8] = b"ANBLK\n\0\0";
 const CORE_WAL_FILE_MAGIC: &[u8; 6] = b"ANWAL\n";
 const CORE_WAL_FRAME_MAGIC: &[u8; 4] = b"AWF1";
 const CORE_STREAM_SEGMENT_VERSION: u16 = 1;
 const CORE_ACTIVE_STREAM_VERSION: u16 = 1;
+const CORE_ROOT_ANCHOR_VERSION: u16 = 1;
+const CORE_ROOT_REGISTER_VERSION: u16 = 1;
 const CORE_BLOCK_SHARD_VERSION: u16 = 1;
 const CORE_WAL_VERSION: u16 = 1;
 const CORE_WAL_EPOCH: u64 = 1;
@@ -100,6 +102,7 @@ const CORE_STREAM_STATE_LOCATOR_SCHEMA: &str = "anvil.core.stream_state_locator.
 const CORE_STREAM_STATE_LOCATOR_RECORD_KIND: &str = "core_stream.state_locator";
 const CORE_TRANSACTION_STREAM_ID: &str = "core_transactions";
 const CORE_TRANSACTION_PARTITION_ID: &str = "core-control";
+const CORE_TRANSACTION_ROOT_PARTITION_ID: u64 = 0;
 const CORE_TRANSACTION_RECORD_KIND: &str = "core_transaction";
 const CORE_PIPELINE_KEY_LEN: usize = 32;
 const CORE_PIPELINE_NONCE_LEN: usize = 12;
@@ -306,6 +309,41 @@ struct StoredStreamStateLocatorRecord {
     sequence: u64,
     event_hash: String,
     locator: CoreManifestLocator,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CoreRootAnchorRecord {
+    schema: String,
+    root_anchor_key: String,
+    root_key_hash: String,
+    root_generation: u64,
+    previous_root_hash: String,
+    transaction_manifest: Option<CoreManifestLocator>,
+    checkpoint_manifest: Option<CoreManifestLocator>,
+    publisher_node_id: String,
+    publisher_epoch: u64,
+    partition_owner_fence: u64,
+    created_at_unix_nanos: u64,
+    root_state: String,
+    mutation_first: Option<String>,
+    mutation_last: Option<String>,
+    writer_families: Vec<String>,
+    manifest_count: u64,
+    final_block_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CoreRootRegisterHeader {
+    schema: String,
+    root_partition_id: u64,
+    root_key_hash: String,
+    root_generation: u64,
+    shard_index: u16,
+    register_cohort_nodes: Vec<String>,
+    register_cohort_hash: String,
+    placement_epoch: u64,
+    created_at_unix_nanos: u64,
+    root_anchor_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4426,30 +4464,12 @@ impl CoreStore {
     }
 
     async fn read_direct_stream_records(&self, stream_id: &str) -> Result<Vec<StreamRecord>> {
-        for attempt in 0..CORE_CONTROL_READ_RETRY_ATTEMPTS {
-            let Some(bytes) = self
-                .read_bytes_from_quorum(
-                    &format!("CoreStore stream {stream_id}"),
-                    |store, node_id| store.stream_replica_path(node_id, stream_id),
-                )
-                .await?
-            else {
-                return Ok(Vec::new());
-            };
-            match decode_active_stream_records(stream_id, &bytes)
-                .with_context(|| format!("decode CoreStore active stream {stream_id}"))
-            {
-                Ok(records) => return Ok(records),
-                Err(error)
-                    if is_incomplete_core_frame_error(&error)
-                        && attempt + 1 < CORE_CONTROL_READ_RETRY_ATTEMPTS =>
-                {
-                    tokio::time::sleep(CORE_REF_LOCK_RETRY_DELAY).await;
-                }
-                Err(error) => return Err(error),
-            }
+        if stream_id != CORE_TRANSACTION_STREAM_ID {
+            bail!(
+                "CoreStore direct stream reads are reserved for the root-anchored transaction stream"
+            );
         }
-        unreachable!("CoreStore stream decode retry loop must return")
+        self.read_core_transaction_stream_records_from_root().await
     }
 
     async fn read_stream_records_after(
@@ -4469,30 +4489,22 @@ impl CoreStore {
             }
             return Ok(filtered);
         }
-        for attempt in 0..CORE_CONTROL_READ_RETRY_ATTEMPTS {
-            let Some(bytes) = self
-                .read_bytes_from_quorum(
-                    &format!("CoreStore stream {stream_id}"),
-                    |store, node_id| store.stream_replica_path(node_id, stream_id),
-                )
-                .await?
-            else {
-                return Ok(Vec::new());
-            };
-            match decode_active_stream_records_page(stream_id, &bytes, after_sequence, limit)
-                .with_context(|| format!("decode CoreStore active stream page {stream_id}"))
-            {
-                Ok(records) => return Ok(records),
-                Err(error)
-                    if is_incomplete_core_frame_error(&error)
-                        && attempt + 1 < CORE_CONTROL_READ_RETRY_ATTEMPTS =>
-                {
-                    tokio::time::sleep(CORE_REF_LOCK_RETRY_DELAY).await;
-                }
-                Err(error) => return Err(error),
-            }
+        if stream_id != CORE_TRANSACTION_STREAM_ID {
+            bail!(
+                "CoreStore direct stream paging is reserved for the root-anchored transaction stream"
+            );
         }
-        unreachable!("CoreStore stream page decode retry loop must return")
+        let records = self
+            .read_core_transaction_stream_records_from_root()
+            .await?;
+        let filtered = records
+            .into_iter()
+            .filter(|record| record.sequence > after_sequence)
+            .collect::<Vec<_>>();
+        if limit > 0 {
+            return Ok(filtered.into_iter().take(limit).collect());
+        }
+        Ok(filtered)
     }
 
     async fn latest_stream_state_locator(
@@ -4647,17 +4659,247 @@ impl CoreStore {
     ) -> Result<Option<CoreManifestLocator>> {
         let bytes = encode_active_stream_records(stream_id, records)?;
         if stream_id == CORE_TRANSACTION_STREAM_ID {
-            self.write_bytes_to_quorum(
-                &format!("CoreStore stream {stream_id}"),
-                &bytes,
-                |store, node_id| store.stream_replica_path(node_id, stream_id),
-            )
-            .await?;
+            self.write_core_transaction_stream_records(records, bytes)
+                .await?;
             return Ok(None);
         }
         self.write_stream_state_logical_file(stream_id, records, bytes)
             .await
             .map(Some)
+    }
+
+    async fn read_core_transaction_stream_records_from_root(&self) -> Result<Vec<StreamRecord>> {
+        let Some(anchor) = self
+            .read_latest_root_anchor(core_transaction_root_anchor_key())
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(locator) = anchor.transaction_manifest else {
+            return Ok(Vec::new());
+        };
+        validate_manifest_locator(&locator)?;
+        let manifest = self.read_logical_file_manifest(&locator).await?;
+        let bytes = self.read_logical_file_plaintext(&manifest).await?;
+        decode_active_stream_records(CORE_TRANSACTION_STREAM_ID, &bytes)
+            .with_context(|| "decode root-anchored CoreStore transaction stream")
+    }
+
+    async fn write_core_transaction_stream_records(
+        &self,
+        records: &[StreamRecord],
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        let locator = self
+            .write_stream_state_logical_file(CORE_TRANSACTION_STREAM_ID, records, bytes)
+            .await?;
+        self.publish_core_transaction_root_anchor(records, locator)
+            .await
+    }
+
+    async fn publish_core_transaction_root_anchor(
+        &self,
+        records: &[StreamRecord],
+        transaction_manifest: CoreManifestLocator,
+    ) -> Result<()> {
+        let root_anchor_key = core_transaction_root_anchor_key();
+        let root_key_hash = root_key_hash(root_anchor_key);
+        let current = self.read_latest_root_anchor(root_anchor_key).await?;
+        let root_generation = current
+            .as_ref()
+            .map(|anchor| anchor.root_generation.saturating_add(1))
+            .unwrap_or(0);
+        let previous_root_hash = current
+            .as_ref()
+            .map(hash_root_anchor_record)
+            .transpose()?
+            .unwrap_or_else(|| ZERO_HASH.to_string());
+        let writer_families = records
+            .iter()
+            .map(|record| {
+                if record.stream_id == CORE_TRANSACTION_STREAM_ID {
+                    "core_control".to_string()
+                } else {
+                    record.partition_id.clone()
+                }
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let final_block_count = transaction_manifest
+            .block_locators
+            .iter()
+            .map(|block| block.data_shards + block.parity_shards)
+            .sum::<u32>() as u64;
+        let anchor = CoreRootAnchorRecord {
+            schema: "anvil.core.root_anchor.v1".to_string(),
+            root_anchor_key: root_anchor_key.to_string(),
+            root_key_hash,
+            root_generation,
+            previous_root_hash,
+            transaction_manifest: Some(transaction_manifest),
+            checkpoint_manifest: None,
+            publisher_node_id: CORE_WAL_NODE_ID.to_string(),
+            publisher_epoch: LOCAL_PLACEMENT_EPOCH,
+            partition_owner_fence: LOCAL_PLACEMENT_EPOCH,
+            created_at_unix_nanos: unix_timestamp_nanos(),
+            root_state: "committed".to_string(),
+            mutation_first: records.first().map(|record| record.cursor.clone()),
+            mutation_last: records.last().map(|record| record.cursor.clone()),
+            writer_families,
+            manifest_count: 1,
+            final_block_count,
+        };
+        self.write_root_register_anchor(&anchor).await
+    }
+
+    async fn read_latest_root_anchor(
+        &self,
+        root_anchor_key: &str,
+    ) -> Result<Option<CoreRootAnchorRecord>> {
+        let root_key_hash = root_key_hash(root_anchor_key);
+        let root_hash_hex = strip_sha256_prefix(&root_key_hash)?;
+        let root_dir = self
+            .root_register_hash_dir(&root_key_hash)?
+            .join(root_hash_hex);
+        let entries = match std::fs::read_dir(&root_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", root_dir.display()));
+            }
+        };
+        let mut generations = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(raw) = name.strip_prefix("generation-") else {
+                continue;
+            };
+            if let Ok(generation) = raw.parse::<u64>() {
+                generations.push(generation);
+            }
+        }
+        generations.sort_unstable_by(|left, right| right.cmp(left));
+        for generation in generations {
+            if let Some(anchor) = self
+                .read_committed_root_anchor_generation(&root_key_hash, generation)
+                .await?
+            {
+                if anchor.root_anchor_key != root_anchor_key {
+                    bail!("CoreStore root register anchor key mismatch");
+                }
+                return Ok(Some(anchor));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn read_committed_root_anchor_generation(
+        &self,
+        root_key_hash: &str,
+        generation: u64,
+    ) -> Result<Option<CoreRootAnchorRecord>> {
+        let generation_dir = self.root_register_generation_dir(root_key_hash, generation)?;
+        let entries = match std::fs::read_dir(&generation_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", generation_dir.display()));
+            }
+        };
+        let mut by_hash = BTreeMap::<String, (CoreRootAnchorRecord, usize)>::new();
+        for entry in entries {
+            let entry = entry?;
+            if entry
+                .path()
+                .extension()
+                .is_none_or(|extension| extension != "anr")
+            {
+                continue;
+            }
+            let bytes = read_file(&entry.path(), "core_store", "read_root_register_shard").await?;
+            let (header, anchor) = decode_root_register_shard_file(&bytes)?;
+            if header.root_key_hash != root_key_hash || header.root_generation != generation {
+                continue;
+            }
+            let anchor_hash = hash_root_anchor_record(&anchor)?;
+            if anchor_hash != header.root_anchor_hash {
+                bail!("CoreStore root register shard anchor hash mismatch");
+            }
+            by_hash
+                .entry(anchor_hash)
+                .and_modify(|(_, count)| *count += 1)
+                .or_insert((anchor, 1));
+        }
+        Ok(by_hash.into_values().find_map(
+            |(anchor, count)| {
+                if count >= 2 { Some(anchor) } else { None }
+            },
+        ))
+    }
+
+    async fn write_root_register_anchor(&self, anchor: &CoreRootAnchorRecord) -> Result<()> {
+        validate_root_anchor_record(anchor)?;
+        let anchor_bytes = encode_root_anchor_record(anchor)?;
+        let root_anchor_hash = format!("sha256:{}", sha256_hex(&anchor_bytes));
+        let cohort_nodes = local_control_node_ids()
+            .into_iter()
+            .take(3)
+            .collect::<Vec<_>>();
+        let cohort_hash = descriptor_hash(&[
+            "anvil.root.cohort.v1",
+            &anchor.root_key_hash,
+            &anchor.root_generation.to_string(),
+            &cohort_nodes.join(","),
+        ]);
+        let created_at_unix_nanos = unix_timestamp_nanos();
+        let generation_dir =
+            self.root_register_generation_dir(&anchor.root_key_hash, anchor.root_generation)?;
+        for (index, _node_id) in cohort_nodes.iter().enumerate() {
+            let header = CoreRootRegisterHeader {
+                schema: "anvil.core.root_register_shard.v1".to_string(),
+                root_partition_id: CORE_TRANSACTION_ROOT_PARTITION_ID,
+                root_key_hash: anchor.root_key_hash.clone(),
+                root_generation: anchor.root_generation,
+                shard_index: index as u16,
+                register_cohort_nodes: cohort_nodes.clone(),
+                register_cohort_hash: cohort_hash.clone(),
+                placement_epoch: LOCAL_PLACEMENT_EPOCH,
+                created_at_unix_nanos,
+                root_anchor_hash: root_anchor_hash.clone(),
+            };
+            let bytes = encode_root_register_shard_file(&header, &anchor_bytes)?;
+            let shard_path = generation_dir.join(format!("shard-{index}.anr"));
+            write_file_atomic(&shard_path, &bytes).await?;
+        }
+        Ok(())
+    }
+
+    fn root_register_hash_dir(&self, root_key_hash: &str) -> Result<PathBuf> {
+        let hash_hex = strip_sha256_prefix(root_key_hash)?;
+        Ok(self
+            .storage
+            .core_store_root_path()
+            .join("blocks")
+            .join("register")
+            .join(CORE_TRANSACTION_ROOT_PARTITION_ID.to_string())
+            .join(&hash_hex[0..2]))
+    }
+
+    fn root_register_generation_dir(
+        &self,
+        root_key_hash: &str,
+        generation: u64,
+    ) -> Result<PathBuf> {
+        let hash_hex = strip_sha256_prefix(root_key_hash)?;
+        Ok(self
+            .root_register_hash_dir(root_key_hash)?
+            .join(hash_hex)
+            .join(format!("generation-{generation:020}")))
     }
 
     async fn write_stream_state_logical_file(
@@ -4670,19 +4912,36 @@ impl CoreStore {
         let state_hash = format!("sha256:{}", sha256_hex(&bytes));
         let state_hash_hex = strip_sha256_prefix(&state_hash)?;
         let profile = local_erasure_profile(LOCAL_ERASURE_PROFILE_ID)?;
+        let (writer_family, logical_file_id, mutation_id) =
+            if stream_id == CORE_TRANSACTION_STREAM_ID {
+                (
+                    "core_control",
+                    format!("lf_core_transaction_state_{state_hash_hex}"),
+                    format!(
+                        "core_transaction_state_{}",
+                        sha256_hex(stream_id.as_bytes())
+                    ),
+                )
+            } else {
+                (
+                    "stream",
+                    format!("lf_stream_state_{state_hash_hex}"),
+                    format!("stream_state_{}", sha256_hex(stream_id.as_bytes())),
+                )
+            };
         let object_ref = self
             .materialise_object_blob_bytes(
-                &format!("lf_stream_state_{state_hash_hex}"),
+                &logical_file_id,
                 last_sequence,
                 0,
                 &state_hash,
                 state_hash_hex,
                 &bytes,
                 &[],
-                &format!("stream_state_{}", sha256_hex(stream_id.as_bytes())),
+                &mutation_id,
                 profile,
                 "none",
-                "stream",
+                writer_family,
             )
             .await?;
         let object_manifest = self.read_object_manifest(&object_ref).await?;
@@ -4695,15 +4954,15 @@ impl CoreStore {
             encryption: none_encryption_descriptor(&state_hash, &state_hash),
         };
         let request = WriteLogicalFileRequest {
-            writer_family: "stream".to_string(),
+            writer_family: writer_family.to_string(),
             generation: last_sequence,
-            logical_file_id: format!("lf_stream_state_{state_hash_hex}"),
+            logical_file_id,
             source: Vec::new(),
             range_hints: Vec::new(),
             pipeline_policy: CorePipelinePolicy::default(),
             trace_context: CoreTraceContext::default(),
             boundary_values: Vec::new(),
-            mutation_id: format!("stream_state_{}", sha256_hex(stream_id.as_bytes())),
+            mutation_id,
             region_id: "local".to_string(),
         };
         let manifest = logical_file_manifest_from_object_manifests(
@@ -4843,95 +5102,6 @@ impl CoreStore {
             .join("sha256")
             .join(&hash[0..2])
             .join(format!("{hash}.landed"))
-    }
-
-    fn stream_data_replica_dir(&self, node_id: &str) -> PathBuf {
-        self.storage
-            .core_store_replica_path(node_id)
-            .join("streams")
-            .join("data")
-    }
-
-    fn stream_replica_path(&self, node_id: &str, stream_id: &str) -> PathBuf {
-        self.stream_data_replica_dir(node_id)
-            .join(format!("{}.anstream", logical_file_name(stream_id)))
-    }
-
-    async fn read_bytes_from_quorum<F>(
-        &self,
-        label: &str,
-        mut replica_path: F,
-    ) -> Result<Option<Vec<u8>>>
-    where
-        F: FnMut(&Self, &str) -> PathBuf,
-    {
-        for attempt in 0..CORE_CONTROL_READ_RETRY_ATTEMPTS {
-            let mut votes: BTreeMap<String, (Vec<u8>, usize)> = BTreeMap::new();
-            let mut found = 0usize;
-            for node_id in local_control_node_ids() {
-                let path = replica_path(self, &node_id);
-                let bytes = match read_file(&path, "core_store", "read_quorum_replica").await {
-                    Ok(bytes) => bytes,
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(err) => {
-                        return Err(err).with_context(|| format!("read {label} replica {node_id}"));
-                    }
-                };
-                found += 1;
-                let hash = sha256_hex(&bytes);
-                let entry = votes.entry(hash).or_insert((bytes, 0));
-                entry.1 += 1;
-            }
-
-            if found == 0 {
-                return Ok(None);
-            }
-            let Some((_, (bytes, count))) = votes.iter().max_by_key(|(_, (_, count))| *count)
-            else {
-                return Ok(None);
-            };
-            if *count >= LOCAL_CONTROL_READ_QUORUM {
-                return Ok(Some(bytes.clone()));
-            }
-            if attempt + 1 == CORE_CONTROL_READ_RETRY_ATTEMPTS {
-                bail!(
-                    "{label} did not reach read quorum: {} matching replicas, {} required",
-                    count,
-                    LOCAL_CONTROL_READ_QUORUM
-                );
-            }
-            tokio::time::sleep(CORE_REF_LOCK_RETRY_DELAY).await;
-        }
-        unreachable!("CoreStore control read retry loop must return")
-    }
-
-    async fn write_bytes_to_quorum<F>(
-        &self,
-        label: &str,
-        bytes: &[u8],
-        mut replica_path: F,
-    ) -> Result<()>
-    where
-        F: FnMut(&Self, &str) -> PathBuf,
-    {
-        let mut acks = 0usize;
-        let mut errors = Vec::new();
-        for node_id in local_control_node_ids() {
-            let path = replica_path(self, &node_id);
-            match write_file_atomic(&path, bytes).await {
-                Ok(()) => acks += 1,
-                Err(err) => errors.push(format!("{node_id}: {err:#}")),
-            }
-        }
-        if acks < LOCAL_CONTROL_WRITE_QUORUM {
-            bail!(
-                "{label} write quorum failed: {} acks, {} required; errors={:?}",
-                acks,
-                LOCAL_CONTROL_WRITE_QUORUM,
-                errors
-            );
-        }
-        Ok(())
     }
 }
 
@@ -7266,6 +7436,262 @@ fn decode_manifest_ref_parts(manifest_ref: &str) -> Result<(&str, &str)> {
     Ok((hash, profile))
 }
 
+fn core_transaction_root_anchor_key() -> &'static str {
+    "system/core-control/0"
+}
+
+fn root_key_hash(root_anchor_key: &str) -> String {
+    descriptor_hash(&["anvil.root.key.v1", root_anchor_key])
+}
+
+fn validate_root_anchor_record(anchor: &CoreRootAnchorRecord) -> Result<()> {
+    if anchor.schema != "anvil.core.root_anchor.v1" {
+        bail!("CoreStore root anchor has invalid schema");
+    }
+    if anchor.root_anchor_key != core_transaction_root_anchor_key() {
+        bail!(
+            "CoreStore unsupported root anchor key {}",
+            anchor.root_anchor_key
+        );
+    }
+    let expected_root_key_hash = root_key_hash(&anchor.root_anchor_key);
+    if anchor.root_key_hash != expected_root_key_hash {
+        bail!("CoreStore root anchor key hash mismatch");
+    }
+    validate_hash(&anchor.root_key_hash, "root key hash")?;
+    validate_hash(&anchor.previous_root_hash, "previous root hash")?;
+    if anchor.root_state != "committed" {
+        bail!("CoreStore root anchor state must be committed");
+    }
+    if anchor.publisher_node_id.is_empty() {
+        bail!("CoreStore root anchor publisher node id must not be empty");
+    }
+    if anchor.publisher_epoch == 0 || anchor.partition_owner_fence == 0 {
+        bail!("CoreStore root anchor publisher epoch and owner fence must be nonzero");
+    }
+    if let Some(locator) = &anchor.transaction_manifest {
+        validate_manifest_locator(locator)?;
+    }
+    if let Some(locator) = &anchor.checkpoint_manifest {
+        validate_manifest_locator(locator)?;
+    }
+    Ok(())
+}
+
+fn hash_root_anchor_record(anchor: &CoreRootAnchorRecord) -> Result<String> {
+    Ok(format!(
+        "sha256:{}",
+        sha256_hex(&encode_root_anchor_record(anchor)?)
+    ))
+}
+
+fn encode_root_anchor_record(anchor: &CoreRootAnchorRecord) -> Result<Vec<u8>> {
+    validate_root_anchor_record(anchor)?;
+    let header = serde_json::json!({
+        "schema": &anchor.schema,
+        "root_anchor_key": &anchor.root_anchor_key,
+        "root_key_hash": &anchor.root_key_hash,
+        "root_generation": anchor.root_generation,
+        "previous_root_hash": &anchor.previous_root_hash,
+        "transaction_manifest": &anchor.transaction_manifest,
+        "checkpoint_manifest": &anchor.checkpoint_manifest,
+        "publisher_node_id": &anchor.publisher_node_id,
+        "publisher_epoch": anchor.publisher_epoch,
+        "partition_owner_fence": anchor.partition_owner_fence,
+        "created_at_unix_nanos": anchor.created_at_unix_nanos,
+    });
+    let body = serde_json::json!({
+        "root_state": &anchor.root_state,
+        "mutation_first": &anchor.mutation_first,
+        "mutation_last": &anchor.mutation_last,
+        "writer_families": &anchor.writer_families,
+        "manifest_count": anchor.manifest_count,
+        "final_block_count": anchor.final_block_count,
+    });
+    let header_json = serde_json::to_vec(&header)?;
+    let body_json = serde_json::to_vec(&body)?;
+    let mut out = Vec::with_capacity(
+        CORE_ROOT_ANCHOR_MAGIC.len() + 2 + 4 + 8 + header_json.len() + body_json.len() + 4 + 32,
+    );
+    out.extend_from_slice(CORE_ROOT_ANCHOR_MAGIC);
+    out.extend_from_slice(&CORE_ROOT_ANCHOR_VERSION.to_le_bytes());
+    out.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(body_json.len() as u64).to_le_bytes());
+    out.extend_from_slice(&header_json);
+    out.extend_from_slice(&body_json);
+    let mut crc_input = Vec::with_capacity(header_json.len() + body_json.len());
+    crc_input.extend_from_slice(&header_json);
+    crc_input.extend_from_slice(&body_json);
+    out.extend_from_slice(&crc32c(&crc_input).to_le_bytes());
+    let file_hash = Sha256::digest(&out);
+    out.extend_from_slice(&file_hash);
+    Ok(out)
+}
+
+fn decode_root_anchor_record(bytes: &[u8]) -> Result<CoreRootAnchorRecord> {
+    let mut offset = 0usize;
+    let magic = read_exact(bytes, &mut offset, CORE_ROOT_ANCHOR_MAGIC.len())?;
+    if magic != CORE_ROOT_ANCHOR_MAGIC {
+        bail!("CoreStore root anchor has invalid magic");
+    }
+    let version = read_u16_le(bytes, &mut offset)?;
+    if version != CORE_ROOT_ANCHOR_VERSION {
+        bail!("CoreStore root anchor has unsupported version {version}");
+    }
+    let header_len = read_u32_le(bytes, &mut offset)? as usize;
+    let body_len = read_u64_le(bytes, &mut offset)? as usize;
+    let header_json = read_exact(bytes, &mut offset, header_len)?;
+    let body_json = read_exact(bytes, &mut offset, body_len)?;
+    let expected_crc = read_u32_le(bytes, &mut offset)?;
+    let mut crc_input = Vec::with_capacity(header_json.len() + body_json.len());
+    crc_input.extend_from_slice(header_json);
+    crc_input.extend_from_slice(body_json);
+    if crc32c(&crc_input) != expected_crc {
+        bail!("CoreStore root anchor checksum mismatch");
+    }
+    let hash_start = offset;
+    let expected_hash = read_exact(bytes, &mut offset, 32)?;
+    if offset != bytes.len() {
+        bail!("CoreStore root anchor has trailing bytes");
+    }
+    let actual_hash = Sha256::digest(&bytes[..hash_start]);
+    let actual_hash: &[u8] = actual_hash.as_ref();
+    if expected_hash != actual_hash {
+        bail!("CoreStore root anchor file hash mismatch");
+    }
+    let header: serde_json::Value = serde_json::from_slice(header_json)?;
+    let body: serde_json::Value = serde_json::from_slice(body_json)?;
+    let anchor = CoreRootAnchorRecord {
+        schema: json_required_string(&header, "schema")?,
+        root_anchor_key: json_required_string(&header, "root_anchor_key")?,
+        root_key_hash: json_required_string(&header, "root_key_hash")?,
+        root_generation: json_required_u64(&header, "root_generation")?,
+        previous_root_hash: json_required_string(&header, "previous_root_hash")?,
+        transaction_manifest: header
+            .get("transaction_manifest")
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?,
+        checkpoint_manifest: header
+            .get("checkpoint_manifest")
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?,
+        publisher_node_id: json_required_string(&header, "publisher_node_id")?,
+        publisher_epoch: json_required_u64(&header, "publisher_epoch")?,
+        partition_owner_fence: json_required_u64(&header, "partition_owner_fence")?,
+        created_at_unix_nanos: json_required_u64(&header, "created_at_unix_nanos")?,
+        root_state: json_required_string(&body, "root_state")?,
+        mutation_first: json_optional_string(&body, "mutation_first")?,
+        mutation_last: json_optional_string(&body, "mutation_last")?,
+        writer_families: serde_json::from_value(
+            body.get("writer_families")
+                .cloned()
+                .ok_or_else(|| anyhow!("CoreStore root anchor is missing writer_families"))?,
+        )?,
+        manifest_count: json_required_u64(&body, "manifest_count")?,
+        final_block_count: json_required_u64(&body, "final_block_count")?,
+    };
+    validate_root_anchor_record(&anchor)?;
+    Ok(anchor)
+}
+
+fn encode_root_register_shard_file(
+    header: &CoreRootRegisterHeader,
+    root_anchor_record: &[u8],
+) -> Result<Vec<u8>> {
+    validate_hash(&header.root_key_hash, "root register key hash")?;
+    validate_hash(&header.root_anchor_hash, "root register anchor hash")?;
+    let root_key_hash = decode_sha256_hash_bytes(&header.root_key_hash)?;
+    let header_json = serde_json::to_vec(header)?;
+    let mut out = Vec::with_capacity(
+        CORE_ROOT_REGISTER_MAGIC.len()
+            + 2
+            + 8
+            + 32
+            + 8
+            + 2
+            + 4
+            + 8
+            + header_json.len()
+            + root_anchor_record.len()
+            + 4
+            + 32,
+    );
+    out.extend_from_slice(CORE_ROOT_REGISTER_MAGIC);
+    out.extend_from_slice(&CORE_ROOT_REGISTER_VERSION.to_le_bytes());
+    out.extend_from_slice(&header.root_partition_id.to_le_bytes());
+    out.extend_from_slice(&root_key_hash);
+    out.extend_from_slice(&header.root_generation.to_le_bytes());
+    out.extend_from_slice(&header.shard_index.to_le_bytes());
+    out.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(root_anchor_record.len() as u64).to_le_bytes());
+    out.extend_from_slice(&header_json);
+    out.extend_from_slice(root_anchor_record);
+    let checksum_start = CORE_ROOT_REGISTER_MAGIC.len();
+    out.extend_from_slice(&crc32c(&out[checksum_start..]).to_le_bytes());
+    let file_hash = Sha256::digest(&out);
+    out.extend_from_slice(&file_hash);
+    Ok(out)
+}
+
+fn decode_root_register_shard_file(
+    bytes: &[u8],
+) -> Result<(CoreRootRegisterHeader, CoreRootAnchorRecord)> {
+    let mut offset = 0usize;
+    let magic = read_exact(bytes, &mut offset, CORE_ROOT_REGISTER_MAGIC.len())?;
+    if magic != CORE_ROOT_REGISTER_MAGIC {
+        bail!("CoreStore root register shard has invalid magic");
+    }
+    let version = read_u16_le(bytes, &mut offset)?;
+    if version != CORE_ROOT_REGISTER_VERSION {
+        bail!("CoreStore root register shard has unsupported version {version}");
+    }
+    let root_partition_id = read_u64_le(bytes, &mut offset)?;
+    let root_key_hash_bytes = read_exact(bytes, &mut offset, 32)?;
+    let root_key_hash = format!("sha256:{}", hex::encode(root_key_hash_bytes));
+    let root_generation = read_u64_le(bytes, &mut offset)?;
+    let shard_index = read_u16_le(bytes, &mut offset)?;
+    let header_len = read_u32_le(bytes, &mut offset)? as usize;
+    let root_anchor_len = read_u64_le(bytes, &mut offset)? as usize;
+    let header_json = read_exact(bytes, &mut offset, header_len)?;
+    let root_anchor_record = read_exact(bytes, &mut offset, root_anchor_len)?;
+    let expected_crc = read_u32_le(bytes, &mut offset)?;
+    let checksum_start = CORE_ROOT_REGISTER_MAGIC.len();
+    let checksum_end = offset - 4;
+    if crc32c(&bytes[checksum_start..checksum_end]) != expected_crc {
+        bail!("CoreStore root register shard checksum mismatch");
+    }
+    let hash_start = offset;
+    let expected_hash = read_exact(bytes, &mut offset, 32)?;
+    if offset != bytes.len() {
+        bail!("CoreStore root register shard has trailing bytes");
+    }
+    let actual_hash = Sha256::digest(&bytes[..hash_start]);
+    let actual_hash: &[u8] = actual_hash.as_ref();
+    if expected_hash != actual_hash {
+        bail!("CoreStore root register shard file hash mismatch");
+    }
+    let header: CoreRootRegisterHeader = serde_json::from_slice(header_json)?;
+    if header.root_partition_id != root_partition_id
+        || header.root_key_hash != root_key_hash
+        || header.root_generation != root_generation
+        || header.shard_index != shard_index
+    {
+        bail!("CoreStore root register fixed fields do not match header");
+    }
+    let anchor = decode_root_anchor_record(root_anchor_record)?;
+    Ok((header, anchor))
+}
+
+fn decode_sha256_hash_bytes(hash: &str) -> Result<[u8; 32]> {
+    let raw = strip_sha256_prefix(hash)?;
+    let bytes = hex::decode(raw)?;
+    Ok(bytes
+        .try_into()
+        .map_err(|_| anyhow!("CoreStore hash did not decode to 32 bytes"))?)
+}
+
 fn root_catalog_region(catalog: &CoreRootCatalog) -> String {
     catalog
         .root_partitions
@@ -7523,29 +7949,6 @@ fn decode_active_stream_records(stream_id: &str, bytes: &[u8]) -> Result<Vec<Str
     Ok(records)
 }
 
-fn decode_active_stream_records_page(
-    stream_id: &str,
-    bytes: &[u8],
-    after_sequence: u64,
-    limit: usize,
-) -> Result<Vec<StreamRecord>> {
-    validate_active_stream_hash(bytes)?;
-    let (mut offset, record_count) = decode_active_stream_header(stream_id, bytes)?;
-    let mut records = Vec::with_capacity(limit.min(record_count as usize));
-    let mut previous = None;
-    for _ in 0..record_count {
-        if limit > 0 && records.len() >= limit {
-            break;
-        }
-        let record = decode_active_stream_record(stream_id, bytes, &mut offset, previous.as_ref())?;
-        previous = Some(record.clone());
-        if record.sequence > after_sequence {
-            records.push(record);
-        }
-    }
-    Ok(records)
-}
-
 fn decode_active_stream_header(stream_id: &str, bytes: &[u8]) -> Result<(usize, u64)> {
     let mut offset = 0usize;
     let magic = read_exact(bytes, &mut offset, CORE_ACTIVE_STREAM_MAGIC.len())?;
@@ -7586,20 +7989,6 @@ fn decode_active_stream_record(
     }
     verify_stream_record(previous, &record)?;
     Ok(record)
-}
-
-fn validate_active_stream_hash(bytes: &[u8]) -> Result<()> {
-    if bytes.len() < 32 {
-        bail!("CoreStore active stream is too short for hash");
-    }
-    let stream_hash_start = bytes.len() - 32;
-    let stream_hash = &bytes[stream_hash_start..];
-    let actual_stream_hash = Sha256::digest(&bytes[..stream_hash_start]);
-    let actual_stream_hash: &[u8] = actual_stream_hash.as_ref();
-    if stream_hash != actual_stream_hash {
-        bail!("CoreStore active stream hash mismatch");
-    }
-    Ok(())
 }
 
 fn encode_stream_segment(
@@ -8268,6 +8657,22 @@ mod tests {
             landed_bytes: Vec::new(),
             created_at_unix_nanos,
         }
+    }
+
+    fn count_files_with_extension(root: &std::path::Path, extension: &str) -> usize {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return 0;
+        };
+        let mut count = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                count += count_files_with_extension(&path, extension);
+            } else if path.extension().is_some_and(|actual| actual == extension) {
+                count += 1;
+            }
+        }
+        count
     }
 
     fn test_object_ref_for_payload(
@@ -10230,7 +10635,17 @@ mod tests {
         }
 
         for node_id in local_control_node_ids() {
-            let path = store.stream_replica_path(&node_id, "tenant:t/bucket:b/ranged-stream");
+            let path = tmp
+                .path()
+                .join("_core")
+                .join("replicas")
+                .join(&node_id)
+                .join("streams")
+                .join("data")
+                .join(format!(
+                    "{}.anstream",
+                    logical_file_name("tenant:t/bucket:b/ranged-stream")
+                ));
             assert!(
                 !path.exists(),
                 "non-transaction stream state must not be stored in direct replica files"
@@ -10258,6 +10673,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(full.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn core_store_transaction_stream_is_root_anchored_not_direct_replica_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+
+        store
+            .append_stream(AppendStreamRecord {
+                stream_id: "tenant:t/bucket:b/root-anchor-proof".to_string(),
+                partition_id: "tenant:t/bucket:b".to_string(),
+                record_kind: "event.root_anchor_proof".to_string(),
+                payload: br#"{"ok":true}"#.to_vec(),
+                fence: None,
+                transaction_id: None,
+                idempotency_key: Some("root-anchor-proof".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let direct_core_stream_file = tmp
+            .path()
+            .join("_core")
+            .join("replicas")
+            .join(local_control_node_id(1))
+            .join("streams")
+            .join("data")
+            .join(format!(
+                "{}.anstream",
+                logical_file_name(CORE_TRANSACTION_STREAM_ID)
+            ));
+        assert!(
+            !direct_core_stream_file.exists(),
+            "CoreStore transaction stream must be rooted in register anchors, not direct .anstream replicas"
+        );
+
+        let register_root = tmp
+            .path()
+            .join("_core")
+            .join("blocks")
+            .join("register")
+            .join(CORE_TRANSACTION_ROOT_PARTITION_ID.to_string());
+        let register_shard_count = count_files_with_extension(&register_root, "anr");
+        assert!(
+            register_shard_count >= 3,
+            "CoreStore root register must contain root-register-r3 shard files"
+        );
+
+        drop(store);
+        let recovered = CoreStore::new(storage).await.unwrap();
+        let records = recovered
+            .read_direct_stream_records(CORE_TRANSACTION_STREAM_ID)
+            .await
+            .unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|record| record.record_kind == CORE_WAL_FINALISATION_RECORD_KIND),
+            "CoreStore must recover transaction stream records from the latest root anchor"
+        );
     }
 
     #[tokio::test]

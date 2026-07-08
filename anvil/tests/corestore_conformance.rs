@@ -529,6 +529,38 @@ fn count_stream_name_sidecar_dirs(root: &Path) -> usize {
         .count()
 }
 
+fn count_files_with_extension(root: &Path, extension: &str) -> usize {
+    let Ok(entries) = fs::read_dir(root) else {
+        return 0;
+    };
+    let mut count = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            count += count_files_with_extension(&path, extension);
+        } else if path.extension().is_some_and(|actual| actual == extension) {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn count_files_named(root: &Path, file_name: &str) -> usize {
+    let Ok(entries) = fs::read_dir(root) else {
+        return 0;
+    };
+    let mut count = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            count += count_files_named(&path, file_name);
+        } else if path.file_name().is_some_and(|actual| actual == file_name) {
+            count += 1;
+        }
+    }
+    count
+}
+
 #[test]
 fn rfc_0006_protected_writers_use_commit_time_partition_preconditions() {
     let protected_writers = [
@@ -1124,6 +1156,46 @@ async fn rfc_0006_corestore_streams_are_chained_and_idempotent() {
     assert_eq!(watched[0].event_type, "audit.updated");
     assert_eq!(watched[0].transaction_id, None);
     assert_eq!(watched[0].payload_hash, records[1].payload_hash);
+}
+
+#[tokio::test]
+async fn rfc_0007_core_transaction_stream_uses_root_register_not_direct_anstream() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = CoreStore::new(storage).await.unwrap();
+
+    store
+        .append_stream(AppendStreamRecord {
+            stream_id: "object_metadata:tenant:root-register-proof".to_string(),
+            partition_id: "tenant:root-register-proof".to_string(),
+            record_kind: "object_metadata.put".to_string(),
+            payload: br#"{"object":"proof"}"#.to_vec(),
+            fence: None,
+            transaction_id: None,
+            idempotency_key: Some("root-register-proof".to_string()),
+        })
+        .await
+        .unwrap();
+
+    let core_stream_file = format!(
+        "{}.anstream",
+        hex::encode(Sha256::digest(b"core_transactions"))
+    );
+    assert_eq!(
+        count_files_named(
+            &tmp.path().join("_core").join("replicas"),
+            &core_stream_file
+        ),
+        0,
+        "RFC 0007 forbids direct transaction .anstream replicas; discovery must start from root register anchors"
+    );
+    assert!(
+        count_files_with_extension(
+            &tmp.path().join("_core").join("blocks").join("register"),
+            "anr"
+        ) >= 3,
+        "RFC 0007 root-register-r3 must persist transaction root anchors as .anr shards"
+    );
 }
 
 #[tokio::test]
