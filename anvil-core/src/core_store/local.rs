@@ -6627,8 +6627,13 @@ fn descriptor_hash(parts: &[&str]) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MinimalCborValue {
-    Text(String),
+    Null,
+    Bool(bool),
     U64(u64),
+    I64(i64),
+    Text(String),
+    Array(Vec<MinimalCborValue>),
+    Map(BTreeMap<String, MinimalCborValue>),
 }
 
 #[derive(Debug, Clone)]
@@ -6965,49 +6970,195 @@ fn expect_cbor_u64(
 
 fn encode_minimal_cbor_map(map: &BTreeMap<String, MinimalCborValue>) -> Vec<u8> {
     let mut out = Vec::new();
-    push_cbor_type_len(&mut out, 5, map.len() as u64);
-    for (key, value) in map {
-        push_cbor_text(&mut out, key);
-        match value {
-            MinimalCborValue::Text(value) => push_cbor_text(&mut out, value),
-            MinimalCborValue::U64(value) => push_cbor_type_len(&mut out, 0, *value),
-        }
-    }
+    push_cbor_map(&mut out, map);
     out
+}
+
+fn encode_canonical_cbor_json(value: &serde_json::Value) -> Result<Vec<u8>> {
+    let value = minimal_cbor_value_from_json(value)?;
+    let mut out = Vec::new();
+    push_minimal_cbor_value(&mut out, &value);
+    Ok(out)
+}
+
+fn decode_canonical_cbor_json(bytes: &[u8]) -> Result<serde_json::Value> {
+    let mut offset = 0usize;
+    let value = read_minimal_cbor_value(bytes, &mut offset)?;
+    if offset != bytes.len() {
+        bail!("CoreStore canonical CBOR value has trailing bytes");
+    }
+    let encoded = {
+        let mut out = Vec::new();
+        push_minimal_cbor_value(&mut out, &value);
+        out
+    };
+    if encoded != bytes {
+        bail!("CoreStore CBOR value is not canonical");
+    }
+    minimal_cbor_value_to_json(value)
 }
 
 fn decode_minimal_cbor_map(bytes: &[u8]) -> Result<BTreeMap<String, MinimalCborValue>> {
     let mut offset = 0usize;
-    let (major, len) = read_cbor_type_len(bytes, &mut offset)?;
-    if major != 5 {
-        bail!("CoreStore block shard header CBOR is not a map");
-    }
-    let mut previous_key = None::<String>;
-    let mut map = BTreeMap::new();
-    for _ in 0..len {
-        let key = read_cbor_text(bytes, &mut offset)?;
-        if previous_key
-            .as_ref()
-            .is_some_and(|previous| previous >= &key)
-        {
-            bail!("CoreStore block shard header CBOR map keys are not canonical");
-        }
-        previous_key = Some(key.clone());
-        let (major, value_len) = read_cbor_type_len(bytes, &mut offset)?;
-        let value = match major {
-            0 => MinimalCborValue::U64(value_len),
-            3 => {
-                let raw = read_exact(bytes, &mut offset, value_len as usize)?;
-                MinimalCborValue::Text(std::str::from_utf8(raw)?.to_string())
-            }
-            _ => bail!("CoreStore block shard header CBOR has unsupported value type"),
-        };
-        map.insert(key, value);
-    }
+    let value = read_minimal_cbor_value(bytes, &mut offset)?;
     if offset != bytes.len() {
         bail!("CoreStore block shard header CBOR has trailing bytes");
     }
+    let MinimalCborValue::Map(map) = value else {
+        bail!("CoreStore block shard header CBOR is not a map");
+    };
+    let encoded = encode_minimal_cbor_map(&map);
+    if encoded != bytes {
+        bail!("CoreStore block shard header CBOR map keys are not canonical");
+    }
     Ok(map)
+}
+
+fn minimal_cbor_value_from_json(value: &serde_json::Value) -> Result<MinimalCborValue> {
+    Ok(match value {
+        serde_json::Value::Null => MinimalCborValue::Null,
+        serde_json::Value::Bool(value) => MinimalCborValue::Bool(*value),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_u64() {
+                MinimalCborValue::U64(value)
+            } else if let Some(value) = value.as_i64() {
+                MinimalCborValue::I64(value)
+            } else {
+                bail!("CoreStore canonical CBOR does not support floating point numbers");
+            }
+        }
+        serde_json::Value::String(value) => MinimalCborValue::Text(value.clone()),
+        serde_json::Value::Array(values) => MinimalCborValue::Array(
+            values
+                .iter()
+                .map(minimal_cbor_value_from_json)
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        serde_json::Value::Object(values) => {
+            let mut map = BTreeMap::new();
+            for (key, value) in values {
+                map.insert(key.clone(), minimal_cbor_value_from_json(value)?);
+            }
+            MinimalCborValue::Map(map)
+        }
+    })
+}
+
+fn minimal_cbor_value_to_json(value: MinimalCborValue) -> Result<serde_json::Value> {
+    Ok(match value {
+        MinimalCborValue::Null => serde_json::Value::Null,
+        MinimalCborValue::Bool(value) => serde_json::Value::Bool(value),
+        MinimalCborValue::U64(value) => serde_json::Value::Number(value.into()),
+        MinimalCborValue::I64(value) => serde_json::Value::Number(value.into()),
+        MinimalCborValue::Text(value) => serde_json::Value::String(value),
+        MinimalCborValue::Array(values) => serde_json::Value::Array(
+            values
+                .into_iter()
+                .map(minimal_cbor_value_to_json)
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        MinimalCborValue::Map(values) => {
+            let mut map = serde_json::Map::new();
+            for (key, value) in values {
+                map.insert(key, minimal_cbor_value_to_json(value)?);
+            }
+            serde_json::Value::Object(map)
+        }
+    })
+}
+
+fn push_minimal_cbor_value(out: &mut Vec<u8>, value: &MinimalCborValue) {
+    match value {
+        MinimalCborValue::Null => out.push(0xf6),
+        MinimalCborValue::Bool(false) => out.push(0xf4),
+        MinimalCborValue::Bool(true) => out.push(0xf5),
+        MinimalCborValue::U64(value) => push_cbor_type_len(out, 0, *value),
+        MinimalCborValue::I64(value) => {
+            if *value >= 0 {
+                push_cbor_type_len(out, 0, *value as u64);
+            } else {
+                push_cbor_type_len(out, 1, (-1_i128 - i128::from(*value)) as u64);
+            }
+        }
+        MinimalCborValue::Text(value) => push_cbor_text(out, value),
+        MinimalCborValue::Array(values) => {
+            push_cbor_type_len(out, 4, values.len() as u64);
+            for value in values {
+                push_minimal_cbor_value(out, value);
+            }
+        }
+        MinimalCborValue::Map(map) => push_cbor_map(out, map),
+    }
+}
+
+fn push_cbor_map(out: &mut Vec<u8>, map: &BTreeMap<String, MinimalCborValue>) {
+    push_cbor_type_len(out, 5, map.len() as u64);
+    let mut entries = map
+        .iter()
+        .map(|(key, value)| (encode_cbor_text_key(key), key, value))
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    for (encoded_key, _key, value) in entries {
+        out.extend_from_slice(&encoded_key);
+        push_minimal_cbor_value(out, value);
+    }
+}
+
+fn read_minimal_cbor_value(bytes: &[u8], offset: &mut usize) -> Result<MinimalCborValue> {
+    let (major, value_len) = read_cbor_type_len(bytes, offset)?;
+    match major {
+        0 => Ok(MinimalCborValue::U64(value_len)),
+        1 => {
+            if value_len > i64::MAX as u64 {
+                bail!("CoreStore CBOR negative integer is too small");
+            }
+            Ok(MinimalCborValue::I64(-1 - value_len as i64))
+        }
+        3 => {
+            let raw = read_exact(bytes, offset, value_len as usize)?;
+            Ok(MinimalCborValue::Text(
+                std::str::from_utf8(raw)?.to_string(),
+            ))
+        }
+        4 => {
+            let mut values = Vec::with_capacity(value_len as usize);
+            for _ in 0..value_len {
+                values.push(read_minimal_cbor_value(bytes, offset)?);
+            }
+            Ok(MinimalCborValue::Array(values))
+        }
+        5 => {
+            let mut previous_key = None::<Vec<u8>>;
+            let mut map = BTreeMap::new();
+            for _ in 0..value_len {
+                let key_start = *offset;
+                let key = read_cbor_text(bytes, offset)?;
+                let key_bytes = bytes[key_start..*offset].to_vec();
+                if previous_key
+                    .as_ref()
+                    .is_some_and(|previous| previous >= &key_bytes)
+                {
+                    bail!("CoreStore CBOR map keys are not canonical");
+                }
+                previous_key = Some(key_bytes);
+                map.insert(key, read_minimal_cbor_value(bytes, offset)?);
+            }
+            Ok(MinimalCborValue::Map(map))
+        }
+        7 => match value_len {
+            20 => Ok(MinimalCborValue::Bool(false)),
+            21 => Ok(MinimalCborValue::Bool(true)),
+            22 => Ok(MinimalCborValue::Null),
+            other => bail!("CoreStore CBOR simple value {other} is unsupported"),
+        },
+        _ => bail!("CoreStore CBOR major type {major} is unsupported"),
+    }
+}
+
+fn encode_cbor_text_key(value: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_cbor_text(&mut out, value);
+    out
 }
 
 fn push_cbor_text(out: &mut Vec<u8>, value: &str) {
@@ -7836,20 +7987,20 @@ fn encode_transaction_manifest_record(
         "mutation_count": transaction.mutation_ids.len(),
         "logical_manifest_count": transaction.logical_manifests.len(),
     });
-    let header_json = serde_json::to_vec(&header)?;
-    let body_json = serde_json::to_vec(transaction)?;
+    let header_cbor = encode_canonical_cbor_json(&header)?;
+    let body_cbor = encode_canonical_cbor_json(&serde_json::to_value(transaction)?)?;
     let mut out = Vec::with_capacity(
-        CORE_TRANSACTION_MANIFEST_MAGIC.len() + 2 + 4 + 8 + header_json.len() + body_json.len() + 4,
+        CORE_TRANSACTION_MANIFEST_MAGIC.len() + 2 + 4 + 8 + header_cbor.len() + body_cbor.len() + 4,
     );
     out.extend_from_slice(CORE_TRANSACTION_MANIFEST_MAGIC);
     out.extend_from_slice(&CORE_TRANSACTION_MANIFEST_VERSION.to_le_bytes());
-    out.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
-    out.extend_from_slice(&(body_json.len() as u64).to_le_bytes());
-    out.extend_from_slice(&header_json);
-    out.extend_from_slice(&body_json);
-    let mut crc_input = Vec::with_capacity(header_json.len() + body_json.len());
-    crc_input.extend_from_slice(&header_json);
-    crc_input.extend_from_slice(&body_json);
+    out.extend_from_slice(&(header_cbor.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(body_cbor.len() as u64).to_le_bytes());
+    out.extend_from_slice(&header_cbor);
+    out.extend_from_slice(&body_cbor);
+    let mut crc_input = Vec::with_capacity(header_cbor.len() + body_cbor.len());
+    crc_input.extend_from_slice(&header_cbor);
+    crc_input.extend_from_slice(&body_cbor);
     out.extend_from_slice(&crc32c(&crc_input).to_le_bytes());
     Ok(out)
 }
@@ -7866,23 +8017,24 @@ fn decode_transaction_manifest_record(bytes: &[u8]) -> Result<CoreTransactionMan
     }
     let header_len = read_u32_le(bytes, &mut offset)? as usize;
     let body_len = read_u64_le(bytes, &mut offset)? as usize;
-    let header_json = read_exact(bytes, &mut offset, header_len)?;
-    let body_json = read_exact(bytes, &mut offset, body_len)?;
+    let header_cbor = read_exact(bytes, &mut offset, header_len)?;
+    let body_cbor = read_exact(bytes, &mut offset, body_len)?;
     let expected_crc = read_u32_le(bytes, &mut offset)?;
     if offset != bytes.len() {
         bail!("CoreStore transaction manifest has trailing bytes");
     }
-    let mut crc_input = Vec::with_capacity(header_json.len() + body_json.len());
-    crc_input.extend_from_slice(header_json);
-    crc_input.extend_from_slice(body_json);
+    let mut crc_input = Vec::with_capacity(header_cbor.len() + body_cbor.len());
+    crc_input.extend_from_slice(header_cbor);
+    crc_input.extend_from_slice(body_cbor);
     if crc32c(&crc_input) != expected_crc {
         bail!("CoreStore transaction manifest checksum mismatch");
     }
-    let header: serde_json::Value = serde_json::from_slice(header_json)?;
+    let header = decode_canonical_cbor_json(header_cbor)?;
     if json_required_string(&header, "schema")? != "anvil.core.transaction_manifest.v1" {
         bail!("CoreStore transaction manifest header has invalid schema");
     }
-    let transaction: CoreTransactionManifestRecord = serde_json::from_slice(body_json)?;
+    let transaction: CoreTransactionManifestRecord =
+        serde_json::from_value(decode_canonical_cbor_json(body_cbor)?)?;
     if json_required_u64(&header, "pre_root_generation")? != transaction.pre_root_generation
         || json_required_u64(&header, "post_root_generation")? != transaction.post_root_generation
         || json_required_u64(&header, "mutation_count")? != transaction.mutation_ids.len() as u64
@@ -7924,20 +8076,20 @@ fn encode_root_anchor_record(anchor: &CoreRootAnchorRecord) -> Result<Vec<u8>> {
         "manifest_count": anchor.manifest_count,
         "final_block_count": anchor.final_block_count,
     });
-    let header_json = serde_json::to_vec(&header)?;
-    let body_json = serde_json::to_vec(&body)?;
+    let header_cbor = encode_canonical_cbor_json(&header)?;
+    let body_cbor = encode_canonical_cbor_json(&body)?;
     let mut out = Vec::with_capacity(
-        CORE_ROOT_ANCHOR_MAGIC.len() + 2 + 4 + 8 + header_json.len() + body_json.len() + 4 + 32,
+        CORE_ROOT_ANCHOR_MAGIC.len() + 2 + 4 + 8 + header_cbor.len() + body_cbor.len() + 4 + 32,
     );
     out.extend_from_slice(CORE_ROOT_ANCHOR_MAGIC);
     out.extend_from_slice(&CORE_ROOT_ANCHOR_VERSION.to_le_bytes());
-    out.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
-    out.extend_from_slice(&(body_json.len() as u64).to_le_bytes());
-    out.extend_from_slice(&header_json);
-    out.extend_from_slice(&body_json);
-    let mut crc_input = Vec::with_capacity(header_json.len() + body_json.len());
-    crc_input.extend_from_slice(&header_json);
-    crc_input.extend_from_slice(&body_json);
+    out.extend_from_slice(&(header_cbor.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(body_cbor.len() as u64).to_le_bytes());
+    out.extend_from_slice(&header_cbor);
+    out.extend_from_slice(&body_cbor);
+    let mut crc_input = Vec::with_capacity(header_cbor.len() + body_cbor.len());
+    crc_input.extend_from_slice(&header_cbor);
+    crc_input.extend_from_slice(&body_cbor);
     out.extend_from_slice(&crc32c(&crc_input).to_le_bytes());
     let file_hash = Sha256::digest(&out);
     out.extend_from_slice(&file_hash);
@@ -7956,12 +8108,12 @@ fn decode_root_anchor_record(bytes: &[u8]) -> Result<CoreRootAnchorRecord> {
     }
     let header_len = read_u32_le(bytes, &mut offset)? as usize;
     let body_len = read_u64_le(bytes, &mut offset)? as usize;
-    let header_json = read_exact(bytes, &mut offset, header_len)?;
-    let body_json = read_exact(bytes, &mut offset, body_len)?;
+    let header_cbor = read_exact(bytes, &mut offset, header_len)?;
+    let body_cbor = read_exact(bytes, &mut offset, body_len)?;
     let expected_crc = read_u32_le(bytes, &mut offset)?;
-    let mut crc_input = Vec::with_capacity(header_json.len() + body_json.len());
-    crc_input.extend_from_slice(header_json);
-    crc_input.extend_from_slice(body_json);
+    let mut crc_input = Vec::with_capacity(header_cbor.len() + body_cbor.len());
+    crc_input.extend_from_slice(header_cbor);
+    crc_input.extend_from_slice(body_cbor);
     if crc32c(&crc_input) != expected_crc {
         bail!("CoreStore root anchor checksum mismatch");
     }
@@ -7975,8 +8127,8 @@ fn decode_root_anchor_record(bytes: &[u8]) -> Result<CoreRootAnchorRecord> {
     if expected_hash != actual_hash {
         bail!("CoreStore root anchor file hash mismatch");
     }
-    let header: serde_json::Value = serde_json::from_slice(header_json)?;
-    let body: serde_json::Value = serde_json::from_slice(body_json)?;
+    let header = decode_canonical_cbor_json(header_cbor)?;
+    let body = decode_canonical_cbor_json(body_cbor)?;
     let anchor = CoreRootAnchorRecord {
         schema: json_required_string(&header, "schema")?,
         root_anchor_key: json_required_string(&header, "root_anchor_key")?,
@@ -8019,7 +8171,7 @@ fn encode_root_register_shard_file(
     validate_hash(&header.root_key_hash, "root register key hash")?;
     validate_hash(&header.root_anchor_hash, "root register anchor hash")?;
     let root_key_hash = decode_sha256_hash_bytes(&header.root_key_hash)?;
-    let header_json = serde_json::to_vec(header)?;
+    let header_cbor = encode_canonical_cbor_json(&serde_json::to_value(header)?)?;
     let mut out = Vec::with_capacity(
         CORE_ROOT_REGISTER_MAGIC.len()
             + 2
@@ -8029,7 +8181,7 @@ fn encode_root_register_shard_file(
             + 2
             + 4
             + 8
-            + header_json.len()
+            + header_cbor.len()
             + root_anchor_record.len()
             + 4
             + 32,
@@ -8040,9 +8192,9 @@ fn encode_root_register_shard_file(
     out.extend_from_slice(&root_key_hash);
     out.extend_from_slice(&header.root_generation.to_le_bytes());
     out.extend_from_slice(&header.shard_index.to_le_bytes());
-    out.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(header_cbor.len() as u32).to_le_bytes());
     out.extend_from_slice(&(root_anchor_record.len() as u64).to_le_bytes());
-    out.extend_from_slice(&header_json);
+    out.extend_from_slice(&header_cbor);
     out.extend_from_slice(root_anchor_record);
     let checksum_start = CORE_ROOT_REGISTER_MAGIC.len();
     out.extend_from_slice(&crc32c(&out[checksum_start..]).to_le_bytes());
@@ -8070,7 +8222,7 @@ fn decode_root_register_shard_file(
     let shard_index = read_u16_le(bytes, &mut offset)?;
     let header_len = read_u32_le(bytes, &mut offset)? as usize;
     let root_anchor_len = read_u64_le(bytes, &mut offset)? as usize;
-    let header_json = read_exact(bytes, &mut offset, header_len)?;
+    let header_cbor = read_exact(bytes, &mut offset, header_len)?;
     let root_anchor_record = read_exact(bytes, &mut offset, root_anchor_len)?;
     let expected_crc = read_u32_le(bytes, &mut offset)?;
     let checksum_start = CORE_ROOT_REGISTER_MAGIC.len();
@@ -8088,7 +8240,8 @@ fn decode_root_register_shard_file(
     if expected_hash != actual_hash {
         bail!("CoreStore root register shard file hash mismatch");
     }
-    let header: CoreRootRegisterHeader = serde_json::from_slice(header_json)?;
+    let header: CoreRootRegisterHeader =
+        serde_json::from_value(decode_canonical_cbor_json(header_cbor)?)?;
     if header.root_partition_id != root_partition_id
         || header.root_key_hash != root_key_hash
         || header.root_generation != root_generation
@@ -11310,6 +11463,20 @@ mod tests {
             .await
             .unwrap();
         assert!(transaction_manifest_bytes.starts_with(CORE_TRANSACTION_MANIFEST_MAGIC));
+        let header_len_offset = CORE_TRANSACTION_MANIFEST_MAGIC.len() + 2;
+        let header_len = u32::from_le_bytes(
+            transaction_manifest_bytes[header_len_offset..header_len_offset + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let header_start = header_len_offset + 4 + 8;
+        let header_bytes = &transaction_manifest_bytes[header_start..header_start + header_len];
+        assert_eq!(
+            header_bytes[0] >> 5,
+            5,
+            "transaction manifest header must be canonical CBOR map"
+        );
+        assert!(serde_json::from_slice::<serde_json::Value>(header_bytes).is_err());
         let transaction_manifest = decode_transaction_manifest_record(&transaction_manifest_bytes)
             .expect("decode transaction manifest frame");
         assert_eq!(
