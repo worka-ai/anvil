@@ -2705,7 +2705,7 @@ impl CoreStore {
             landed_bytes,
             created_at_unix_nanos: unix_timestamp_nanos(),
         };
-        let header_json = serde_json::to_vec(&record)?;
+        let header_json = canonical_json_bytes(&record)?;
         let frame = encode_wal_frame(&header_json, payload)?;
         self.enforce_admission_capacity(frame.len() as u64, 0)
             .await?;
@@ -3127,7 +3127,7 @@ impl CoreStore {
         let mut compacted =
             encode_wal_file_header(CORE_WAL_NODE_ID, CORE_WAL_EPOCH, compacted_first_sequence)?;
         for (record, payload) in &retained {
-            let header_json = serde_json::to_vec(record)?;
+            let header_json = canonical_json_bytes(record)?;
             compacted.extend_from_slice(&encode_wal_frame(&header_json, payload)?);
         }
 
@@ -6734,6 +6734,52 @@ fn descriptor_hash(parts: &[&str]) -> String {
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
+fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    let value = serde_json::to_value(value)?;
+    let mut out = Vec::new();
+    write_canonical_json_value(&value, &mut out)?;
+    Ok(out)
+}
+
+fn write_canonical_json_value(value: &serde_json::Value, out: &mut Vec<u8>) -> Result<()> {
+    match value {
+        serde_json::Value::Null => out.extend_from_slice(b"null"),
+        serde_json::Value::Bool(true) => out.extend_from_slice(b"true"),
+        serde_json::Value::Bool(false) => out.extend_from_slice(b"false"),
+        serde_json::Value::Number(number) => out.extend_from_slice(number.to_string().as_bytes()),
+        serde_json::Value::String(value) => {
+            out.extend_from_slice(serde_json::to_string(value)?.as_bytes())
+        }
+        serde_json::Value::Array(values) => {
+            out.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                write_canonical_json_value(value, out)?;
+            }
+            out.push(b']');
+        }
+        serde_json::Value::Object(map) => {
+            out.push(b'{');
+            for (index, key) in map.keys().collect::<BTreeSet<_>>().into_iter().enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(serde_json::to_string(key)?.as_bytes());
+                out.push(b':');
+                write_canonical_json_value(
+                    map.get(key)
+                        .ok_or_else(|| anyhow!("canonical JSON object key disappeared"))?,
+                    out,
+                )?;
+            }
+            out.push(b'}');
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MinimalCborValue {
     Null,
@@ -9586,7 +9632,7 @@ mod tests {
         fs::create_dir_all(store.admission_wal_dir()).await.unwrap();
         let mut bytes = encode_wal_file_header(CORE_WAL_NODE_ID, CORE_WAL_EPOCH, 1).unwrap();
         for record in records {
-            let header = serde_json::to_vec(&record).unwrap();
+            let header = canonical_json_bytes(&record).unwrap();
             bytes.extend_from_slice(&encode_wal_frame(&header, &[]).unwrap());
         }
         fs::write(store.active_wal_path(), bytes).await.unwrap();
@@ -10838,6 +10884,61 @@ mod tests {
             meta.pointer("/boundary_values/0/name")
                 .and_then(serde_json::Value::as_str),
             Some("customer_tenant")
+        );
+    }
+
+    #[tokio::test]
+    async fn core_store_wal_header_uses_canonical_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        store
+            .admit_core_mutation(
+                "stream.append",
+                "stream",
+                serde_json::json!({
+                    "stream_id": "tenant:t/bucket:b/canonical-wal",
+                    "partition_id": "tenant:t/bucket:b",
+                    "record_kind": "event.created",
+                    "transaction_id": null,
+                }),
+                "canonical-wal-json".to_string(),
+                Some("canonical-idempotency".to_string()),
+                CoreWalPayload::Inline(br#"{"ok":true}"#),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let wal_bytes = tokio::fs::read(store.active_wal_path()).await.unwrap();
+        let decoded = decode_wal_records(&wal_bytes).unwrap();
+        let record = decoded.first().unwrap().0.clone();
+        let mut offset = 0usize;
+        assert_eq!(
+            read_exact(&wal_bytes, &mut offset, CORE_WAL_FILE_MAGIC.len()).unwrap(),
+            CORE_WAL_FILE_MAGIC
+        );
+        assert_eq!(
+            read_u16_le(&wal_bytes, &mut offset).unwrap(),
+            CORE_WAL_VERSION
+        );
+        let node_len = read_u16_le(&wal_bytes, &mut offset).unwrap() as usize;
+        let _node_id = read_exact(&wal_bytes, &mut offset, node_len).unwrap();
+        let _wal_epoch = read_u64_le(&wal_bytes, &mut offset).unwrap();
+        let _first_sequence = read_u64_le(&wal_bytes, &mut offset).unwrap();
+        let _created_at = read_u64_le(&wal_bytes, &mut offset).unwrap();
+        let _header_crc = read_u32_le(&wal_bytes, &mut offset).unwrap();
+        assert_eq!(
+            read_exact(&wal_bytes, &mut offset, CORE_WAL_FRAME_MAGIC.len()).unwrap(),
+            CORE_WAL_FRAME_MAGIC
+        );
+        let header_len = read_u32_le(&wal_bytes, &mut offset).unwrap() as usize;
+        let _payload_len = read_u64_le(&wal_bytes, &mut offset).unwrap();
+        let header_json = read_exact(&wal_bytes, &mut offset, header_len).unwrap();
+        assert_eq!(header_json, canonical_json_bytes(&record).unwrap());
+        assert!(
+            String::from_utf8_lossy(&header_json).starts_with("{\"anvil_storage_tenant_id\":"),
+            "WAL header JSON keys must be sorted bytewise"
         );
     }
 
