@@ -127,6 +127,7 @@ aws-credential-types = "1"   # for Credentials
 aws-smithy-runtime-api = "1" # for Identity
 
 aes-gcm = "0.10.3"
+aes-gcm-siv = "0.11.1"
 constant_time_eq = "0.4.2"
 http-body-util = "0.1.1"
 subtle = "2.6.1"

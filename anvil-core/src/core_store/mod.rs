@@ -15,7 +15,7 @@ use std::future::Future;
 use anyhow::Result;
 
 pub use encoding::*;
-pub use local::{CoreStore, CoreStoreCommitError, is_stream_head_mismatch};
+pub use local::{CorePipelineKeyring, CoreStore, CoreStoreCommitError, is_stream_head_mismatch};
 pub use types::*;
 
 pub trait CoreStoreBlockApi {

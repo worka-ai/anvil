@@ -171,6 +171,7 @@ pub struct CoreLogicalBlockRef {
     pub compressed_length: u64,
     pub encrypted_length: u64,
     pub content_hash: String,
+    pub encryption: CoreEncryptionDescriptor,
     pub erasure_set_id: String,
     pub shards: Vec<CoreLogicalShardRef>,
     pub codec_id: String,

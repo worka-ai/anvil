@@ -158,7 +158,11 @@ impl AppState {
         let arc_config = Arc::new(config);
         let jwt_manager = Arc::new(JwtManager::new(arc_config.jwt_secret.clone()));
         let storage = storage::Storage::new_at(&arc_config.storage_path).await?;
-        let core_store = core_store::CoreStore::new(storage.clone()).await?;
+        let core_store = core_store::CoreStore::new_with_pipeline_keyring(
+            storage.clone(),
+            arc_config.core_pipeline_keyring()?,
+        )
+        .await?;
         let cluster_state = Arc::new(RwLock::new(HashMap::new()));
         let persistence = persistence::Persistence::new(&arc_config, event_publisher)?;
         if !arc_config.region.is_empty() {

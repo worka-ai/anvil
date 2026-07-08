@@ -1,6 +1,8 @@
 use super::types::*;
 use crate::error_codes::AnvilErrorCode;
 use crate::storage::Storage;
+use aes_gcm_siv::aead::{Aead, AeadCore, OsRng, Payload};
+use aes_gcm_siv::{Aes256GcmSiv, Nonce};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -95,6 +97,8 @@ const CORE_WAL_FINALISATION_RECORD_KIND: &str = "core_wal.finalisation";
 const CORE_TRANSACTION_STREAM_ID: &str = "core_transactions";
 const CORE_TRANSACTION_PARTITION_ID: &str = "core-control";
 const CORE_TRANSACTION_RECORD_KIND: &str = "core_transaction";
+const CORE_PIPELINE_KEY_LEN: usize = 32;
+const CORE_PIPELINE_NONCE_LEN: usize = 12;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -122,7 +126,9 @@ struct MaterializedLogicalBlock {
     object_manifest: CoreObjectManifest,
     logical_offset: u64,
     logical_length: u64,
+    compressed_length: u64,
     plaintext_hash: String,
+    encryption: CoreEncryptionDescriptor,
 }
 
 impl LocalErasureProfile {
@@ -191,6 +197,84 @@ impl CoreAdmissionCapacityLimits {
 pub struct CoreStore {
     storage: Storage,
     write_lock: Arc<Mutex<()>>,
+    pipeline_keyring: Option<Arc<CorePipelineKeyring>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CorePipelineKeyring {
+    active_key_id: String,
+    keys: BTreeMap<String, [u8; CORE_PIPELINE_KEY_LEN]>,
+}
+
+impl CorePipelineKeyring {
+    pub fn new(
+        active_key_id: impl Into<String>,
+        active_key: [u8; CORE_PIPELINE_KEY_LEN],
+    ) -> Result<Self> {
+        let active_key_id = validate_pipeline_key_id(active_key_id.into())?;
+        let mut keys = BTreeMap::new();
+        keys.insert(active_key_id.clone(), active_key);
+        Ok(Self {
+            active_key_id,
+            keys,
+        })
+    }
+
+    pub fn from_hex_config(
+        active_key_id: &str,
+        active_key_hex: &str,
+        previous_keys: &str,
+    ) -> Result<Self> {
+        let mut keyring = Self::new(active_key_id, decode_pipeline_key_hex(active_key_hex)?)?;
+        for item in previous_keys
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+        {
+            let (key_id, key_hex) = item
+                .split_once(':')
+                .ok_or_else(|| anyhow!("previous CoreStore pipeline keys must be key_id:hex"))?;
+            keyring.insert_previous_key(key_id, decode_pipeline_key_hex(key_hex)?)?;
+        }
+        Ok(keyring)
+    }
+
+    pub fn active_key_id(&self) -> &str {
+        &self.active_key_id
+    }
+
+    pub fn insert_previous_key(
+        &mut self,
+        key_id: &str,
+        key: [u8; CORE_PIPELINE_KEY_LEN],
+    ) -> Result<()> {
+        let key_id = validate_pipeline_key_id(key_id.to_string())?;
+        if key_id == self.active_key_id {
+            bail!("previous CoreStore pipeline key id must not equal active key id");
+        }
+        if self.keys.insert(key_id.clone(), key).is_some() {
+            bail!("duplicate CoreStore pipeline key id '{key_id}'");
+        }
+        Ok(())
+    }
+
+    fn active_key(&self) -> Result<&[u8; CORE_PIPELINE_KEY_LEN]> {
+        self.keys
+            .get(&self.active_key_id)
+            .ok_or_else(|| anyhow!("active CoreStore pipeline key is not present in keyring"))
+    }
+
+    fn key(&self, key_id: &str) -> Result<&[u8; CORE_PIPELINE_KEY_LEN]> {
+        self.keys
+            .get(key_id)
+            .ok_or_else(|| anyhow!("CoreStore pipeline key id '{key_id}' is not configured"))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PipelineBlockBytes {
+    stored: Vec<u8>,
+    encryption: CoreEncryptionDescriptor,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -388,9 +472,24 @@ impl From<&StreamRecord> for StoredStreamRecord {
 
 impl CoreStore {
     pub async fn new(storage: Storage) -> Result<Self> {
+        Self::new_with_optional_pipeline_keyring(storage, None).await
+    }
+
+    pub async fn new_with_pipeline_keyring(
+        storage: Storage,
+        pipeline_keyring: CorePipelineKeyring,
+    ) -> Result<Self> {
+        Self::new_with_optional_pipeline_keyring(storage, Some(Arc::new(pipeline_keyring))).await
+    }
+
+    async fn new_with_optional_pipeline_keyring(
+        storage: Storage,
+        pipeline_keyring: Option<Arc<CorePipelineKeyring>>,
+    ) -> Result<Self> {
         let store = Self {
             storage,
             write_lock: Arc::new(Mutex::new(())),
+            pipeline_keyring,
         };
         store.ensure_layout().await?;
         store.recover_core_wal().await?;
@@ -411,17 +510,53 @@ impl CoreStore {
         input: PutBlob,
         profile: LocalErasureProfile,
     ) -> Result<CoreObjectRef> {
+        self.put_blob_with_profile_and_encoding(input, profile, "none", "object_blob")
+            .await
+    }
+
+    async fn put_logical_file_block_with_profile(
+        &self,
+        request: &WriteLogicalFileRequest,
+        block_index: usize,
+        bytes: Vec<u8>,
+        encryption_algorithm: String,
+        profile: LocalErasureProfile,
+    ) -> Result<CoreObjectRef> {
+        self.put_blob_with_profile_and_encoding(
+            PutBlob {
+                logical_name: format!("{}/block-{block_index:06}", request.logical_file_id),
+                bytes,
+                boundary_values: request.boundary_values.clone(),
+                region_id: request.region_id.clone(),
+                mutation_id: format!("{}-block-{block_index:06}", request.mutation_id),
+            },
+            profile,
+            &encryption_algorithm,
+            &request.writer_family,
+        )
+        .await
+    }
+
+    async fn put_blob_with_profile_and_encoding(
+        &self,
+        input: PutBlob,
+        profile: LocalErasureProfile,
+        encryption_algorithm: &str,
+        writer_family: &str,
+    ) -> Result<CoreObjectRef> {
         let _perf_guard = crate::perf::guard("anvil_core_store_op", &[("operation", "put_blob")]);
         self.ensure_layout().await?;
         validate_logical_id(&input.logical_name, "blob logical name")?;
+        validate_logical_id(writer_family, "blob writer family")?;
         let admission = self
             .admit_core_mutation(
                 "object.put",
-                "object_blob",
+                writer_family,
                 serde_json::json!({
                     "logical_name": input.logical_name.clone(),
                     "region_id": input.region_id.clone(),
                     "erasure_profile_id": profile.id,
+                    "encryption": encryption_algorithm,
                 }),
                 input.mutation_id.clone(),
                 None,
@@ -442,6 +577,8 @@ impl CoreStore {
                 &admission.boundary_values,
                 &admission.mutation_id,
                 profile,
+                encryption_algorithm,
+                writer_family,
             )
             .await?;
         self.mark_core_wal_finalised_unlocked(&admission, "committed")
@@ -456,6 +593,8 @@ impl CoreStore {
         boundary_values: &[CoreBoundaryValue],
         mutation_id: &str,
         profile: LocalErasureProfile,
+        encryption_algorithm: &str,
+        writer_family: &str,
     ) -> Result<CoreObjectRef> {
         if sha256_hex(materialised_bytes) != hash {
             bail!("CoreStore object materialisation hash mismatch");
@@ -486,10 +625,10 @@ impl CoreStore {
                     payload_plain_hash: format!("sha256:{shard_hash}"),
                     payload_stored_hash: format!("sha256:{shard_hash}"),
                     compression: "none".to_string(),
-                    encryption: "none".to_string(),
+                    encryption: encryption_algorithm.to_string(),
                     placement_epoch: LOCAL_PLACEMENT_EPOCH,
                     boundary_summary_hash: boundary_summary_hash(boundary_values)?,
-                    writer_family: "object_blob".to_string(),
+                    writer_family: writer_family.to_string(),
                     created_by_mutation_id: mutation_id.to_string(),
                 },
                 shard,
@@ -526,7 +665,7 @@ impl CoreStore {
                 stripe_size,
                 placement_scope: "region".to_string(),
                 repair_priority: "normal".to_string(),
-                encryption: "none".to_string(),
+                encryption: encryption_algorithm.to_string(),
             },
             placements: object_placements,
         })
@@ -774,9 +913,6 @@ impl CoreStore {
         validate_logical_id(&request.logical_file_id, "logical file id")?;
         validate_logical_id(&request.mutation_id, "logical file mutation id")?;
         let profile = local_erasure_profile(&request.pipeline_policy.erasure_profile_id)?;
-        if request.pipeline_policy.encryption != "none" {
-            bail!("CoreStore logical file encryption policy is not implemented for local backend");
-        }
         validate_pipeline_policy(&request.pipeline_policy, profile)?;
 
         let source = std::mem::take(&mut request.source);
@@ -792,15 +928,22 @@ impl CoreStore {
         } else {
             let (stored_source, compression) =
                 encode_logical_file_source(&request.pipeline_policy.compression, source)?;
+            let block_plain_hash = format!("sha256:{}", sha256_hex(&stored_source));
+            let pipeline_block = self.encrypt_pipeline_block(
+                &request.pipeline_policy,
+                &request.logical_file_id,
+                0,
+                0,
+                plaintext_len,
+                &block_plain_hash,
+                stored_source,
+            )?;
             let object_ref = self
-                .put_blob_with_profile(
-                    PutBlob {
-                        logical_name: format!("{}/block-000000", request.logical_file_id),
-                        bytes: stored_source,
-                        boundary_values: request.boundary_values.clone(),
-                        region_id: request.region_id.clone(),
-                        mutation_id: format!("{}-block-000000", request.mutation_id),
-                    },
+                .put_logical_file_block_with_profile(
+                    &request,
+                    0,
+                    pipeline_block.stored,
+                    pipeline_block.encryption.algorithm.clone(),
                     profile,
                 )
                 .await?;
@@ -810,7 +953,9 @@ impl CoreStore {
                     object_manifest,
                     logical_offset: 0,
                     logical_length: plaintext_len,
+                    compressed_length: compression.compressed_length,
                     plaintext_hash: plaintext_hash.clone(),
+                    encryption: pipeline_block.encryption,
                 }],
                 compression,
             )
@@ -837,15 +982,22 @@ impl CoreStore {
         .map_err(|_| anyhow!("CoreStore target_block_size exceeds usize"))?;
         let mut blocks = Vec::new();
         if source.is_empty() {
+            let empty_hash = format!("sha256:{}", sha256_hex(&[]));
+            let pipeline_block = self.encrypt_pipeline_block(
+                &request.pipeline_policy,
+                &request.logical_file_id,
+                0,
+                0,
+                0,
+                &empty_hash,
+                Vec::new(),
+            )?;
             let object_ref = self
-                .put_blob_with_profile(
-                    PutBlob {
-                        logical_name: format!("{}/block-000000", request.logical_file_id),
-                        bytes: Vec::new(),
-                        boundary_values: request.boundary_values.clone(),
-                        region_id: request.region_id.clone(),
-                        mutation_id: format!("{}-block-000000", request.mutation_id),
-                    },
+                .put_logical_file_block_with_profile(
+                    request,
+                    0,
+                    pipeline_block.stored,
+                    pipeline_block.encryption.algorithm.clone(),
                     profile,
                 )
                 .await?;
@@ -854,7 +1006,9 @@ impl CoreStore {
                 object_manifest,
                 logical_offset: 0,
                 logical_length: 0,
-                plaintext_hash: format!("sha256:{}", sha256_hex(&[])),
+                compressed_length: 0,
+                plaintext_hash: empty_hash,
+                encryption: pipeline_block.encryption,
             });
             return Ok(blocks);
         }
@@ -868,15 +1022,21 @@ impl CoreStore {
             let chunk = &source[start..end];
             let chunk_bytes = chunk.to_vec();
             let chunk_hash = format!("sha256:{}", sha256_hex(&chunk_bytes));
+            let pipeline_block = self.encrypt_pipeline_block(
+                &request.pipeline_policy,
+                &request.logical_file_id,
+                index,
+                logical_offset,
+                chunk.len() as u64,
+                &chunk_hash,
+                chunk_bytes,
+            )?;
             let object_ref = self
-                .put_blob_with_profile(
-                    PutBlob {
-                        logical_name: format!("{}/block-{index:06}", request.logical_file_id),
-                        bytes: chunk_bytes,
-                        boundary_values: request.boundary_values.clone(),
-                        region_id: request.region_id.clone(),
-                        mutation_id: format!("{}-block-{index:06}", request.mutation_id),
-                    },
+                .put_logical_file_block_with_profile(
+                    request,
+                    index,
+                    pipeline_block.stored,
+                    pipeline_block.encryption.algorithm.clone(),
                     profile,
                 )
                 .await?;
@@ -885,7 +1045,9 @@ impl CoreStore {
                 object_manifest,
                 logical_offset,
                 logical_length: chunk.len() as u64,
+                compressed_length: chunk.len() as u64,
                 plaintext_hash: chunk_hash,
+                encryption: pipeline_block.encryption,
             });
         }
         Ok(blocks)
@@ -897,6 +1059,164 @@ impl CoreStore {
     ) -> Result<CoreObjectRef> {
         let manifest = self.write_logical_file(request).await?;
         Ok(core_object_ref_from_logical_file_manifest(&manifest))
+    }
+
+    fn encrypt_pipeline_block(
+        &self,
+        policy: &CorePipelinePolicy,
+        logical_file_id: &str,
+        _block_index: usize,
+        logical_offset: u64,
+        logical_length: u64,
+        plaintext_hash: &str,
+        plaintext: Vec<u8>,
+    ) -> Result<PipelineBlockBytes> {
+        match policy.encryption.as_str() {
+            "none" => {
+                let ciphertext_hash = format!("sha256:{}", sha256_hex(&plaintext));
+                Ok(PipelineBlockBytes {
+                    stored: plaintext,
+                    encryption: none_encryption_descriptor(plaintext_hash, &ciphertext_hash),
+                })
+            }
+            "aes_gcm_siv" => {
+                let keyring = self.pipeline_keyring.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "CoreStore aes_gcm_siv pipeline encryption requires a configured keyring"
+                    )
+                })?;
+                let cipher = <Aes256GcmSiv as aes_gcm_siv::aead::KeyInit>::new_from_slice(
+                    keyring.active_key()?,
+                )
+                .map_err(|err| anyhow!(err.to_string()))?;
+                let nonce = Aes256GcmSiv::generate_nonce(&mut OsRng);
+                let aad = pipeline_block_aad(
+                    logical_file_id,
+                    logical_offset,
+                    logical_length,
+                    plaintext_hash,
+                );
+                let ciphertext = cipher
+                    .encrypt(
+                        &nonce,
+                        Payload {
+                            msg: &plaintext,
+                            aad: &aad,
+                        },
+                    )
+                    .map_err(|err| anyhow!(err.to_string()))?;
+                let aad_hash = format!("sha256:{}", sha256_hex(&aad));
+                let ciphertext_hash = format!("sha256:{}", sha256_hex(&ciphertext));
+                #[allow(deprecated)]
+                let nonce_bytes = nonce.as_slice().to_vec();
+                let descriptor_hash = encryption_descriptor_hash(
+                    "aes_gcm_siv",
+                    keyring.active_key_id(),
+                    &nonce_bytes,
+                    &aad_hash,
+                    plaintext_hash,
+                    &ciphertext_hash,
+                );
+                Ok(PipelineBlockBytes {
+                    stored: ciphertext,
+                    encryption: CoreEncryptionDescriptor {
+                        algorithm: "aes_gcm_siv".to_string(),
+                        key_id: keyring.active_key_id().to_string(),
+                        nonce: nonce_bytes,
+                        aad_hash,
+                        plaintext_hash: plaintext_hash.to_string(),
+                        ciphertext_hash,
+                        descriptor_hash,
+                    },
+                })
+            }
+            other => bail!("CoreStore unsupported logical file encryption policy {other}"),
+        }
+    }
+
+    fn decrypt_pipeline_block(
+        &self,
+        logical_file_id: &str,
+        block: &CoreLogicalBlockRef,
+        stored: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        match block.encryption.algorithm.as_str() {
+            "none" => {
+                let actual_hash = format!("sha256:{}", sha256_hex(&stored));
+                if actual_hash != block.encryption.ciphertext_hash {
+                    bail!(
+                        "CoreStore unencrypted block hash mismatch: expected {}, got {}",
+                        block.encryption.ciphertext_hash,
+                        actual_hash
+                    );
+                }
+                Ok(stored)
+            }
+            "aes_gcm_siv" => {
+                if block.encryption.nonce.len() != CORE_PIPELINE_NONCE_LEN {
+                    bail!("CoreStore aes_gcm_siv block nonce has invalid length");
+                }
+                let keyring = self.pipeline_keyring.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "CoreStore aes_gcm_siv pipeline decryption requires a configured keyring"
+                    )
+                })?;
+                let actual_ciphertext_hash = format!("sha256:{}", sha256_hex(&stored));
+                if actual_ciphertext_hash != block.encryption.ciphertext_hash {
+                    bail!(
+                        "CoreStore encrypted block ciphertext hash mismatch: expected {}, got {}",
+                        block.encryption.ciphertext_hash,
+                        actual_ciphertext_hash
+                    );
+                }
+                let aad = pipeline_block_aad(
+                    logical_file_id,
+                    block.logical_offset,
+                    block.logical_length,
+                    &block.encryption.plaintext_hash,
+                );
+                let aad_hash = format!("sha256:{}", sha256_hex(&aad));
+                if aad_hash != block.encryption.aad_hash {
+                    bail!("CoreStore encrypted block AAD hash mismatch");
+                }
+                let expected_descriptor_hash = encryption_descriptor_hash(
+                    "aes_gcm_siv",
+                    &block.encryption.key_id,
+                    &block.encryption.nonce,
+                    &block.encryption.aad_hash,
+                    &block.encryption.plaintext_hash,
+                    &block.encryption.ciphertext_hash,
+                );
+                if expected_descriptor_hash != block.encryption.descriptor_hash {
+                    bail!("CoreStore encrypted block descriptor hash mismatch");
+                }
+                let cipher = <Aes256GcmSiv as aes_gcm_siv::aead::KeyInit>::new_from_slice(
+                    keyring.key(&block.encryption.key_id)?,
+                )
+                .map_err(|err| anyhow!(err.to_string()))?;
+                #[allow(deprecated)]
+                let nonce = Nonce::from_slice(&block.encryption.nonce);
+                let plaintext = cipher
+                    .decrypt(
+                        nonce,
+                        Payload {
+                            msg: &stored,
+                            aad: &aad,
+                        },
+                    )
+                    .map_err(|err| anyhow!(err.to_string()))?;
+                let plaintext_hash = format!("sha256:{}", sha256_hex(&plaintext));
+                if plaintext_hash != block.encryption.plaintext_hash {
+                    bail!(
+                        "CoreStore encrypted block plaintext hash mismatch: expected {}, got {}",
+                        block.encryption.plaintext_hash,
+                        plaintext_hash
+                    );
+                }
+                Ok(plaintext)
+            }
+            other => bail!("CoreStore unsupported logical file encryption descriptor {other}"),
+        }
     }
 
     async fn write_control_logical_file_ref(
@@ -977,18 +1297,27 @@ impl CoreStore {
             if overlap_start >= overlap_end {
                 continue;
             }
-            let object_ref =
-                object_ref_from_logical_block_ref(block, &manifest.erasure_profile_id)?;
-            out.extend(
-                self.get_blob_range(GetBlobRange {
-                    object_ref,
-                    range: CoreByteRange {
-                        start: overlap_start - block_start,
-                        end_exclusive: overlap_end - block_start,
-                    },
-                })
-                .await?,
-            );
+            if block.encryption.algorithm == "none" {
+                let object_ref =
+                    object_ref_from_logical_block_ref(block, &manifest.erasure_profile_id)?;
+                out.extend(
+                    self.get_blob_range(GetBlobRange {
+                        object_ref,
+                        range: CoreByteRange {
+                            start: overlap_start - block_start,
+                            end_exclusive: overlap_end - block_start,
+                        },
+                    })
+                    .await?,
+                );
+            } else {
+                let block_plaintext = self.read_logical_block_plaintext(manifest, block).await?;
+                let start = usize::try_from(overlap_start - block_start)
+                    .map_err(|_| anyhow!("CoreStore logical block range start exceeds usize"))?;
+                let end = usize::try_from(overlap_end - block_start)
+                    .map_err(|_| anyhow!("CoreStore logical block range end exceeds usize"))?;
+                out.extend_from_slice(&block_plaintext[start..end]);
+            }
         }
         Ok(out)
     }
@@ -1034,8 +1363,11 @@ impl CoreStore {
             )
             .await?
         } else {
-            let object_ref = object_ref_from_logical_file_manifest(manifest)?;
-            self.get_blob(GetBlob { object_ref }).await?
+            let block = manifest
+                .blocks
+                .first()
+                .ok_or_else(|| anyhow!("CoreStore compressed logical file has no block"))?;
+            self.read_logical_block_plaintext(manifest, block).await?
         };
         let plaintext = decode_logical_file_source(&manifest.compression.algorithm, stored)?;
         let actual_hash = format!("sha256:{}", sha256_hex(&plaintext));
@@ -1044,6 +1376,24 @@ impl CoreStore {
                 "CoreStore logical file content hash mismatch: expected {}, got {}",
                 manifest.content_hash,
                 actual_hash
+            );
+        }
+        Ok(plaintext)
+    }
+
+    async fn read_logical_block_plaintext(
+        &self,
+        manifest: &CoreLogicalFileManifest,
+        block: &CoreLogicalBlockRef,
+    ) -> Result<Vec<u8>> {
+        let object_ref = object_ref_from_logical_block_ref(block, &manifest.erasure_profile_id)?;
+        let stored = self.get_blob(GetBlob { object_ref }).await?;
+        let plaintext = self.decrypt_pipeline_block(&manifest.logical_file_id, block, stored)?;
+        if plaintext.len() as u64 != block.compressed_length {
+            bail!(
+                "CoreStore decrypted block length mismatch: expected {}, got {}",
+                block.compressed_length,
+                plaintext.len()
             );
         }
         Ok(plaintext)
@@ -2502,6 +2852,8 @@ impl CoreStore {
             "object.put" => {
                 let profile_id = json_required_string(&record.target, "erasure_profile_id")?;
                 let profile = local_erasure_profile(&profile_id)?;
+                let encryption = json_optional_string(&record.target, "encryption")?
+                    .unwrap_or_else(|| "none".to_string());
                 let materialised_bytes = self.core_wal_payload_bytes(record, payload).await?;
                 let hash = sha256_hex(&materialised_bytes);
                 if let Some(landed) = record.landed_bytes.first() {
@@ -2516,6 +2868,8 @@ impl CoreStore {
                     &record.boundary_values,
                     &record.mutation_id,
                     profile,
+                    &encryption,
+                    &record.writer_family,
                 )
                 .await?;
                 Ok("committed")
@@ -3795,7 +4149,7 @@ impl CoreStore {
                 stripe_size,
                 placement_scope: "region".to_string(),
                 repair_priority: "normal".to_string(),
-                encryption: "none".to_string(),
+                encryption: object_ref.encoding.encryption.clone(),
             },
             placements,
             created_at: "reconstructed-from-shards".to_string(),
@@ -4460,6 +4814,8 @@ fn logical_file_manifest_from_object_manifests(
             .collect::<Result<Vec<_>>>()?
     };
 
+    let encryption = logical_file_encryption_descriptor(&logical_blocks, &plaintext_hash)?;
+
     Ok(CoreLogicalFileManifest {
         schema: CORE_LOGICAL_FILE_MANIFEST_SCHEMA.to_string(),
         logical_file_id: request.logical_file_id.clone(),
@@ -4471,19 +4827,7 @@ fn logical_file_manifest_from_object_manifests(
         ranges,
         blocks: logical_blocks,
         compression,
-        encryption: CoreEncryptionDescriptor {
-            algorithm: first_manifest.encoding.encryption.clone(),
-            key_id: String::new(),
-            nonce: Vec::new(),
-            aad_hash: String::new(),
-            plaintext_hash,
-            ciphertext_hash: first_manifest.object_hash.clone(),
-            descriptor_hash: descriptor_hash(&[
-                "encryption",
-                &first_manifest.encoding.encryption,
-                &first_manifest.object_hash,
-            ]),
-        },
+        encryption,
         erasure_profile_id: first_manifest.encoding.profile_id.clone(),
         placement_epoch: LOCAL_PLACEMENT_EPOCH,
         created_by_mutation_id: request.mutation_id.clone(),
@@ -4511,9 +4855,10 @@ fn logical_block_ref_from_materialized_block(
         block_id: local_block_id_for_object_hash(object_hash),
         logical_offset: block.logical_offset,
         logical_length: block.logical_length,
-        compressed_length: object_manifest.logical_size,
+        compressed_length: block.compressed_length,
         encrypted_length: object_manifest.logical_size,
         content_hash: block.plaintext_hash.clone(),
+        encryption: block.encryption.clone(),
         erasure_set_id: LOCAL_ERASURE_SET_ID.to_string(),
         shards: object_manifest
             .placements
@@ -4539,6 +4884,71 @@ fn logical_block_ref_from_materialized_block(
             .saturating_mul(u64::from(data_shards))
             .saturating_sub(object_manifest.logical_size),
         block_encoded_hash: object_manifest.object_hash.clone(),
+    })
+}
+
+fn logical_file_encryption_descriptor(
+    blocks: &[CoreLogicalBlockRef],
+    file_plaintext_hash: &str,
+) -> Result<CoreEncryptionDescriptor> {
+    let Some(first) = blocks.first() else {
+        bail!("CoreStore logical file encryption descriptor requires at least one block");
+    };
+    let algorithm = first.encryption.algorithm.clone();
+    if blocks
+        .iter()
+        .any(|block| block.encryption.algorithm != algorithm)
+    {
+        bail!("CoreStore logical file blocks must use one encryption algorithm");
+    }
+    if algorithm == "none" {
+        let ciphertext_hash = descriptor_hash(
+            &blocks
+                .iter()
+                .map(|block| block.encryption.ciphertext_hash.as_str())
+                .collect::<Vec<_>>(),
+        );
+        return Ok(CoreEncryptionDescriptor {
+            algorithm,
+            key_id: String::new(),
+            nonce: Vec::new(),
+            aad_hash: String::new(),
+            plaintext_hash: file_plaintext_hash.to_string(),
+            ciphertext_hash,
+            descriptor_hash: descriptor_hash(&["encryption", "none", file_plaintext_hash]),
+        });
+    }
+    if algorithm != "aes_gcm_siv" {
+        bail!("CoreStore unsupported logical file encryption descriptor {algorithm}");
+    }
+    let key_id = first.encryption.key_id.clone();
+    if blocks.iter().any(|block| block.encryption.key_id != key_id) {
+        bail!("CoreStore logical file encrypted blocks must use one key id");
+    }
+    let block_descriptor_hash = descriptor_hash(
+        &blocks
+            .iter()
+            .map(|block| block.encryption.descriptor_hash.as_str())
+            .collect::<Vec<_>>(),
+    );
+    Ok(CoreEncryptionDescriptor {
+        algorithm,
+        key_id,
+        nonce: Vec::new(),
+        aad_hash: block_descriptor_hash.clone(),
+        plaintext_hash: file_plaintext_hash.to_string(),
+        ciphertext_hash: descriptor_hash(
+            &blocks
+                .iter()
+                .map(|block| block.encryption.ciphertext_hash.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        descriptor_hash: descriptor_hash(&[
+            "encryption",
+            "aes_gcm_siv",
+            file_plaintext_hash,
+            &block_descriptor_hash,
+        ]),
     })
 }
 
@@ -4614,6 +5024,12 @@ fn validate_logical_file_manifest_shape(manifest: &CoreLogicalFileManifest) -> R
         if block.codec_id != profile.codec_id {
             bail!("CoreStore logical file block codec id does not match erasure profile");
         }
+        validate_logical_block_encryption(block)?;
+        if block.encrypted_length < block.compressed_length {
+            bail!(
+                "CoreStore logical file encrypted length cannot be smaller than compressed length"
+            );
+        }
         if manifest.blocks.len() == 1
             && block.compressed_length != manifest.compression.compressed_length
         {
@@ -4639,14 +5055,58 @@ fn validate_logical_file_manifest_shape(manifest: &CoreLogicalFileManifest) -> R
     {
         bail!("CoreStore logical file block stored lengths do not match compression descriptor");
     }
+    validate_logical_file_encryption_descriptor(manifest)?;
     Ok(())
 }
 
-fn object_ref_from_logical_file_manifest(
-    manifest: &CoreLogicalFileManifest,
-) -> Result<CoreObjectRef> {
-    validate_logical_file_manifest_shape(manifest)?;
-    Ok(core_object_ref_from_logical_file_manifest(manifest))
+fn validate_logical_block_encryption(block: &CoreLogicalBlockRef) -> Result<()> {
+    match block.encryption.algorithm.as_str() {
+        "none" => {
+            if !block.encryption.key_id.is_empty()
+                || !block.encryption.nonce.is_empty()
+                || !block.encryption.aad_hash.is_empty()
+            {
+                bail!(
+                    "CoreStore none encrypted block descriptor must not carry key material fields"
+                );
+            }
+            if block.encryption.plaintext_hash.is_empty()
+                || block.encryption.ciphertext_hash.is_empty()
+            {
+                bail!("CoreStore none encrypted block descriptor is incomplete");
+            }
+            if block.encryption.ciphertext_hash != block.block_encoded_hash {
+                bail!(
+                    "CoreStore none encrypted block ciphertext hash must match encoded block hash"
+                );
+            }
+        }
+        "aes_gcm_siv" => {
+            validate_pipeline_key_id(block.encryption.key_id.clone())?;
+            if block.encryption.nonce.len() != CORE_PIPELINE_NONCE_LEN {
+                bail!("CoreStore aes_gcm_siv block nonce has invalid length");
+            }
+            if block.encryption.aad_hash.is_empty()
+                || block.encryption.plaintext_hash.is_empty()
+                || block.encryption.ciphertext_hash.is_empty()
+            {
+                bail!("CoreStore aes_gcm_siv block descriptor is incomplete");
+            }
+            if block.encryption.ciphertext_hash != block.block_encoded_hash {
+                bail!("CoreStore aes_gcm_siv block ciphertext hash must match encoded block hash");
+            }
+        }
+        other => bail!("CoreStore unsupported logical file encryption descriptor {other}"),
+    }
+    Ok(())
+}
+
+fn validate_logical_file_encryption_descriptor(manifest: &CoreLogicalFileManifest) -> Result<()> {
+    let expected = logical_file_encryption_descriptor(&manifest.blocks, &manifest.content_hash)?;
+    if expected != manifest.encryption {
+        bail!("CoreStore logical file encryption descriptor does not match block descriptors");
+    }
+    Ok(())
 }
 
 fn object_ref_from_logical_block_ref(
@@ -4671,7 +5131,7 @@ fn object_ref_from_logical_block_ref(
                 .saturating_mul(u64::from(block.data_shards)),
             placement_scope: "region".to_string(),
             repair_priority: "normal".to_string(),
-            encryption: "none".to_string(),
+            encryption: block.encryption.algorithm.clone(),
         },
         placements: block
             .shards
@@ -4801,6 +5261,82 @@ fn decode_logical_file_source(compression: &str, stored: Vec<u8>) -> Result<Vec<
         "zstd" => Ok(zstd::stream::decode_all(Cursor::new(stored))?),
         other => bail!("CoreStore unsupported logical file compression descriptor {other}"),
     }
+}
+
+fn none_encryption_descriptor(
+    plaintext_hash: &str,
+    ciphertext_hash: &str,
+) -> CoreEncryptionDescriptor {
+    CoreEncryptionDescriptor {
+        algorithm: "none".to_string(),
+        key_id: String::new(),
+        nonce: Vec::new(),
+        aad_hash: String::new(),
+        plaintext_hash: plaintext_hash.to_string(),
+        ciphertext_hash: ciphertext_hash.to_string(),
+        descriptor_hash: descriptor_hash(&["encryption", "none", plaintext_hash, ciphertext_hash]),
+    }
+}
+
+fn validate_pipeline_key_id(key_id: String) -> Result<String> {
+    if key_id.is_empty()
+        || key_id.len() > 128
+        || key_id.contains(':')
+        || key_id.contains(',')
+        || key_id.chars().any(|ch| ch == '\0' || ch.is_control())
+    {
+        bail!("CoreStore pipeline key id must be 1-128 visible chars excluding ':' and ','");
+    }
+    Ok(key_id)
+}
+
+fn decode_pipeline_key_hex(key_hex: &str) -> Result<[u8; CORE_PIPELINE_KEY_LEN]> {
+    let key = hex::decode(key_hex.trim()).context("CoreStore pipeline key must be hex encoded")?;
+    if key.len() != CORE_PIPELINE_KEY_LEN {
+        bail!("CoreStore pipeline key must be exactly 32 bytes");
+    }
+    let mut out = [0u8; CORE_PIPELINE_KEY_LEN];
+    out.copy_from_slice(&key);
+    Ok(out)
+}
+
+fn pipeline_block_aad(
+    logical_file_id: &str,
+    logical_offset: u64,
+    logical_length: u64,
+    plaintext_hash: &str,
+) -> Vec<u8> {
+    let mut aad = Vec::new();
+    for part in [
+        "anvil.core.pipeline_block.v1",
+        logical_file_id,
+        &logical_offset.to_string(),
+        &logical_length.to_string(),
+        plaintext_hash,
+    ] {
+        aad.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        aad.extend_from_slice(part.as_bytes());
+    }
+    aad
+}
+
+fn encryption_descriptor_hash(
+    algorithm: &str,
+    key_id: &str,
+    nonce: &[u8],
+    aad_hash: &str,
+    plaintext_hash: &str,
+    ciphertext_hash: &str,
+) -> String {
+    descriptor_hash(&[
+        "encryption",
+        algorithm,
+        key_id,
+        &hex::encode(nonce),
+        aad_hash,
+        plaintext_hash,
+        ciphertext_hash,
+    ])
 }
 
 fn validate_pipeline_policy(
@@ -7101,6 +7637,137 @@ mod tests {
         );
         let bytes = store.get_blob(GetBlob { object_ref }).await.unwrap();
         assert_eq!(bytes, b"hello corestore");
+    }
+
+    #[tokio::test]
+    async fn core_store_logical_file_aes_gcm_siv_round_trips_without_plaintext_shards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let keyring = CorePipelineKeyring::from_hex_config(
+            "k1",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "",
+        )
+        .unwrap();
+        let store = CoreStore::new_with_pipeline_keyring(storage.clone(), keyring)
+            .await
+            .unwrap();
+        let source = b"alpha tenant boundary data; beta tenant boundary data; gamma".repeat(2);
+        let manifest = store
+            .write_logical_file(WriteLogicalFileRequest {
+                writer_family: "object_blob".to_string(),
+                generation: 1,
+                logical_file_id: "lf_encrypted_object".to_string(),
+                source: source.clone(),
+                range_hints: Vec::new(),
+                pipeline_policy: CorePipelinePolicy {
+                    encryption: "aes_gcm_siv".to_string(),
+                    target_block_size: 24,
+                    ..CorePipelinePolicy::default()
+                },
+                trace_context: CoreTraceContext::default(),
+                boundary_values: Vec::new(),
+                mutation_id: "mut-encrypted-logical-file".to_string(),
+                region_id: "local".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(manifest.encryption.algorithm, "aes_gcm_siv");
+        assert!(manifest.blocks.len() > 1);
+        assert!(
+            manifest
+                .blocks
+                .iter()
+                .all(|block| block.encryption.algorithm == "aes_gcm_siv")
+        );
+        assert!(
+            manifest
+                .blocks
+                .iter()
+                .all(|block| block.encrypted_length > block.compressed_length)
+        );
+
+        let first_block = &manifest.blocks[0];
+        let first_object_ref =
+            object_ref_from_logical_block_ref(first_block, &manifest.erasure_profile_id).unwrap();
+        let stored = store
+            .get_blob(GetBlob {
+                object_ref: first_object_ref,
+            })
+            .await
+            .unwrap();
+        assert_ne!(
+            &stored[..first_block.compressed_length as usize],
+            &source[..first_block.compressed_length as usize]
+        );
+
+        let whole = store
+            .read_logical_range(ReadLogicalRangeRequest {
+                manifest: manifest.clone(),
+                ranges: vec![CoreByteRange {
+                    start: 0,
+                    end_exclusive: source.len() as u64,
+                }],
+                authz_scope: AuthzScopeRef {
+                    anvil_storage_tenant_id: "local".to_string(),
+                    authz_realm_id: "system".to_string(),
+                },
+                expected_boundary: None,
+                prefetch_policy: CorePrefetchPolicy::default(),
+                trace_context: CoreTraceContext::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(whole, source);
+
+        let slice = store
+            .read_logical_range(ReadLogicalRangeRequest {
+                manifest,
+                ranges: vec![CoreByteRange {
+                    start: 7,
+                    end_exclusive: 53,
+                }],
+                authz_scope: AuthzScopeRef {
+                    anvil_storage_tenant_id: "local".to_string(),
+                    authz_realm_id: "system".to_string(),
+                },
+                expected_boundary: None,
+                prefetch_policy: CorePrefetchPolicy::default(),
+                trace_context: CoreTraceContext::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(slice, source[7..53]);
+    }
+
+    #[tokio::test]
+    async fn core_store_logical_file_aes_gcm_siv_requires_keyring() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        let err = store
+            .write_logical_file(WriteLogicalFileRequest {
+                writer_family: "object_blob".to_string(),
+                generation: 1,
+                logical_file_id: "lf_encryption_requires_key".to_string(),
+                source: b"secret".to_vec(),
+                range_hints: Vec::new(),
+                pipeline_policy: CorePipelinePolicy {
+                    encryption: "aes_gcm_siv".to_string(),
+                    ..CorePipelinePolicy::default()
+                },
+                trace_context: CoreTraceContext::default(),
+                boundary_values: Vec::new(),
+                mutation_id: "mut-encryption-requires-key".to_string(),
+                region_id: "local".to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("requires a configured keyring"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[tokio::test]

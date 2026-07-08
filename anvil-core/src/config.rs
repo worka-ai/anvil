@@ -179,16 +179,29 @@ impl Config {
     }
 
     pub fn secret_keyring(&self) -> Result<crate::crypto::EncryptionKeyring> {
-        let active_key_id = if self.anvil_secret_encryption_key_id.trim().is_empty() {
-            "primary"
-        } else {
-            &self.anvil_secret_encryption_key_id
-        };
+        let active_key_id = self.active_encryption_key_id();
         crate::crypto::EncryptionKeyring::from_hex_config(
             active_key_id,
             &self.anvil_secret_encryption_key,
             &self.anvil_secret_encryption_previous_keys,
         )
+    }
+
+    pub fn core_pipeline_keyring(&self) -> Result<crate::core_store::CorePipelineKeyring> {
+        let active_key_id = self.active_encryption_key_id();
+        crate::core_store::CorePipelineKeyring::from_hex_config(
+            active_key_id,
+            &self.anvil_secret_encryption_key,
+            &self.anvil_secret_encryption_previous_keys,
+        )
+    }
+
+    fn active_encryption_key_id(&self) -> &str {
+        if self.anvil_secret_encryption_key_id.trim().is_empty() {
+            "primary"
+        } else {
+            &self.anvil_secret_encryption_key_id
+        }
     }
 
     pub fn validate_admin_listener_bind(&self) -> Result<()> {
