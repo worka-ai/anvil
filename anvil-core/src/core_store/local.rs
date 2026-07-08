@@ -5006,7 +5006,8 @@ impl CoreStore {
                 return Err(error).with_context(|| format!("read {}", generation_dir.display()));
             }
         };
-        let mut by_hash = BTreeMap::<String, (CoreRootAnchorRecord, usize)>::new();
+        let mut by_hash =
+            BTreeMap::<(String, String), (CoreRootAnchorRecord, BTreeSet<u16>)>::new();
         for entry in entries {
             let entry = entry?;
             if entry
@@ -5026,15 +5027,23 @@ impl CoreStore {
                 bail!("CoreStore root register shard anchor hash mismatch");
             }
             by_hash
-                .entry(anchor_hash)
-                .and_modify(|(_, count)| *count += 1)
-                .or_insert((anchor, 1));
+                .entry((anchor_hash, header.register_cohort_hash.clone()))
+                .and_modify(|(_, shards)| {
+                    shards.insert(header.shard_index);
+                })
+                .or_insert_with(|| {
+                    let mut shards = BTreeSet::new();
+                    shards.insert(header.shard_index);
+                    (anchor, shards)
+                });
         }
-        Ok(by_hash.into_values().find_map(
-            |(anchor, count)| {
-                if count >= 2 { Some(anchor) } else { None }
-            },
-        ))
+        Ok(by_hash.into_values().find_map(|(anchor, shards)| {
+            if shards.len() >= 2 {
+                Some(anchor)
+            } else {
+                None
+            }
+        }))
     }
 
     async fn write_root_register_anchor(&self, anchor: &CoreRootAnchorRecord) -> Result<()> {
@@ -8206,12 +8215,45 @@ fn decode_root_anchor_record(bytes: &[u8]) -> Result<CoreRootAnchorRecord> {
     Ok(anchor)
 }
 
+fn validate_root_register_header(header: &CoreRootRegisterHeader) -> Result<()> {
+    if header.schema != "anvil.core.root_register_shard.v1" {
+        bail!("CoreStore root register shard header has invalid schema");
+    }
+    if header.root_partition_id != CORE_TRANSACTION_ROOT_PARTITION_ID {
+        bail!("CoreStore root register shard header has invalid root partition");
+    }
+    validate_hash(&header.root_key_hash, "root register key hash")?;
+    validate_hash(&header.root_anchor_hash, "root register anchor hash")?;
+    if header.shard_index >= 3 {
+        bail!("CoreStore root register shard index is outside root-register-r3");
+    }
+    if header.placement_epoch == 0 {
+        bail!("CoreStore root register placement epoch must be nonzero");
+    }
+    if header.created_at_unix_nanos == 0 {
+        bail!("CoreStore root register timestamp must be nonzero");
+    }
+    let unique_nodes = header.register_cohort_nodes.iter().collect::<BTreeSet<_>>();
+    if header.register_cohort_nodes.len() != 3 || unique_nodes.len() != 3 {
+        bail!("CoreStore root register cohort must contain three distinct nodes");
+    }
+    let expected_cohort_hash = descriptor_hash(&[
+        "anvil.root.cohort.v1",
+        &header.root_key_hash,
+        &header.root_generation.to_string(),
+        &header.register_cohort_nodes.join(","),
+    ]);
+    if header.register_cohort_hash != expected_cohort_hash {
+        bail!("CoreStore root register cohort hash mismatch");
+    }
+    Ok(())
+}
+
 fn encode_root_register_shard_file(
     header: &CoreRootRegisterHeader,
     root_anchor_record: &[u8],
 ) -> Result<Vec<u8>> {
-    validate_hash(&header.root_key_hash, "root register key hash")?;
-    validate_hash(&header.root_anchor_hash, "root register anchor hash")?;
+    validate_root_register_header(header)?;
     let root_key_hash = decode_sha256_hash_bytes(&header.root_key_hash)?;
     let header_cbor = encode_canonical_cbor_json(&serde_json::to_value(header)?)?;
     let mut out = Vec::with_capacity(
@@ -8284,6 +8326,7 @@ fn decode_root_register_shard_file(
     }
     let header: CoreRootRegisterHeader =
         serde_json::from_value(decode_canonical_cbor_json(header_cbor)?)?;
+    validate_root_register_header(&header)?;
     if header.root_partition_id != root_partition_id
         || header.root_key_hash != root_key_hash
         || header.root_generation != root_generation
@@ -11692,6 +11735,29 @@ mod tests {
         assert!(
             store.write_root_register_anchor(&skipped).await.is_err(),
             "root register publication must not skip generations"
+        );
+
+        let root_key_hash = root_key_hash(core_transaction_root_anchor_key());
+        let generation_dir = store
+            .root_register_generation_dir(&root_key_hash, 0)
+            .unwrap();
+        let shard_0 = generation_dir.join("shard-0.anr");
+        tokio::fs::remove_file(generation_dir.join("shard-1.anr"))
+            .await
+            .unwrap();
+        tokio::fs::remove_file(generation_dir.join("shard-2.anr"))
+            .await
+            .unwrap();
+        tokio::fs::copy(&shard_0, generation_dir.join("shard-copy.anr"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .read_committed_root_anchor_generation(&root_key_hash, 0)
+                .await
+                .unwrap()
+                .is_none(),
+            "root register majority must require distinct shard receipt indices"
         );
     }
 
