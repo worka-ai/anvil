@@ -4939,6 +4939,44 @@ impl CoreStore {
         validate_root_anchor_record(anchor)?;
         let anchor_bytes = encode_root_anchor_record(anchor)?;
         let root_anchor_hash = format!("sha256:{}", sha256_hex(&anchor_bytes));
+        match self
+            .read_latest_root_anchor(&anchor.root_anchor_key)
+            .await?
+        {
+            Some(current) => {
+                let current_hash = hash_root_anchor_record(&current)?;
+                if anchor.root_generation < current.root_generation {
+                    bail!(
+                        "CoreStore root register rejected stale generation {} below current {}",
+                        anchor.root_generation,
+                        current.root_generation
+                    );
+                }
+                if anchor.root_generation == current.root_generation {
+                    if root_anchor_hash == current_hash {
+                        return Ok(());
+                    }
+                    bail!(
+                        "CoreStore root register rejected conflicting generation {}",
+                        anchor.root_generation
+                    );
+                }
+                if anchor.root_generation != current.root_generation.saturating_add(1) {
+                    bail!("CoreStore root register generations must be contiguous");
+                }
+                if anchor.previous_root_hash != current_hash {
+                    bail!("CoreStore root register previous hash mismatch");
+                }
+            }
+            None => {
+                if anchor.root_generation != 0 {
+                    bail!("CoreStore root register first generation must be zero");
+                }
+                if anchor.previous_root_hash != ZERO_HASH {
+                    bail!("CoreStore root register genesis previous hash must be zero");
+                }
+            }
+        }
         let cohort_nodes = local_control_node_ids()
             .into_iter()
             .take(3)
@@ -10999,6 +11037,38 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn core_store_root_register_rejects_conflicting_or_skipped_generations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        let genesis = store
+            .read_latest_root_anchor(core_transaction_root_anchor_key())
+            .await
+            .unwrap()
+            .expect("genesis root anchor");
+
+        store
+            .write_root_register_anchor(&genesis)
+            .await
+            .expect("same root generation and bytes are idempotent");
+
+        let mut conflict = genesis.clone();
+        conflict.created_at_unix_nanos = conflict.created_at_unix_nanos.saturating_add(1);
+        assert!(
+            store.write_root_register_anchor(&conflict).await.is_err(),
+            "same root generation with different bytes must fail create-new CAS"
+        );
+
+        let mut skipped = genesis.clone();
+        skipped.root_generation = 2;
+        skipped.previous_root_hash = hash_root_anchor_record(&genesis).unwrap();
+        assert!(
+            store.write_root_register_anchor(&skipped).await.is_err(),
+            "root register publication must not skip generations"
         );
     }
 
