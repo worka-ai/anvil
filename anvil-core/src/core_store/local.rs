@@ -99,6 +99,10 @@ const CORE_STREAM_SEGMENT_TRAILER_SCHEMA: &str = "anvil.core.stream_segment_trai
 const CORE_BLOCK_SHARD_HEADER_SCHEMA: &str = "anvil.core.block_shard.v1";
 const CORE_WAL_RECORD_SCHEMA: &str = "anvil.core.wal_record.v1";
 const CORE_WAL_FINALISATION_SCHEMA: &str = "anvil.core.wal_finalisation.v1";
+const CORE_LOCAL_ADMISSION_RECEIPT_SCHEMA: &str = "anvil.admission.local_receipt.v1";
+const CORE_ADMISSION_COMMIT_CERTIFICATE_SCHEMA: &str = "anvil.admission.commit_certificate.v1";
+const CORE_LOCAL_ADMISSION_PROFILE: &str = "local-single-node-development";
+const CORE_LOCAL_ADMISSION_PROFILE_EPOCH: u64 = 1;
 const CORE_WAL_FINALISATION_RECORD_KIND: &str = "core_wal.finalisation";
 const CORE_STREAM_STATE_LOCATOR_SCHEMA: &str = "anvil.core.stream_state_locator.v1";
 const CORE_STREAM_STATE_LOCATOR_RECORD_KIND: &str = "core_stream.state_locator";
@@ -461,6 +465,44 @@ struct CoreWalFinalisationRecord {
     finalised_at_unix_nanos: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CoreAdmissionAttemptId {
+    mutation_id: String,
+    root_anchor_key: String,
+    root_key_hash: String,
+    source_node_id: String,
+    source_wal_epoch: u64,
+    source_wal_sequence: u64,
+    request_hash: String,
+    admission_profile: String,
+    admission_profile_epoch: u64,
+    selected_mirror_node_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CoreLocalAdmissionReceipt {
+    schema: String,
+    attempt_id: CoreAdmissionAttemptId,
+    landed_byte_hashes: Vec<String>,
+    descriptor_hashes: Vec<String>,
+    wal_frame_hash: String,
+    local_wal_fsync_sequence: u64,
+    local_landed_fsync_sequence: u64,
+    signed_payload_hash: String,
+    source_signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CoreAdmissionCommitCertificate {
+    schema: String,
+    attempt_id: CoreAdmissionAttemptId,
+    local_receipt: CoreLocalAdmissionReceipt,
+    mirror_receipts: Vec<serde_json::Value>,
+    committed_at_unix_nanos: u64,
+    signed_payload_hash: String,
+    source_signature: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 struct StreamAppendOutcome {
     receipt: StreamAppendReceipt,
@@ -614,6 +656,27 @@ impl CoreStore {
             .verify(signed_payload_hash.as_bytes(), receipt_signature)
         {
             bail!("CoreStore shard receipt signature verification failed for node {node_id}");
+        }
+        Ok(())
+    }
+
+    fn verify_core_admission_signature(
+        &self,
+        node_id: &str,
+        signed_payload_hash: &str,
+        receipt_signature: &[u8],
+    ) -> Result<()> {
+        if node_id != CORE_WAL_NODE_ID {
+            bail!("CoreStore admission receipt references unknown source node {node_id}");
+        }
+        if !self
+            .node_signing_keypair
+            .public()
+            .verify(signed_payload_hash.as_bytes(), receipt_signature)
+        {
+            bail!(
+                "CoreStore admission receipt signature verification failed for source node {node_id}"
+            );
         }
         Ok(())
     }
@@ -2737,6 +2800,9 @@ impl CoreStore {
             frame.len() as u64,
             started_at.elapsed(),
         );
+        drop(file);
+        self.write_local_admission_commit_certificate(&record, &frame)
+            .await?;
         Ok(record)
     }
 
@@ -2826,6 +2892,75 @@ impl CoreStore {
             landing_id,
             relative_path,
         })
+    }
+
+    async fn write_local_admission_commit_certificate(
+        &self,
+        record: &CoreWalAdmissionRecord,
+        wal_frame: &[u8],
+    ) -> Result<()> {
+        let mut certificate =
+            build_local_admission_commit_certificate(record, wal_frame, unix_timestamp_nanos())?;
+        certificate.local_receipt.source_signature =
+            self.sign_core_receipt(&certificate.local_receipt.signed_payload_hash)?;
+        certificate.source_signature = self.sign_core_receipt(&certificate.signed_payload_hash)?;
+        validate_local_admission_commit_certificate(&certificate)?;
+        self.verify_core_admission_signature(
+            &record.node_id,
+            &certificate.local_receipt.signed_payload_hash,
+            &certificate.local_receipt.source_signature,
+        )?;
+        self.verify_core_admission_signature(
+            &record.node_id,
+            &certificate.signed_payload_hash,
+            &certificate.source_signature,
+        )?;
+        let bytes = encode_canonical_cbor_json(&serde_json::to_value(&certificate)?)?;
+        write_file_atomic(
+            &self.admission_commit_certificate_path(record.sequence),
+            &bytes,
+        )
+        .await
+    }
+
+    async fn verify_local_admission_commit_certificate(
+        &self,
+        record: &CoreWalAdmissionRecord,
+        wal_frame: &[u8],
+    ) -> Result<CoreAdmissionCommitCertificate> {
+        let path = self.admission_commit_certificate_path(record.sequence);
+        let bytes = read_file(&path, "core_store", "read_admission_commit_certificate")
+            .await
+            .with_context(|| {
+                format!(
+                    "read CoreStore admission commit certificate for WAL sequence {}",
+                    record.sequence
+                )
+            })?;
+        let certificate: CoreAdmissionCommitCertificate =
+            serde_json::from_value(decode_canonical_cbor_json(&bytes)?)?;
+        validate_local_admission_commit_certificate(&certificate)?;
+        let expected_wal_frame_hash = domain_hash_bytes("anvil.admission.wal_frame.v1", wal_frame);
+        if certificate.local_receipt.wal_frame_hash != expected_wal_frame_hash {
+            bail!("CoreStore admission commit certificate WAL frame hash mismatch");
+        }
+        let expected_attempt = admission_attempt_id(record)?;
+        if certificate.attempt_id != expected_attempt
+            || certificate.local_receipt.attempt_id != expected_attempt
+        {
+            bail!("CoreStore admission commit certificate attempt id mismatch");
+        }
+        self.verify_core_admission_signature(
+            &record.node_id,
+            &certificate.local_receipt.signed_payload_hash,
+            &certificate.local_receipt.source_signature,
+        )?;
+        self.verify_core_admission_signature(
+            &record.node_id,
+            &certificate.signed_payload_hash,
+            &certificate.source_signature,
+        )?;
+        Ok(certificate)
     }
 
     async fn enforce_admission_capacity(
@@ -3207,6 +3342,9 @@ impl CoreStore {
             if finalised.contains(&record_key) {
                 continue;
             }
+            let wal_frame = encode_wal_frame(&canonical_json_bytes(&record)?, &payload)?;
+            self.verify_local_admission_commit_certificate(&record, &wal_frame)
+                .await?;
             let replay = match self
                 .replay_core_wal_record_unlocked(&record, &payload)
                 .await
@@ -5398,6 +5536,15 @@ impl CoreStore {
 
     fn active_wal_path(&self) -> PathBuf {
         self.admission_wal_dir().join("active.anwal")
+    }
+
+    fn admission_receipts_dir(&self) -> PathBuf {
+        self.admission_wal_dir().join("receipts")
+    }
+
+    fn admission_commit_certificate_path(&self, sequence: u64) -> PathBuf {
+        self.admission_receipts_dir()
+            .join(format!("{sequence:020}.receipt"))
     }
 
     fn admission_landed_bytes_root(&self) -> PathBuf {
@@ -8331,6 +8478,212 @@ fn decode_root_anchor_record(bytes: &[u8]) -> Result<CoreRootAnchorRecord> {
     Ok(anchor)
 }
 
+fn domain_hash_bytes(domain: &str, bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((domain.len() as u64).to_le_bytes());
+    hasher.update(domain.as_bytes());
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn admission_attempt_id(record: &CoreWalAdmissionRecord) -> Result<CoreAdmissionAttemptId> {
+    Ok(CoreAdmissionAttemptId {
+        mutation_id: record.mutation_id.clone(),
+        root_anchor_key: core_transaction_root_anchor_key().to_string(),
+        root_key_hash: root_key_hash(core_transaction_root_anchor_key()),
+        source_node_id: record.node_id.clone(),
+        source_wal_epoch: record.wal_epoch,
+        source_wal_sequence: record.sequence,
+        request_hash: admission_request_hash(record)?,
+        admission_profile: CORE_LOCAL_ADMISSION_PROFILE.to_string(),
+        admission_profile_epoch: CORE_LOCAL_ADMISSION_PROFILE_EPOCH,
+        selected_mirror_node_ids: Vec::new(),
+    })
+}
+
+fn admission_request_hash(record: &CoreWalAdmissionRecord) -> Result<String> {
+    let body_descriptor_hashes = record
+        .landed_bytes
+        .iter()
+        .map(landed_byte_descriptor_hash)
+        .collect::<Result<Vec<_>>>()?;
+    let value = serde_json::json!({
+        "operation_family": record.operation_family,
+        "writer_family": record.writer_family,
+        "target": record.target,
+        "preconditions": record.preconditions,
+        "boundary_values": record.boundary_values,
+        "body_descriptor_hashes": body_descriptor_hashes,
+        "idempotency_key_hash": record.idempotency_key_hash,
+    });
+    Ok(domain_hash_bytes(
+        "anvil.request_hash.v1",
+        &canonical_json_bytes(&value)?,
+    ))
+}
+
+fn landed_byte_descriptor_hash(landed: &CoreWalLandedByte) -> Result<String> {
+    validate_hash(&landed.sha256, "landed byte descriptor hash")?;
+    Ok(descriptor_hash(&[
+        "anvil.landed_byte.descriptor.v1",
+        &landed.landing_id,
+        &landed.sha256,
+        &landed.length.to_string(),
+        "application/octet-stream",
+    ]))
+}
+
+fn local_admission_receipt_payload_hash(receipt: &CoreLocalAdmissionReceipt) -> Result<String> {
+    let value = serde_json::json!({
+        "schema": receipt.schema,
+        "attempt_id": receipt.attempt_id,
+        "landed_byte_hashes": receipt.landed_byte_hashes,
+        "descriptor_hashes": receipt.descriptor_hashes,
+        "wal_frame_hash": receipt.wal_frame_hash,
+        "local_wal_fsync_sequence": receipt.local_wal_fsync_sequence,
+        "local_landed_fsync_sequence": receipt.local_landed_fsync_sequence,
+    });
+    Ok(domain_hash_bytes(
+        "anvil.admission.receipt.v1",
+        &canonical_json_bytes(&value)?,
+    ))
+}
+
+fn admission_commit_certificate_payload_hash(
+    certificate: &CoreAdmissionCommitCertificate,
+) -> Result<String> {
+    let mut mirror_hashes = certificate
+        .mirror_receipts
+        .iter()
+        .map(|receipt| {
+            canonical_json_bytes(receipt)
+                .map(|bytes| domain_hash_bytes("anvil.admission.receipt.v1", &bytes))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    mirror_hashes.sort();
+    let value = serde_json::json!({
+        "attempt_id": certificate.attempt_id,
+        "local_receipt_hash": certificate.local_receipt.signed_payload_hash,
+        "mirror_receipt_hashes": mirror_hashes,
+        "committed_at_unix_nanos": certificate.committed_at_unix_nanos,
+    });
+    Ok(domain_hash_bytes(
+        "anvil.admission.commit_certificate.v1",
+        &canonical_json_bytes(&value)?,
+    ))
+}
+
+fn build_local_admission_commit_certificate(
+    record: &CoreWalAdmissionRecord,
+    wal_frame: &[u8],
+    committed_at_unix_nanos: u64,
+) -> Result<CoreAdmissionCommitCertificate> {
+    let attempt_id = admission_attempt_id(record)?;
+    let landed_byte_hashes = record
+        .landed_bytes
+        .iter()
+        .map(|landed| landed.sha256.clone())
+        .collect::<Vec<_>>();
+    let descriptor_hashes = record
+        .landed_bytes
+        .iter()
+        .map(landed_byte_descriptor_hash)
+        .collect::<Result<Vec<_>>>()?;
+    let mut local_receipt = CoreLocalAdmissionReceipt {
+        schema: CORE_LOCAL_ADMISSION_RECEIPT_SCHEMA.to_string(),
+        attempt_id: attempt_id.clone(),
+        landed_byte_hashes,
+        descriptor_hashes,
+        wal_frame_hash: domain_hash_bytes("anvil.admission.wal_frame.v1", wal_frame),
+        local_wal_fsync_sequence: LOCAL_SHARD_FSYNC_SEQUENCE,
+        local_landed_fsync_sequence: LOCAL_SHARD_FSYNC_SEQUENCE,
+        signed_payload_hash: String::new(),
+        source_signature: Vec::new(),
+    };
+    local_receipt.signed_payload_hash = local_admission_receipt_payload_hash(&local_receipt)?;
+    let mut certificate = CoreAdmissionCommitCertificate {
+        schema: CORE_ADMISSION_COMMIT_CERTIFICATE_SCHEMA.to_string(),
+        attempt_id,
+        local_receipt,
+        mirror_receipts: Vec::new(),
+        committed_at_unix_nanos,
+        signed_payload_hash: String::new(),
+        source_signature: Vec::new(),
+    };
+    certificate.signed_payload_hash = admission_commit_certificate_payload_hash(&certificate)?;
+    Ok(certificate)
+}
+
+fn validate_local_admission_commit_certificate(
+    certificate: &CoreAdmissionCommitCertificate,
+) -> Result<()> {
+    if certificate.schema != CORE_ADMISSION_COMMIT_CERTIFICATE_SCHEMA {
+        bail!("CoreStore admission commit certificate has invalid schema");
+    }
+    if certificate.local_receipt.schema != CORE_LOCAL_ADMISSION_RECEIPT_SCHEMA {
+        bail!("CoreStore local admission receipt has invalid schema");
+    }
+    if certificate.attempt_id != certificate.local_receipt.attempt_id {
+        bail!("CoreStore admission commit certificate attempt mismatch");
+    }
+    validate_hash(
+        &certificate.attempt_id.root_key_hash,
+        "admission attempt root key hash",
+    )?;
+    validate_hash(
+        &certificate.attempt_id.request_hash,
+        "admission attempt request hash",
+    )?;
+    validate_logical_id(
+        &certificate.attempt_id.source_node_id,
+        "admission source node id",
+    )?;
+    if certificate.attempt_id.admission_profile.is_empty()
+        || certificate.attempt_id.admission_profile_epoch == 0
+    {
+        bail!("CoreStore admission attempt profile must be present");
+    }
+    if certificate.local_receipt.local_wal_fsync_sequence == 0 {
+        bail!("CoreStore local admission receipt WAL fsync sequence must be nonzero");
+    }
+    if !certificate.local_receipt.landed_byte_hashes.is_empty()
+        && certificate.local_receipt.local_landed_fsync_sequence == 0
+    {
+        bail!("CoreStore local admission receipt landed fsync sequence must be nonzero");
+    }
+    if certificate.local_receipt.landed_byte_hashes.len()
+        != certificate.local_receipt.descriptor_hashes.len()
+    {
+        bail!("CoreStore local admission receipt descriptor count mismatch");
+    }
+    validate_hash(
+        &certificate.local_receipt.wal_frame_hash,
+        "admission WAL frame hash",
+    )?;
+    for hash in &certificate.local_receipt.landed_byte_hashes {
+        validate_hash(hash, "admission landed byte hash")?;
+    }
+    for hash in &certificate.local_receipt.descriptor_hashes {
+        validate_hash(hash, "admission landed descriptor hash")?;
+    }
+    let expected_local = local_admission_receipt_payload_hash(&certificate.local_receipt)?;
+    if certificate.local_receipt.signed_payload_hash != expected_local {
+        bail!("CoreStore local admission receipt payload hash mismatch");
+    }
+    if certificate.local_receipt.source_signature.is_empty() {
+        bail!("CoreStore local admission receipt signature must not be empty");
+    }
+    let expected_certificate = admission_commit_certificate_payload_hash(certificate)?;
+    if certificate.signed_payload_hash != expected_certificate {
+        bail!("CoreStore admission commit certificate payload hash mismatch");
+    }
+    if certificate.source_signature.is_empty() {
+        bail!("CoreStore admission commit certificate signature must not be empty");
+    }
+    Ok(())
+}
+
 fn root_register_header_node_id(header: &CoreRootRegisterHeader) -> Result<&str> {
     header
         .register_cohort_nodes
@@ -11022,6 +11375,77 @@ mod tests {
             tokio::fs::metadata(&path).await.unwrap().len(),
             before_tail_len,
             "WAL reader must truncate the partial frame to the last valid frame boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn core_store_wal_admission_writes_signed_commit_certificate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        let record = store
+            .admit_core_mutation(
+                "stream.append",
+                "stream",
+                serde_json::json!({
+                    "stream_id": "tenant:t/bucket:b/certified-wal",
+                    "partition_id": "tenant:t/bucket:b",
+                    "record_kind": "event.created",
+                    "transaction_id": null,
+                }),
+                "certified-wal-admission".to_string(),
+                Some("certified-idempotency".to_string()),
+                CoreWalPayload::Landed(br#"{"ok":true}"#),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let wal_frame = encode_wal_frame(&canonical_json_bytes(&record).unwrap(), &[]).unwrap();
+        let certificate = store
+            .verify_local_admission_commit_certificate(&record, &wal_frame)
+            .await
+            .unwrap();
+        assert_eq!(
+            certificate.local_receipt.local_wal_fsync_sequence,
+            LOCAL_SHARD_FSYNC_SEQUENCE
+        );
+        assert_eq!(certificate.local_receipt.landed_byte_hashes.len(), 1);
+        assert_eq!(certificate.local_receipt.descriptor_hashes.len(), 1);
+        assert!(
+            certificate
+                .local_receipt
+                .signed_payload_hash
+                .starts_with("sha256:")
+        );
+        assert!(certificate.signed_payload_hash.starts_with("sha256:"));
+        assert!(!certificate.local_receipt.source_signature.is_empty());
+        assert!(!certificate.source_signature.is_empty());
+    }
+
+    #[tokio::test]
+    async fn core_store_recovery_rejects_uncertified_wal_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        write_test_wal_records(
+            &store,
+            vec![test_wal_record(
+                "uncertified-wal-record",
+                unix_timestamp_nanos(),
+                1,
+            )],
+        )
+        .await;
+        drop(store);
+
+        assert!(
+            CoreStore::new(storage)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("admission commit certificate"),
+            "recovery must not replay a WAL mutation that lacks committed admission evidence"
         );
     }
 
