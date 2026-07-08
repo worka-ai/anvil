@@ -72,6 +72,7 @@ const CORE_STREAM_SPARSE_INDEX_MAGIC: &[u8; 8] = b"ANSSIX1\0";
 const CORE_ACTIVE_STREAM_MAGIC: &[u8; 8] = b"ANASTR1\0";
 const CORE_ROOT_ANCHOR_MAGIC: &[u8; 8] = b"ANROOT1\0";
 const CORE_ROOT_REGISTER_MAGIC: &[u8; 8] = b"ANREGRT1";
+const CORE_TRANSACTION_MANIFEST_MAGIC: &[u8; 8] = b"ANXACT1\0";
 const CORE_BLOCK_SHARD_MAGIC: &[u8; 8] = b"ANBLK\n\0\0";
 const CORE_WAL_FILE_MAGIC: &[u8; 6] = b"ANWAL\n";
 const CORE_WAL_FRAME_MAGIC: &[u8; 4] = b"AWF1";
@@ -79,6 +80,7 @@ const CORE_STREAM_SEGMENT_VERSION: u16 = 1;
 const CORE_ACTIVE_STREAM_VERSION: u16 = 1;
 const CORE_ROOT_ANCHOR_VERSION: u16 = 1;
 const CORE_ROOT_REGISTER_VERSION: u16 = 1;
+const CORE_TRANSACTION_MANIFEST_VERSION: u16 = 1;
 const CORE_BLOCK_SHARD_VERSION: u16 = 1;
 const CORE_WAL_VERSION: u16 = 1;
 const CORE_WAL_EPOCH: u64 = 1;
@@ -4700,8 +4702,7 @@ impl CoreStore {
         let transaction_manifest_bytes = self
             .read_logical_file_plaintext(&transaction_manifest)
             .await?;
-        let transaction: CoreTransactionManifestRecord =
-            serde_json::from_slice(&transaction_manifest_bytes)?;
+        let transaction = decode_transaction_manifest_record(&transaction_manifest_bytes)?;
         validate_transaction_manifest_record(&transaction, anchor.root_generation)?;
         let state_locator = transaction
             .logical_manifests
@@ -4749,7 +4750,7 @@ impl CoreStore {
                 "core_control",
                 format!("lf_core_transaction_manifest_{post_root_generation:020}"),
                 post_root_generation,
-                serde_json::to_vec(&transaction)?,
+                encode_transaction_manifest_record(&transaction)?,
                 format!("core_transaction_manifest_{post_root_generation:020}"),
                 "local".to_string(),
             )
@@ -7670,6 +7671,74 @@ fn validate_transaction_manifest_record(
         validate_manifest_locator(locator)?;
     }
     Ok(())
+}
+
+fn encode_transaction_manifest_record(
+    transaction: &CoreTransactionManifestRecord,
+) -> Result<Vec<u8>> {
+    let header = serde_json::json!({
+        "schema": &transaction.schema,
+        "pre_root_generation": transaction.pre_root_generation,
+        "post_root_generation": transaction.post_root_generation,
+        "mutation_count": transaction.mutation_ids.len(),
+        "logical_manifest_count": transaction.logical_manifests.len(),
+    });
+    let header_json = serde_json::to_vec(&header)?;
+    let body_json = serde_json::to_vec(transaction)?;
+    let mut out = Vec::with_capacity(
+        CORE_TRANSACTION_MANIFEST_MAGIC.len() + 2 + 4 + 8 + header_json.len() + body_json.len() + 4,
+    );
+    out.extend_from_slice(CORE_TRANSACTION_MANIFEST_MAGIC);
+    out.extend_from_slice(&CORE_TRANSACTION_MANIFEST_VERSION.to_le_bytes());
+    out.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(body_json.len() as u64).to_le_bytes());
+    out.extend_from_slice(&header_json);
+    out.extend_from_slice(&body_json);
+    let mut crc_input = Vec::with_capacity(header_json.len() + body_json.len());
+    crc_input.extend_from_slice(&header_json);
+    crc_input.extend_from_slice(&body_json);
+    out.extend_from_slice(&crc32c(&crc_input).to_le_bytes());
+    Ok(out)
+}
+
+fn decode_transaction_manifest_record(bytes: &[u8]) -> Result<CoreTransactionManifestRecord> {
+    let mut offset = 0usize;
+    let magic = read_exact(bytes, &mut offset, CORE_TRANSACTION_MANIFEST_MAGIC.len())?;
+    if magic != CORE_TRANSACTION_MANIFEST_MAGIC {
+        bail!("CoreStore transaction manifest has invalid magic");
+    }
+    let version = read_u16_le(bytes, &mut offset)?;
+    if version != CORE_TRANSACTION_MANIFEST_VERSION {
+        bail!("CoreStore transaction manifest has unsupported version {version}");
+    }
+    let header_len = read_u32_le(bytes, &mut offset)? as usize;
+    let body_len = read_u64_le(bytes, &mut offset)? as usize;
+    let header_json = read_exact(bytes, &mut offset, header_len)?;
+    let body_json = read_exact(bytes, &mut offset, body_len)?;
+    let expected_crc = read_u32_le(bytes, &mut offset)?;
+    if offset != bytes.len() {
+        bail!("CoreStore transaction manifest has trailing bytes");
+    }
+    let mut crc_input = Vec::with_capacity(header_json.len() + body_json.len());
+    crc_input.extend_from_slice(header_json);
+    crc_input.extend_from_slice(body_json);
+    if crc32c(&crc_input) != expected_crc {
+        bail!("CoreStore transaction manifest checksum mismatch");
+    }
+    let header: serde_json::Value = serde_json::from_slice(header_json)?;
+    if json_required_string(&header, "schema")? != "anvil.core.transaction_manifest.v1" {
+        bail!("CoreStore transaction manifest header has invalid schema");
+    }
+    let transaction: CoreTransactionManifestRecord = serde_json::from_slice(body_json)?;
+    if json_required_u64(&header, "pre_root_generation")? != transaction.pre_root_generation
+        || json_required_u64(&header, "post_root_generation")? != transaction.post_root_generation
+        || json_required_u64(&header, "mutation_count")? != transaction.mutation_ids.len() as u64
+        || json_required_u64(&header, "logical_manifest_count")?
+            != transaction.logical_manifests.len() as u64
+    {
+        bail!("CoreStore transaction manifest header/body mismatch");
+    }
+    Ok(transaction)
 }
 
 fn hash_root_anchor_record(anchor: &CoreRootAnchorRecord) -> Result<String> {
@@ -11050,8 +11119,9 @@ mod tests {
             .read_logical_file_plaintext(&transaction_manifest)
             .await
             .unwrap();
-        let transaction_manifest: CoreTransactionManifestRecord =
-            serde_json::from_slice(&transaction_manifest_bytes).unwrap();
+        assert!(transaction_manifest_bytes.starts_with(CORE_TRANSACTION_MANIFEST_MAGIC));
+        let transaction_manifest = decode_transaction_manifest_record(&transaction_manifest_bytes)
+            .expect("decode transaction manifest frame");
         assert_eq!(
             transaction_manifest.post_root_generation,
             latest_anchor.root_generation
