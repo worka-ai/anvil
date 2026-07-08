@@ -94,6 +94,8 @@ const CORE_BLOCK_SHARD_HEADER_SCHEMA: &str = "anvil.core.block_shard.v1";
 const CORE_WAL_RECORD_SCHEMA: &str = "anvil.core.wal_record.v1";
 const CORE_WAL_FINALISATION_SCHEMA: &str = "anvil.core.wal_finalisation.v1";
 const CORE_WAL_FINALISATION_RECORD_KIND: &str = "core_wal.finalisation";
+const CORE_STREAM_STATE_LOCATOR_SCHEMA: &str = "anvil.core.stream_state_locator.v1";
+const CORE_STREAM_STATE_LOCATOR_RECORD_KIND: &str = "core_stream.state_locator";
 const CORE_TRANSACTION_STREAM_ID: &str = "core_transactions";
 const CORE_TRANSACTION_PARTITION_ID: &str = "core-control";
 const CORE_TRANSACTION_RECORD_KIND: &str = "core_transaction";
@@ -295,6 +297,15 @@ struct StoredStreamRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredStreamStateLocatorRecord {
+    schema: String,
+    stream_id: String,
+    sequence: u64,
+    event_hash: String,
+    locator: CoreManifestLocator,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredStreamSegmentHeader {
     schema: String,
     stream_id: String,
@@ -384,7 +395,15 @@ struct CoreWalFinalisationRecord {
     boundary_values: Vec<CoreBoundaryValue>,
     landed_bytes: Vec<CoreWalLandedByte>,
     state: String,
+    #[serde(default)]
+    result: Option<serde_json::Value>,
     finalised_at_unix_nanos: u64,
+}
+
+#[derive(Debug, Clone)]
+struct StreamAppendOutcome {
+    receipt: StreamAppendReceipt,
+    state_locator: Option<CoreManifestLocator>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -392,6 +411,12 @@ struct CoreWalRecordKey {
     node_id: String,
     wal_epoch: u64,
     wal_sequence: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CoreWalReplayOutcome {
+    state: &'static str,
+    result: Option<serde_json::Value>,
 }
 
 impl From<&CoreWalAdmissionRecord> for CoreWalRecordKey {
@@ -1672,10 +1697,14 @@ impl CoreStore {
             )
             .await?;
         match self.append_stream_unlocked(input).await {
-            Ok(receipt) => {
-                self.mark_core_wal_finalised_unlocked(&admission, "committed")
+            Ok(outcome) => {
+                let result = outcome
+                    .state_locator
+                    .as_ref()
+                    .map(|locator| serde_json::json!({ "stream_state_locator": locator }));
+                self.mark_core_wal_finalised_with_result_unlocked(&admission, "committed", result)
                     .await?;
-                Ok(receipt)
+                Ok(outcome.receipt)
             }
             Err(error) => {
                 self.mark_core_wal_finalised_unlocked(&admission, "aborted")
@@ -1699,7 +1728,7 @@ impl CoreStore {
     async fn append_stream_unlocked(
         &self,
         input: AppendStreamRecord,
-    ) -> Result<StreamAppendReceipt> {
+    ) -> Result<StreamAppendOutcome> {
         let idempotency_key_hash = input
             .idempotency_key
             .as_deref()
@@ -1712,7 +1741,7 @@ impl CoreStore {
         &self,
         input: AppendStreamRecord,
         idempotency_key_hash: Option<String>,
-    ) -> Result<StreamAppendReceipt> {
+    ) -> Result<StreamAppendOutcome> {
         if let Some(fence) = input.fence.as_ref() {
             self.validate_fence_precondition_unlocked(fence).await?;
         }
@@ -1724,7 +1753,10 @@ impl CoreStore {
             )
             .await?
         {
-            return Ok(receipt);
+            return Ok(StreamAppendOutcome {
+                receipt,
+                state_locator: None,
+            });
         }
         let mut records = self.read_all_stream_records(&input.stream_id).await?;
         let payload_hash = format!("sha256:{}", sha256_hex(&input.payload));
@@ -1758,14 +1790,22 @@ impl CoreStore {
         };
         record.event_hash = format!("sha256:{}", sha256_hex(&event_hash_input(&record)?));
         records.push(record.clone());
-        self.write_stream_records(&input.stream_id, &records)
+        let state_locator = self
+            .write_stream_records(&input.stream_id, &records)
             .await?;
-        Ok(StreamAppendReceipt {
-            stream_id: record.stream_id,
-            sequence: record.sequence,
-            cursor: record.cursor,
-            event_hash: record.event_hash,
-            idempotent_replay: false,
+        if let Some(locator) = state_locator.as_ref() {
+            self.append_stream_state_locator_record(&record, locator)
+                .await?;
+        }
+        Ok(StreamAppendOutcome {
+            receipt: StreamAppendReceipt {
+                stream_id: record.stream_id,
+                sequence: record.sequence,
+                cursor: record.cursor,
+                event_hash: record.event_hash,
+                idempotent_replay: false,
+            },
+            state_locator,
         })
     }
 
@@ -2730,7 +2770,7 @@ impl CoreStore {
     async fn read_core_wal_finalisation_keys(&self) -> Result<BTreeSet<CoreWalRecordKey>> {
         let mut keys = BTreeSet::new();
         for record in self
-            .read_all_stream_records(CORE_TRANSACTION_STREAM_ID)
+            .read_direct_stream_records(CORE_TRANSACTION_STREAM_ID)
             .await?
         {
             if record.record_kind != CORE_WAL_FINALISATION_RECORD_KIND {
@@ -2754,10 +2794,20 @@ impl CoreStore {
         admission: &CoreWalAdmissionRecord,
         state: &str,
     ) -> Result<()> {
+        self.mark_core_wal_finalised_with_result_unlocked(admission, state, None)
+            .await
+    }
+
+    async fn mark_core_wal_finalised_with_result_unlocked(
+        &self,
+        admission: &CoreWalAdmissionRecord,
+        state: &str,
+        result: Option<serde_json::Value>,
+    ) -> Result<()> {
         let _transaction_guard = self.acquire_stream_lock(CORE_TRANSACTION_STREAM_ID).await?;
         let admission_key = CoreWalRecordKey::from(admission);
         for record in self
-            .read_all_stream_records(CORE_TRANSACTION_STREAM_ID)
+            .read_direct_stream_records(CORE_TRANSACTION_STREAM_ID)
             .await?
         {
             if record.record_kind != CORE_WAL_FINALISATION_RECORD_KIND {
@@ -2772,7 +2822,10 @@ impl CoreStore {
             if existing_key != admission_key {
                 continue;
             }
-            if existing.mutation_id == admission.mutation_id && existing.state == state {
+            if existing.mutation_id == admission.mutation_id
+                && existing.state == state
+                && existing.result == result
+            {
                 return Ok(());
             }
             bail!(
@@ -2796,6 +2849,7 @@ impl CoreStore {
             boundary_values: admission.boundary_values.clone(),
             landed_bytes: admission.landed_bytes.clone(),
             state: state.to_string(),
+            result,
             finalised_at_unix_nanos: unix_timestamp_nanos(),
         };
         self.append_stream_unlocked(AppendStreamRecord {
@@ -2939,11 +2993,11 @@ impl CoreStore {
             if finalised.contains(&record_key) {
                 continue;
             }
-            let state = match self
+            let replay = match self
                 .replay_core_wal_record_unlocked(&record, &payload)
                 .await
             {
-                Ok(state) => state,
+                Ok(replay) => replay,
                 Err(error) => {
                     if self.wait_for_core_wal_finalisation(&record_key).await? {
                         continue;
@@ -2956,7 +3010,10 @@ impl CoreStore {
                     });
                 }
             };
-            if let Err(error) = self.mark_core_wal_finalised_unlocked(&record, state).await {
+            if let Err(error) = self
+                .mark_core_wal_finalised_with_result_unlocked(&record, replay.state, replay.result)
+                .await
+            {
                 if self.wait_for_core_wal_finalisation(&record_key).await? {
                     continue;
                 }
@@ -2980,7 +3037,7 @@ impl CoreStore {
         &self,
         record: &CoreWalAdmissionRecord,
         payload: &[u8],
-    ) -> Result<&'static str> {
+    ) -> Result<CoreWalReplayOutcome> {
         match record.operation_family.as_str() {
             "object.put" => {
                 let profile_id = json_required_string(&record.target, "erasure_profile_id")?;
@@ -3013,7 +3070,10 @@ impl CoreStore {
                     &record.writer_family,
                 )
                 .await?;
-                Ok("committed")
+                Ok(CoreWalReplayOutcome {
+                    state: "committed",
+                    result: None,
+                })
             }
             "stream.append" => {
                 let stream_id = json_required_string(&record.target, "stream_id")?;
@@ -3021,26 +3081,36 @@ impl CoreStore {
                 let record_kind = json_required_string(&record.target, "record_kind")?;
                 let transaction_id = json_optional_string(&record.target, "transaction_id")?;
                 let payload = self.core_wal_payload_bytes(record, payload).await?;
-                self.append_stream_unlocked_with_idempotency_hash(
-                    AppendStreamRecord {
-                        stream_id,
-                        partition_id,
-                        record_kind,
-                        payload,
-                        fence: None,
-                        transaction_id,
-                        idempotency_key: None,
-                    },
-                    record.idempotency_key_hash.clone(),
-                )
-                .await?;
-                Ok("committed")
+                let outcome = self
+                    .append_stream_unlocked_with_idempotency_hash(
+                        AppendStreamRecord {
+                            stream_id,
+                            partition_id,
+                            record_kind,
+                            payload,
+                            fence: None,
+                            transaction_id,
+                            idempotency_key: None,
+                        },
+                        record.idempotency_key_hash.clone(),
+                    )
+                    .await?;
+                Ok(CoreWalReplayOutcome {
+                    state: "committed",
+                    result: outcome
+                        .state_locator
+                        .as_ref()
+                        .map(|locator| serde_json::json!({ "stream_state_locator": locator })),
+                })
             }
             "mutation.batch" => {
                 let payload = self.core_wal_payload_bytes(record, payload).await?;
                 let batch: CoreMutationBatch = serde_json::from_slice(&payload)?;
                 let receipt = self.recover_admitted_mutation_batch_unlocked(batch).await?;
-                Ok(core_transaction_state_name(receipt.state))
+                Ok(CoreWalReplayOutcome {
+                    state: core_transaction_state_name(receipt.state),
+                    result: None,
+                })
             }
             "ref.compare_and_swap" => {
                 let ref_name = json_required_string(&record.target, "ref_name")?;
@@ -3055,7 +3125,10 @@ impl CoreStore {
                     .as_ref()
                     .is_some_and(|value| value.target == new_target)
                 {
-                    return Ok("committed");
+                    return Ok(CoreWalReplayOutcome {
+                        state: "committed",
+                        result: None,
+                    });
                 }
                 let precondition = CoreMutationPrecondition::Ref {
                     ref_name: ref_name.clone(),
@@ -3074,7 +3147,10 @@ impl CoreStore {
                     Some(&precondition),
                 )
                 .await?;
-                Ok("committed")
+                Ok(CoreWalReplayOutcome {
+                    state: "committed",
+                    result: None,
+                })
             }
             "ref.delete" => {
                 let ref_name = json_required_string(&record.target, "ref_name")?;
@@ -3084,7 +3160,10 @@ impl CoreStore {
                 let transaction_id = json_optional_string(&record.target, "transaction_id")?;
                 let current = self.read_ref(&ref_name).await?;
                 let Some(previous) = current else {
-                    return Ok("committed");
+                    return Ok(CoreWalReplayOutcome {
+                        state: "committed",
+                        result: None,
+                    });
                 };
                 validate_ref_precondition(
                     Some(&previous),
@@ -3115,7 +3194,10 @@ impl CoreStore {
                     committed_at: now_rfc3339(),
                 };
                 self.append_ref_update_unlocked(&update).await?;
-                Ok("committed")
+                Ok(CoreWalReplayOutcome {
+                    state: "committed",
+                    result: None,
+                })
             }
             other => bail!(
                 "CoreStore WAL recovery does not support operation family {other}; refusing startup with unfinalised WAL"
@@ -3171,57 +3253,43 @@ impl CoreStore {
     }
 
     pub async fn list_stream_ids(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut votes: BTreeMap<String, usize> = BTreeMap::new();
-        for node_id in local_control_node_ids() {
-            let dir = self.stream_data_replica_dir(&node_id);
-            let mut entries = match fs::read_dir(&dir).await {
-                Ok(entries) => entries,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => {
-                    return Err(err).with_context(|| {
-                        format!("read CoreStore stream data directory {node_id}")
-                    });
+        let mut ids = BTreeSet::new();
+        if CORE_TRANSACTION_STREAM_ID.starts_with(prefix)
+            && !self
+                .read_direct_stream_records(CORE_TRANSACTION_STREAM_ID)
+                .await?
+                .is_empty()
+        {
+            ids.insert(CORE_TRANSACTION_STREAM_ID.to_string());
+        }
+        for record in self
+            .read_direct_stream_records(CORE_TRANSACTION_STREAM_ID)
+            .await?
+        {
+            if record.record_kind == CORE_STREAM_STATE_LOCATOR_RECORD_KIND {
+                let state: StoredStreamStateLocatorRecord =
+                    serde_json::from_slice(&record.payload)?;
+                if state.schema == CORE_STREAM_STATE_LOCATOR_SCHEMA
+                    && state.stream_id.starts_with(prefix)
+                {
+                    ids.insert(state.stream_id);
                 }
-            };
-            while let Some(entry) = entries.next_entry().await? {
-                if is_core_store_temp_entry(&entry.file_name()) {
-                    continue;
-                }
-                let file_type = match entry.file_type().await {
-                    Ok(file_type) => file_type,
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(err) => {
-                        return Err(err).with_context(|| "read CoreStore stream entry type");
-                    }
-                };
-                if !file_type.is_file() {
-                    continue;
-                }
-                let path = entry.path();
-                if path.extension().and_then(|value| value.to_str()) != Some("anstream") {
-                    continue;
-                }
-                let bytes = match read_file(&path, "core_store", "read_stream_id_from_data").await {
-                    Ok(bytes) => bytes,
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(err) => {
-                        return Err(err).with_context(|| "read CoreStore stream data entry");
-                    }
-                };
-                let stream_id = decode_active_stream_id(&bytes)?;
-                if stream_id.starts_with(prefix) {
-                    *votes.entry(stream_id).or_default() += 1;
-                }
+                continue;
+            }
+            if record.record_kind != CORE_WAL_FINALISATION_RECORD_KIND {
+                continue;
+            }
+            let finalisation: CoreWalFinalisationRecord = serde_json::from_slice(&record.payload)?;
+            if finalisation.operation_family != "stream.append" || finalisation.state != "committed"
+            {
+                continue;
+            }
+            let stream_id = json_required_string(&finalisation.target, "stream_id")?;
+            if stream_id.starts_with(prefix) {
+                ids.insert(stream_id);
             }
         }
-        let mut ids = votes
-            .into_iter()
-            .filter_map(|(stream_id, count)| {
-                (count >= LOCAL_CONTROL_READ_QUORUM).then_some(stream_id)
-            })
-            .collect::<Vec<_>>();
-        ids.sort();
-        Ok(ids)
+        Ok(ids.into_iter().collect())
     }
 
     pub async fn compare_and_swap_ref(&self, input: CompareAndSwapRef) -> Result<CasRefReceipt> {
@@ -3634,10 +3702,10 @@ impl CoreStore {
                         idempotency_key: idempotency_key.clone(),
                     })
                     .await
-                    .map(|receipt| CoreTransactionUpdate::StreamAppend {
+                    .map(|outcome| CoreTransactionUpdate::StreamAppend {
                         stream_id: stream_id.clone(),
-                        visible_sequence: receipt.sequence,
-                        prepared_record_hash: receipt.event_hash,
+                        visible_sequence: outcome.receipt.sequence,
+                        prepared_record_hash: outcome.receipt.event_hash,
                     }),
             };
             match operation_result {
@@ -3768,10 +3836,10 @@ impl CoreStore {
                         idempotency_key: idempotency_key.clone(),
                     })
                     .await
-                    .map(|receipt| CoreTransactionUpdate::StreamAppend {
+                    .map(|outcome| CoreTransactionUpdate::StreamAppend {
                         stream_id: stream_id.clone(),
-                        visible_sequence: receipt.sequence,
-                        prepared_record_hash: receipt.event_hash,
+                        visible_sequence: outcome.receipt.sequence,
+                        prepared_record_hash: outcome.receipt.event_hash,
                     }),
             };
             match operation_result {
@@ -3879,7 +3947,7 @@ impl CoreStore {
         transaction_id: &str,
     ) -> Result<Option<CoreTransaction>> {
         let records = self
-            .read_all_stream_records(CORE_TRANSACTION_STREAM_ID)
+            .read_direct_stream_records(CORE_TRANSACTION_STREAM_ID)
             .await?;
         for record in records {
             if record.record_kind != CORE_TRANSACTION_RECORD_KIND {
@@ -4297,7 +4365,7 @@ impl CoreStore {
     ) -> Result<Vec<CoreBoundaryValue>> {
         let mut values = Vec::new();
         for record in self
-            .read_all_stream_records(CORE_TRANSACTION_STREAM_ID)
+            .read_direct_stream_records(CORE_TRANSACTION_STREAM_ID)
             .await?
         {
             if record.record_kind != CORE_WAL_FINALISATION_RECORD_KIND {
@@ -4337,6 +4405,19 @@ impl CoreStore {
     }
 
     async fn read_all_stream_records(&self, stream_id: &str) -> Result<Vec<StreamRecord>> {
+        if stream_id != CORE_TRANSACTION_STREAM_ID {
+            let Some(locator) = self.latest_stream_state_locator(stream_id).await? else {
+                return Ok(Vec::new());
+            };
+            let manifest = self.read_logical_file_manifest(&locator).await?;
+            let bytes = self.read_logical_file_plaintext(&manifest).await?;
+            return decode_active_stream_records(stream_id, &bytes)
+                .with_context(|| format!("decode CoreStore stream state {stream_id}"));
+        }
+        self.read_direct_stream_records(stream_id).await
+    }
+
+    async fn read_direct_stream_records(&self, stream_id: &str) -> Result<Vec<StreamRecord>> {
         for attempt in 0..CORE_CONTROL_READ_RETRY_ATTEMPTS {
             let Some(bytes) = self
                 .read_bytes_from_quorum(
@@ -4369,6 +4450,17 @@ impl CoreStore {
         after_sequence: u64,
         limit: usize,
     ) -> Result<Vec<StreamRecord>> {
+        if stream_id != CORE_TRANSACTION_STREAM_ID {
+            let records = self.read_all_stream_records(stream_id).await?;
+            let filtered = records
+                .into_iter()
+                .filter(|record| record.sequence > after_sequence)
+                .collect::<Vec<_>>();
+            if limit > 0 {
+                return Ok(filtered.into_iter().take(limit).collect());
+            }
+            return Ok(filtered);
+        }
         for attempt in 0..CORE_CONTROL_READ_RETRY_ATTEMPTS {
             let Some(bytes) = self
                 .read_bytes_from_quorum(
@@ -4395,14 +4487,226 @@ impl CoreStore {
         unreachable!("CoreStore stream page decode retry loop must return")
     }
 
-    async fn write_stream_records(&self, stream_id: &str, records: &[StreamRecord]) -> Result<()> {
-        let bytes = encode_active_stream_records(stream_id, records)?;
-        self.write_bytes_to_quorum(
-            &format!("CoreStore stream {stream_id}"),
-            &bytes,
-            |store, node_id| store.stream_replica_path(node_id, stream_id),
+    async fn latest_stream_state_locator(
+        &self,
+        stream_id: &str,
+    ) -> Result<Option<CoreManifestLocator>> {
+        validate_logical_id(stream_id, "stream id")?;
+        let mut latest = None::<(u64, CoreManifestLocator)>;
+        for record in self
+            .read_direct_stream_records(CORE_TRANSACTION_STREAM_ID)
+            .await?
+        {
+            if record.record_kind == CORE_STREAM_STATE_LOCATOR_RECORD_KIND {
+                let state: StoredStreamStateLocatorRecord =
+                    serde_json::from_slice(&record.payload)?;
+                if state.schema != CORE_STREAM_STATE_LOCATOR_SCHEMA || state.stream_id != stream_id
+                {
+                    continue;
+                }
+                validate_manifest_locator(&state.locator)?;
+                if latest
+                    .as_ref()
+                    .is_none_or(|(sequence, _)| state.sequence > *sequence)
+                {
+                    latest = Some((state.sequence, state.locator));
+                }
+                continue;
+            }
+            if record.record_kind != CORE_WAL_FINALISATION_RECORD_KIND {
+                continue;
+            }
+            let finalisation: CoreWalFinalisationRecord = serde_json::from_slice(&record.payload)?;
+            if finalisation.operation_family != "stream.append"
+                || finalisation.state != "committed"
+                || json_required_string(&finalisation.target, "stream_id")? != stream_id
+            {
+                continue;
+            }
+            let Some(result) = finalisation.result else {
+                continue;
+            };
+            let Some(locator_value) = result.get("stream_state_locator") else {
+                continue;
+            };
+            let locator: CoreManifestLocator = serde_json::from_value(locator_value.clone())?;
+            validate_manifest_locator(&locator)?;
+            if latest
+                .as_ref()
+                .is_none_or(|(sequence, _)| record.sequence > *sequence)
+            {
+                latest = Some((record.sequence, locator));
+            }
+        }
+        Ok(latest.map(|(_, locator)| locator))
+    }
+
+    async fn append_stream_state_locator_record(
+        &self,
+        record: &StreamRecord,
+        locator: &CoreManifestLocator,
+    ) -> Result<()> {
+        if record.stream_id == CORE_TRANSACTION_STREAM_ID {
+            return Ok(());
+        }
+        let state = StoredStreamStateLocatorRecord {
+            schema: CORE_STREAM_STATE_LOCATOR_SCHEMA.to_string(),
+            stream_id: record.stream_id.clone(),
+            sequence: record.sequence,
+            event_hash: record.event_hash.clone(),
+            locator: locator.clone(),
+        };
+        self.append_transaction_stream_record_direct(
+            CORE_STREAM_STATE_LOCATOR_RECORD_KIND,
+            serde_json::to_vec(&state)?,
+            Some(format!(
+                "{}:{}:{}:{}",
+                CORE_STREAM_STATE_LOCATOR_RECORD_KIND,
+                record.stream_id,
+                record.sequence,
+                record.event_hash
+            )),
         )
-        .await
+        .await?;
+        Ok(())
+    }
+
+    async fn append_transaction_stream_record_direct(
+        &self,
+        record_kind: &str,
+        payload: Vec<u8>,
+        idempotency_key: Option<String>,
+    ) -> Result<StreamAppendReceipt> {
+        let idempotency_key_hash = idempotency_key
+            .as_deref()
+            .map(|key| format!("sha256:{}", sha256_hex(key.as_bytes())));
+        if let Some(receipt) = self
+            .stream_idempotent_replay_by_hash_unlocked(
+                CORE_TRANSACTION_STREAM_ID,
+                &payload,
+                idempotency_key_hash.as_deref(),
+            )
+            .await?
+        {
+            return Ok(receipt);
+        }
+
+        let mut records = self
+            .read_direct_stream_records(CORE_TRANSACTION_STREAM_ID)
+            .await?;
+        let sequence = records
+            .last()
+            .map(|record| record.sequence + 1)
+            .unwrap_or(1);
+        let previous_event_hash = records
+            .last()
+            .map(|record| record.event_hash.clone())
+            .unwrap_or_else(|| ZERO_HASH.to_string());
+        let cursor = format!("{CORE_TRANSACTION_STREAM_ID}:{sequence:020}");
+        let payload_hash = format!("sha256:{}", sha256_hex(&payload));
+        let mut record = StreamRecord {
+            schema: CORE_WATCH_EVENT_SCHEMA.to_string(),
+            stream_id: CORE_TRANSACTION_STREAM_ID.to_string(),
+            partition_id: CORE_TRANSACTION_PARTITION_ID.to_string(),
+            sequence,
+            cursor,
+            previous_event_hash,
+            event_hash: String::new(),
+            record_kind: record_kind.to_string(),
+            payload_hash,
+            payload,
+            transaction_id: None,
+            idempotency_key_hash,
+            created_at: now_rfc3339(),
+        };
+        record.event_hash = format!("sha256:{}", sha256_hex(&event_hash_input(&record)?));
+        records.push(record.clone());
+        self.write_stream_records(CORE_TRANSACTION_STREAM_ID, &records)
+            .await?;
+        Ok(StreamAppendReceipt {
+            stream_id: record.stream_id,
+            sequence: record.sequence,
+            cursor: record.cursor,
+            event_hash: record.event_hash,
+            idempotent_replay: false,
+        })
+    }
+
+    async fn write_stream_records(
+        &self,
+        stream_id: &str,
+        records: &[StreamRecord],
+    ) -> Result<Option<CoreManifestLocator>> {
+        let bytes = encode_active_stream_records(stream_id, records)?;
+        if stream_id == CORE_TRANSACTION_STREAM_ID {
+            self.write_bytes_to_quorum(
+                &format!("CoreStore stream {stream_id}"),
+                &bytes,
+                |store, node_id| store.stream_replica_path(node_id, stream_id),
+            )
+            .await?;
+            return Ok(None);
+        }
+        self.write_stream_state_logical_file(stream_id, records, bytes)
+            .await
+            .map(Some)
+    }
+
+    async fn write_stream_state_logical_file(
+        &self,
+        stream_id: &str,
+        records: &[StreamRecord],
+        bytes: Vec<u8>,
+    ) -> Result<CoreManifestLocator> {
+        let last_sequence = records.last().map(|record| record.sequence).unwrap_or(0);
+        let state_hash = format!("sha256:{}", sha256_hex(&bytes));
+        let state_hash_hex = strip_sha256_prefix(&state_hash)?;
+        let profile = local_erasure_profile(LOCAL_ERASURE_PROFILE_ID)?;
+        let object_ref = self
+            .materialise_object_blob_bytes(
+                &format!("lf_stream_state_{state_hash_hex}"),
+                last_sequence,
+                0,
+                &state_hash,
+                state_hash_hex,
+                &bytes,
+                &[],
+                &format!("stream_state_{}", sha256_hex(stream_id.as_bytes())),
+                profile,
+                "none",
+                "stream",
+            )
+            .await?;
+        let object_manifest = self.read_object_manifest(&object_ref).await?;
+        let block = MaterializedLogicalBlock {
+            object_manifest,
+            logical_offset: 0,
+            logical_length: bytes.len() as u64,
+            compressed_length: bytes.len() as u64,
+            plaintext_hash: state_hash.clone(),
+            encryption: none_encryption_descriptor(&state_hash, &state_hash),
+        };
+        let request = WriteLogicalFileRequest {
+            writer_family: "stream".to_string(),
+            generation: last_sequence,
+            logical_file_id: format!("lf_stream_state_{state_hash_hex}"),
+            source: Vec::new(),
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
+            boundary_values: Vec::new(),
+            mutation_id: format!("stream_state_{}", sha256_hex(stream_id.as_bytes())),
+            region_id: "local".to_string(),
+        };
+        let manifest = logical_file_manifest_from_object_manifests(
+            &request,
+            &[block],
+            state_hash,
+            bytes.len() as u64,
+            none_compression_descriptor(&bytes),
+        )?;
+        self.publish_logical_file_manifest(&manifest, &request.pipeline_policy)
+            .await
     }
 
     async fn acquire_batch_locks(&self, batch: &CoreMutationBatch) -> Result<Vec<CoreStoreLock>> {
@@ -6646,11 +6950,6 @@ fn stream_head_from_records(records: &[StreamRecord]) -> (u64, String) {
         .unwrap_or_else(|| (0, ZERO_HASH.to_string()))
 }
 
-fn is_core_store_temp_entry(name: &std::ffi::OsStr) -> bool {
-    name.to_str()
-        .is_some_and(|value| value.starts_with('.') || value.ends_with(".tmp"))
-}
-
 fn validate_batch_partitions(batch: &CoreMutationBatch) -> Result<()> {
     let mut ref_ops = BTreeSet::new();
     for precondition in &batch.preconditions {
@@ -7092,23 +7391,6 @@ fn encode_active_stream_records(stream_id: &str, records: &[StreamRecord]) -> Re
     let stream_hash = Sha256::digest(&bytes);
     bytes.extend_from_slice(&stream_hash);
     Ok(bytes)
-}
-
-fn decode_active_stream_id(bytes: &[u8]) -> Result<String> {
-    let mut offset = 0usize;
-    let magic = read_exact(bytes, &mut offset, CORE_ACTIVE_STREAM_MAGIC.len())?;
-    if magic != CORE_ACTIVE_STREAM_MAGIC {
-        bail!("CoreStore active stream has invalid magic");
-    }
-    let version = read_u16_le(bytes, &mut offset)?;
-    if version != CORE_ACTIVE_STREAM_VERSION {
-        bail!("CoreStore active stream has unsupported version {version}");
-    }
-    let encoded_stream_id_len = read_u32_le(bytes, &mut offset)? as usize;
-    let encoded_stream_id = read_exact(bytes, &mut offset, encoded_stream_id_len)?;
-    Ok(std::str::from_utf8(encoded_stream_id)
-        .context("decode CoreStore active stream id as utf-8")?
-        .to_string())
 }
 
 fn decode_active_stream_records(stream_id: &str, bytes: &[u8]) -> Result<Vec<StreamRecord>> {
@@ -9499,7 +9781,7 @@ mod tests {
             .unwrap();
 
         let finalisations = store
-            .read_all_stream_records(CORE_TRANSACTION_STREAM_ID)
+            .read_direct_stream_records(CORE_TRANSACTION_STREAM_ID)
             .await
             .unwrap()
             .into_iter()
@@ -9782,7 +10064,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn core_store_read_stream_page_does_not_decode_unrequested_tail_records() {
+    async fn core_store_read_stream_page_uses_corestore_stream_state_without_replica_files() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = Storage::new_at(tmp.path()).await.unwrap();
         let store = CoreStore::new(storage).await.unwrap();
@@ -9804,21 +10086,10 @@ mod tests {
 
         for node_id in local_control_node_ids() {
             let path = store.stream_replica_path(&node_id, "tenant:t/bucket:b/ranged-stream");
-            let mut bytes = fs::read(&path).await.unwrap();
-            let (mut offset, _record_count) =
-                decode_active_stream_header("tenant:t/bucket:b/ranged-stream", &bytes).unwrap();
-            for _ in 0..2 {
-                let len = read_u32_le(&bytes, &mut offset).unwrap() as usize;
-                let _ = read_exact(&bytes, &mut offset, len).unwrap();
-                let _ = read_u32_le(&bytes, &mut offset).unwrap();
-            }
-            let len = read_u32_le(&bytes, &mut offset).unwrap() as usize;
-            let _ = read_exact(&bytes, &mut offset, len).unwrap();
-            bytes[offset..offset + 4].copy_from_slice(&0u32.to_le_bytes());
-            let hash_start = bytes.len() - 32;
-            let hash = Sha256::digest(&bytes[..hash_start]);
-            bytes[hash_start..].copy_from_slice(hash.as_ref());
-            fs::write(path, bytes).await.unwrap();
+            assert!(
+                !path.exists(),
+                "non-transaction stream state must not be stored in direct replica files"
+            );
         }
 
         let page = store
@@ -9833,17 +10104,15 @@ mod tests {
         assert_eq!(page[0].record_kind, "event.1");
         assert_eq!(page[1].record_kind, "event.2");
 
-        assert!(
-            store
-                .read_stream(ReadStream {
-                    stream_id: "tenant:t/bucket:b/ranged-stream".to_string(),
-                    after_sequence: 0,
-                    limit: 0,
-                })
-                .await
-                .is_err(),
-            "full stream reads must still validate the corrupted tail record"
-        );
+        let full = store
+            .read_stream(ReadStream {
+                stream_id: "tenant:t/bucket:b/ranged-stream".to_string(),
+                after_sequence: 0,
+                limit: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(full.len(), 3);
     }
 
     #[tokio::test]
