@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::fs::OpenOptions;
@@ -114,6 +114,9 @@ const CORE_PIPELINE_KEY_LEN: usize = 32;
 const CORE_PIPELINE_NONCE_LEN: usize = 12;
 
 type HmacSha256 = Hmac<Sha256>;
+
+static CORE_STORE_PROCESS_WRITE_LOCKS: LazyLock<StdMutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>> =
+    LazyLock::new(|| StdMutex::new(BTreeMap::new()));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LocalErasureProfile {
@@ -283,6 +286,18 @@ impl CorePipelineKeyring {
             .get(key_id)
             .ok_or_else(|| anyhow!("CoreStore pipeline key id '{key_id}' is not configured"))
     }
+}
+
+fn process_write_lock(storage_root: PathBuf) -> Arc<Mutex<()>> {
+    let mut locks = CORE_STORE_PROCESS_WRITE_LOCKS
+        .lock()
+        .expect("CoreStore process write-lock registry poisoned");
+    if let Some(existing) = locks.get(&storage_root).and_then(Weak::upgrade) {
+        return existing;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(storage_root, Arc::downgrade(&lock));
+    lock
 }
 
 #[derive(Debug, Clone)]
@@ -631,9 +646,10 @@ impl CoreStore {
                 .core_store_root_path()
                 .join("node-signing-keypair.pb"),
         )?);
+        let write_lock = process_write_lock(storage.core_store_root_path());
         let store = Self {
             storage,
-            write_lock: Arc::new(Mutex::new(())),
+            write_lock,
             pipeline_keyring,
             node_signing_keypair,
         };
@@ -2946,14 +2962,32 @@ impl CoreStore {
         wal_frame: &[u8],
     ) -> Result<CoreAdmissionCommitCertificate> {
         let path = self.admission_commit_certificate_path(record.sequence);
-        let bytes = read_file(&path, "core_store", "read_admission_commit_certificate")
-            .await
-            .with_context(|| {
-                format!(
-                    "read CoreStore admission commit certificate for WAL sequence {}",
-                    record.sequence
-                )
-            })?;
+        let mut bytes = None;
+        for _ in 0..CORE_CONTROL_READ_RETRY_ATTEMPTS {
+            match read_file(&path, "core_store", "read_admission_commit_certificate").await {
+                Ok(read) => {
+                    bytes = Some(read);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tokio::time::sleep(CORE_REF_LOCK_RETRY_DELAY).await;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "read CoreStore admission commit certificate for WAL sequence {}",
+                            record.sequence
+                        )
+                    });
+                }
+            }
+        }
+        let bytes = bytes.ok_or_else(|| {
+            anyhow!(
+                "read CoreStore admission commit certificate for WAL sequence {}",
+                record.sequence
+            )
+        })?;
         let certificate: CoreAdmissionCommitCertificate =
             serde_json::from_value(decode_canonical_cbor_json(&bytes)?)?;
         validate_local_admission_commit_certificate(&certificate)?;
@@ -5331,7 +5365,7 @@ impl CoreStore {
             &anchor.root_generation.to_string(),
             &cohort_nodes.join(","),
         ]);
-        let created_at_unix_nanos = unix_timestamp_nanos();
+        let created_at_unix_nanos = anchor.created_at_unix_nanos;
         let generation_dir =
             self.root_register_generation_dir(&anchor.root_key_hash, anchor.root_generation)?;
         for (index, _node_id) in cohort_nodes.iter().enumerate() {
@@ -5355,9 +5389,66 @@ impl CoreStore {
             header.receipt_signature = self.sign_core_receipt(&header.signed_payload_hash)?;
             let bytes = encode_root_register_shard_file(&header, &anchor_bytes)?;
             let shard_path = generation_dir.join(format!("shard-{index}.anr"));
-            write_file_create_new_or_same(&shard_path, &bytes).await?;
+            self.write_root_register_shard_create_new_or_same(
+                &shard_path,
+                &bytes,
+                &root_anchor_hash,
+            )
+            .await?;
         }
         Ok(())
+    }
+
+    async fn write_root_register_shard_create_new_or_same(
+        &self,
+        path: &PathBuf,
+        bytes: &[u8],
+        expected_root_anchor_hash: &str,
+    ) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let tmp_path = path.with_extension(format!("anr.{}.tmp", uuid::Uuid::new_v4()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .await
+            .with_context(|| {
+                format!("create CoreStore root register temp {}", tmp_path.display())
+            })?;
+        file.write_all(bytes).await?;
+        file.sync_all().await?;
+        drop(file);
+
+        match fs::hard_link(&tmp_path, path).await {
+            Ok(()) => {
+                let _ = fs::remove_file(&tmp_path).await;
+                sync_parent_dir(path, "root_register_create_new_sync_parent_dir").await?;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&tmp_path).await;
+                let existing = read_file(path, "core_store", "root_register_existing_read").await?;
+                if existing == bytes {
+                    return Ok(());
+                }
+                let (_header, anchor) = decode_root_register_shard_file(&existing)?;
+                if hash_root_anchor_record(&anchor)? == expected_root_anchor_hash {
+                    return Ok(());
+                }
+                bail!(
+                    "CoreStore root register detected conflicting existing shard {}",
+                    path.display()
+                );
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&tmp_path).await;
+                return Err(error).with_context(|| {
+                    format!("publish CoreStore root register file {}", path.display())
+                });
+            }
+        }
     }
 
     fn root_register_hash_dir(&self, root_key_hash: &str) -> Result<PathBuf> {
@@ -8909,8 +9000,12 @@ fn validate_root_register_header(header: &CoreRootRegisterHeader) -> Result<()> 
     if header.placement_epoch == 0 {
         bail!("CoreStore root register placement epoch must be nonzero");
     }
-    if header.created_at_unix_nanos == 0 {
-        bail!("CoreStore root register timestamp must be nonzero");
+    if header.root_generation == 0 {
+        if header.created_at_unix_nanos != 0 {
+            bail!("CoreStore genesis root register timestamp must be zero");
+        }
+    } else if header.created_at_unix_nanos == 0 {
+        bail!("CoreStore non-genesis root register timestamp must be nonzero");
     }
     if header.fsync_sequence == 0 {
         bail!("CoreStore root register fsync sequence must be nonzero");
@@ -9933,71 +10028,6 @@ async fn write_file_atomic(path: &PathBuf, bytes: &[u8]) -> Result<()> {
         });
     }
     sync_parent_dir(path, "atomic_write_sync_parent_dir").await?;
-    Ok(())
-}
-
-async fn write_file_create_new_or_same(path: &PathBuf, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        let started_at = Instant::now();
-        fs::create_dir_all(parent).await?;
-        crate::perf::record_io_duration(
-            "core_store",
-            "create_dir_all",
-            parent,
-            0,
-            started_at.elapsed(),
-        );
-    }
-
-    let started_at = Instant::now();
-    let create_result = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .await;
-    crate::perf::record_io_duration(
-        "core_store",
-        "create_new",
-        path,
-        bytes.len() as u64,
-        started_at.elapsed(),
-    );
-    let mut file = match create_result {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let existing = read_file(path, "core_store", "create_new_existing_read").await?;
-            if existing == bytes {
-                return Ok(());
-            }
-            bail!(
-                "CoreStore create_new detected conflicting existing file {}",
-                path.display()
-            );
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("create CoreStore file {}", path.display()));
-        }
-    };
-    let started_at = Instant::now();
-    file.write_all(bytes).await?;
-    crate::perf::record_io_duration(
-        "core_store",
-        "write_all",
-        path,
-        bytes.len() as u64,
-        started_at.elapsed(),
-    );
-    let started_at = Instant::now();
-    file.sync_all().await?;
-    crate::perf::record_io_duration(
-        "core_store",
-        "sync_all",
-        path,
-        bytes.len() as u64,
-        started_at.elapsed(),
-    );
-    drop(file);
-    sync_parent_dir(path, "create_new_sync_parent_dir").await?;
     Ok(())
 }
 

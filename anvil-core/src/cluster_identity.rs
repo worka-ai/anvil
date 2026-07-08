@@ -26,10 +26,21 @@ pub fn load_or_create_node_id(path: impl AsRef<Path>) -> Result<String> {
         Ok(raw) => validate_node_id_file(path, &raw),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let node_id = generate_node_id();
-            persist_new_file(path, node_id.as_bytes()).with_context(|| {
-                format!("failed to persist node identity file {}", path.display())
-            })?;
-            Ok(node_id)
+            match persist_new_file(path, node_id.as_bytes()) {
+                Ok(()) => Ok(node_id),
+                Err(error) if is_already_exists_error(&error) => {
+                    let raw = fs::read_to_string(path).with_context(|| {
+                        format!(
+                            "failed to read concurrently-created node identity file {}",
+                            path.display()
+                        )
+                    })?;
+                    validate_node_id_file(path, &raw)
+                }
+                Err(error) => Err(error).with_context(|| {
+                    format!("failed to persist node identity file {}", path.display())
+                }),
+            }
         }
         Err(err) => Err(err)
             .with_context(|| format!("failed to read node identity file {}", path.display())),
@@ -43,10 +54,21 @@ pub fn load_or_create_cluster_keypair(path: impl AsRef<Path>) -> Result<identity
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let keypair = identity::Keypair::generate_ed25519();
             let bytes = keypair.to_protobuf_encoding()?;
-            persist_new_file(path, &bytes).with_context(|| {
-                format!("failed to persist cluster keypair file {}", path.display())
-            })?;
-            Ok(keypair)
+            match persist_new_file(path, &bytes) {
+                Ok(()) => Ok(keypair),
+                Err(error) if is_already_exists_error(&error) => {
+                    let bytes = fs::read(path).with_context(|| {
+                        format!(
+                            "failed to read concurrently-created cluster keypair file {}",
+                            path.display()
+                        )
+                    })?;
+                    parse_cluster_keypair(path, &bytes)
+                }
+                Err(error) => Err(error).with_context(|| {
+                    format!("failed to persist cluster keypair file {}", path.display())
+                }),
+            }
         }
         Err(err) => Err(err)
             .with_context(|| format!("failed to read cluster keypair file {}", path.display())),
@@ -107,6 +129,13 @@ fn persist_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("failed to atomically create {}", path.display()))?;
     sync_parent_dir(&parent);
     Ok(())
+}
+
+fn is_already_exists_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
 }
 
 fn parent_dir(path: &Path) -> PathBuf {
