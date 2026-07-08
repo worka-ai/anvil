@@ -6015,11 +6015,30 @@ fn validate_manifest_locator(locator: &CoreManifestLocator) -> Result<()> {
     if block.data_shards == 0 {
         bail!("CoreStore manifest locator block must include data shards");
     }
+    if block.placement_epoch == 0 {
+        bail!("CoreStore manifest locator block placement epoch must be nonzero");
+    }
     if block.shard_receipts.len() < block.data_shards as usize {
         bail!("CoreStore manifest locator block has too few shard receipts");
     }
+    let mut seen_shards = BTreeSet::new();
     for receipt in &block.shard_receipts {
+        if !seen_shards.insert(receipt.shard_index) {
+            bail!("CoreStore manifest locator shard receipt index is duplicated");
+        }
+        validate_logical_id(&receipt.node_id, "manifest locator receipt node id")?;
+        validate_logical_id(&receipt.region_id, "manifest locator receipt region id")?;
+        validate_logical_id(&receipt.cell_id, "manifest locator receipt cell id")?;
         validate_hash(&receipt.shard_hash, "manifest locator shard receipt hash")?;
+        if receipt.shard_length == 0 && locator.manifest_length != 0 {
+            bail!("CoreStore manifest locator shard receipt length must be nonzero");
+        }
+        if receipt.fsync_sequence == 0 {
+            bail!("CoreStore manifest locator shard receipt fsync sequence must be nonzero");
+        }
+        if receipt.written_at_unix_nanos == 0 {
+            bail!("CoreStore manifest locator shard receipt timestamp must be nonzero");
+        }
         validate_hash(
             &receipt.signed_payload_hash,
             "manifest locator shard receipt payload hash",
@@ -9384,6 +9403,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored_manifest, write.manifest);
+    }
+
+    #[tokio::test]
+    async fn core_store_manifest_locator_rejects_invalid_shard_receipts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let store = CoreStore::new(storage).await.unwrap();
+        let write = store
+            .write_logical_file_with_locator(WriteLogicalFileRequest {
+                writer_family: "object_blob".to_string(),
+                generation: 10,
+                logical_file_id: "objects/reports/report-10".to_string(),
+                source: b"manifest locator receipt validation".to_vec(),
+                range_hints: Vec::new(),
+                pipeline_policy: CorePipelinePolicy::default(),
+                trace_context: CoreTraceContext::default(),
+                boundary_values: Vec::new(),
+                mutation_id: "logical-file-locator-mut-10".to_string(),
+                region_id: "local".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let mut stale_epoch = write.locator.clone();
+        stale_epoch.block_locators[0].placement_epoch = 0;
+        assert!(
+            store
+                .read_logical_file_manifest(&stale_epoch)
+                .await
+                .is_err()
+        );
+
+        let mut missing_fsync = write.locator.clone();
+        missing_fsync.block_locators[0].shard_receipts[0].fsync_sequence = 0;
+        assert!(
+            store
+                .read_logical_file_manifest(&missing_fsync)
+                .await
+                .is_err()
+        );
+
+        let mut bad_hash = write.locator.clone();
+        bad_hash.block_locators[0].shard_receipts[0].shard_hash =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        assert!(store.read_logical_file_manifest(&bad_hash).await.is_err());
+
+        let mut duplicate = write.locator.clone();
+        duplicate.block_locators[0].shard_receipts[1].shard_index =
+            duplicate.block_locators[0].shard_receipts[0].shard_index;
+        assert!(store.read_logical_file_manifest(&duplicate).await.is_err());
     }
 
     #[tokio::test]
