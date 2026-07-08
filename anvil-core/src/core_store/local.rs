@@ -1372,6 +1372,36 @@ impl CoreStore {
         Ok(out)
     }
 
+    pub async fn read_logical_file_manifest(
+        &self,
+        locator: &CoreManifestLocator,
+    ) -> Result<CoreLogicalFileManifest> {
+        let _perf_guard = crate::perf::guard(
+            "anvil_core_store_op",
+            &[("operation", "read_logical_file_manifest")],
+        );
+        validate_manifest_locator(locator)?;
+        let object_ref = object_ref_from_manifest_locator(locator)?;
+        let bytes = self.get_blob(GetBlob { object_ref }).await?;
+        if bytes.len() as u64 != locator.manifest_length {
+            bail!("CoreStore manifest locator length mismatch");
+        }
+        let actual_hash = format!("sha256:{}", sha256_hex(&bytes));
+        if actual_hash != locator.manifest_hash || actual_hash != locator.manifest_ref.manifest_hash
+        {
+            bail!("CoreStore manifest locator hash mismatch");
+        }
+        let manifest: CoreLogicalFileManifest = serde_json::from_slice(&bytes)?;
+        validate_logical_file_manifest_shape(&manifest)?;
+        if manifest.logical_file_id != locator.manifest_ref.logical_file_id
+            || manifest.writer_family != locator.manifest_ref.writer_family
+            || manifest.writer_generation != locator.manifest_ref.writer_generation
+        {
+            bail!("CoreStore manifest locator identity mismatch");
+        }
+        Ok(manifest)
+    }
+
     async fn read_uncompressed_logical_range(
         &self,
         manifest: &CoreLogicalFileManifest,
@@ -5300,6 +5330,97 @@ fn manifest_locator_from_manifest_and_ref(
     })
 }
 
+fn validate_manifest_locator(locator: &CoreManifestLocator) -> Result<()> {
+    validate_logical_id(
+        &locator.manifest_ref.logical_file_id,
+        "manifest locator logical file id",
+    )?;
+    validate_logical_id(
+        &locator.manifest_ref.writer_family,
+        "manifest locator writer family",
+    )?;
+    validate_hash(
+        &locator.manifest_ref.manifest_hash,
+        "manifest locator ref hash",
+    )?;
+    validate_hash(&locator.manifest_hash, "manifest locator hash")?;
+    if locator.manifest_hash != locator.manifest_ref.manifest_hash {
+        bail!("CoreStore manifest locator hash must match manifest ref hash");
+    }
+    match locator.manifest_encoding.as_str() {
+        "deterministic-protobuf" | "canonical-cbor" | "writer-segment" => {}
+        other => bail!("CoreStore unsupported manifest locator encoding {other}"),
+    }
+    if locator.manifest_length == 0 {
+        bail!("CoreStore manifest locator length must be nonzero");
+    }
+    if locator.block_locators.len() != 1 {
+        bail!("CoreStore local manifest locator expects exactly one block locator");
+    }
+    let block = &locator.block_locators[0];
+    if block.logical_start != 0 || block.logical_end != locator.manifest_length {
+        bail!("CoreStore manifest locator block range must cover the manifest bytes exactly");
+    }
+    validate_hash(&block.block_plain_hash, "manifest locator block plain hash")?;
+    validate_hash(
+        &block.block_encoded_hash,
+        "manifest locator block encoded hash",
+    )?;
+    if block.block_plain_hash != locator.manifest_hash {
+        bail!("CoreStore manifest locator block plain hash must match manifest hash");
+    }
+    if block.data_shards == 0 {
+        bail!("CoreStore manifest locator block must include data shards");
+    }
+    if block.shard_receipts.len() < block.data_shards as usize {
+        bail!("CoreStore manifest locator block has too few shard receipts");
+    }
+    for receipt in &block.shard_receipts {
+        validate_hash(&receipt.shard_hash, "manifest locator shard receipt hash")?;
+    }
+    Ok(())
+}
+
+fn object_ref_from_manifest_locator(locator: &CoreManifestLocator) -> Result<CoreObjectRef> {
+    validate_manifest_locator(locator)?;
+    let block = &locator.block_locators[0];
+    Ok(CoreObjectRef {
+        hash: block.block_encoded_hash.clone(),
+        logical_size: locator.manifest_length,
+        manifest_ref: encode_manifest_ref_with_profile(
+            strip_sha256_prefix(&block.block_encoded_hash)?,
+            &block.erasure_profile_id,
+        ),
+        encoding: CoreObjectEncoding {
+            block_id: block.block_id.clone(),
+            profile_id: block.erasure_profile_id.clone(),
+            data_shards: block.data_shards as u16,
+            parity_shards: block.parity_shards as u16,
+            minimum_read_shards: block.data_shards as u16,
+            minimum_write_ack_shards: (block.data_shards + block.parity_shards) as u16,
+            stripe_size: block.shard_payload_len * u64::from(block.data_shards),
+            placement_scope: "region".to_string(),
+            repair_priority: "normal".to_string(),
+            encryption: block.encryption.algorithm.clone(),
+        },
+        placements: block
+            .shard_receipts
+            .iter()
+            .map(|receipt| CoreObjectPlacement {
+                shard_index: receipt.shard_index as u16,
+                node_id: receipt.node_id.clone(),
+                region_id: receipt.region_id.clone(),
+                cell_id: receipt.cell_id.clone(),
+                shard_hash: receipt.shard_hash.clone(),
+                stored_size: receipt.shard_length,
+                generation: 1,
+                placement_epoch: block.placement_epoch,
+                fsync_sequence: receipt.fsync_sequence,
+            })
+            .collect(),
+    })
+}
+
 fn block_locator_from_manifest_object_ref(
     manifest: &CoreLogicalFileManifest,
     manifest_object_ref: &CoreObjectRef,
@@ -8192,49 +8313,10 @@ mod tests {
             "manifest locator must point at the published manifest bytes, not the data block"
         );
 
-        let manifest_object_ref = CoreObjectRef {
-            hash: block.block_encoded_hash.clone(),
-            logical_size: write.locator.manifest_length,
-            manifest_ref: encode_manifest_ref_with_profile(
-                strip_sha256_prefix(&block.block_encoded_hash).unwrap(),
-                &block.erasure_profile_id,
-            ),
-            encoding: CoreObjectEncoding {
-                block_id: block.block_id.clone(),
-                profile_id: block.erasure_profile_id.clone(),
-                data_shards: block.data_shards as u16,
-                parity_shards: block.parity_shards as u16,
-                minimum_read_shards: block.data_shards as u16,
-                minimum_write_ack_shards: (block.data_shards + block.parity_shards) as u16,
-                stripe_size: block.shard_payload_len * u64::from(block.data_shards),
-                placement_scope: "region".to_string(),
-                repair_priority: "normal".to_string(),
-                encryption: block.encryption.algorithm.clone(),
-            },
-            placements: block
-                .shard_receipts
-                .iter()
-                .map(|receipt| CoreObjectPlacement {
-                    shard_index: receipt.shard_index as u16,
-                    node_id: receipt.node_id.clone(),
-                    region_id: receipt.region_id.clone(),
-                    cell_id: receipt.cell_id.clone(),
-                    shard_hash: receipt.shard_hash.clone(),
-                    stored_size: receipt.shard_length,
-                    generation: 1,
-                    placement_epoch: block.placement_epoch,
-                    fsync_sequence: receipt.fsync_sequence,
-                })
-                .collect(),
-        };
-        let manifest_bytes = store
-            .get_blob(GetBlob {
-                object_ref: manifest_object_ref,
-            })
+        let stored_manifest = store
+            .read_logical_file_manifest(&write.locator)
             .await
             .unwrap();
-        let stored_manifest: CoreLogicalFileManifest =
-            serde_json::from_slice(&manifest_bytes).unwrap();
         assert_eq!(stored_manifest, write.manifest);
     }
 

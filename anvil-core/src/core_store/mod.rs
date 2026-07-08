@@ -29,6 +29,11 @@ pub trait CoreStoreBlockApi {
         request: ReadLogicalRangeRequest,
     ) -> impl Future<Output = Result<Vec<u8>>> + Send;
 
+    fn read_logical_file_manifest(
+        &self,
+        locator: CoreManifestLocator,
+    ) -> impl Future<Output = Result<CoreLogicalFileManifest>> + Send;
+
     fn verify_manifest(
         &self,
         manifest: &CoreLogicalFileManifest,
@@ -48,6 +53,13 @@ impl CoreStoreBlockApi for CoreStore {
         request: ReadLogicalRangeRequest,
     ) -> impl Future<Output = Result<Vec<u8>>> + Send {
         CoreStore::read_logical_range(self, request)
+    }
+
+    fn read_logical_file_manifest(
+        &self,
+        locator: CoreManifestLocator,
+    ) -> impl Future<Output = Result<CoreLogicalFileManifest>> + Send {
+        async move { CoreStore::read_logical_file_manifest(self, &locator).await }
     }
 
     fn verify_manifest(
