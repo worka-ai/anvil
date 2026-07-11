@@ -1,5 +1,6 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures_util::StreamExt;
+use sha2::Digest;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tokio::fs;
@@ -7,7 +8,9 @@ use tokio::io::AsyncWriteExt;
 use tracing::info;
 
 const STORAGE_DIR: &str = "anvil-data";
-const TEMP_DIR: &str = "tmp";
+const CORESTORE_DIR: &str = "corestore";
+const CORESTORE_STAGING_DIR: &str = "staging";
+const CORESTORE_TMP_DIR: &str = "tmp";
 #[derive(Debug, Clone)]
 pub struct Storage {
     storage_path: PathBuf,
@@ -21,7 +24,7 @@ impl Storage {
 
     pub async fn new_at(storage_path: impl AsRef<Path>) -> Result<Self> {
         let storage_path = storage_path.as_ref().to_path_buf();
-        let temp_path = storage_path.join(TEMP_DIR);
+        let temp_path = core_store_staging_tmp_path(&storage_path);
         fs::create_dir_all(&storage_path).await?;
         fs::create_dir_all(&temp_path).await?;
         Ok(Self {
@@ -32,7 +35,7 @@ impl Storage {
 
     pub fn new_at_sync(storage_path: impl AsRef<Path>) -> Result<Self> {
         let storage_path = storage_path.as_ref().to_path_buf();
-        let temp_path = storage_path.join(TEMP_DIR);
+        let temp_path = core_store_staging_tmp_path(&storage_path);
         std::fs::create_dir_all(&storage_path)?;
         std::fs::create_dir_all(&temp_path)?;
         Ok(Self {
@@ -46,19 +49,31 @@ impl Storage {
     }
 
     pub fn core_store_root_path(&self) -> PathBuf {
-        self.storage_path.join("_core")
+        self.storage_path.join(CORESTORE_DIR)
     }
 
-    pub fn core_store_replicas_path(&self) -> PathBuf {
-        self.core_store_root_path().join("replicas")
-    }
-
-    pub fn core_store_replica_path(&self, node_id: &str) -> PathBuf {
-        self.core_store_replicas_path().join(node_id)
+    pub fn core_store_meta_path(&self) -> PathBuf {
+        self.core_store_root_path().join("meta").join("rocksdb")
     }
 
     pub fn core_store_staging_path(&self) -> PathBuf {
-        self.core_store_root_path().join("staging")
+        self.core_store_root_path().join(CORESTORE_STAGING_DIR)
+    }
+
+    pub fn core_store_blocks_path(&self) -> PathBuf {
+        self.core_store_root_path().join("blocks")
+    }
+
+    pub fn core_store_local_block_cache_path(&self) -> PathBuf {
+        self.core_store_blocks_path().join("local-cache")
+    }
+
+    pub fn core_store_admission_path(&self) -> PathBuf {
+        self.storage_path.join("admission")
+    }
+
+    pub fn core_store_landed_bytes_path(&self) -> PathBuf {
+        self.core_store_admission_path().join("landed-bytes")
     }
 
     pub fn relative_storage_path(&self, path: &Path) -> Result<String> {
@@ -83,7 +98,7 @@ impl Storage {
         Ok(self.storage_path.join(clean))
     }
 
-    fn get_temp_payload_path(&self, upload_id: &str) -> PathBuf {
+    fn staged_upload_scratch_path(&self, upload_id: &str) -> PathBuf {
         self.temp_path.join(upload_id)
     }
 
@@ -93,7 +108,8 @@ impl Storage {
     ) -> Result<(PathBuf, i64, String)> {
         info!("stream_to_temp_file called");
         let upload_id = uuid::Uuid::new_v4().to_string();
-        let temp_path = self.get_temp_payload_path(&upload_id);
+        // Class C scratch: callers must route durable bytes into CoreStore before publishing refs.
+        let temp_path = self.staged_upload_scratch_path(&upload_id);
         let started_at = Instant::now();
         let mut file = fs::File::create(&temp_path).await?;
         crate::perf::record_io_duration(
@@ -104,7 +120,7 @@ impl Storage {
             started_at.elapsed(),
         );
 
-        let mut overall_hasher = blake3::Hasher::new();
+        let mut overall_hasher = sha2::Sha256::new();
         let mut total_bytes = 0;
         let mut chunk_count = 0u64;
         let mut write_duration = std::time::Duration::ZERO;
@@ -135,16 +151,16 @@ impl Storage {
             chunk_count,
         );
         let started_at = Instant::now();
-        file.flush().await?;
+        file.sync_all().await?;
         crate::perf::record_io_duration(
             "storage",
-            "temp_file_flush",
+            "temp_file_sync_all",
             &temp_path,
             total_bytes as u64,
             started_at.elapsed(),
         );
 
-        let content_hash = overall_hasher.finalize().to_hex().to_string();
+        let content_hash = hex::encode(overall_hasher.finalize());
         info!(
             ?temp_path,
             total_bytes,
@@ -153,4 +169,29 @@ impl Storage {
         );
         Ok((temp_path, total_bytes, content_hash))
     }
+}
+
+fn core_store_staging_tmp_path(storage_path: &Path) -> PathBuf {
+    storage_path
+        .join(CORESTORE_DIR)
+        .join(CORESTORE_STAGING_DIR)
+        .join(CORESTORE_TMP_DIR)
+}
+
+pub fn ensure_operator_path_outside_storage(
+    storage_path: impl AsRef<Path>,
+    candidate_path: impl AsRef<Path>,
+    field_name: &str,
+    path_kind: &str,
+) -> Result<()> {
+    let storage_path = std::path::absolute(storage_path.as_ref())
+        .with_context(|| format!("resolve {field_name} storage path"))?;
+    let candidate_path = std::path::absolute(candidate_path.as_ref())
+        .with_context(|| format!("resolve {field_name} path"))?;
+    if candidate_path == storage_path || candidate_path.starts_with(&storage_path) {
+        anyhow::bail!(
+            "{field_name} must be outside storage_path; {path_kind} is operator-controlled state, not Anvil CoreStore data"
+        );
+    }
+    Ok(())
 }

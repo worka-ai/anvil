@@ -1,10 +1,17 @@
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use super::manifest_proto::encode_logical_file_manifest_proto;
+use super::transaction_manifest_proto::encode_manifest_locator_proto;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 pub const CORE_OBJECT_MANIFEST_SCHEMA: &str = "anvil.core.object_manifest.v1";
 pub const CORE_LOGICAL_FILE_MANIFEST_SCHEMA: &str = "anvil.core.logical_file_manifest.v1";
-pub const CORE_REF_SCHEMA: &str = "anvil.core.ref_value.v1";
-pub const CORE_REF_UPDATE_SCHEMA: &str = "anvil.core.ref_update.v1";
+pub const CORE_LOGICAL_FILE_INLINE_REF_PREFIX: &str = "core-logical-file-inline:";
+pub const CORE_LOGICAL_FILE_LOCATOR_REF_PREFIX: &str = "core-logical-file-locator:";
 pub const CORE_TRANSACTION_SCHEMA: &str = "anvil.core.transaction.v1";
 pub const CORE_WATCH_EVENT_SCHEMA: &str = "anvil.core.watch_event.v1";
 pub const CORE_FENCE_SCHEMA: &str = "anvil.core.fence.v1";
@@ -44,6 +51,22 @@ pub struct WriteLogicalFileRequest {
     pub generation: u64,
     pub logical_file_id: String,
     pub source: Vec<u8>,
+    pub range_hints: Vec<CoreLogicalRangeHint>,
+    pub pipeline_policy: CorePipelinePolicy,
+    pub trace_context: CoreTraceContext,
+    pub boundary_values: Vec<CoreBoundaryValue>,
+    pub mutation_id: String,
+    pub region_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WriteLogicalFilePathRequest {
+    pub writer_family: String,
+    pub generation: u64,
+    pub logical_file_id: String,
+    pub source_path: PathBuf,
+    pub source_len: u64,
+    pub source_hash: String,
     pub range_hints: Vec<CoreLogicalRangeHint>,
     pub pipeline_policy: CorePipelinePolicy,
     pub trace_context: CoreTraceContext,
@@ -96,7 +119,7 @@ pub struct CorePipelinePolicy {
 impl Default for CorePipelinePolicy {
     fn default() -> Self {
         Self {
-            compression: "none".to_string(),
+            compression: "zstd".to_string(),
             encryption: "none".to_string(),
             erasure_profile_id: "ec-4-2".to_string(),
             placement_scope: "region".to_string(),
@@ -188,6 +211,8 @@ pub struct CoreBlockLocator {
     pub encryption: CoreEncryptionDescriptor,
     pub erasure_profile_id: String,
     pub placement_epoch: u64,
+    pub boundary_summary_hash: String,
+    pub boundary_values_b64: String,
     pub shard_receipts: Vec<CoreShardReceiptSummary>,
 }
 
@@ -204,6 +229,8 @@ pub struct CoreShardReceiptSummary {
     pub signed_payload_hash: String,
     pub signature_algorithm: String,
     pub receipt_signature: Vec<u8>,
+    pub boundary_summary_hash: String,
+    pub boundary_values_b64: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -229,6 +256,7 @@ pub struct CoreLogicalBlockRef {
     pub compressed_length: u64,
     pub encrypted_length: u64,
     pub content_hash: String,
+    pub compression: CoreCompressionDescriptor,
     pub encryption: CoreEncryptionDescriptor,
     pub erasure_set_id: String,
     pub shards: Vec<CoreLogicalShardRef>,
@@ -239,6 +267,8 @@ pub struct CoreLogicalBlockRef {
     pub shard_payload_len: u64,
     pub padding_len: u64,
     pub block_encoded_hash: String,
+    pub boundary_summary_hash: String,
+    pub boundary_values_b64: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -256,6 +286,8 @@ pub struct CoreLogicalShardRef {
     pub signed_payload_hash: String,
     pub signature_algorithm: String,
     pub receipt_signature: Vec<u8>,
+    pub boundary_summary_hash: String,
+    pub boundary_values_b64: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -291,30 +323,37 @@ pub struct CoreLogicalFileVerificationReport {
 pub fn core_object_ref_from_logical_file_manifest(
     manifest: &CoreLogicalFileManifest,
 ) -> CoreObjectRef {
-    let storage_hash = manifest
-        .blocks
-        .first()
-        .map(|block| block.block_encoded_hash.as_str())
-        .unwrap_or(&manifest.content_hash);
-    let manifest_hash = storage_hash.strip_prefix("sha256:").unwrap_or(storage_hash);
-    let logical_size = manifest
-        .blocks
-        .first()
-        .map(|block| block.encrypted_length)
-        .unwrap_or(manifest.logical_size);
+    let manifest_bytes = encode_logical_file_manifest_proto(manifest)
+        .expect("CoreLogicalFileManifest produced by CoreStore should encode deterministically");
+    let inline_manifest_ref = format!(
+        "{}{}",
+        CORE_LOGICAL_FILE_INLINE_REF_PREFIX,
+        URL_SAFE_NO_PAD.encode(manifest_bytes)
+    );
+    core_object_ref_from_logical_file_ref(manifest, inline_manifest_ref)
+}
+
+pub fn core_object_ref_from_logical_file_write(write: &CoreLogicalFileWrite) -> CoreObjectRef {
+    let locator_bytes = encode_manifest_locator_proto(&write.locator)
+        .expect("CoreManifestLocator produced by CoreStore should encode deterministically");
+    let locator_ref = format!(
+        "{}{}",
+        CORE_LOGICAL_FILE_LOCATOR_REF_PREFIX,
+        URL_SAFE_NO_PAD.encode(locator_bytes)
+    );
+    core_object_ref_from_logical_file_ref(&write.manifest, locator_ref)
+}
+
+fn core_object_ref_from_logical_file_ref(
+    manifest: &CoreLogicalFileManifest,
+    manifest_ref: String,
+) -> CoreObjectRef {
     CoreObjectRef {
-        hash: storage_hash.to_string(),
-        logical_size,
-        manifest_ref: format!(
-            "core-manifest-sha256:{manifest_hash}:profile:{}",
-            manifest.erasure_profile_id
-        ),
+        hash: manifest.content_hash.clone(),
+        logical_size: manifest.logical_size,
+        manifest_ref,
         encoding: CoreObjectEncoding {
-            block_id: manifest
-                .blocks
-                .first()
-                .map(|block| block.block_id.clone())
-                .unwrap_or_default(),
+            block_id: manifest.logical_file_id.clone(),
             profile_id: manifest.erasure_profile_id.clone(),
             data_shards: manifest.data_shards as u16,
             parity_shards: manifest.parity_shards as u16,
@@ -322,43 +361,51 @@ pub fn core_object_ref_from_logical_file_manifest(
             minimum_write_ack_shards: (manifest.data_shards + manifest.parity_shards) as u16,
             stripe_size: manifest
                 .blocks
-                .first()
+                .iter()
                 .map(|block| {
                     block
                         .shard_payload_len
                         .saturating_mul(manifest.data_shards as u64)
                 })
-                .unwrap_or(logical_size),
+                .max()
+                .unwrap_or(manifest.logical_size),
             placement_scope: "region".to_string(),
             repair_priority: "normal".to_string(),
+            stored_hash: manifest.content_hash.clone(),
+            compression: manifest.compression.clone(),
             encryption: manifest.encryption.algorithm.clone(),
         },
         placements: manifest
             .blocks
-            .first()
-            .map(|block| {
-                block
-                    .shards
-                    .iter()
-                    .map(|shard| CoreObjectPlacement {
-                        shard_index: shard.shard_index as u16,
-                        node_id: shard.node_id.clone(),
-                        region_id: shard.region_id.clone(),
-                        cell_id: shard.cell_id.clone(),
-                        shard_hash: shard.shard_hash.clone(),
-                        stored_size: shard.stored_length,
-                        generation: shard.generation,
-                        placement_epoch: shard.placement_epoch,
-                        fsync_sequence: shard.fsync_sequence,
-                        written_at_unix_nanos: shard.written_at_unix_nanos,
-                        signed_payload_hash: shard.signed_payload_hash.clone(),
-                        signature_algorithm: shard.signature_algorithm.clone(),
-                        receipt_signature: shard.receipt_signature.clone(),
-                    })
-                    .collect()
+            .iter()
+            .flat_map(|block| {
+                block.shards.iter().map(|shard| CoreObjectPlacement {
+                    shard_index: shard.shard_index as u16,
+                    node_id: shard.node_id.clone(),
+                    region_id: shard.region_id.clone(),
+                    cell_id: shard.cell_id.clone(),
+                    shard_hash: shard.shard_hash.clone(),
+                    stored_size: shard.stored_length,
+                    generation: shard.generation,
+                    placement_epoch: shard.placement_epoch,
+                    fsync_sequence: shard.fsync_sequence,
+                    written_at_unix_nanos: shard.written_at_unix_nanos,
+                    signed_payload_hash: shard.signed_payload_hash.clone(),
+                    signature_algorithm: shard.signature_algorithm.clone(),
+                    receipt_signature: shard.receipt_signature.clone(),
+                })
             })
-            .unwrap_or_default(),
+            .collect(),
     }
+}
+
+fn core_descriptor_hash(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -374,7 +421,7 @@ pub struct CoreObjectRef {
 impl CoreObjectRef {
     pub fn test_unlocated(hash: String, logical_size: u64, manifest_ref: String) -> Self {
         Self {
-            hash,
+            hash: hash.clone(),
             logical_size,
             manifest_ref,
             encoding: CoreObjectEncoding {
@@ -387,6 +434,15 @@ impl CoreObjectRef {
                 stripe_size: logical_size,
                 placement_scope: "region".to_string(),
                 repair_priority: "normal".to_string(),
+                stored_hash: hash.clone(),
+                compression: CoreCompressionDescriptor {
+                    algorithm: "none".to_string(),
+                    level: 0,
+                    uncompressed_length: logical_size,
+                    compressed_length: logical_size,
+                    dictionary_id: String::new(),
+                    descriptor_hash: String::new(),
+                },
                 encryption: "none".to_string(),
             },
             placements: Vec::new(),
@@ -419,6 +475,8 @@ pub struct CoreObjectEncoding {
     pub stripe_size: u64,
     pub placement_scope: String,
     pub repair_priority: String,
+    pub stored_hash: String,
+    pub compression: CoreCompressionDescriptor,
     pub encryption: String,
 }
 
@@ -437,6 +495,10 @@ pub struct CoreObjectPlacement {
     pub signed_payload_hash: String,
     pub signature_algorithm: String,
     pub receipt_signature: Vec<u8>,
+}
+
+pub fn boundary_schema_bucket_key(anvil_storage_tenant_id: i64, bucket_name: &str) -> String {
+    format!("tenant:{anvil_storage_tenant_id}/bucket:{bucket_name}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -473,6 +535,11 @@ pub struct CoreBoundaryValue {
     pub categories: Vec<String>,
     pub source_kind: String,
     pub required: bool,
+    pub max_values_per_block: u32,
+    pub placement_affinity: String,
+    pub compaction_scope: String,
+    pub shared_ranges_allowed: bool,
+    pub shared_record_kinds: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -481,12 +548,19 @@ pub enum CoreBoundarySource {
     UserMetadataJsonPointer {
         pointer: String,
     },
+    SystemMetadataField {
+        field: String,
+    },
     PathTemplate {
         template: String,
     },
     BodyJsonPointer {
         pointer: String,
         max_body_bytes: u64,
+    },
+    WriterSuppliedBoundary {
+        writer_family: String,
+        field: String,
     },
 }
 
@@ -501,7 +575,7 @@ pub struct PutBoundarySchema {
 pub struct BoundarySchemaReceipt {
     pub bucket: String,
     pub generation: u64,
-    pub ref_generation: u64,
+    pub row_generation: u64,
     pub schema_hash: String,
 }
 
@@ -511,6 +585,8 @@ pub struct AppendStreamRecord {
     pub partition_id: String,
     pub record_kind: String,
     pub payload: Vec<u8>,
+    pub content_type: Option<String>,
+    pub user_metadata_json: String,
     pub fence: Option<CoreFencePrecondition>,
     pub transaction_id: Option<String>,
     pub idempotency_key: Option<String>,
@@ -544,6 +620,8 @@ pub struct StreamRecord {
     pub record_kind: String,
     pub payload_hash: String,
     pub payload: Vec<u8>,
+    pub content_type: Option<String>,
+    pub user_metadata_json: String,
     pub transaction_id: Option<String>,
     pub idempotency_key_hash: Option<String>,
     pub created_at: String,
@@ -631,7 +709,6 @@ pub struct CoreRootCatalog {
     pub root_partitions: Vec<CoreRootPartition>,
     pub placement_catalog_ref: String,
     pub stream_directory_ref: String,
-    pub ref_directory_ref: String,
     pub authz_system_realm_ref: String,
     pub created_at: String,
     pub signed_by: String,
@@ -652,7 +729,7 @@ pub struct CoreRootCatalogReceipt {
     pub mesh_id: String,
     pub generation: u64,
     pub catalog_hash: String,
-    pub ref_generation: u64,
+    pub row_generation: u64,
     pub watch_cursor: String,
 }
 
@@ -672,22 +749,8 @@ pub struct CoreQuorumProfileReceipt {
     pub placement_group: String,
     pub epoch: u64,
     pub profile_hash: String,
-    pub ref_generation: u64,
+    pub row_generation: u64,
     pub watch_cursor: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CompareAndSwapRef {
-    pub ref_name: String,
-    pub expected_generation: Option<u64>,
-    pub expected_target: Option<String>,
-    pub require_absent: bool,
-    pub require_present: bool,
-    pub fence: Option<CoreFencePrecondition>,
-    pub authz_revision: Option<String>,
-    pub source_watch_cursor: Option<String>,
-    pub new_target: String,
-    pub transaction_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -698,49 +761,6 @@ pub struct CoreFencePrecondition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CoreRefValue {
-    pub schema: String,
-    pub ref_name: String,
-    pub generation: u64,
-    pub target: String,
-    pub transaction_id: Option<String>,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CasRefReceipt {
-    pub ref_name: String,
-    pub generation: u64,
-    pub previous_target: Option<String>,
-    pub new_target: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CoreRefUpdateRecord {
-    pub schema: String,
-    pub ref_name: String,
-    pub previous_generation: Option<u64>,
-    pub new_generation: Option<u64>,
-    pub previous_target: Option<String>,
-    pub new_target: Option<String>,
-    pub preconditions: CoreRefUpdatePreconditions,
-    pub mutation_id: String,
-    pub transaction_id: Option<String>,
-    pub committed_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CoreRefUpdatePreconditions {
-    pub expected_generation: Option<u64>,
-    pub expected_target: Option<String>,
-    pub require_absent: bool,
-    pub require_present: bool,
-    pub fence_token: Option<u64>,
-    pub authz_revision: Option<String>,
-    pub source_watch_cursor: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoreTransaction {
     pub schema: String,
     pub transaction_id: String,
@@ -748,33 +768,54 @@ pub struct CoreTransaction {
     pub state: CoreTransactionState,
     pub preconditions_hash: String,
     pub operations_hash: String,
-    pub prepared_refs: Vec<String>,
     pub visible_updates: Vec<CoreTransactionUpdate>,
     pub finalisation_error: Option<String>,
     pub committed_at: String,
     pub committed_by_principal: String,
+    pub created_at_unix_nanos: u64,
+    pub expires_at_unix_nanos: u64,
+    pub root_anchor_key: String,
+    pub root_key_hash: String,
+    pub committed_root_generation: Option<u64>,
+    pub purpose: String,
+    pub failure_evidence: Option<String>,
+    pub outcome: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CoreTransactionState {
+    Open,
     Prepared,
     Committed,
     FinalisationFailed,
     Aborted,
+    RolledBack,
+    Expired,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CoreTransactionUpdate {
-    CoreRefUpdate {
-        ref_name: String,
-        new_generation: u64,
-    },
     StreamAppend {
         stream_id: String,
         visible_sequence: u64,
         prepared_record_hash: String,
+    },
+    CoreMetaPut {
+        cf: String,
+        table_id: u16,
+        tuple_key: Vec<u8>,
+        previous_payload_hash: Option<String>,
+        payload: Vec<u8>,
+        payload_hash: String,
+    },
+    CoreMetaDelete {
+        cf: String,
+        table_id: u16,
+        tuple_key: Vec<u8>,
+        previous_payload_hash: Option<String>,
     },
 }
 
@@ -790,19 +831,17 @@ pub struct CoreMutationBatch {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CoreMutationPrecondition {
-    Ref {
-        ref_name: String,
-        expected_generation: Option<u64>,
-        expected_target: Option<String>,
-        require_absent: bool,
-        require_present: bool,
-        fence: Option<CoreFencePrecondition>,
-        authz_revision: Option<String>,
-        source_watch_cursor: Option<String>,
-    },
     Fence {
         fence_name: String,
         fence_token: u64,
+    },
+    CoreMetaRow {
+        cf: String,
+        table_id: u16,
+        tuple_key: Vec<u8>,
+        expected_payload_hash: Option<String>,
+        require_absent: bool,
+        require_present: bool,
     },
     StreamHead {
         stream_id: String,
@@ -814,17 +853,25 @@ pub enum CoreMutationPrecondition {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CoreMutationOperation {
-    RefUpdate {
-        partition_id: String,
-        ref_name: String,
-        new_target: String,
-    },
     StreamAppend {
         partition_id: String,
         stream_id: String,
         record_kind: String,
         payload: Vec<u8>,
         idempotency_key: Option<String>,
+    },
+    CoreMetaPut {
+        partition_id: String,
+        cf: String,
+        table_id: u16,
+        tuple_key: Vec<u8>,
+        payload: Vec<u8>,
+    },
+    CoreMetaDelete {
+        partition_id: String,
+        cf: String,
+        table_id: u16,
+        tuple_key: Vec<u8>,
     },
 }
 
@@ -835,6 +882,18 @@ pub struct CoreMutationBatchReceipt {
     pub state: CoreTransactionState,
     pub visible_updates: Vec<CoreTransactionUpdate>,
     pub finalisation_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreBeginTransaction {
+    pub idempotency_key: String,
+    pub root_anchor_key: String,
+    pub root_key_hash: String,
+    pub scope_partition: String,
+    pub ttl_ms: u64,
+    pub purpose: String,
+    pub principal: String,
+    pub preconditions_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -871,4 +930,53 @@ pub enum SourceKind {
     GitObject,
     PersonalDatabaseRecord,
     MeshControlRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreInternalPutShard {
+    pub logical_file_id: String,
+    pub block_id: String,
+    pub shard_index: u16,
+    pub erasure_profile_id: String,
+    pub placement_epoch: u64,
+    pub shard_bytes: Vec<u8>,
+    pub shard_hash: String,
+    pub boundary_summary_hash: String,
+    pub boundary_values_b64: String,
+    pub writer_family: String,
+    pub mutation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreInternalGetShard {
+    pub block_id: String,
+    pub shard_index: u16,
+    pub erasure_profile_id: String,
+    pub placement_epoch: u64,
+    pub shard_hash: String,
+    pub boundary_summary_hash: Option<String>,
+    pub range: Option<CoreByteRange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreInternalShardReceipt {
+    pub node_id: String,
+    pub region_id: String,
+    pub cell_id: String,
+    pub block_id: String,
+    pub shard_index: u16,
+    pub shard_hash: String,
+    pub shard_length: u64,
+    pub fsync_sequence: u64,
+    pub written_at_unix_nanos: u64,
+    pub signed_payload_hash: String,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreInternalRootAnchorRead {
+    pub root_key_hash: String,
+    pub generation: u64,
+    pub root_anchor_record: Vec<u8>,
+    pub root_anchor_hash: String,
 }

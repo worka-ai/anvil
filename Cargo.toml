@@ -5,6 +5,7 @@ members = [
     "anvil",
     "anvil-cli",
     "clients/rust",
+    "crates/anvil-corestore-model",
     "documentation",
 ]
 
@@ -20,4 +21,4 @@ license = "Apache-2.0"
 homepage = "https://github.com/worka-ai/anvil"
 repository = "https://github.com/worka-ai/anvil"
 documentation = "https://github.com/worka-ai/anvil/tree/main/documentation"
-rust-version = "1.89.0"
+rust-version = "1.96.0"

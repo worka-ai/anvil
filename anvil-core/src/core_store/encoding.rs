@@ -69,7 +69,7 @@ impl SourceId {
         push_len_bytes(&mut out, self.resource_id.as_bytes())?;
         out.extend_from_slice(&self.generation.to_le_bytes());
         out.push(u8::from(self.tombstone));
-        let variant = serde_json::to_vec(&self.variant)?;
+        let variant = encode_string_map(&self.variant)?;
         push_len_bytes(&mut out, &variant)?;
         Ok(out)
     }
@@ -144,6 +144,17 @@ fn push_len_bytes(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
     out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(value);
     Ok(())
+}
+
+fn encode_string_map(map: &std::collections::BTreeMap<String, String>) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let len = u32::try_from(map.len()).map_err(|_| anyhow!("CoreStore map too large"))?;
+    out.extend_from_slice(&len.to_le_bytes());
+    for (key, value) in map {
+        push_len_bytes(&mut out, key.as_bytes())?;
+        push_len_bytes(&mut out, value.as_bytes())?;
+    }
+    Ok(out)
 }
 
 fn push_escaped_terminated(out: &mut Vec<u8>, value: &[u8]) {

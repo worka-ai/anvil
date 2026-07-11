@@ -1,0 +1,1019 @@
+use super::local_stream_control::control_record_proto::decode_stream_head_record;
+use super::*;
+use crate::formats::writer::WriterFamily;
+
+impl CoreStore {
+    async fn acquire_batch_locks(&self, batch: &CoreMutationBatch) -> Result<Vec<CoreStoreLock>> {
+        let mut lock_keys = BTreeSet::new();
+        lock_keys.insert(("transaction".to_string(), batch.transaction_id.clone()));
+        for precondition in &batch.preconditions {
+            match precondition {
+                CoreMutationPrecondition::Fence { fence_name, .. } => {
+                    lock_keys.insert(("fence".to_string(), fence_name.clone()));
+                }
+                CoreMutationPrecondition::CoreMetaRow {
+                    cf,
+                    table_id,
+                    tuple_key,
+                    ..
+                } => {
+                    lock_keys.insert((
+                        "coremeta".to_string(),
+                        format!("{cf}:{table_id}:{}", sha256_hex(tuple_key)),
+                    ));
+                }
+                CoreMutationPrecondition::StreamHead { stream_id, .. } => {
+                    lock_keys.insert(("stream".to_string(), stream_id.clone()));
+                }
+            }
+        }
+        for operation in &batch.operations {
+            match operation {
+                CoreMutationOperation::StreamAppend { stream_id, .. } => {
+                    lock_keys.insert(("stream".to_string(), stream_id.clone()));
+                }
+                CoreMutationOperation::CoreMetaPut {
+                    cf,
+                    table_id,
+                    tuple_key,
+                    ..
+                }
+                | CoreMutationOperation::CoreMetaDelete {
+                    cf,
+                    table_id,
+                    tuple_key,
+                    ..
+                } => {
+                    lock_keys.insert((
+                        "coremeta".to_string(),
+                        format!("{cf}:{table_id}:{}", sha256_hex(tuple_key)),
+                    ));
+                }
+            }
+        }
+        let mut guards = Vec::with_capacity(lock_keys.len());
+        for (kind, id) in lock_keys {
+            guards.push(self.acquire_named_lock(&kind, &id).await?);
+        }
+        Ok(guards)
+    }
+
+    pub async fn list_stream_ids(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut ids = BTreeSet::new();
+        for item in self.meta.scan_prefix(
+            CF_STREAM_HEADS,
+            TABLE_STREAM_HEAD_ROW,
+            &meta_tuple_key(&[b"stream-head"]),
+        )? {
+            let head = decode_stream_head_record(&item.payload)?;
+            if head.schema != "anvil.core.stream_head.v1" {
+                bail!("CoreStore stream head metadata row has invalid schema");
+            }
+            if head.stream_id.starts_with(prefix) && head.record_count > 0 {
+                ids.insert(head.stream_id);
+            }
+        }
+        Ok(ids.into_iter().collect())
+    }
+
+    pub async fn commit_mutation_batch(
+        &self,
+        batch: CoreMutationBatch,
+    ) -> Result<CoreMutationBatchReceipt> {
+        let _perf_guard = crate::perf::guard(
+            "anvil_core_store_op",
+            &[("operation", "commit_mutation_batch")],
+        );
+        let total_start = std::time::Instant::now();
+        let timing_name = batch.transaction_id.clone();
+        validate_logical_id(&batch.transaction_id, "transaction id")?;
+        validate_logical_id(&batch.scope_partition, "transaction scope partition")?;
+        validate_logical_id(&batch.committed_by_principal, "transaction principal")?;
+        if batch.operations.is_empty() {
+            bail!("CoreStore mutation batch must include at least one operation");
+        }
+        validate_batch_partitions(&batch)?;
+
+        let step_start = std::time::Instant::now();
+        let _operation_guards = self.acquire_batch_locks(&batch).await?;
+        crate::emit_test_timing(
+            format!("core_store.commit_mutation_batch acquire_batch_locks tx={timing_name}"),
+            step_start.elapsed(),
+        );
+        let step_start = std::time::Instant::now();
+        let _guard = self.write_lock.lock().await;
+        crate::emit_test_timing(
+            format!("core_store.commit_mutation_batch write_lock tx={timing_name}"),
+            step_start.elapsed(),
+        );
+        let step_start = std::time::Instant::now();
+        if let Some(transaction) = self
+            .read_transaction_unlocked(&batch.transaction_id)
+            .await?
+        {
+            if matches!(
+                transaction.state,
+                CoreTransactionState::Committed | CoreTransactionState::FinalisationFailed
+            ) {
+                return Ok(receipt_from_transaction(&transaction));
+            }
+            bail!(
+                "CoreStore transaction {} already exists with non-implicit state {}",
+                batch.transaction_id,
+                core_transaction_state_name(transaction.state)
+            );
+        }
+        crate::emit_test_timing(
+            format!("core_store.commit_mutation_batch read_transaction tx={timing_name}"),
+            step_start.elapsed(),
+        );
+        let step_start = std::time::Instant::now();
+        self.validate_mutation_preconditions_unlocked(
+            &batch.preconditions,
+            &batch.committed_by_principal,
+            None,
+        )
+        .await?;
+        crate::emit_test_timing(
+            format!("core_store.commit_mutation_batch validate_preconditions tx={timing_name}"),
+            step_start.elapsed(),
+        );
+        let batch_payload = encode_core_mutation_batch(&batch)?;
+        let pending_mutation_payload =
+            if batch_payload.len() <= CORE_PENDING_MUTATION_MAX_INLINE_PAYLOAD_BYTES {
+                CorePendingMutationPayload::Inline(&batch_payload)
+            } else {
+                CorePendingMutationPayload::Landed(&batch_payload)
+            };
+        let admission = self
+            .admit_core_mutation(
+                "mutation.batch",
+                WriterFamily::CoreControl.as_str(),
+                CorePendingMutationTarget::MutationBatch {
+                    transaction_id: batch.transaction_id.clone(),
+                    scope_partition: batch.scope_partition.clone(),
+                    operation_count: batch.operations.len() as u64,
+                },
+                batch.transaction_id.clone(),
+                Some(batch.transaction_id.clone()),
+                pending_mutation_payload,
+                Vec::new(),
+            )
+            .await?;
+
+        let mut visible_updates = Vec::with_capacity(batch.operations.len());
+        let step_start = std::time::Instant::now();
+        let mut finalisation_error = None;
+        for operation in &batch.operations {
+            let operation_result = match operation {
+                CoreMutationOperation::StreamAppend {
+                    partition_id,
+                    stream_id,
+                    record_kind,
+                    payload,
+                    idempotency_key,
+                } => self
+                    .append_stream_unlocked(AppendStreamRecord {
+                        stream_id: stream_id.clone(),
+                        partition_id: partition_id.clone(),
+                        record_kind: record_kind.clone(),
+                        payload: payload.clone(),
+                        content_type: None,
+                        user_metadata_json: "{}".to_string(),
+                        fence: None,
+                        transaction_id: Some(batch.transaction_id.clone()),
+                        idempotency_key: idempotency_key.clone(),
+                    })
+                    .await
+                    .map(|outcome| CoreTransactionUpdate::StreamAppend {
+                        stream_id: stream_id.clone(),
+                        visible_sequence: outcome.receipt.sequence,
+                        prepared_record_hash: outcome.receipt.event_hash,
+                    }),
+                CoreMutationOperation::CoreMetaPut {
+                    cf,
+                    table_id,
+                    tuple_key,
+                    payload,
+                    ..
+                } => {
+                    self.apply_coremeta_put_update_unlocked(cf, *table_id, tuple_key, payload)
+                        .await
+                }
+                CoreMutationOperation::CoreMetaDelete {
+                    cf,
+                    table_id,
+                    tuple_key,
+                    ..
+                } => {
+                    self.apply_coremeta_delete_update_unlocked(cf, *table_id, tuple_key)
+                        .await
+                }
+            };
+            match operation_result {
+                Ok(update) => visible_updates.push(update),
+                Err(error) => {
+                    finalisation_error = Some(format!("{error:#}"));
+                    break;
+                }
+            }
+        }
+        crate::emit_test_timing(
+            format!("core_store.commit_mutation_batch operations tx={timing_name}"),
+            step_start.elapsed(),
+        );
+
+        let transaction_state = if finalisation_error.is_some() {
+            CoreTransactionState::FinalisationFailed
+        } else {
+            CoreTransactionState::Committed
+        };
+        let transaction_visible_updates = if finalisation_error.is_some() {
+            Vec::new()
+        } else {
+            visible_updates.clone()
+        };
+        let transaction = CoreTransaction {
+            schema: CORE_TRANSACTION_SCHEMA.to_string(),
+            transaction_id: batch.transaction_id.clone(),
+            scope_partition: batch.scope_partition.clone(),
+            state: transaction_state,
+            preconditions_hash: core_mutation_preconditions_hash(&batch.preconditions)?,
+            operations_hash: core_mutation_operations_hash(&batch.operations)?,
+            visible_updates: transaction_visible_updates.clone(),
+            finalisation_error: finalisation_error.clone(),
+            committed_at: now_rfc3339(),
+            committed_by_principal: batch.committed_by_principal.clone(),
+            created_at_unix_nanos: current_unix_nanos_u64()?,
+            expires_at_unix_nanos: 0,
+            root_anchor_key: batch.scope_partition.clone(),
+            root_key_hash: root_key_hash(&batch.scope_partition),
+            committed_root_generation: if transaction_state == CoreTransactionState::Committed {
+                committed_root_generation_from_updates(&transaction_visible_updates)?
+            } else {
+                None
+            },
+            purpose: "implicit_mutation_batch".to_string(),
+            failure_evidence: finalisation_error.clone(),
+            outcome: core_transaction_state_name(transaction_state).to_string(),
+        };
+        let step_start = std::time::Instant::now();
+        self.write_transaction_with_staged_rows_unlocked(&transaction, &batch.preconditions)
+            .await?;
+        self.mark_pending_mutation_finalised_unlocked(
+            &admission,
+            core_transaction_state_name(transaction_state),
+        )
+        .await?;
+        crate::emit_test_timing(
+            format!("core_store.commit_mutation_batch write_transaction tx={timing_name}"),
+            step_start.elapsed(),
+        );
+        crate::emit_test_timing(
+            format!("core_store.commit_mutation_batch total tx={timing_name}"),
+            total_start.elapsed(),
+        );
+
+        Ok(CoreMutationBatchReceipt {
+            transaction_id: batch.transaction_id,
+            scope_partition: batch.scope_partition,
+            state: transaction_state,
+            visible_updates: transaction_visible_updates,
+            finalisation_error,
+        })
+    }
+
+    pub(super) async fn recover_admitted_mutation_batch_unlocked(
+        &self,
+        batch: CoreMutationBatch,
+    ) -> Result<CoreMutationBatchReceipt> {
+        validate_logical_id(&batch.transaction_id, "transaction id")?;
+        validate_logical_id(&batch.scope_partition, "transaction scope partition")?;
+        validate_logical_id(&batch.committed_by_principal, "transaction principal")?;
+        if batch.operations.is_empty() {
+            bail!("CoreStore mutation batch must include at least one operation");
+        }
+        validate_batch_partitions(&batch)?;
+
+        if let Some(transaction) = self
+            .read_transaction_unlocked(&batch.transaction_id)
+            .await?
+        {
+            if matches!(
+                transaction.state,
+                CoreTransactionState::Committed | CoreTransactionState::FinalisationFailed
+            ) {
+                return Ok(receipt_from_transaction(&transaction));
+            }
+            bail!(
+                "CoreStore transaction {} already exists with non-implicit state {}",
+                batch.transaction_id,
+                core_transaction_state_name(transaction.state)
+            );
+        }
+        self.validate_mutation_preconditions_unlocked(
+            &batch.preconditions,
+            &batch.committed_by_principal,
+            None,
+        )
+        .await?;
+
+        let mut visible_updates = Vec::with_capacity(batch.operations.len());
+        let mut finalisation_error = None;
+        for operation in &batch.operations {
+            let operation_result = match operation {
+                CoreMutationOperation::StreamAppend {
+                    partition_id,
+                    stream_id,
+                    record_kind,
+                    payload,
+                    idempotency_key,
+                } => self
+                    .append_stream_unlocked(AppendStreamRecord {
+                        stream_id: stream_id.clone(),
+                        partition_id: partition_id.clone(),
+                        record_kind: record_kind.clone(),
+                        payload: payload.clone(),
+                        content_type: None,
+                        user_metadata_json: "{}".to_string(),
+                        fence: None,
+                        transaction_id: Some(batch.transaction_id.clone()),
+                        idempotency_key: idempotency_key.clone(),
+                    })
+                    .await
+                    .map(|outcome| CoreTransactionUpdate::StreamAppend {
+                        stream_id: stream_id.clone(),
+                        visible_sequence: outcome.receipt.sequence,
+                        prepared_record_hash: outcome.receipt.event_hash,
+                    }),
+                CoreMutationOperation::CoreMetaPut {
+                    cf,
+                    table_id,
+                    tuple_key,
+                    payload,
+                    ..
+                } => {
+                    self.apply_coremeta_put_update_unlocked(cf, *table_id, tuple_key, payload)
+                        .await
+                }
+                CoreMutationOperation::CoreMetaDelete {
+                    cf,
+                    table_id,
+                    tuple_key,
+                    ..
+                } => {
+                    self.apply_coremeta_delete_update_unlocked(cf, *table_id, tuple_key)
+                        .await
+                }
+            };
+            match operation_result {
+                Ok(update) => visible_updates.push(update),
+                Err(error) => {
+                    finalisation_error = Some(format!("{error:#}"));
+                    break;
+                }
+            }
+        }
+
+        let transaction_state = if finalisation_error.is_some() {
+            CoreTransactionState::FinalisationFailed
+        } else {
+            CoreTransactionState::Committed
+        };
+        let transaction_visible_updates = if finalisation_error.is_some() {
+            Vec::new()
+        } else {
+            visible_updates.clone()
+        };
+        let transaction = CoreTransaction {
+            schema: CORE_TRANSACTION_SCHEMA.to_string(),
+            transaction_id: batch.transaction_id.clone(),
+            scope_partition: batch.scope_partition.clone(),
+            state: transaction_state,
+            preconditions_hash: core_mutation_preconditions_hash(&batch.preconditions)?,
+            operations_hash: core_mutation_operations_hash(&batch.operations)?,
+            visible_updates: transaction_visible_updates.clone(),
+            finalisation_error: finalisation_error.clone(),
+            committed_at: now_rfc3339(),
+            committed_by_principal: batch.committed_by_principal.clone(),
+            created_at_unix_nanos: current_unix_nanos_u64()?,
+            expires_at_unix_nanos: 0,
+            root_anchor_key: batch.scope_partition.clone(),
+            root_key_hash: root_key_hash(&batch.scope_partition),
+            committed_root_generation: if transaction_state == CoreTransactionState::Committed {
+                committed_root_generation_from_updates(&transaction_visible_updates)?
+            } else {
+                None
+            },
+            purpose: "implicit_mutation_batch_recovery".to_string(),
+            failure_evidence: finalisation_error.clone(),
+            outcome: core_transaction_state_name(transaction_state).to_string(),
+        };
+        self.write_transaction_with_staged_rows_unlocked(&transaction, &batch.preconditions)
+            .await?;
+
+        Ok(CoreMutationBatchReceipt {
+            transaction_id: batch.transaction_id,
+            scope_partition: batch.scope_partition,
+            state: transaction_state,
+            visible_updates: transaction_visible_updates,
+            finalisation_error,
+        })
+    }
+
+    pub async fn read_transaction(&self, transaction_id: &str) -> Result<Option<CoreTransaction>> {
+        validate_logical_id(transaction_id, "transaction id")?;
+        self.read_transaction_unlocked(transaction_id).await
+    }
+
+    pub async fn read_explicit_transaction_for_principal(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+    ) -> Result<CoreTransaction> {
+        validate_logical_id(transaction_id, "transaction id")?;
+        validate_logical_id(principal, "transaction principal")?;
+        let _guard = self.write_lock.lock().await;
+        let transaction = self
+            .read_transaction_unlocked(transaction_id)
+            .await?
+            .ok_or_else(|| anyhow!("TransactionNotFound"))?;
+        if transaction.committed_by_principal != principal {
+            bail!("TransactionPrincipalMismatch");
+        }
+        if transaction.state == CoreTransactionState::Open
+            && transaction.expires_at_unix_nanos != 0
+            && current_unix_nanos_u64()? >= transaction.expires_at_unix_nanos
+        {
+            let expired = transaction_with_state(
+                transaction,
+                CoreTransactionState::Expired,
+                Some("TransactionExpired".to_string()),
+            )?;
+            self.write_transaction_unlocked(&expired).await?;
+            return Ok(expired);
+        }
+        Ok(transaction)
+    }
+
+    pub fn root_key_hash_for_anchor(root_anchor_key: &str) -> String {
+        root_key_hash(root_anchor_key)
+    }
+
+    pub async fn begin_explicit_transaction(
+        &self,
+        input: CoreBeginTransaction,
+    ) -> Result<CoreTransaction> {
+        validate_logical_id(&input.idempotency_key, "transaction idempotency key")?;
+        validate_logical_id(&input.root_anchor_key, "transaction root anchor key")?;
+        validate_hash(&input.root_key_hash, "transaction root key hash")?;
+        validate_logical_id(&input.scope_partition, "transaction scope partition")?;
+        validate_logical_id(&input.principal, "transaction principal")?;
+        validate_transaction_scope_fields(
+            &input.root_anchor_key,
+            &input.root_key_hash,
+            &input.scope_partition,
+        )?;
+        let ttl_ms = input.ttl_ms.clamp(1, 3_600_000);
+        let created_at_unix_nanos = current_unix_nanos_u64()?;
+        let expires_at_unix_nanos =
+            created_at_unix_nanos.saturating_add(ttl_ms.saturating_mul(1_000_000));
+        let transaction_id = explicit_transaction_id(
+            &input.principal,
+            &input.root_key_hash,
+            &input.idempotency_key,
+        );
+        let transaction = CoreTransaction {
+            schema: CORE_TRANSACTION_SCHEMA.to_string(),
+            transaction_id,
+            scope_partition: input.scope_partition,
+            state: CoreTransactionState::Open,
+            preconditions_hash: input.preconditions_hash,
+            operations_hash: ZERO_HASH.to_string(),
+            visible_updates: Vec::new(),
+            finalisation_error: None,
+            committed_at: String::new(),
+            committed_by_principal: input.principal,
+            created_at_unix_nanos,
+            expires_at_unix_nanos,
+            root_anchor_key: input.root_anchor_key,
+            root_key_hash: input.root_key_hash,
+            committed_root_generation: None,
+            purpose: input.purpose,
+            failure_evidence: None,
+            outcome: "open".to_string(),
+        };
+
+        let _guard = self.write_lock.lock().await;
+        if let Some(existing) = self
+            .read_transaction_unlocked(&transaction.transaction_id)
+            .await?
+        {
+            if existing.root_anchor_key == transaction.root_anchor_key
+                && existing.root_key_hash == transaction.root_key_hash
+                && existing.scope_partition == transaction.scope_partition
+                && existing.preconditions_hash == transaction.preconditions_hash
+                && existing.committed_by_principal == transaction.committed_by_principal
+            {
+                return Ok(existing);
+            }
+            if !is_allowed_transaction_transition(&existing, &transaction) {
+                bail!(
+                    "CoreStore transaction {} idempotency conflict",
+                    transaction.transaction_id
+                );
+            }
+        }
+        self.write_transaction_unlocked(&transaction).await?;
+        Ok(transaction)
+    }
+
+    pub async fn stage_explicit_transaction_batch(
+        &self,
+        batch: CoreMutationBatch,
+    ) -> Result<CoreMutationBatchReceipt> {
+        validate_logical_id(&batch.transaction_id, "transaction id")?;
+        validate_logical_id(&batch.scope_partition, "transaction scope partition")?;
+        validate_logical_id(&batch.committed_by_principal, "transaction principal")?;
+        if batch.operations.is_empty() {
+            bail!("CoreStore explicit transaction stage must include at least one operation");
+        }
+        let _operation_guards = self.acquire_batch_locks(&batch).await?;
+        let _guard = self.write_lock.lock().await;
+        let mut transaction = self
+            .read_transaction_unlocked(&batch.transaction_id)
+            .await?
+            .ok_or_else(|| anyhow!("TransactionNotFound"))?;
+        if transaction.state != CoreTransactionState::Open {
+            bail!("TransactionNotOpen");
+        }
+        if transaction.committed_by_principal != batch.committed_by_principal {
+            bail!("TransactionPrincipalMismatch");
+        }
+        validate_transaction_root_scope(&transaction)?;
+        if transaction.scope_partition != batch.scope_partition {
+            bail!("TransactionScopeMismatch");
+        }
+        if transaction.expires_at_unix_nanos != 0
+            && current_unix_nanos_u64()? >= transaction.expires_at_unix_nanos
+        {
+            let expired = transaction_with_state(
+                transaction,
+                CoreTransactionState::Expired,
+                Some("TransactionExpired".to_string()),
+            )?;
+            self.write_transaction_unlocked(&expired).await?;
+            bail!("TransactionExpired");
+        }
+        validate_explicit_transaction_scope(&batch, &transaction.scope_partition)?;
+        validate_batch_partitions(&batch)?;
+        self.validate_mutation_preconditions_unlocked(
+            &batch.preconditions,
+            &batch.committed_by_principal,
+            Some(&batch.transaction_id),
+        )
+        .await?;
+
+        let mut staged_updates = Vec::with_capacity(batch.operations.len());
+        let mut coremeta_batch_overlay = BTreeMap::<(String, u16, Vec<u8>), Option<Vec<u8>>>::new();
+        for operation in &batch.operations {
+            let update = match operation {
+                CoreMutationOperation::StreamAppend {
+                    partition_id,
+                    stream_id,
+                    record_kind,
+                    payload,
+                    idempotency_key,
+                } => self
+                    .append_stream_unlocked(AppendStreamRecord {
+                        stream_id: stream_id.clone(),
+                        partition_id: partition_id.clone(),
+                        record_kind: record_kind.clone(),
+                        payload: payload.clone(),
+                        content_type: None,
+                        user_metadata_json: "{}".to_string(),
+                        fence: None,
+                        transaction_id: Some(batch.transaction_id.clone()),
+                        idempotency_key: idempotency_key.clone(),
+                    })
+                    .await
+                    .map(|outcome| CoreTransactionUpdate::StreamAppend {
+                        stream_id: stream_id.clone(),
+                        visible_sequence: outcome.receipt.sequence,
+                        prepared_record_hash: outcome.receipt.event_hash,
+                    })?,
+                CoreMutationOperation::CoreMetaPut {
+                    cf,
+                    table_id,
+                    tuple_key,
+                    payload,
+                    ..
+                } => {
+                    ensure_coremeta_payload_in_transaction_scope(payload, &transaction)?;
+                    let cf = canonical_coremeta_cf_name(cf)?;
+                    let key = (cf.to_string(), *table_id, tuple_key.clone());
+                    let previous_payload = match coremeta_batch_overlay.get(&key) {
+                        Some(payload) => payload.clone(),
+                        None => self.coremeta_payload_visible_to_transaction_unlocked(
+                            cf,
+                            *table_id,
+                            tuple_key,
+                            &transaction,
+                        )?,
+                    };
+                    let previous_payload_hash = previous_payload
+                        .as_ref()
+                        .map(|payload| core_meta_payload_digest(*table_id, payload));
+                    let payload_hash = core_meta_payload_digest(*table_id, payload);
+                    coremeta_batch_overlay.insert(key, Some(payload.clone()));
+                    CoreTransactionUpdate::CoreMetaPut {
+                        cf: cf.to_string(),
+                        table_id: *table_id,
+                        tuple_key: tuple_key.clone(),
+                        previous_payload_hash,
+                        payload: payload.clone(),
+                        payload_hash,
+                    }
+                }
+                CoreMutationOperation::CoreMetaDelete {
+                    cf,
+                    table_id,
+                    tuple_key,
+                    ..
+                } => {
+                    let cf = canonical_coremeta_cf_name(cf)?;
+                    let key = (cf.to_string(), *table_id, tuple_key.clone());
+                    let previous_payload = match coremeta_batch_overlay.get(&key) {
+                        Some(payload) => payload.clone(),
+                        None => self.coremeta_payload_visible_to_transaction_unlocked(
+                            cf,
+                            *table_id,
+                            tuple_key,
+                            &transaction,
+                        )?,
+                    };
+                    if let Some(payload) = previous_payload.as_ref() {
+                        ensure_coremeta_payload_in_transaction_scope(payload, &transaction)?;
+                    }
+                    let previous_payload_hash = previous_payload
+                        .as_ref()
+                        .map(|payload| core_meta_payload_digest(*table_id, payload));
+                    coremeta_batch_overlay.insert(key, None);
+                    CoreTransactionUpdate::CoreMetaDelete {
+                        cf: cf.to_string(),
+                        table_id: *table_id,
+                        tuple_key: tuple_key.clone(),
+                        previous_payload_hash,
+                    }
+                }
+            };
+            staged_updates.push(update);
+        }
+
+        transaction.visible_updates.extend(staged_updates.clone());
+        transaction.operations_hash = core_mutation_operations_hash(&batch.operations)?;
+        transaction.outcome = "open".to_string();
+        self.write_transaction_with_staged_rows_unlocked(&transaction, &batch.preconditions)
+            .await?;
+        Ok(CoreMutationBatchReceipt {
+            transaction_id: batch.transaction_id,
+            scope_partition: batch.scope_partition,
+            state: CoreTransactionState::Open,
+            visible_updates: staged_updates,
+            finalisation_error: None,
+        })
+    }
+
+    pub async fn stage_coremeta_put_in_transaction(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+        cf: &str,
+        table_id: u16,
+        tuple_key: Vec<u8>,
+        payload: Vec<u8>,
+        expected_payload_hash: Option<String>,
+        require_absent: bool,
+        require_present: bool,
+    ) -> Result<CoreMutationBatchReceipt> {
+        validate_logical_id(transaction_id, "transaction id")?;
+        validate_logical_id(principal, "transaction principal")?;
+        validate_coremeta_operation_payload(cf, table_id, &tuple_key, &payload)?;
+        let transaction = self
+            .read_explicit_transaction_for_principal(transaction_id, principal)
+            .await?;
+        validate_transaction_root_scope(&transaction)?;
+        let scope_partition = transaction.scope_partition.clone();
+        self.stage_explicit_transaction_batch(CoreMutationBatch {
+            transaction_id: transaction_id.to_string(),
+            scope_partition,
+            committed_by_principal: principal.to_string(),
+            preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
+                cf: canonical_coremeta_cf_name(cf)?.to_string(),
+                table_id,
+                tuple_key: tuple_key.clone(),
+                expected_payload_hash,
+                require_absent,
+                require_present,
+            }],
+            operations: vec![CoreMutationOperation::CoreMetaPut {
+                partition_id: transaction.root_anchor_key,
+                cf: canonical_coremeta_cf_name(cf)?.to_string(),
+                table_id,
+                tuple_key,
+                payload,
+            }],
+        })
+        .await
+    }
+
+    pub async fn stage_coremeta_delete_in_transaction(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+        cf: &str,
+        table_id: u16,
+        tuple_key: Vec<u8>,
+        expected_payload_hash: Option<String>,
+        require_present: bool,
+    ) -> Result<CoreMutationBatchReceipt> {
+        validate_logical_id(transaction_id, "transaction id")?;
+        validate_logical_id(principal, "transaction principal")?;
+        validate_coremeta_operation_key(cf, table_id, &tuple_key)?;
+        let transaction = self
+            .read_explicit_transaction_for_principal(transaction_id, principal)
+            .await?;
+        validate_transaction_root_scope(&transaction)?;
+        let scope_partition = transaction.scope_partition.clone();
+        self.stage_explicit_transaction_batch(CoreMutationBatch {
+            transaction_id: transaction_id.to_string(),
+            scope_partition,
+            committed_by_principal: principal.to_string(),
+            preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
+                cf: canonical_coremeta_cf_name(cf)?.to_string(),
+                table_id,
+                tuple_key: tuple_key.clone(),
+                expected_payload_hash,
+                require_absent: false,
+                require_present,
+            }],
+            operations: vec![CoreMutationOperation::CoreMetaDelete {
+                partition_id: transaction.root_anchor_key,
+                cf: canonical_coremeta_cf_name(cf)?.to_string(),
+                table_id,
+                tuple_key,
+            }],
+        })
+        .await
+    }
+
+    pub async fn commit_explicit_transaction(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+    ) -> Result<CoreTransaction> {
+        validate_logical_id(transaction_id, "transaction id")?;
+        validate_logical_id(principal, "transaction principal")?;
+        let _guard = self.write_lock.lock().await;
+        let transaction = self
+            .read_transaction_unlocked(transaction_id)
+            .await?
+            .ok_or_else(|| anyhow!("TransactionNotFound"))?;
+        if transaction.committed_by_principal != principal {
+            bail!("TransactionPrincipalMismatch");
+        }
+        match transaction.state {
+            CoreTransactionState::Committed => return Ok(transaction),
+            CoreTransactionState::Open => {}
+            CoreTransactionState::RolledBack | CoreTransactionState::Aborted => {
+                bail!("TransactionRolledBack");
+            }
+            CoreTransactionState::Expired => bail!("TransactionExpired"),
+            _ => bail!("TransactionNotCommittable"),
+        }
+        if transaction.expires_at_unix_nanos != 0
+            && current_unix_nanos_u64()? >= transaction.expires_at_unix_nanos
+        {
+            let expired = transaction_with_state(
+                transaction,
+                CoreTransactionState::Expired,
+                Some("TransactionExpired".to_string()),
+            )?;
+            self.write_transaction_unlocked(&expired).await?;
+            bail!("TransactionExpired");
+        }
+        validate_transaction_root_scope(&transaction)?;
+        self.validate_explicit_transaction_commit_unlocked(&transaction)
+            .await?;
+        let committed = transaction_with_state(transaction, CoreTransactionState::Committed, None)?;
+        let committed_transaction = self
+            .commit_explicit_transaction_rows_and_coremeta_updates_unlocked(&committed)
+            .await?;
+        Ok(committed_transaction)
+    }
+
+    pub async fn rollback_explicit_transaction(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+        reason: &str,
+    ) -> Result<CoreTransaction> {
+        validate_logical_id(transaction_id, "transaction id")?;
+        validate_logical_id(principal, "transaction principal")?;
+        let _guard = self.write_lock.lock().await;
+        let transaction = self
+            .read_transaction_unlocked(transaction_id)
+            .await?
+            .ok_or_else(|| anyhow!("TransactionNotFound"))?;
+        if transaction.committed_by_principal != principal {
+            bail!("TransactionPrincipalMismatch");
+        }
+        match transaction.state {
+            CoreTransactionState::RolledBack => return Ok(transaction),
+            CoreTransactionState::Committed => bail!("TransactionAlreadyCommitted"),
+            _ => {}
+        }
+        let rolled_back = transaction_with_state(
+            transaction,
+            CoreTransactionState::RolledBack,
+            Some(if reason.trim().is_empty() {
+                "RollbackRequested".to_string()
+            } else {
+                format!("RollbackRequested: {reason}")
+            }),
+        )?;
+        self.write_transaction_unlocked(&rolled_back).await?;
+        Ok(rolled_back)
+    }
+
+    pub async fn commit_transaction(&self, transaction: CoreTransaction) -> Result<()> {
+        if transaction.state != CoreTransactionState::Committed {
+            bail!("CoreStore only persists committed transactions through commit_transaction");
+        }
+        validate_transaction_root_scope(&transaction)?;
+        validate_logical_id(&transaction.transaction_id, "transaction id")?;
+        let _guard = self.write_lock.lock().await;
+        self.write_transaction_unlocked(&transaction).await
+    }
+
+    pub(super) async fn write_transaction_unlocked(
+        &self,
+        transaction: &CoreTransaction,
+    ) -> Result<()> {
+        if let Some(existing) = self
+            .read_transaction_unlocked(&transaction.transaction_id)
+            .await?
+        {
+            if existing.state == transaction.state
+                && existing.preconditions_hash == transaction.preconditions_hash
+                && existing.operations_hash == transaction.operations_hash
+                && existing.visible_updates == transaction.visible_updates
+                && existing.finalisation_error == transaction.finalisation_error
+                && existing.committed_by_principal == transaction.committed_by_principal
+                && existing.root_anchor_key == transaction.root_anchor_key
+                && existing.root_key_hash == transaction.root_key_hash
+                && existing.scope_partition == transaction.scope_partition
+                && existing.failure_evidence == transaction.failure_evidence
+                && existing.outcome == transaction.outcome
+            {
+                return Ok(());
+            }
+            if !is_allowed_transaction_transition(&existing, transaction) {
+                bail!(
+                    "CoreStore transaction {} idempotency conflict",
+                    transaction.transaction_id
+                );
+            }
+        }
+        self.write_transaction_with_staged_rows_unlocked(transaction, &[])
+            .await?;
+        Ok(())
+    }
+
+    pub(super) async fn read_transaction_unlocked(
+        &self,
+        transaction_id: &str,
+    ) -> Result<Option<CoreTransaction>> {
+        self.read_transaction_from_rows_unlocked(transaction_id)
+            .await
+    }
+}
+
+pub(super) fn transaction_lists_stream_record(
+    transaction: &CoreTransaction,
+    record: &StreamRecord,
+) -> Result<bool> {
+    Ok(transaction.visible_updates.iter().any(|visible_update| {
+        matches!(
+            visible_update,
+            CoreTransactionUpdate::StreamAppend {
+                stream_id,
+                visible_sequence,
+                prepared_record_hash,
+            } if stream_id == &record.stream_id
+                && *visible_sequence == record.sequence
+                && prepared_record_hash == &record.event_hash
+        )
+    }))
+}
+
+fn ensure_coremeta_payload_in_transaction_scope(
+    payload: &[u8],
+    transaction: &CoreTransaction,
+) -> Result<()> {
+    let common = core_meta_row_common_from_payload(payload)?;
+    if !common.root_key_hash.is_empty() && common.root_key_hash != transaction.root_key_hash {
+        bail!("TransactionScopeMismatch");
+    }
+    Ok(())
+}
+
+fn validate_explicit_transaction_scope(
+    batch: &CoreMutationBatch,
+    scope_partition: &str,
+) -> Result<()> {
+    for operation in &batch.operations {
+        let partition_id = match operation {
+            CoreMutationOperation::StreamAppend { partition_id, .. }
+            | CoreMutationOperation::CoreMetaPut { partition_id, .. }
+            | CoreMutationOperation::CoreMetaDelete { partition_id, .. } => partition_id,
+        };
+        if partition_id != scope_partition {
+            bail!("TransactionScopeMismatch");
+        }
+    }
+    Ok(())
+}
+
+fn is_allowed_transaction_transition(existing: &CoreTransaction, next: &CoreTransaction) -> bool {
+    if existing.transaction_id != next.transaction_id
+        || existing.scope_partition != next.scope_partition
+        || existing.preconditions_hash != next.preconditions_hash
+        || existing.committed_by_principal != next.committed_by_principal
+        || existing.created_at_unix_nanos != next.created_at_unix_nanos
+        || existing.expires_at_unix_nanos != next.expires_at_unix_nanos
+        || existing.root_anchor_key != next.root_anchor_key
+        || existing.root_key_hash != next.root_key_hash
+    {
+        return false;
+    }
+
+    match existing.state {
+        CoreTransactionState::Open => match next.state {
+            CoreTransactionState::Open => {
+                has_prefix(&next.visible_updates, &existing.visible_updates)
+            }
+            CoreTransactionState::Prepared
+            | CoreTransactionState::Committed
+            | CoreTransactionState::FinalisationFailed
+            | CoreTransactionState::Aborted
+            | CoreTransactionState::RolledBack
+            | CoreTransactionState::Expired
+            | CoreTransactionState::Failed => true,
+        },
+        CoreTransactionState::Prepared => matches!(
+            next.state,
+            CoreTransactionState::Committed
+                | CoreTransactionState::FinalisationFailed
+                | CoreTransactionState::Aborted
+                | CoreTransactionState::RolledBack
+                | CoreTransactionState::Expired
+                | CoreTransactionState::Failed
+        ),
+        CoreTransactionState::Committed
+        | CoreTransactionState::FinalisationFailed
+        | CoreTransactionState::Aborted
+        | CoreTransactionState::RolledBack
+        | CoreTransactionState::Expired
+        | CoreTransactionState::Failed => false,
+    }
+}
+
+pub(super) fn validate_core_meta_row_precondition(
+    current: Option<&[u8]>,
+    cf: &str,
+    table_id: u16,
+    expected_payload_hash: Option<&str>,
+    require_absent: bool,
+    require_present: bool,
+) -> Result<()> {
+    if require_absent && current.is_some() {
+        bail!("CoreMeta row {cf}/{table_id:#06x} must be absent");
+    }
+    if require_present && current.is_none() {
+        bail!("CoreMeta row {cf}/{table_id:#06x} must be present");
+    }
+    if let (Some(expected), Some(payload)) = (expected_payload_hash, current) {
+        let actual = core_meta_payload_digest(table_id, payload);
+        if actual != expected {
+            bail!(
+                "CoreMeta row {cf}/{table_id:#06x} target mismatch: payload hash mismatch expected {expected}, got {actual}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn has_prefix<T: PartialEq>(value: &[T], prefix: &[T]) -> bool {
+    value.len() >= prefix.len() && &value[..prefix.len()] == prefix
+}

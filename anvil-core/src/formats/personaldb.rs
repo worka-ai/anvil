@@ -16,7 +16,7 @@ pub struct PersonalDbLogRecord {
     pub certificate_hash: Hash32,
     pub payload_ref: Vec<u8>,
     pub certificate_ref: Vec<u8>,
-    pub inline_certificate_json: Vec<u8>,
+    pub inline_certificate_bytes: Vec<u8>,
     pub entry_hash: Hash32,
 }
 
@@ -33,7 +33,7 @@ impl PersonalDbLogRecord {
         certificate_hash: Hash32,
         payload_ref: Vec<u8>,
         certificate_ref: Vec<u8>,
-        inline_certificate_json: Vec<u8>,
+        inline_certificate_bytes: Vec<u8>,
     ) -> Self {
         let mut record = Self {
             log_index,
@@ -46,7 +46,7 @@ impl PersonalDbLogRecord {
             certificate_hash,
             payload_ref,
             certificate_ref,
-            inline_certificate_json,
+            inline_certificate_bytes,
             entry_hash: [0; 32],
         };
         record.entry_hash = hash32(&record.chain_hash_material());
@@ -111,7 +111,7 @@ impl PersonalDbLogRecord {
             certificate_hash: input[128..160].try_into().unwrap(),
             payload_ref: input[payload_ref_start..certificate_ref_start].to_vec(),
             certificate_ref: input[certificate_ref_start..inline_certificate_start].to_vec(),
-            inline_certificate_json: input[inline_certificate_start..hash_start].to_vec(),
+            inline_certificate_bytes: input[inline_certificate_start..hash_start].to_vec(),
             entry_hash,
         };
         if hash32(&record.chain_hash_material()) != entry_hash {
@@ -127,7 +127,7 @@ impl PersonalDbLogRecord {
             PERSONALDB_LOG_FIXED_LEN
                 + self.payload_ref.len()
                 + self.certificate_ref.len()
-                + self.inline_certificate_json.len(),
+                + self.inline_certificate_bytes.len(),
         );
         out.extend_from_slice(&self.log_index.to_le_bytes());
         out.extend_from_slice(&self.client_log_epoch.to_le_bytes());
@@ -139,10 +139,10 @@ impl PersonalDbLogRecord {
         out.extend_from_slice(&self.certificate_hash);
         out.extend_from_slice(&(self.payload_ref.len() as u16).to_le_bytes());
         out.extend_from_slice(&(self.certificate_ref.len() as u16).to_le_bytes());
-        out.extend_from_slice(&(self.inline_certificate_json.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(self.inline_certificate_bytes.len() as u32).to_le_bytes());
         out.extend_from_slice(&self.payload_ref);
         out.extend_from_slice(&self.certificate_ref);
-        out.extend_from_slice(&self.inline_certificate_json);
+        out.extend_from_slice(&self.inline_certificate_bytes);
         out
     }
 

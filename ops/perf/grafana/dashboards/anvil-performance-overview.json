@@ -1,197 +1,301 @@
 {
-  "uid": "anvil-performance-overview",
-  "title": "Anvil Performance Overview",
-  "tags": [
-    "anvil",
-    "performance"
-  ],
-  "timezone": "utc",
-  "schemaVersion": 39,
-  "version": 1,
-  "refresh": "5s",
-  "time": {
-    "from": "now-2h",
-    "to": "now"
-  },
   "panels": [
     {
+      "datasource": {
+        "type": "mysql",
+        "uid": "greptime"
+      },
+      "description": "Request-level latency from the HTTP/gRPC middleware, grouped without high-cardinality ids.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
       "id": 1,
-      "type": "table",
-      "title": "Slowest performance cases",
-      "gridPos": {
-        "x": 0,
-        "y": 0,
-        "w": 12,
-        "h": 8
-      },
-      "datasource": {
-        "type": "mysql",
-        "uid": "greptime"
-      },
+      "options": {},
       "targets": [
         {
-          "refId": "A",
           "datasource": {
             "type": "mysql",
             "uid": "greptime"
           },
           "format": "table",
-          "rawSql": "SELECT `case`, COUNT(*) AS samples, AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms FROM anvil_perf_case GROUP BY `case` ORDER BY max_ms DESC LIMIT 30",
-          "rawQuery": true
+          "rawQuery": true,
+          "rawSql": "SELECT plane, method, status, COUNT(*) AS samples, AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms FROM anvil_request_duration_ms GROUP BY plane, method, status ORDER BY max_ms DESC LIMIT 50",
+          "refId": "A"
         }
       ],
-      "options": {},
-      "description": "High-level test case duration. Start here to see which end-to-end operation is slow."
+      "title": "P50/P95/P99 request latency by plane and method",
+      "type": "table"
     },
     {
-      "id": 2,
-      "type": "table",
-      "title": "Request latency by route",
+      "datasource": {
+        "type": "mysql",
+        "uid": "greptime"
+      },
       "gridPos": {
+        "h": 8,
+        "w": 12,
         "x": 12,
-        "y": 0,
-        "w": 12,
-        "h": 8
+        "y": 0
       },
-      "datasource": {
-        "type": "mysql",
-        "uid": "greptime"
-      },
+      "id": 2,
+      "options": {},
       "targets": [
         {
-          "refId": "A",
           "datasource": {
             "type": "mysql",
             "uid": "greptime"
           },
           "format": "table",
-          "rawSql": "SELECT path, status, COUNT(*) AS requests, AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms FROM anvil_request GROUP BY path, status ORDER BY max_ms DESC LIMIT 30",
-          "rawQuery": true
+          "rawQuery": true,
+          "rawSql": "SELECT plane, status, COUNT(*) AS requests FROM anvil_request_duration_ms GROUP BY plane, status ORDER BY requests DESC",
+          "refId": "A"
         }
       ],
-      "options": {},
-      "description": "Public/admin request latency after route middleware, grouped by route and status."
+      "title": "Request throughput and error rate",
+      "type": "table"
     },
     {
-      "id": 3,
-      "type": "timeseries",
-      "title": "Request latency over time",
-      "gridPos": {
-        "x": 0,
-        "y": 8,
-        "w": 24,
-        "h": 8
-      },
       "datasource": {
         "type": "mysql",
         "uid": "greptime"
       },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "mysql",
-            "uid": "greptime"
-          },
-          "format": "time_series",
-          "rawSql": "SELECT greptime_timestamp AS time, CONCAT(path, ' ', status) AS metric, duration_ms FROM anvil_request ORDER BY greptime_timestamp",
-          "rawQuery": true
-        }
-      ],
-      "options": {},
       "fieldConfig": {
         "defaults": {
           "unit": "ms"
         },
         "overrides": []
-      }
-    },
-    {
-      "id": 4,
-      "type": "table",
-      "title": "CoreStore operation latency",
+      },
       "gridPos": {
-        "x": 0,
-        "y": 16,
-        "w": 12,
-        "h": 8
-      },
-      "datasource": {
-        "type": "mysql",
-        "uid": "greptime"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "mysql",
-            "uid": "greptime"
-          },
-          "format": "table",
-          "rawSql": "SELECT operation, COUNT(*) AS calls, AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms FROM anvil_core_store_op GROUP BY operation ORDER BY max_ms DESC LIMIT 30",
-          "rawQuery": true
-        }
-      ],
-      "options": {},
-      "description": "Top-level CoreStore operations such as put_blob, append_stream, mutation batches, CAS and fences."
-    },
-    {
-      "id": 5,
-      "type": "table",
-      "title": "Internal spans",
-      "gridPos": {
-        "x": 12,
-        "y": 16,
-        "w": 12,
-        "h": 8
-      },
-      "datasource": {
-        "type": "mysql",
-        "uid": "greptime"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "mysql",
-            "uid": "greptime"
-          },
-          "format": "table",
-          "rawSql": "SELECT span, COUNT(*) AS samples, AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms FROM anvil_internal_span GROUP BY span ORDER BY max_ms DESC LIMIT 50",
-          "rawQuery": true
-        }
-      ],
-      "options": {},
-      "description": "Manually emitted internal spans from release/perf gates and focused code paths."
-    },
-    {
-      "id": 6,
-      "type": "table",
-      "title": "File I/O phases by max latency",
-      "gridPos": {
-        "x": 0,
-        "y": 24,
+        "h": 8,
         "w": 24,
-        "h": 8
+        "x": 0,
+        "y": 8
       },
+      "id": 3,
+      "options": {},
+      "targets": [
+        {
+          "datasource": {
+            "type": "mysql",
+            "uid": "greptime"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT greptime_timestamp AS time, CONCAT(plane, ' ', method, ' ', status) AS metric, duration_ms FROM anvil_request_duration_ms ORDER BY greptime_timestamp",
+          "refId": "A"
+        }
+      ],
+      "title": "Request latency over time",
+      "type": "timeseries"
+    },
+    {
       "datasource": {
         "type": "mysql",
         "uid": "greptime"
       },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "id": 4,
+      "options": {},
       "targets": [
         {
-          "refId": "A",
           "datasource": {
             "type": "mysql",
             "uid": "greptime"
           },
           "format": "table",
-          "rawSql": "SELECT component, operation, COUNT(*) AS calls, SUM(bytes) AS bytes, AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms FROM anvil_file_io GROUP BY component, operation ORDER BY max_ms DESC LIMIT 50",
-          "rawQuery": true
+          "rawQuery": true,
+          "rawSql": "SELECT operation_family, writer_family, status, COUNT(*) AS admitted, AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms FROM anvil_admission_duration_ms GROUP BY operation_family, writer_family, status ORDER BY max_ms DESC LIMIT 50",
+          "refId": "A"
         }
       ],
+      "title": "Admitted writes vs materialised writes",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "mysql",
+        "uid": "greptime"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "id": 5,
       "options": {},
-      "description": "Disk operations measured at file-operation level, including write_all, sync_all, rename, reads, lock files and temp payload files."
+      "targets": [
+        {
+          "datasource": {
+            "type": "mysql",
+            "uid": "greptime"
+          },
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT * FROM anvil_rocksdb_pending_bytes ORDER BY greptime_timestamp DESC LIMIT 100",
+          "refId": "A"
+        }
+      ],
+      "title": "Pending CoreMeta bytes, row count, landed-byte backlog",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "mysql",
+        "uid": "greptime"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 24
+      },
+      "id": 6,
+      "options": {},
+      "targets": [
+        {
+          "datasource": {
+            "type": "mysql",
+            "uid": "greptime"
+          },
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT writer_family, bucket, boundary_schema_generation, COUNT(*) AS samples, AVG(duration_ms) AS avg_ms, MAX(duration_ms) AS max_ms FROM anvil_materialisation_lag_ms GROUP BY writer_family, bucket, boundary_schema_generation ORDER BY max_ms DESC LIMIT 50",
+          "refId": "A"
+        }
+      ],
+      "title": "Materialisation lag by writer family",
+      "type": "table"
+    },
+    {
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "greptime"
+          },
+          "format": "time_series",
+          "rawSql": "SELECT ts, value FROM anvil_pending_rows ORDER BY ts DESC LIMIT 1000",
+          "refId": "A"
+        }
+      ],
+      "title": "Pending Row Count",
+      "type": "timeseries"
+    },
+    {
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "greptime"
+          },
+          "format": "time_series",
+          "rawSql": "SELECT ts, value FROM anvil_pending_coremeta_bytes ORDER BY ts DESC LIMIT 1000",
+          "refId": "A"
+        }
+      ],
+      "title": "Pending CoreMeta Bytes",
+      "type": "timeseries"
+    },
+    {
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "greptime"
+          },
+          "format": "time_series",
+          "rawSql": "SELECT ts, value FROM anvil_landed_bytes_backlog ORDER BY ts DESC LIMIT 1000",
+          "refId": "A"
+        }
+      ],
+      "title": "Landed Bytes Backlog",
+      "type": "timeseries"
     }
-  ]
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": [
+    "anvil",
+    "performance"
+  ],
+  "time": {
+    "from": "now-2h",
+    "to": "now"
+  },
+  "timezone": "utc",
+  "title": "Anvil Performance Overview",
+  "uid": "anvil-performance-overview",
+  "version": 1
 }

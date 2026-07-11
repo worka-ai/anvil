@@ -89,6 +89,54 @@ pub fn record_duration(measurement: &str, labels: &[(&str, &str)], duration: Dur
     });
 }
 
+pub fn record_histogram_duration_ms(
+    measurement: &str,
+    labels: &[(&str, &str)],
+    duration: Duration,
+) {
+    record_duration(measurement, labels, duration);
+}
+
+pub fn record_request_duration(
+    plane: &str,
+    method: &str,
+    path: &str,
+    status: &str,
+    tenant_present: bool,
+    request_id_sampled: bool,
+    duration: Duration,
+) {
+    record_histogram_duration_ms(
+        "anvil_request_duration_ms",
+        &[
+            ("plane", plane),
+            ("method", method),
+            ("path", path),
+            ("status", status),
+            ("tenant_present", bool_label(tenant_present)),
+            ("request_id_sampled", bool_label(request_id_sampled)),
+        ],
+        duration,
+    );
+}
+
+pub fn record_fsync_duration(
+    component: &str,
+    file_class: &str,
+    operation: &str,
+    duration: Duration,
+) {
+    record_histogram_duration_ms(
+        "anvil_fsync_duration_ms",
+        &[
+            ("component", component),
+            ("file_class", file_class),
+            ("operation", operation),
+        ],
+        duration,
+    );
+}
+
 pub fn record_io_duration(
     component: &str,
     operation: &str,
@@ -115,6 +163,58 @@ pub fn record_io_duration(
                 "duration_ms".to_string(),
                 PerfField::F64(duration.as_secs_f64() * 1000.0),
             ),
+            ("bytes".to_string(), PerfField::U64(bytes)),
+        ],
+        timestamp_ns: unix_timestamp_nanos(),
+    });
+}
+
+pub fn record_coremeta_duration(
+    operation: &str,
+    cf: &str,
+    table_id: u16,
+    row_count: u64,
+    bytes: u64,
+    duration: Duration,
+) {
+    if !enabled() {
+        return;
+    }
+    if matches!(
+        operation,
+        "put" | "delete" | "write_batch" | "write_encoded_rows"
+    ) {
+        record_histogram_duration_ms(
+            "anvil_rocksdb_write_batch_duration_ms",
+            &[
+                ("node_id", "local"),
+                (
+                    "column_family_group",
+                    if cf == "multi" { "multi" } else { cf },
+                ),
+                ("fsync_mode", "wal-sync"),
+                ("status", "ok"),
+            ],
+            duration,
+        );
+    }
+    emit(PerfEvent {
+        measurement: "anvil_coremeta_io".to_string(),
+        labels: vec![
+            ("operation".to_string(), operation.to_string()),
+            ("column_family".to_string(), cf.to_string()),
+            ("table_id".to_string(), format!("0x{table_id:04x}")),
+        ],
+        fields: vec![
+            (
+                "duration_nanos".to_string(),
+                PerfField::U128(duration.as_nanos()),
+            ),
+            (
+                "duration_ms".to_string(),
+                PerfField::F64(duration.as_secs_f64() * 1000.0),
+            ),
+            ("row_count".to_string(), PerfField::U64(row_count)),
             ("bytes".to_string(), PerfField::U64(bytes)),
         ],
         timestamp_ns: unix_timestamp_nanos(),
@@ -151,6 +251,21 @@ pub fn record_gauge(measurement: &str, labels: &[(&str, &str)], value: i64) {
     });
 }
 
+pub fn record_float_gauge(measurement: &str, labels: &[(&str, &str)], value: f64) {
+    if !enabled() {
+        return;
+    }
+    emit(PerfEvent {
+        measurement: measurement.to_string(),
+        labels: labels
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect(),
+        fields: vec![("value".to_string(), PerfField::F64(value))],
+        timestamp_ns: unix_timestamp_nanos(),
+    });
+}
+
 pub fn record_text(measurement: &str, labels: &[(&str, &str)], field: &str, value: &str) {
     if !enabled() {
         return;
@@ -159,11 +274,509 @@ pub fn record_text(measurement: &str, labels: &[(&str, &str)], field: &str, valu
         measurement: measurement.to_string(),
         labels: labels
             .iter()
-            .map(|(key, value)| ((*key).to_string(), ((*value).to_string())))
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect(),
         fields: vec![(field.to_string(), PerfField::Str(value.to_string()))],
         timestamp_ns: unix_timestamp_nanos(),
     });
+}
+
+pub fn write_non_authoritative_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
+}
+
+pub fn record_bytes_counter(measurement: &str, labels: &[(&str, &str)], bytes: u64) {
+    if !enabled() {
+        return;
+    }
+    emit(PerfEvent {
+        measurement: measurement.to_string(),
+        labels: labels
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect(),
+        fields: vec![("bytes".to_string(), PerfField::U64(bytes))],
+        timestamp_ns: unix_timestamp_nanos(),
+    });
+}
+
+pub fn record_materialisation_lag_ms(writer_family: &str, lag_ms: u64) {
+    let labels = &[("writer_family", writer_family)];
+    record_gauge(
+        "anvil_materialisation_lag_ms",
+        labels,
+        lag_ms.min(i64::MAX as u64) as i64,
+    );
+    record_histogram_duration_ms(
+        "anvil_materialisation_lag_ms",
+        labels,
+        Duration::from_millis(lag_ms),
+    );
+}
+
+pub fn record_pending_state(
+    node_id: &str,
+    writer_family: &str,
+    pending_rows: u64,
+    pending_coremeta_bytes: u64,
+    landed_bytes: u64,
+) {
+    record_gauge(
+        "anvil_pending_rows",
+        &[("node_id", node_id), ("writer_family", writer_family)],
+        pending_rows.min(i64::MAX as u64) as i64,
+    );
+    record_gauge(
+        "anvil_pending_coremeta_bytes",
+        &[("node_id", node_id), ("writer_family", writer_family)],
+        pending_coremeta_bytes.min(i64::MAX as u64) as i64,
+    );
+    record_gauge(
+        "anvil_landed_bytes_backlog",
+        &[("node_id", node_id), ("writer_family", writer_family)],
+        landed_bytes.min(i64::MAX as u64) as i64,
+    );
+}
+
+pub fn record_byte_pipeline_stage_duration(
+    stage: &str,
+    writer_family: &str,
+    erasure_profile: &str,
+    bytes_in: u64,
+    bytes_out: u64,
+    duration: Duration,
+) {
+    if !enabled() {
+        return;
+    }
+    emit(PerfEvent {
+        measurement: "anvil_byte_pipeline_stage_duration_ms".to_string(),
+        labels: vec![
+            ("stage".to_string(), stage.to_string()),
+            ("writer_family".to_string(), writer_family.to_string()),
+            ("erasure_profile".to_string(), erasure_profile.to_string()),
+        ],
+        fields: vec![
+            (
+                "duration_nanos".to_string(),
+                PerfField::U128(duration.as_nanos()),
+            ),
+            (
+                "duration_ms".to_string(),
+                PerfField::F64(duration.as_secs_f64() * 1000.0),
+            ),
+            ("bytes_in".to_string(), PerfField::U64(bytes_in)),
+            ("bytes_out".to_string(), PerfField::U64(bytes_out)),
+        ],
+        timestamp_ns: unix_timestamp_nanos(),
+    });
+}
+
+pub fn record_dedupe_hit_ratio(writer_family: &str, erasure_profile: &str, ratio: f64) {
+    record_float_gauge(
+        "anvil_dedupe_hit_ratio",
+        &[
+            ("writer_family", writer_family),
+            ("erasure_profile", erasure_profile),
+        ],
+        ratio.clamp(0.0, 1.0),
+    );
+}
+
+pub fn record_compression_ratio(
+    writer_family: &str,
+    compression: &str,
+    erasure_profile: &str,
+    uncompressed_bytes: u64,
+    stored_bytes: u64,
+) {
+    let ratio = if uncompressed_bytes == 0 {
+        1.0
+    } else {
+        stored_bytes as f64 / uncompressed_bytes as f64
+    };
+    record_float_gauge(
+        "anvil_compression_ratio",
+        &[
+            ("writer_family", writer_family),
+            ("compression", compression),
+            ("erasure_profile", erasure_profile),
+        ],
+        ratio,
+    );
+}
+
+pub fn record_erasure_reconstruction_total(erasure_profile: &str, status: &str) {
+    record_counter(
+        "anvil_erasure_reconstruction_total",
+        &[("erasure_profile", erasure_profile), ("status", status)],
+        1,
+    );
+}
+
+pub fn record_query_plan_duration(
+    query_kind: &str,
+    index_kind: &str,
+    status: &str,
+    ranges_read: u64,
+    duration: Duration,
+) {
+    if !enabled() {
+        return;
+    }
+    emit(PerfEvent {
+        measurement: "anvil_query_plan_duration_ms".to_string(),
+        labels: vec![
+            ("query_kind".to_string(), query_kind.to_string()),
+            ("index_kind".to_string(), index_kind.to_string()),
+            ("status".to_string(), status.to_string()),
+        ],
+        fields: vec![
+            (
+                "duration_nanos".to_string(),
+                PerfField::U128(duration.as_nanos()),
+            ),
+            (
+                "duration_ms".to_string(),
+                PerfField::F64(duration.as_secs_f64() * 1000.0),
+            ),
+            ("ranges_read".to_string(), PerfField::U64(ranges_read)),
+        ],
+        timestamp_ns: unix_timestamp_nanos(),
+    });
+}
+
+pub fn record_query_prune_ratio(
+    measurement: &str,
+    query_kind: &str,
+    index_kind: &str,
+    before: u64,
+    after: u64,
+) {
+    let ratio = if before == 0 {
+        0.0
+    } else {
+        1.0 - (after.min(before) as f64 / before as f64)
+    };
+    record_float_gauge(
+        measurement,
+        &[("query_kind", query_kind), ("index_kind", index_kind)],
+        ratio.clamp(0.0, 1.0),
+    );
+}
+
+pub fn record_authz_candidate_prune_ratio(
+    query_kind: &str,
+    index_kind: &str,
+    before: u64,
+    after: u64,
+) {
+    record_query_prune_ratio(
+        "anvil_authz_candidate_prune_ratio",
+        query_kind,
+        index_kind,
+        before,
+        after,
+    );
+}
+
+pub fn record_boundary_prune_ratio(query_kind: &str, index_kind: &str, before: u64, after: u64) {
+    record_query_prune_ratio(
+        "anvil_boundary_prune_ratio",
+        query_kind,
+        index_kind,
+        before,
+        after,
+    );
+}
+
+pub fn record_query_ranges_read_total(query_kind: &str, index_kind: &str, ranges: u64) {
+    record_counter(
+        "anvil_query_ranges_read_total",
+        &[("query_kind", query_kind), ("index_kind", index_kind)],
+        ranges,
+    );
+}
+
+pub fn record_compaction_duration(
+    compaction_kind: &str,
+    writer_family: &str,
+    status: &str,
+    bytes_rewritten: u64,
+    duration: Duration,
+) {
+    record_histogram_duration_ms(
+        "anvil_compaction_duration_ms",
+        &[
+            ("compaction_kind", compaction_kind),
+            ("writer_family", writer_family),
+            ("status", status),
+        ],
+        duration,
+    );
+    record_bytes_counter(
+        "anvil_compaction_bytes_rewritten_total",
+        &[
+            ("compaction_kind", compaction_kind),
+            ("writer_family", writer_family),
+        ],
+        bytes_rewritten,
+    );
+}
+
+pub fn record_repair_duration(
+    repair_kind: &str,
+    writer_family: &str,
+    status: &str,
+    duration: Duration,
+) {
+    record_histogram_duration_ms(
+        "anvil_repair_duration_ms",
+        &[
+            ("repair_kind", repair_kind),
+            ("writer_family", writer_family),
+            ("status", status),
+        ],
+        duration,
+    );
+}
+
+pub fn record_recovery_duration(recovery_kind: &str, status: &str, duration: Duration) {
+    record_histogram_duration_ms(
+        "anvil_recovery_duration_ms",
+        &[("recovery_kind", recovery_kind), ("status", status)],
+        duration,
+    );
+}
+
+pub fn record_coremeta_replication_duration(
+    phase: &str,
+    profile: &str,
+    quorum_outcome: &str,
+    duration: Duration,
+) {
+    record_histogram_duration_ms(
+        "anvil_coremeta_replication_duration_ms",
+        &[
+            ("phase", phase),
+            ("profile", profile),
+            ("quorum_outcome", quorum_outcome),
+        ],
+        duration,
+    );
+}
+
+pub fn record_coremeta_quorum_total(phase: &str, profile: &str, outcome: &str) {
+    record_counter(
+        "anvil_coremeta_quorum_total",
+        &[("phase", phase), ("profile", profile), ("outcome", outcome)],
+        1,
+    );
+}
+
+pub fn record_root_register_cas_duration(
+    operation: &str,
+    profile: &str,
+    outcome: &str,
+    duration: Duration,
+) {
+    record_histogram_duration_ms(
+        "anvil_root_register_cas_duration_ms",
+        &[
+            ("operation", operation),
+            ("profile", profile),
+            ("outcome", outcome),
+        ],
+        duration,
+    );
+}
+
+pub fn record_root_generation_in_doubt(root_kind: &str, partition_id: u64) {
+    let partition = partition_id.to_string();
+    record_counter(
+        "anvil_root_generation_in_doubt_total",
+        &[("root_kind", root_kind), ("partition_id", &partition)],
+        1,
+    );
+}
+
+pub fn record_partition_failover_duration(
+    region_id: &str,
+    cell_id: &str,
+    status: &str,
+    duration: Duration,
+) {
+    record_histogram_duration_ms(
+        "anvil_partition_failover_duration_ms",
+        &[
+            ("region_id", region_id),
+            ("cell_id", cell_id),
+            ("status", status),
+        ],
+        duration,
+    );
+}
+
+pub fn record_failover_vote_total(decision: &str, reason: &str) {
+    record_counter(
+        "anvil_failover_vote_total",
+        &[("decision", decision), ("reason", reason)],
+        1,
+    );
+}
+
+pub fn record_anti_entropy_findings_total(
+    finding_kind: &str,
+    writer_family: &str,
+    severity: &str,
+    count: u64,
+) {
+    record_counter(
+        "anvil_anti_entropy_findings_total",
+        &[
+            ("finding_kind", finding_kind),
+            ("writer_family", writer_family),
+            ("severity", severity),
+        ],
+        count,
+    );
+}
+
+pub fn record_repair_queue_depth(repair_kind: &str, region_id: &str, cell_id: &str, depth: u64) {
+    record_gauge(
+        "anvil_repair_queue_depth",
+        &[
+            ("repair_kind", repair_kind),
+            ("region_id", region_id),
+            ("cell_id", cell_id),
+        ],
+        depth.min(i64::MAX as u64) as i64,
+    );
+}
+
+pub fn record_tombstone_debt(writer_family: &str, debt: u64) {
+    record_gauge(
+        "anvil_tombstone_debt",
+        &[("writer_family", writer_family)],
+        debt.min(i64::MAX as u64) as i64,
+    );
+}
+
+pub fn record_protocol_errors_total(operation: &str, code: &str) {
+    record_counter(
+        "anvil_protocol_errors_total",
+        &[("operation", operation), ("code", code)],
+        1,
+    );
+}
+
+#[derive(Debug, Clone)]
+pub struct TraceEvent<'a> {
+    pub trace_id: &'a str,
+    pub span_id: &'a str,
+    pub parent_span_id: Option<&'a str>,
+    pub request_id: Option<&'a str>,
+    pub component: &'a str,
+    pub operation: &'a str,
+    pub writer_family: Option<&'a str>,
+    pub bucket_hash: Option<&'a str>,
+    pub boundary_schema_generation: Option<u64>,
+    pub duration: Duration,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub fsync_count: u64,
+    pub status: &'a str,
+}
+
+pub const TRACE_OPERATION_NAMES: &[&str] = &[
+    "api.request",
+    "admission.validate",
+    "admission.boundary_extract",
+    "admission.landed_write",
+    "admission.landed_fsync",
+    "admission.rocksdb_write_batch",
+    "admission.rocksdb_fsync",
+    "admission.commit_evidence_write_batch",
+    "coremeta.replicate_pending",
+    "coremeta.persist_commit_certificate",
+    "coremeta.quorum_wait",
+    "failover.vote_grant",
+    "failover.vote_reject",
+    "failover.in_doubt",
+    "materialiser.plan",
+    "writer.build",
+    "byte_pipeline.chunk",
+    "byte_pipeline.dedupe",
+    "byte_pipeline.compress",
+    "byte_pipeline.encrypt",
+    "byte_pipeline.erasure_encode",
+    "placement.plan",
+    "block.shard_write",
+    "block.shard_fsync",
+    "root_register.cas_read",
+    "root_register.cas_write",
+    "root_register.quorum_wait",
+    "root_register.failover_vote",
+    "root_register.failover_publish",
+    "manifest.publish",
+    "query.plan",
+    "query.authz_prune",
+    "query.boundary_prune",
+    "erasure.range_read",
+    "erasure.decode",
+    "repair.enqueue",
+    "repair.reconstruct",
+    "anti_entropy.scan",
+    "response.stream",
+];
+
+pub fn record_trace_event(event: TraceEvent<'_>) {
+    if !enabled() {
+        return;
+    }
+    let mut labels = vec![
+        ("schema".to_string(), "anvil.trace_event.v1".to_string()),
+        ("trace_id".to_string(), event.trace_id.to_string()),
+        ("span_id".to_string(), event.span_id.to_string()),
+        ("component".to_string(), event.component.to_string()),
+        ("operation".to_string(), event.operation.to_string()),
+        ("status".to_string(), event.status.to_string()),
+    ];
+    push_optional_label(&mut labels, "parent_span_id", event.parent_span_id);
+    push_optional_label(&mut labels, "request_id", event.request_id);
+    push_optional_label(&mut labels, "writer_family", event.writer_family);
+    push_optional_label(&mut labels, "bucket_hash", event.bucket_hash);
+    let mut fields = vec![
+        (
+            "duration_micros".to_string(),
+            PerfField::U128(event.duration.as_micros()),
+        ),
+        ("bytes_in".to_string(), PerfField::U64(event.bytes_in)),
+        ("bytes_out".to_string(), PerfField::U64(event.bytes_out)),
+        ("fsync_count".to_string(), PerfField::U64(event.fsync_count)),
+    ];
+    if let Some(generation) = event.boundary_schema_generation {
+        fields.push((
+            "boundary_schema_generation".to_string(),
+            PerfField::U64(generation),
+        ));
+    }
+    emit(PerfEvent {
+        measurement: "anvil_trace_event".to_string(),
+        labels,
+        fields,
+        timestamp_ns: unix_timestamp_nanos(),
+    });
+}
+
+fn push_optional_label(labels: &mut Vec<(String, String)>, key: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        labels.push((key.to_string(), value.to_string()));
+    }
+}
+
+fn bool_label(value: bool) -> &'static str {
+    if value { "true" } else { "false" }
 }
 
 pub async fn flush() {
