@@ -25,27 +25,33 @@ fn proxy_header(name: &str, value: impl AsRef<[u8]>) -> ProxyHeader {
     }
 }
 
+fn proxy_authz_context(claims: &Claims) -> Vec<u8> {
+    anvil::services::internal_proxy::encode_proxy_authz_context(claims).unwrap()
+}
+
+async fn seeded_test_app_claims(cluster: &TestCluster, jti: Option<&str>) -> Claims {
+    let app = cluster.states[0]
+        .persistence
+        .get_app_by_client_id("test-app")
+        .await
+        .unwrap()
+        .expect("test-app is seeded before cluster start");
+    Claims {
+        sub: app.id.to_string(),
+        exp: usize::MAX,
+        tenant_id: app.tenant_id,
+        jti: jti.map(ToOwned::to_owned),
+    }
+}
+
 #[tokio::test]
 async fn internal_proxy_put_and_get_preserve_original_principal_authority() {
     let mut cluster = TestCluster::new(&["eu-west-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
     cluster.create_bucket("proxy-bucket", "eu-west-1").await;
 
-    let original_claims = Claims {
-        sub: "test-app".to_string(),
-        exp: usize::MAX,
-        scopes: vec!["*|*".to_string()],
-        tenant_id: 1,
-        jti: Some("original-jti".to_string()),
-    };
-    let internal_token = cluster.states[0]
-        .jwt_manager
-        .mint_token(
-            "internal".to_string(),
-            vec!["internal:proxy_object|*".to_string()],
-            0,
-        )
-        .unwrap();
+    let original_claims = seeded_test_app_claims(&cluster, Some("original-jti")).await;
+    let internal_token = cluster.admin_token();
 
     let mut proxy_client = InternalProxyServiceClient::connect(cluster.grpc_addrs[0].clone())
         .await
@@ -62,7 +68,7 @@ async fn internal_proxy_put_and_get_preserve_original_principal_authority() {
         canonical_path: "/via-proxy.txt".to_string(),
         bucket_locator_generation: 1,
         headers: vec![proxy_header("content-type", "text/plain")],
-        authz_context: serde_json::to_vec(&original_claims).unwrap(),
+        authz_context: proxy_authz_context(&original_claims),
     };
     let put_stream = iter(vec![
         ProxyRequestChunk {
@@ -103,7 +109,7 @@ async fn internal_proxy_put_and_get_preserve_original_principal_authority() {
         canonical_path: "/via-proxy.txt".to_string(),
         bucket_locator_generation: 1,
         headers: vec![],
-        authz_context: serde_json::to_vec(&original_claims).unwrap(),
+        authz_context: proxy_authz_context(&original_claims),
     };
     let get_stream = iter(vec![ProxyRequestChunk {
         part: Some(proxy_request_chunk::Part::Header(get_header)),
@@ -149,6 +155,8 @@ async fn internal_proxy_put_and_get_preserve_original_principal_authority() {
                 object_key: "via-proxy.txt".to_string(),
                 version_id: None,
                 range: None,
+
+                ..Default::default()
             }),
             &cluster.token,
         ))
@@ -174,21 +182,8 @@ async fn internal_proxy_rejects_mismatched_original_principal() {
         .create_bucket("proxy-auth-bucket", "eu-west-1")
         .await;
 
-    let original_claims = Claims {
-        sub: "test-app".to_string(),
-        exp: usize::MAX,
-        scopes: vec!["*|*".to_string()],
-        tenant_id: 1,
-        jti: None,
-    };
-    let internal_token = cluster.states[0]
-        .jwt_manager
-        .mint_token(
-            "internal".to_string(),
-            vec!["internal:proxy_object|*".to_string()],
-            0,
-        )
-        .unwrap();
+    let original_claims = seeded_test_app_claims(&cluster, None).await;
+    let internal_token = cluster.admin_token();
 
     let mut proxy_client = InternalProxyServiceClient::connect(cluster.grpc_addrs[0].clone())
         .await
@@ -205,7 +200,7 @@ async fn internal_proxy_rejects_mismatched_original_principal() {
         canonical_path: "/missing.txt".to_string(),
         bucket_locator_generation: 1,
         headers: vec![],
-        authz_context: serde_json::to_vec(&original_claims).unwrap(),
+        authz_context: proxy_authz_context(&original_claims),
     };
     let err = proxy_client
         .proxy_object(with_bearer(
@@ -213,6 +208,48 @@ async fn internal_proxy_rejects_mismatched_original_principal() {
                 part: Some(proxy_request_chunk::Part::Header(get_header)),
             }])),
             &internal_token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+}
+#[tokio::test]
+async fn internal_proxy_rejects_magic_internal_principal_without_system_realm_authority() {
+    let mut cluster = TestCluster::new(&["eu-west-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(10)).await;
+    cluster
+        .create_bucket("proxy-no-magic-bucket", "eu-west-1")
+        .await;
+
+    let original_claims = seeded_test_app_claims(&cluster, None).await;
+    let unauthorised_internal_token = cluster.states[0]
+        .jwt_manager
+        .mint_token("internal".to_string(), 0)
+        .unwrap();
+
+    let mut proxy_client = InternalProxyServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let get_header = ProxyRequestHeader {
+        request_id: "proxy-no-magic".to_string(),
+        idempotency_key: "".to_string(),
+        principal_id: original_claims.sub.clone(),
+        tenant_id: original_claims.tenant_id.to_string(),
+        bucket_name: "proxy-no-magic-bucket".to_string(),
+        object_key: "missing.txt".to_string(),
+        method: "GET".to_string(),
+        canonical_host: "proxy-no-magic-bucket.tenant.eu-west-1.anvil-storage.test".to_string(),
+        canonical_path: "/missing.txt".to_string(),
+        bucket_locator_generation: 1,
+        headers: vec![],
+        authz_context: proxy_authz_context(&original_claims),
+    };
+    let err = proxy_client
+        .proxy_object(with_bearer(
+            tonic::Request::new(iter(vec![ProxyRequestChunk {
+                part: Some(proxy_request_chunk::Part::Header(get_header)),
+            }])),
+            &unauthorised_internal_token,
         ))
         .await
         .unwrap_err();

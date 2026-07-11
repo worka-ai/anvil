@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anvil::anvil_api::GetAccessTokenRequest;
 use anvil::anvil_api::admin_service_client::AdminServiceClient;
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
-use anvil_core::AppState;
+use anvil_core::{AppState, access_control};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::Credentials;
@@ -63,7 +63,6 @@ pub async fn get_auth_token(_admin_state_path: &str, grpc_addr: &str) -> String 
         .get_access_token(GetAccessTokenRequest {
             client_id: "test-app".to_string(),
             client_secret: "test-secret".to_string(),
-            scopes: vec!["*|*".to_string()],
         })
         .await
         .unwrap()
@@ -82,6 +81,7 @@ pub struct TestCluster {
     pub admin_state_path: String,
     pub config: Arc<anvil_core::config::Config>,
     pub storage_path: PathBuf,
+    cleanup_path: PathBuf,
     _cluster_permit: OwnedSemaphorePermit,
 }
 
@@ -96,6 +96,8 @@ impl TestCluster {
         let mut create_req = tonic::Request::new(anvil::anvil_api::CreateBucketRequest {
             bucket_name: bucket_name.to_string(),
             region: region.to_string(),
+
+            options: None,
         });
         create_req.metadata_mut().insert(
             "authorization",
@@ -124,7 +126,7 @@ impl TestCluster {
                 .try_init();
         });
 
-        let storage_path =
+        let cluster_storage_root =
             std::env::temp_dir().join(format!("anvil-test-storage-{}", uuid::Uuid::new_v4()));
         let mut config = anvil_core::config::Config {
             cluster_secret: Some("test-cluster-secret".to_string()),
@@ -133,16 +135,22 @@ impl TestCluster {
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             cluster_listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".to_string(),
             public_cluster_addrs: vec![],
+            corestore_internal_bearer_token: "test-corestore-internal-token".to_string(),
             metadata_cache_ttl_secs: 1,
             public_api_addr: "127.0.0.1:0".to_string(),
             api_listen_addr: "127.0.0.1:0".to_string(),
+            mesh_id: "test-mesh".to_string(),
             region: "".to_string(),
+            cell_id: "test-cell-1".to_string(),
             bootstrap_system_admin_subject_kind: "app".to_string(),
             bootstrap_system_admin_subject_id: "admin-principal".to_string(),
             bootstrap_addrs: vec![],
             init_cluster: false,
             enable_mdns: false,
-            storage_path: storage_path.to_string_lossy().into_owned(),
+            storage_path: cluster_storage_root
+                .join("template")
+                .to_string_lossy()
+                .into_owned(),
             personaldb_snapshot_entry_threshold: 1024,
             personaldb_snapshot_payload_bytes_threshold: 64 * 1024 * 1024,
             allow_test_only_embedding_provider: true,
@@ -152,21 +160,16 @@ impl TestCluster {
         let config = Arc::new(config);
 
         let unique_regions: HashSet<String> = regions.iter().map(|s| s.to_string()).collect();
-        let admin_state_path = storage_path.clone();
+        let first_region = regions.first().copied().unwrap_or("default");
+        let admin_state_path = cluster_storage_root.join(format!("node-000-{first_region}"));
         let mut states = Vec::new();
         for (node_index, region_name) in regions.iter().enumerate() {
             let mut node_config = config.deref().clone();
-            node_config.region = region_name.to_string();
+            node_config.region = (*region_name).to_string();
+            node_config.cell_id = format!("test-cell-{}", node_index + 1);
             node_config.metadata_cache_ttl_secs = 1;
-            node_config.storage_path = storage_path.to_string_lossy().into_owned();
-            node_config.node_id_path = storage_path
-                .join(format!("node-{region_name}-{node_index}.id"))
-                .to_string_lossy()
-                .into_owned();
-            node_config.cluster_keypair_path = storage_path
-                .join(format!(
-                    "node-{region_name}-{node_index}.cluster-keypair.pb"
-                ))
+            node_config.storage_path = cluster_storage_root
+                .join(format!("node-{node_index:03}-{region_name}"))
                 .to_string_lossy()
                 .into_owned();
             let state = AppState::new(node_config, None).await.unwrap();
@@ -198,11 +201,15 @@ impl TestCluster {
                     .create_app(tenant.id, "test-app", "test-app", &encrypted_secret)
                     .await
                     .unwrap();
-                state
-                    .persistence
-                    .grant_policy(app.id, "*", "*")
-                    .await
-                    .unwrap();
+                access_control::grant_storage_tenant_owner(
+                    &state.persistence,
+                    tenant.id,
+                    &app.id.to_string(),
+                    "test-cluster",
+                    "grant test app ownership of its storage tenant",
+                )
+                .await
+                .unwrap();
             }
             states.push(state);
         }
@@ -211,6 +218,7 @@ impl TestCluster {
                 state.persistence.create_region(&region).await.unwrap();
             }
         }
+        install_canonical_coremeta_bootstrap_snapshot(&states);
 
         Self {
             nodes: Vec::new(),
@@ -220,7 +228,8 @@ impl TestCluster {
             token: String::new(),
             admin_state_path: admin_state_path.to_string_lossy().into_owned(),
             config,
-            storage_path,
+            storage_path: admin_state_path,
+            cleanup_path: cluster_storage_root,
             _cluster_permit: cluster_permit,
         }
     }
@@ -284,20 +293,54 @@ impl TestCluster {
         );
 
         let node_spawn_start = Instant::now();
-        for i in 0..self.states.len() {
-            let mut state = self.states[i].clone();
-            let swarm = swarms.remove(0);
+        let peer_ids = swarms
+            .iter()
+            .map(|swarm| swarm.local_peer_id().to_string())
+            .collect::<Vec<_>>();
+        let mut listeners = Vec::new();
+        let mut admin_listeners = Vec::new();
+        for _ in 0..self.states.len() {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let admin_addr = admin_listener.local_addr().unwrap();
             self.grpc_addrs.push(format!("http://{}", addr));
             self.admin_addrs.push(format!("http://{}", admin_addr));
+            listeners.push(listener);
+            admin_listeners.push(admin_listener);
+        }
 
-            let cfg = &state.config.deref();
-            let mut cfg = anvil_core::config::Config::from_ref(cfg);
-            cfg.public_api_addr = format!("http://{}", addr);
-            state.config = Arc::new(cfg);
+        for i in 0..self.states.len() {
+            let mut cfg = anvil_core::config::Config::from_ref(self.states[i].config.deref());
+            cfg.public_api_addr = self.grpc_addrs[i].clone();
+            cfg.corestore_internal_bearer_token = self.states[i]
+                .jwt_manager
+                .mint_token("admin-principal".to_string(), 0)
+                .unwrap();
+            self.states[i].config = Arc::new(cfg.clone());
+            self.states[i].core_store =
+                anvil_core::core_store::CoreStore::new_with_pipeline_keyring_and_identity(
+                    self.states[i].storage.clone(),
+                    cfg.core_pipeline_keyring().unwrap(),
+                    anvil_core::core_store::CoreStoreNodeIdentity {
+                        mesh_id: cfg.mesh_id.clone(),
+                        node_id: cfg.node_id.clone(),
+                        region_id: cfg.region.clone(),
+                        cell_id: cfg.cell_id.clone(),
+                        public_api_addr: cfg.public_api_addr.clone(),
+                        internal_bearer_token: (!cfg.corestore_internal_bearer_token.is_empty())
+                            .then_some(cfg.corestore_internal_bearer_token.clone()),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        for i in 0..self.states.len() {
+            let state = self.states[i].clone();
+            let swarm = swarms.remove(0);
+            let listener = listeners.remove(0);
+            let admin_listener = admin_listeners.remove(0);
 
             let handle = tokio::spawn(async move {
                 let (_tx, rx) = tokio::sync::mpsc::channel(1);
@@ -320,9 +363,15 @@ impl TestCluster {
 
         let token_start = Instant::now();
         if get_new_token {
+            let test_app = self.states[0]
+                .persistence
+                .get_app_by_client_id("test-app")
+                .await
+                .unwrap()
+                .expect("test-app is seeded before cluster start");
             self.token = self.states[0]
                 .jwt_manager
-                .mint_token("test-app".to_string(), vec!["*|*".to_string()], 1)
+                .mint_token(test_app.id.to_string(), test_app.tenant_id)
                 .unwrap();
         }
         emit_test_timing(
@@ -363,6 +412,13 @@ impl TestCluster {
                     format!("start_and_converge port_ready nodes={node_count}"),
                     port_start.elapsed(),
                 );
+                let lifecycle_seed_start = Instant::now();
+                self.seed_corestore_mesh_lifecycle(&peer_ids, &listen_addrs)
+                    .await;
+                emit_test_timing(
+                    format!("start_and_converge mesh_lifecycle_seed nodes={node_count}"),
+                    lifecycle_seed_start.elapsed(),
+                );
                 let stabilization_start = Instant::now();
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 emit_test_timing(
@@ -377,6 +433,88 @@ impl TestCluster {
             }
         }
         panic!("Cluster did not converge in time");
+    }
+
+    async fn seed_corestore_mesh_lifecycle(
+        &self,
+        peer_ids: &[String],
+        listen_addrs: &[libp2p::Multiaddr],
+    ) {
+        let mut seen_regions = BTreeSet::new();
+        let mut regions = Vec::new();
+        let mut seen_cells = BTreeSet::new();
+        let mut cells = Vec::new();
+        let mut nodes = Vec::new();
+
+        for (index, source) in self.states.iter().enumerate() {
+            if seen_regions.insert(source.config.region.clone()) {
+                regions.push(anvil_core::mesh_lifecycle::CreateRegionDescriptor {
+                    mesh_id: source.config.mesh_id.clone(),
+                    region: source.config.region.clone(),
+                    public_base_url: source.config.public_api_addr.clone(),
+                    virtual_host_suffix: format!("{}.test.anvil.local", source.config.region),
+                    placement_weight: 100,
+                    default_cell: Some(source.config.cell_id.clone()),
+                });
+            }
+
+            let cell_key = format!("{}/{}", source.config.region, source.config.cell_id);
+            if seen_cells.insert(cell_key) {
+                cells.push(anvil_core::mesh_lifecycle::RegisterCellDescriptor {
+                    mesh_id: source.config.mesh_id.clone(),
+                    region: source.config.region.clone(),
+                    cell_id: source.config.cell_id.clone(),
+                    placement_weight: 100,
+                    failure_domain: source.config.cell_id.clone(),
+                });
+            }
+
+            nodes.push(anvil_core::mesh_lifecycle::RegisterNodeDescriptor {
+                mesh_id: source.config.mesh_id.clone(),
+                node_id: source.config.node_id.clone(),
+                region: source.config.region.clone(),
+                cell_id: source.config.cell_id.clone(),
+                libp2p_peer_id: peer_ids[index].clone(),
+                receipt_signing_public_key_proto: source
+                    .core_store
+                    .local_receipt_signing_public_key_proto(),
+                public_api_addr: source.config.public_api_addr.clone(),
+                public_cluster_addrs: vec![listen_addrs[index].to_string()],
+                capabilities: vec![
+                    anvil_core::mesh_lifecycle::NodeCapability::Object,
+                    anvil_core::mesh_lifecycle::NodeCapability::Index,
+                    anvil_core::mesh_lifecycle::NodeCapability::PersonalDb,
+                    anvil_core::mesh_lifecycle::NodeCapability::Metadata,
+                    anvil_core::mesh_lifecycle::NodeCapability::Gateway,
+                    anvil_core::mesh_lifecycle::NodeCapability::Admin,
+                ],
+                capacity_json: "{}".to_string(),
+            });
+        }
+
+        let projection = anvil_core::mesh_lifecycle::BootstrapMeshLifecycleProjection {
+            regions,
+            cells,
+            nodes,
+        };
+
+        for target in &self.states {
+            for source in &self.states {
+                target
+                    .core_store
+                    .register_node_receipt_signing_public_key(
+                        &source.config.node_id,
+                        &source.core_store.local_receipt_signing_public_key_proto(),
+                    )
+                    .unwrap();
+            }
+            anvil_core::mesh_lifecycle::install_bootstrap_lifecycle_projection(
+                &target.storage,
+                &target.core_store,
+                projection.clone(),
+            )
+            .unwrap();
+        }
     }
 
     #[allow(unused)]
@@ -410,7 +548,7 @@ impl TestCluster {
     pub fn admin_token(&self) -> String {
         self.states[0]
             .jwt_manager
-            .mint_token("admin-principal".to_string(), Vec::new(), 0)
+            .mint_token("admin-principal".to_string(), 0)
             .unwrap()
     }
 
@@ -506,6 +644,36 @@ impl TestCluster {
             .await;
         credentials
     }
+
+    pub async fn create_application_with_storage_tenant_owner(
+        &self,
+        tenant_ref: &str,
+        app_name: &str,
+    ) -> (String, String) {
+        let (app_id, client_id, client_secret) =
+            self.create_application_with_id(tenant_ref, app_name).await;
+        let tenant_id = if let Ok(tenant_id) = tenant_ref.parse::<i64>() {
+            tenant_id
+        } else {
+            self.states[0]
+                .persistence
+                .get_tenant_by_name(tenant_ref)
+                .await
+                .unwrap()
+                .expect("tenant exists")
+                .id
+        };
+        access_control::grant_storage_tenant_owner(
+            &self.states[0].persistence,
+            tenant_id,
+            &app_id,
+            "test-admin",
+            "test grant storage tenant owner",
+        )
+        .await
+        .unwrap();
+        (client_id, client_secret)
+    }
 }
 
 fn test_admin_context(
@@ -520,16 +688,43 @@ fn test_admin_context(
     }
 }
 
+fn install_canonical_coremeta_bootstrap_snapshot(states: &[AppState]) {
+    let Some(canonical) = states.first() else {
+        return;
+    };
+    let snapshot = canonical
+        .core_store
+        .export_coremeta_snapshot_rows()
+        .expect("export canonical CoreMeta bootstrap snapshot")
+        .into_iter()
+        .filter(|row| !is_node_local_coremeta_row(row))
+        .collect::<Vec<_>>();
+
+    for target in states.iter().skip(1) {
+        target
+            .core_store
+            .install_coremeta_snapshot_rows(&snapshot)
+            .expect("install canonical CoreMeta bootstrap snapshot");
+    }
+}
+
+fn is_node_local_coremeta_row(row: &anvil_core::core_store::CoreMetaEncodedOwnedRow) -> bool {
+    row.cf == anvil_core::core_store::CF_MESH
+        && row.core_meta_key.len() >= 3
+        && u16::from_le_bytes([row.core_meta_key[1], row.core_meta_key[2]])
+            == anvil_core::core_store::TABLE_NODE_SIGNING_KEYPAIR_ROW
+}
+
 impl Drop for TestCluster {
     fn drop(&mut self) {
         for node in self.nodes.drain(..) {
             node.abort();
         }
-        if let Err(e) = std::fs::remove_dir_all(&self.storage_path) {
+        if let Err(e) = std::fs::remove_dir_all(&self.cleanup_path) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 eprintln!(
                     "Failed to remove test storage {}: {}",
-                    self.storage_path.display(),
+                    self.cleanup_path.display(),
                     e
                 );
             }

@@ -67,7 +67,7 @@ async fn setup_test_profile(
 ) -> (String, String) {
     let app_name = format!("cli-test-app-{}", uuid::Uuid::new_v4());
     let (client_id, client_secret) = cluster
-        .create_application_with_policy("default", &app_name, "*", "*")
+        .create_application_with_storage_tenant_owner("default", &app_name)
         .await;
 
     let output = run_cli(
@@ -116,7 +116,7 @@ async fn test_cli_auth_get_token() {
 
 async fn create_app(cluster: &TestCluster, app_name: &str) -> (String, String) {
     cluster
-        .create_application_with_policy("default", app_name, "*", "*")
+        .create_application_with_storage_tenant_owner("default", app_name)
         .await
 }
 

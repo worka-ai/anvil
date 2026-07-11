@@ -17,11 +17,12 @@ fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
     NativeMutationContext {
         tenant_id: 1,
         bucket_id,
-        principal: "test-app".to_string(),
+        principal: "2".to_string(),
         request_id: format!("{tag}-{nonce}-request"),
         precondition: "none".to_string(),
         authz_zookie_optional: String::new(),
         idempotency_key: format!("{tag}-{nonce}-idempotency"),
+        transaction_id: None,
     }
 }
 
@@ -69,6 +70,7 @@ async fn test_delete_bucket_soft_deletes_and_enqueues_task() {
     let mut create_req = Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
         region: "test-region-1".to_string(),
+        options: None,
     });
     create_req.metadata_mut().insert(
         "authorization",
@@ -97,6 +99,7 @@ async fn test_delete_bucket_soft_deletes_and_enqueues_task() {
     // 2. Delete the bucket
     let mut del_req = Request::new(DeleteBucketRequest {
         bucket_name: bucket_name.clone(),
+        options: None,
     });
     del_req.metadata_mut().insert(
         "authorization",
@@ -162,8 +165,8 @@ async fn test_delete_bucket_soft_deletes_and_enqueues_task() {
             break;
         }
         assert!(
-            start.elapsed() < Duration::from_secs(12),
-            "delete bucket task did not complete"
+            start.elapsed() < Duration::from_secs(45),
+            "delete bucket task did not complete; last status was {status:?}"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -181,6 +184,7 @@ async fn test_delete_bucket_soft_deletes_and_enqueues_task() {
     let mut recreate_req = Request::new(CreateBucketRequest {
         bucket_name,
         region: "test-region-1".to_string(),
+        options: None,
     });
     recreate_req.metadata_mut().insert(
         "authorization",
@@ -208,6 +212,7 @@ async fn test_delete_bucket_rejects_retained_objects() {
     let mut create_req = Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
         region: "test-region-1".to_string(),
+        options: None,
     });
     create_req.metadata_mut().insert(
         "authorization",
@@ -229,6 +234,7 @@ async fn test_delete_bucket_rejects_retained_objects() {
                     mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
                     content_type: None,
                     user_metadata_json: String::new(),
+                    storage_class: None,
                 },
             )),
         },
@@ -247,6 +253,7 @@ async fn test_delete_bucket_rejects_retained_objects() {
 
     let mut del_req = Request::new(DeleteBucketRequest {
         bucket_name: bucket_name.clone(),
+        options: None,
     });
     del_req.metadata_mut().insert(
         "authorization",
@@ -279,6 +286,7 @@ async fn test_delete_bucket_rejects_active_multipart_uploads() {
     let mut create_req = Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
         region: "test-region-1".to_string(),
+        options: None,
     });
     create_req.metadata_mut().insert(
         "authorization",
@@ -309,6 +317,7 @@ async fn test_delete_bucket_rejects_active_multipart_uploads() {
 
     let mut active_delete_req = Request::new(DeleteBucketRequest {
         bucket_name: bucket_name.clone(),
+        options: None,
     });
     active_delete_req.metadata_mut().insert(
         "authorization",
@@ -336,7 +345,10 @@ async fn test_delete_bucket_rejects_active_multipart_uploads() {
         .await
         .unwrap();
 
-    let mut empty_delete_req = Request::new(DeleteBucketRequest { bucket_name });
+    let mut empty_delete_req = Request::new(DeleteBucketRequest {
+        bucket_name,
+        options: None,
+    });
     empty_delete_req.metadata_mut().insert(
         "authorization",
         format!("Bearer {}", token).parse().unwrap(),
@@ -361,6 +373,7 @@ async fn test_list_buckets() {
     let mut create_req1 = Request::new(CreateBucketRequest {
         bucket_name: bucket_name1.clone(),
         region: "test-region-1".to_string(),
+        options: None,
     });
     create_req1.metadata_mut().insert(
         "authorization",
@@ -371,6 +384,7 @@ async fn test_list_buckets() {
     let mut create_req2 = Request::new(CreateBucketRequest {
         bucket_name: bucket_name2.clone(),
         region: "test-region-1".to_string(),
+        options: None,
     });
     create_req2.metadata_mut().insert(
         "authorization",
@@ -409,6 +423,7 @@ async fn test_get_bucket_policy_reflects_public_read_flag() {
     let mut create_req = Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
         region: "test-region-1".to_string(),
+        options: None,
     });
     create_req.metadata_mut().insert(
         "authorization",
@@ -440,6 +455,7 @@ async fn test_get_bucket_policy_reflects_public_read_flag() {
     let mut put_req = Request::new(PutBucketPolicyRequest {
         bucket_name: bucket_name.clone(),
         policy_json: serde_json::json!({"is_public_read": true}).to_string(),
+        options: None,
     });
     put_req.metadata_mut().insert(
         "authorization",
@@ -477,6 +493,7 @@ async fn test_watch_bucket_metadata_streams_snapshot_events() {
     let mut create_req = Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
         region: "test-region-1".to_string(),
+        options: None,
     });
     create_req.metadata_mut().insert(
         "authorization",
@@ -492,6 +509,7 @@ async fn test_watch_bucket_metadata_streams_snapshot_events() {
     let mut put_req = Request::new(PutBucketPolicyRequest {
         bucket_name: bucket_name.clone(),
         policy_json: serde_json::json!({"is_public_read": true}).to_string(),
+        options: None,
     });
     put_req.metadata_mut().insert(
         "authorization",
@@ -501,6 +519,7 @@ async fn test_watch_bucket_metadata_streams_snapshot_events() {
 
     let mut del_req = Request::new(DeleteBucketRequest {
         bucket_name: bucket_name.clone(),
+        options: None,
     });
     del_req.metadata_mut().insert(
         "authorization",

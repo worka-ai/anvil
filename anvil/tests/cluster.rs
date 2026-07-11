@@ -8,6 +8,7 @@ use tempfile::TempDir;
 
 fn cluster_test_config(secret: &str) -> (TempDir, Arc<anvil::config::Config>) {
     let storage = tempfile::tempdir().unwrap();
+    let storage_path = storage.path().join("storage");
     let config = Arc::new(anvil::config::Config {
         jwt_secret: "test-secret".to_string(),
         anvil_secret_encryption_key:
@@ -22,7 +23,7 @@ fn cluster_test_config(secret: &str) -> (TempDir, Arc<anvil::config::Config>) {
         enable_mdns: false,
         cluster_secret: Some(secret.to_string()),
         metadata_cache_ttl_secs: 1,
-        storage_path: storage.path().to_string_lossy().into_owned(),
+        storage_path: storage_path.to_string_lossy().into_owned(),
         personaldb_snapshot_entry_threshold: 1024,
         personaldb_snapshot_payload_bytes_threshold: 64 * 1024 * 1024,
         ..anvil::config::Config::default()

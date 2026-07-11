@@ -15,11 +15,12 @@ fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
     NativeMutationContext {
         tenant_id: 1,
         bucket_id,
-        principal: "test-app".to_string(),
+        principal: "2".to_string(),
         request_id: format!("{tag}-{nonce}-request"),
         precondition: "none".to_string(),
         authz_zookie_optional: String::new(),
         idempotency_key: format!("{tag}-{nonce}-idempotency"),
+        transaction_id: None,
     }
 }
 
@@ -41,6 +42,8 @@ async fn test_distributed_reconstruction_on_node_failure() {
     let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
         region: "test-region-1".to_string(),
+
+        options: None,
     });
     create_bucket_req.metadata_mut().insert(
         "authorization",
@@ -63,6 +66,7 @@ async fn test_distributed_reconstruction_on_node_failure() {
         mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
         content_type: None,
         user_metadata_json: String::new(),
+        storage_class: None,
     };
     let mut chunks = vec![PutObjectRequest {
         data: Some(anvil::anvil_api::put_object_request::Data::Metadata(
@@ -109,6 +113,8 @@ async fn test_distributed_reconstruction_on_node_failure() {
                 object_key: object_key.clone(),
                 version_id: None,
                 range: None,
+
+                ..Default::default()
             });
             get_req.metadata_mut().insert(
                 "authorization",

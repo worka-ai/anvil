@@ -34,7 +34,7 @@ async fn test_cli_auth_and_hf_key_add() {
 
     // 1. Create an application through the network admin API.
     let (client_id, client_secret) = cluster
-        .create_application_with_policy("default", &app_name, "*", "*")
+        .create_application_with_storage_tenant_owner("default", &app_name)
         .await;
 
     // 2. Configure the CLI

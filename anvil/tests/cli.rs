@@ -65,7 +65,7 @@ async fn run_cli(args: &[&str], config_dir: &std::path::Path) -> std::process::O
 async fn setup_test_profile(cluster: &TestCluster, config_dir: &std::path::Path) {
     let app_name = "cli-test-app";
     let (client_id, client_secret) = cluster
-        .create_application_with_policy("default", app_name, "*", "*")
+        .create_application_with_storage_tenant_owner("default", app_name)
         .await;
 
     let output = run_cli(

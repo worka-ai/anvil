@@ -12,25 +12,8 @@ use tonic::Code;
 use anvil_test_utils::*;
 
 fn count_corestore_shard_files(root: &Path, object_hash: &str) -> usize {
-    let object_hash = object_hash.strip_prefix("sha256:").unwrap_or(object_hash);
-    let prefix = object_hash.get(0..2).unwrap_or_default();
-    let replicas_root = root.join("_core").join("replicas");
-    let Ok(entries) = std::fs::read_dir(&replicas_root) else {
-        return 0;
-    };
-
-    entries
-        .flatten()
-        .map(|entry| {
-            entry
-                .path()
-                .join("blobs")
-                .join("sha256")
-                .join(prefix)
-                .join(object_hash)
-        })
-        .map(|path| count_shard_files(&path))
-        .sum()
+    let _ = object_hash;
+    count_shard_files(&root.join("corestore").join("blocks").join("local-cache"))
 }
 
 fn count_shard_files(root: &Path) -> usize {
@@ -46,7 +29,7 @@ fn count_shard_files(root: &Path) -> usize {
         } else if path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("shard-") && name.ends_with(".bin"))
+            .is_some_and(|name| name.starts_with("shard-") && name.ends_with(".anb"))
         {
             count += 1;
         }
@@ -56,7 +39,7 @@ fn count_shard_files(root: &Path) -> usize {
 }
 
 fn count_corestore_object_manifest_sidecars(root: &Path) -> usize {
-    let replicas_root = root.join("_core").join("replicas");
+    let replicas_root = root.join("corestore").join("meta").join("replicas");
     let Ok(entries) = std::fs::read_dir(&replicas_root) else {
         return 0;
     };
@@ -72,11 +55,12 @@ fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
     NativeMutationContext {
         tenant_id: 1,
         bucket_id,
-        principal: "test-app".to_string(),
+        principal: "2".to_string(),
         request_id: format!("{tag}-{nonce}-request"),
         precondition: "none".to_string(),
         authz_zookie_optional: String::new(),
         idempotency_key: format!("{tag}-{nonce}-idempotency"),
+        transaction_id: None,
     }
 }
 
@@ -96,6 +80,8 @@ async fn test_distributed_put_and_get() {
     let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
         region: "test-region-1".to_string(),
+
+        options: None,
     });
     create_bucket_req.metadata_mut().insert(
         "authorization",
@@ -118,6 +104,7 @@ async fn test_distributed_put_and_get() {
         mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
         content_type: None,
         user_metadata_json: String::new(),
+        storage_class: None,
     };
     let mut chunks = vec![PutObjectRequest {
         data: Some(anvil_api::put_object_request::Data::Metadata(metadata)),
@@ -147,6 +134,8 @@ async fn test_distributed_put_and_get() {
         object_key,
         version_id: Some(response.version_id),
         range: None,
+
+        ..Default::default()
     };
     let mut get_object_req = tonic::Request::new(get_request);
     get_object_req.metadata_mut().insert(
@@ -204,6 +193,8 @@ async fn test_single_node_put() {
     let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
         region: "test-region-1".to_string(),
+
+        options: None,
     });
     create_bucket_req.metadata_mut().insert(
         "authorization",
@@ -226,6 +217,7 @@ async fn test_single_node_put() {
         mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
         content_type: None,
         user_metadata_json: String::new(),
+        storage_class: None,
     };
     let chunks = vec![
         PutObjectRequest {
@@ -278,6 +270,8 @@ async fn test_multi_region_list_and_isolation() {
     let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
         region: "us-east-1".to_string(),
+
+        options: None,
     });
     create_bucket_req.metadata_mut().insert(
         "authorization",
@@ -297,6 +291,7 @@ async fn test_multi_region_list_and_isolation() {
         mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
         content_type: None,
         user_metadata_json: String::new(),
+        storage_class: None,
     };
     let chunks = vec![
         PutObjectRequest {

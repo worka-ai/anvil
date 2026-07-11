@@ -157,7 +157,7 @@ async fn docker_cluster_end_to_end() {
     .await;
 
     // Initialise the Docker node through its internal admin API.
-    docker_admin(
+    let tenant_out = docker_admin_output(
         &compose_file_path,
         &[
             "tenant",
@@ -170,6 +170,17 @@ async fn docker_cluster_end_to_end() {
             "docker e2e tenant",
         ],
     );
+    assert!(
+        tenant_out.status.success(),
+        "admin tenant create failed: {}",
+        String::from_utf8_lossy(&tenant_out.stderr)
+    );
+    let tenant_doc: serde_json::Value = serde_json::from_slice(&tenant_out.stdout).unwrap();
+    let tenant_id = tenant_doc["resource"]["tenant_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let tenant_resource = format!("tenant:{tenant_id}");
 
     let app_out = docker_admin_output(
         &compose_file_path,
@@ -177,7 +188,7 @@ async fn docker_cluster_end_to_end() {
             "app",
             "create",
             "--tenant-id",
-            "default",
+            tenant_id.as_str(),
             "--app-name",
             "docker-e2e-app",
             "--audit-reason",
@@ -208,15 +219,15 @@ async fn docker_cluster_end_to_end() {
             "policy",
             "grant",
             "--tenant-id",
-            "default",
+            tenant_id.as_str(),
             "--app-name",
             "docker-e2e-app",
             "--action",
-            "*",
+            "bucket:create",
             "--resource",
-            "*",
+            tenant_resource.as_str(),
             "--audit-reason",
-            "docker e2e wildcard policy",
+            "docker e2e bucket creation grant",
         ],
     );
 
@@ -232,7 +243,6 @@ async fn docker_cluster_end_to_end() {
         .get_access_token(anvil::anvil_api::GetAccessTokenRequest {
             client_id: client_id.clone(),
             client_secret: client_secret.clone(),
-            scopes: vec!["*".into()],
         })
         .await
         .unwrap()
@@ -251,6 +261,8 @@ async fn docker_cluster_end_to_end() {
     let mut req = tonic::Request::new(anvil::anvil_api::CreateBucketRequest {
         bucket_name: private_bucket.clone(),
         region: "docker-test".into(),
+
+        options: None,
     });
     req.metadata_mut().insert(
         "authorization",
@@ -263,6 +275,8 @@ async fn docker_cluster_end_to_end() {
     let mut req = tonic::Request::new(anvil::anvil_api::CreateBucketRequest {
         bucket_name: public_bucket.clone(),
         region: "docker-test".into(),
+
+        options: None,
     });
     req.metadata_mut().insert(
         "authorization",

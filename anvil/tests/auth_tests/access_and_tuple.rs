@@ -1,0 +1,753 @@
+use super::*;
+
+#[tokio::test]
+async fn test_grant_and_revoke_access() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    let mut bucket_client = BucketServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut object_client = ObjectServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    let bucket_name = "grant-test-bucket".to_string();
+    let mut create_bucket = Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
+
+        options: None,
+    });
+    add_bearer(&mut create_bucket, &cluster.token);
+    bucket_client.create_bucket(create_bucket).await.unwrap();
+
+    let (granter_client_id, granter_client_secret) = create_app(&cluster, "granter-app").await;
+
+    // Delegation is non-escalating: the granter must already hold the
+    // capability it delegates, in addition to policy management authority.
+    grant_policy(&cluster, "granter-app", "policy:grant", "tenant:1").await;
+    grant_policy(&cluster, "granter-app", "policy:revoke", "tenant:1").await;
+    grant_policy(&cluster, "granter-app", "bucket:read", &bucket_name).await;
+
+    let granter_token = get_token(
+        &cluster.grpc_addrs[0],
+        &granter_client_id,
+        &granter_client_secret,
+    )
+    .await;
+
+    let (grantee_client_id, grantee_client_secret) = create_app(&cluster, "grantee-app").await;
+
+    let resource = bucket_name.clone();
+
+    // 2. Grant access
+    let mut grant_req = Request::new(GrantAccessRequest {
+        grantee_app_id: "grantee-app".to_string(),
+        resource: resource.clone(),
+        action: "bucket:read".to_string(),
+    });
+    grant_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", granter_token).parse().unwrap(),
+    );
+    auth_client.grant_access(grant_req).await.unwrap();
+
+    // 3. Verify grantee can now get a token and use the granted relationship.
+    let grantee_token = get_token(
+        &cluster.grpc_addrs[0],
+        &grantee_client_id,
+        &grantee_client_secret,
+    )
+    .await;
+    let mut allowed_list = Request::new(ListObjectsRequest {
+        bucket_name: bucket_name.clone(),
+        prefix: String::new(),
+        delimiter: String::new(),
+        start_after: String::new(),
+        max_keys: 100,
+
+        ..Default::default()
+    });
+    add_bearer(&mut allowed_list, &grantee_token);
+    object_client.list_objects(allowed_list).await.unwrap();
+
+    // 4. Revoke access
+    let mut revoke_req = Request::new(RevokeAccessRequest {
+        grantee_app_id: "grantee-app".to_string(),
+        resource: resource.clone(),
+        action: "bucket:read".to_string(),
+    });
+    revoke_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", granter_token).parse().unwrap(),
+    );
+    auth_client.revoke_access(revoke_req).await.unwrap();
+
+    // 5. Existing tokens identify the principal only; authorization is checked
+    // at request time, so the revoked relationship must deny the same token.
+    let mut denied_list = Request::new(ListObjectsRequest {
+        bucket_name,
+        prefix: String::new(),
+        delimiter: String::new(),
+        start_after: String::new(),
+        max_keys: 100,
+
+        ..Default::default()
+    });
+    add_bearer(&mut denied_list, &grantee_token);
+    let denied = object_client.list_objects(denied_list).await.unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn test_authz_tuple_write_check_and_watch() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut watch_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    let mut write_add = Request::new(WriteAuthzTupleRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: String::new(),
+        operation: "add".to_string(),
+        reason: "grant viewer".to_string(),
+        scope: None,
+    });
+    write_add.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let add = auth_client
+        .write_authz_tuple(write_add)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(add.revision, 1);
+    assert_eq!(add.zookie, "authz:1");
+    assert!(!add.record_hash.is_empty());
+
+    let mut watch_req = Request::new(WatchAuthzTupleLogRequest {
+        after_revision: 0,
+        namespace: "document".to_string(),
+        scope: None,
+    });
+    watch_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let mut stream = watch_client
+        .watch_authz_tuple_log(watch_req)
+        .await
+        .unwrap()
+        .into_inner();
+    let watched_add = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(watched_add.revision, add.revision);
+    assert_eq!(watched_add.namespace, "document");
+    assert_eq!(watched_add.operation, "add");
+    let envelope = watched_add.envelope.as_ref().expect("authz watch envelope");
+    assert_eq!(envelope.watch_stream_id, "authz_tuple_log");
+    assert_eq!(envelope.partition_family, "authz_tuple");
+    assert_eq!(envelope.cursor_low, watched_add.revision);
+    assert_eq!(envelope.authz_revision, watched_add.revision);
+    assert_eq!(envelope.record_kind, "authz_tuple");
+    assert!(envelope.object_ref.contains("document:alpha#viewer"));
+    assert!(!envelope.payload_hash.is_empty());
+
+    let mut check_req = Request::new(CheckPermissionRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: String::new(),
+        consistency: "latest".to_string(),
+        zookie: String::new(),
+        scope: None,
+    });
+    check_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let allowed = auth_client
+        .check_permission(check_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(allowed.allowed);
+    assert_eq!(allowed.revision, add.revision);
+
+    let mut exact_add_req = Request::new(CheckPermissionRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: String::new(),
+        consistency: "exact".to_string(),
+        zookie: add.zookie.clone(),
+        scope: None,
+    });
+    exact_add_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let exact_add = auth_client
+        .check_permission(exact_add_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(exact_add.allowed);
+    assert_eq!(exact_add.revision, add.revision);
+
+    let mut write_remove = Request::new(WriteAuthzTupleRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: String::new(),
+        operation: "remove".to_string(),
+        reason: "revoke viewer".to_string(),
+        scope: None,
+    });
+    write_remove.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let remove = auth_client
+        .write_authz_tuple(write_remove)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(remove.revision, 2);
+
+    let watched_remove = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(watched_remove.revision, remove.revision);
+    assert_eq!(watched_remove.operation, "remove");
+
+    let mut check_req = Request::new(CheckPermissionRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: String::new(),
+        consistency: "latest".to_string(),
+        zookie: String::new(),
+        scope: None,
+    });
+    check_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let denied = auth_client
+        .check_permission(check_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!denied.allowed);
+    assert_eq!(denied.revision, remove.revision);
+
+    let mut at_least_add_req = Request::new(CheckPermissionRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: String::new(),
+        consistency: "at_least".to_string(),
+        zookie: add.zookie,
+        scope: None,
+    });
+    at_least_add_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let at_least_add = auth_client
+        .check_permission(at_least_add_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!at_least_add.allowed);
+    assert_eq!(at_least_add.revision, remove.revision);
+
+    let mut exact_add_after_remove_req = Request::new(CheckPermissionRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: String::new(),
+        consistency: "exact".to_string(),
+        zookie: "authz:1".to_string(),
+        scope: None,
+    });
+    exact_add_after_remove_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let exact_add_after_remove = auth_client
+        .check_permission(exact_add_after_remove_req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(exact_add_after_remove.allowed);
+    assert_eq!(exact_add_after_remove.revision, 1);
+
+    let mut unavailable_req = Request::new(CheckPermissionRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: String::new(),
+        consistency: "exact".to_string(),
+        zookie: "authz:999".to_string(),
+        scope: None,
+    });
+    unavailable_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let unavailable = auth_client
+        .check_permission(unavailable_req)
+        .await
+        .unwrap_err();
+    assert_eq!(unavailable.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn test_authz_batch_read_and_list_operations() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    let mut write = Request::new(WriteAuthzTuplesRequest {
+        mutations: vec![
+            authz_mutation("document", "alpha", "viewer", "user", "alice", "add"),
+            authz_mutation("document", "beta", "viewer", "user", "alice", "add"),
+            authz_mutation("document", "beta", "viewer", "user", "alice", "remove"),
+            authz_mutation("document", "alpha", "editor", "user", "bob", "add"),
+        ],
+        scope: None,
+    });
+    add_bearer(&mut write, &token);
+    let written = auth_client
+        .write_authz_tuples(write)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(written.results.len(), 4);
+    assert!(written.results.iter().all(|result| result.revision == 1));
+    assert_eq!(written.revision, 1);
+    assert_eq!(written.zookie, "authz:1");
+
+    let mut first_page = Request::new(ReadAuthzTuplesRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        page_size: 1,
+        scope: None,
+        ..Default::default()
+    });
+    add_bearer(&mut first_page, &token);
+    let first_page = auth_client
+        .read_authz_tuples(first_page)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first_page.tuples.len(), 1);
+    assert_eq!(first_page.tuples[0].object_id, "alpha");
+    assert!(!first_page.next_page_token.is_empty());
+
+    let mut wrong_filter_page = Request::new(ReadAuthzTuplesRequest {
+        namespace: "document".to_string(),
+        object_id: "beta".to_string(),
+        page_size: 1,
+        page_token: first_page.next_page_token.clone(),
+        scope: None,
+        ..Default::default()
+    });
+    add_bearer(&mut wrong_filter_page, &token);
+    let wrong_filter = auth_client
+        .read_authz_tuples(wrong_filter_page)
+        .await
+        .unwrap_err();
+    assert_eq!(wrong_filter.code(), tonic::Code::InvalidArgument);
+
+    let mut second_page = Request::new(ReadAuthzTuplesRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        page_size: 1,
+        page_token: first_page.next_page_token,
+        scope: None,
+        ..Default::default()
+    });
+    add_bearer(&mut second_page, &token);
+    let second_page = auth_client
+        .read_authz_tuples(second_page)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second_page.tuples.len(), 1);
+    assert!(second_page.next_page_token.is_empty());
+
+    let mut checks = Request::new(CheckPermissionsRequest {
+        checks: vec![
+            check_permission_request("document", "alpha", "viewer", "user", "alice", "latest", ""),
+            check_permission_request("document", "beta", "viewer", "user", "alice", "latest", ""),
+        ],
+    });
+    add_bearer(&mut checks, &token);
+    let checks = auth_client
+        .check_permissions(checks)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        checks
+            .results
+            .iter()
+            .map(|result| result.allowed)
+            .collect::<Vec<_>>(),
+        vec![true, false]
+    );
+    assert_eq!(checks.revision, 1);
+
+    let mut objects = Request::new(ListAuthzObjectsRequest {
+        namespace: "document".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "user".to_string(),
+        subject_id: "alice".to_string(),
+        caveat_hash: String::new(),
+        scope: None,
+        ..Default::default()
+    });
+    add_bearer(&mut objects, &token);
+    let objects = auth_client
+        .list_authz_objects(objects)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(objects.object_ids, vec!["alpha".to_string()]);
+
+    let mut subjects = Request::new(ListAuthzSubjectsRequest {
+        namespace: "document".to_string(),
+        object_id: "alpha".to_string(),
+        relation: "editor".to_string(),
+        subject_kind: "user".to_string(),
+        scope: None,
+        ..Default::default()
+    });
+    add_bearer(&mut subjects, &token);
+    let subjects = auth_client
+        .list_authz_subjects(subjects)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(subjects.subjects.len(), 1);
+    assert_eq!(subjects.subjects[0].subject_id, "bob");
+}
+
+#[tokio::test]
+async fn test_authz_batch_watch_and_pagination_are_revision_bound() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut first_batch = Request::new(WriteAuthzTuplesRequest {
+        mutations: vec![
+            authz_mutation("document", "alpha", "viewer", "user", "alice", "add"),
+            authz_mutation("document", "beta", "viewer", "user", "bob", "add"),
+            authz_mutation("document", "gamma", "viewer", "user", "charlie", "add"),
+        ],
+        scope: None,
+    });
+    add_bearer(&mut first_batch, &token);
+    let first_batch = auth_client
+        .write_authz_tuples(first_batch)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first_batch.revision, 1);
+    assert_eq!(first_batch.results.len(), 3);
+
+    let mut watch_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut watch_req = Request::new(WatchAuthzTupleLogRequest {
+        after_revision: 0,
+        namespace: "document".to_string(),
+        scope: None,
+    });
+    add_bearer(&mut watch_req, &token);
+    let mut stream = watch_client
+        .watch_authz_tuple_log(watch_req)
+        .await
+        .unwrap()
+        .into_inner();
+
+    let mut watched = Vec::new();
+    for _ in 0..first_batch.results.len() {
+        watched.push(
+            tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    assert_eq!(watched.len(), 3);
+    assert!(
+        watched.iter().all(|event| event.revision == 1),
+        "batch watch events must become visible only as one committed revision"
+    );
+    assert_eq!(
+        watched
+            .iter()
+            .map(|event| event.object_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "beta", "gamma"]
+    );
+
+    let mut first_page = Request::new(ReadAuthzTuplesRequest {
+        namespace: "document".to_string(),
+        page_size: 1,
+        scope: None,
+        ..Default::default()
+    });
+    add_bearer(&mut first_page, &token);
+    let first_page = auth_client
+        .read_authz_tuples(first_page)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first_page.revision, 1);
+    assert!(!first_page.next_page_token.is_empty());
+
+    let mut second_batch = Request::new(WriteAuthzTuplesRequest {
+        mutations: vec![authz_mutation(
+            "document", "delta", "viewer", "user", "dana", "add",
+        )],
+        scope: None,
+    });
+    add_bearer(&mut second_batch, &token);
+    let second_batch = auth_client
+        .write_authz_tuples(second_batch)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second_batch.revision, 2);
+
+    let mut revision_bound_page = Request::new(ReadAuthzTuplesRequest {
+        namespace: "document".to_string(),
+        page_size: 100,
+        page_token: first_page.next_page_token,
+        scope: None,
+        ..Default::default()
+    });
+    add_bearer(&mut revision_bound_page, &token);
+    let revision_bound_page = auth_client
+        .read_authz_tuples(revision_bound_page)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(revision_bound_page.revision, 1);
+    assert!(
+        revision_bound_page
+            .tuples
+            .iter()
+            .all(|tuple| tuple.object_id != "delta"),
+        "a follow-up page must keep reading the original revision"
+    );
+
+    let mut latest_page = Request::new(ReadAuthzTuplesRequest {
+        namespace: "document".to_string(),
+        page_size: 100,
+        scope: None,
+        ..Default::default()
+    });
+    add_bearer(&mut latest_page, &token);
+    let latest_page = auth_client
+        .read_authz_tuples(latest_page)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(latest_page.revision, 2);
+    assert!(
+        latest_page
+            .tuples
+            .iter()
+            .any(|tuple| tuple.object_id == "delta")
+    );
+}
+
+#[tokio::test]
+async fn test_authz_tuple_batch_failure_is_atomic() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    let mut invalid_batch = Request::new(WriteAuthzTuplesRequest {
+        mutations: vec![
+            authz_mutation("document", "alpha", "viewer", "user", "alice", "add"),
+            AuthzTupleMutation {
+                namespace: "document".to_string(),
+                object_id: "beta".to_string(),
+                relation: "viewer".to_string(),
+                subject_kind: "user".to_string(),
+                subject_id: "alice".to_string(),
+                caveat_hash: "not-a-hex32-caveat".to_string(),
+                operation: "add".to_string(),
+                reason: "invalid".to_string(),
+                scope: None,
+            },
+        ],
+        scope: None,
+    });
+    add_bearer(&mut invalid_batch, &token);
+    let err = auth_client
+        .write_authz_tuples(invalid_batch)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert_eq!(
+        cluster.states[0]
+            .persistence
+            .latest_authz_revision(1)
+            .await
+            .unwrap(),
+        0,
+        "failed authz batches must not advance the tenant revision"
+    );
+
+    let mut unsafe_component_batch = Request::new(WriteAuthzTuplesRequest {
+        mutations: vec![
+            authz_mutation("document", "alpha", "viewer", "user", "alice", "add"),
+            authz_mutation("bad/slash", "beta", "viewer", "user", "alice", "add"),
+        ],
+        scope: None,
+    });
+    add_bearer(&mut unsafe_component_batch, &token);
+    let err = auth_client
+        .write_authz_tuples(unsafe_component_batch)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert_eq!(
+        cluster.states[0]
+            .persistence
+            .latest_authz_revision(1)
+            .await
+            .unwrap(),
+        0,
+        "failed authz batches with unsafe components must not advance the tenant revision"
+    );
+
+    let mut valid_batch = Request::new(WriteAuthzTuplesRequest {
+        mutations: vec![
+            authz_mutation("document", "alpha", "viewer", "user", "alice", "add"),
+            authz_mutation("document", "beta", "viewer", "user", "alice", "add"),
+        ],
+        scope: None,
+    });
+    add_bearer(&mut valid_batch, &token);
+    let valid = auth_client
+        .write_authz_tuples(valid_batch)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(valid.revision, 1);
+    assert!(valid.results.iter().all(|result| result.revision == 1));
+}
+
+#[tokio::test]
+async fn test_authz_accepts_arbitrary_safe_subject_kind() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let token = cluster.token.clone();
+    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    let mut write = Request::new(WriteAuthzTuplesRequest {
+        mutations: vec![authz_mutation(
+            "document", "doc-1", "viewer", "folder", "folder-1", "add",
+        )],
+        scope: None,
+    });
+    add_bearer(&mut write, &token);
+    let written = auth_client
+        .write_authz_tuples(write)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(written.revision, 1);
+
+    let mut check = Request::new(check_permission_request(
+        "document", "doc-1", "viewer", "folder", "folder-1", "latest", "",
+    ));
+    add_bearer(&mut check, &token);
+    let check = auth_client
+        .check_permission(check)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(check.allowed);
+
+    let mut read = Request::new(ReadAuthzTuplesRequest {
+        namespace: "document".to_string(),
+        object_id: "doc-1".to_string(),
+        relation: "viewer".to_string(),
+        subject_kind: "folder".to_string(),
+        subject_id: "folder-1".to_string(),
+        caveat_hash: String::new(),
+        consistency: "latest".to_string(),
+        zookie: String::new(),
+        page_size: 10,
+        page_token: String::new(),
+        scope: None,
+    });
+    add_bearer(&mut read, &token);
+    let read = auth_client
+        .read_authz_tuples(read)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(read.tuples.len(), 1);
+    assert_eq!(read.tuples[0].subject_kind, "folder");
+}

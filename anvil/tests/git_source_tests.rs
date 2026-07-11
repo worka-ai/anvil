@@ -3,10 +3,14 @@ use anvil::anvil_api::{
     GetGitBlobByPathRequest, GetGitObjectRequest, GitPackMetadata, ListGitTreeRequest,
     PutGitPackRequest, WatchGitSourceRequest, put_git_pack_request,
 };
-use anvil::core_store::CoreStore;
+use anvil::core_store::{
+    CF_MATERIALISATION, CoreMetaStore, CoreMetaTuplePart, TABLE_WRITER_SEGMENT_ROW,
+    core_meta_tuple_key,
+};
 use anvil::formats::git::{GitHashAlgorithm, GitSourceRecord};
 use anvil::git_source_index::{GitSourceIndexWrite, write_git_source_index};
 use anvil::git_source_watch::{GitSourceWatchPayload, append_git_source_watch_record};
+use anvil::writer_segment_catalog::read_writer_segment_catalog_record;
 use anvil_test_utils::TestCluster;
 use flate2::{Compression, write::ZlibEncoder};
 use futures_util::StreamExt;
@@ -14,6 +18,16 @@ use sha1::{Digest, Sha1};
 use std::io::Write;
 use std::time::Duration;
 use tonic::Request;
+
+fn writer_segment_catalog_tuple_key(family: &str, scope: &str, segment_ref: &str) -> Vec<u8> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("writer-segment"),
+        CoreMetaTuplePart::Utf8(family),
+        CoreMetaTuplePart::Utf8(scope),
+        CoreMetaTuplePart::Utf8(segment_ref),
+    ])
+    .unwrap()
+}
 
 #[tokio::test]
 async fn test_git_source_watch_streams_snapshot_and_new_events() {
@@ -187,11 +201,7 @@ async fn test_git_source_query_apis_use_latest_index_and_enforce_read_authz() {
 
     let read_denied_token = cluster.states[0]
         .jwt_manager
-        .mint_token(
-            "watch-only".to_string(),
-            vec!["git_source:watch|repository:repo-alpha".to_string()],
-            1,
-        )
+        .mint_token("watch-only".to_string(), 1)
         .unwrap();
     let denied = client
         .get_git_object(authorized(
@@ -250,26 +260,38 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
     assert_eq!(response.watch_cursor_low, 1);
     assert_eq!(response.watch_cursor_high, 0);
     assert!(response.index_path.starts_with("git_source_index:"));
-    let core_store = CoreStore::new(cluster.states[0].storage.clone())
-        .await
-        .unwrap();
+    let index_scope = "tenant:1:repository:repo-alpha";
     assert!(
-        core_store
-            .read_ref(&response.index_path)
-            .await
-            .unwrap()
-            .is_some()
+        read_writer_segment_catalog_record(
+            &cluster.states[0].storage,
+            "git_source_index",
+            index_scope,
+            &response.index_path,
+        )
+        .unwrap()
+        .is_some()
     );
-    core_store
-        .delete_ref(&response.index_path, None, None, true)
-        .await
+    CoreMetaStore::open(cluster.states[0].storage.core_store_meta_path())
+        .unwrap()
+        .delete(
+            CF_MATERIALISATION,
+            TABLE_WRITER_SEGMENT_ROW,
+            &writer_segment_catalog_tuple_key(
+                "git_source_index",
+                index_scope,
+                &response.index_path,
+            ),
+        )
         .unwrap();
     assert!(
-        core_store
-            .read_ref(&response.index_path)
-            .await
-            .unwrap()
-            .is_none()
+        read_writer_segment_catalog_record(
+            &cluster.states[0].storage,
+            "git_source_index",
+            index_scope,
+            &response.index_path,
+        )
+        .unwrap()
+        .is_none()
     );
 
     let blob = client
@@ -289,12 +311,15 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
     assert_eq!(blob.tree_path, "README.md");
     assert_eq!(blob.pack_object_version_id, response.version_id);
     assert!(
-        core_store
-            .read_ref(&response.index_path)
-            .await
-            .unwrap()
-            .is_some(),
-        "git source query must rebuild a missing derived index ref from stored pack bytes"
+        read_writer_segment_catalog_record(
+            &cluster.states[0].storage,
+            "git_source_index",
+            index_scope,
+            &response.index_path,
+        )
+        .unwrap()
+        .is_some(),
+        "git source query must rebuild a missing derived index catalog row from stored pack bytes"
     );
 
     let s3 = cluster

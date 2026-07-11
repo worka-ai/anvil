@@ -14,11 +14,12 @@ fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
     NativeMutationContext {
         tenant_id: 1,
         bucket_id,
-        principal: "test-app".to_string(),
+        principal: "2".to_string(),
         request_id: format!("{tag}-{nonce}-request"),
         precondition: "none".to_string(),
         authz_zookie_optional: String::new(),
         idempotency_key: format!("{tag}-{nonce}-idempotency"),
+        transaction_id: None,
     }
 }
 
@@ -37,6 +38,8 @@ async fn rust_client_calls_live_native_api() {
         .create_bucket(CreateBucketRequest {
             bucket_name: bucket_name.clone(),
             region: "rust-client-region".to_string(),
+
+            options: None,
         })
         .await
         .expect("rust client should create a bucket")
@@ -65,6 +68,7 @@ async fn rust_client_calls_live_native_api() {
                 mutation_context: Some(native_mutation_context(bucket.bucket_id, "put-object")),
                 content_type: None,
                 user_metadata_json: String::new(),
+                storage_class: None,
             })),
         },
         PutObjectRequest {
@@ -87,6 +91,8 @@ async fn rust_client_calls_live_native_api() {
             object_key,
             version_id: Some(stored.version_id),
             range: None,
+
+            ..Default::default()
         })
         .await
         .expect("rust client should stream an object download")

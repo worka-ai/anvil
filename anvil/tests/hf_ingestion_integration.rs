@@ -26,6 +26,8 @@ async fn hf_ingestion_single_file_integration() {
     let mut req = tonic::Request::new(anvil::anvil_api::CreateBucketRequest {
         bucket_name: bucket_name.clone(),
         region: "test-region-1".into(),
+
+        options: None,
     });
     req.metadata_mut().insert(
         "authorization",
@@ -167,14 +169,7 @@ async fn hf_ingestion_permission_denied() {
 
     let ok_token = cluster.states[0]
         .jwt_manager
-        .mint_token(
-            "test-app".into(),
-            vec![
-                "hf_key:create|pd-test".into(),
-                "bucket:create|models-denied".into(),
-            ],
-            1,
-        )
+        .mint_token("test-app".into(), 1)
         .unwrap();
 
     // Create bucket
@@ -186,6 +181,8 @@ async fn hf_ingestion_permission_denied() {
     let mut req = tonic::Request::new(anvil::anvil_api::CreateBucketRequest {
         bucket_name: "models-denied".into(),
         region: "test-region-1".into(),
+
+        options: None,
     });
     req.metadata_mut().insert(
         "authorization",
@@ -231,7 +228,7 @@ async fn hf_ingestion_permission_denied() {
     // Forge a very limited token: no hf:ingest:start scopes
     let limited_token = cluster.states[0]
         .jwt_manager
-        .mint_token("test-app".into(), vec!["read:*".into()], 0)
+        .mint_token("test-app".into(), 0)
         .unwrap();
     sreq.metadata_mut().insert(
         "authorization",

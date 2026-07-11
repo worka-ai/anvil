@@ -6,9 +6,12 @@ use anvil::anvil_api::{
     NativeMutationContext, ObjectMetadata, PutObjectRequest, QueryIndexRequest, QueryIndexResponse,
 };
 use anvil_core::core_store::{
-    AcquireFence, AppendStreamRecord, CompareAndSwapRef, CoreMutationBatch, CoreMutationOperation,
-    CoreMutationPrecondition, CoreStore, GetBlob, PutBlob, ReadStream, ReleaseFence,
+    AcquireFence, AppendStreamRecord, CF_INLINE_PAYLOADS, CoreMetaStore, CoreMetaTuplePart,
+    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreStore, GetBlob,
+    PutBlob, ReadStream, ReleaseFence, TABLE_INLINE_PAYLOAD_ROW, core_meta_committed_row_common,
+    core_meta_root_key_hash, core_meta_tuple_key, encode_core_meta_inline_payload_row,
 };
+use anvil_core::perf_baseline::{BaselineManifest, BaselineRunSummary, BaselineScenarioSummary};
 use anvil_core::storage::Storage;
 use anvil_test_utils::{TestCluster, emit_test_timing};
 use serde::Serialize;
@@ -34,12 +37,35 @@ fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
     NativeMutationContext {
         tenant_id: 1,
         bucket_id,
-        principal: "test-app".to_string(),
+        principal: "2".to_string(),
         request_id: format!("{tag}-{nonce}-request"),
         precondition: "none".to_string(),
         authz_zookie_optional: String::new(),
         idempotency_key: format!("{tag}-{nonce}-idempotency"),
+        transaction_id: None,
     }
+}
+
+fn perf_coremeta_tuple_key(name: &str) -> Vec<u8> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("perf"),
+        CoreMetaTuplePart::Utf8(name),
+    ])
+    .unwrap()
+}
+
+fn perf_coremeta_payload(name: &str, generation: u64) -> Vec<u8> {
+    encode_core_meta_inline_payload_row(
+        format!("perf-coremeta-{name}-{generation}").as_bytes(),
+        core_meta_committed_row_common(
+            "perf",
+            core_meta_root_key_hash(&format!("perf/{name}")),
+            generation,
+            format!("perf-coremeta-{name}-{generation}"),
+            generation,
+        ),
+    )
+    .unwrap()
 }
 
 #[derive(Debug, Serialize)]
@@ -48,9 +74,11 @@ struct PerfSample {
     duration_ms: f64,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default)]
 struct PerfReport {
     samples: Vec<PerfSample>,
+    scenarios: Vec<BaselineScenarioSummary>,
+    started_at: Option<Instant>,
 }
 
 impl PerfReport {
@@ -68,23 +96,75 @@ impl PerfReport {
             name: name.to_string(),
             duration_ms: elapsed.as_secs_f64() * 1000.0,
         });
+        self.scenarios
+            .push(BaselineScenarioSummary::single_sample(name, elapsed));
         result
     }
 
     async fn write(&self) {
-        let path = std::env::var("ANVIL_PERF_REPORT_PATH").unwrap_or_else(|_| {
-            workspace_perf_path("performance-summary.json")
-                .to_string_lossy()
-                .into_owned()
-        });
-        if let Some(parent) = std::path::Path::new(&path).parent() {
-            tokio::fs::create_dir_all(parent).await.unwrap();
+        let run_dir = std::env::var("ANVIL_PERF_RUN_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| workspace_perf_path(""));
+        tokio::fs::create_dir_all(&run_dir).await.unwrap();
+
+        let manifest = BaselineManifest::release_default();
+        manifest
+            .write_json_file(run_dir.join("baseline-manifest.json"))
+            .unwrap();
+        let elapsed = self
+            .started_at
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        let summary = BaselineRunSummary::smoke(
+            "cargo test -p anvil --test performance_tests -- --ignored-or-env-gated",
+            &manifest,
+            std::env::var("GITHUB_SHA")
+                .or_else(|_| std::env::var("ANVIL_GIT_COMMIT"))
+                .unwrap_or_else(|_| "local".to_string()),
+            std::env::var("ANVIL_MACHINE_CLASS").unwrap_or_else(|_| "local-dev".to_string()),
+            elapsed,
+            self.scenarios.clone(),
+        )
+        .unwrap();
+        tokio::fs::write(
+            run_dir.join("performance-summary.json"),
+            serde_json::to_vec_pretty(&summary).unwrap(),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            run_dir.join("release-gate-step.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": "anvil.perf.release_gate_step.v1",
+                "pass": summary.pass,
+                "dataset_id": summary.dataset_id,
+                "manifest_hash": summary.manifest_hash,
+                "scenario_count": summary.scenarios.len()
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            run_dir.join("slow-spans.json"),
+            serde_json::to_vec_pretty(&summary.slowest_traced_spans).unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut line_protocol = String::new();
+        for sample in &self.samples {
+            line_protocol.push_str(&format!(
+                "anvil_perf_case,case={} duration_ms={} {}\n",
+                sample.name.replace(' ', "\\ "),
+                sample.duration_ms,
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            ));
         }
-        tokio::fs::write(&path, serde_json::to_vec_pretty(self).unwrap())
+        tokio::fs::write(run_dir.join("anvil.line"), line_protocol)
             .await
             .unwrap();
         anvil::perf::flush().await;
-        eprintln!("[perf] wrote {path}");
+        eprintln!("[perf] wrote {}", run_dir.display());
     }
 }
 
@@ -114,6 +194,7 @@ async fn put_json_object(
                 mutation_context: Some(native_mutation_context(bucket_id, tag)),
                 content_type: Some("application/json".to_string()),
                 user_metadata_json: String::new(),
+                storage_class: None,
             },
         )),
     };
@@ -179,12 +260,13 @@ async fn performance_native_api_smoke() {
     }
 
     let mut report = PerfReport::default();
+    report.started_at = Some(Instant::now());
 
     let method_suite_started_at = Instant::now();
     {
         let temp = tempfile::tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let store = CoreStore::new(storage).await.unwrap();
+        let store = CoreStore::new(storage.clone()).await.unwrap();
         let payload = vec![42_u8; 64 * 1024];
 
         let object_ref = report
@@ -227,6 +309,8 @@ async fn performance_native_api_smoke() {
                                 "payload": "method-level event"
                             }))
                             .unwrap(),
+                            content_type: Some("application/json".to_string()),
+                            user_metadata_json: "{}".to_string(),
                             fence: None,
                             transaction_id: None,
                             idempotency_key: Some(format!("perf-stream-{idx}")),
@@ -251,26 +335,43 @@ async fn performance_native_api_smoke() {
             .await;
         assert_eq!(stream_records.len(), 20);
 
+        let coremeta_key = perf_coremeta_tuple_key("current");
+        let coremeta_payload = perf_coremeta_payload("current", 1);
         let receipt = report
-            .measure("corestore_cas_ref_create", || async {
+            .measure("corestore_coremeta_row_create", || async {
                 store
-                    .compare_and_swap_ref(CompareAndSwapRef {
-                        ref_name: "perf/ref/current".to_string(),
-                        expected_generation: None,
-                        expected_target: None,
-                        require_absent: true,
-                        require_present: false,
-                        fence: None,
-                        authz_revision: None,
-                        source_watch_cursor: None,
-                        new_target: format!("sha256:{:064x}", 1),
-                        transaction_id: Some(format!("perf-cas-{}", uuid::Uuid::new_v4())),
+                    .commit_mutation_batch(CoreMutationBatch {
+                        transaction_id: format!("perf-coremeta-{}", uuid::Uuid::new_v4()),
+                        scope_partition: "perf".to_string(),
+                        committed_by_principal: "perf-principal".to_string(),
+                        preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
+                            cf: CF_INLINE_PAYLOADS.to_string(),
+                            table_id: TABLE_INLINE_PAYLOAD_ROW,
+                            tuple_key: coremeta_key.clone(),
+                            expected_payload_hash: None,
+                            require_absent: true,
+                            require_present: false,
+                        }],
+                        operations: vec![CoreMutationOperation::CoreMetaPut {
+                            partition_id: "perf".to_string(),
+                            cf: CF_INLINE_PAYLOADS.to_string(),
+                            table_id: TABLE_INLINE_PAYLOAD_ROW,
+                            tuple_key: coremeta_key.clone(),
+                            payload: coremeta_payload.clone(),
+                        }],
                     })
                     .await
                     .unwrap()
             })
             .await;
-        assert_eq!(receipt.generation, 1);
+        assert_eq!(receipt.visible_updates.len(), 1);
+        assert!(
+            CoreMetaStore::open(storage.core_store_meta_path())
+                .unwrap()
+                .get(CF_INLINE_PAYLOADS, TABLE_INLINE_PAYLOAD_ROW, &coremeta_key)
+                .unwrap()
+                .is_some()
+        );
 
         let permit = report
             .measure("corestore_acquire_fence", || async {
@@ -285,28 +386,30 @@ async fn performance_native_api_smoke() {
             })
             .await;
 
+        let batch_coremeta_key = perf_coremeta_tuple_key("batch");
+        let batch_coremeta_payload = perf_coremeta_payload("batch", 1);
         report
-            .measure("corestore_mutation_batch_ref_and_stream", || async {
+            .measure("corestore_mutation_batch_coremeta_and_stream", || async {
                 store
                     .commit_mutation_batch(CoreMutationBatch {
                         transaction_id: format!("perf-batch-{}", uuid::Uuid::new_v4()),
                         scope_partition: "perf".to_string(),
                         committed_by_principal: "perf-principal".to_string(),
-                        preconditions: vec![CoreMutationPrecondition::Ref {
-                            ref_name: "perf/ref/batch".to_string(),
-                            expected_generation: None,
-                            expected_target: None,
+                        preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
+                            cf: CF_INLINE_PAYLOADS.to_string(),
+                            table_id: TABLE_INLINE_PAYLOAD_ROW,
+                            tuple_key: batch_coremeta_key.clone(),
+                            expected_payload_hash: None,
                             require_absent: true,
                             require_present: false,
-                            fence: None,
-                            authz_revision: None,
-                            source_watch_cursor: None,
                         }],
                         operations: vec![
-                            CoreMutationOperation::RefUpdate {
+                            CoreMutationOperation::CoreMetaPut {
                                 partition_id: "perf".to_string(),
-                                ref_name: "perf/ref/batch".to_string(),
-                                new_target: format!("sha256:{:064x}", 2),
+                                cf: CF_INLINE_PAYLOADS.to_string(),
+                                table_id: TABLE_INLINE_PAYLOAD_ROW,
+                                tuple_key: batch_coremeta_key.clone(),
+                                payload: batch_coremeta_payload.clone(),
                             },
                             CoreMutationOperation::StreamAppend {
                                 partition_id: "perf".to_string(),
@@ -375,6 +478,8 @@ async fn performance_native_api_smoke() {
                     CreateBucketRequest {
                         bucket_name: bucket_name.clone(),
                         region: "perf-region-1".to_string(),
+
+                        options: None,
                     },
                     &token,
                 ))
@@ -417,6 +522,8 @@ async fn performance_native_api_smoke() {
                         object_key: "queue/item-00.json".to_string(),
                         version_id: None,
                         range: None,
+
+                        ..Default::default()
                     },
                     &token,
                 ))
@@ -437,6 +544,8 @@ async fn performance_native_api_smoke() {
                         delimiter: String::new(),
                         start_after: String::new(),
                         max_keys: 50,
+
+                        ..Default::default()
                     },
                     &token,
                 ))
@@ -474,7 +583,8 @@ async fn performance_native_api_smoke() {
                             ]
                         })
                         .to_string(),
-                    },
+
+                        options: None,},
                     &token,
                 ))
                 .await
@@ -496,6 +606,7 @@ async fn performance_native_api_smoke() {
                     phrase: false,
                     path_prefix: "queue/".to_string(),
                     metadata_filters_json: String::new(),
+                    boundary_predicates_json: String::new(),
                     typed_predicates_json: serde_json::json!([
                         {"field": "queue_name", "op": "eq", "value": "outbound"},
                         {"field": "state", "op": "in", "values": ["pending", "failed"]},
