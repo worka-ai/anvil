@@ -192,6 +192,8 @@ impl Persistence {
         input: crate::mesh_lifecycle::RegisterNodeDescriptor,
     ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::NodeDescriptor> {
         let record_key = format!("{}/{}/{}", input.region, input.cell_id, input.node_id);
+        let node_id = input.node_id.clone();
+        let receipt_signing_public_key_proto = input.receipt_signing_public_key_proto.clone();
         let partition = crate::mesh_lifecycle::lifecycle_control_partition(
             crate::mesh_lifecycle::NODE_DESCRIPTOR_STREAM_FAMILY,
             &record_key,
@@ -205,7 +207,7 @@ impl Persistence {
             .map_err(|err| {
                 crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
             })?;
-        crate::mesh_lifecycle::register_node_with_control(
+        let descriptor = crate::mesh_lifecycle::register_node_with_control(
             &self.storage,
             input,
             crate::mesh_lifecycle::LifecycleControlWriteAuthority {
@@ -213,7 +215,14 @@ impl Persistence {
                 signing_key: &self.partition_owner_signing_key,
             },
         )
-        .await
+        .await?;
+        let store = CoreStore::new(self.storage.clone())
+            .await
+            .map_err(|err| crate::mesh_lifecycle::LifecycleError::Other(err.into()))?;
+        store
+            .register_node_receipt_signing_public_key(&node_id, &receipt_signing_public_key_proto)
+            .map_err(|err| crate::mesh_lifecycle::LifecycleError::Other(err.into()))?;
+        Ok(descriptor)
     }
 
     pub async fn transition_node_descriptor(
@@ -502,6 +511,33 @@ impl Persistence {
         Ok(descriptor)
     }
 
+    pub async fn create_host_alias_descriptor_in_transaction(
+        &self,
+        routing_config: &crate::routing::RoutingConfig,
+        input: crate::mesh_lifecycle::CreateHostAliasDescriptor,
+        transaction_id: &str,
+        principal: &str,
+    ) -> crate::mesh_lifecycle::LifecycleResult<crate::routing::HostAliasDescriptor> {
+        let descriptor = crate::mesh_lifecycle::create_host_alias_in_transaction(
+            &self.storage,
+            routing_config,
+            input,
+            transaction_id,
+            principal,
+        )
+        .await?;
+        mesh_directory::write_host_alias_descriptor_in_transaction(
+            &self.storage,
+            &descriptor,
+            true,
+            transaction_id,
+            principal,
+        )
+        .await
+        .map_err(mesh_directory_lifecycle_error)?;
+        Ok(descriptor)
+    }
+
     pub async fn transition_host_alias_descriptor(
         &self,
         hostname: &str,
@@ -530,6 +566,35 @@ impl Persistence {
                 permit: &permit,
                 signing_key: &self.partition_owner_signing_key,
             },
+        )
+        .await
+        .map_err(mesh_directory_lifecycle_error)?;
+        Ok(descriptor)
+    }
+
+    pub async fn transition_host_alias_descriptor_in_transaction(
+        &self,
+        hostname: &str,
+        expected_generation: u64,
+        target: crate::routing::HostAliasState,
+        transaction_id: &str,
+        principal: &str,
+    ) -> crate::mesh_lifecycle::LifecycleResult<crate::routing::HostAliasDescriptor> {
+        let descriptor = crate::mesh_lifecycle::transition_host_alias_in_transaction(
+            &self.storage,
+            hostname,
+            expected_generation,
+            target,
+            transaction_id,
+            principal,
+        )
+        .await?;
+        mesh_directory::write_host_alias_descriptor_in_transaction(
+            &self.storage,
+            &descriptor,
+            false,
+            transaction_id,
+            principal,
         )
         .await
         .map_err(mesh_directory_lifecycle_error)?;

@@ -1,10 +1,10 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{Notify, mpsc::Sender};
+use tokio::sync::{Notify, OnceCell, mpsc::Sender};
 
 use crate::{
     append_journal, authz_journal, authz_repair,
@@ -13,7 +13,7 @@ use crate::{
     cluster::MetadataEvent,
     config::Config,
     control_journal,
-    core_store::{CoreObjectRef, CoreStore, PutBlob},
+    core_store::{CoreObjectRef, CoreStore},
     directory_repair,
     embedding_provider::EmbeddingProviderRegistry,
     hf_journal, index_builder, index_diagnostic_journal, index_journal, index_repair,
@@ -36,6 +36,7 @@ use crate::{
 pub struct Persistence {
     storage: Storage,
     cache: MetadataCache,
+    core_store: Arc<OnceCell<CoreStore>>,
     event_publisher: Option<Sender<MetadataEvent>>,
     task_notify: Arc<Notify>,
     mesh_id: String,
@@ -179,7 +180,7 @@ pub struct Object {
     pub record_hash: String,
     pub created_at: DateTime<Utc>,
     pub deleted_at: Option<DateTime<Utc>>,
-    pub storage_class: Option<i16>,
+    pub storage_class: Option<String>,
     pub user_meta: Option<JsonValue>,
     pub shard_map: Option<JsonValue>,
     pub checksum: Option<Vec<u8>>,
@@ -212,6 +213,7 @@ struct ObjectVersionRecordHashInput<'a> {
     size: i64,
     etag: &'a str,
     content_type: Option<&'a str>,
+    storage_class: Option<&'a str>,
     user_metadata_hash: &'a str,
     index_policy_snapshot: &'a str,
     authz_revision: i64,
@@ -496,6 +498,10 @@ fn object_version_record_hash(input: ObjectVersionRecordHashInput<'_>) -> String
         hasher.update(content_type.as_bytes());
     }
     hasher.update(&[0]);
+    if let Some(storage_class) = input.storage_class {
+        hasher.update(storage_class.as_bytes());
+    }
+    hasher.update(&[0]);
     hasher.update(input.user_metadata_hash.as_bytes());
     hasher.update(input.index_policy_snapshot.as_bytes());
     hasher.update(&input.authz_revision.to_le_bytes());
@@ -510,15 +516,6 @@ fn user_metadata_hash(user_meta: Option<&JsonValue>) -> String {
     blake3::hash(&canonical_json_bytes(user_meta))
         .to_hex()
         .to_string()
-}
-
-fn core_object_ref_to_shard_map(object_ref: &CoreObjectRef) -> JsonValue {
-    serde_json::json!({
-        "schema": "anvil.core.object_ref.v1",
-        "hash": object_ref.hash,
-        "logical_size": object_ref.logical_size,
-        "manifest_ref": object_ref.manifest_ref,
-    })
 }
 
 fn is_retryable_partition_fence_error(error: &anyhow::Error) -> bool {

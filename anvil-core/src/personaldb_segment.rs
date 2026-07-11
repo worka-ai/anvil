@@ -1,20 +1,30 @@
-use crate::core_store::{
-    CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
-    WriteLogicalFileRequest, core_object_ref_from_logical_file_manifest,
-};
+use crate::core_store::{CorePipelinePolicy, CoreStore, CoreTraceContext};
 use crate::formats::{
-    BinaryEnvelopeHeader, BinaryFileFooter, COMMON_FOOTER_LEN, COMMON_HEADER_LEN, FileFamily,
-    Hash32, hash32,
+    FileFamily, Hash32, decode_writer_segment, encode_writer_segment_header, hash32,
+    header_field_string, header_field_u64,
     personaldb::{PersonalDbLogRecord, validate_personaldb_log_chain},
+    required_header_string, required_header_u64, single_body_range_index,
+    table::{TableRow, WriterBodyTable, decode_writer_body_tables, encode_writer_body_tables},
+    unix_nanos_from_rfc3339,
+    writer::{
+        WriterFamily, WriterSegmentBuildInput, build_writer_segment_logical_file,
+        canonical_logical_file_id,
+    },
+};
+use crate::personaldb_coremeta::{
+    list_personaldb_data_locator_rows, read_personaldb_data_locator_bytes,
+    read_personaldb_data_locator_row,
+    write_personaldb_logical_file_as_data_locator_with_preconditions,
 };
 use crate::storage::Storage;
 use anyhow::{Result, anyhow};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
 const PERSONALDB_LOG_SEGMENT_REF_PREFIX: &str = "personaldb_log_segment:";
-const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
+const TABLE_PERSONALDB_GROUP_DESCRIPTOR: u16 = 0x0601;
+const TABLE_PERSONALDB_CHANGESET: u16 = 0x0602;
+const TABLE_PERSONALDB_WITNESS_RECORD: u16 = 0x0605;
+const TABLE_PERSONALDB_OWNER_TRANSFER: u16 = 0x0606;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersonalDbLogSegmentHeader {
@@ -65,7 +75,7 @@ pub async fn write_personaldb_log_segment(
         .previous_log_hash;
     let policy_epoch = common_policy_epoch(input.records)?;
     let membership_epoch = common_membership_epoch(input.records)?;
-    let body = encode_log_segment_body(input.records);
+    let body = encode_log_segment_body(input.records)?;
     let segment_hash = hash32(&body);
     let ref_name = personaldb_log_segment_ref_name(
         input.tenant_id,
@@ -74,6 +84,12 @@ pub async fn write_personaldb_log_segment(
         end_log_index,
         &hex::encode(segment_hash),
     )?;
+    let logical_file_id = canonical_logical_file_id(
+        WriterFamily::PersonalDb,
+        end_log_index,
+        &ref_name,
+        &segment_hash,
+    );
 
     let header = PersonalDbLogSegmentHeader {
         tenant_id: input.tenant_id.to_string(),
@@ -85,58 +101,56 @@ pub async fn write_personaldb_log_segment(
         membership_epoch,
         schema_hash: hex::encode(input.schema_hash),
         source_fence_token: input.source_fence_token,
-        codec: "none".to_string(),
+        codec: "writer-body-table-v1".to_string(),
         created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
     };
-    let header_json = serde_json::to_vec(&header)?;
-    let envelope = BinaryEnvelopeHeader::new(FileFamily::PersonalDbLogSegment, 0, 0, header_json);
-    let encoded_header = envelope.encode();
     let (first_hash, last_hash) = record_hash_bounds(input.records);
-    let footer = BinaryFileFooter::new(
-        &encoded_header,
-        &body,
+    let header_proto = encode_personaldb_log_header_proto(&logical_file_id, &header);
+    let range_index = single_body_range_index(
+        body.len(),
         input.records.len() as u64,
         first_hash,
         last_hash,
+    )?;
+    let transaction_id = format!(
+        "personaldb-log-segment:{}:{}:{}:{}",
+        input.tenant_id, input.database_id, start_log_index, end_log_index
     );
-
-    let mut bytes = Vec::with_capacity(encoded_header.len() + body.len() + COMMON_FOOTER_LEN);
-    bytes.extend_from_slice(&encoded_header);
-    bytes.extend_from_slice(&body);
-    bytes.extend_from_slice(&footer.encode());
-    let store = CoreStore::new(storage.clone()).await?;
-    let manifest = store
-        .write_logical_file(WriteLogicalFileRequest {
-            writer_family: "personaldb".to_string(),
-            generation: end_log_index,
-            logical_file_id: ref_name.clone(),
-            source: bytes,
-            range_hints: Vec::new(),
-            pipeline_policy: CorePipelinePolicy::default(),
-            trace_context: CoreTraceContext::default(),
-            boundary_values: Vec::new(),
-            mutation_id: format!(
-                "personaldb-log-segment:{}:{}:{}:{}",
-                input.tenant_id, input.database_id, start_log_index, end_log_index
-            ),
-            region_id: "local".to_string(),
-        })
-        .await?;
-    let object_ref = core_object_ref_from_logical_file_manifest(&manifest);
-    store
-        .compare_and_swap_ref(CompareAndSwapRef {
-            ref_name: ref_name.clone(),
-            expected_generation: None,
-            expected_target: None,
-            require_absent: true,
-            require_present: false,
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-            new_target: encode_core_object_ref_target(&object_ref)?,
-            transaction_id: None,
-        })
-        .await?;
+    let built_segment = build_writer_segment_logical_file(WriterSegmentBuildInput {
+        file_family: FileFamily::PersonalDbLogSegment,
+        writer_family: WriterFamily::PersonalDb,
+        writer_generation: end_log_index,
+        logical_file_id,
+        header_proto,
+        body,
+        range_index,
+        record_count: input.records.len() as u64,
+        first_record_hash: first_hash,
+        last_record_hash: last_hash,
+        boundary_values: Vec::new(),
+        mutation_id: transaction_id.clone(),
+        region_id: "local".to_string(),
+        pipeline_policy: CorePipelinePolicy::default(),
+        trace_context: CoreTraceContext::default(),
+    })?;
+    write_personaldb_logical_file_as_data_locator_with_preconditions(
+        storage,
+        input.tenant_id,
+        input.database_id,
+        &ref_name,
+        "log_segment",
+        built_segment
+            .logical_file
+            .into_write_logical_file_request()?,
+        hex::encode(segment_hash),
+        vec![
+            format!("start_log_index:{start_log_index:020}"),
+            format!("end_log_index:{end_log_index:020}"),
+        ],
+        transaction_id,
+        &[],
+    )
+    .await?;
     Ok(ref_name)
 }
 
@@ -144,16 +158,15 @@ pub async fn read_personaldb_log_segment(
     storage: &Storage,
     segment_ref: &str,
 ) -> Result<DecodedPersonalDbLogSegment> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let ref_value = store
-        .read_ref(segment_ref)
-        .await?
-        .ok_or_else(|| anyhow!("personaldb log segment ref is missing"))?;
-    let bytes = store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
-        })
-        .await?;
+    let (tenant_id, database_id) = personaldb_log_segment_ref_scope(segment_ref)?;
+    let row = read_personaldb_data_locator_row(storage, tenant_id, &database_id, segment_ref)?
+        .ok_or_else(|| anyhow!("personaldb log segment CoreMeta row is missing"))?;
+    if row.data_kind != "log_segment" {
+        return Err(anyhow!(
+            "personaldb log segment locator has wrong data kind"
+        ));
+    }
+    let bytes = read_personaldb_data_locator_bytes(storage, &row).await?;
     decode_personaldb_log_segment(&bytes)
 }
 
@@ -162,58 +175,116 @@ pub async fn list_personaldb_log_segment_refs(
     tenant_id: i64,
     database_id: &str,
 ) -> Result<Vec<String>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let mut refs = store
-        .list_ref_names(&personaldb_log_segment_ref_prefix(tenant_id, database_id)?)
-        .await?;
+    let prefix = personaldb_log_segment_ref_prefix(tenant_id, database_id)?;
+    let mut refs = list_personaldb_data_locator_rows(storage, tenant_id, database_id)?
+        .into_iter()
+        .filter(|row| row.data_kind == "log_segment" && row.data_id.starts_with(&prefix))
+        .map(|row| row.data_id)
+        .collect::<Vec<_>>();
     refs.sort();
     Ok(refs)
 }
 
 pub fn decode_personaldb_log_segment(bytes: &[u8]) -> Result<DecodedPersonalDbLogSegment> {
-    let envelope = BinaryEnvelopeHeader::decode(bytes)?;
-    if envelope.family != FileFamily::PersonalDbLogSegment {
-        return Err(anyhow!("personaldb log segment file family mismatch"));
-    }
-    if bytes.len() < COMMON_FOOTER_LEN {
-        return Err(anyhow!("personaldb log segment is shorter than footer"));
-    }
-    let header_end = COMMON_HEADER_LEN
-        .checked_add(envelope.header_json.len())
-        .ok_or_else(|| anyhow!("personaldb log segment header length overflow"))?;
-    let footer_start = bytes
-        .len()
-        .checked_sub(COMMON_FOOTER_LEN)
-        .ok_or_else(|| anyhow!("personaldb log segment footer length overflow"))?;
-    if footer_start < header_end {
-        return Err(anyhow!("personaldb log segment body overlaps header"));
-    }
-    let encoded_header = &bytes[..header_end];
-    let body = &bytes[header_end..footer_start];
-    let footer = BinaryFileFooter::decode(&bytes[footer_start..])?;
-    footer.verify(encoded_header, body)?;
-    let header: PersonalDbLogSegmentHeader = serde_json::from_slice(&envelope.header_json)?;
-    let records = decode_log_segment_body(body)?;
+    let segment = decode_writer_segment(bytes, FileFamily::PersonalDbLogSegment)?;
+    let header = decode_personaldb_log_header_proto(&segment.header)?;
+    let records = decode_log_segment_body(segment.body)?;
     validate_log_segment_records(&records)?;
     validate_header_matches_records(&header, &records)?;
     Ok(DecodedPersonalDbLogSegment { header, records })
 }
 
-fn encode_log_segment_body(records: &[PersonalDbLogRecord]) -> Vec<u8> {
-    let len = records.iter().map(|record| record.encode().len()).sum();
-    let mut out = Vec::with_capacity(len);
-    for record in records {
-        out.extend_from_slice(&record.encode());
-    }
-    out
+fn encode_personaldb_log_header_proto(
+    logical_file_id: &str,
+    header: &PersonalDbLogSegmentHeader,
+) -> Vec<u8> {
+    encode_writer_segment_header(
+        "anvil.personaldb.log_segment_header.v1",
+        logical_file_id,
+        FileFamily::PersonalDbLogSegment,
+        header.end_log_index,
+        None,
+        None,
+        unix_nanos_from_rfc3339(&header.created_at),
+        vec![
+            header_field_string("tenant_id", header.tenant_id.clone()),
+            header_field_string("database_id", header.database_id.clone()),
+            header_field_u64("start_log_index", header.start_log_index),
+            header_field_string("base_log_hash", header.base_log_hash.clone()),
+            header_field_u64("policy_epoch", header.policy_epoch),
+            header_field_u64("membership_epoch", header.membership_epoch),
+            header_field_string("schema_hash", header.schema_hash.clone()),
+            header_field_u64("source_fence_token", header.source_fence_token),
+            header_field_string("codec", header.codec.clone()),
+            header_field_string("created_at", header.created_at.clone()),
+        ],
+    )
 }
 
-fn decode_log_segment_body(mut input: &[u8]) -> Result<Vec<PersonalDbLogRecord>> {
+fn decode_personaldb_log_header_proto(
+    header: &crate::formats::WriterSegmentHeaderProto,
+) -> Result<PersonalDbLogSegmentHeader> {
+    Ok(PersonalDbLogSegmentHeader {
+        tenant_id: required_header_string(header, "tenant_id")?,
+        database_id: required_header_string(header, "database_id")?,
+        start_log_index: required_header_u64(header, "start_log_index")?,
+        end_log_index: header.writer_generation,
+        base_log_hash: required_header_string(header, "base_log_hash")?,
+        policy_epoch: required_header_u64(header, "policy_epoch")?,
+        membership_epoch: required_header_u64(header, "membership_epoch")?,
+        schema_hash: required_header_string(header, "schema_hash")?,
+        source_fence_token: required_header_u64(header, "source_fence_token")?,
+        codec: required_header_string(header, "codec")?,
+        created_at: required_header_string(header, "created_at")?,
+    })
+}
+
+fn encode_log_segment_body(records: &[PersonalDbLogRecord]) -> Result<Vec<u8>> {
+    let changeset_rows = records
+        .iter()
+        .map(|record| TableRow {
+            key: record.log_index.to_be_bytes().to_vec(),
+            value: record.encode(),
+        })
+        .collect();
+    encode_writer_body_tables(&[
+        WriterBodyTable {
+            table_id: TABLE_PERSONALDB_GROUP_DESCRIPTOR,
+            row_type_id: TABLE_PERSONALDB_GROUP_DESCRIPTOR,
+            rows: Vec::new(),
+        },
+        WriterBodyTable {
+            table_id: TABLE_PERSONALDB_CHANGESET,
+            row_type_id: TABLE_PERSONALDB_CHANGESET,
+            rows: changeset_rows,
+        },
+        WriterBodyTable {
+            table_id: TABLE_PERSONALDB_WITNESS_RECORD,
+            row_type_id: TABLE_PERSONALDB_WITNESS_RECORD,
+            rows: Vec::new(),
+        },
+        WriterBodyTable {
+            table_id: TABLE_PERSONALDB_OWNER_TRANSFER,
+            row_type_id: TABLE_PERSONALDB_OWNER_TRANSFER,
+            rows: Vec::new(),
+        },
+    ])
+    .map_err(anyhow::Error::from)
+}
+
+fn decode_log_segment_body(input: &[u8]) -> Result<Vec<PersonalDbLogRecord>> {
     let mut records = Vec::new();
-    while !input.is_empty() {
-        let (record, used) = PersonalDbLogRecord::decode(input)?;
-        records.push(record);
-        input = &input[used..];
+    for table in decode_writer_body_tables(input)? {
+        if table.table_id != TABLE_PERSONALDB_CHANGESET {
+            continue;
+        }
+        for row in table.rows {
+            let (record, used) = PersonalDbLogRecord::decode(&row.value)?;
+            if used != row.value.len() {
+                return Err(anyhow!("personaldb log row has trailing bytes"));
+            }
+            records.push(record);
+        }
     }
     Ok(records)
 }
@@ -256,6 +327,32 @@ fn personaldb_log_segment_ref_name(
     ))
 }
 
+fn personaldb_log_segment_ref_scope(segment_ref: &str) -> Result<(i64, String)> {
+    let tenant_marker = "tenant:";
+    let database_marker = ":database:";
+    let tenant_start = segment_ref
+        .find(tenant_marker)
+        .ok_or_else(|| anyhow!("personaldb log segment ref is missing tenant"))?
+        + tenant_marker.len();
+    let database_marker_offset = segment_ref[tenant_start..]
+        .find(database_marker)
+        .ok_or_else(|| anyhow!("personaldb log segment ref is missing database"))?
+        + tenant_start;
+    let tenant_id = segment_ref[tenant_start..database_marker_offset]
+        .parse::<i64>()
+        .map_err(|_| anyhow!("personaldb log segment ref tenant is invalid"))?;
+    let database_start = database_marker_offset + database_marker.len();
+    let database_end = segment_ref[database_start..]
+        .find(':')
+        .map(|offset| database_start + offset)
+        .unwrap_or(segment_ref.len());
+    let database_id = segment_ref[database_start..database_end].to_string();
+    if !segment_ref.starts_with(&personaldb_log_segment_ref_prefix(tenant_id, &database_id)?) {
+        return Err(anyhow!("personaldb log segment ref has invalid prefix"));
+    }
+    Ok((tenant_id, database_id))
+}
+
 fn require_safe_component(value: &str, field: &'static str) -> Result<()> {
     if value.is_empty()
         || value == "."
@@ -275,20 +372,6 @@ fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
         return Err(anyhow!("{field} must be hex32"));
     }
     Ok(())
-}
-
-fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
-    Ok(format!(
-        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
-    ))
-}
-
-fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
-    let encoded = target
-        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
-        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
-    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
 }
 
 fn validate_header_matches_records(
@@ -376,8 +459,8 @@ mod tests {
             [2; 32],
             [3; 32],
             format!("log/payloads/by-index/{log_index:020}-payload.sqlite-changeset").into_bytes(),
-            format!("log/certificates/{log_index:020}-cert.certificate.json").into_bytes(),
-            format!(r#"{{"log_index":{log_index}}}"#).into_bytes(),
+            format!("log/certificates/{log_index:020}-cert.certificate.pb").into_bytes(),
+            format!("personaldb-test-certificate:{log_index}").into_bytes(),
         )
     }
 
@@ -478,19 +561,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let store = CoreStore::new(storage.clone()).await.unwrap();
-        let ref_value = store
-            .read_ref(&segment_ref)
-            .await
+        let row = read_personaldb_data_locator_row(&storage, 9, "db-alpha", &segment_ref)
             .unwrap()
-            .expect("segment ref exists");
-        let mut bytes = store
-            .get_blob(GetBlob {
-                object_ref: decode_core_object_ref_target(&ref_value.target).unwrap(),
-            })
+            .expect("segment CoreMeta row exists");
+        let mut bytes = read_personaldb_data_locator_bytes(&storage, &row)
             .await
             .unwrap();
-        bytes[COMMON_HEADER_LEN + 1] ^= 1;
+        bytes[crate::formats::WRITER_SEGMENT_FIXED_HEADER_LEN + 1] ^= 1;
         assert!(decode_personaldb_log_segment(&bytes).is_err());
     }
 }

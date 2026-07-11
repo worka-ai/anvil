@@ -1,19 +1,22 @@
 use crate::{
     core_store::{
-        CompareAndSwapRef, CoreMutationPrecondition, CoreObjectRef, CorePipelinePolicy,
-        CoreRefValue, CoreStore, CoreTraceContext, GetBlob, WriteLogicalFileRequest,
+        CF_LEASES_FENCES, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore, CoreMetaTuplePart,
+        CoreMutationPrecondition, TABLE_OWNERSHIP_FENCE_ROW, TABLE_PARTITION_OWNER_ROW,
+        commit_coremeta_batch_for_storage, core_meta_committed_row_common,
+        core_meta_payload_digest, core_meta_root_key_hash, core_meta_tuple_key,
     },
     error_codes::AnvilErrorCode,
-    formats::{JournalFrame, hash32},
+    formats::hash32,
     storage::Storage,
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::{Hmac, Mac};
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::fmt;
+use std::{fmt, sync::LazyLock};
+use tokio::sync::Mutex as TokioMutex;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -26,15 +29,32 @@ pub const OWNERSHIP_CAS_CONFLICT: &str = "OwnershipCasConflict";
 pub const MAX_OWNERSHIP_LEASE_MS: u64 = 120_000;
 
 const OWNERSHIP_LOCK_RETRY_ATTEMPTS: usize = 200;
-const PARTITION_OWNER_REF_PREFIX: &str = "partition_owner:";
-const OWNERSHIP_FENCE_REF_PREFIX: &str = "ownership_fence:";
-const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
+const PARTITION_OWNER_ROW_PREFIX: &str = "partition_owner";
+const OWNERSHIP_FENCE_REF_PREFIX: &str = "ownership_fence";
+static OWNERSHIP_FENCE_META_LOCK: LazyLock<TokioMutex<()>> = LazyLock::new(|| TokioMutex::new(()));
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PartitionOwnerStatus {
     Recovering,
     Ready,
+}
+
+impl PartitionOwnerStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Recovering => "recovering",
+            Self::Ready => "ready",
+        }
+    }
+}
+
+fn partition_owner_status_from_str(value: &str) -> Result<PartitionOwnerStatus> {
+    Ok(match value {
+        "recovering" => PartitionOwnerStatus::Recovering,
+        "ready" => PartitionOwnerStatus::Ready,
+        _ => bail!("unsupported partition owner status {value}"),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -109,6 +129,19 @@ impl OwnershipResourceKind {
             Self::WatchPartition => "watch_partition",
         }
     }
+}
+
+fn ownership_resource_kind_from_str(value: &str) -> Result<OwnershipResourceKind> {
+    Ok(match value {
+        "control_partition" => OwnershipResourceKind::ControlPartition,
+        "bucket_primary" => OwnershipResourceKind::BucketPrimary,
+        "object_partition" => OwnershipResourceKind::ObjectPartition,
+        "index_partition" => OwnershipResourceKind::IndexPartition,
+        "personaldb_group" => OwnershipResourceKind::PersonalDbGroup,
+        "task_queue" => OwnershipResourceKind::TaskQueue,
+        "watch_partition" => OwnershipResourceKind::WatchPartition,
+        _ => bail!("unsupported ownership resource kind {value}"),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -235,6 +268,117 @@ impl OwnershipFenceRecord {
     }
 }
 
+impl OwnershipFenceState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Transferring => "transferring",
+            Self::Draining => "draining",
+            Self::Expired => "expired",
+            Self::Released => "released",
+        }
+    }
+}
+
+fn ownership_fence_state_from_str(value: &str) -> Result<OwnershipFenceState> {
+    Ok(match value {
+        "active" => OwnershipFenceState::Active,
+        "transferring" => OwnershipFenceState::Transferring,
+        "draining" => OwnershipFenceState::Draining,
+        "expired" => OwnershipFenceState::Expired,
+        "released" => OwnershipFenceState::Released,
+        _ => bail!("unsupported ownership fence state {value}"),
+    })
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct OwnershipResourceProto {
+    #[prost(string, tag = "1")]
+    resource_kind: String,
+    #[prost(string, tag = "2")]
+    resource_id: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct OwnershipPrincipalProto {
+    #[prost(int64, tag = "1")]
+    tenant_id: i64,
+    #[prost(string, tag = "2")]
+    principal_kind: String,
+    #[prost(string, tag = "3")]
+    principal_id: String,
+    #[prost(string, tag = "4")]
+    actor_instance_id: String,
+    #[prost(string, tag = "5")]
+    display_name: String,
+    #[prost(string, tag = "6")]
+    region: String,
+    #[prost(string, tag = "7")]
+    cell: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct OwnershipFenceRecordProto {
+    #[prost(message, optional, tag = "1")]
+    common: Option<crate::core_store::CoreMetaRowCommonProto>,
+    #[prost(uint32, tag = "2")]
+    format_version: u32,
+    #[prost(message, optional, tag = "3")]
+    resource: Option<OwnershipResourceProto>,
+    #[prost(message, optional, tag = "4")]
+    owner: Option<OwnershipPrincipalProto>,
+    #[prost(uint64, tag = "5")]
+    fence: u64,
+    #[prost(string, tag = "6")]
+    state: String,
+    #[prost(int64, tag = "7")]
+    lease_expires_at_nanos: i64,
+    #[prost(int64, tag = "8")]
+    last_heartbeat_at_nanos: i64,
+    #[prost(uint64, tag = "9")]
+    generation: u64,
+    #[prost(string, optional, tag = "10")]
+    last_operation: Option<String>,
+    #[prost(string, optional, tag = "11")]
+    last_idempotency_key: Option<String>,
+    #[prost(message, optional, tag = "12")]
+    last_actor: Option<OwnershipPrincipalProto>,
+    #[prost(string, optional, tag = "13")]
+    ownership_hash: Option<String>,
+    #[prost(string, optional, tag = "14")]
+    ownership_signature: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct PartitionOwnerRecordProto {
+    #[prost(message, optional, tag = "1")]
+    common: Option<crate::core_store::CoreMetaRowCommonProto>,
+    #[prost(uint32, tag = "2")]
+    format_version: u32,
+    #[prost(string, tag = "3")]
+    partition_family: String,
+    #[prost(string, tag = "4")]
+    partition_id: String,
+    #[prost(string, tag = "5")]
+    owner_node_id: String,
+    #[prost(uint64, tag = "6")]
+    fence_token: u64,
+    #[prost(uint64, tag = "7")]
+    recovery_epoch: u64,
+    #[prost(string, tag = "8")]
+    status: String,
+    #[prost(uint64, tag = "9")]
+    recovered_through_sequence: u64,
+    #[prost(string, tag = "10")]
+    recovered_manifest_hash: String,
+    #[prost(int64, tag = "11")]
+    updated_at_nanos: i64,
+    #[prost(string, optional, tag = "12")]
+    owner_hash: Option<String>,
+    #[prost(string, optional, tag = "13")]
+    owner_signature: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnershipFenceOutcome {
     pub record: OwnershipFenceRecord,
@@ -355,14 +499,194 @@ pub fn hash_partition_owner(owner: &PartitionOwnerState) -> Result<String> {
     let mut unsigned = owner.clone();
     unsigned.owner_hash = None;
     unsigned.owner_signature = None;
-    Ok(hex::encode(hash32(&serde_json::to_vec(&unsigned)?)))
+    Ok(hex::encode(hash32(&encode_partition_owner_record(
+        &unsigned,
+    )?)))
 }
 
 pub fn hash_ownership_fence(record: &OwnershipFenceRecord) -> Result<String> {
     let mut unsigned = record.clone();
     unsigned.ownership_hash = None;
     unsigned.ownership_signature = None;
-    Ok(hex::encode(hash32(&serde_json::to_vec(&unsigned)?)))
+    Ok(hex::encode(hash32(&encode_ownership_fence_record(
+        &unsigned,
+    )?)))
+}
+
+fn encode_partition_owner_record(owner: &PartitionOwnerState) -> Result<Vec<u8>> {
+    Ok(partition_owner_to_proto(owner).encode_to_vec())
+}
+
+fn decode_partition_owner_record(bytes: &[u8]) -> Result<PartitionOwnerState> {
+    let proto = PartitionOwnerRecordProto::decode(bytes)?;
+    if proto.encode_to_vec() != bytes {
+        bail!("partition owner record is not deterministic protobuf");
+    }
+    partition_owner_from_proto(proto)
+}
+
+fn partition_owner_to_proto(owner: &PartitionOwnerState) -> PartitionOwnerRecordProto {
+    PartitionOwnerRecordProto {
+        common: Some(core_meta_committed_row_common(
+            "system",
+            core_meta_root_key_hash(&format!(
+                "partition-owner/{}/{}",
+                owner.partition_family, owner.partition_id
+            )),
+            owner.fence_token,
+            owner.owner_node_id.clone(),
+            owner.updated_at_nanos.max(0) as u64,
+        )),
+        format_version: u32::from(owner.format_version),
+        partition_family: owner.partition_family.clone(),
+        partition_id: owner.partition_id.clone(),
+        owner_node_id: owner.owner_node_id.clone(),
+        fence_token: owner.fence_token,
+        recovery_epoch: owner.recovery_epoch,
+        status: owner.status.as_str().to_string(),
+        recovered_through_sequence: owner.recovered_through_sequence,
+        recovered_manifest_hash: owner.recovered_manifest_hash.clone(),
+        updated_at_nanos: owner.updated_at_nanos,
+        owner_hash: owner.owner_hash.clone(),
+        owner_signature: owner.owner_signature.clone(),
+    }
+}
+
+fn partition_owner_from_proto(proto: PartitionOwnerRecordProto) -> Result<PartitionOwnerState> {
+    proto
+        .common
+        .as_ref()
+        .ok_or_else(|| anyhow!("partition owner row missing CoreMeta common"))?;
+    Ok(PartitionOwnerState {
+        format_version: u16::try_from(proto.format_version)
+            .map_err(|_| anyhow!("partition owner format version exceeds u16"))?,
+        partition_family: proto.partition_family,
+        partition_id: proto.partition_id,
+        owner_node_id: proto.owner_node_id,
+        fence_token: proto.fence_token,
+        recovery_epoch: proto.recovery_epoch,
+        status: partition_owner_status_from_str(&proto.status)?,
+        recovered_through_sequence: proto.recovered_through_sequence,
+        recovered_manifest_hash: proto.recovered_manifest_hash,
+        updated_at_nanos: proto.updated_at_nanos,
+        owner_hash: proto.owner_hash,
+        owner_signature: proto.owner_signature,
+    })
+}
+
+fn encode_ownership_fence_record(record: &OwnershipFenceRecord) -> Result<Vec<u8>> {
+    let proto = ownership_fence_record_to_proto(record)?;
+    Ok(proto.encode_to_vec())
+}
+
+fn decode_ownership_fence_record(bytes: &[u8]) -> Result<OwnershipFenceRecord> {
+    let proto = OwnershipFenceRecordProto::decode(bytes)?;
+    if proto.encode_to_vec() != bytes {
+        bail!("ownership fence record is not deterministic protobuf");
+    }
+    ownership_fence_record_from_proto(proto)
+}
+
+fn ownership_fence_record_to_proto(
+    record: &OwnershipFenceRecord,
+) -> Result<OwnershipFenceRecordProto> {
+    Ok(OwnershipFenceRecordProto {
+        common: Some(core_meta_committed_row_common(
+            format!("tenant/{}", record.owner.tenant_id),
+            core_meta_root_key_hash(&format!(
+                "ownership-fence/{}/{}",
+                record.resource.resource_kind.as_str(),
+                record.resource.resource_id
+            )),
+            record.generation,
+            record.last_idempotency_key.clone().unwrap_or_default(),
+            record.last_heartbeat_at_nanos.max(0) as u64,
+        )),
+        format_version: u32::from(record.format_version),
+        resource: Some(ownership_resource_to_proto(&record.resource)),
+        owner: Some(ownership_principal_to_proto(&record.owner)),
+        fence: record.fence,
+        state: record.state.as_str().to_string(),
+        lease_expires_at_nanos: record.lease_expires_at_nanos,
+        last_heartbeat_at_nanos: record.last_heartbeat_at_nanos,
+        generation: record.generation,
+        last_operation: record.last_operation.clone(),
+        last_idempotency_key: record.last_idempotency_key.clone(),
+        last_actor: record.last_actor.as_ref().map(ownership_principal_to_proto),
+        ownership_hash: record.ownership_hash.clone(),
+        ownership_signature: record.ownership_signature.clone(),
+    })
+}
+
+fn ownership_fence_record_from_proto(
+    proto: OwnershipFenceRecordProto,
+) -> Result<OwnershipFenceRecord> {
+    proto
+        .common
+        .as_ref()
+        .ok_or_else(|| anyhow!("ownership fence row missing CoreMeta common"))?;
+    Ok(OwnershipFenceRecord {
+        format_version: u16::try_from(proto.format_version)
+            .map_err(|_| anyhow!("ownership fence format version exceeds u16"))?,
+        resource: ownership_resource_from_proto(
+            proto
+                .resource
+                .ok_or_else(|| anyhow!("ownership fence record is missing resource"))?,
+        )?,
+        owner: ownership_principal_from_proto(
+            proto
+                .owner
+                .ok_or_else(|| anyhow!("ownership fence record is missing owner"))?,
+        ),
+        fence: proto.fence,
+        state: ownership_fence_state_from_str(&proto.state)?,
+        lease_expires_at_nanos: proto.lease_expires_at_nanos,
+        last_heartbeat_at_nanos: proto.last_heartbeat_at_nanos,
+        generation: proto.generation,
+        last_operation: proto.last_operation,
+        last_idempotency_key: proto.last_idempotency_key,
+        last_actor: proto.last_actor.map(ownership_principal_from_proto),
+        ownership_hash: proto.ownership_hash,
+        ownership_signature: proto.ownership_signature,
+    })
+}
+
+fn ownership_resource_to_proto(resource: &OwnershipResource) -> OwnershipResourceProto {
+    OwnershipResourceProto {
+        resource_kind: resource.resource_kind.as_str().to_string(),
+        resource_id: resource.resource_id.clone(),
+    }
+}
+
+fn ownership_resource_from_proto(proto: OwnershipResourceProto) -> Result<OwnershipResource> {
+    Ok(OwnershipResource {
+        resource_kind: ownership_resource_kind_from_str(&proto.resource_kind)?,
+        resource_id: proto.resource_id,
+    })
+}
+
+fn ownership_principal_to_proto(principal: &OwnershipPrincipal) -> OwnershipPrincipalProto {
+    OwnershipPrincipalProto {
+        tenant_id: principal.tenant_id,
+        principal_kind: principal.principal_kind.clone(),
+        principal_id: principal.principal_id.clone(),
+        actor_instance_id: principal.actor_instance_id.clone(),
+        display_name: principal.display_name.clone(),
+        region: principal.region.clone(),
+        cell: principal.cell.clone(),
+    }
+}
+
+fn ownership_principal_from_proto(proto: OwnershipPrincipalProto) -> OwnershipPrincipal {
+    OwnershipPrincipal {
+        tenant_id: proto.tenant_id,
+        principal_kind: proto.principal_kind,
+        principal_id: proto.principal_id,
+        actor_instance_id: proto.actor_instance_id,
+        display_name: proto.display_name,
+        region: proto.region,
+        cell: proto.cell,
+    }
 }
 
 pub async fn acquire_ownership(
@@ -649,19 +973,15 @@ pub async fn list_partition_owners(
     storage: &Storage,
     signing_key: &[u8],
 ) -> Result<Vec<PartitionOwnerState>> {
-    let store = CoreStore::new(storage.clone()).await?;
     let mut out = Vec::new();
-    for ref_name in store.list_ref_names(PARTITION_OWNER_REF_PREFIX).await? {
-        let Some((partition_family, partition_id)) = parse_partition_owner_ref_name(&ref_name)?
-        else {
-            continue;
-        };
-        let Some((_, owner)) =
-            read_partition_owner_state(storage, &partition_family, &partition_id, signing_key)
-                .await?
-        else {
-            continue;
-        };
+    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
+    for record in meta.scan_prefix(
+        CF_LEASES_FENCES,
+        TABLE_PARTITION_OWNER_ROW,
+        &partition_owner_row_prefix()?,
+    )? {
+        let owner = decode_partition_owner_record(&record.payload)?;
+        owner.verify(signing_key)?;
         out.push(owner);
     }
     out.sort_by(|left, right| {
@@ -692,12 +1012,25 @@ pub async fn force_expire_partition_owner_for_node(
     now_nanos: i64,
     signing_key: &[u8],
 ) -> Result<Option<PartitionOwnerState>> {
+    let failover_started_at = std::time::Instant::now();
     let Some((ref_value, mut owner)) =
         read_partition_owner_state(storage, partition_family, partition_id, signing_key).await?
     else {
+        crate::perf::record_partition_failover_duration(
+            "unknown",
+            "unknown",
+            "owner_absent",
+            failover_started_at.elapsed(),
+        );
         return Ok(None);
     };
     if owner.owner_node_id != owner_node_id {
+        crate::perf::record_partition_failover_duration(
+            "unknown",
+            "unknown",
+            "owner_mismatch",
+            failover_started_at.elapsed(),
+        );
         return Ok(None);
     }
     owner.owner_node_id = format!("expired-{owner_node_id}");
@@ -707,6 +1040,16 @@ pub async fn force_expire_partition_owner_for_node(
     owner.updated_at_nanos = now_nanos;
     owner = owner.seal(signing_key)?;
     write_partition_owner_state(storage, &owner, Some(&ref_value)).await?;
+    crate::perf::record_root_generation_in_doubt(
+        "partition_owner",
+        partition_id_hash(partition_id),
+    );
+    crate::perf::record_partition_failover_duration(
+        "unknown",
+        "unknown",
+        "forced_expired",
+        failover_started_at.elapsed(),
+    );
     Ok(Some(owner))
 }
 
@@ -714,12 +1057,15 @@ pub async fn list_ownership_fences(
     storage: &Storage,
     signing_key: &[u8],
 ) -> Result<Vec<OwnershipFenceRecord>> {
-    let store = CoreStore::new(storage.clone()).await?;
     let mut out = Vec::new();
-    for ref_name in store.list_ref_names(OWNERSHIP_FENCE_REF_PREFIX).await? {
-        let Some(record) = read_ownership_fence_ref(storage, &ref_name, signing_key).await? else {
-            continue;
-        };
+    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
+    for record in meta.scan_prefix(
+        CF_LEASES_FENCES,
+        TABLE_OWNERSHIP_FENCE_ROW,
+        &ownership_fence_row_prefix()?,
+    )? {
+        let record = decode_ownership_fence_record(&record.payload)?;
+        record.verify(signing_key)?;
         out.push(record);
     }
     out.sort_by(|left, right| {
@@ -754,6 +1100,7 @@ pub async fn acquire_partition_recovery(
     request: PartitionRecoveryAcquire,
     signing_key: &[u8],
 ) -> Result<PartitionOwnerState> {
+    let failover_started_at = std::time::Instant::now();
     validate_recovery_acquire(&request)?;
     let existing = read_partition_owner_state(
         storage,
@@ -790,6 +1137,18 @@ pub async fn acquire_partition_recovery(
         existing.as_ref().map(|(ref_value, _)| ref_value),
     )
     .await?;
+    if existing.is_some() {
+        crate::perf::record_root_generation_in_doubt(
+            "partition_owner",
+            partition_id_hash(&state.partition_id),
+        );
+    }
+    crate::perf::record_partition_failover_duration(
+        "unknown",
+        "unknown",
+        "recovery_acquired",
+        failover_started_at.elapsed(),
+    );
     Ok(state)
 }
 
@@ -804,6 +1163,7 @@ pub async fn publish_partition_ready(
     now_nanos: i64,
     signing_key: &[u8],
 ) -> Result<PartitionOwnerState> {
+    let failover_started_at = std::time::Instant::now();
     let Some((ref_value, mut state)) =
         read_partition_owner_state(storage, partition_family, partition_id, signing_key).await?
     else {
@@ -833,7 +1193,22 @@ pub async fn publish_partition_ready(
     state.updated_at_nanos = now_nanos;
     state = state.seal(signing_key)?;
     write_partition_owner_state(storage, &state, Some(&ref_value)).await?;
+    crate::perf::record_partition_failover_duration(
+        "unknown",
+        "unknown",
+        "ready_published",
+        failover_started_at.elapsed(),
+    );
     Ok(state)
+}
+
+fn partition_id_hash(partition_id: &str) -> u64 {
+    let hash = hash32(partition_id.as_bytes());
+    u64::from_le_bytes(
+        hash[..8]
+            .try_into()
+            .expect("hash32 is at least eight bytes"),
+    )
 }
 
 pub async fn validate_partition_write(
@@ -861,7 +1236,7 @@ pub async fn validate_partition_write(
     validate_write_permit_for_state(&owner, permit, true)
 }
 
-pub async fn partition_write_ref_precondition(
+pub async fn partition_write_precondition(
     storage: &Storage,
     permit: &PartitionWritePermit,
     signing_key: &[u8],
@@ -877,26 +1252,27 @@ pub async fn partition_write_ref_precondition(
         code: AnvilErrorCode::PartitionNotOwned,
         reason: "partition owner state cannot be read",
     })?;
-    let Some((ref_value, owner)) = state else {
+    let Some((payload, owner)) = state else {
         return Err(FenceRejection {
             code: AnvilErrorCode::PartitionNotOwned,
             reason: "partition owner state is absent",
         });
     };
     validate_write_permit_for_state(&owner, permit, true)?;
-    Ok(CoreMutationPrecondition::Ref {
-        ref_name: partition_owner_ref_name(&permit.partition_family, &permit.partition_id)
+    Ok(CoreMutationPrecondition::CoreMetaRow {
+        cf: CF_LEASES_FENCES.to_string(),
+        table_id: TABLE_PARTITION_OWNER_ROW,
+        tuple_key: partition_owner_row_key(&permit.partition_family, &permit.partition_id)
             .map_err(|_| FenceRejection {
                 code: AnvilErrorCode::PartitionNotOwned,
-                reason: "partition owner ref cannot be addressed",
+                reason: "partition owner row cannot be addressed",
             })?,
-        expected_generation: Some(ref_value.generation),
-        expected_target: Some(ref_value.target),
+        expected_payload_hash: Some(core_meta_payload_digest(
+            TABLE_PARTITION_OWNER_ROW,
+            &payload,
+        )),
         require_absent: false,
         require_present: true,
-        fence: None,
-        authz_revision: None,
-        source_watch_cursor: None,
     })
 }
 
@@ -947,119 +1323,84 @@ pub async fn read_partition_owner(
     )
 }
 
-pub fn frames_for_recovered_fence(
-    frames: &[JournalFrame],
-    manifest_checkpoint_sequence: u64,
-    current_fence_token: u64,
-) -> Vec<JournalFrame> {
-    frames
-        .iter()
-        .filter(|frame| {
-            frame.partition_sequence > manifest_checkpoint_sequence
-                && frame.fence_token == current_fence_token
-        })
-        .cloned()
-        .collect()
-}
-
-pub fn reject_stale_frames_after_checkpoint(
-    frames: &[JournalFrame],
-    manifest_checkpoint_sequence: u64,
-    current_fence_token: u64,
-) -> Result<(), FenceRejection> {
-    if frames.iter().any(|frame| {
-        frame.partition_sequence > manifest_checkpoint_sequence
-            && frame.fence_token != current_fence_token
-    }) {
-        return Err(FenceRejection {
-            code: AnvilErrorCode::StaleFenceToken,
-            reason: "journal contains stale-fence records after manifest checkpoint",
-        });
-    }
-    Ok(())
-}
-
 async fn read_ownership_fence_state(
     storage: &Storage,
     tenant_id: i64,
     resource: &OwnershipResource,
     signing_key: &[u8],
-) -> Result<Option<(CoreRefValue, OwnershipFenceRecord)>> {
+) -> Result<Option<(Vec<u8>, OwnershipFenceRecord)>> {
     validate_ownership_resource(resource)?;
     if tenant_id < 0 {
         return Err(anyhow!("ownership fence tenant id must be nonnegative"));
     }
-    let ref_name = ownership_fence_ref_name(tenant_id, resource)?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(&ref_name).await? else {
+    let row_key = ownership_fence_row_key(tenant_id, resource)?;
+    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
+    let Some(bytes) = meta.get(CF_LEASES_FENCES, TABLE_OWNERSHIP_FENCE_ROW, &row_key)? else {
         return Ok(None);
     };
-    let object_ref = decode_core_object_ref_target(&ref_value.target)?;
-    let bytes = store.get_blob(GetBlob { object_ref }).await?;
-    let record: OwnershipFenceRecord = serde_json::from_slice(&bytes)?;
+    let record = decode_ownership_fence_record(&bytes)?;
     record.verify(signing_key)?;
     if record.owner.tenant_id != tenant_id || record.resource != *resource {
         return Err(anyhow!("ownership fence ref scope mismatch"));
     }
-    Ok(Some((ref_value, record)))
+    Ok(Some((bytes, record)))
 }
 
 async fn write_ownership_fence_state(
     storage: &Storage,
     record: &OwnershipFenceRecord,
-    expected_ref: Option<&CoreRefValue>,
+    expected_ref: Option<&Vec<u8>>,
 ) -> Result<()> {
-    let ref_name = ownership_fence_ref_name(record.owner.tenant_id, &record.resource)?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let object_ref = store
-        .write_logical_file_ref(WriteLogicalFileRequest {
-            writer_family: "ownership_fence".to_string(),
-            generation: record.generation,
-            logical_file_id: ref_name.clone(),
-            source: serde_json::to_vec_pretty(record)?,
-            range_hints: Vec::new(),
-            pipeline_policy: CorePipelinePolicy::default(),
-            trace_context: CoreTraceContext::default(),
-            boundary_values: Vec::new(),
-            mutation_id: format!(
-                "ownership-fence:{}:{}:{}:{}:{}:{}",
-                record.owner.tenant_id,
-                record.resource.resource_kind.as_str(),
-                record.generation,
-                record.owner.principal_id,
-                record.owner.actor_instance_id,
-                record.ownership_hash.as_deref().unwrap_or("unsealed")
-            ),
-            region_id: "local".to_string(),
-        })
-        .await?;
-    store
-        .compare_and_swap_ref(CompareAndSwapRef {
-            ref_name,
-            expected_generation: expected_ref.map(|value| value.generation),
-            expected_target: expected_ref.map(|value| value.target.clone()),
-            require_absent: expected_ref.is_none(),
-            require_present: expected_ref.is_some(),
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-            new_target: encode_core_object_ref_target(&object_ref)?,
-            transaction_id: None,
-        })
-        .await?;
+    let row_key = ownership_fence_row_key(record.owner.tenant_id, &record.resource)?;
+    let bytes = encode_ownership_fence_record(record)?;
+    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
+    let _guard = OWNERSHIP_FENCE_META_LOCK.lock().await;
+    let current = meta.get(CF_LEASES_FENCES, TABLE_OWNERSHIP_FENCE_ROW, &row_key)?;
+    match (expected_ref, current.as_deref()) {
+        (None, None) => {}
+        (Some(expected), Some(actual)) if expected.as_slice() == actual => {}
+        (None, Some(_)) => bail!("CoreStore ownership fence CAS conflict: row must be absent"),
+        (Some(_), None) => bail!("CoreStore ownership fence CAS conflict: row must be present"),
+        (Some(_), Some(_)) => bail!("CoreStore ownership fence CAS conflict: row changed"),
+    }
+    let op = CoreMetaBatchOp {
+        cf: CF_LEASES_FENCES,
+        table_id: TABLE_OWNERSHIP_FENCE_ROW,
+        tuple_key: &row_key,
+        common: None,
+        kind: CoreMetaBatchOpKind::Put(&bytes),
+    };
+    commit_coremeta_batch_for_storage(
+        storage,
+        &format!(
+            "ownership-fence:{}:{}",
+            record.resource.resource_kind.as_str(),
+            record.generation
+        ),
+        &[op],
+    )
+    .await?;
     Ok(())
 }
 
-fn ownership_fence_ref_name(tenant_id: i64, resource: &OwnershipResource) -> Result<String> {
+fn ownership_fence_row_prefix() -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[CoreMetaTuplePart::Utf8(OWNERSHIP_FENCE_REF_PREFIX)])
+}
+
+fn ownership_fence_row_key(tenant_id: i64, resource: &OwnershipResource) -> Result<Vec<u8>> {
     validate_ownership_resource(resource)?;
     if tenant_id < 0 {
         return Err(anyhow!("ownership fence tenant id must be nonnegative"));
     }
-    Ok(format!(
-        "{OWNERSHIP_FENCE_REF_PREFIX}tenant:{tenant_id}:kind:{}:resource:{}",
-        resource.resource_kind.as_str(),
-        ownership_resource_hash(tenant_id, resource)?
-    ))
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(OWNERSHIP_FENCE_REF_PREFIX),
+        CoreMetaTuplePart::Utf8(&format!("tenant:{tenant_id}")),
+        CoreMetaTuplePart::Utf8(resource.resource_kind.as_str()),
+        CoreMetaTuplePart::Hash(&format!(
+            "blake3:{}",
+            ownership_resource_hash(tenant_id, resource)?
+        )),
+    ])
 }
 
 fn ownership_resource_hash(tenant_id: i64, resource: &OwnershipResource) -> Result<String> {
@@ -1077,88 +1418,61 @@ async fn read_partition_owner_state(
     partition_family: &str,
     partition_id: &str,
     signing_key: &[u8],
-) -> Result<Option<(CoreRefValue, PartitionOwnerState)>> {
-    let ref_name = partition_owner_ref_name(partition_family, partition_id)?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(&ref_name).await? else {
+) -> Result<Option<(Vec<u8>, PartitionOwnerState)>> {
+    let row_key = partition_owner_row_key(partition_family, partition_id)?;
+    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
+    let Some(bytes) = meta.get(CF_LEASES_FENCES, TABLE_PARTITION_OWNER_ROW, &row_key)? else {
         return Ok(None);
     };
-    let object_ref = decode_core_object_ref_target(&ref_value.target)?;
-    let bytes = store.get_blob(GetBlob { object_ref }).await?;
-    let owner: PartitionOwnerState = serde_json::from_slice(&bytes)?;
+    let owner = decode_partition_owner_record(&bytes)?;
     owner.verify(signing_key)?;
     if owner.partition_family != partition_family || owner.partition_id != partition_id {
-        return Err(anyhow!("partition owner ref scope mismatch"));
+        return Err(anyhow!("partition owner row scope mismatch"));
     }
-    Ok(Some((ref_value, owner)))
+    Ok(Some((bytes, owner)))
 }
 
 async fn write_partition_owner_state(
     storage: &Storage,
     owner: &PartitionOwnerState,
-    expected_ref: Option<&CoreRefValue>,
+    expected_ref: Option<&Vec<u8>>,
 ) -> Result<()> {
-    let ref_name = partition_owner_ref_name(&owner.partition_family, &owner.partition_id)?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let object_ref = store
-        .write_logical_file_ref(WriteLogicalFileRequest {
-            writer_family: "partition_owner".to_string(),
-            generation: owner.recovery_epoch,
-            logical_file_id: ref_name.clone(),
-            source: serde_json::to_vec_pretty(owner)?,
-            range_hints: Vec::new(),
-            pipeline_policy: CorePipelinePolicy::default(),
-            trace_context: CoreTraceContext::default(),
-            boundary_values: Vec::new(),
-            mutation_id: format!(
-                "partition-owner:{}:{}:{}:{}:{}",
-                owner.partition_family,
-                owner.partition_id,
-                owner.recovery_epoch,
-                owner.owner_node_id,
-                owner.owner_hash.as_deref().unwrap_or("unsealed")
-            ),
-            region_id: "local".to_string(),
-        })
-        .await?;
-    store
-        .compare_and_swap_ref(CompareAndSwapRef {
-            ref_name,
-            expected_generation: expected_ref.map(|value| value.generation),
-            expected_target: expected_ref.map(|value| value.target.clone()),
-            require_absent: expected_ref.is_none(),
-            require_present: expected_ref.is_some(),
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-            new_target: encode_core_object_ref_target(&object_ref)?,
-            transaction_id: None,
-        })
-        .await?;
+    let row_key = partition_owner_row_key(&owner.partition_family, &owner.partition_id)?;
+    let bytes = encode_partition_owner_record(owner)?;
+    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
+    let _guard = OWNERSHIP_FENCE_META_LOCK.lock().await;
+    let current = meta.get(CF_LEASES_FENCES, TABLE_PARTITION_OWNER_ROW, &row_key)?;
+    match (expected_ref, current.as_deref()) {
+        (None, None) => {}
+        (Some(expected), Some(actual)) if expected.as_slice() == actual => {}
+        (None, Some(_)) => bail!("CoreStore partition owner CAS conflict: row must be absent"),
+        (Some(_), None) => bail!("CoreStore partition owner CAS conflict: row must be present"),
+        (Some(_), Some(_)) => bail!("CoreStore partition owner CAS conflict: row changed"),
+    }
+    let op = CoreMetaBatchOp {
+        cf: CF_LEASES_FENCES,
+        table_id: TABLE_PARTITION_OWNER_ROW,
+        tuple_key: &row_key,
+        common: None,
+        kind: CoreMetaBatchOpKind::Put(&bytes),
+    };
+    commit_coremeta_batch_for_storage(
+        storage,
+        &format!(
+            "partition-owner:{}:{}",
+            owner.partition_family, owner.fence_token
+        ),
+        &[op],
+    )
+    .await?;
     Ok(())
 }
 
-async fn read_ownership_fence_ref(
-    storage: &Storage,
-    ref_name: &str,
-    signing_key: &[u8],
-) -> Result<Option<OwnershipFenceRecord>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(ref_name).await? else {
-        return Ok(None);
-    };
-    let object_ref = decode_core_object_ref_target(&ref_value.target)?;
-    let bytes = store.get_blob(GetBlob { object_ref }).await?;
-    let record: OwnershipFenceRecord = serde_json::from_slice(&bytes)?;
-    record.verify(signing_key)?;
-    let expected_ref = ownership_fence_ref_name(record.owner.tenant_id, &record.resource)?;
-    if expected_ref != ref_name {
-        return Err(anyhow!("ownership fence ref scope mismatch"));
-    }
-    Ok(Some(record))
+fn partition_owner_row_prefix() -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[CoreMetaTuplePart::Utf8(PARTITION_OWNER_ROW_PREFIX)])
 }
 
-fn partition_owner_ref_name(partition_family: &str, partition_id: &str) -> Result<String> {
+fn partition_owner_row_key(partition_family: &str, partition_id: &str) -> Result<Vec<u8>> {
     require_nonempty(partition_family, "partition family")?;
     if partition_family.contains('\0')
         || partition_family.contains("..")
@@ -1168,37 +1482,11 @@ fn partition_owner_ref_name(partition_family: &str, partition_id: &str) -> Resul
         return Err(anyhow!("partition family contains an invalid component"));
     }
     validate_hex32(partition_id, "partition id")?;
-    Ok(format!(
-        "{PARTITION_OWNER_REF_PREFIX}family:{partition_family}:partition:{partition_id}"
-    ))
-}
-
-fn parse_partition_owner_ref_name(ref_name: &str) -> Result<Option<(String, String)>> {
-    let Some(rest) = ref_name.strip_prefix(PARTITION_OWNER_REF_PREFIX) else {
-        return Ok(None);
-    };
-    let Some(rest) = rest.strip_prefix("family:") else {
-        return Ok(None);
-    };
-    let Some((family, partition_id)) = rest.split_once(":partition:") else {
-        return Ok(None);
-    };
-    validate_hex32(partition_id, "partition id")?;
-    Ok(Some((family.to_string(), partition_id.to_string())))
-}
-
-fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
-    Ok(format!(
-        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
-    ))
-}
-
-fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
-    let encoded = target
-        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
-        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
-    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(PARTITION_OWNER_ROW_PREFIX),
+        CoreMetaTuplePart::Utf8(partition_family),
+        CoreMetaTuplePart::Hash(&format!("blake3:{partition_id}")),
+    ])
 }
 
 fn is_core_ref_cas_conflict(err: &anyhow::Error) -> bool {
@@ -1210,6 +1498,8 @@ fn is_core_ref_cas_conflict(err: &anyhow::Error) -> bool {
             || message.contains("must be present")
             || message.contains("CAS lock was not acquired")
             || message.contains("CoreStore stream idempotency conflict")
+            || message.contains("CoreStore ownership fence CAS conflict")
+            || message.contains("CoreStore partition owner CAS conflict")
     })
 }
 

@@ -405,9 +405,15 @@ async fn gateway_audit_records_are_corestore_append_stream_records() {
     assert_eq!(read.len(), 1);
     assert_eq!(read[0].audit, first.record);
     assert_eq!(read[0].stream.record_kind, GATEWAY_AUDIT_SCHEMA);
+    let expected_payload = encode_gateway_record(&first.record).unwrap();
+    assert_eq!(read[0].stream.payload, expected_payload);
     assert_eq!(
-        read[0].stream.payload,
-        serde_json::to_vec(&first.record).unwrap()
+        decode_gateway_record::<GatewayAuditRecord>(&read[0].stream.payload).unwrap(),
+        first.record
+    );
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&read[0].stream.payload).is_err(),
+        "gateway audit records must not be persisted as JSON payloads"
     );
     assert_eq!(
         read[0].stream.payload_hash,
@@ -461,14 +467,6 @@ async fn gateway_credential_record_is_corestore_backed_and_hash_checked() {
         .unwrap()
         .unwrap();
     assert!(revoked.revoked_at.is_some());
-
-    let refs = CoreStore::new(storage.clone())
-        .await
-        .unwrap()
-        .list_ref_names("gateway_credential:")
-        .await
-        .unwrap();
-    assert_eq!(refs.len(), 1);
 }
 
 #[tokio::test]
@@ -615,7 +613,7 @@ async fn gateway_mount_resolution_uses_corestore_records_and_fixed_priority() {
         GatewayMountMatchKind::ExactHostAlias
     );
     assert_eq!(exact_resolution.matched_path_prefix, "/v2/");
-    assert_eq!(exact_resolution.ref_generation, 2);
+    assert_eq!(exact_resolution.row_generation, 2);
     assert_eq!(
         exact_resolution.record.authz_scope.authz_realm_id,
         "realm-a"

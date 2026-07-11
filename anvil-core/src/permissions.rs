@@ -7,22 +7,6 @@ use std::str::FromStr;
 /// Permissions are structured as `<resource>:<action>`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AnvilAction {
-    All, // Matches *:*
-
-    // Wildcard actions
-    BucketAll,       // Matches bucket:*
-    ObjectAll,       // Matches object:*
-    HfKeyAll,        // Matches hf_key:*
-    HfIngestionAll,  // Matches hf_ingestion:*
-    PolicyAll,       // Matches policy:*
-    AuthzAll,        // Matches authz:*
-    AppAll,          // Matches app:*
-    IndexAll,        // Matches index:*
-    PersonalDbAll,   // Matches personaldb:*
-    GitSourceAll,    // Matches git_source:*
-    RepairAll,       // Matches repair:*
-    CoordinationAll, // Matches coordination:*
-
     // Bucket actions
     BucketCreate,
     BucketDelete,
@@ -74,6 +58,12 @@ pub enum AnvilAction {
     IndexDelete,
     IndexWatch,
 
+    // Append stream actions
+    StreamCreate,
+    StreamAppend,
+    StreamRead,
+    StreamSealSegment,
+
     // PersonalDB actions
     PersonalDbCreate,
     PersonalDbRead,
@@ -87,6 +77,17 @@ pub enum AnvilAction {
     GitSourceRead,
     GitSourceWrite,
     GitSourceWatch,
+
+    // Registry/package gateway actions
+    RegistryBlobWrite,
+    RegistryVersionWrite,
+    RegistryRefWrite,
+    RegistryRead,
+    RegistryList,
+
+    // Mesh lifecycle actions
+    MeshManage,
+    MeshRead,
 
     // Repair actions
     RepairRead,
@@ -104,22 +105,6 @@ pub enum AnvilAction {
 impl fmt::Display for AnvilAction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
-            AnvilAction::All => "*",
-
-            // Wildcard actions
-            AnvilAction::BucketAll => "bucket:*",
-            AnvilAction::ObjectAll => "object:*",
-            AnvilAction::HfKeyAll => "hf_key:*",
-            AnvilAction::HfIngestionAll => "hf_ingestion:*",
-            AnvilAction::PolicyAll => "policy:*",
-            AnvilAction::AuthzAll => "authz:*",
-            AnvilAction::AppAll => "app:*",
-            AnvilAction::IndexAll => "index:*",
-            AnvilAction::PersonalDbAll => "personaldb:*",
-            AnvilAction::GitSourceAll => "git_source:*",
-            AnvilAction::RepairAll => "repair:*",
-            AnvilAction::CoordinationAll => "coordination:*",
-
             // Bucket actions
             AnvilAction::BucketCreate => "bucket:create",
             AnvilAction::BucketDelete => "bucket:delete",
@@ -171,6 +156,12 @@ impl fmt::Display for AnvilAction {
             AnvilAction::IndexDelete => "index:delete",
             AnvilAction::IndexWatch => "index:watch",
 
+            // Append stream actions
+            AnvilAction::StreamCreate => "stream:create",
+            AnvilAction::StreamAppend => "stream:append",
+            AnvilAction::StreamRead => "stream:read",
+            AnvilAction::StreamSealSegment => "stream:seal_segment",
+
             // PersonalDB actions
             AnvilAction::PersonalDbCreate => "personaldb:create",
             AnvilAction::PersonalDbRead => "personaldb:read",
@@ -184,6 +175,17 @@ impl fmt::Display for AnvilAction {
             AnvilAction::GitSourceRead => "git_source:read",
             AnvilAction::GitSourceWrite => "git_source:write",
             AnvilAction::GitSourceWatch => "git_source:watch",
+
+            // Registry/package gateway actions
+            AnvilAction::RegistryBlobWrite => "registry:blob_write",
+            AnvilAction::RegistryVersionWrite => "registry:version_write",
+            AnvilAction::RegistryRefWrite => "registry:ref_write",
+            AnvilAction::RegistryRead => "registry:read",
+            AnvilAction::RegistryList => "registry:list",
+
+            // Mesh lifecycle actions
+            AnvilAction::MeshManage => "mesh:manage",
+            AnvilAction::MeshRead => "mesh:read",
 
             // Repair actions
             AnvilAction::RepairRead => "repair:read",
@@ -206,22 +208,6 @@ impl FromStr for AnvilAction {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "*" => Ok(AnvilAction::All),
-
-            // Wildcard actions
-            "bucket:*" => Ok(AnvilAction::BucketAll),
-            "object:*" => Ok(AnvilAction::ObjectAll),
-            "hf_key:*" => Ok(AnvilAction::HfKeyAll),
-            "hf_ingestion:*" => Ok(AnvilAction::HfIngestionAll),
-            "policy:*" => Ok(AnvilAction::PolicyAll),
-            "authz:*" => Ok(AnvilAction::AuthzAll),
-            "app:*" => Ok(AnvilAction::AppAll),
-            "index:*" => Ok(AnvilAction::IndexAll),
-            "personaldb:*" => Ok(AnvilAction::PersonalDbAll),
-            "git_source:*" => Ok(AnvilAction::GitSourceAll),
-            "repair:*" => Ok(AnvilAction::RepairAll),
-            "coordination:*" => Ok(AnvilAction::CoordinationAll),
-
             // Bucket actions
             "bucket:create" => Ok(AnvilAction::BucketCreate),
             "bucket:delete" => Ok(AnvilAction::BucketDelete),
@@ -273,6 +259,12 @@ impl FromStr for AnvilAction {
             "index:delete" => Ok(AnvilAction::IndexDelete),
             "index:watch" => Ok(AnvilAction::IndexWatch),
 
+            // Append stream actions
+            "stream:create" => Ok(AnvilAction::StreamCreate),
+            "stream:append" => Ok(AnvilAction::StreamAppend),
+            "stream:read" => Ok(AnvilAction::StreamRead),
+            "stream:seal_segment" => Ok(AnvilAction::StreamSealSegment),
+
             // PersonalDB actions
             "personaldb:create" => Ok(AnvilAction::PersonalDbCreate),
             "personaldb:read" => Ok(AnvilAction::PersonalDbRead),
@@ -286,6 +278,17 @@ impl FromStr for AnvilAction {
             "git_source:read" => Ok(AnvilAction::GitSourceRead),
             "git_source:write" => Ok(AnvilAction::GitSourceWrite),
             "git_source:watch" => Ok(AnvilAction::GitSourceWatch),
+
+            // Registry/package gateway actions
+            "registry:blob_write" => Ok(AnvilAction::RegistryBlobWrite),
+            "registry:version_write" => Ok(AnvilAction::RegistryVersionWrite),
+            "registry:ref_write" => Ok(AnvilAction::RegistryRefWrite),
+            "registry:read" => Ok(AnvilAction::RegistryRead),
+            "registry:list" => Ok(AnvilAction::RegistryList),
+
+            // Mesh lifecycle actions
+            "mesh:manage" => Ok(AnvilAction::MeshManage),
+            "mesh:read" => Ok(AnvilAction::MeshRead),
 
             // Repair actions
             "repair:read" => Ok(AnvilAction::RepairRead),
@@ -311,17 +314,6 @@ mod tests {
     #[test]
     fn test_action_display_and_from_str() {
         let actions = vec![
-            AnvilAction::All,
-            AnvilAction::BucketAll,
-            AnvilAction::ObjectAll,
-            AnvilAction::HfKeyAll,
-            AnvilAction::HfIngestionAll,
-            AnvilAction::PolicyAll,
-            AnvilAction::AuthzAll,
-            AnvilAction::IndexAll,
-            AnvilAction::PersonalDbAll,
-            AnvilAction::GitSourceAll,
-            AnvilAction::RepairAll,
             AnvilAction::BucketCreate,
             AnvilAction::BucketWatch,
             AnvilAction::ObjectWrite,
@@ -333,6 +325,10 @@ mod tests {
             AnvilAction::AuthzSchemaWrite,
             AnvilAction::IndexCreate,
             AnvilAction::IndexWatch,
+            AnvilAction::StreamCreate,
+            AnvilAction::StreamAppend,
+            AnvilAction::StreamRead,
+            AnvilAction::StreamSealSegment,
             AnvilAction::PersonalDbCreate,
             AnvilAction::PersonalDbRead,
             AnvilAction::PersonalDbCommit,
@@ -340,9 +336,15 @@ mod tests {
             AnvilAction::GitSourceRead,
             AnvilAction::GitSourceWrite,
             AnvilAction::GitSourceWatch,
+            AnvilAction::RegistryBlobWrite,
+            AnvilAction::RegistryVersionWrite,
+            AnvilAction::RegistryRefWrite,
+            AnvilAction::RegistryRead,
+            AnvilAction::RegistryList,
+            AnvilAction::MeshManage,
+            AnvilAction::MeshRead,
             AnvilAction::RepairRead,
             AnvilAction::RepairRun,
-            AnvilAction::CoordinationAll,
             AnvilAction::CoordinationLeaseRead,
             AnvilAction::CoordinationLeaseWrite,
             AnvilAction::CoordinationLeaseAdmin,

@@ -16,10 +16,10 @@ pub(super) fn persistence_owner_node_id(config: &Config) -> String {
     "local-anvil-node".to_string()
 }
 
-pub(super) fn nonempty_or(value: &str, fallback: &str) -> String {
+pub(super) fn nonempty_or(value: &str, default_value: &str) -> String {
     let value = value.trim();
     if value.is_empty() {
-        fallback.to_string()
+        default_value.to_string()
     } else {
         value.to_string()
     }

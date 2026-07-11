@@ -2,9 +2,11 @@ use crate::{
     anvil_personaldb_sqlite_changeset::{
         DecodedSqliteChangesetChange, SqliteChangesetOperation, SqliteChangesetValue,
     },
+    core_store::encode_deterministic_proto,
     formats::{Hash32, hash32, personaldb::RowIndexRecord},
 };
 use anyhow::{Result, anyhow};
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -81,6 +83,114 @@ pub struct RowMetadata {
     pub policy_epoch: u64,
     pub auth_attribute_hash: String,
     pub updated_at_nanos: i64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct VerifiedMutationEnvelopeHashProto {
+    #[prost(uint32, tag = "1")]
+    format_version: u32,
+    #[prost(string, tag = "2")]
+    tenant_id: String,
+    #[prost(string, tag = "3")]
+    database_id: String,
+    #[prost(uint64, tag = "4")]
+    base_log_index: u64,
+    #[prost(uint64, tag = "5")]
+    proposed_log_index: u64,
+    #[prost(string, tag = "6")]
+    changeset_payload_hash: String,
+    #[prost(string, tag = "7")]
+    schema_hash: String,
+    #[prost(uint64, tag = "8")]
+    policy_epoch: u64,
+    #[prost(uint64, tag = "9")]
+    authz_revision: u64,
+    #[prost(message, repeated, tag = "10")]
+    table_effects: Vec<TableEffectHashProto>,
+    #[prost(message, optional, tag = "11")]
+    row_metadata_delta: Option<RowMetadataDeltaHashProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct TableEffectHashProto {
+    #[prost(string, tag = "1")]
+    table_name: String,
+    #[prost(string, tag = "2")]
+    primary_key_hash: String,
+    #[prost(string, tag = "3")]
+    operation: String,
+    #[prost(string, optional, tag = "4")]
+    before_columns_hash: Option<String>,
+    #[prost(string, optional, tag = "5")]
+    after_columns_hash: Option<String>,
+    #[prost(string, repeated, tag = "6")]
+    changed_columns: Vec<String>,
+    #[prost(message, optional, tag = "7")]
+    source_resource_binding: Option<ResourceBindingHashProto>,
+    #[prost(string, repeated, tag = "8")]
+    required_permissions: Vec<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ResourceBindingHashProto {
+    #[prost(string, tag = "1")]
+    resource_type: String,
+    #[prost(string, tag = "2")]
+    resource_id: String,
+    #[prost(string, optional, tag = "3")]
+    parent_resource_id: Option<String>,
+    #[prost(string, tag = "4")]
+    creator_principal: String,
+    #[prost(string, optional, tag = "5")]
+    owner_principal: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct RowMetadataDeltaHashProto {
+    #[prost(message, repeated, tag = "1")]
+    upserts: Vec<RowMetadataHashProto>,
+    #[prost(message, repeated, tag = "2")]
+    deletes: Vec<RowMetadataKeyHashProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct RowMetadataKeyHashProto {
+    #[prost(string, tag = "1")]
+    database_id: String,
+    #[prost(string, tag = "2")]
+    table_name_hash: String,
+    #[prost(string, tag = "3")]
+    primary_key_hash: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct RowMetadataHashProto {
+    #[prost(string, tag = "1")]
+    source_database_id: String,
+    #[prost(string, tag = "2")]
+    source_table: String,
+    #[prost(string, tag = "3")]
+    table_name_hash: String,
+    #[prost(string, tag = "4")]
+    primary_key_hash: String,
+    #[prost(string, tag = "5")]
+    resource_type: String,
+    #[prost(string, tag = "6")]
+    resource_id: String,
+    #[prost(string, optional, tag = "7")]
+    parent_resource_id: Option<String>,
+    #[prost(string, tag = "8")]
+    creator_principal: String,
+    #[prost(string, optional, tag = "9")]
+    owner_principal: Option<String>,
+    #[prost(uint64, tag = "10")]
+    row_version: u64,
+    #[prost(uint64, tag = "11")]
+    policy_epoch: u64,
+    #[prost(string, tag = "12")]
+    auth_attribute_hash: String,
+    #[prost(int64, tag = "13")]
+    updated_at_nanos: i64,
 }
 
 impl VerifiedMutationEnvelope {
@@ -250,7 +360,96 @@ impl RowMetadata {
 pub fn hash_verified_mutation_envelope(envelope: &VerifiedMutationEnvelope) -> Result<String> {
     let mut unsigned = envelope.clone();
     unsigned.envelope_hash = None;
-    Ok(hex::encode(hash32(&serde_json::to_vec(&unsigned)?)))
+    canonicalize_envelope(&mut unsigned);
+    validate_unsigned_envelope(&unsigned)?;
+    Ok(hex::encode(hash32(&encode_deterministic_proto(
+        &envelope_hash_proto(&unsigned),
+    ))))
+}
+
+fn envelope_hash_proto(envelope: &VerifiedMutationEnvelope) -> VerifiedMutationEnvelopeHashProto {
+    VerifiedMutationEnvelopeHashProto {
+        format_version: u32::from(envelope.format_version),
+        tenant_id: envelope.tenant_id.clone(),
+        database_id: envelope.database_id.clone(),
+        base_log_index: envelope.base_log_index,
+        proposed_log_index: envelope.proposed_log_index,
+        changeset_payload_hash: envelope.changeset_payload_hash.clone(),
+        schema_hash: envelope.schema_hash.clone(),
+        policy_epoch: envelope.policy_epoch,
+        authz_revision: envelope.authz_revision,
+        table_effects: envelope
+            .table_effects
+            .iter()
+            .map(table_effect_hash_proto)
+            .collect(),
+        row_metadata_delta: Some(row_metadata_delta_hash_proto(&envelope.row_metadata_delta)),
+    }
+}
+
+fn table_effect_hash_proto(effect: &TableEffect) -> TableEffectHashProto {
+    TableEffectHashProto {
+        table_name: effect.table_name.clone(),
+        primary_key_hash: effect.primary_key_hash.clone(),
+        operation: match effect.operation {
+            TableOperation::Insert => "insert",
+            TableOperation::Update => "update",
+            TableOperation::Delete => "delete",
+        }
+        .to_string(),
+        before_columns_hash: effect.before_columns_hash.clone(),
+        after_columns_hash: effect.after_columns_hash.clone(),
+        changed_columns: effect.changed_columns.clone(),
+        source_resource_binding: Some(resource_binding_hash_proto(&effect.source_resource_binding)),
+        required_permissions: effect.required_permissions.clone(),
+    }
+}
+
+fn resource_binding_hash_proto(binding: &ResourceBinding) -> ResourceBindingHashProto {
+    ResourceBindingHashProto {
+        resource_type: binding.resource_type.clone(),
+        resource_id: binding.resource_id.clone(),
+        parent_resource_id: binding.parent_resource_id.clone(),
+        creator_principal: binding.creator_principal.clone(),
+        owner_principal: binding.owner_principal.clone(),
+    }
+}
+
+fn row_metadata_delta_hash_proto(delta: &RowMetadataDelta) -> RowMetadataDeltaHashProto {
+    RowMetadataDeltaHashProto {
+        upserts: delta.upserts.iter().map(row_metadata_hash_proto).collect(),
+        deletes: delta
+            .deletes
+            .iter()
+            .map(row_metadata_key_hash_proto)
+            .collect(),
+    }
+}
+
+fn row_metadata_key_hash_proto(key: &RowMetadataKey) -> RowMetadataKeyHashProto {
+    RowMetadataKeyHashProto {
+        database_id: key.database_id.clone(),
+        table_name_hash: key.table_name_hash.clone(),
+        primary_key_hash: key.primary_key_hash.clone(),
+    }
+}
+
+fn row_metadata_hash_proto(row: &RowMetadata) -> RowMetadataHashProto {
+    RowMetadataHashProto {
+        source_database_id: row.source_database_id.clone(),
+        source_table: row.source_table.clone(),
+        table_name_hash: row.table_name_hash.clone(),
+        primary_key_hash: row.primary_key_hash.clone(),
+        resource_type: row.resource_type.clone(),
+        resource_id: row.resource_id.clone(),
+        parent_resource_id: row.parent_resource_id.clone(),
+        creator_principal: row.creator_principal.clone(),
+        owner_principal: row.owner_principal.clone(),
+        row_version: row.row_version,
+        policy_epoch: row.policy_epoch,
+        auth_attribute_hash: row.auth_attribute_hash.clone(),
+        updated_at_nanos: row.updated_at_nanos,
+    }
 }
 
 fn canonicalize_envelope(envelope: &mut VerifiedMutationEnvelope) {

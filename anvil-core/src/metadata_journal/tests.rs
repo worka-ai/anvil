@@ -1,7 +1,10 @@
 use super::*;
-use crate::core_store::PutBlob;
+use crate::core_store::{CoreStore, PutBlob};
 use crate::partition_fence::{
     PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
+};
+use crate::writer_segment_catalog::{
+    read_writer_segment_catalog_record, write_writer_segment_catalog_record,
 };
 use chrono::Utc;
 use tempfile::tempdir;
@@ -80,7 +83,7 @@ async fn ready_object_metadata_permit(
 }
 
 #[tokio::test]
-async fn append_object_mutation_writes_chained_metadata_and_directory_frames() {
+async fn append_object_mutation_writes_direct_metadata_and_directory_records() {
     let temp = tempdir().unwrap();
     let storage = Storage::new_at(temp.path()).await.unwrap();
     let bucket = sample_bucket();
@@ -99,17 +102,27 @@ async fn append_object_mutation_writes_chained_metadata_and_directory_frames() {
     .await
     .unwrap();
 
-    let frames = read_all_metadata_journal_frames(&storage, &bucket)
+    let records = read_all_metadata_journal_records(&storage, &bucket)
         .await
         .unwrap();
-    assert_eq!(frames.len(), 4);
-    assert_eq!(frames[0].record_kind, JournalRecordKind::ObjectVersion);
-    assert_eq!(frames[1].record_kind, JournalRecordKind::DirectoryEntry);
-    assert_eq!(frames[2].record_kind, JournalRecordKind::DeleteMarker);
-    assert_eq!(frames[3].record_kind, JournalRecordKind::DirectoryEntry);
-    assert_eq!(frames[1].previous_record_hash, frames[0].record_hash);
-    assert_eq!(frames[2].previous_record_hash, frames[1].record_hash);
-    validate_journal_chain(&frames).unwrap();
+    assert_eq!(records.len(), 4);
+    assert_eq!(
+        records[0].record_kind,
+        ObjectMetadataRecordKind::ObjectVersion
+    );
+    assert_eq!(
+        records[1].record_kind,
+        ObjectMetadataRecordKind::DirectoryEntry
+    );
+    assert_eq!(
+        records[2].record_kind,
+        ObjectMetadataRecordKind::DeleteMarker
+    );
+    assert_eq!(
+        records[3].record_kind,
+        ObjectMetadataRecordKind::DirectoryEntry
+    );
+    assert!(records.iter().all(|record| !record.payload.is_empty()));
 
     let current = read_current_objects(&storage, &bucket, b"unused without manifest")
         .await
@@ -147,14 +160,14 @@ async fn object_metadata_write_permit_sets_frame_and_manifest_fence() {
     )
     .await
     .unwrap();
-    let frames = read_all_metadata_journal_frames(&storage, &bucket)
+    let records = read_all_metadata_journal_records(&storage, &bucket)
         .await
         .unwrap();
-    assert_eq!(frames.len(), 2);
+    assert_eq!(records.len(), 2);
     assert!(
-        frames
+        records
             .iter()
-            .all(|frame| frame.fence_token == permit.fence_token)
+            .all(|record| record.body.fence_token == permit.fence_token)
     );
 
     let manifest_key = b"manifest signing key";
@@ -214,7 +227,7 @@ async fn object_metadata_corestore_batch_rejects_stale_partition_precondition() 
     let storage = Storage::new_at(temp.path()).await.unwrap();
     let bucket = sample_bucket();
     let stale_permit = ready_object_metadata_permit(&storage, &bucket, "node-a").await;
-    let stale_precondition = crate::partition_fence::partition_write_ref_precondition(
+    let stale_precondition = crate::partition_fence::partition_write_precondition(
         &storage,
         &stale_permit,
         PARTITION_OWNER_KEY,
@@ -231,6 +244,8 @@ async fn object_metadata_corestore_batch_rejects_stale_partition_precondition() 
         ObjectJournalMutation::Put,
         stale_permit.fence_token,
         Some(stale_precondition),
+        None,
+        None,
     )
     .await
     .unwrap_err();
@@ -253,12 +268,12 @@ async fn object_metadata_corestore_batch_rejects_stale_partition_precondition() 
 }
 
 #[tokio::test]
-async fn object_metadata_mutation_updates_current_object_coreref_in_same_batch() {
+async fn object_metadata_mutation_updates_current_object_coremeta_projection() {
     let temp = tempdir().unwrap();
     let storage = Storage::new_at(temp.path()).await.unwrap();
     let bucket = sample_bucket();
     let permit = ready_object_metadata_permit(&storage, &bucket, "node-a").await;
-    let key = "docs/current-ref.txt";
+    let key = "docs/current-row.txt";
     let first = sample_object(1, key, false);
 
     append_object_mutation_with_permit(
@@ -271,15 +286,14 @@ async fn object_metadata_mutation_updates_current_object_coreref_in_same_batch()
     )
     .await
     .unwrap();
-    let store = CoreStore::new(storage.clone()).await.unwrap();
-    let ref_name = current_object_ref_name(&bucket, key);
-    let first_ref = store
-        .read_ref(&ref_name)
-        .await
-        .unwrap()
-        .expect("current object ref is published");
-    assert_eq!(first_ref.generation, 1);
-    assert!(first_ref.target.contains("sequence:2"));
+    assert_eq!(
+        read_current_object(&storage, &bucket, PARTITION_OWNER_KEY, key)
+            .await
+            .unwrap()
+            .unwrap()
+            .version_id,
+        first.version_id
+    );
 
     let second = sample_object(2, key, true);
     append_object_mutation_with_permit(
@@ -292,18 +306,31 @@ async fn object_metadata_mutation_updates_current_object_coreref_in_same_batch()
     )
     .await
     .unwrap();
-    let second_ref = store
-        .read_ref(&ref_name)
+    assert!(
+        read_current_object(&storage, &bucket, PARTITION_OWNER_KEY, key)
+            .await
+            .unwrap()
+            .is_none(),
+        "current reads hide delete-marker heads; exact version reads still expose the marker"
+    );
+    assert_eq!(
+        read_object_version(
+            &storage,
+            &bucket,
+            PARTITION_OWNER_KEY,
+            key,
+            second.version_id
+        )
         .await
         .unwrap()
-        .expect("current object ref is updated");
-    assert_eq!(second_ref.generation, 2);
-    assert_ne!(second_ref.target, first_ref.target);
-    assert!(second_ref.target.contains("sequence:4"));
+        .unwrap()
+        .version_id,
+        second.version_id
+    );
 }
 
 #[tokio::test]
-async fn read_current_object_uses_current_object_coreref() {
+async fn read_current_object_uses_coremeta_row() {
     let temp = tempdir().unwrap();
     let storage = Storage::new_at(temp.path()).await.unwrap();
     let bucket = sample_bucket();
@@ -322,10 +349,6 @@ async fn read_current_object_uses_current_object_coreref() {
     )
     .await
     .unwrap();
-    let store = CoreStore::new(storage.clone()).await.unwrap();
-    let ref_name = current_object_ref_name(&bucket, key);
-    let first_ref = store.read_ref(&ref_name).await.unwrap().unwrap();
-
     append_object_mutation_with_permit(
         &storage,
         &bucket,
@@ -344,31 +367,13 @@ async fn read_current_object_uses_current_object_coreref() {
             .content_hash,
         second.content_hash
     );
-
-    let latest_ref = store.read_ref(&ref_name).await.unwrap().unwrap();
-    store
-        .compare_and_swap_ref(CompareAndSwapRef {
-            ref_name,
-            expected_generation: Some(latest_ref.generation),
-            expected_target: Some(latest_ref.target),
-            require_absent: false,
-            require_present: true,
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-            new_target: first_ref.target,
-            transaction_id: None,
-        })
-        .await
-        .unwrap();
-
     assert_eq!(
         read_current_object(&storage, &bucket, PARTITION_OWNER_KEY, key)
             .await
             .unwrap()
             .unwrap()
             .content_hash,
-        first.content_hash
+        second.content_hash
     );
 }
 
@@ -603,10 +608,8 @@ async fn seal_object_journal_segments_writes_metadata_and_directory_segments() {
     let metadata_bytes = read_core_ref_uri_payload(&storage, &sealed.metadata_ref)
         .await
         .unwrap();
-    let metadata_body = decode_segment_file(&metadata_bytes, FileFamily::MetadataSegment).unwrap();
-    let metadata_records = metadata_body.data_blocks[0]
-        .decode_uncompressed_records()
-        .unwrap();
+    let metadata_records =
+        decode_segment_file(&metadata_bytes, FileFamily::MetadataSegment).unwrap();
     assert_eq!(metadata_records.len(), 3);
     assert!(
         metadata_records
@@ -617,19 +620,16 @@ async fn seal_object_journal_segments_writes_metadata_and_directory_segments() {
     let directory_bytes = read_core_ref_uri_payload(&storage, &sealed.directory_ref)
         .await
         .unwrap();
-    let directory_body =
+    let directory_records =
         decode_segment_file(&directory_bytes, FileFamily::DirectorySegment).unwrap();
-    let directory_records = directory_body.data_blocks[0]
-        .decode_uncompressed_records()
-        .unwrap();
     assert_eq!(directory_records.len(), 2);
-    let latest_a: DirectoryEntryBody = serde_json::from_slice(&directory_records[0].value).unwrap();
+    let latest_a = decode_directory_entry_body(&directory_records[0].value).unwrap();
     assert_eq!(latest_a.version_id, second.version_id.to_string());
 
     let mut corrupted_metadata = read_core_ref_uri_payload(&storage, &sealed.metadata_ref)
         .await
         .unwrap();
-    let body_byte = corrupted_metadata.len() - COMMON_FOOTER_LEN - 1;
+    let body_byte = corrupted_metadata.len() - crate::formats::SEGMENT_HASH_LEN - 1;
     corrupted_metadata[body_byte] ^= 1;
     let ref_name = sealed
         .metadata_ref
@@ -646,19 +646,16 @@ async fn seal_object_journal_segments_writes_metadata_and_directory_segments() {
         })
         .await
         .unwrap();
-    store
-        .compare_and_swap_ref(CompareAndSwapRef {
-            ref_name: ref_name.to_string(),
-            expected_generation: None,
-            expected_target: None,
-            require_absent: false,
-            require_present: true,
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-            new_target: encode_core_object_ref_target(&object_ref).unwrap(),
-            transaction_id: None,
-        })
+    let mut catalog = read_writer_segment_catalog_record(
+        &storage,
+        OBJECT_METADATA_SEGMENT_CATALOG_FAMILY,
+        &object_metadata_segment_scope(ref_name),
+        ref_name,
+    )
+    .unwrap()
+    .expect("metadata segment catalog row exists");
+    catalog.core_object_ref_target = encode_core_object_ref_target(&object_ref).unwrap();
+    write_writer_segment_catalog_record(&storage, &catalog)
         .await
         .unwrap();
     assert!(
@@ -666,10 +663,13 @@ async fn seal_object_journal_segments_writes_metadata_and_directory_segments() {
             .await
             .is_err()
     );
-    assert!(
+    assert_eq!(
         read_current_objects(&storage, &bucket, signing_key)
             .await
-            .is_err()
+            .unwrap()
+            .len(),
+        2,
+        "live current-object reads are served from CoreMeta rows, not corrupted compacted segments"
     );
     let directory_listing =
         list_current_objects(&storage, &bucket, signing_key, "docs/", "", 10, "/")
@@ -757,22 +757,13 @@ async fn object_metadata_stream_rejects_corrupted_appended_frame() {
         .unwrap();
 
     let stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
-    let mut hasher = Sha256::new();
-    hasher.update(stream_id.as_bytes());
-    let file_name = format!("{}.anstream", hex::encode(hasher.finalize()));
-    for index in 1..=3 {
-        let stream_path = storage
-            .core_store_replica_path(&format!("local-control-node-{index}"))
-            .join("streams")
-            .join("data")
-            .join(&file_name);
-        let mut bytes = tokio::fs::read(&stream_path).await.unwrap();
-        let last = bytes.len() - 33;
-        bytes[last] ^= 1;
-        tokio::fs::write(&stream_path, bytes).await.unwrap();
-    }
+    CoreStore::new(storage.clone())
+        .await
+        .unwrap()
+        .corrupt_stream_record_payload_for_test(&stream_id, 1)
+        .unwrap();
     assert!(
-        read_all_metadata_journal_frames(&storage, &bucket)
+        read_all_metadata_journal_records(&storage, &bucket)
             .await
             .is_err()
     );

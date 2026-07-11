@@ -319,17 +319,21 @@ pub(super) fn metadata_backed_row_from_object(
     bucket: &Bucket,
     object: &Object,
 ) -> Result<TypedFieldSegmentRow> {
-    let values = object
-        .user_meta
-        .as_ref()
-        .and_then(JsonValue::as_object)
-        .map(|metadata| {
-            metadata
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect::<BTreeMap<_, _>>()
-        })
-        .unwrap_or_default();
+    let mut values = BTreeMap::new();
+    if let Some(metadata) = object.user_meta.as_ref().and_then(JsonValue::as_object) {
+        for (key, value) in metadata {
+            values.insert(key.clone(), value.clone());
+            insert_json_pointer_metadata_values(
+                &mut values,
+                format!("/{}", json_pointer_escape(key)),
+                value,
+            );
+        }
+    }
+    values.insert(
+        "object_key".to_string(),
+        JsonValue::String(object.key.clone()),
+    );
     Ok(TypedFieldSegmentRow {
         object_key: object.key.clone(),
         object_version_id: object.version_id.to_string(),
@@ -343,6 +347,27 @@ pub(super) fn metadata_backed_row_from_object(
     })
 }
 
+fn insert_json_pointer_metadata_values(
+    values: &mut BTreeMap<String, JsonValue>,
+    pointer: String,
+    value: &JsonValue,
+) {
+    values.insert(pointer.clone(), value.clone());
+    if let Some(object) = value.as_object() {
+        for (key, child) in object {
+            insert_json_pointer_metadata_values(
+                values,
+                format!("{}/{}", pointer, json_pointer_escape(key)),
+                child,
+            );
+        }
+    }
+}
+
+fn json_pointer_escape(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
+}
+
 pub(super) async fn build_typed_json_object_rows(
     storage: &Storage,
     bucket: &Bucket,
@@ -351,7 +376,11 @@ pub(super) async fn build_typed_json_object_rows(
     core_store: &CoreStore,
     partition_owner_signing_key: &[u8],
     source_cursor: u128,
-) -> Result<(Vec<TypedFieldSegmentRow>, Vec<IndexBuildDiagnostic>)> {
+) -> Result<(
+    Vec<TypedFieldSegmentRow>,
+    Vec<IndexBuildDiagnostic>,
+    Vec<CoreBoundaryValue>,
+)> {
     let objects = metadata_journal::read_current_objects_through_sequence(
         storage,
         bucket,
@@ -359,6 +388,7 @@ pub(super) async fn build_typed_json_object_rows(
         source_cursor,
     )
     .await?;
+    let boundary_values = boundary_values_for_objects(storage, &objects).await?;
     let mut rows = Vec::new();
     let mut diagnostics = Vec::new();
     for object in objects {
@@ -405,7 +435,7 @@ pub(super) async fn build_typed_json_object_rows(
             }),
         }
     }
-    Ok((rows, diagnostics))
+    Ok((rows, diagnostics, boundary_values))
 }
 
 pub(super) async fn build_typed_json_append_rows(
@@ -414,7 +444,11 @@ pub(super) async fn build_typed_json_append_rows(
     definition: &TypedJsonBuildDefinition,
     core_store: &CoreStore,
     source_cursor: u128,
-) -> Result<(Vec<TypedFieldSegmentRow>, Vec<IndexBuildDiagnostic>)> {
+) -> Result<(
+    Vec<TypedFieldSegmentRow>,
+    Vec<IndexBuildDiagnostic>,
+    Vec<CoreBoundaryValue>,
+)> {
     let records = crate::append_journal::list_append_stream_records_for_bucket(
         core_store.storage(),
         bucket.tenant_id,
@@ -423,12 +457,19 @@ pub(super) async fn build_typed_json_append_rows(
     .await?;
     let mut rows = Vec::new();
     let mut diagnostics = Vec::new();
+    let mut boundary_values = BTreeSet::new();
     for (stream, record) in records {
         if (record.id.max(0) as u128) > source_cursor {
             continue;
         }
         if !selector_matches_append(&index.selector, &stream, &record) {
             continue;
+        }
+        if let Ok(manifest) = core_store
+            .read_object_manifest(&record.payload_object_ref)
+            .await
+        {
+            boundary_values.extend(manifest.boundary_values.into_iter());
         }
         let payload = match core_store
             .get_blob(GetBlob {
@@ -475,7 +516,7 @@ pub(super) async fn build_typed_json_append_rows(
             }),
         }
     }
-    Ok((rows, diagnostics))
+    Ok((rows, diagnostics, boundary_values.into_iter().collect()))
 }
 
 pub(super) fn selector_matches_append(
@@ -685,7 +726,7 @@ pub(super) fn object_current_source_id(bucket: &Bucket, object: &Object) -> Sour
     let storage_tenant = bucket.tenant_id.to_string();
     SourceId {
         schema: "anvil.query.source_id.v1".to_string(),
-        mesh_id: "local-mesh".to_string(),
+        mesh_id: "default".to_string(),
         anvil_storage_tenant_id: storage_tenant.clone(),
         authz_scope: AuthzScopeRef {
             anvil_storage_tenant_id: storage_tenant,
@@ -711,7 +752,7 @@ pub(super) fn append_record_source_id(
     let storage_tenant = bucket.tenant_id.to_string();
     SourceId {
         schema: "anvil.query.source_id.v1".to_string(),
-        mesh_id: "local-mesh".to_string(),
+        mesh_id: "default".to_string(),
         anvil_storage_tenant_id: storage_tenant.clone(),
         authz_scope: AuthzScopeRef {
             anvil_storage_tenant_id: storage_tenant,
@@ -1088,25 +1129,78 @@ pub(super) async fn read_object_payload(
     core_store: &CoreStore,
     object: &Object,
 ) -> Result<Vec<u8>> {
-    let object_ref = core_object_ref_from_shard_map(object).ok_or_else(|| {
-        anyhow!(
+    let target = core_object_data_target_from_shard_map(object).with_context(|| {
+        format!(
             "object {} version {} is not CoreStore-backed",
-            object.key,
-            object.version_id
+            object.key, object.version_id
         )
     })?;
-    core_store
-        .get_blob(GetBlob { object_ref })
-        .await
-        .with_context(|| format!("read CoreStore payload for {}", object.key))
+    match target {
+        CoreObjectDataTarget::LogicalFile(locator) => {
+            let manifest = core_store
+                .read_logical_file_manifest(&locator)
+                .await
+                .with_context(|| format!("read CoreStore logical manifest for {}", object.key))?;
+            core_store
+                .read_logical_range(ReadLogicalRangeRequest {
+                    ranges: vec![CoreByteRange {
+                        start: 0,
+                        end_exclusive: manifest.logical_size,
+                    }],
+                    manifest,
+                    authz_scope: AuthzScopeRef {
+                        anvil_storage_tenant_id: object.tenant_id.to_string(),
+                        authz_realm_id: format!("object:{}", object.bucket_id),
+                    },
+                    expected_boundary: None,
+                    prefetch_policy: CorePrefetchPolicy::default(),
+                    trace_context: Default::default(),
+                })
+                .await
+                .with_context(|| format!("read CoreStore logical payload for {}", object.key))
+        }
+        CoreObjectDataTarget::ObjectRef(object_ref) => core_store
+            .get_blob(GetBlob { object_ref })
+            .await
+            .with_context(|| format!("read CoreStore object-ref payload for {}", object.key)),
+    }
 }
 
-pub(super) fn core_object_ref_from_shard_map(object: &Object) -> Option<CoreObjectRef> {
-    let value = object.shard_map.as_ref()?;
-    if value.get("schema")?.as_str()? != "anvil.core.object_ref.v1" {
-        return None;
+pub(super) enum CoreObjectDataTarget {
+    LogicalFile(CoreManifestLocator),
+    ObjectRef(CoreObjectRef),
+}
+
+pub(super) fn core_object_data_target_from_shard_map(
+    object: &Object,
+) -> Result<CoreObjectDataTarget> {
+    let value = object
+        .shard_map
+        .as_ref()
+        .ok_or_else(|| anyhow!("object shard map is missing"))?;
+    if value.get("schema").and_then(JsonValue::as_str) != Some("anvil.core.object_data_target.v1") {
+        anyhow::bail!("object shard map is not a canonical CoreStore object data target");
     }
-    serde_json::from_value(value.clone()).ok()
+    let kind = value
+        .get("kind")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| anyhow!("object data target kind is missing"))?;
+    let target = value
+        .get("target")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| anyhow!("object data target bytes are missing"))?;
+    match kind {
+        "logical_file" => {
+            let bytes = URL_SAFE_NO_PAD.decode(target)?;
+            Ok(CoreObjectDataTarget::LogicalFile(
+                decode_manifest_locator_proto(&bytes)?,
+            ))
+        }
+        "object_ref" => Ok(CoreObjectDataTarget::ObjectRef(
+            decode_core_object_ref_target(target)?,
+        )),
+        other => anyhow::bail!("unsupported CoreStore object data target kind {other}"),
+    }
 }
 
 pub(super) fn object_authz_label_hash(bucket: &Bucket, object: &Object) -> [u8; 32] {

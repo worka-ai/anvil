@@ -1,16 +1,52 @@
 use crate::{
     core_store::{
-        CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
-        WriteLogicalFileRequest,
+        CF_REGISTRY, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore, CoreMetaTuplePart,
+        CoreStore, TABLE_GIT_SOURCE_MANIFEST_ROW, core_meta_committed_row_common,
+        core_meta_root_key_hash, core_meta_tuple_key, decode_deterministic_proto,
+        encode_deterministic_proto,
     },
+    formats::unix_nanos_from_rfc3339,
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
-use base64::Engine;
+use prost::Message;
 use serde::{Deserialize, Serialize};
 
-const GIT_SOURCE_MANIFEST_REF_PREFIX: &str = "git_source_manifest:";
-const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
+#[derive(Clone, PartialEq, Message)]
+struct GitSourceRepositoryManifestProto {
+    #[prost(uint32, tag = "1")]
+    format_version: u32,
+    #[prost(int64, tag = "2")]
+    tenant_id: i64,
+    #[prost(string, tag = "3")]
+    repository_id: String,
+    #[prost(string, tag = "4")]
+    bucket_name: String,
+    #[prost(string, tag = "5")]
+    object_key: String,
+    #[prost(string, tag = "6")]
+    pack_object_version_id: String,
+    #[prost(string, tag = "7")]
+    source_hash: String,
+    #[prost(uint64, tag = "8")]
+    generation: u64,
+    #[prost(uint64, tag = "9")]
+    record_count: u64,
+    #[prost(string, tag = "10")]
+    index_path: String,
+    #[prost(string, tag = "11")]
+    updated_at: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct GitSourceRepositoryManifestRowProto {
+    #[prost(message, optional, tag = "1")]
+    common: Option<crate::core_store::CoreMetaRowCommonProto>,
+    #[prost(string, tag = "2")]
+    schema: String,
+    #[prost(bytes, tag = "3")]
+    manifest_bytes: Vec<u8>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitSourceRepositoryManifest {
@@ -32,38 +68,22 @@ pub async fn write_git_source_repository_manifest(
     manifest: &GitSourceRepositoryManifest,
 ) -> Result<()> {
     validate_manifest(manifest)?;
-    let ref_name = manifest_ref_name(manifest.tenant_id, &manifest.repository_id)?;
     let store = CoreStore::new(storage.clone()).await?;
-    let object_ref = store
-        .write_logical_file_ref(WriteLogicalFileRequest {
-            writer_family: "git_source".to_string(),
-            generation: manifest.generation,
-            logical_file_id: ref_name.clone(),
-            source: serde_json::to_vec(manifest)?,
-            range_hints: Vec::new(),
-            pipeline_policy: CorePipelinePolicy::default(),
-            trace_context: CoreTraceContext::default(),
-            boundary_values: Vec::new(),
-            mutation_id: format!(
-                "git-source-manifest:{}:{}",
-                manifest.tenant_id, manifest.repository_id
-            ),
-            region_id: "local".to_string(),
-        })
-        .await?;
+    let payload = encode_git_source_manifest_row(manifest)?;
+    let tuple_key = manifest_tuple_key(manifest.tenant_id, &manifest.repository_id)?;
+    let mutation_id = format!(
+        "git-source-manifest:{}:{}:{}",
+        manifest.tenant_id, manifest.repository_id, manifest.generation
+    );
+    let op = CoreMetaBatchOp {
+        cf: CF_REGISTRY,
+        table_id: TABLE_GIT_SOURCE_MANIFEST_ROW,
+        tuple_key: &tuple_key,
+        common: None,
+        kind: CoreMetaBatchOpKind::Put(&payload),
+    };
     store
-        .compare_and_swap_ref(CompareAndSwapRef {
-            ref_name,
-            expected_generation: None,
-            expected_target: None,
-            require_absent: false,
-            require_present: false,
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-            new_target: encode_core_object_ref_target(&object_ref)?,
-            transaction_id: None,
-        })
+        .commit_coremeta_batch_by_embedded_roots(&mutation_id, &[op])
         .await?;
     Ok(())
 }
@@ -73,24 +93,96 @@ pub async fn read_git_source_repository_manifest(
     tenant_id: i64,
     repository_id: &str,
 ) -> Result<Option<GitSourceRepositoryManifest>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store
-        .read_ref(&manifest_ref_name(tenant_id, repository_id)?)
-        .await?
+    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
+    let Some(payload) = meta.get(
+        CF_REGISTRY,
+        TABLE_GIT_SOURCE_MANIFEST_ROW,
+        &manifest_tuple_key(tenant_id, repository_id)?,
+    )?
     else {
         return Ok(None);
     };
-    let bytes = store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
-        })
-        .await?;
-    let manifest: GitSourceRepositoryManifest = serde_json::from_slice(&bytes)?;
+    let manifest = decode_git_source_manifest_row(&payload)?;
     validate_manifest(&manifest)?;
     if manifest.tenant_id != tenant_id || manifest.repository_id != repository_id {
         return Err(anyhow!("git source manifest path scope mismatch"));
     }
     Ok(Some(manifest))
+}
+
+fn encode_git_source_manifest(manifest: &GitSourceRepositoryManifest) -> Result<Vec<u8>> {
+    Ok(encode_deterministic_proto(
+        &GitSourceRepositoryManifestProto {
+            format_version: manifest.format_version,
+            tenant_id: manifest.tenant_id,
+            repository_id: manifest.repository_id.clone(),
+            bucket_name: manifest.bucket_name.clone(),
+            object_key: manifest.object_key.clone(),
+            pack_object_version_id: manifest.pack_object_version_id.clone(),
+            source_hash: manifest.source_hash.clone(),
+            generation: manifest.generation,
+            record_count: manifest.record_count,
+            index_path: manifest.index_path.clone(),
+            updated_at: manifest.updated_at.clone(),
+        },
+    ))
+}
+
+fn encode_git_source_manifest_row(manifest: &GitSourceRepositoryManifest) -> Result<Vec<u8>> {
+    validate_manifest(manifest)?;
+    Ok(encode_deterministic_proto(
+        &GitSourceRepositoryManifestRowProto {
+            common: Some(core_meta_committed_row_common(
+                format!("tenant/{}", manifest.tenant_id),
+                core_meta_root_key_hash(&format!(
+                    "git-source-manifest/{}/{}",
+                    manifest.tenant_id, manifest.repository_id
+                )),
+                manifest.generation,
+                format!(
+                    "git-source-manifest:{}:{}:{}",
+                    manifest.tenant_id, manifest.repository_id, manifest.generation
+                ),
+                unix_nanos_from_rfc3339(&manifest.updated_at),
+            )),
+            schema: "anvil.coremeta.git_source_manifest.v1".to_string(),
+            manifest_bytes: encode_git_source_manifest(manifest)?,
+        },
+    ))
+}
+
+fn decode_git_source_manifest(bytes: &[u8]) -> Result<GitSourceRepositoryManifest> {
+    let proto = decode_deterministic_proto::<GitSourceRepositoryManifestProto>(
+        bytes,
+        "git source repository manifest",
+    )?;
+    Ok(GitSourceRepositoryManifest {
+        format_version: proto.format_version,
+        tenant_id: proto.tenant_id,
+        repository_id: proto.repository_id,
+        bucket_name: proto.bucket_name,
+        object_key: proto.object_key,
+        pack_object_version_id: proto.pack_object_version_id,
+        source_hash: proto.source_hash,
+        generation: proto.generation,
+        record_count: proto.record_count,
+        index_path: proto.index_path,
+        updated_at: proto.updated_at,
+    })
+}
+
+fn decode_git_source_manifest_row(bytes: &[u8]) -> Result<GitSourceRepositoryManifest> {
+    let row = decode_deterministic_proto::<GitSourceRepositoryManifestRowProto>(
+        bytes,
+        "git source repository manifest row",
+    )?;
+    if row.schema != "anvil.coremeta.git_source_manifest.v1" {
+        return Err(anyhow!("git source manifest row has invalid schema"));
+    }
+    row.common
+        .as_ref()
+        .ok_or_else(|| anyhow!("git source manifest row missing CoreMeta common"))?;
+    decode_git_source_manifest(&row.manifest_bytes)
 }
 
 fn validate_manifest(manifest: &GitSourceRepositoryManifest) -> Result<()> {
@@ -117,11 +209,16 @@ fn validate_manifest(manifest: &GitSourceRepositoryManifest) -> Result<()> {
     Ok(())
 }
 
-fn manifest_ref_name(tenant_id: i64, repository_id: &str) -> Result<String> {
+fn manifest_tuple_key(tenant_id: i64, repository_id: &str) -> Result<Vec<u8>> {
+    if tenant_id <= 0 {
+        return Err(anyhow!("git source manifest tenant id must be positive"));
+    }
     require_safe_component(repository_id, "repository_id")?;
-    Ok(format!(
-        "{GIT_SOURCE_MANIFEST_REF_PREFIX}tenant:{tenant_id}:repository:{repository_id}"
-    ))
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("git-source-manifest"),
+        CoreMetaTuplePart::I64(tenant_id),
+        CoreMetaTuplePart::Utf8(repository_id),
+    ])
 }
 
 fn require_safe_component(value: &str, field: &'static str) -> Result<()> {
@@ -138,22 +235,6 @@ fn require_safe_component(value: &str, field: &'static str) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
-    Ok(format!(
-        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
-    ))
-}
-
-fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
-    let encoded = target
-        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
-        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
-    Ok(serde_json::from_slice(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded)?,
-    )?)
 }
 
 fn require_nonempty(value: &str, field: &'static str) -> Result<()> {

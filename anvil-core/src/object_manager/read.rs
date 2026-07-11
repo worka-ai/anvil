@@ -1,4 +1,5 @@
 use super::*;
+use crate::core_store::ReadLogicalRangeRequest;
 
 impl ObjectManager {
     pub async fn get_object(
@@ -46,6 +47,7 @@ impl ObjectManager {
             version_id,
             range,
             link_mode,
+            ObjectReadConsistency::Latest,
         )
         .await
     }
@@ -59,6 +61,7 @@ impl ObjectManager {
         version_id: Option<uuid::Uuid>,
         range: Option<CoreByteRange>,
         link_mode: ObjectLinkReadMode,
+        consistency: ObjectReadConsistency,
     ) -> Result<ObjectReadResult, Status> {
         let _latency = self
             .observability
@@ -78,28 +81,30 @@ impl ObjectManager {
             .get_authorized_bucket(claims.as_ref(), route_tenant_id, &bucket_name)
             .await?;
 
-        if !bucket.is_public_read {
-            let claims = claims
-                .as_ref()
-                .ok_or_else(|| Status::permission_denied("Permission denied"))?;
-            if !self
-                .object_read_allowed(claims, &bucket_name, &object_key, None)
-                .await?
-            {
-                return Err(Status::permission_denied("Permission denied"));
-            }
-        }
+        self.require_object_read_access(
+            claims.as_ref(),
+            &bucket,
+            &object_key,
+            consistency.authz_revision(),
+        )
+        .await?;
 
         let mut object = match version_id {
             Some(version_id) => {
-                let object = metadata_journal::read_object_version(
-                    &self.storage,
-                    &bucket,
-                    &self.signing_key,
-                    &object_key,
-                    version_id,
-                )
-                .await
+                let object = if let Some(root_generation) = consistency.root_generation() {
+                    self.core_store
+                        .read_object_version_metadata_at_generation(
+                            &bucket,
+                            &object_key,
+                            version_id,
+                            root_generation,
+                        )
+                        .await
+                } else {
+                    self.core_store
+                        .read_object_version_metadata(&bucket, &object_key, version_id)
+                        .await
+                }
                 .map_err(|e| Status::internal(e.to_string()))?
                 .ok_or_else(|| Status::not_found("Object version not found"))?;
                 if object.deleted_at.is_some() {
@@ -107,15 +112,24 @@ impl ObjectManager {
                 }
                 object
             }
-            None => metadata_journal::read_current_object(
-                &self.storage,
-                &bucket,
-                &self.signing_key,
-                &object_key,
-            )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Object not found"))?,
+            None => {
+                let object = if let Some(root_generation) = consistency.root_generation() {
+                    self.core_store
+                        .read_current_object_metadata_at_generation(
+                            &bucket,
+                            &object_key,
+                            root_generation,
+                        )
+                        .await
+                } else {
+                    self.core_store
+                        .read_current_object_metadata(&bucket, &object_key)
+                        .await
+                };
+                object
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .ok_or_else(|| Status::not_found("Object not found"))?
+            }
         };
         let mut followed_link = None;
         if version_id.is_none() && object.kind == object_links::ObjectEntryKind::Link {
@@ -123,7 +137,7 @@ impl ObjectManager {
                 return Err(Status::failed_precondition("ObjectLinkMetadataRead"));
             }
             let (target, link) = self
-                .resolve_followed_link(&bucket, object, claims.as_ref())
+                .resolve_followed_link(&bucket, object, claims.as_ref(), consistency)
                 .await?;
             object = target;
             followed_link = Some(link);
@@ -133,38 +147,86 @@ impl ObjectManager {
         let app_state = self.clone();
         let object_clone = object.clone();
         let range_start = range.map(|range| range.start).unwrap_or(0);
+        let logical_authz_scope = AuthzScopeRef {
+            anvil_storage_tenant_id: bucket.tenant_id.to_string(),
+            authz_realm_id: format!("bucket:{}", bucket.name),
+        };
 
         tokio::spawn(async move {
-            let Some(object_ref) = object_clone
+            let data_target = match object_clone
                 .shard_map
                 .as_ref()
-                .and_then(core_object_ref_from_shard_map)
-            else {
-                let _ = tx
-                    .send(Err(Status::not_found(
-                        "Object data unavailable: object is not CoreStore-backed",
-                    )))
-                    .await;
-                return;
+                .ok_or_else(|| anyhow!("object shard map is missing"))
+                .and_then(object_data_target_from_shard_map)
+            {
+                Ok(data_target) => data_target,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(Status::not_found(format!(
+                            "Object data unavailable: {error}"
+                        ))))
+                        .await;
+                    return;
+                }
             };
 
-            let read_result = if let Some(range) = range {
-                app_state
-                    .core_store
-                    .get_blob_range(GetBlobRange { object_ref, range })
-                    .await
-            } else {
-                app_state.core_store.get_blob(GetBlob { object_ref }).await
+            let read_result = match data_target {
+                ObjectDataTarget::LogicalFile(locator) => {
+                    let manifest = match app_state
+                        .core_store
+                        .read_logical_file_manifest(&locator)
+                        .await
+                    {
+                        Ok(manifest) => manifest,
+                        Err(error) => {
+                            let _ = tx.send(Err(Status::not_found(error.to_string()))).await;
+                            return;
+                        }
+                    };
+                    let read_range = range.unwrap_or(CoreByteRange {
+                        start: 0,
+                        end_exclusive: manifest.logical_size,
+                    });
+                    app_state
+                        .core_store
+                        .read_logical_range_chunks(
+                            ReadLogicalRangeRequest {
+                                manifest,
+                                ranges: vec![read_range],
+                                authz_scope: logical_authz_scope,
+                                expected_boundary: None,
+                                prefetch_policy: CorePrefetchPolicy::default(),
+                                trace_context: Default::default(),
+                            },
+                            1024 * 64,
+                            |chunk| {
+                                let tx = tx.clone();
+                                async move {
+                                    tx.send(Ok(chunk))
+                                        .await
+                                        .map_err(|_| anyhow!("object read response stream closed"))
+                                }
+                            },
+                        )
+                        .await
+                }
+                ObjectDataTarget::ObjectRef(object_ref) => {
+                    app_state
+                        .core_store
+                        .read_object_ref_chunks(object_ref, range, 1024 * 64, |chunk| {
+                            let tx = tx.clone();
+                            async move {
+                                tx.send(Ok(chunk))
+                                    .await
+                                    .map_err(|_| anyhow!("object read response stream closed"))
+                            }
+                        })
+                        .await
+                }
             };
 
             match read_result {
-                Ok(full_data) => {
-                    for chunk in full_data.chunks(1024 * 64) {
-                        if tx.send(Ok(chunk.to_vec())).await.is_err() {
-                            return;
-                        }
-                    }
-                }
+                Ok(()) => {}
                 Err(error) => {
                     let _ = tx.send(Err(Status::not_found(error.to_string()))).await;
                 }
@@ -181,10 +243,11 @@ impl ObjectManager {
 
     pub async fn delete_object(
         &self,
-        tenant_id: i64,
+        claims: &auth::Claims,
         bucket_name: &str,
         object_key: &str,
-        scopes: &[String],
+        transaction_id: Option<&str>,
+        transaction_principal: Option<&str>,
     ) -> Result<Object, Status> {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
@@ -197,36 +260,44 @@ impl ObjectManager {
             return Err(Status::invalid_argument("Invalid object key"));
         }
 
-        if !auth::is_authorized(
-            AnvilAction::ObjectDelete,
-            &format!("{}/{}", bucket_name, object_key),
-            scopes,
-        ) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
-
+        let tenant_id = claims.tenant_id;
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
+        access_control::require_object_permission(
+            &self.storage,
+            claims,
+            &bucket,
+            object_key,
+            "delete",
+        )
+        .await?;
 
         let delete_marker = self
             .persistence
-            .soft_delete_object(bucket.id, object_key)
+            .soft_delete_object_in_transaction(
+                bucket.id,
+                object_key,
+                transaction_id,
+                transaction_principal,
+            )
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Object not found"))?;
-
-        self.publish_object_watch_event(tenant_id, &bucket, &delete_marker, "delete", true)
-            .await?;
+        if transaction_id.is_none() {
+            self.publish_object_watch_event(tenant_id, &bucket, &delete_marker, "delete", true)
+                .await?;
+        }
 
         Ok(delete_marker)
     }
 
     pub async fn delete_object_version(
         &self,
-        tenant_id: i64,
+        claims: &auth::Claims,
         bucket_name: &str,
         object_key: &str,
         version_id: uuid::Uuid,
-        scopes: &[String],
+        transaction_id: Option<&str>,
+        transaction_principal: Option<&str>,
     ) -> Result<Object, Status> {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
@@ -238,15 +309,16 @@ impl ObjectManager {
             return Err(Status::invalid_argument("Invalid object key"));
         }
 
-        if !auth::is_authorized(
-            AnvilAction::ObjectDelete,
-            &format!("{}/{}", bucket_name, object_key),
-            scopes,
-        ) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
-
+        let tenant_id = claims.tenant_id;
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
+        access_control::require_object_permission(
+            &self.storage,
+            claims,
+            &bucket,
+            object_key,
+            "delete",
+        )
+        .await?;
         if bucket.region != self.region {
             return Err(Status::failed_precondition(format!(
                 "Bucket is in region {}",
@@ -256,19 +328,26 @@ impl ObjectManager {
 
         let deleted = self
             .persistence
-            .delete_object_version(bucket.id, object_key, version_id)
+            .delete_object_version_in_transaction(
+                bucket.id,
+                object_key,
+                version_id,
+                transaction_id,
+                transaction_principal,
+            )
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Object version not found"))?;
-
-        self.publish_object_watch_event(
-            tenant_id,
-            &bucket,
-            &deleted,
-            "delete_version",
-            deleted.deleted_at.is_some(),
-        )
-        .await?;
+        if transaction_id.is_none() {
+            self.publish_object_watch_event(
+                tenant_id,
+                &bucket,
+                &deleted,
+                "delete_version",
+                deleted.deleted_at.is_some(),
+            )
+            .await?;
+        }
 
         Ok(deleted)
     }
@@ -280,13 +359,33 @@ impl ObjectManager {
         object_key: &str,
         version_id: Option<uuid::Uuid>,
     ) -> Result<Object, Status> {
+        self.head_object_with_consistency(
+            claims,
+            bucket_name,
+            object_key,
+            version_id,
+            ObjectReadConsistency::Latest,
+        )
+        .await
+    }
+
+    pub async fn head_object_with_consistency(
+        &self,
+        claims: Option<auth::Claims>,
+        bucket_name: &str,
+        object_key: &str,
+        version_id: Option<uuid::Uuid>,
+        consistency: ObjectReadConsistency,
+    ) -> Result<Object, Status> {
         Ok(self
-            .head_object_with_link_mode(
+            .head_object_with_link_mode_for_tenant(
                 claims,
+                None,
                 bucket_name,
                 object_key,
                 version_id,
                 ObjectLinkReadMode::Follow,
+                consistency,
             )
             .await?
             .object)
@@ -307,6 +406,7 @@ impl ObjectManager {
             object_key,
             version_id,
             link_mode,
+            ObjectReadConsistency::Latest,
         )
         .await
     }
@@ -319,6 +419,7 @@ impl ObjectManager {
         object_key: &str,
         version_id: Option<uuid::Uuid>,
         link_mode: ObjectLinkReadMode,
+        consistency: ObjectReadConsistency,
     ) -> Result<ObjectHeadResult, Status> {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
@@ -334,28 +435,30 @@ impl ObjectManager {
             .get_authorized_bucket(claims.as_ref(), route_tenant_id, bucket_name)
             .await?;
 
-        if !bucket.is_public_read {
-            let claims = claims
-                .as_ref()
-                .ok_or_else(|| Status::permission_denied("Permission denied"))?;
-            if !self
-                .object_read_allowed(claims, bucket_name, object_key, None)
-                .await?
-            {
-                return Err(Status::permission_denied("Permission denied"));
-            }
-        }
+        self.require_object_read_access(
+            claims.as_ref(),
+            &bucket,
+            object_key,
+            consistency.authz_revision(),
+        )
+        .await?;
 
         let mut object = match version_id {
             Some(version_id) => {
-                let object = metadata_journal::read_object_version(
-                    &self.storage,
-                    &bucket,
-                    &self.signing_key,
-                    object_key,
-                    version_id,
-                )
-                .await
+                let object = if let Some(root_generation) = consistency.root_generation() {
+                    self.core_store
+                        .read_object_version_metadata_at_generation(
+                            &bucket,
+                            object_key,
+                            version_id,
+                            root_generation,
+                        )
+                        .await
+                } else {
+                    self.core_store
+                        .read_object_version_metadata(&bucket, object_key, version_id)
+                        .await
+                }
                 .map_err(|e| Status::internal(e.to_string()))?
                 .ok_or_else(|| Status::not_found("Object version not found"))?;
                 if object.deleted_at.is_some() {
@@ -363,15 +466,24 @@ impl ObjectManager {
                 }
                 object
             }
-            None => metadata_journal::read_current_object(
-                &self.storage,
-                &bucket,
-                &self.signing_key,
-                object_key,
-            )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Object not found"))?,
+            None => {
+                let object = if let Some(root_generation) = consistency.root_generation() {
+                    self.core_store
+                        .read_current_object_metadata_at_generation(
+                            &bucket,
+                            object_key,
+                            root_generation,
+                        )
+                        .await
+                } else {
+                    self.core_store
+                        .read_current_object_metadata(&bucket, object_key)
+                        .await
+                };
+                object
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .ok_or_else(|| Status::not_found("Object not found"))?
+            }
         };
         let mut followed_link = None;
         if version_id.is_none() && object.kind == object_links::ObjectEntryKind::Link {
@@ -379,7 +491,7 @@ impl ObjectManager {
                 return Err(Status::failed_precondition("ObjectLinkMetadataRead"));
             }
             let (target, link) = self
-                .resolve_followed_link(&bucket, object, claims.as_ref())
+                .resolve_followed_link(&bucket, object, claims.as_ref(), consistency)
                 .await?;
             object = target;
             followed_link = Some(link);
@@ -397,8 +509,15 @@ impl ObjectManager {
         object_key: &str,
         version_id: Option<uuid::Uuid>,
     ) -> Result<object_links::ObjectLinkDescriptor, Status> {
-        self.read_object_link_for_tenant(claims, None, bucket_name, object_key, version_id)
-            .await
+        self.read_object_link_for_tenant(
+            claims,
+            None,
+            bucket_name,
+            object_key,
+            version_id,
+            ObjectReadConsistency::Latest,
+        )
+        .await
     }
 
     pub async fn read_object_link_for_tenant(
@@ -408,6 +527,7 @@ impl ObjectManager {
         bucket_name: &str,
         object_key: &str,
         version_id: Option<uuid::Uuid>,
+        consistency: ObjectReadConsistency,
     ) -> Result<object_links::ObjectLinkDescriptor, Status> {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
@@ -422,38 +542,52 @@ impl ObjectManager {
         let bucket = self
             .get_authorized_bucket(claims.as_ref(), route_tenant_id, bucket_name)
             .await?;
-        if !bucket.is_public_read {
-            let claims = claims
-                .as_ref()
-                .ok_or_else(|| Status::permission_denied("Permission denied"))?;
-            if !self
-                .object_read_allowed(claims, bucket_name, object_key, None)
-                .await?
-            {
-                return Err(Status::permission_denied("Permission denied"));
-            }
-        }
+        self.require_object_read_access(
+            claims.as_ref(),
+            &bucket,
+            object_key,
+            consistency.authz_revision(),
+        )
+        .await?;
 
         let object = match version_id {
-            Some(version_id) => metadata_journal::read_object_version(
-                &self.storage,
-                &bucket,
-                &self.signing_key,
-                object_key,
-                version_id,
-            )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Object link not found"))?,
-            None => metadata_journal::read_current_object(
-                &self.storage,
-                &bucket,
-                &self.signing_key,
-                object_key,
-            )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Object link not found"))?,
+            Some(version_id) => {
+                let object = if let Some(root_generation) = consistency.root_generation() {
+                    self.core_store
+                        .read_object_version_metadata_at_generation(
+                            &bucket,
+                            object_key,
+                            version_id,
+                            root_generation,
+                        )
+                        .await
+                } else {
+                    self.core_store
+                        .read_object_version_metadata(&bucket, object_key, version_id)
+                        .await
+                };
+                object
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .ok_or_else(|| Status::not_found("Object link not found"))?
+            }
+            None => {
+                let object = if let Some(root_generation) = consistency.root_generation() {
+                    self.core_store
+                        .read_current_object_metadata_at_generation(
+                            &bucket,
+                            object_key,
+                            root_generation,
+                        )
+                        .await
+                } else {
+                    self.core_store
+                        .read_current_object_metadata(&bucket, object_key)
+                        .await
+                };
+                object
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .ok_or_else(|| Status::not_found("Object link not found"))?
+            }
         };
         if object.deleted_at.is_some() || object.kind != object_links::ObjectEntryKind::Link {
             return Err(Status::not_found("Object link not found"));
@@ -479,6 +613,7 @@ impl ObjectManager {
             start_after,
             limit,
             delimiter,
+            ObjectReadConsistency::Latest,
         )
         .await
     }
@@ -492,6 +627,7 @@ impl ObjectManager {
         start_after: &str,
         limit: i32,
         delimiter: &str,
+        consistency: ObjectReadConsistency,
     ) -> Result<(Vec<Object>, Vec<String>), Status> {
         let _latency = self
             .observability
@@ -507,25 +643,20 @@ impl ObjectManager {
             return Err(Status::invalid_argument("Invalid object key prefix"));
         }
 
-        // Allow public buckets to bypass auth; otherwise require appropriate scope
         let bucket = self
             .get_authorized_bucket(claims.as_ref(), route_tenant_id, bucket_name)
             .await?;
-        if !bucket.is_public_read {
-            let claims = claims
-                .as_ref()
-                .ok_or_else(|| Status::permission_denied("Permission denied"))?;
-            if !auth::is_authorized(AnvilAction::ObjectList, bucket_name, &claims.scopes) {
-                return Err(Status::permission_denied("Permission denied"));
-            }
-        }
+        let reader_claims = self
+            .authorized_bucket_reader_claims(claims.as_ref(), &bucket, consistency.authz_revision())
+            .await?;
 
-        let mut objects = metadata_journal::read_current_directory_objects(
-            &self.storage,
-            &bucket,
-            &self.signing_key,
-        )
-        .await
+        let mut objects = if let Some(root_generation) = consistency.root_generation() {
+            self.core_store
+                .list_current_object_metadata_at_generation(&bucket, root_generation)
+                .await
+        } else {
+            self.core_store.list_current_object_metadata(&bucket).await
+        }
         .map_err(|e| Status::internal(e.to_string()))?;
         objects.retain(|object| {
             object.key.starts_with(prefix)
@@ -534,14 +665,14 @@ impl ObjectManager {
         });
         objects.sort_by(|left, right| left.key.cmp(&right.key));
 
-        if !bucket.is_public_read {
-            let claims = claims
-                .as_ref()
-                .expect("private bucket listing has claims after authorization");
-            objects = self
-                .filter_objects_visible_to_reader(claims, bucket_name, objects, None)
-                .await?;
-        }
+        objects = self
+            .filter_objects_visible_to_reader(
+                &reader_claims,
+                bucket_name,
+                objects,
+                consistency.authz_revision(),
+            )
+            .await?;
 
         let listing =
             visible_object_listing(objects, prefix, normalized_list_limit(limit), delimiter);
@@ -565,6 +696,7 @@ impl ObjectManager {
             key_marker,
             version_id_marker,
             limit,
+            ObjectReadConsistency::Latest,
         )
         .await
     }
@@ -578,6 +710,7 @@ impl ObjectManager {
         key_marker: &str,
         version_id_marker: &str,
         limit: i32,
+        consistency: ObjectReadConsistency,
     ) -> Result<crate::persistence::ObjectVersionsPage, Status> {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
@@ -607,69 +740,71 @@ impl ObjectManager {
         let bucket = self
             .get_authorized_bucket(claims.as_ref(), route_tenant_id, bucket_name)
             .await?;
-        if !bucket.is_public_read {
-            let claims = claims
-                .as_ref()
-                .ok_or_else(|| Status::permission_denied("Permission denied"))?;
-            if !auth::is_authorized(AnvilAction::ObjectList, bucket_name, &claims.scopes) {
-                return Err(Status::permission_denied("Permission denied"));
-            }
-        }
-
-        if bucket.is_public_read {
-            return metadata_journal::read_object_versions(
-                &self.storage,
-                &bucket,
-                &self.signing_key,
-                prefix,
-                key_marker,
-                version_id_marker,
-                normalized_list_limit(limit),
-            )
-            .await
-            .map_err(|e| Status::internal(e.to_string()));
-        }
-
-        let claims = claims
-            .as_ref()
-            .expect("private bucket version listing has claims after authorization");
+        let reader_claims = self
+            .authorized_bucket_reader_claims(claims.as_ref(), &bucket, consistency.authz_revision())
+            .await?;
         self.list_visible_object_versions(
-            claims,
+            &reader_claims,
             bucket_name,
             &bucket,
             prefix,
             key_marker,
             version_id_marker,
             normalized_list_limit(limit),
+            consistency,
         )
         .await
     }
 
     pub async fn current_object_for_write_precondition(
         &self,
-        tenant_id: i64,
+        claims: &auth::Claims,
         bucket_name: &str,
         object_key: &str,
-        scopes: &[String],
     ) -> Result<Option<Object>, Status> {
-        self.validate_write_request(bucket_name, object_key, scopes)?;
-        let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
-        metadata_journal::read_current_object(&self.storage, &bucket, &self.signing_key, object_key)
+        self.validate_write_request(claims, bucket_name, object_key)
+            .await?;
+        let bucket = self
+            .get_tenant_bucket(claims.tenant_id, bucket_name)
+            .await?;
+        self.core_store
+            .read_current_object_metadata(&bucket, object_key)
             .await
             .map_err(|e| Status::internal(e.to_string()))
     }
 
     pub async fn current_object_for_mutation_precondition(
         &self,
-        tenant_id: i64,
+        claims: &auth::Claims,
         bucket_name: &str,
         object_key: &str,
-        scopes: &[String],
         action: AnvilAction,
     ) -> Result<Option<Object>, Status> {
-        self.validate_object_request(bucket_name, object_key, scopes, action)?;
-        let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
-        metadata_journal::read_current_object(&self.storage, &bucket, &self.signing_key, object_key)
+        match action {
+            AnvilAction::ObjectRead | AnvilAction::ObjectWrite | AnvilAction::ObjectDelete => {
+                self.validate_object_request(claims, bucket_name, object_key, action)
+                    .await?;
+            }
+            AnvilAction::StreamCreate
+            | AnvilAction::StreamAppend
+            | AnvilAction::StreamSealSegment => {
+                self.validate_object_path_only(bucket_name, object_key)?;
+                access_control::require_action(
+                    &self.storage,
+                    &self.persistence,
+                    claims,
+                    action,
+                    &format!("{bucket_name}/{object_key}"),
+                )
+                .await?;
+            }
+            _ => return Err(Status::internal("unsupported mutation precondition action")),
+        }
+        let bucket = self
+            .get_tenant_bucket(claims.tenant_id, bucket_name)
+            .await?;
+        self.core_store
+            .read_current_object_metadata(&bucket, object_key)
             .await
             .map_err(|e| Status::internal(e.to_string()))
     }
@@ -682,12 +817,10 @@ impl ObjectManager {
         source_version_id: Option<uuid::Uuid>,
         destination_bucket_name: &str,
         destination_object_key: &str,
+        transaction_id: Option<&str>,
     ) -> Result<Object, Status> {
-        self.validate_write_request(
-            destination_bucket_name,
-            destination_object_key,
-            &claims.scopes,
-        )?;
+        self.validate_write_request(&claims, destination_bucket_name, destination_object_key)
+            .await?;
         let source_object = self
             .head_object(
                 Some(claims.clone()),
@@ -699,10 +832,12 @@ impl ObjectManager {
         let destination_bucket = self
             .get_tenant_bucket(claims.tenant_id, destination_bucket_name)
             .await?;
+        let transaction_principal =
+            crate::object_manager::transaction_principal_from_claims(&claims);
 
         let copied = self
             .persistence
-            .create_object(
+            .create_object_with_storage_class(
                 claims.tenant_id,
                 destination_bucket.id,
                 destination_object_key,
@@ -713,18 +848,22 @@ impl ObjectManager {
                 source_object.user_meta,
                 source_object.shard_map,
                 None,
+                transaction_id,
+                Some(transaction_principal.as_str()),
+                source_object.storage_class,
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-
-        self.publish_object_watch_event(
-            claims.tenant_id,
-            &destination_bucket,
-            &copied,
-            "copy",
-            false,
-        )
-        .await?;
+        if transaction_id.is_none() {
+            self.publish_object_watch_event(
+                claims.tenant_id,
+                &destination_bucket,
+                &copied,
+                "copy",
+                false,
+            )
+            .await?;
+        }
 
         Ok(copied)
     }
@@ -735,6 +874,7 @@ impl ObjectManager {
         sources: Vec<ComposeSource>,
         destination_bucket_name: &str,
         destination_object_key: &str,
+        transaction_id: Option<&str>,
     ) -> Result<Object, Status> {
         if sources.is_empty() {
             return Err(Status::invalid_argument(
@@ -782,12 +922,14 @@ impl ObjectManager {
         ));
 
         self.put_object(
-            claims.tenant_id,
+            &claims,
             destination_bucket_name,
             destination_object_key,
-            &claims.scopes,
             composed_stream,
-            ObjectWriteOptions::default(),
+            ObjectWriteOptions {
+                transaction_id: transaction_id.map(ToOwned::to_owned),
+                ..Default::default()
+            },
         )
         .await
     }
@@ -799,6 +941,7 @@ impl ObjectManager {
         object_key: &str,
         base_version_id: Option<uuid::Uuid>,
         merge_patch_json: &str,
+        transaction_id: Option<&str>,
     ) -> Result<Object, Status> {
         let (_source_object, source_stream, _range_start) = self
             .get_object(
@@ -821,14 +964,17 @@ impl ObjectManager {
             .map_err(|e| Status::internal(format!("Failed to serialize patched JSON: {}", e)))?;
 
         self.put_object(
-            claims.tenant_id,
+            &claims,
             bucket_name,
             object_key,
-            &claims.scopes,
             tokio_stream::iter(vec![Ok(patched_bytes)]),
             ObjectWriteOptions {
                 content_type: Some("application/json".to_string()),
                 user_metadata: None,
+                transaction_id: transaction_id.map(ToOwned::to_owned),
+                transaction_principal: transaction_id
+                    .map(|_| crate::object_manager::transaction_principal_from_claims(&claims)),
+                storage_class_id: None,
             },
         )
         .await
@@ -861,18 +1007,15 @@ impl ObjectManager {
             return Err(self.remote_bucket_status(locator.home_region.as_str()));
         }
 
-        let bucket = match tenant_id {
-            Some(tenant_id) => {
-                bucket_journal::read_current_bucket(&self.storage, tenant_id, bucket_name)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?
-                    .ok_or_else(|| Status::not_found("Bucket not found for this tenant"))
-            }
-            None => bucket_journal::read_public_bucket_by_name(&self.storage, bucket_name)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-                .ok_or_else(|| Status::not_found("Public bucket not found")),
-        }?;
+        let tenant_id = tenant_id.ok_or_else(|| {
+            Status::permission_denied(
+                "Bucket reads require authenticated tenant claims or an explicit tenant route",
+            )
+        })?;
+        let bucket = bucket_journal::read_current_bucket(&self.storage, tenant_id, bucket_name)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Bucket not found for this tenant"))?;
 
         if bucket.region != self.region {
             return Err(self.remote_bucket_status(&bucket.region));
@@ -922,6 +1065,7 @@ impl ObjectManager {
         bucket: &Bucket,
         initial_link: Object,
         claims: Option<&auth::Claims>,
+        consistency: ObjectReadConsistency,
     ) -> Result<(Object, object_links::FollowedObjectLink), Status> {
         let initial_descriptor = object_links::link_descriptor(&bucket.name, &initial_link)
             .ok_or_else(|| Status::internal("Object link descriptor missing"))?;
@@ -939,37 +1083,48 @@ impl ObjectManager {
             if !seen.insert(seen_key) {
                 return Err(Status::failed_precondition("ObjectLinkLoop"));
             }
-            if !bucket.is_public_read {
-                let claims =
-                    claims.ok_or_else(|| Status::permission_denied("Permission denied"))?;
-                if !self
-                    .object_read_allowed(claims, &bucket.name, &link.target_key, None)
-                    .await?
-                {
-                    return Err(Status::permission_denied("Permission denied"));
-                }
-            }
+            self.require_object_read_access(
+                claims,
+                bucket,
+                &link.target_key,
+                consistency.authz_revision(),
+            )
+            .await?;
 
             let target = match link.target_version {
-                Some(version_id) => {
-                    metadata_journal::read_object_version(
-                        &self.storage,
-                        bucket,
-                        &self.signing_key,
-                        &link.target_key,
-                        version_id,
-                    )
-                    .await
-                }
-                None => {
-                    metadata_journal::read_current_object(
-                        &self.storage,
-                        bucket,
-                        &self.signing_key,
-                        &link.target_key,
-                    )
-                    .await
-                }
+                Some(version_id) => match consistency.root_generation() {
+                    Some(root_generation) => {
+                        self.core_store
+                            .read_object_version_metadata_at_generation(
+                                bucket,
+                                &link.target_key,
+                                version_id,
+                                root_generation,
+                            )
+                            .await
+                    }
+                    None => {
+                        self.core_store
+                            .read_object_version_metadata(bucket, &link.target_key, version_id)
+                            .await
+                    }
+                },
+                None => match consistency.root_generation() {
+                    Some(root_generation) => {
+                        self.core_store
+                            .read_current_object_metadata_at_generation(
+                                bucket,
+                                &link.target_key,
+                                root_generation,
+                            )
+                            .await
+                    }
+                    None => {
+                        self.core_store
+                            .read_current_object_metadata(bucket, &link.target_key)
+                            .await
+                    }
+                },
             }
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::failed_precondition("DanglingObjectLink"))?;
@@ -1004,19 +1159,118 @@ impl ObjectManager {
         object_key: &str,
         authz_revision: Option<i64>,
     ) -> Result<bool, Status> {
-        let object_resource = format!("{bucket_name}/{object_key}");
-        access_control::scope_or_relationship_allows(
+        let bucket = self
+            .get_tenant_bucket(claims.tenant_id, bucket_name)
+            .await?;
+        self.object_read_allowed_for_bucket(claims, &bucket, object_key, authz_revision)
+            .await
+    }
+
+    async fn object_read_allowed_for_bucket(
+        &self,
+        claims: &auth::Claims,
+        bucket: &Bucket,
+        object_key: &str,
+        authz_revision: Option<i64>,
+    ) -> Result<bool, Status> {
+        let object_id = access_control::object_object_id(&bucket, object_key);
+        if access_control::system_realm_relationship_allows(
             &self.storage,
             claims,
-            AnvilAction::ObjectRead,
-            &object_resource,
-            "object",
-            &object_resource,
-            "reader",
+            crate::system_realm::SYSTEM_OBJECT_NAMESPACE,
+            &object_id,
+            "get",
+            authz_revision,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        {
+            return Ok(true);
+        }
+        access_control::system_realm_relationship_allows(
+            &self.storage,
+            claims,
+            crate::system_realm::SYSTEM_BUCKET_NAMESPACE,
+            &access_control::bucket_object_id(&bucket),
+            "get_object",
             authz_revision,
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))
+    }
+
+    async fn require_object_read_access(
+        &self,
+        claims: Option<&auth::Claims>,
+        bucket: &Bucket,
+        object_key: &str,
+        authz_revision: Option<i64>,
+    ) -> Result<(), Status> {
+        if let Some(claims) = claims
+            && self
+                .object_read_allowed_for_bucket(claims, bucket, object_key, authz_revision)
+                .await?
+        {
+            return Ok(());
+        }
+
+        if bucket.is_public_read {
+            let public_claims = access_control::public_read_claims(bucket.tenant_id);
+            if self
+                .object_read_allowed_for_bucket(&public_claims, bucket, object_key, authz_revision)
+                .await?
+            {
+                return Ok(());
+            }
+        }
+
+        Err(Status::permission_denied("Permission denied"))
+    }
+
+    async fn bucket_relation_allowed(
+        &self,
+        claims: &auth::Claims,
+        bucket: &Bucket,
+        relation: &str,
+        authz_revision: Option<i64>,
+    ) -> Result<bool, Status> {
+        access_control::system_realm_relationship_allows(
+            &self.storage,
+            claims,
+            crate::system_realm::SYSTEM_BUCKET_NAMESPACE,
+            &access_control::bucket_object_id(bucket),
+            relation,
+            authz_revision,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))
+    }
+
+    async fn authorized_bucket_reader_claims(
+        &self,
+        claims: Option<&auth::Claims>,
+        bucket: &Bucket,
+        authz_revision: Option<i64>,
+    ) -> Result<auth::Claims, Status> {
+        if let Some(claims) = claims
+            && self
+                .bucket_relation_allowed(claims, bucket, "list_objects", authz_revision)
+                .await?
+        {
+            return Ok(claims.clone());
+        }
+
+        if bucket.is_public_read {
+            let public_claims = access_control::public_read_claims(bucket.tenant_id);
+            if self
+                .bucket_relation_allowed(&public_claims, bucket, "list_objects", authz_revision)
+                .await?
+            {
+                return Ok(public_claims);
+            }
+        }
+
+        Err(Status::permission_denied("Permission denied"))
     }
 
     async fn filter_objects_visible_to_reader(
@@ -1047,6 +1301,7 @@ impl ObjectManager {
         key_marker: &str,
         version_id_marker: Option<uuid::Uuid>,
         limit: i32,
+        consistency: ObjectReadConsistency,
     ) -> Result<ObjectVersionsPage, Status> {
         let requested_limit = normalized_list_limit(limit).max(1) as usize;
         let visible_target = requested_limit.saturating_add(1);
@@ -1056,21 +1311,38 @@ impl ObjectManager {
         let mut current_version_marker = version_id_marker;
 
         loop {
-            let page = metadata_journal::read_object_versions(
-                &self.storage,
-                bucket,
-                &self.signing_key,
-                prefix,
-                &current_key_marker,
-                current_version_marker,
-                page_limit,
-            )
-            .await
+            let page = if let Some(root_generation) = consistency.root_generation() {
+                self.core_store
+                    .list_object_versions_metadata_at_generation(
+                        bucket,
+                        prefix,
+                        &current_key_marker,
+                        current_version_marker,
+                        page_limit,
+                        root_generation,
+                    )
+                    .await
+            } else {
+                self.core_store
+                    .list_object_versions_metadata(
+                        bucket,
+                        prefix,
+                        &current_key_marker,
+                        current_version_marker,
+                        page_limit,
+                    )
+                    .await
+            }
             .map_err(|e| Status::internal(e.to_string()))?;
 
             for version in page.versions {
                 if self
-                    .object_read_allowed(claims, bucket_name, &version.object.key, None)
+                    .object_read_allowed(
+                        claims,
+                        bucket_name,
+                        &version.object.key,
+                        consistency.authz_revision(),
+                    )
                     .await?
                 {
                     visible.push(version);
@@ -1117,7 +1389,7 @@ impl ObjectManager {
         })
     }
 
-    pub(super) async fn publish_object_watch_event(
+    pub(crate) async fn publish_object_watch_event(
         &self,
         tenant_id: i64,
         bucket: &Bucket,
@@ -1144,34 +1416,59 @@ impl ObjectManager {
         Ok(())
     }
 
-    pub(super) fn validate_write_request(
+    pub(super) async fn validate_write_request(
         &self,
+        claims: &auth::Claims,
         bucket_name: &str,
         object_key: &str,
-        scopes: &[String],
     ) -> Result<(), Status> {
-        self.validate_object_request(bucket_name, object_key, scopes, AnvilAction::ObjectWrite)
+        self.validate_object_request(claims, bucket_name, object_key, AnvilAction::ObjectWrite)
+            .await
     }
 
-    fn validate_object_request(
+    pub(super) fn validate_object_path_only(
         &self,
         bucket_name: &str,
         object_key: &str,
-        scopes: &[String],
-        action: AnvilAction,
     ) -> Result<(), Status> {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
         if validation::is_reserved_internal_key(object_key) {
+            self.record_reserved_namespace_rejection("object_path");
             return Err(Status::permission_denied("UnauthorizedReservedNamespace"));
         }
         if !validation::is_valid_object_key(object_key) {
             return Err(Status::invalid_argument("Invalid object key"));
         }
-        if !auth::is_authorized(action, &format!("{}/{}", bucket_name, object_key), scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        Ok(())
+    }
+
+    async fn validate_object_request(
+        &self,
+        claims: &auth::Claims,
+        bucket_name: &str,
+        object_key: &str,
+        action: AnvilAction,
+    ) -> Result<(), Status> {
+        self.validate_object_path_only(bucket_name, object_key)?;
+        let bucket = self
+            .get_tenant_bucket(claims.tenant_id, bucket_name)
+            .await?;
+        let relation = match action {
+            AnvilAction::ObjectRead => "get",
+            AnvilAction::ObjectWrite => "put",
+            AnvilAction::ObjectDelete => "delete",
+            _ => return Err(Status::internal("unsupported object action")),
+        };
+        access_control::require_object_permission(
+            &self.storage,
+            claims,
+            &bucket,
+            object_key,
+            relation,
+        )
+        .await?;
         Ok(())
     }
 

@@ -1,24 +1,59 @@
 use crate::{
-    core_store::{
-        CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
-        WriteLogicalFileRequest,
-    },
+    core_store::{decode_deterministic_proto, encode_deterministic_proto},
     formats::{Hash32, hash32},
     personaldb_control::PersonalDbSnapshotManifest,
+    personaldb_coremeta::{
+        read_personaldb_data_locator_bytes, read_personaldb_data_locator_row,
+        write_personaldb_bytes_as_data_locator,
+    },
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use prost::Message;
 
 const PERSONALDB_SNAPSHOT_OBJECT_REF_PREFIX: &str = "personaldb_snapshot_object:";
 const PERSONALDB_SNAPSHOT_MANIFEST_REF_PREFIX: &str = "personaldb_snapshot_manifest:";
-const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersonalDbSnapshotWriteResult {
     pub object_ref: String,
     pub manifest_ref: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct PersonalDbSnapshotManifestProto {
+    #[prost(uint32, tag = "1")]
+    format_version: u32,
+    #[prost(string, tag = "2")]
+    tenant_id: String,
+    #[prost(string, tag = "3")]
+    database_id: String,
+    #[prost(uint64, tag = "4")]
+    log_index: u64,
+    #[prost(string, tag = "5")]
+    log_hash: String,
+    #[prost(string, tag = "6")]
+    state_hash: String,
+    #[prost(string, tag = "7")]
+    schema_hash: String,
+    #[prost(string, tag = "8")]
+    snapshot_object_key: String,
+    #[prost(string, tag = "9")]
+    snapshot_object_hash: String,
+    #[prost(uint64, tag = "10")]
+    source_segment_start: u64,
+    #[prost(uint64, tag = "11")]
+    source_segment_end: u64,
+    #[prost(uint64, tag = "12")]
+    row_index_generation: u64,
+    #[prost(string, tag = "13")]
+    created_at: String,
+    #[prost(string, tag = "14")]
+    created_by_node: String,
+    #[prost(string, optional, tag = "15")]
+    manifest_hash: Option<String>,
+    #[prost(string, optional, tag = "16")]
+    manifest_signature: Option<String>,
 }
 
 pub async fn write_personaldb_snapshot(
@@ -46,17 +81,21 @@ pub async fn write_personaldb_snapshot(
     )?;
     if manifest.snapshot_object_key != object_ref {
         return Err(anyhow!(
-            "personaldb snapshot object key does not match CoreStore ref"
+            "personaldb snapshot object key does not match CoreStore object identity"
         ));
     }
 
-    let store = CoreStore::new(storage.clone()).await?;
-    put_immutable_ref_bytes(
-        &store,
+    write_personaldb_bytes_as_data_locator(
+        storage,
+        tenant_id,
+        database_id,
         &object_ref,
-        compressed_sqlite_bytes,
-        "personaldb-snapshot-object",
-        &format!(
+        "snapshot_object",
+        manifest.log_index,
+        compressed_sqlite_bytes.to_vec(),
+        manifest.snapshot_object_hash.clone(),
+        vec![format!("state_hash:{}", manifest.state_hash)],
+        format!(
             "personaldb-snapshot-object:{tenant_id}:{database_id}:{}",
             manifest.log_index
         ),
@@ -68,13 +107,21 @@ pub async fn write_personaldb_snapshot(
         manifest.log_index,
         &hex::encode(state_hash),
     )?;
-    let manifest_bytes = serde_json::to_vec_pretty(manifest)?;
-    put_immutable_ref_bytes(
-        &store,
+    let manifest_bytes = encode_snapshot_manifest(manifest)?;
+    write_personaldb_bytes_as_data_locator(
+        storage,
+        tenant_id,
+        database_id,
         &manifest_ref,
-        &manifest_bytes,
-        "personaldb-snapshot-manifest",
-        &format!(
+        "snapshot_manifest",
+        manifest.log_index,
+        manifest_bytes,
+        manifest
+            .manifest_hash
+            .clone()
+            .unwrap_or_else(|| hex::encode(hash32(manifest_ref.as_bytes()))),
+        vec![format!("state_hash:{}", manifest.state_hash)],
+        format!(
             "personaldb-snapshot-manifest:{tenant_id}:{database_id}:{}",
             manifest.log_index
         ),
@@ -113,16 +160,19 @@ pub async fn read_personaldb_snapshot_manifest_by_ref(
     manifest_ref: &str,
     signing_key: &[u8],
 ) -> Result<Option<PersonalDbSnapshotManifest>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(manifest_ref).await? else {
+    let (tenant_id, database_id) = personaldb_ref_scope(manifest_ref)?;
+    let Some(row) =
+        read_personaldb_data_locator_row(storage, tenant_id, &database_id, manifest_ref)?
+    else {
         return Ok(None);
     };
-    let bytes = store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
-        })
-        .await?;
-    let manifest: PersonalDbSnapshotManifest = serde_json::from_slice(&bytes)?;
+    if row.data_kind != "snapshot_manifest" {
+        return Err(anyhow!(
+            "personaldb snapshot manifest locator has wrong data kind"
+        ));
+    }
+    let bytes = read_personaldb_data_locator_bytes(storage, &row).await?;
+    let manifest = decode_snapshot_manifest(&bytes)?;
     manifest.verify(signing_key)?;
     Ok(Some(manifest))
 }
@@ -144,22 +194,90 @@ pub async fn read_personaldb_snapshot_object(
     )?;
     if manifest.snapshot_object_key != expected_object_ref {
         return Err(anyhow!(
-            "personaldb snapshot object key does not match CoreStore ref"
+            "personaldb snapshot object key does not match CoreStore object identity"
         ));
     }
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(&manifest.snapshot_object_key).await? else {
+    let Some(row) = read_personaldb_data_locator_row(
+        storage,
+        tenant_id,
+        database_id,
+        &manifest.snapshot_object_key,
+    )?
+    else {
         return Ok(None);
     };
-    let bytes = store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
-        })
-        .await?;
+    if row.data_kind != "snapshot_object" {
+        return Err(anyhow!(
+            "personaldb snapshot object locator has wrong data kind"
+        ));
+    }
+    let bytes = read_personaldb_data_locator_bytes(storage, &row).await?;
     if hash32(&bytes) != decode_hex32(&manifest.snapshot_object_hash, "snapshot_object_hash")? {
         return Err(anyhow!("personaldb snapshot object hash mismatch"));
     }
     Ok(Some(bytes))
+}
+
+fn encode_snapshot_manifest(manifest: &PersonalDbSnapshotManifest) -> Result<Vec<u8>> {
+    Ok(encode_deterministic_proto(&snapshot_manifest_to_proto(
+        manifest,
+    )))
+}
+
+fn decode_snapshot_manifest(bytes: &[u8]) -> Result<PersonalDbSnapshotManifest> {
+    snapshot_manifest_from_proto(
+        decode_deterministic_proto::<PersonalDbSnapshotManifestProto>(
+            bytes,
+            "personaldb snapshot manifest",
+        )?,
+    )
+}
+
+fn snapshot_manifest_to_proto(
+    manifest: &PersonalDbSnapshotManifest,
+) -> PersonalDbSnapshotManifestProto {
+    PersonalDbSnapshotManifestProto {
+        format_version: u32::from(manifest.format_version),
+        tenant_id: manifest.tenant_id.clone(),
+        database_id: manifest.database_id.clone(),
+        log_index: manifest.log_index,
+        log_hash: manifest.log_hash.clone(),
+        state_hash: manifest.state_hash.clone(),
+        schema_hash: manifest.schema_hash.clone(),
+        snapshot_object_key: manifest.snapshot_object_key.clone(),
+        snapshot_object_hash: manifest.snapshot_object_hash.clone(),
+        source_segment_start: manifest.source_segment_start,
+        source_segment_end: manifest.source_segment_end,
+        row_index_generation: manifest.row_index_generation,
+        created_at: manifest.created_at.clone(),
+        created_by_node: manifest.created_by_node.clone(),
+        manifest_hash: manifest.manifest_hash.clone(),
+        manifest_signature: manifest.manifest_signature.clone(),
+    }
+}
+
+fn snapshot_manifest_from_proto(
+    proto: PersonalDbSnapshotManifestProto,
+) -> Result<PersonalDbSnapshotManifest> {
+    Ok(PersonalDbSnapshotManifest {
+        format_version: u16::try_from(proto.format_version)
+            .map_err(|_| anyhow!("personaldb snapshot manifest version exceeds u16"))?,
+        tenant_id: proto.tenant_id,
+        database_id: proto.database_id,
+        log_index: proto.log_index,
+        log_hash: proto.log_hash,
+        state_hash: proto.state_hash,
+        schema_hash: proto.schema_hash,
+        snapshot_object_key: proto.snapshot_object_key,
+        snapshot_object_hash: proto.snapshot_object_hash,
+        source_segment_start: proto.source_segment_start,
+        source_segment_end: proto.source_segment_end,
+        row_index_generation: proto.row_index_generation,
+        created_at: proto.created_at,
+        created_by_node: proto.created_by_node,
+        manifest_hash: proto.manifest_hash,
+        manifest_signature: proto.manifest_signature,
+    })
 }
 
 fn ensure_manifest_scope(
@@ -228,80 +346,59 @@ fn validate_scope_component(tenant_id: i64, database_id: &str) -> Result<()> {
     Ok(())
 }
 
-async fn put_immutable_ref_bytes(
-    store: &CoreStore,
-    ref_name: &str,
-    bytes: &[u8],
-    logical_name: &str,
-    mutation_id: &str,
-) -> Result<()> {
-    let object_ref = store
-        .write_logical_file_ref(WriteLogicalFileRequest {
-            writer_family: "personaldb".to_string(),
-            generation: 1,
-            logical_file_id: format!("{logical_name}:{ref_name}"),
-            source: bytes.to_vec(),
-            range_hints: Vec::new(),
-            pipeline_policy: CorePipelinePolicy::default(),
-            trace_context: CoreTraceContext::default(),
-            boundary_values: Vec::new(),
-            mutation_id: mutation_id.to_string(),
-            region_id: "local".to_string(),
-        })
-        .await?;
-    let target = encode_core_object_ref_target(&object_ref)?;
-    match store
-        .compare_and_swap_ref(CompareAndSwapRef {
-            ref_name: ref_name.to_string(),
-            expected_generation: None,
-            expected_target: None,
-            require_absent: true,
-            require_present: false,
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-            new_target: target,
-            transaction_id: None,
-        })
-        .await
+fn personaldb_ref_scope(ref_name: &str) -> Result<(i64, String)> {
+    if ![
+        PERSONALDB_SNAPSHOT_OBJECT_REF_PREFIX,
+        PERSONALDB_SNAPSHOT_MANIFEST_REF_PREFIX,
+    ]
+    .iter()
+    .any(|prefix| ref_name.starts_with(prefix))
     {
-        Ok(_) => Ok(()),
-        Err(err) => {
-            let Some(existing) = store.read_ref(ref_name).await? else {
-                return Err(err);
-            };
-            let existing_bytes = store
-                .get_blob(GetBlob {
-                    object_ref: decode_core_object_ref_target(&existing.target)?,
-                })
-                .await?;
-            if existing_bytes == bytes {
-                Ok(())
-            } else {
-                Err(anyhow!("personaldb immutable snapshot ref collision"))
-            }
-        }
+        return Err(anyhow!(
+            "personaldb snapshot data id has unsupported ref prefix"
+        ));
     }
+    if ref_name.contains('/') || ref_name.contains('\\') || ref_name.chars().any(char::is_control) {
+        return Err(anyhow!(
+            "personaldb snapshot data id must not be a storage path"
+        ));
+    }
+    let tenant_marker = "tenant:";
+    let database_marker = ":database:";
+    let tenant_start = ref_name
+        .find(tenant_marker)
+        .ok_or_else(|| anyhow!("personaldb snapshot data id is missing tenant"))?
+        + tenant_marker.len();
+    let database_marker_offset = ref_name[tenant_start..]
+        .find(database_marker)
+        .ok_or_else(|| anyhow!("personaldb snapshot data id is missing database"))?
+        + tenant_start;
+    let tenant_id = ref_name[tenant_start..database_marker_offset]
+        .parse::<i64>()
+        .map_err(|_| anyhow!("personaldb snapshot data id tenant is invalid"))?;
+    let database_start = database_marker_offset + database_marker.len();
+    let database_end = ref_name[database_start..]
+        .find(':')
+        .map(|offset| database_start + offset)
+        .unwrap_or(ref_name.len());
+    let database_id = ref_name[database_start..database_end].to_string();
+    validate_scope_component(tenant_id, &database_id)?;
+    Ok((tenant_id, database_id))
 }
 
-fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
-    Ok(format!(
-        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
-    ))
+#[cfg(test)]
+fn encode_core_object_ref_target(object_ref: &crate::core_store::CoreObjectRef) -> Result<String> {
+    crate::core_store::encode_core_object_ref_target(object_ref)
 }
 
-fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
-    let encoded = target
-        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
-        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
-    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
+#[cfg(test)]
+fn decode_core_object_ref_target(target: &str) -> Result<crate::core_store::CoreObjectRef> {
+    crate::core_store::decode_core_object_ref_target(target)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core_store::PutBlob;
     use tempfile::tempdir;
 
     const KEY: &[u8] = b"personaldb snapshot signing key";
@@ -393,37 +490,20 @@ mod tests {
         write_personaldb_snapshot(&storage, 6, "db-alpha", bytes, &manifest, KEY)
             .await
             .unwrap();
-        let store = CoreStore::new(storage.clone()).await.unwrap();
-        let corrupt = store
-            .put_blob(PutBlob {
-                logical_name: "corrupt-snapshot".to_string(),
-                bytes: b"corrupt".to_vec(),
-                boundary_values: Vec::new(),
-                region_id: "local".to_string(),
-                mutation_id: "corrupt-snapshot".to_string(),
-            })
-            .await
-            .unwrap();
-        let current = store
-            .read_ref(&manifest.snapshot_object_key)
-            .await
-            .unwrap()
-            .expect("snapshot object ref exists");
-        store
-            .compare_and_swap_ref(CompareAndSwapRef {
-                ref_name: manifest.snapshot_object_key.clone(),
-                expected_generation: Some(current.generation),
-                expected_target: Some(current.target),
-                require_absent: false,
-                require_present: true,
-                fence: None,
-                authz_revision: None,
-                source_watch_cursor: None,
-                new_target: encode_core_object_ref_target(&corrupt).unwrap(),
-                transaction_id: None,
-            })
-            .await
-            .unwrap();
+        write_personaldb_bytes_as_data_locator(
+            &storage,
+            6,
+            "db-alpha",
+            &manifest.snapshot_object_key,
+            "snapshot_object",
+            manifest.log_index + 1,
+            b"corrupt".to_vec(),
+            hex::encode(hash32(b"corrupt")),
+            vec![format!("state_hash:{}", manifest.state_hash)],
+            "corrupt-snapshot".to_string(),
+        )
+        .await
+        .unwrap();
         assert!(
             read_personaldb_snapshot_object(&storage, 6, "db-alpha", &manifest, KEY)
                 .await

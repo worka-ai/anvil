@@ -5,6 +5,7 @@ impl Persistence {
         Ok(Self {
             storage: Storage::new_at_sync(&config.storage_path)?,
             cache: MetadataCache::new(config),
+            core_store: Arc::new(OnceCell::new()),
             event_publisher,
             task_notify: Arc::new(Notify::new()),
             mesh_id: nonempty_or(&config.mesh_id, "default"),
@@ -24,6 +25,13 @@ impl Persistence {
                 config.task_lease_ttl_secs
             },
         })
+    }
+
+    pub(super) async fn core_store(&self) -> Result<CoreStore> {
+        self.core_store
+            .get_or_try_init(|| async { CoreStore::new(self.storage.clone()).await })
+            .await
+            .cloned()
     }
 
     pub(super) async fn publish_event(&self, event: MetadataEvent) {
@@ -438,6 +446,76 @@ impl Persistence {
         Ok(())
     }
 
+    pub async fn move_bucket_home_region(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        target_region: &str,
+    ) -> Result<Bucket> {
+        let mut bucket = bucket_journal::read_current_bucket(&self.storage, tenant_id, bucket_name)
+            .await?
+            .ok_or_else(|| anyhow!("bucket not found"))?;
+        if bucket.region == target_region {
+            return Ok(bucket);
+        }
+        crate::mesh_lifecycle::ensure_region_accepts_new_writes(&self.storage, target_region)
+            .await?;
+
+        let target_cell = self
+            .choose_bucket_home_cell(target_region)
+            .await?
+            .ok_or_else(|| anyhow!("target region has no active cell"))?;
+        let tenant = mesh_directory::TenantId::new(tenant_id.to_string())?;
+        let name = mesh_directory::BucketName::canonicalize(bucket_name)?;
+        let key = mesh_directory::BucketLocatorKey::new(tenant, name);
+        let existing = mesh_directory::read_bucket_locator(&self.storage, &key)
+            .await?
+            .ok_or_else(|| anyhow!("bucket locator not found"))?;
+
+        let mut moved = existing.clone();
+        moved.home_region = mesh_directory::RegionName::new(target_region.to_string())?;
+        moved.home_cell = mesh_directory::CellId::new(target_cell)?;
+        moved.status = mesh_directory::BucketLocatorStatus::Active;
+        moved.updated_at = Utc::now().to_rfc3339();
+        moved.generation = existing.generation.saturating_add(1);
+        self.write_mesh_bucket_locator_descriptor(&moved).await?;
+
+        bucket.region = target_region.to_string();
+        let tenant_permit = self.bucket_tenant_write_permit(bucket.tenant_id).await?;
+        let global_permit = self.bucket_global_write_permit().await?;
+        bucket_journal::append_bucket_mutation_with_permits(
+            &self.storage,
+            &bucket,
+            BucketJournalMutation::Update,
+            &tenant_permit,
+            &global_permit,
+            &self.partition_owner_signing_key,
+        )
+        .await?;
+        self.cache.invalidate_bucket(tenant_id, bucket_name).await;
+        self.publish_event(MetadataEvent::BucketUpdated {
+            tenant_id,
+            name: bucket_name.to_string(),
+        })
+        .await;
+        Ok(bucket)
+    }
+
+    async fn choose_bucket_home_cell(&self, target_region: &str) -> Result<Option<String>> {
+        let mut cells = crate::mesh_lifecycle::list_cells(&self.storage, Some(target_region))
+            .await?
+            .into_iter()
+            .filter(|cell| cell.state == crate::mesh_lifecycle::LifecycleState::Active)
+            .collect::<Vec<_>>();
+        cells.sort_by(|left, right| {
+            right
+                .placement_weight
+                .cmp(&left.placement_weight)
+                .then_with(|| left.cell_id.cmp(&right.cell_id))
+        });
+        Ok(cells.into_iter().next().map(|cell| cell.cell_id))
+    }
+
     pub(super) async fn global_write_permit(
         &self,
         partition_family: &str,
@@ -504,9 +582,15 @@ impl Persistence {
         ) {
             return Ok(());
         }
-        let nodes = crate::mesh_lifecycle::list_nodes(&self.storage, None, None)
-            .await
-            .map_err(|err| anyhow!(err.to_string()))?;
+        let core_store = self.core_store().await?;
+        let nodes = crate::mesh_lifecycle::list_nodes_with_core_store(
+            &self.storage,
+            &core_store,
+            None,
+            None,
+        )
+        .await
+        .map_err(|err| anyhow!(err.to_string()))?;
         if nodes.is_empty() {
             return Ok(());
         }
@@ -564,6 +648,10 @@ impl Persistence {
         .await?
         {
             if record.owner == owner && record.is_active_unexpired(now_nanos) {
+                let remaining_nanos = record.lease_expires_at_nanos.saturating_sub(now_nanos);
+                if remaining_nanos > ttl_nanos / 3 {
+                    return Ok(());
+                }
                 renew_ownership(
                     &self.storage,
                     RenewOwnership {

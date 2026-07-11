@@ -1,9 +1,13 @@
 use crate::{
-    core_store::{AppendStreamRecord, CoreStore, ReadStream},
+    core_store::{
+        AppendStreamRecord, CoreStore, ReadStream, decode_deterministic_proto,
+        encode_deterministic_proto,
+    },
     formats::{Hash32, hash32, watch::WatchRecord},
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
+use prost::Message;
 use serde::{Deserialize, Serialize};
 
 const PERSONALDB_GROUP_PARTITION_FAMILY: u16 = 4;
@@ -21,6 +25,26 @@ pub struct PersonalDbGroupWatchPayload {
     pub certificate_hash: String,
     pub committed_head_hash: String,
     pub emitted_at: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct PersonalDbGroupWatchPayloadProto {
+    #[prost(string, tag = "1")]
+    database_id: String,
+    #[prost(string, tag = "2")]
+    event_type: String,
+    #[prost(uint64, tag = "3")]
+    log_index: u64,
+    #[prost(string, tag = "4")]
+    log_hash: String,
+    #[prost(string, tag = "5")]
+    changeset_payload_hash: String,
+    #[prost(string, tag = "6")]
+    certificate_hash: String,
+    #[prost(string, tag = "7")]
+    committed_head_hash: String,
+    #[prost(string, tag = "8")]
+    emitted_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +67,30 @@ pub struct PersonalDbProjectionWatchPayload {
     pub projection_log_hash: String,
     pub definition_hash: String,
     pub emitted_at: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct PersonalDbProjectionWatchPayloadProto {
+    #[prost(string, tag = "1")]
+    database_id: String,
+    #[prost(string, tag = "2")]
+    projection_id: String,
+    #[prost(string, tag = "3")]
+    event_type: String,
+    #[prost(string, tag = "4")]
+    source_database_id: String,
+    #[prost(uint64, tag = "5")]
+    source_log_index: u64,
+    #[prost(string, tag = "6")]
+    source_log_hash: String,
+    #[prost(uint64, tag = "7")]
+    projection_log_index: u64,
+    #[prost(string, tag = "8")]
+    projection_log_hash: String,
+    #[prost(string, tag = "9")]
+    definition_hash: String,
+    #[prost(string, tag = "10")]
+    emitted_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,7 +124,7 @@ pub async fn append_personaldb_group_watch_record(
         authz_revision,
         0,
         payload.log_index,
-        serde_json::to_vec(&payload)?,
+        encode_group_watch_payload(&payload),
     );
     core_store
         .append_stream(AppendStreamRecord {
@@ -84,6 +132,8 @@ pub async fn append_personaldb_group_watch_record(
             partition_id: hex::encode(partition_id(tenant_id, database_id)),
             record_kind: "personaldb_group_watch".to_string(),
             payload: record.encode(),
+            content_type: None,
+            user_metadata_json: "{}".to_string(),
             fence: None,
             transaction_id: None,
             idempotency_key: Some(format!(
@@ -124,7 +174,7 @@ pub async fn append_personaldb_projection_watch_record(
         authz_revision,
         0,
         payload.projection_log_index,
-        serde_json::to_vec(&payload)?,
+        encode_projection_watch_payload(&payload),
     );
     core_store
         .append_stream(AppendStreamRecord {
@@ -136,6 +186,8 @@ pub async fn append_personaldb_projection_watch_record(
             )),
             record_kind: "personaldb_projection_watch".to_string(),
             payload: record.encode(),
+            content_type: None,
+            user_metadata_json: "{}".to_string(),
             fence: None,
             transaction_id: None,
             idempotency_key: Some(format!(
@@ -171,7 +223,7 @@ pub async fn list_personaldb_group_watch_events(
         {
             continue;
         }
-        let payload: PersonalDbGroupWatchPayload = serde_json::from_slice(&record.payload)?;
+        let payload = decode_group_watch_payload(&record.payload)?;
         validate_payload(database_id, &payload)?;
         events.push(PersonalDbGroupWatchEvent {
             cursor: record.cursor,
@@ -212,7 +264,7 @@ pub async fn list_personaldb_projection_watch_events(
         {
             continue;
         }
-        let payload: PersonalDbProjectionWatchPayload = serde_json::from_slice(&record.payload)?;
+        let payload = decode_projection_watch_payload(&record.payload)?;
         validate_projection_payload(database_id, projection_id, &payload)?;
         events.push(PersonalDbProjectionWatchEvent {
             cursor: record.cursor,
@@ -354,6 +406,70 @@ fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
         return Err(anyhow!("{field} must be hex32"));
     }
     Ok(())
+}
+
+fn encode_group_watch_payload(payload: &PersonalDbGroupWatchPayload) -> Vec<u8> {
+    encode_deterministic_proto(&PersonalDbGroupWatchPayloadProto {
+        database_id: payload.database_id.clone(),
+        event_type: payload.event_type.clone(),
+        log_index: payload.log_index,
+        log_hash: payload.log_hash.clone(),
+        changeset_payload_hash: payload.changeset_payload_hash.clone(),
+        certificate_hash: payload.certificate_hash.clone(),
+        committed_head_hash: payload.committed_head_hash.clone(),
+        emitted_at: payload.emitted_at.clone(),
+    })
+}
+
+fn decode_group_watch_payload(bytes: &[u8]) -> Result<PersonalDbGroupWatchPayload> {
+    let proto = decode_deterministic_proto::<PersonalDbGroupWatchPayloadProto>(
+        bytes,
+        "personaldb group watch payload",
+    )?;
+    Ok(PersonalDbGroupWatchPayload {
+        database_id: proto.database_id,
+        event_type: proto.event_type,
+        log_index: proto.log_index,
+        log_hash: proto.log_hash,
+        changeset_payload_hash: proto.changeset_payload_hash,
+        certificate_hash: proto.certificate_hash,
+        committed_head_hash: proto.committed_head_hash,
+        emitted_at: proto.emitted_at,
+    })
+}
+
+fn encode_projection_watch_payload(payload: &PersonalDbProjectionWatchPayload) -> Vec<u8> {
+    encode_deterministic_proto(&PersonalDbProjectionWatchPayloadProto {
+        database_id: payload.database_id.clone(),
+        projection_id: payload.projection_id.clone(),
+        event_type: payload.event_type.clone(),
+        source_database_id: payload.source_database_id.clone(),
+        source_log_index: payload.source_log_index,
+        source_log_hash: payload.source_log_hash.clone(),
+        projection_log_index: payload.projection_log_index,
+        projection_log_hash: payload.projection_log_hash.clone(),
+        definition_hash: payload.definition_hash.clone(),
+        emitted_at: payload.emitted_at.clone(),
+    })
+}
+
+fn decode_projection_watch_payload(bytes: &[u8]) -> Result<PersonalDbProjectionWatchPayload> {
+    let proto = decode_deterministic_proto::<PersonalDbProjectionWatchPayloadProto>(
+        bytes,
+        "personaldb projection watch payload",
+    )?;
+    Ok(PersonalDbProjectionWatchPayload {
+        database_id: proto.database_id,
+        projection_id: proto.projection_id,
+        event_type: proto.event_type,
+        source_database_id: proto.source_database_id,
+        source_log_index: proto.source_log_index,
+        source_log_hash: proto.source_log_hash,
+        projection_log_index: proto.projection_log_index,
+        projection_log_hash: proto.projection_log_hash,
+        definition_hash: proto.definition_hash,
+        emitted_at: proto.emitted_at,
+    })
 }
 
 fn partition_id(tenant_id: i64, database_id: &str) -> Hash32 {

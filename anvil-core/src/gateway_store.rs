@@ -1,11 +1,16 @@
 use crate::{
     core_store::{
-        AppendStreamRecord, AuthzScopeRef, CompareAndSwapRef, CoreMutationBatch,
-        CoreMutationOperation, CoreMutationPrecondition, CoreObjectRef, CorePipelinePolicy,
-        CoreRefValue, CoreStore, CoreTraceContext, GetBlob, ReadStream, StreamAppendReceipt,
-        StreamRecord, WriteLogicalFileRequest, core_object_ref_from_logical_file_manifest,
+        AppendStreamRecord, AuthzScopeRef, CF_REGISTRY, CoreLogicalFileWrite, CoreMetaBatchOp,
+        CoreMetaBatchOpKind, CoreMetaStore, CoreMetaTuplePart, CoreObjectRef, CorePipelinePolicy,
+        CoreStore, CoreTraceContext, GetBlob, ReadStream, StreamAppendReceipt, StreamRecord,
+        TABLE_GATEWAY_METADATA_ROW, WriteLogicalFileRequest, core_meta_committed_row_common,
+        core_meta_root_key_hash, core_meta_tuple_key, core_object_ref_from_logical_file_write,
+        decode_deterministic_proto, encode_deterministic_proto,
     },
-    formats::hash32,
+    formats::{
+        hash32,
+        writer::{WriterFamily, canonical_logical_file_id},
+    },
     storage::Storage,
 };
 use anyhow::{Result, anyhow, bail};
@@ -13,16 +18,14 @@ use argon2::Argon2;
 use argon2::password_hash::{
     PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng,
 };
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
-const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 const GATEWAY_REPOSITORY_SCHEMA: &str = "anvil.gateway.repository.v1";
 const GATEWAY_BLOB_SCHEMA: &str = "anvil.gateway.blob.v1";
 const GATEWAY_TAG_SCHEMA: &str = "anvil.gateway.tag.v1";
@@ -31,6 +34,14 @@ const GATEWAY_CREDENTIAL_SCHEMA: &str = "anvil.gateway.credential.v1";
 const GATEWAY_MOUNT_SCHEMA: &str = "anvil.gateway.mount.v1";
 const GATEWAY_AUDIT_SCHEMA: &str = "anvil.gateway.audit.v1";
 const GATEWAY_ACCESS_TOKEN_KIND: &str = "anvil.gateway.access_token.v1";
+const GATEWAY_METADATA_ROW_SCHEMA: &str = "anvil.gateway.coremeta_record.v1";
+const GATEWAY_ROW_REPOSITORY: &str = "repository";
+const GATEWAY_ROW_BLOB: &str = "blob";
+const GATEWAY_ROW_TAG: &str = "tag";
+const GATEWAY_ROW_UPLOAD_SESSION: &str = "upload_session";
+const GATEWAY_ROW_UPLOAD_IDEMPOTENCY: &str = "upload_idempotency";
+const GATEWAY_ROW_CREDENTIAL: &str = "credential";
+const GATEWAY_ROW_MOUNT: &str = "mount";
 pub const GATEWAY_CREDENTIAL_CACHE_TTL_SECONDS: i64 = 60;
 pub const GATEWAY_ACCESS_TOKEN_MAX_TTL_SECONDS: i64 = 900;
 const REGIONAL_GATEWAY_SUFFIX: &str = ".anvil-storage.com";
@@ -172,7 +183,7 @@ pub enum GatewayMountMatchKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayMountResolution {
     pub record: GatewayMountRecord,
-    pub ref_generation: u64,
+    pub row_generation: u64,
     pub matched_host: String,
     pub matched_path_prefix: String,
     pub match_kind: GatewayMountMatchKind,
@@ -279,7 +290,8 @@ pub fn normalize_gateway_identifier(input: &str, label: &str) -> Result<String> 
         if matches!(
             lower.as_str(),
             "_anvil"
-                | "_core"
+                | "corestore"
+                | "admission"
                 | "_system"
                 | "_authz"
                 | "_credentials"
@@ -327,8 +339,9 @@ pub async fn create_gateway_repository(
         record_hash: String::new(),
     };
     record.record_hash = hash_record(&record)?;
-    put_record_ref(
+    put_record_row(
         storage,
+        GATEWAY_ROW_REPOSITORY,
         &gateway_repository_ref_name(&record)?,
         &record,
         true,
@@ -346,12 +359,17 @@ pub async fn read_gateway_repository(
     repository: &str,
 ) -> Result<Option<GatewayRepositoryRecord>> {
     let key = GatewayRepositoryKey::new(tenant_id, gateway, registry_instance_id, repository)?;
-    let Some(record) = read_record_ref::<GatewayRepositoryRecord>(storage, &key.ref_name()).await?
+    let Some(row) = read_record_row::<GatewayRepositoryRecord>(
+        storage,
+        GATEWAY_ROW_REPOSITORY,
+        &key.ref_name(),
+    )
+    .await?
     else {
         return Ok(None);
     };
-    validate_repository_record(&record, &key)?;
-    Ok(Some(record))
+    validate_repository_record(&row.record, &key)?;
+    Ok(Some(row.record))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -384,28 +402,31 @@ pub async fn put_gateway_blob(
         &repository,
         digest,
     )?;
-    if let Some(existing) = read_record_ref::<GatewayBlobRecord>(storage, &ref_name).await? {
+    if let Some(existing) =
+        read_record_row::<GatewayBlobRecord>(storage, GATEWAY_ROW_BLOB, &ref_name).await?
+    {
         validate_blob_record(
-            &existing,
+            &existing.record,
             tenant_id,
             &gateway,
             &registry_instance_id,
             &repository,
             digest,
         )?;
-        return Ok(existing);
+        return Ok(existing.record);
     }
 
     let store = CoreStore::new(storage.clone()).await?;
-    let object_ref = write_gateway_logical_file(
+    let payload_write = write_gateway_logical_file_with_locator(
         &store,
-        "registry_blob",
+        WriterFamily::Registry.as_str(),
         1,
         ref_name.clone(),
         bytes.to_vec(),
         format!("gateway-blob:{tenant_id}:{gateway}:{registry_instance_id}:{repository}:{digest}"),
     )
     .await?;
+    let object_ref = core_object_ref_from_logical_file_write(&payload_write);
     let mut record = GatewayBlobRecord {
         schema: GATEWAY_BLOB_SCHEMA.to_string(),
         tenant_id,
@@ -421,7 +442,8 @@ pub async fn put_gateway_blob(
         record_hash: String::new(),
     };
     record.record_hash = hash_record(&record)?;
-    put_record_ref(storage, &ref_name, &record, true, None).await?;
+    coremeta::write_registry_blob_locator_row(storage, &record, &payload_write.locator).await?;
+    put_record_row(storage, GATEWAY_ROW_BLOB, &ref_name, &record, true, None).await?;
     Ok(record)
 }
 
@@ -444,9 +466,12 @@ pub async fn read_gateway_blob(
         &repository,
         digest,
     )?;
-    let Some(record) = read_record_ref::<GatewayBlobRecord>(storage, &ref_name).await? else {
+    let Some(row) =
+        read_record_row::<GatewayBlobRecord>(storage, GATEWAY_ROW_BLOB, &ref_name).await?
+    else {
         return Ok(None);
     };
+    let record = row.record;
     validate_blob_record(
         &record,
         tenant_id,
@@ -500,10 +525,27 @@ pub async fn update_gateway_tag(
     };
     record.record_hash = hash_record(&record)?;
     let ref_name = gateway_tag_ref_name(&record)?;
-    let receipt = put_record_ref(storage, &ref_name, &record, false, expected_generation).await?;
+    let blob = coremeta::read_registry_blob_locator_row(
+        storage,
+        tenant_id,
+        &record.gateway,
+        &record.registry_instance_id,
+        &record.target_digest,
+    )?
+    .ok_or_else(|| anyhow!("registry tag target blob is missing CoreMeta locator row"))?;
+    let row = put_record_row(
+        storage,
+        GATEWAY_ROW_TAG,
+        &ref_name,
+        &record,
+        false,
+        expected_generation,
+    )
+    .await?;
+    coremeta::write_registry_version_row_for_tag(storage, &record, &blob, row.generation).await?;
     Ok(GatewayTagUpdateReceipt {
         record,
-        generation: receipt.generation,
+        generation: row.generation,
     })
 }
 
@@ -514,7 +556,7 @@ pub async fn read_gateway_tag(
     registry_instance_id: &str,
     repository: &str,
     tag: &str,
-) -> Result<Option<(GatewayTagRecord, CoreRefValue)>> {
+) -> Result<Option<(GatewayTagRecord, GatewayStoredHandle)>> {
     let gateway = normalize_gateway_identifier(gateway, "gateway")?;
     let registry_instance_id = normalize_gateway_identifier(registry_instance_id, "registry")?;
     let repository = normalize_gateway_identifier(repository, "repository")?;
@@ -526,16 +568,13 @@ pub async fn read_gateway_tag(
         &repository,
         &tag,
     )?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(&ref_name).await? else {
+    let Some(row) =
+        read_record_row::<GatewayTagRecord>(storage, GATEWAY_ROW_TAG, &ref_name).await?
+    else {
         return Ok(None);
     };
-    let bytes = store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
-        })
-        .await?;
-    let record: GatewayTagRecord = serde_json::from_slice(&bytes)?;
+    let stored_handle = row.stored_handle();
+    let record = row.record;
     validate_tag_record(
         &record,
         tenant_id,
@@ -544,7 +583,7 @@ pub async fn read_gateway_tag(
         &repository,
         &tag,
     )?;
-    Ok(Some((record, ref_value)))
+    Ok(Some((record, stored_handle)))
 }
 
 pub async fn create_gateway_upload_session(
@@ -577,21 +616,25 @@ pub async fn create_gateway_upload_session(
         &repository,
         &idempotency_key_hash,
     )?;
-    let store = CoreStore::new(storage.clone()).await?;
-    if let Some(ref_value) = store.read_ref(&idempotency_ref_name).await? {
-        let record = read_upload_session_from_ref_value(&store, &ref_value).await?;
+    if let Some(existing) = read_record_row::<GatewayUploadSessionRecord>(
+        storage,
+        GATEWAY_ROW_UPLOAD_IDEMPOTENCY,
+        &idempotency_ref_name,
+    )
+    .await?
+    {
         validate_upload_session_record(
-            &record,
+            &existing.record,
             tenant_id,
             &gateway,
             &registry_instance_id,
             &repository,
-            &record.upload_id,
+            &existing.record.upload_id,
         )?;
-        if record.expected_digest.as_deref() != expected_digest {
+        if existing.record.expected_digest.as_deref() != expected_digest {
             bail!("gateway upload session idempotency target mismatch");
         }
-        return Ok(record);
+        return Ok(existing.record);
     }
 
     let upload_id = Uuid::new_v4().simple().to_string();
@@ -616,85 +659,24 @@ pub async fn create_gateway_upload_session(
         record_hash: String::new(),
     };
     record.record_hash = hash_record(&record)?;
-    let session_ref_name = gateway_upload_ref_name(&record)?;
-    let object_ref = write_gateway_logical_file(
-        &store,
-        "registry_upload_session",
-        1,
-        session_ref_name.clone(),
-        serde_json::to_vec_pretty(&record)?,
-        format!(
-            "gateway-upload-start:{}:{}",
-            session_ref_name,
-            Uuid::new_v4().simple()
-        ),
+    let session_handle_name = gateway_upload_ref_name(&record)?;
+    if let Err(error) = put_upload_session_start_rows(
+        storage,
+        &session_handle_name,
+        &idempotency_ref_name,
+        &record,
     )
-    .await?;
-    let receipt = store
-        .commit_mutation_batch(CoreMutationBatch {
-            transaction_id: format!(
-                "gateway-upload-start:{}:{}",
-                session_ref_name,
-                Uuid::new_v4().simple()
-            ),
-            scope_partition: gateway_partition_id(
-                record.tenant_id,
-                &record.gateway,
-                &record.registry_instance_id,
-                &record.repository,
-            ),
-            committed_by_principal: record.started_by_principal.clone(),
-            preconditions: vec![
-                CoreMutationPrecondition::Ref {
-                    ref_name: session_ref_name.clone(),
-                    expected_generation: None,
-                    expected_target: None,
-                    require_absent: true,
-                    require_present: false,
-                    fence: None,
-                    authz_revision: None,
-                    source_watch_cursor: None,
-                },
-                CoreMutationPrecondition::Ref {
-                    ref_name: idempotency_ref_name.clone(),
-                    expected_generation: None,
-                    expected_target: None,
-                    require_absent: true,
-                    require_present: false,
-                    fence: None,
-                    authz_revision: None,
-                    source_watch_cursor: None,
-                },
-            ],
-            operations: vec![
-                CoreMutationOperation::RefUpdate {
-                    partition_id: gateway_partition_id(
-                        record.tenant_id,
-                        &record.gateway,
-                        &record.registry_instance_id,
-                        &record.repository,
-                    ),
-                    ref_name: session_ref_name,
-                    new_target: encode_core_object_ref_target(&object_ref)?,
-                },
-                CoreMutationOperation::RefUpdate {
-                    partition_id: gateway_partition_id(
-                        record.tenant_id,
-                        &record.gateway,
-                        &record.registry_instance_id,
-                        &record.repository,
-                    ),
-                    ref_name: idempotency_ref_name.clone(),
-                    new_target: encode_core_object_ref_target(&object_ref)?,
-                },
-            ],
-        })
-        .await;
-    if let Err(error) = receipt {
-        if let Some(ref_value) = store.read_ref(&idempotency_ref_name).await? {
-            let existing = read_upload_session_from_ref_value(&store, &ref_value).await?;
-            if existing.expected_digest.as_deref() == expected_digest {
-                return Ok(existing);
+    .await
+    {
+        if let Some(existing) = read_record_row::<GatewayUploadSessionRecord>(
+            storage,
+            GATEWAY_ROW_UPLOAD_IDEMPOTENCY,
+            &idempotency_ref_name,
+        )
+        .await?
+        {
+            if existing.record.expected_digest.as_deref() == expected_digest {
+                return Ok(existing.record);
             }
         }
         return Err(error);
@@ -710,7 +692,7 @@ pub async fn read_gateway_upload_session(
     registry_instance_id: &str,
     repository: &str,
     upload_id: &str,
-) -> Result<Option<(GatewayUploadSessionRecord, CoreRefValue)>> {
+) -> Result<Option<(GatewayUploadSessionRecord, GatewayStoredHandle)>> {
     let gateway = normalize_gateway_identifier(gateway, "gateway")?;
     let registry_instance_id = normalize_gateway_identifier(registry_instance_id, "registry")?;
     let repository = normalize_gateway_identifier(repository, "repository")?;
@@ -722,16 +704,17 @@ pub async fn read_gateway_upload_session(
         &repository,
         &upload_id,
     )?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(&ref_name).await? else {
+    let Some(row) = read_record_row::<GatewayUploadSessionRecord>(
+        storage,
+        GATEWAY_ROW_UPLOAD_SESSION,
+        &ref_name,
+    )
+    .await?
+    else {
         return Ok(None);
     };
-    let bytes = store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
-        })
-        .await?;
-    let record: GatewayUploadSessionRecord = serde_json::from_slice(&bytes)?;
+    let stored_handle = row.stored_handle();
+    let record = row.record;
     validate_upload_session_record(
         &record,
         tenant_id,
@@ -740,7 +723,7 @@ pub async fn read_gateway_upload_session(
         &repository,
         &upload_id,
     )?;
-    Ok(Some((record, ref_value)))
+    Ok(Some((record, stored_handle)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -752,7 +735,7 @@ pub async fn abort_gateway_upload_session(
     repository: &str,
     upload_id: &str,
 ) -> Result<GatewayUploadSessionReceipt> {
-    let Some((mut record, ref_value)) = read_gateway_upload_session(
+    let Some((mut record, stored_handle)) = read_gateway_upload_session(
         storage,
         tenant_id,
         gateway,
@@ -769,22 +752,23 @@ pub async fn abort_gateway_upload_session(
             record.state = GatewayUploadSessionState::Aborted;
             record.record_hash.clear();
             record.record_hash = hash_record(&record)?;
-            let receipt = put_record_ref(
+            let row = put_record_row(
                 storage,
+                GATEWAY_ROW_UPLOAD_SESSION,
                 &gateway_upload_ref_name(&record)?,
                 &record,
                 false,
-                Some(ref_value.generation),
+                Some(stored_handle.generation),
             )
             .await?;
             Ok(GatewayUploadSessionReceipt {
                 record,
-                generation: receipt.generation,
+                generation: row.generation,
             })
         }
         GatewayUploadSessionState::Aborted => Ok(GatewayUploadSessionReceipt {
             record,
-            generation: ref_value.generation,
+            generation: stored_handle.generation,
         }),
         GatewayUploadSessionState::Committed
         | GatewayUploadSessionState::Expired
@@ -803,7 +787,7 @@ pub async fn expire_gateway_upload_session(
     repository: &str,
     upload_id: &str,
 ) -> Result<GatewayUploadSessionReceipt> {
-    let Some((mut record, ref_value)) = read_gateway_upload_session(
+    let Some((mut record, stored_handle)) = read_gateway_upload_session(
         storage,
         tenant_id,
         gateway,
@@ -818,7 +802,7 @@ pub async fn expire_gateway_upload_session(
     match record.state {
         GatewayUploadSessionState::Expired => Ok(GatewayUploadSessionReceipt {
             record,
-            generation: ref_value.generation,
+            generation: stored_handle.generation,
         }),
         GatewayUploadSessionState::Open | GatewayUploadSessionState::Receiving
             if is_upload_session_expired(&record)? =>
@@ -826,17 +810,18 @@ pub async fn expire_gateway_upload_session(
             record.state = GatewayUploadSessionState::Expired;
             record.record_hash.clear();
             record.record_hash = hash_record(&record)?;
-            let receipt = put_record_ref(
+            let row = put_record_row(
                 storage,
+                GATEWAY_ROW_UPLOAD_SESSION,
                 &gateway_upload_ref_name(&record)?,
                 &record,
                 false,
-                Some(ref_value.generation),
+                Some(stored_handle.generation),
             )
             .await?;
             Ok(GatewayUploadSessionReceipt {
                 record,
-                generation: receipt.generation,
+                generation: row.generation,
             })
         }
         GatewayUploadSessionState::Open | GatewayUploadSessionState::Receiving => {
@@ -863,7 +848,7 @@ pub async fn append_gateway_upload_part(
     bytes: &[u8],
     idempotency_key: &str,
 ) -> Result<GatewayUploadSessionReceipt> {
-    let Some((mut record, ref_value)) = read_gateway_upload_session(
+    let Some((mut record, stored_handle)) = read_gateway_upload_session(
         storage,
         tenant_id,
         gateway,
@@ -879,17 +864,18 @@ pub async fn append_gateway_upload_part(
         record.state = GatewayUploadSessionState::Expired;
         record.record_hash.clear();
         record.record_hash = hash_record(&record)?;
-        let receipt = put_record_ref(
+        let row = put_record_row(
             storage,
+            GATEWAY_ROW_UPLOAD_SESSION,
             &gateway_upload_ref_name(&record)?,
             &record,
             false,
-            Some(ref_value.generation),
+            Some(stored_handle.generation),
         )
         .await?;
         return Ok(GatewayUploadSessionReceipt {
             record,
-            generation: receipt.generation,
+            generation: row.generation,
         });
     }
     if !matches!(
@@ -916,7 +902,7 @@ pub async fn append_gateway_upload_part(
         {
             return Ok(GatewayUploadSessionReceipt {
                 record,
-                generation: ref_value.generation,
+                generation: stored_handle.generation,
             });
         }
         bail!("gateway upload part idempotency conflict");
@@ -938,7 +924,7 @@ pub async fn append_gateway_upload_part(
     let store = CoreStore::new(storage.clone()).await?;
     let object_ref = write_gateway_logical_file(
         &store,
-        "registry_upload_part",
+        WriterFamily::Registry.as_str(),
         record.staged_parts.len() as u64 + 1,
         format!(
             "gateway_upload_part:tenant:{tenant_id}:gateway:{}:registry:{}:repository:{}:upload:{}:part:{part_id}",
@@ -968,17 +954,18 @@ pub async fn append_gateway_upload_part(
     record.state = GatewayUploadSessionState::Receiving;
     record.record_hash.clear();
     record.record_hash = hash_record(&record)?;
-    let receipt = put_record_ref(
+    let row = put_record_row(
         storage,
+        GATEWAY_ROW_UPLOAD_SESSION,
         &gateway_upload_ref_name(&record)?,
         &record,
         false,
-        Some(ref_value.generation),
+        Some(stored_handle.generation),
     )
     .await?;
     Ok(GatewayUploadSessionReceipt {
         record,
-        generation: receipt.generation,
+        generation: row.generation,
     })
 }
 
@@ -994,7 +981,7 @@ pub async fn finalise_gateway_upload_session(
     media_type: &str,
     committed_by_principal: &str,
 ) -> Result<GatewayBlobRecord> {
-    let Some((session, session_ref)) = read_gateway_upload_session(
+    let Some((session, session_handle)) = read_gateway_upload_session(
         storage,
         tenant_id,
         gateway,
@@ -1083,23 +1070,31 @@ pub async fn finalise_gateway_upload_session(
         &repository,
         &target_digest,
     )?;
-    if let Some(existing) = read_record_ref::<GatewayBlobRecord>(storage, &blob_ref_name).await? {
+    if let Some(existing) =
+        read_record_row::<GatewayBlobRecord>(storage, GATEWAY_ROW_BLOB, &blob_ref_name).await?
+    {
         validate_blob_record(
-            &existing,
+            &existing.record,
             tenant_id,
             &gateway,
             &registry_instance_id,
             &repository,
             &target_digest,
         )?;
-        return commit_upload_session_record(store, session, session_ref, &target_digest, None)
-            .await
-            .map(|_| existing);
+        return commit_upload_session_record(
+            storage,
+            session,
+            session_handle,
+            &target_digest,
+            None,
+        )
+        .await
+        .map(|_| existing.record);
     }
 
-    let payload_ref = write_gateway_logical_file(
+    let payload_write = write_gateway_logical_file_with_locator(
         &store,
-        "registry_blob",
+        WriterFamily::Registry.as_str(),
         1,
         blob_ref_name.clone(),
         payload,
@@ -1108,6 +1103,7 @@ pub async fn finalise_gateway_upload_session(
         ),
     )
     .await?;
+    let payload_ref = core_object_ref_from_logical_file_write(&payload_write);
     let mut blob_record = GatewayBlobRecord {
         schema: GATEWAY_BLOB_SCHEMA.to_string(),
         tenant_id,
@@ -1123,24 +1119,14 @@ pub async fn finalise_gateway_upload_session(
         record_hash: String::new(),
     };
     blob_record.record_hash = hash_record(&blob_record)?;
-    let blob_record_ref = write_gateway_logical_file(
-        &store,
-        "registry_metadata",
-        1,
-        blob_ref_name.clone(),
-        serde_json::to_vec_pretty(&blob_record)?,
-        format!(
-            "gateway-blob-record:{blob_ref_name}:{}",
-            Uuid::new_v4().simple()
-        ),
-    )
-    .await?;
+    coremeta::write_registry_blob_locator_row(storage, &blob_record, &payload_write.locator)
+        .await?;
     commit_upload_session_record(
-        store,
+        storage,
         session,
-        session_ref,
+        session_handle,
         &target_digest,
-        Some((blob_ref_name, blob_record_ref)),
+        Some((blob_ref_name, blob_record.clone())),
     )
     .await?;
     Ok(blob_record)
@@ -1155,8 +1141,16 @@ pub async fn put_gateway_credential_record(
     validate_credential_record_shape(&record)?;
     record.record_hash = hash_record(&record)?;
     let ref_name = gateway_credential_ref_name(&record)?;
-    let receipt = put_record_ref(storage, &ref_name, &record, false, expected_generation).await?;
-    Ok(receipt.generation)
+    let row = put_record_row(
+        storage,
+        GATEWAY_ROW_CREDENTIAL,
+        &ref_name,
+        &record,
+        false,
+        expected_generation,
+    )
+    .await?;
+    Ok(row.generation)
 }
 
 pub async fn read_gateway_credential_record(
@@ -1164,20 +1158,18 @@ pub async fn read_gateway_credential_record(
     tenant_id: i64,
     gateway: &str,
     credential_id: &str,
-) -> Result<Option<(GatewayCredentialRecord, CoreRefValue)>> {
+) -> Result<Option<(GatewayCredentialRecord, GatewayStoredHandle)>> {
     let gateway = normalize_gateway_identifier(gateway, "gateway")?;
     let credential_id = normalize_gateway_identifier(credential_id, "credential id")?;
     let ref_name = gateway_credential_ref_name_parts(tenant_id, &gateway, &credential_id)?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(&ref_name).await? else {
+    let Some(row) =
+        read_record_row::<GatewayCredentialRecord>(storage, GATEWAY_ROW_CREDENTIAL, &ref_name)
+            .await?
+    else {
         return Ok(None);
     };
-    let bytes = store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
-        })
-        .await?;
-    let record: GatewayCredentialRecord = serde_json::from_slice(&bytes)?;
+    let stored_handle = row.stored_handle();
+    let record = row.record;
     if record.tenant_id != tenant_id
         || record.gateway != gateway
         || record.credential_id != credential_id
@@ -1185,7 +1177,7 @@ pub async fn read_gateway_credential_record(
         bail!("gateway credential record scope mismatch");
     }
     validate_credential_record_shape(&record)?;
-    Ok(Some((record, ref_value)))
+    Ok(Some((record, stored_handle)))
 }
 
 pub async fn revoke_gateway_credential_record(
@@ -1195,7 +1187,7 @@ pub async fn revoke_gateway_credential_record(
     credential_id: &str,
     expected_generation: u64,
 ) -> Result<u64> {
-    let Some((mut record, _ref_value)) =
+    let Some((mut record, _stored_handle)) =
         read_gateway_credential_record(storage, tenant_id, gateway, credential_id).await?
     else {
         bail!("gateway credential record not found");
@@ -1242,7 +1234,7 @@ pub async fn issue_gateway_access_token(
     if actions.is_empty() {
         bail!("gateway token requires at least one action");
     }
-    let Some((credential, ref_value)) =
+    let Some((credential, stored_handle)) =
         read_gateway_credential_record(storage, tenant_id, &gateway, &credential_id).await?
     else {
         bail!("gateway credential not found");
@@ -1263,7 +1255,7 @@ pub async fn issue_gateway_access_token(
         actions,
         subject_principal: credential.subject_principal,
         credential_id,
-        credential_generation: ref_value.generation,
+        credential_generation: stored_handle.generation,
         iat: now,
         exp: (now + ttl) as usize,
         jti: Uuid::new_v4().to_string(),
@@ -1313,7 +1305,7 @@ pub async fn validate_gateway_access_token(
         }
     }
 
-    let Some((credential, ref_value)) = read_gateway_credential_record(
+    let Some((credential, stored_handle)) = read_gateway_credential_record(
         storage,
         claims.tenant_id,
         &claims.gateway,
@@ -1323,7 +1315,7 @@ pub async fn validate_gateway_access_token(
     else {
         bail!("gateway credential not found");
     };
-    if ref_value.generation != claims.credential_generation
+    if stored_handle.generation != claims.credential_generation
         || credential.subject_principal != claims.subject_principal
     {
         bail!("gateway credential changed after token issue");
@@ -1344,31 +1336,36 @@ pub async fn put_gateway_mount_record(
     validate_mount_record_shape(&record)?;
     record.record_hash = hash_record(&record)?;
     let ref_name = gateway_mount_ref_name(&record)?;
-    let receipt = put_record_ref(storage, &ref_name, &record, false, expected_generation).await?;
-    Ok(receipt.generation)
+    let row = put_record_row(
+        storage,
+        GATEWAY_ROW_MOUNT,
+        &ref_name,
+        &record,
+        false,
+        expected_generation,
+    )
+    .await?;
+    Ok(row.generation)
 }
 
 pub async fn read_gateway_mount_record(
     storage: &Storage,
     mount_id: &str,
-) -> Result<Option<(GatewayMountRecord, CoreRefValue)>> {
+) -> Result<Option<(GatewayMountRecord, GatewayStoredHandle)>> {
     let mount_id = normalize_gateway_identifier(mount_id, "mount id")?;
     let ref_name = gateway_mount_ref_name_parts(&mount_id)?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(&ref_name).await? else {
+    let Some(row) =
+        read_record_row::<GatewayMountRecord>(storage, GATEWAY_ROW_MOUNT, &ref_name).await?
+    else {
         return Ok(None);
     };
-    let bytes = store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
-        })
-        .await?;
-    let record: GatewayMountRecord = serde_json::from_slice(&bytes)?;
+    let stored_handle = row.stored_handle();
+    let record = row.record;
     if record.mount_id != mount_id {
         bail!("gateway mount record scope mismatch");
     }
     validate_mount_record_shape(&record)?;
-    Ok(Some((record, ref_value)))
+    Ok(Some((record, stored_handle)))
 }
 
 pub async fn resolve_gateway_mount(
@@ -1433,7 +1430,7 @@ pub async fn append_gateway_audit_record(
             if stream.idempotency_key_hash.as_deref() != Some(idempotency_key_hash.as_str()) {
                 continue;
             }
-            let existing: GatewayAuditRecord = serde_json::from_slice(&stream.payload)?;
+            let existing: GatewayAuditRecord = decode_gateway_record(&stream.payload)?;
             validate_gateway_audit_record(&existing)?;
             if record.created_at.is_empty() {
                 record.created_at = existing.created_at.clone();
@@ -1466,7 +1463,9 @@ pub async fn append_gateway_audit_record(
             stream_id,
             partition_id,
             record_kind: GATEWAY_AUDIT_SCHEMA.to_string(),
-            payload: serde_json::to_vec(&record)?,
+            payload: encode_gateway_record(&record)?,
+            content_type: None,
+            user_metadata_json: "{}".to_string(),
             fence: None,
             transaction_id: None,
             idempotency_key: idempotency_key.map(str::to_string),
@@ -1499,7 +1498,7 @@ pub async fn read_gateway_audit_records(
         if stream.record_kind != GATEWAY_AUDIT_SCHEMA {
             bail!("gateway audit stream contains unexpected record kind");
         }
-        let audit: GatewayAuditRecord = serde_json::from_slice(&stream.payload)?;
+        let audit: GatewayAuditRecord = decode_gateway_record(&stream.payload)?;
         if audit.tenant_id != tenant_id
             || audit.gateway != gateway
             || audit.registry_instance_id != registry_instance_id
@@ -1514,34 +1513,25 @@ pub async fn read_gateway_audit_records(
 
 async fn list_gateway_mount_records(
     storage: &Storage,
-) -> Result<Vec<(GatewayMountRecord, CoreRefValue)>> {
-    let store = CoreStore::new(storage.clone()).await?;
+) -> Result<Vec<(GatewayMountRecord, GatewayStoredHandle)>> {
     let mut mounts = Vec::new();
-    for ref_name in store.list_ref_names("gateway_mount:mount:").await? {
-        let Some(ref_value) = store.read_ref(&ref_name).await? else {
-            continue;
-        };
-        let bytes = store
-            .get_blob(GetBlob {
-                object_ref: decode_core_object_ref_target(&ref_value.target)?,
-            })
-            .await?;
-        let record: GatewayMountRecord = serde_json::from_slice(&bytes)?;
-        validate_mount_record_shape(&record)?;
-        mounts.push((record, ref_value));
+    for row in list_record_rows::<GatewayMountRecord>(storage, GATEWAY_ROW_MOUNT).await? {
+        validate_mount_record_shape(&row.record)?;
+        let stored_handle = row.stored_handle();
+        mounts.push((row.record, stored_handle));
     }
     Ok(mounts)
 }
 
 fn best_gateway_mount_match(
-    mounts: &[(GatewayMountRecord, CoreRefValue)],
+    mounts: &[(GatewayMountRecord, GatewayStoredHandle)],
     host: &str,
     path: &str,
     match_kind: GatewayMountMatchKind,
 ) -> Option<GatewayMountResolution> {
     mounts
         .iter()
-        .filter_map(|(record, ref_value)| {
+        .filter_map(|(record, stored_handle)| {
             if record.state != GatewayMountState::Active {
                 return None;
             }
@@ -1571,7 +1561,7 @@ fn best_gateway_mount_match(
             };
             Some(GatewayMountResolution {
                 record: record.clone(),
-                ref_generation: ref_value.generation,
+                row_generation: stored_handle.generation,
                 matched_host: host.to_string(),
                 matched_path_prefix: matched_prefix,
                 match_kind,
@@ -1608,105 +1598,41 @@ fn path_style_gateway_prefix(record: &GatewayMountRecord) -> String {
 }
 
 async fn commit_upload_session_record(
-    store: CoreStore,
+    storage: &Storage,
     mut session: GatewayUploadSessionRecord,
-    session_ref: CoreRefValue,
+    session_handle: GatewayStoredHandle,
     committed_digest: &str,
-    blob_record_ref: Option<(String, CoreObjectRef)>,
+    blob_record: Option<(String, GatewayBlobRecord)>,
 ) -> Result<GatewayUploadSessionReceipt> {
     session.state = GatewayUploadSessionState::Committed;
     session.committed_digest = Some(committed_digest.to_string());
     session.completed_at = Some(now_rfc3339());
     session.record_hash.clear();
     session.record_hash = hash_record(&session)?;
-    let session_ref_name = gateway_upload_ref_name(&session)?;
-    let session_object_ref = write_gateway_logical_file(
-        &store,
-        "registry_upload_session",
-        session_ref.generation + 1,
-        session_ref_name.clone(),
-        serde_json::to_vec_pretty(&session)?,
-        format!(
-            "gateway-upload-commit:{}:{}",
-            session_ref_name,
-            Uuid::new_v4().simple()
-        ),
+    let session_handle_name = gateway_upload_ref_name(&session)?;
+    if let Some((blob_key, blob_record)) = blob_record {
+        put_record_row(
+            storage,
+            GATEWAY_ROW_BLOB,
+            &blob_key,
+            &blob_record,
+            true,
+            None,
+        )
+        .await?;
+    }
+    let row = put_record_row(
+        storage,
+        GATEWAY_ROW_UPLOAD_SESSION,
+        &session_handle_name,
+        &session,
+        false,
+        Some(session_handle.generation),
     )
     .await?;
-    let mut preconditions = vec![CoreMutationPrecondition::Ref {
-        ref_name: session_ref_name.clone(),
-        expected_generation: Some(session_ref.generation),
-        expected_target: Some(session_ref.target),
-        require_absent: false,
-        require_present: true,
-        fence: None,
-        authz_revision: None,
-        source_watch_cursor: None,
-    }];
-    let mut operations = vec![CoreMutationOperation::RefUpdate {
-        partition_id: gateway_partition_id(
-            session.tenant_id,
-            &session.gateway,
-            &session.registry_instance_id,
-            &session.repository,
-        ),
-        ref_name: session_ref_name.clone(),
-        new_target: encode_core_object_ref_target(&session_object_ref)?,
-    }];
-    if let Some((blob_ref_name, object_ref)) = blob_record_ref {
-        preconditions.push(CoreMutationPrecondition::Ref {
-            ref_name: blob_ref_name.clone(),
-            expected_generation: None,
-            expected_target: None,
-            require_absent: true,
-            require_present: false,
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-        });
-        operations.push(CoreMutationOperation::RefUpdate {
-            partition_id: gateway_partition_id(
-                session.tenant_id,
-                &session.gateway,
-                &session.registry_instance_id,
-                &session.repository,
-            ),
-            ref_name: blob_ref_name,
-            new_target: encode_core_object_ref_target(&object_ref)?,
-        });
-    }
-    let receipt = store
-        .commit_mutation_batch(CoreMutationBatch {
-            transaction_id: format!(
-                "gateway-upload-commit:{}:{}",
-                session.upload_id,
-                Uuid::new_v4().simple()
-            ),
-            scope_partition: gateway_partition_id(
-                session.tenant_id,
-                &session.gateway,
-                &session.registry_instance_id,
-                &session.repository,
-            ),
-            committed_by_principal: session.started_by_principal.clone(),
-            preconditions,
-            operations,
-        })
-        .await?;
-    let generation = receipt
-        .visible_updates
-        .iter()
-        .find_map(|update| match update {
-            crate::core_store::CoreTransactionUpdate::CoreRefUpdate {
-                ref_name,
-                new_generation,
-            } if ref_name == &session_ref_name => Some(*new_generation),
-            _ => None,
-        })
-        .ok_or_else(|| anyhow!("gateway upload commit did not update session ref"))?;
     Ok(GatewayUploadSessionReceipt {
         record: session,
-        generation,
+        generation: row.generation,
     })
 }
 
@@ -1718,8 +1644,32 @@ async fn write_gateway_logical_file(
     source: Vec<u8>,
     mutation_id: String,
 ) -> Result<CoreObjectRef> {
-    let manifest = store
-        .write_logical_file(WriteLogicalFileRequest {
+    let write = write_gateway_logical_file_with_locator(
+        store,
+        writer_family,
+        generation,
+        logical_file_id,
+        source,
+        mutation_id,
+    )
+    .await?;
+    Ok(core_object_ref_from_logical_file_write(&write))
+}
+
+async fn write_gateway_logical_file_with_locator(
+    store: &CoreStore,
+    writer_family: &str,
+    generation: u64,
+    logical_file_id: String,
+    source: Vec<u8>,
+    mutation_id: String,
+) -> Result<CoreLogicalFileWrite> {
+    let family = WriterFamily::from_name(writer_family)
+        .ok_or_else(|| anyhow!("unsupported gateway writer family {writer_family}"))?;
+    let logical_file_id =
+        canonical_logical_file_id(family, generation, &logical_file_id, &hash32(&source));
+    store
+        .write_logical_file_with_locator(WriteLogicalFileRequest {
             writer_family: writer_family.to_string(),
             generation,
             logical_file_id,
@@ -1731,164 +1681,23 @@ async fn write_gateway_logical_file(
             mutation_id,
             region_id: "local".to_string(),
         })
-        .await?;
-    Ok(core_object_ref_from_logical_file_manifest(&manifest))
-}
-
-async fn put_record_ref<T: Serialize>(
-    storage: &Storage,
-    ref_name: &str,
-    record: &T,
-    require_absent: bool,
-    expected_generation: Option<u64>,
-) -> Result<crate::core_store::CasRefReceipt> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let current = store.read_ref(ref_name).await?;
-    if require_absent && current.is_some() {
-        bail!("CoreStore gateway ref {ref_name} already exists");
-    }
-    if let Some(expected_generation) = expected_generation {
-        let actual = current.as_ref().map(|value| value.generation);
-        if actual != Some(expected_generation) {
-            bail!("CoreStore gateway ref {ref_name} generation mismatch");
-        }
-    }
-    let object_ref = write_gateway_logical_file(
-        &store,
-        "registry_metadata",
-        current
-            .as_ref()
-            .map(|value| value.generation + 1)
-            .unwrap_or(1),
-        ref_name.to_string(),
-        serde_json::to_vec_pretty(record)?,
-        format!("gateway-record:{ref_name}:{}", Uuid::new_v4().simple()),
-    )
-    .await?;
-    store
-        .compare_and_swap_ref(CompareAndSwapRef {
-            ref_name: ref_name.to_string(),
-            expected_generation: current.as_ref().map(|value| value.generation),
-            expected_target: current.as_ref().map(|value| value.target.clone()),
-            require_absent: current.is_none(),
-            require_present: current.is_some(),
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-            new_target: encode_core_object_ref_target(&object_ref)?,
-            transaction_id: None,
-        })
         .await
 }
 
-async fn read_record_ref<T: for<'de> Deserialize<'de>>(
-    storage: &Storage,
-    ref_name: &str,
-) -> Result<Option<T>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(ref_name).await? else {
-        return Ok(None);
-    };
-    let bytes = store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
-        })
-        .await?;
-    Ok(Some(serde_json::from_slice(&bytes)?))
-}
-
-async fn read_upload_session_from_ref_value(
-    store: &CoreStore,
-    ref_value: &CoreRefValue,
-) -> Result<GatewayUploadSessionRecord> {
-    let bytes = store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
-        })
-        .await?;
-    Ok(serde_json::from_slice(&bytes)?)
-}
-
-struct GatewayRepositoryKey {
-    tenant_id: i64,
-    gateway: String,
-    registry_instance_id: String,
-    repository: String,
-}
-
-impl GatewayRepositoryKey {
-    fn new(
-        tenant_id: i64,
-        gateway: &str,
-        registry_instance_id: &str,
-        repository: &str,
-    ) -> Result<Self> {
-        validate_tenant(tenant_id)?;
-        Ok(Self {
-            tenant_id,
-            gateway: normalize_gateway_identifier(gateway, "gateway")?,
-            registry_instance_id: normalize_gateway_identifier(registry_instance_id, "registry")?,
-            repository: normalize_gateway_identifier(repository, "repository")?,
-        })
-    }
-
-    fn ref_name(&self) -> String {
-        format!(
-            "gateway_repository:tenant:{}:gateway:{}:registry:{}:repository:{}",
-            self.tenant_id, self.gateway, self.registry_instance_id, self.repository
-        )
-    }
-}
-
-fn gateway_repository_ref_name(record: &GatewayRepositoryRecord) -> Result<String> {
-    Ok(GatewayRepositoryKey::new(
-        record.tenant_id,
-        &record.gateway,
-        &record.registry_instance_id,
-        &record.repository,
-    )?
-    .ref_name())
-}
-
-fn gateway_blob_ref_name(
-    tenant_id: i64,
-    gateway: &str,
-    registry_instance_id: &str,
-    repository: &str,
-    digest: &str,
-) -> Result<String> {
-    validate_tenant(tenant_id)?;
-    validate_gateway_digest(digest)?;
-    Ok(format!(
-        "gateway_blob:tenant:{tenant_id}:gateway:{gateway}:registry:{registry_instance_id}:repository:{repository}:digest:{digest}"
-    ))
-}
-
-fn gateway_tag_ref_name(record: &GatewayTagRecord) -> Result<String> {
-    gateway_tag_ref_name_parts(
-        record.tenant_id,
-        &record.gateway,
-        &record.registry_instance_id,
-        &record.repository,
-        &record.tag,
-    )
-}
-
-fn gateway_tag_ref_name_parts(
-    tenant_id: i64,
-    gateway: &str,
-    registry_instance_id: &str,
-    repository: &str,
-    tag: &str,
-) -> Result<String> {
-    validate_tenant(tenant_id)?;
-    Ok(format!(
-        "gateway_tag:tenant:{tenant_id}:gateway:{gateway}:registry:{registry_instance_id}:repository:{repository}:tag:{tag}"
-    ))
-}
-
+mod coremeta;
 mod helpers;
+mod keys;
+mod metadata_rows;
+mod record_codec;
+mod registry_api;
 use helpers::*;
+use keys::*;
+use metadata_rows::*;
+pub(crate) use metadata_rows::{
+    GatewayStoredHandle, encode_gateway_metadata_row, materialize_committed_gateway_transaction,
+};
+use record_codec::*;
+pub use registry_api::*;
 
 #[cfg(test)]
 mod tests;

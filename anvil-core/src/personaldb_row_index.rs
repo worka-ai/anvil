@@ -1,21 +1,24 @@
 use crate::{
-    core_store::{
-        CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
-        WriteLogicalFileRequest,
-    },
     formats::{
-        BinaryEnvelopeHeader, BinaryFileFooter, COMMON_FOOTER_LEN, COMMON_HEADER_LEN, FileFamily,
-        Hash32, hash32, personaldb::RowIndexRecord,
+        FileFamily, Hash32, decode_writer_segment, encode_writer_segment,
+        encode_writer_segment_header, hash32, header_field_string,
+        personaldb::RowIndexRecord,
+        required_header_string, single_body_range_index,
+        table::{TableRow, WriterBodyTable, decode_writer_body_tables, encode_writer_body_tables},
+        unix_nanos_from_rfc3339,
+    },
+    personaldb_coremeta::{
+        personaldb_payload_hash, read_personaldb_data_locator_bytes,
+        read_personaldb_data_locator_row, write_personaldb_bytes_as_data_locator,
     },
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
-const PERSONALDB_ROW_INDEX_REF_PREFIX: &str = "personaldb_row_index:";
-const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
+const PERSONALDB_ROW_INDEX_DATA_PREFIX: &str = "personaldb_row_index:";
+const PERSONALDB_ROW_INDEX_KIND: &str = "row_index";
+const TABLE_PERSONALDB_PROJECTION_PAGE: u16 = 0x0604;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersonalDbRowIndexHeader {
@@ -49,12 +52,13 @@ pub async fn write_personaldb_row_index(
 ) -> Result<String> {
     let mut records = input.records.to_vec();
     records.sort_by(compare_row_index_records);
-    let body = encode_row_index_body(&records);
-    let ref_name = personaldb_row_index_ref_name(
+    let body = encode_row_index_body(&records)?;
+    let source_hash_hex = hex::encode(input.source_hash);
+    let data_id = personaldb_row_index_data_id(
         input.tenant_id,
         input.database_id,
         input.generation,
-        &hex::encode(input.source_hash),
+        &source_hash_hex,
     )?;
 
     let header = PersonalDbRowIndexHeader {
@@ -63,107 +67,105 @@ pub async fn write_personaldb_row_index(
         generation: input.generation,
         source_hash: hex::encode(input.source_hash),
         key_order: "database_id_table_hash_primary_key_hash".to_string(),
-        codec: "none".to_string(),
+        codec: "writer-body-table-v1".to_string(),
         created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
     };
-    let header_json = serde_json::to_vec(&header)?;
-    let envelope = BinaryEnvelopeHeader::new(FileFamily::PersonalDbRowIndex, 0, 0, header_json);
-    let encoded_header = envelope.encode();
     let (first_hash, last_hash) = record_hash_bounds(&records);
-    let footer = BinaryFileFooter::new(
-        &encoded_header,
+    let header_proto = encode_personaldb_row_index_header_proto(&data_id, &header);
+    let range_index =
+        single_body_range_index(body.len(), records.len() as u64, first_hash, last_hash)?;
+    let encoded = encode_writer_segment(
+        FileFamily::PersonalDbRowIndex,
+        0,
+        header_proto,
         &body,
+        &range_index,
         records.len() as u64,
         first_hash,
         last_hash,
-    );
+    )?;
 
-    let mut bytes = Vec::with_capacity(encoded_header.len() + body.len() + COMMON_FOOTER_LEN);
-    bytes.extend_from_slice(&encoded_header);
-    bytes.extend_from_slice(&body);
-    bytes.extend_from_slice(&footer.encode());
-
-    let store = CoreStore::new(storage.clone()).await?;
-    let object_ref = store
-        .write_logical_file_ref(WriteLogicalFileRequest {
-            writer_family: "personaldb".to_string(),
-            generation: input.generation,
-            logical_file_id: ref_name.clone(),
-            source: bytes,
-            range_hints: Vec::new(),
-            pipeline_policy: CorePipelinePolicy::default(),
-            trace_context: CoreTraceContext::default(),
-            boundary_values: Vec::new(),
-            mutation_id: format!(
-                "personaldb-row-index:{}:{}:{}",
-                input.tenant_id, input.database_id, input.generation
-            ),
-            region_id: "local".to_string(),
-        })
-        .await?;
-    store
-        .compare_and_swap_ref(CompareAndSwapRef {
-            ref_name: ref_name.clone(),
-            expected_generation: None,
-            expected_target: None,
-            require_absent: true,
-            require_present: false,
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-            new_target: encode_core_object_ref_target(&object_ref)?,
-            transaction_id: None,
-        })
-        .await?;
-    Ok(ref_name)
+    write_personaldb_bytes_as_data_locator(
+        storage,
+        input.tenant_id,
+        input.database_id,
+        &data_id,
+        PERSONALDB_ROW_INDEX_KIND,
+        input.generation,
+        encoded.bytes.clone(),
+        personaldb_payload_hash(&encoded.bytes),
+        vec![source_hash_hex],
+        format!(
+            "personaldb-row-index:{}:{}:{}",
+            input.tenant_id, input.database_id, input.generation
+        ),
+    )
+    .await?;
+    Ok(data_id)
 }
 
 pub async fn read_personaldb_row_index(
     storage: &Storage,
-    row_index_ref: &str,
+    row_index_data_id: &str,
 ) -> Result<DecodedPersonalDbRowIndex> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let ref_value = store
-        .read_ref(row_index_ref)
-        .await?
-        .ok_or_else(|| anyhow!("personaldb row index ref is missing"))?;
-    let bytes = store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
-        })
-        .await?;
+    let (tenant_id, database_id, _generation, _source_hash) =
+        parse_personaldb_row_index_data_id(row_index_data_id)?;
+    let row =
+        read_personaldb_data_locator_row(storage, tenant_id, &database_id, row_index_data_id)?
+            .ok_or_else(|| anyhow!("personaldb row index CoreMeta row is missing"))?;
+    if row.data_kind != PERSONALDB_ROW_INDEX_KIND {
+        return Err(anyhow!("personaldb row index CoreMeta row kind mismatch"));
+    }
+    let bytes = read_personaldb_data_locator_bytes(storage, &row).await?;
     decode_personaldb_row_index(&bytes)
 }
 
 pub fn decode_personaldb_row_index(bytes: &[u8]) -> Result<DecodedPersonalDbRowIndex> {
-    let envelope = BinaryEnvelopeHeader::decode(bytes)?;
-    if envelope.family != FileFamily::PersonalDbRowIndex {
-        return Err(anyhow!("personaldb row index file family mismatch"));
-    }
-    if bytes.len() < COMMON_FOOTER_LEN {
-        return Err(anyhow!("personaldb row index is shorter than footer"));
-    }
-    let header_end = COMMON_HEADER_LEN
-        .checked_add(envelope.header_json.len())
-        .ok_or_else(|| anyhow!("personaldb row index header length overflow"))?;
-    let footer_start = bytes
-        .len()
-        .checked_sub(COMMON_FOOTER_LEN)
-        .ok_or_else(|| anyhow!("personaldb row index footer length overflow"))?;
-    if footer_start < header_end {
-        return Err(anyhow!("personaldb row index body overlaps header"));
-    }
-    let encoded_header = &bytes[..header_end];
-    let body = &bytes[header_end..footer_start];
-    let footer = BinaryFileFooter::decode(&bytes[footer_start..])?;
-    footer.verify(encoded_header, body)?;
-    let header: PersonalDbRowIndexHeader = serde_json::from_slice(&envelope.header_json)?;
-    let records = decode_row_index_body(body)?;
+    let segment = decode_writer_segment(bytes, FileFamily::PersonalDbRowIndex)?;
+    let header = decode_personaldb_row_index_header_proto(&segment.header)?;
+    let records = decode_row_index_body(segment.body)?;
     ensure_sorted(&records)?;
     Ok(DecodedPersonalDbRowIndex { header, records })
 }
 
-pub fn personaldb_row_index_ref_name(
+fn encode_personaldb_row_index_header_proto(
+    logical_file_id: &str,
+    header: &PersonalDbRowIndexHeader,
+) -> Vec<u8> {
+    encode_writer_segment_header(
+        "anvil.personaldb.row_index_header.v1",
+        logical_file_id,
+        FileFamily::PersonalDbRowIndex,
+        header.generation,
+        None,
+        None,
+        unix_nanos_from_rfc3339(&header.created_at),
+        vec![
+            header_field_string("tenant_id", header.tenant_id.clone()),
+            header_field_string("database_id", header.database_id.clone()),
+            header_field_string("source_hash", header.source_hash.clone()),
+            header_field_string("key_order", header.key_order.clone()),
+            header_field_string("codec", header.codec.clone()),
+            header_field_string("created_at", header.created_at.clone()),
+        ],
+    )
+}
+
+fn decode_personaldb_row_index_header_proto(
+    header: &crate::formats::WriterSegmentHeaderProto,
+) -> Result<PersonalDbRowIndexHeader> {
+    Ok(PersonalDbRowIndexHeader {
+        tenant_id: required_header_string(header, "tenant_id")?,
+        database_id: required_header_string(header, "database_id")?,
+        generation: header.writer_generation,
+        source_hash: required_header_string(header, "source_hash")?,
+        key_order: required_header_string(header, "key_order")?,
+        codec: required_header_string(header, "codec")?,
+        created_at: required_header_string(header, "created_at")?,
+    })
+}
+
+pub fn personaldb_row_index_data_id(
     tenant_id: i64,
     database_id: &str,
     generation: u64,
@@ -177,7 +179,41 @@ pub fn personaldb_row_index_ref_name(
     require_safe_component(database_id, "database_id")?;
     validate_hex32(source_hash, "source_hash")?;
     Ok(format!(
-        "{PERSONALDB_ROW_INDEX_REF_PREFIX}tenant:{tenant_id}:database:{database_id}:generation:{generation:020}:source:{source_hash}"
+        "{PERSONALDB_ROW_INDEX_DATA_PREFIX}tenant:{tenant_id}:database:{database_id}:generation:{generation:020}:source:{source_hash}"
+    ))
+}
+
+fn parse_personaldb_row_index_data_id(data_id: &str) -> Result<(i64, String, u64, String)> {
+    let Some(rest) = data_id.strip_prefix(PERSONALDB_ROW_INDEX_DATA_PREFIX) else {
+        return Err(anyhow!("personaldb row index data id has invalid prefix"));
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    if parts.len() != 8
+        || parts[0] != "tenant"
+        || parts[2] != "database"
+        || parts[4] != "generation"
+        || parts[6] != "source"
+    {
+        return Err(anyhow!("personaldb row index data id has invalid shape"));
+    }
+    let tenant_id = parts[1]
+        .parse::<i64>()
+        .map_err(|_| anyhow!("personaldb row index tenant id is invalid"))?;
+    if tenant_id < 0 {
+        return Err(anyhow!(
+            "personaldb row index tenant id must be nonnegative"
+        ));
+    }
+    require_safe_component(parts[3], "database_id")?;
+    let generation = parts[5]
+        .parse::<u64>()
+        .map_err(|_| anyhow!("personaldb row index generation is invalid"))?;
+    validate_hex32(parts[7], "source_hash")?;
+    Ok((
+        tenant_id,
+        parts[3].to_string(),
+        generation,
+        parts[7].to_string(),
     ))
 }
 
@@ -202,37 +238,54 @@ fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
     Ok(())
 }
 
-fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
-    Ok(format!(
-        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
-    ))
+fn encode_row_index_body(records: &[RowIndexRecord]) -> Result<Vec<u8>> {
+    let rows = records
+        .iter()
+        .map(|record| TableRow {
+            key: row_index_key(record),
+            value: record.encode(),
+        })
+        .collect::<Vec<_>>();
+    encode_writer_body_tables(&[WriterBodyTable {
+        table_id: TABLE_PERSONALDB_PROJECTION_PAGE,
+        row_type_id: TABLE_PERSONALDB_PROJECTION_PAGE,
+        rows,
+    }])
+    .map_err(anyhow::Error::from)
 }
 
-fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
-    let encoded = target
-        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
-        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
-    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
-}
-
-fn encode_row_index_body(records: &[RowIndexRecord]) -> Vec<u8> {
-    let len = records.iter().map(|record| record.encode().len()).sum();
-    let mut out = Vec::with_capacity(len);
-    for record in records {
-        out.extend_from_slice(&record.encode());
-    }
-    out
-}
-
-fn decode_row_index_body(mut input: &[u8]) -> Result<Vec<RowIndexRecord>> {
+fn decode_row_index_body(input: &[u8]) -> Result<Vec<RowIndexRecord>> {
     let mut records = Vec::new();
-    while !input.is_empty() {
-        let (record, used) = RowIndexRecord::decode(input)?;
-        records.push(record);
-        input = &input[used..];
+    for table in decode_writer_body_tables(input)? {
+        if table.table_id != TABLE_PERSONALDB_PROJECTION_PAGE {
+            return Err(anyhow!(
+                "personaldb row index segment contains unexpected table {:04x}",
+                table.table_id
+            ));
+        }
+        for row in table.rows {
+            let (record, used) = RowIndexRecord::decode(&row.value)?;
+            if used != row.value.len() {
+                return Err(anyhow!("personaldb row index row has trailing bytes"));
+            }
+            if row.key != row_index_key(&record) {
+                return Err(anyhow!(
+                    "personaldb row index row key does not match encoded record"
+                ));
+            }
+            records.push(record);
+        }
     }
     Ok(records)
+}
+
+fn row_index_key(record: &RowIndexRecord) -> Vec<u8> {
+    let mut key = Vec::new();
+    key.extend_from_slice(&record.database_id);
+    key.push(0);
+    key.extend_from_slice(&record.table_name_hash);
+    key.extend_from_slice(&record.primary_key_hash);
+    key
 }
 
 fn ensure_sorted(records: &[RowIndexRecord]) -> Result<()> {
@@ -294,7 +347,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let records = vec![row(9), row(1), row(5)];
-        let row_index_ref = write_personaldb_row_index(
+        let row_index_data_id = write_personaldb_row_index(
             &storage,
             PersonalDbRowIndexWrite {
                 tenant_id: 4,
@@ -306,11 +359,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(row_index_ref.starts_with(
+        assert!(row_index_data_id.starts_with(
             "personaldb_row_index:tenant:4:database:db-alpha:generation:00000000000000000012:"
         ));
 
-        let decoded = read_personaldb_row_index(&storage, &row_index_ref)
+        let decoded = read_personaldb_row_index(&storage, &row_index_data_id)
             .await
             .unwrap();
         assert_eq!(decoded.header.tenant_id, "4");
@@ -325,7 +378,7 @@ mod tests {
     async fn personaldb_row_index_footer_protects_body() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let row_index_ref = write_personaldb_row_index(
+        let row_index_data_id = write_personaldb_row_index(
             &storage,
             PersonalDbRowIndexWrite {
                 tenant_id: 4,
@@ -337,27 +390,20 @@ mod tests {
         )
         .await
         .unwrap();
-        let store = CoreStore::new(storage.clone()).await.unwrap();
-        let ref_value = store
-            .read_ref(&row_index_ref)
-            .await
+        let row = read_personaldb_data_locator_row(&storage, 4, "db-alpha", &row_index_data_id)
             .unwrap()
-            .expect("row index ref exists");
-        let mut bytes = store
-            .get_blob(GetBlob {
-                object_ref: decode_core_object_ref_target(&ref_value.target).unwrap(),
-            })
+            .expect("row index CoreMeta row exists");
+        let mut bytes = read_personaldb_data_locator_bytes(&storage, &row)
             .await
             .unwrap();
-        bytes[COMMON_HEADER_LEN + 1] ^= 1;
+        bytes[crate::formats::WRITER_SEGMENT_FIXED_HEADER_LEN + 1] ^= 1;
         assert!(decode_personaldb_row_index(&bytes).is_err());
     }
 
     #[test]
     fn personaldb_row_index_rejects_unsorted_body() {
         let records = vec![row(9), row(1)];
-        let body = encode_row_index_body(&records);
-        assert!(decode_row_index_body(&body).is_ok());
+        assert!(encode_row_index_body(&records).is_err());
         assert!(ensure_sorted(&records).is_err());
     }
 }

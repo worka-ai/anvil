@@ -1,13 +1,35 @@
 use crate::{
-    core_store::{AppendStreamRecord, CoreStore, ReadStream},
+    core_store::{
+        AppendStreamRecord, CoreStore, ReadStream, decode_deterministic_proto,
+        encode_deterministic_proto,
+    },
     formats::{Hash32, hash32, watch::WatchRecord},
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
+use prost::Message;
 use serde::{Deserialize, Serialize};
 
 const GIT_SOURCE_PARTITION_FAMILY: u16 = 6;
 const GIT_SOURCE_RECORD_KIND: u16 = 1;
+
+#[derive(Clone, PartialEq, Message)]
+struct GitSourceWatchPayloadProto {
+    #[prost(string, tag = "1")]
+    repository_id: String,
+    #[prost(string, tag = "2")]
+    event_type: String,
+    #[prost(uint64, tag = "3")]
+    generation: u64,
+    #[prost(string, tag = "4")]
+    source_hash: String,
+    #[prost(string, tag = "5")]
+    index_path: String,
+    #[prost(string, optional, tag = "6")]
+    pack_object_version_id: Option<String>,
+    #[prost(string, tag = "7")]
+    emitted_at: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GitSourceWatchPayload {
@@ -52,7 +74,7 @@ pub async fn append_git_source_watch_record(
         authz_revision,
         payload.generation,
         0,
-        serde_json::to_vec(&payload)?,
+        encode_git_source_watch_payload(&payload)?,
     );
     core_store
         .append_stream(AppendStreamRecord {
@@ -60,6 +82,8 @@ pub async fn append_git_source_watch_record(
             partition_id: hex::encode(partition_id(tenant_id, repository_id)),
             record_kind: "git_source_watch".to_string(),
             payload: record.encode(),
+            content_type: None,
+            user_metadata_json: "{}".to_string(),
             fence: None,
             transaction_id: None,
             idempotency_key: Some(format!(
@@ -94,7 +118,7 @@ pub async fn list_git_source_watch_events(
         {
             continue;
         }
-        let payload: GitSourceWatchPayload = serde_json::from_slice(&record.payload)?;
+        let payload: GitSourceWatchPayload = decode_git_source_watch_payload(&record.payload)?;
         validate_payload(repository_id, &payload)?;
         events.push(GitSourceWatchEvent {
             cursor: record.cursor,
@@ -130,6 +154,34 @@ pub async fn latest_git_source_watch_cursor(
         })
         .map(|record| record.cursor)
         .max())
+}
+
+fn encode_git_source_watch_payload(payload: &GitSourceWatchPayload) -> Result<Vec<u8>> {
+    Ok(encode_deterministic_proto(&GitSourceWatchPayloadProto {
+        repository_id: payload.repository_id.clone(),
+        event_type: payload.event_type.clone(),
+        generation: payload.generation,
+        source_hash: payload.source_hash.clone(),
+        index_path: payload.index_path.clone(),
+        pack_object_version_id: payload.pack_object_version_id.clone(),
+        emitted_at: payload.emitted_at.clone(),
+    }))
+}
+
+fn decode_git_source_watch_payload(bytes: &[u8]) -> Result<GitSourceWatchPayload> {
+    let proto = decode_deterministic_proto::<GitSourceWatchPayloadProto>(
+        bytes,
+        "GitSourceWatchPayload payload",
+    )?;
+    Ok(GitSourceWatchPayload {
+        repository_id: proto.repository_id,
+        event_type: proto.event_type,
+        generation: proto.generation,
+        source_hash: proto.source_hash,
+        index_path: proto.index_path,
+        pack_object_version_id: proto.pack_object_version_id,
+        emitted_at: proto.emitted_at,
+    })
 }
 
 async fn ensure_cursor_is_monotonic(

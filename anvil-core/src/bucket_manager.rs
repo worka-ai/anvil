@@ -1,5 +1,5 @@
 use crate::{
-    auth, bucket_journal,
+    access_control, auth, bucket_journal,
     permissions::AnvilAction,
     persistence::{Bucket, Persistence},
     storage::Storage,
@@ -24,10 +24,9 @@ impl BucketManager {
 
     pub async fn create_bucket(
         &self,
-        tenant_id: i64,
+        claims: &auth::Claims,
         bucket_name: &str,
         region: &str,
-        scopes: &[String],
     ) -> Result<Bucket, Status> {
         tracing::debug!(
             "[manager] ENTERING create_bucket for bucket: {}",
@@ -36,16 +35,30 @@ impl BucketManager {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
-        if !auth::is_authorized(AnvilAction::BucketCreate, bucket_name, scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            claims,
+            AnvilAction::BucketCreate,
+            bucket_name,
+        )
+        .await?;
 
         tracing::debug!("[manager] Creating bucket metadata: {}", bucket_name);
         let bucket = self
             .persistence
-            .create_bucket(tenant_id, bucket_name, region)
+            .create_bucket(claims.tenant_id, bucket_name, region)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        access_control::grant_bucket_defaults(
+            &self.persistence,
+            &bucket,
+            &claims.sub,
+            &claims.sub,
+            "grant creator bucket owner",
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
 
         tracing::debug!(
             "[manager] EXITING create_bucket for bucket: {}",
@@ -56,16 +69,20 @@ impl BucketManager {
 
     pub async fn delete_bucket(
         &self,
-        tenant_id: i64,
+        claims: &auth::Claims,
         bucket_name: &str,
-        scopes: &[String],
     ) -> Result<Bucket, Status> {
-        if !auth::is_authorized(AnvilAction::BucketDelete, bucket_name, scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            claims,
+            AnvilAction::BucketDelete,
+            bucket_name,
+        )
+        .await?;
 
         let existing_bucket =
-            bucket_journal::read_current_bucket(&self.storage, tenant_id, bucket_name)
+            bucket_journal::read_current_bucket(&self.storage, claims.tenant_id, bucket_name)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?
                 .ok_or_else(|| Status::not_found("Bucket not found"))?;
@@ -80,7 +97,7 @@ impl BucketManager {
 
         let bucket = self
             .persistence
-            .soft_delete_bucket(tenant_id, bucket_name)
+            .soft_delete_bucket(claims.tenant_id, bucket_name)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
@@ -95,17 +112,17 @@ impl BucketManager {
         Ok(bucket)
     }
 
-    pub async fn list_buckets(
-        &self,
-        tenant_id: i64,
-        scopes: &[String],
-    ) -> Result<Vec<Bucket>, Status> {
+    pub async fn list_buckets(&self, claims: &auth::Claims) -> Result<Vec<Bucket>, Status> {
+        let tenant_id = claims.tenant_id;
         tracing::debug!("[manager] ENTERING list_buckets for tenant: {}", tenant_id);
-        if !auth::is_authorized(AnvilAction::BucketList, "*", scopes) {
-            return Err(Status::permission_denied(
-                "Permission denied to list buckets",
-            ));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            claims,
+            AnvilAction::BucketList,
+            "*",
+        )
+        .await?;
 
         tracing::debug!(
             "[manager] Reading bucket metadata journal for tenant: {}",
@@ -124,18 +141,23 @@ impl BucketManager {
 
     pub async fn get_bucket_policy(
         &self,
-        tenant_id: i64,
+        claims: &auth::Claims,
         bucket_name: &str,
-        scopes: &[String],
     ) -> Result<serde_json::Value, Status> {
-        if !auth::is_authorized(AnvilAction::BucketRead, bucket_name, scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            claims,
+            AnvilAction::BucketRead,
+            bucket_name,
+        )
+        .await?;
 
-        let bucket = bucket_journal::read_current_bucket(&self.storage, tenant_id, bucket_name)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Bucket not found"))?;
+        let bucket =
+            bucket_journal::read_current_bucket(&self.storage, claims.tenant_id, bucket_name)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::not_found("Bucket not found"))?;
 
         Ok(serde_json::json!({
             "is_public_read": bucket.is_public_read,
@@ -144,20 +166,33 @@ impl BucketManager {
 
     pub async fn set_bucket_public_access(
         &self,
-        tenant_id: i64,
+        claims: &auth::Claims,
         bucket_name: &str,
         is_public: bool,
-        scopes: &[String],
     ) -> Result<Bucket, Status> {
-        if !auth::is_authorized(AnvilAction::BucketWrite, bucket_name, scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            claims,
+            AnvilAction::BucketWrite,
+            bucket_name,
+        )
+        .await?;
 
         let bucket = self
             .persistence
-            .set_bucket_public_access(tenant_id, bucket_name, is_public)
+            .set_bucket_public_access(claims.tenant_id, bucket_name, is_public)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        access_control::write_bucket_public_read_tuple(
+            &self.persistence,
+            &bucket,
+            is_public,
+            &claims.sub,
+            "bucket public-read policy update",
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(bucket)
     }

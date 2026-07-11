@@ -13,6 +13,41 @@ impl Persistence {
         user_meta: Option<JsonValue>,
         shard_map: Option<JsonValue>,
         payload: Option<Vec<u8>>,
+        transaction_id: Option<&str>,
+    ) -> Result<Object> {
+        self.create_object_with_storage_class(
+            tenant_id,
+            bucket_id,
+            key,
+            content_hash,
+            size,
+            etag,
+            content_type,
+            user_meta,
+            shard_map,
+            payload,
+            transaction_id,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn create_object_with_storage_class(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        key: &str,
+        content_hash: &str,
+        size: i64,
+        etag: &str,
+        content_type: Option<&str>,
+        user_meta: Option<JsonValue>,
+        shard_map: Option<JsonValue>,
+        payload: Option<Vec<u8>>,
+        transaction_id: Option<&str>,
+        transaction_principal: Option<&str>,
+        storage_class: Option<String>,
     ) -> Result<Object> {
         let total_start = std::time::Instant::now();
         let step_start = std::time::Instant::now();
@@ -31,21 +66,10 @@ impl Persistence {
         let step_start = std::time::Instant::now();
         let shard_map = match (shard_map, payload) {
             (Some(shard_map), _) => Some(shard_map),
-            (None, Some(payload)) => {
-                let core_store = CoreStore::new(self.storage.clone()).await?;
-                let object_ref = core_store
-                    .put_blob(PutBlob {
-                        logical_name: format!(
-                            "object-payload/{}/{}/{}",
-                            tenant_id, bucket_id, version_id
-                        ),
-                        bytes: payload,
-                        boundary_values: Vec::new(),
-                        region_id: self.region.clone(),
-                        mutation_id: mutation_id.to_string(),
-                    })
-                    .await?;
-                Some(core_object_ref_to_shard_map(&object_ref))
+            (None, Some(_)) => {
+                bail!(
+                    "object payload bytes must be written by the object service through CoreStore logical-file staging before metadata creation"
+                );
             }
             (None, None) => None,
         };
@@ -75,6 +99,7 @@ impl Persistence {
             size,
             etag,
             content_type,
+            storage_class: storage_class.as_deref(),
             user_metadata_hash: &user_metadata_hash,
             index_policy_snapshot: &index_policy_snapshot,
             authz_revision,
@@ -104,7 +129,7 @@ impl Persistence {
             record_hash,
             created_at: Utc::now(),
             deleted_at: None,
-            storage_class: None,
+            storage_class,
             user_meta,
             shard_map,
             checksum: None,
@@ -115,40 +140,57 @@ impl Persistence {
             step_start.elapsed(),
         );
         let step_start = std::time::Instant::now();
-        let permit = self
-            .object_metadata_write_permit(bucket.tenant_id, bucket.id)
-            .await?;
+        let permit =
+            Box::pin(self.object_metadata_write_permit(bucket.tenant_id, bucket.id)).await?;
         crate::emit_test_timing(
             "persistence.create_object object_metadata_write_permit",
             step_start.elapsed(),
         );
         let step_start = std::time::Instant::now();
-        metadata_journal::append_object_mutation_with_permit(
-            &self.storage,
-            &bucket,
-            &object,
-            metadata_journal::ObjectJournalMutation::Put,
-            &permit,
-            &self.partition_owner_signing_key,
-        )
-        .await?;
+        if let Some(transaction_id) = transaction_id {
+            Box::pin(
+                metadata_journal::append_object_mutation_with_permit_in_transaction(
+                    &self.storage,
+                    &bucket,
+                    &object,
+                    metadata_journal::ObjectJournalMutation::Put,
+                    &permit,
+                    &self.partition_owner_signing_key,
+                    Some(transaction_id),
+                    transaction_principal,
+                ),
+            )
+            .await?;
+        } else {
+            Box::pin(metadata_journal::append_object_mutation_with_permit(
+                &self.storage,
+                &bucket,
+                &object,
+                metadata_journal::ObjectJournalMutation::Put,
+                &permit,
+                &self.partition_owner_signing_key,
+            ))
+            .await?;
+        }
         crate::emit_test_timing(
             "persistence.create_object append_object_mutation",
             step_start.elapsed(),
         );
-        let step_start = std::time::Instant::now();
-        self.enqueue_index_builds_for_bucket(&bucket).await?;
-        crate::emit_test_timing(
-            "persistence.create_object enqueue_index_builds_for_bucket",
-            step_start.elapsed(),
-        );
-        let step_start = std::time::Instant::now();
-        self.enqueue_object_metadata_compaction_if_due(&bucket)
-            .await?;
-        crate::emit_test_timing(
-            "persistence.create_object enqueue_object_metadata_compaction_if_due",
-            step_start.elapsed(),
-        );
+        if transaction_id.is_none() {
+            let step_start = std::time::Instant::now();
+            self.enqueue_index_builds_for_bucket(&bucket).await?;
+            crate::emit_test_timing(
+                "persistence.create_object enqueue_index_builds_for_bucket",
+                step_start.elapsed(),
+            );
+            let step_start = std::time::Instant::now();
+            self.enqueue_object_metadata_compaction_if_due(&bucket)
+                .await?;
+            crate::emit_test_timing(
+                "persistence.create_object enqueue_object_metadata_compaction_if_due",
+                step_start.elapsed(),
+            );
+        }
         crate::emit_test_timing("persistence.create_object total", total_start.elapsed());
         Ok(object)
     }
@@ -270,7 +312,7 @@ impl Persistence {
             .await?;
         let user_meta = Some(serde_json::json!({
             "schema": "anvil.object_link.v1",
-            "idempotency_key": request.idempotency_key,
+            "idempotency_key": request.idempotency_key.clone(),
         }));
         let user_metadata_hash = user_metadata_hash(user_meta.as_ref());
         let authz_revision = self.latest_authz_revision(request.tenant_id).await?;
@@ -284,6 +326,7 @@ impl Persistence {
             size: 0,
             etag: &etag,
             content_type: Some(object_links::LINK_METADATA_CONTENT_TYPE),
+            storage_class: None,
             user_metadata_hash: &user_metadata_hash,
             index_policy_snapshot: &index_policy_snapshot,
             authz_revision,
@@ -329,18 +372,32 @@ impl Persistence {
         let permit = self
             .object_metadata_write_permit(bucket.tenant_id, bucket.id)
             .await?;
-        metadata_journal::append_object_mutation_with_permit(
-            &self.storage,
-            &bucket,
-            &object,
-            metadata_journal::ObjectJournalMutation::Put,
-            &permit,
-            &self.partition_owner_signing_key,
-        )
-        .await?;
-        self.enqueue_index_builds_for_bucket(&bucket).await?;
-        self.enqueue_object_metadata_compaction_if_due(&bucket)
+        if let Some(transaction_id) = request.transaction_id.as_deref() {
+            metadata_journal::append_object_mutation_with_permit_in_transaction(
+                &self.storage,
+                &bucket,
+                &object,
+                metadata_journal::ObjectJournalMutation::Put,
+                &permit,
+                &self.partition_owner_signing_key,
+                Some(transaction_id),
+                request.transaction_principal.as_deref(),
+            )
             .await?;
+        } else {
+            metadata_journal::append_object_mutation_with_permit(
+                &self.storage,
+                &bucket,
+                &object,
+                metadata_journal::ObjectJournalMutation::Put,
+                &permit,
+                &self.partition_owner_signing_key,
+            )
+            .await?;
+            self.enqueue_index_builds_for_bucket(&bucket).await?;
+            self.enqueue_object_metadata_compaction_if_due(&bucket)
+                .await?;
+        }
         Ok(object_links::ObjectLinkMutation {
             link: object,
             descriptor,
@@ -472,7 +529,7 @@ impl Persistence {
             .await?;
         let user_meta = Some(serde_json::json!({
             "schema": "anvil.object_link_delete.v1",
-            "idempotency_key": request.idempotency_key,
+            "idempotency_key": request.idempotency_key.clone(),
         }));
         let user_metadata_hash = user_metadata_hash(user_meta.as_ref());
         let authz_revision = self.latest_authz_revision(request.tenant_id).await?;
@@ -486,6 +543,7 @@ impl Persistence {
             size: 0,
             etag: &etag,
             content_type: Some(object_links::LINK_METADATA_CONTENT_TYPE),
+            storage_class: None,
             user_metadata_hash: &user_metadata_hash,
             index_policy_snapshot: &index_policy_snapshot,
             authz_revision,
@@ -530,18 +588,32 @@ impl Persistence {
         let permit = self
             .object_metadata_write_permit(bucket.tenant_id, bucket.id)
             .await?;
-        metadata_journal::append_object_mutation_with_permit(
-            &self.storage,
-            &bucket,
-            &object,
-            metadata_journal::ObjectJournalMutation::DeleteMarker,
-            &permit,
-            &self.partition_owner_signing_key,
-        )
-        .await?;
-        self.enqueue_index_builds_for_bucket(&bucket).await?;
-        self.enqueue_object_metadata_compaction_if_due(&bucket)
+        if let Some(transaction_id) = request.transaction_id.as_deref() {
+            metadata_journal::append_object_mutation_with_permit_in_transaction(
+                &self.storage,
+                &bucket,
+                &object,
+                metadata_journal::ObjectJournalMutation::DeleteMarker,
+                &permit,
+                &self.partition_owner_signing_key,
+                Some(transaction_id),
+                request.transaction_principal.as_deref(),
+            )
             .await?;
+        } else {
+            metadata_journal::append_object_mutation_with_permit(
+                &self.storage,
+                &bucket,
+                &object,
+                metadata_journal::ObjectJournalMutation::DeleteMarker,
+                &permit,
+                &self.partition_owner_signing_key,
+            )
+            .await?;
+            self.enqueue_index_builds_for_bucket(&bucket).await?;
+            self.enqueue_object_metadata_compaction_if_due(&bucket)
+                .await?;
+        }
         Ok(object_links::DeleteObjectLinkResult {
             link_key: request.link_key,
             generation: new_generation,
@@ -679,6 +751,17 @@ impl Persistence {
     }
 
     pub async fn soft_delete_object(&self, bucket_id: i64, key: &str) -> Result<Option<Object>> {
+        self.soft_delete_object_in_transaction(bucket_id, key, None, None)
+            .await
+    }
+
+    pub async fn soft_delete_object_in_transaction(
+        &self,
+        bucket_id: i64,
+        key: &str,
+        transaction_id: Option<&str>,
+        transaction_principal: Option<&str>,
+    ) -> Result<Option<Object>> {
         let Some(bucket) =
             bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
         else {
@@ -714,18 +797,32 @@ impl Persistence {
         let permit = self
             .object_metadata_write_permit(bucket.tenant_id, bucket.id)
             .await?;
-        metadata_journal::append_object_mutation_with_permit(
-            &self.storage,
-            &bucket,
-            &object,
-            metadata_journal::ObjectJournalMutation::DeleteMarker,
-            &permit,
-            &self.partition_owner_signing_key,
-        )
-        .await?;
-        self.enqueue_index_builds_for_bucket(&bucket).await?;
-        self.enqueue_object_metadata_compaction_if_due(&bucket)
+        if let Some(transaction_id) = transaction_id {
+            metadata_journal::append_object_mutation_with_permit_in_transaction(
+                &self.storage,
+                &bucket,
+                &object,
+                metadata_journal::ObjectJournalMutation::DeleteMarker,
+                &permit,
+                &self.partition_owner_signing_key,
+                Some(transaction_id),
+                transaction_principal,
+            )
             .await?;
+        } else {
+            metadata_journal::append_object_mutation_with_permit(
+                &self.storage,
+                &bucket,
+                &object,
+                metadata_journal::ObjectJournalMutation::DeleteMarker,
+                &permit,
+                &self.partition_owner_signing_key,
+            )
+            .await?;
+            self.enqueue_index_builds_for_bucket(&bucket).await?;
+            self.enqueue_object_metadata_compaction_if_due(&bucket)
+                .await?;
+        }
         Ok(Some(object))
     }
 
@@ -734,6 +831,18 @@ impl Persistence {
         bucket_id: i64,
         key: &str,
         version_id: uuid::Uuid,
+    ) -> Result<Option<Object>> {
+        self.delete_object_version_in_transaction(bucket_id, key, version_id, None, None)
+            .await
+    }
+
+    pub async fn delete_object_version_in_transaction(
+        &self,
+        bucket_id: i64,
+        key: &str,
+        version_id: uuid::Uuid,
+        transaction_id: Option<&str>,
+        transaction_principal: Option<&str>,
     ) -> Result<Option<Object>> {
         let Some(bucket) =
             bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
@@ -762,18 +871,32 @@ impl Persistence {
         let permit = self
             .object_metadata_write_permit(bucket.tenant_id, bucket.id)
             .await?;
-        metadata_journal::append_object_mutation_with_permit(
-            &self.storage,
-            &bucket,
-            &object,
-            metadata_journal::ObjectJournalMutation::DeleteVersion,
-            &permit,
-            &self.partition_owner_signing_key,
-        )
-        .await?;
-        self.enqueue_index_builds_for_bucket(&bucket).await?;
-        self.enqueue_object_metadata_compaction_if_due(&bucket)
+        if let Some(transaction_id) = transaction_id {
+            metadata_journal::append_object_mutation_with_permit_in_transaction(
+                &self.storage,
+                &bucket,
+                &object,
+                metadata_journal::ObjectJournalMutation::DeleteVersion,
+                &permit,
+                &self.partition_owner_signing_key,
+                Some(transaction_id),
+                transaction_principal,
+            )
             .await?;
+        } else {
+            metadata_journal::append_object_mutation_with_permit(
+                &self.storage,
+                &bucket,
+                &object,
+                metadata_journal::ObjectJournalMutation::DeleteVersion,
+                &permit,
+                &self.partition_owner_signing_key,
+            )
+            .await?;
+            self.enqueue_index_builds_for_bucket(&bucket).await?;
+            self.enqueue_object_metadata_compaction_if_due(&bucket)
+                .await?;
+        }
         Ok(Some(object))
     }
 

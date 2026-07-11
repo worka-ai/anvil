@@ -1,4 +1,189 @@
 use super::*;
+use crate::{
+    access_control, config::Config, core_store::CoreStore, storage::Storage, system_realm,
+};
+use tempfile::{TempDir, tempdir};
+
+fn test_config(storage_path: &std::path::Path) -> Config {
+    Config {
+        jwt_secret: "test-secret".to_string(),
+        anvil_secret_encryption_key:
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        public_api_addr: "test-node".to_string(),
+        api_listen_addr: "127.0.0.1:0".to_string(),
+        region: "test-region".to_string(),
+        storage_path: storage_path.to_string_lossy().to_string(),
+        ..Config::default()
+    }
+}
+
+async fn seeded_core_store_link() -> (TempDir, ObjectManager, Bucket, Object, Object, auth::Claims)
+{
+    let temp = tempdir().unwrap();
+    let storage_path = temp.path().join("storage");
+    let config = test_config(&storage_path);
+    let storage = Storage::new_at(&config.storage_path).await.unwrap();
+    let core_store = CoreStore::new(storage.clone()).await.unwrap();
+    let persistence = Persistence::new(&config, None).unwrap();
+    persistence.create_region("test-region").await.unwrap();
+    let tenant = persistence
+        .create_tenant("tenant-a", "tenant-a")
+        .await
+        .unwrap();
+    let bucket = persistence
+        .create_bucket(tenant.id, "links", "test-region")
+        .await
+        .unwrap();
+    let bucket = persistence
+        .set_bucket_public_access(tenant.id, &bucket.name, true)
+        .await
+        .unwrap();
+    access_control::write_bucket_public_read_tuple(
+        &persistence,
+        &bucket,
+        true,
+        "test",
+        "object manager public link seed",
+    )
+    .await
+    .unwrap();
+    let claims = auth::Claims {
+        sub: "test-app".to_string(),
+        exp: usize::MAX,
+        tenant_id: tenant.id,
+        jti: None,
+    };
+    access_control::grant_storage_tenant_owner(
+        &persistence,
+        tenant.id,
+        &claims.sub,
+        "test",
+        "object manager link seed",
+    )
+    .await
+    .unwrap();
+    access_control::grant_bucket_defaults(
+        &persistence,
+        &bucket,
+        &claims.sub,
+        "test",
+        "object manager link seed",
+    )
+    .await
+    .unwrap();
+
+    persistence
+        .write_authz_tuple(
+            system_realm::SYSTEM_STORAGE_TENANT_ID,
+            &access_control::system_realm_namespace(system_realm::SYSTEM_BUCKET_NAMESPACE),
+            &access_control::bucket_object_id(&bucket),
+            "put_object",
+            access_control::APP_SUBJECT_KIND,
+            &claims.sub,
+            "",
+            "add",
+            "test",
+            "object manager direct put seed",
+        )
+        .await
+        .unwrap();
+    persistence
+        .write_authz_tuple(
+            system_realm::SYSTEM_STORAGE_TENANT_ID,
+            &access_control::system_realm_namespace(system_realm::SYSTEM_BUCKET_NAMESPACE),
+            &access_control::bucket_object_id(&bucket),
+            "get_object",
+            access_control::APP_SUBJECT_KIND,
+            access_control::PUBLIC_APP_PRINCIPAL_ID,
+            "",
+            "add",
+            "test",
+            "object manager direct public read seed",
+        )
+        .await
+        .unwrap();
+    let (watch_tx, _) = tokio::sync::broadcast::channel(8);
+    let manager = ObjectManager::new(
+        persistence.clone(),
+        storage,
+        core_store,
+        "test-region".to_string(),
+        CrossRegionRoutingPolicy::RedirectPreferred,
+        hex::decode(&config.anvil_secret_encryption_key).unwrap(),
+        watch_tx,
+        Observability::default(),
+    );
+    let target = manager
+        .put_object(
+            &claims,
+            &bucket.name,
+            "versions/app-v1.bin",
+            tokio_stream::iter(vec![Ok(b"linked payload".to_vec())]),
+            ObjectWriteOptions {
+                content_type: Some("application/octet-stream".to_string()),
+                user_metadata: None,
+                transaction_id: None,
+                transaction_principal: None,
+                storage_class_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let now = chrono::Utc::now();
+    let link_target = object_links::ObjectLinkTarget {
+        target_key: target.key.clone(),
+        target_version: None,
+        resolution: object_links::ObjectLinkResolution::Follow,
+        generation: 1,
+        created_at: now,
+        created_by: "principal:test".to_string(),
+    };
+    let descriptor = object_links::ObjectLinkDescriptor {
+        schema: "anvil.object_link.v1".to_string(),
+        tenant_id: tenant.id.to_string(),
+        bucket_name: bucket.name.clone(),
+        link_key: "latest.bin".to_string(),
+        target_key: target.key.clone(),
+        target_version: None,
+        resolution: object_links::ObjectLinkResolution::Follow,
+        created_at: now,
+        updated_at: now,
+        created_by: "principal:test".to_string(),
+        generation: 1,
+    };
+    let link = Object {
+        id: target.id + 1,
+        tenant_id: tenant.id,
+        bucket_id: bucket.id,
+        key: descriptor.link_key.clone(),
+        kind: object_links::ObjectEntryKind::Link,
+        content_hash: object_links::link_metadata_hash(&descriptor),
+        size: 0,
+        etag: object_links::link_metadata_etag(&descriptor),
+        content_type: Some(object_links::LINK_METADATA_CONTENT_TYPE.to_string()),
+        version_id: uuid::Uuid::new_v4(),
+        mutation_id: uuid::Uuid::new_v4(),
+        index_policy_snapshot: "test-index-policy".to_string(),
+        user_metadata_hash: blake3::hash(b"core-store-link").to_hex().to_string(),
+        authz_revision: 0,
+        record_hash: "core-store-link-record".to_string(),
+        created_at: now,
+        deleted_at: None,
+        storage_class: None,
+        user_meta: None,
+        shard_map: None,
+        checksum: None,
+        link: Some(link_target),
+    };
+    manager
+        .core_store
+        .put_object_metadata(&bucket, &link)
+        .await
+        .unwrap();
+
+    (temp, manager, bucket, target, link, claims)
+}
 
 fn boundary_schema() -> CoreBoundarySchema {
     CoreBoundarySchema {
@@ -67,11 +252,14 @@ fn boundary_schema() -> CoreBoundarySchema {
 fn object_boundary_extraction_reads_metadata_path_and_body() {
     let values = extract_object_boundary_values(
         &boundary_schema(),
+        1,
+        "docs",
         "customers/8e4b4477-99d8-4f4b-89db-876d2c7f0c6a/projects/alpha/docs/a.json",
         Some("application/json"),
         Some(&serde_json::json!({
             "customer_tenant_id": "8e4b4477-99d8-4f4b-89db-876d2c7f0c6a"
         })),
+        br#"{"document":{"day":"2026-07-07"}}"#.len() as u64,
         br#"{"document":{"day":"2026-07-07"}}"#,
     )
     .unwrap();
@@ -93,9 +281,12 @@ fn object_boundary_extraction_reads_metadata_path_and_body() {
 fn object_boundary_extraction_rejects_missing_required_metadata() {
     let error = extract_object_boundary_values(
         &boundary_schema(),
+        1,
+        "docs",
         "customers/8e4b4477-99d8-4f4b-89db-876d2c7f0c6a/projects/alpha/docs/a.json",
         Some("application/json"),
         Some(&serde_json::json!({})),
+        br#"{"document":{"day":"2026-07-07"}}"#.len() as u64,
         br#"{"document":{"day":"2026-07-07"}}"#,
     )
     .unwrap_err();
@@ -110,11 +301,14 @@ fn object_boundary_extraction_rejects_missing_required_metadata() {
 fn object_boundary_extraction_rejects_non_json_body_source() {
     let error = extract_object_boundary_values(
         &boundary_schema(),
+        1,
+        "docs",
         "customers/8e4b4477-99d8-4f4b-89db-876d2c7f0c6a/projects/alpha/docs/a.json",
         Some("text/plain"),
         Some(&serde_json::json!({
             "customer_tenant_id": "8e4b4477-99d8-4f4b-89db-876d2c7f0c6a"
         })),
+        b"plain".len() as u64,
         b"plain",
     )
     .unwrap_err();
@@ -123,4 +317,47 @@ fn object_boundary_extraction_rejects_non_json_body_source() {
             .to_string()
             .contains(AnvilErrorCode::BoundaryExtractorUnsupportedContentType.as_str())
     );
+}
+
+#[tokio::test]
+async fn object_link_metadata_head_and_read_use_core_store_metadata() {
+    let (_temp, manager, bucket, target, link, claims) = seeded_core_store_link().await;
+
+    let current = manager
+        .read_object_link(Some(claims.clone()), &bucket.name, &link.key, None)
+        .await
+        .unwrap();
+    assert_eq!(current.link_key, link.key);
+    assert_eq!(current.target_key, target.key);
+    assert_eq!(current.generation, 1);
+
+    let versioned = manager
+        .read_object_link(
+            Some(claims.clone()),
+            &bucket.name,
+            &link.key,
+            Some(link.version_id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(versioned.link_key, link.key);
+    assert_eq!(versioned.target_key, target.key);
+
+    let head = manager
+        .head_object(Some(claims.clone()), &bucket.name, &link.key, None)
+        .await
+        .unwrap();
+    assert_eq!(head.key, target.key);
+    assert_eq!(head.version_id, target.version_id);
+    assert_eq!(head.size, target.size);
+    assert!(head.etag.starts_with("link-follow-"));
+
+    let result = manager
+        .get_object(Some(claims), bucket.name, link.key, None, None)
+        .await
+        .unwrap();
+    let body = collect_stream_bytes(result.1).await.unwrap();
+    assert_eq!(body, b"linked payload");
+    assert_eq!(result.0.key, target.key);
+    assert_eq!(result.2, 0);
 }

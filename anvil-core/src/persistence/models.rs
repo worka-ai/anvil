@@ -1,12 +1,6 @@
 use super::*;
 
 impl Persistence {
-    pub async fn list_policies(&self) -> Result<Vec<String>> {
-        Ok(control_journal::read_control_state(&self.storage)
-            .await?
-            .policy_summaries())
-    }
-
     pub async fn create_model_artifact(
         &self,
         artifact_id: &str,

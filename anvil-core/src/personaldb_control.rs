@@ -1,11 +1,13 @@
-use crate::formats::hash32;
+use crate::{core_store::encode_deterministic_proto, formats::hash32};
 use anyhow::{Result, anyhow};
 use base64::Engine;
 use hmac::{Hmac, Mac};
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
+const PERSONALDB_SNAPSHOT_OBJECT_REF_PREFIX: &str = "personaldb_snapshot_object:";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersonalDbGroupManifest {
@@ -66,6 +68,104 @@ pub struct PersonalDbCommitCertificate {
     pub witnessed_at: String,
     pub certificate_hash: Option<String>,
     pub witness_signature: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct PersonalDbGroupManifestHashProto {
+    #[prost(uint32, tag = "1")]
+    format_version: u32,
+    #[prost(string, tag = "2")]
+    tenant_id: String,
+    #[prost(string, tag = "3")]
+    database_id: String,
+    #[prost(string, tag = "4")]
+    schema_hash: String,
+    #[prost(string, tag = "5")]
+    genesis_hash: String,
+    #[prost(string, tag = "6")]
+    created_at: String,
+    #[prost(string, tag = "7")]
+    created_by: String,
+    #[prost(string, tag = "8")]
+    consistency_policy: String,
+    #[prost(uint32, tag = "9")]
+    object_layout_version: u32,
+    #[prost(uint64, tag = "10")]
+    active_membership_epoch: u64,
+    #[prost(uint64, tag = "11")]
+    active_policy_epoch: u64,
+    #[prost(uint64, tag = "12")]
+    current_row_index_generation: u64,
+    #[prost(uint64, tag = "13")]
+    current_projection_generation: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct PersonalDbSnapshotManifestHashProto {
+    #[prost(uint32, tag = "1")]
+    format_version: u32,
+    #[prost(string, tag = "2")]
+    tenant_id: String,
+    #[prost(string, tag = "3")]
+    database_id: String,
+    #[prost(uint64, tag = "4")]
+    log_index: u64,
+    #[prost(string, tag = "5")]
+    log_hash: String,
+    #[prost(string, tag = "6")]
+    state_hash: String,
+    #[prost(string, tag = "7")]
+    schema_hash: String,
+    #[prost(string, tag = "8")]
+    snapshot_object_key: String,
+    #[prost(string, tag = "9")]
+    snapshot_object_hash: String,
+    #[prost(uint64, tag = "10")]
+    source_segment_start: u64,
+    #[prost(uint64, tag = "11")]
+    source_segment_end: u64,
+    #[prost(uint64, tag = "12")]
+    row_index_generation: u64,
+    #[prost(string, tag = "13")]
+    created_at: String,
+    #[prost(string, tag = "14")]
+    created_by_node: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct PersonalDbCommitCertificateHashProto {
+    #[prost(uint32, tag = "1")]
+    format_version: u32,
+    #[prost(string, tag = "2")]
+    tenant_id: String,
+    #[prost(string, tag = "3")]
+    database_id: String,
+    #[prost(uint64, tag = "4")]
+    log_index: u64,
+    #[prost(string, tag = "5")]
+    previous_log_hash: String,
+    #[prost(string, tag = "6")]
+    entry_hash: String,
+    #[prost(string, tag = "7")]
+    changeset_payload_hash: String,
+    #[prost(string, tag = "8")]
+    verified_envelope_hash: String,
+    #[prost(uint64, tag = "9")]
+    client_log_epoch: u64,
+    #[prost(uint64, tag = "10")]
+    membership_epoch: u64,
+    #[prost(uint64, tag = "11")]
+    policy_epoch: u64,
+    #[prost(string, tag = "12")]
+    leader_replica_id: String,
+    #[prost(string, tag = "13")]
+    voter_acks_hash: String,
+    #[prost(uint64, tag = "14")]
+    authz_revision: u64,
+    #[prost(string, tag = "15")]
+    witness_node_id: String,
+    #[prost(string, tag = "16")]
+    witnessed_at: String,
 }
 
 impl PersonalDbGroupManifest {
@@ -187,24 +287,88 @@ impl PersonalDbCommitCertificate {
 }
 
 pub fn hash_group_manifest(manifest: &PersonalDbGroupManifest) -> Result<String> {
-    let mut unsigned = manifest.clone();
-    unsigned.manifest_hash = None;
-    unsigned.manifest_signature = None;
-    Ok(hex::encode(hash32(&serde_json::to_vec(&unsigned)?)))
+    validate_group_manifest_unsigned(manifest)?;
+    Ok(hex::encode(hash32(&encode_deterministic_proto(
+        &group_manifest_hash_proto(manifest),
+    ))))
 }
 
 pub fn hash_snapshot_manifest(manifest: &PersonalDbSnapshotManifest) -> Result<String> {
-    let mut unsigned = manifest.clone();
-    unsigned.manifest_hash = None;
-    unsigned.manifest_signature = None;
-    Ok(hex::encode(hash32(&serde_json::to_vec(&unsigned)?)))
+    validate_snapshot_manifest_unsigned(manifest)?;
+    Ok(hex::encode(hash32(&encode_deterministic_proto(
+        &snapshot_manifest_hash_proto(manifest),
+    ))))
 }
 
 pub fn hash_commit_certificate(certificate: &PersonalDbCommitCertificate) -> Result<String> {
-    let mut unsigned = certificate.clone();
-    unsigned.certificate_hash = None;
-    unsigned.witness_signature = None;
-    Ok(hex::encode(hash32(&serde_json::to_vec(&unsigned)?)))
+    validate_commit_certificate_unsigned(certificate)?;
+    Ok(hex::encode(hash32(&encode_deterministic_proto(
+        &commit_certificate_hash_proto(certificate),
+    ))))
+}
+
+fn group_manifest_hash_proto(
+    manifest: &PersonalDbGroupManifest,
+) -> PersonalDbGroupManifestHashProto {
+    PersonalDbGroupManifestHashProto {
+        format_version: u32::from(manifest.format_version),
+        tenant_id: manifest.tenant_id.clone(),
+        database_id: manifest.database_id.clone(),
+        schema_hash: manifest.schema_hash.clone(),
+        genesis_hash: manifest.genesis_hash.clone(),
+        created_at: manifest.created_at.clone(),
+        created_by: manifest.created_by.clone(),
+        consistency_policy: manifest.consistency_policy.clone(),
+        object_layout_version: u32::from(manifest.object_layout_version),
+        active_membership_epoch: manifest.active_membership_epoch,
+        active_policy_epoch: manifest.active_policy_epoch,
+        current_row_index_generation: manifest.current_row_index_generation,
+        current_projection_generation: manifest.current_projection_generation,
+    }
+}
+
+fn snapshot_manifest_hash_proto(
+    manifest: &PersonalDbSnapshotManifest,
+) -> PersonalDbSnapshotManifestHashProto {
+    PersonalDbSnapshotManifestHashProto {
+        format_version: u32::from(manifest.format_version),
+        tenant_id: manifest.tenant_id.clone(),
+        database_id: manifest.database_id.clone(),
+        log_index: manifest.log_index,
+        log_hash: manifest.log_hash.clone(),
+        state_hash: manifest.state_hash.clone(),
+        schema_hash: manifest.schema_hash.clone(),
+        snapshot_object_key: manifest.snapshot_object_key.clone(),
+        snapshot_object_hash: manifest.snapshot_object_hash.clone(),
+        source_segment_start: manifest.source_segment_start,
+        source_segment_end: manifest.source_segment_end,
+        row_index_generation: manifest.row_index_generation,
+        created_at: manifest.created_at.clone(),
+        created_by_node: manifest.created_by_node.clone(),
+    }
+}
+
+fn commit_certificate_hash_proto(
+    certificate: &PersonalDbCommitCertificate,
+) -> PersonalDbCommitCertificateHashProto {
+    PersonalDbCommitCertificateHashProto {
+        format_version: u32::from(certificate.format_version),
+        tenant_id: certificate.tenant_id.clone(),
+        database_id: certificate.database_id.clone(),
+        log_index: certificate.log_index,
+        previous_log_hash: certificate.previous_log_hash.clone(),
+        entry_hash: certificate.entry_hash.clone(),
+        changeset_payload_hash: certificate.changeset_payload_hash.clone(),
+        verified_envelope_hash: certificate.verified_envelope_hash.clone(),
+        client_log_epoch: certificate.client_log_epoch,
+        membership_epoch: certificate.membership_epoch,
+        policy_epoch: certificate.policy_epoch,
+        leader_replica_id: certificate.leader_replica_id.clone(),
+        voter_acks_hash: certificate.voter_acks_hash.clone(),
+        authz_revision: certificate.authz_revision,
+        witness_node_id: certificate.witness_node_id.clone(),
+        witnessed_at: certificate.witnessed_at.clone(),
+    }
 }
 
 fn validate_group_manifest_unsigned(manifest: &PersonalDbGroupManifest) -> Result<()> {
@@ -232,7 +396,11 @@ fn validate_snapshot_manifest_unsigned(manifest: &PersonalDbSnapshotManifest) ->
     validate_hex32(&manifest.snapshot_object_hash, "snapshot_object_hash")?;
     require_nonempty(&manifest.tenant_id, "tenant_id")?;
     require_nonempty(&manifest.database_id, "database_id")?;
-    require_nonempty(&manifest.snapshot_object_key, "snapshot_object_key")?;
+    require_corestore_ref(
+        &manifest.snapshot_object_key,
+        "snapshot_object_ref",
+        PERSONALDB_SNAPSHOT_OBJECT_REF_PREFIX,
+    )?;
     require_nonempty(&manifest.created_by_node, "created_by_node")?;
     if manifest.source_segment_start > manifest.source_segment_end {
         return Err(anyhow!("snapshot source segment range is invalid"));
@@ -292,6 +460,17 @@ fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
 fn require_nonempty(value: &str, field: &'static str) -> Result<()> {
     if value.is_empty() {
         return Err(anyhow!("{field} must not be empty"));
+    }
+    Ok(())
+}
+
+fn require_corestore_ref(value: &str, field: &'static str, prefix: &str) -> Result<()> {
+    require_nonempty(value, field)?;
+    if !value.starts_with(prefix) {
+        return Err(anyhow!("{field} must be a CoreStore/CoreMeta ref"));
+    }
+    if value.contains('/') || value.contains('\\') || value.chars().any(char::is_control) {
+        return Err(anyhow!("{field} must not be a storage path"));
     }
     Ok(())
 }
@@ -370,7 +549,12 @@ mod tests {
             log_hash: hex::encode([1; 32]),
             state_hash: hex::encode([2; 32]),
             schema_hash: hex::encode([3; 32]),
-            snapshot_object_key: "_anvil/personaldb/tenants/tenant/groups/db/snapshots/objects/00000000000000001000-state.sqlite.zst".to_string(),
+            snapshot_object_key: concat!(
+                "personaldb_snapshot_object:tenant:tenant:database:db:",
+                "log:00000000000000001000:",
+                "state:0000000000000000000000000000000000000000000000000000000000000002"
+            )
+            .to_string(),
             snapshot_object_hash: hex::encode([4; 32]),
             source_segment_start: 1,
             source_segment_end: 1000,

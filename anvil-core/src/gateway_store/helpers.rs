@@ -501,7 +501,7 @@ pub(super) fn validate_media_type(value: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn validate_hash<T: Serialize>(record: &T, actual: &str) -> Result<()> {
+pub(super) fn validate_hash<T: GatewayRecordCodec>(record: &T, actual: &str) -> Result<()> {
     let expected = hash_record(record)?;
     if expected != actual {
         bail!("gateway record hash mismatch");
@@ -509,15 +509,8 @@ pub(super) fn validate_hash<T: Serialize>(record: &T, actual: &str) -> Result<()
     Ok(())
 }
 
-pub(super) fn hash_record<T: Serialize>(record: &T) -> Result<String> {
-    let mut value = serde_json::to_value(record)?;
-    if let Some(object) = value.as_object_mut() {
-        object.insert(
-            "record_hash".to_string(),
-            serde_json::Value::String(String::new()),
-        );
-    }
-    Ok(hex::encode(hash32(&serde_json::to_vec(&value)?)))
+pub(super) fn hash_record<T: GatewayRecordCodec>(record: &T) -> Result<String> {
+    hash_gateway_record(record)
 }
 
 pub(super) fn now_rfc3339() -> String {
@@ -538,15 +531,9 @@ pub(super) fn idempotency_hash(value: &str) -> Result<String> {
 }
 
 pub(super) fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
-    Ok(format!(
-        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
-    ))
+    crate::core_store::encode_core_object_ref_target(object_ref)
 }
 
 pub(super) fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
-    let encoded = target
-        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
-        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
-    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
+    crate::core_store::decode_core_object_ref_target(target)
 }

@@ -1,6 +1,7 @@
 use super::*;
-use crate::core_store::PutBlob;
-use crate::formats::JournalRecordKind;
+use crate::core_store::{
+    CF_LEASES_FENCES, CoreMetaStore, TABLE_OWNERSHIP_FENCE_ROW, TABLE_PARTITION_OWNER_ROW,
+};
 use tempfile::tempdir;
 
 const KEY: &[u8] = b"partition owner signing key";
@@ -102,22 +103,6 @@ async fn owner_handoff_rejects_stale_fence_token() {
     assert_eq!(stale_rejection.code, AnvilErrorCode::StaleFenceToken);
 }
 
-#[test]
-fn recovery_replay_keeps_current_fence_after_manifest_checkpoint() {
-    let stale_before = frame(9, 1, [0; 32]);
-    let current_after = frame(11, 2, stale_before.record_hash);
-    let stale_after = frame(12, 1, current_after.record_hash);
-    let frames = vec![stale_before, current_after.clone(), stale_after];
-
-    assert_eq!(
-        frames_for_recovered_fence(&frames, 10, 2),
-        vec![current_after]
-    );
-    let rejection = reject_stale_frames_after_checkpoint(&frames, 10, 2).unwrap_err();
-    assert_eq!(rejection.code, AnvilErrorCode::StaleFenceToken);
-    reject_stale_frames_after_checkpoint(&frames[..2], 10, 2).unwrap();
-}
-
 #[tokio::test]
 async fn partition_owner_state_is_signed_and_path_scoped() {
     let temp = tempdir().unwrap();
@@ -125,48 +110,49 @@ async fn partition_owner_state_is_signed_and_path_scoped() {
     let owner = acquire_partition_recovery(&storage, acquire("node-a", 100), KEY)
         .await
         .unwrap();
-    let (ref_value, _) =
+    let (row, _) =
         read_partition_owner_state(&storage, &owner.partition_family, &owner.partition_id, KEY)
             .await
             .unwrap()
             .unwrap();
-    let store = CoreStore::new(storage.clone()).await.unwrap();
-    let object_ref = decode_core_object_ref_target(&ref_value.target).unwrap();
-    let mut value: serde_json::Value =
-        serde_json::from_slice(&store.get_blob(GetBlob { object_ref }).await.unwrap()).unwrap();
-    value["fence_token"] = serde_json::json!(99);
-    let tampered = store
-        .put_blob(PutBlob {
-            logical_name: "partition-owner-tamper".to_string(),
-            bytes: serde_json::to_vec_pretty(&value).unwrap(),
-            boundary_values: Vec::new(),
-            region_id: "local".to_string(),
-            mutation_id: "partition-owner-tamper".to_string(),
-        })
-        .await
-        .unwrap();
-    store
-        .compare_and_swap_ref(CompareAndSwapRef {
-            ref_name: partition_owner_ref_name(&owner.partition_family, &owner.partition_id)
-                .unwrap(),
-            expected_generation: Some(ref_value.generation),
-            expected_target: Some(ref_value.target),
-            require_absent: false,
-            require_present: true,
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-            new_target: encode_core_object_ref_target(&tampered).unwrap(),
-            transaction_id: None,
-        })
-        .await
-        .unwrap();
+    assert_ne!(row.first().copied(), Some(b'{'));
+    let mut tampered = decode_partition_owner_record(&row).unwrap();
+    tampered.fence_token = 99;
+    let meta = CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
+    meta.put(
+        CF_LEASES_FENCES,
+        TABLE_PARTITION_OWNER_ROW,
+        &partition_owner_row_key(&owner.partition_family, &owner.partition_id).unwrap(),
+        &encode_partition_owner_record(&tampered).unwrap(),
+    )
+    .unwrap();
     assert!(
         read_partition_owner(&storage, &owner.partition_family, &owner.partition_id, KEY)
             .await
             .is_err()
     );
-    assert!(partition_owner_ref_name("../escape", &owner.partition_id).is_err());
+    assert!(partition_owner_row_key("../escape", &owner.partition_id).is_err());
+}
+
+#[tokio::test]
+async fn partition_owner_state_is_coremeta_row() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let owner = acquire_partition_recovery(&storage, acquire("node-a", 100), KEY)
+        .await
+        .unwrap();
+
+    let row_key = partition_owner_row_key(&owner.partition_family, &owner.partition_id).unwrap();
+    let meta = CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
+    let row = meta
+        .get(CF_LEASES_FENCES, TABLE_PARTITION_OWNER_ROW, &row_key)
+        .unwrap()
+        .expect("partition owner must be stored in CoreMeta leases/fences");
+    assert_ne!(row.first().copied(), Some(b'{'));
+    let stored = decode_partition_owner_record(&row).unwrap();
+    assert_eq!(stored.partition_family, owner.partition_family);
+    assert_eq!(stored.partition_id, owner.partition_id);
+    stored.verify(KEY).unwrap();
 }
 
 #[tokio::test]
@@ -223,6 +209,33 @@ async fn ownership_label_is_not_security_identity() {
         .to_string()
         .contains(OWNERSHIP_OWNER_MISMATCH)
     );
+}
+
+#[tokio::test]
+async fn ownership_fences_are_coremeta_rows() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let owner = principal("app-a", "token-a", "node-a");
+    let acquired = acquire_ownership(
+        &storage,
+        ownership_acquire(owner, 100, 500, "acquire-a"),
+        KEY,
+    )
+    .await
+    .unwrap()
+    .record;
+
+    let row_key = ownership_fence_row_key(acquired.owner.tenant_id, &acquired.resource).unwrap();
+    let meta = CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
+    let row = meta
+        .get(CF_LEASES_FENCES, TABLE_OWNERSHIP_FENCE_ROW, &row_key)
+        .unwrap()
+        .expect("ownership fence must be stored in CoreMeta leases/fences");
+    assert_ne!(row.first().copied(), Some(b'{'));
+    let stored = decode_ownership_fence_record(&row).unwrap();
+    assert_eq!(stored.fence, acquired.fence);
+    assert_eq!(stored.resource, acquired.resource);
+    stored.verify(KEY).unwrap();
 }
 
 #[tokio::test]
@@ -620,16 +633,4 @@ fn principal(
         region: "eu-west-1".to_string(),
         cell: "cell-a".to_string(),
     }
-}
-
-fn frame(sequence: u64, fence_token: u64, previous_hash: [u8; 32]) -> JournalFrame {
-    JournalFrame::new(
-        JournalRecordKind::ObjectVersion,
-        sequence,
-        fence_token,
-        [sequence as u8; 16],
-        [fence_token as u8; 32],
-        previous_hash,
-        vec![sequence as u8, fence_token as u8],
-    )
 }

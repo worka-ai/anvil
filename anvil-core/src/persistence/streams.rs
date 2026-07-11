@@ -21,6 +21,30 @@ impl Persistence {
         .await
     }
 
+    pub async fn create_multipart_upload_in_transaction(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        key: &str,
+        transaction_id: &str,
+        transaction_principal: &str,
+    ) -> Result<MultipartUploadMutation> {
+        let permit = self
+            .multipart_metadata_write_permit(tenant_id, bucket_id)
+            .await?;
+        multipart_journal::create_multipart_upload_with_permit_in_transaction(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            key,
+            &permit,
+            &self.partition_owner_signing_key,
+            transaction_id,
+            transaction_principal,
+        )
+        .await
+    }
+
     pub async fn get_active_multipart_upload(
         &self,
         tenant_id: i64,
@@ -34,6 +58,27 @@ impl Persistence {
             bucket_id,
             key,
             upload_id,
+        )
+        .await
+    }
+
+    pub async fn get_active_multipart_upload_in_transaction(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        key: &str,
+        upload_id: uuid::Uuid,
+        transaction_id: &str,
+        transaction_principal: &str,
+    ) -> Result<Option<MultipartUpload>> {
+        multipart_journal::get_active_multipart_upload_in_transaction(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            key,
+            upload_id,
+            transaction_id,
+            transaction_principal,
         )
         .await
     }
@@ -66,11 +111,63 @@ impl Persistence {
         .await
     }
 
+    pub async fn upsert_multipart_part_in_transaction(
+        &self,
+        upload_row_id: i64,
+        part_number: i32,
+        object_ref: CoreObjectRef,
+        size: i64,
+        etag: &str,
+        transaction_id: &str,
+        transaction_principal: &str,
+    ) -> Result<MultipartUploadPartMutation> {
+        let (tenant_id, bucket_id) =
+            multipart_journal::find_multipart_upload_partition_in_transaction(
+                &self.storage,
+                upload_row_id,
+                transaction_id,
+                transaction_principal,
+            )
+            .await?
+            .ok_or_else(|| anyhow!("multipart upload not found"))?;
+        let permit = self
+            .multipart_metadata_write_permit(tenant_id, bucket_id)
+            .await?;
+        multipart_journal::upsert_multipart_part_with_permit_in_transaction(
+            &self.storage,
+            upload_row_id,
+            part_number,
+            object_ref,
+            size,
+            etag,
+            &permit,
+            &self.partition_owner_signing_key,
+            transaction_id,
+            transaction_principal,
+        )
+        .await
+    }
+
     pub async fn list_multipart_parts(
         &self,
         upload_row_id: i64,
     ) -> Result<Vec<MultipartUploadPart>> {
         multipart_journal::list_multipart_parts(&self.storage, upload_row_id).await
+    }
+
+    pub async fn list_multipart_parts_in_transaction(
+        &self,
+        upload_row_id: i64,
+        transaction_id: &str,
+        transaction_principal: &str,
+    ) -> Result<Vec<MultipartUploadPart>> {
+        multipart_journal::list_multipart_parts_in_transaction(
+            &self.storage,
+            upload_row_id,
+            transaction_id,
+            transaction_principal,
+        )
+        .await
     }
 
     pub async fn list_multipart_parts_page(
@@ -132,6 +229,40 @@ impl Persistence {
         .await
     }
 
+    pub async fn complete_multipart_upload_in_transaction(
+        &self,
+        upload_row_id: i64,
+        transaction_id: &str,
+        transaction_principal: &str,
+    ) -> Result<MultipartCompletionMutation> {
+        let Some((tenant_id, bucket_id)) =
+            multipart_journal::find_multipart_upload_partition_in_transaction(
+                &self.storage,
+                upload_row_id,
+                transaction_id,
+                transaction_principal,
+            )
+            .await?
+        else {
+            return Ok(MultipartCompletionMutation {
+                completed: false,
+                receipt: None,
+            });
+        };
+        let permit = self
+            .multipart_metadata_write_permit(tenant_id, bucket_id)
+            .await?;
+        multipart_journal::complete_multipart_upload_with_permit_in_transaction(
+            &self.storage,
+            upload_row_id,
+            &permit,
+            &self.partition_owner_signing_key,
+            transaction_id,
+            transaction_principal,
+        )
+        .await
+    }
+
     pub async fn abort_multipart_upload(
         &self,
         tenant_id: i64,
@@ -150,6 +281,32 @@ impl Persistence {
             upload_id,
             &permit,
             &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub async fn abort_multipart_upload_in_transaction(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        key: &str,
+        upload_id: uuid::Uuid,
+        transaction_id: &str,
+        transaction_principal: &str,
+    ) -> Result<MultipartAbortMutation> {
+        let permit = self
+            .multipart_metadata_write_permit(tenant_id, bucket_id)
+            .await?;
+        multipart_journal::abort_multipart_upload_with_permit_in_transaction(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            key,
+            upload_id,
+            &permit,
+            &self.partition_owner_signing_key,
+            transaction_id,
+            transaction_principal,
         )
         .await
     }
@@ -241,6 +398,32 @@ impl Persistence {
         .await
     }
 
+    pub async fn create_append_stream_in_transaction(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        bucket_name: &str,
+        stream_key: &str,
+        transaction_id: &str,
+        transaction_principal: &str,
+    ) -> Result<AppendStreamMutation> {
+        let permit = self
+            .append_metadata_write_permit(tenant_id, bucket_id)
+            .await?;
+        append_journal::create_append_stream_with_permit_in_transaction(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            bucket_name,
+            stream_key,
+            &permit,
+            &self.partition_owner_signing_key,
+            transaction_id,
+            transaction_principal,
+        )
+        .await
+    }
+
     pub async fn get_active_append_stream(
         &self,
         tenant_id: i64,
@@ -254,6 +437,27 @@ impl Persistence {
             bucket_id,
             stream_key,
             stream_id,
+        )
+        .await
+    }
+
+    pub async fn get_active_append_stream_in_transaction(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        stream_key: &str,
+        stream_id: uuid::Uuid,
+        transaction_id: &str,
+        transaction_principal: &str,
+    ) -> Result<Option<AppendStream>> {
+        append_journal::get_active_append_stream_in_transaction(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            stream_key,
+            stream_id,
+            transaction_id,
+            transaction_principal,
         )
         .await
     }
@@ -286,11 +490,62 @@ impl Persistence {
         .await
     }
 
+    pub async fn append_stream_record_in_transaction(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        stream_row_id: i64,
+        payload_object_ref: CoreObjectRef,
+        payload_size: i64,
+        content_type: Option<String>,
+        user_meta: Option<JsonValue>,
+        transaction_id: &str,
+        transaction_principal: &str,
+    ) -> Result<AppendStreamRecordMutation> {
+        let permit = self
+            .append_metadata_write_permit(tenant_id, bucket_id)
+            .await?;
+        append_journal::append_stream_record_with_permit_in_partition_transaction(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            stream_row_id,
+            payload_object_ref,
+            payload_size,
+            content_type,
+            user_meta,
+            &permit,
+            &self.partition_owner_signing_key,
+            transaction_id,
+            transaction_principal,
+        )
+        .await
+    }
+
     pub async fn list_append_stream_records(
         &self,
         stream_row_id: i64,
     ) -> Result<Vec<AppendStreamRecord>> {
         append_journal::list_append_stream_records(&self.storage, stream_row_id).await
+    }
+
+    pub async fn list_append_stream_records_in_transaction(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        stream_row_id: i64,
+        transaction_id: &str,
+        transaction_principal: &str,
+    ) -> Result<Vec<AppendStreamRecord>> {
+        append_journal::list_append_stream_records_in_transaction(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            stream_row_id,
+            transaction_id,
+            transaction_principal,
+        )
+        .await
     }
 
     pub async fn list_append_stream_records_for_bucket(
@@ -328,6 +583,32 @@ impl Persistence {
         .await
     }
 
+    pub async fn seal_append_stream_in_transaction(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        stream_row_id: i64,
+        segment_hash: &str,
+        transaction_id: &str,
+        transaction_principal: &str,
+    ) -> Result<SealAppendStreamMutation> {
+        let permit = self
+            .append_metadata_write_permit(tenant_id, bucket_id)
+            .await?;
+        append_journal::seal_append_stream_with_permit_in_partition_transaction(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            stream_row_id,
+            segment_hash,
+            &permit,
+            &self.partition_owner_signing_key,
+            transaction_id,
+            transaction_principal,
+        )
+        .await
+    }
+
     pub async fn compare_and_swap_manifest(
         &self,
         tenant_id: i64,
@@ -349,6 +630,35 @@ impl Persistence {
             manifest_hash,
             &permit,
             &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub async fn compare_and_swap_manifest_in_transaction(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        _bucket_name: &str,
+        object_key: &str,
+        expected_revision: i64,
+        manifest: JsonValue,
+        manifest_hash: &str,
+        transaction_id: &str,
+        transaction_principal: &str,
+    ) -> Result<Option<ManifestCasResult>> {
+        let permit = self.manifest_cas_write_permit(tenant_id, bucket_id).await?;
+        manifest_journal::compare_and_swap_manifest_with_permit_in_transaction(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            object_key,
+            expected_revision,
+            manifest,
+            manifest_hash,
+            &permit,
+            &self.partition_owner_signing_key,
+            transaction_id,
+            transaction_principal,
         )
         .await
     }

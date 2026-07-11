@@ -2,15 +2,16 @@ use crate::anvil_api::{ModelManifest, TensorIndexRow};
 use crate::core_store::{
     CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreStore, ReadStream,
 };
-use crate::formats::{Hash32, JournalFrame, JournalRecordKind, hash32, validate_journal_chain};
-use crate::partition_fence::{PartitionWritePermit, partition_write_ref_precondition};
+use crate::formats::{Hash32, hash32};
+use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
 use crate::storage::Storage;
 use anyhow::{Result, anyhow};
-use serde::{Deserialize, Serialize};
+use prost::{Message, Oneof};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
+const MODEL_METADATA_BODY_SCHEMA: &str = "anvil.core.model_metadata.v1";
+
+#[derive(Debug, Clone)]
 enum ModelEventBody {
     ArtifactUpsert {
         artifact_id: String,
@@ -22,6 +23,50 @@ enum ModelEventBody {
         artifact_id: String,
         tensors: Vec<TensorIndexRow>,
     },
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ModelEventBodyProto {
+    #[prost(string, tag = "1")]
+    schema: String,
+    #[prost(uint64, tag = "2")]
+    fence_token: u64,
+    #[prost(string, tag = "3")]
+    mutation_id: String,
+    #[prost(oneof = "model_event_body_proto::Event", tags = "10, 11")]
+    event: Option<model_event_body_proto::Event>,
+}
+
+mod model_event_body_proto {
+    use super::*;
+
+    #[derive(Clone, PartialEq, Oneof)]
+    pub(super) enum Event {
+        #[prost(message, tag = "10")]
+        ArtifactUpsert(super::ModelArtifactUpsertProto),
+        #[prost(message, tag = "11")]
+        TensorsReplace(super::ModelTensorsReplaceProto),
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ModelArtifactUpsertProto {
+    #[prost(string, tag = "1")]
+    artifact_id: String,
+    #[prost(int64, tag = "2")]
+    bucket_id: i64,
+    #[prost(string, tag = "3")]
+    key: String,
+    #[prost(message, optional, tag = "4")]
+    manifest: Option<ModelManifest>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ModelTensorsReplaceProto {
+    #[prost(string, tag = "1")]
+    artifact_id: String,
+    #[prost(message, repeated, tag = "2")]
+    tensors: Vec<TensorIndexRow>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -181,14 +226,10 @@ pub async fn get_model_artifact(
 }
 
 async fn read_model_state(storage: &Storage) -> Result<ModelState> {
-    let frames = read_model_journal_frames(storage).await?;
+    let events = read_model_events(storage).await?;
     let mut state = ModelState::default();
-    for frame in frames {
-        if frame.record_kind != JournalRecordKind::ModelMetadata {
-            continue;
-        }
-        let body: ModelEventBody = serde_json::from_slice(&frame.body)?;
-        match body {
+    for event in events {
+        match event {
             ModelEventBody::ArtifactUpsert {
                 artifact_id,
                 manifest,
@@ -214,28 +255,8 @@ async fn append_model_event(
     partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    let previous = read_model_journal_frames_from_store(&core_store)
-        .await
-        .unwrap_or_default();
-    let sequence = previous
-        .last()
-        .map(|frame| frame.partition_sequence + 1)
-        .unwrap_or(1);
-    let previous_hash = previous
-        .last()
-        .map(|frame| frame.record_hash)
-        .unwrap_or([0; 32]);
     let mutation_id = uuid::Uuid::new_v4();
-    let key_hash = event_key_hash(&event);
-    let frame = JournalFrame::new(
-        JournalRecordKind::ModelMetadata,
-        sequence,
-        fence_token,
-        *mutation_id.as_bytes(),
-        key_hash,
-        previous_hash,
-        serde_json::to_vec(&event)?,
-    );
+    let payload = encode_model_event_body(&event, fence_token, mutation_id)?;
     let partition_id = hex::encode(model_partition_id());
     core_store
         .commit_mutation_batch(CoreMutationBatch {
@@ -247,7 +268,7 @@ async fn append_model_event(
                 partition_id,
                 stream_id: model_metadata_stream_id(),
                 record_kind: "model_metadata".to_string(),
-                payload: frame.encode(),
+                payload,
                 idempotency_key: Some(format!("model-metadata:{mutation_id}")),
             }],
         })
@@ -255,12 +276,8 @@ async fn append_model_event(
     Ok(())
 }
 
-async fn read_model_journal_frames(storage: &Storage) -> Result<Vec<JournalFrame>> {
+async fn read_model_events(storage: &Storage) -> Result<Vec<ModelEventBody>> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    read_model_journal_frames_from_store(&core_store).await
-}
-
-async fn read_model_journal_frames_from_store(core_store: &CoreStore) -> Result<Vec<JournalFrame>> {
     let records = core_store
         .read_stream(ReadStream {
             stream_id: model_metadata_stream_id(),
@@ -268,27 +285,113 @@ async fn read_model_journal_frames_from_store(core_store: &CoreStore) -> Result<
             limit: 0,
         })
         .await?;
-    let mut frames = Vec::new();
-    for record in records {
-        if record.record_kind != "model_metadata" {
-            continue;
-        }
-        frames.push(JournalFrame::decode(&record.payload)?);
-    }
-    validate_journal_chain(&frames)?;
-    Ok(frames)
-}
-
-fn event_key_hash(event: &ModelEventBody) -> Hash32 {
-    let artifact_id = match event {
-        ModelEventBody::ArtifactUpsert { artifact_id, .. }
-        | ModelEventBody::TensorsReplace { artifact_id, .. } => artifact_id,
-    };
-    hash32(format!("model\0{artifact_id}").as_bytes())
+    records
+        .into_iter()
+        .filter(|record| record.record_kind == "model_metadata")
+        .map(|record| decode_model_event_body(&record.payload))
+        .collect()
 }
 
 pub fn model_partition_id() -> Hash32 {
     hash32(b"model_metadata/global")
+}
+
+fn encode_model_event_body(
+    event: &ModelEventBody,
+    fence_token: u64,
+    mutation_id: uuid::Uuid,
+) -> Result<Vec<u8>> {
+    let proto = match event {
+        ModelEventBody::ArtifactUpsert {
+            artifact_id,
+            bucket_id,
+            key,
+            manifest,
+        } => ModelEventBodyProto {
+            schema: MODEL_METADATA_BODY_SCHEMA.to_string(),
+            fence_token,
+            mutation_id: mutation_id.to_string(),
+            event: Some(model_event_body_proto::Event::ArtifactUpsert(
+                ModelArtifactUpsertProto {
+                    artifact_id: artifact_id.clone(),
+                    bucket_id: *bucket_id,
+                    key: key.clone(),
+                    manifest: Some(manifest.clone()),
+                },
+            )),
+        },
+        ModelEventBody::TensorsReplace {
+            artifact_id,
+            tensors,
+        } => ModelEventBodyProto {
+            schema: MODEL_METADATA_BODY_SCHEMA.to_string(),
+            fence_token,
+            mutation_id: mutation_id.to_string(),
+            event: Some(model_event_body_proto::Event::TensorsReplace(
+                ModelTensorsReplaceProto {
+                    artifact_id: artifact_id.clone(),
+                    tensors: tensors.clone(),
+                },
+            )),
+        },
+    };
+    encode_deterministic_proto(&proto)
+}
+
+fn decode_model_event_body(bytes: &[u8]) -> Result<ModelEventBody> {
+    let proto = ModelEventBodyProto::decode(bytes)?;
+    ensure_deterministic_proto(&proto, bytes, "model metadata body")?;
+    if proto.schema != MODEL_METADATA_BODY_SCHEMA {
+        return Err(anyhow!("model metadata body has invalid schema"));
+    }
+    let _mutation_id = uuid::Uuid::parse_str(&proto.mutation_id)
+        .map_err(|_| anyhow!("model metadata body has invalid mutation id"))?;
+    Ok(
+        match proto
+            .event
+            .ok_or_else(|| anyhow!("model metadata body is missing event"))?
+        {
+            model_event_body_proto::Event::ArtifactUpsert(value) => {
+                ModelEventBody::ArtifactUpsert {
+                    artifact_id: value.artifact_id,
+                    bucket_id: value.bucket_id,
+                    key: value.key,
+                    manifest: value.manifest.ok_or_else(|| {
+                        anyhow!("model metadata artifact body is missing manifest")
+                    })?,
+                }
+            }
+            model_event_body_proto::Event::TensorsReplace(value) => {
+                ModelEventBody::TensorsReplace {
+                    artifact_id: value.artifact_id,
+                    tensors: value.tensors,
+                }
+            }
+        },
+    )
+}
+
+#[cfg(test)]
+fn decode_model_event_body_fence(bytes: &[u8]) -> Result<u64> {
+    let proto = ModelEventBodyProto::decode(bytes)?;
+    ensure_deterministic_proto(&proto, bytes, "model metadata body")?;
+    if proto.schema != MODEL_METADATA_BODY_SCHEMA {
+        return Err(anyhow!("model metadata body has invalid schema"));
+    }
+    Ok(proto.fence_token)
+}
+
+fn encode_deterministic_proto(message: &impl Message) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(message.encoded_len());
+    message.encode(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn ensure_deterministic_proto(message: &impl Message, bytes: &[u8], label: &str) -> Result<()> {
+    if encode_deterministic_proto(message)? != bytes {
+        return Err(anyhow!("{label} is not deterministically encoded"));
+    }
+    Ok(())
 }
 
 fn model_metadata_stream_id() -> String {
@@ -301,11 +404,18 @@ fn model_partition_principal() -> String {
 
 #[cfg(test)]
 pub(crate) async fn read_model_frame_fences_for_test(storage: &Storage) -> Result<Vec<u64>> {
-    Ok(read_model_journal_frames(storage)
+    let core_store = CoreStore::new(storage.clone()).await?;
+    Ok(core_store
+        .read_stream(ReadStream {
+            stream_id: model_metadata_stream_id(),
+            after_sequence: 0,
+            limit: 0,
+        })
         .await?
         .into_iter()
-        .map(|frame| frame.fence_token)
-        .collect())
+        .filter(|record| record.record_kind == "model_metadata")
+        .map(|record| decode_model_event_body_fence(&record.payload))
+        .collect::<Result<Vec<_>>>()?)
 }
 
 async fn model_write_precondition(
@@ -314,7 +424,7 @@ async fn model_write_precondition(
     partition_owner_signing_key: &[u8],
 ) -> Result<CoreMutationPrecondition> {
     require_model_permit(permit)?;
-    Ok(partition_write_ref_precondition(storage, permit, partition_owner_signing_key).await?)
+    Ok(partition_write_precondition(storage, permit, partition_owner_signing_key).await?)
 }
 
 fn require_model_permit(permit: &PartitionWritePermit) -> Result<()> {
@@ -431,13 +541,9 @@ mod tests {
             .await
             .unwrap();
 
-        let frames = read_model_journal_frames(&storage).await.unwrap();
-        assert_eq!(frames.len(), 2);
-        assert!(
-            frames
-                .iter()
-                .all(|frame| frame.fence_token == permit.fence_token)
-        );
+        let fences = read_model_frame_fences_for_test(&storage).await.unwrap();
+        assert_eq!(fences.len(), 2);
+        assert!(fences.iter().all(|fence| *fence == permit.fence_token));
     }
 
     #[tokio::test]
@@ -472,7 +578,7 @@ mod tests {
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, "node-a").await;
         let stale_permit = owner.write_permit().unwrap();
-        let stale_precondition = partition_write_ref_precondition(&storage, &stale_permit, KEY)
+        let stale_precondition = partition_write_precondition(&storage, &stale_permit, KEY)
             .await
             .unwrap();
         let newer = ready_owner(&storage, "node-b").await;
@@ -517,15 +623,11 @@ mod tests {
             .await
             .unwrap();
 
-        for path in core_stream_paths_for_test(&storage, &model_metadata_stream_id()) {
-            let mut bytes = tokio::fs::read(&path).await.unwrap();
-            let body_start = bytes
-                .iter()
-                .position(|byte| *byte != b'\n')
-                .expect("stream has bytes");
-            bytes[body_start] ^= 0x55;
-            tokio::fs::write(&path, bytes).await.unwrap();
-        }
+        CoreStore::new(storage.clone())
+            .await
+            .unwrap()
+            .corrupt_stream_record_payload_for_test(&model_metadata_stream_id(), 1)
+            .unwrap();
 
         let err = get_model_artifact(&storage, "artifact-a")
             .await
@@ -566,22 +668,5 @@ mod tests {
         )
         .await
         .unwrap()
-    }
-
-    fn core_stream_paths_for_test(storage: &Storage, stream_id: &str) -> Vec<std::path::PathBuf> {
-        use sha2::{Digest, Sha256};
-
-        let mut hasher = Sha256::new();
-        hasher.update(stream_id.as_bytes());
-        let file_name = format!("{}.anstream", hex::encode(hasher.finalize()));
-        (1..=3)
-            .map(|index| {
-                storage
-                    .core_store_replica_path(&format!("local-control-node-{index}"))
-                    .join("streams")
-                    .join("data")
-                    .join(&file_name)
-            })
-            .collect()
     }
 }

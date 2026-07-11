@@ -1,22 +1,31 @@
 use crate::{
     core_store::{
-        CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
-        WriteLogicalFileRequest,
+        CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
+        core_object_ref_from_logical_file_write,
     },
     formats::{
-        BinaryEnvelopeHeader, BinaryFileFooter, COMMON_FOOTER_LEN, COMMON_HEADER_LEN, FileFamily,
-        Hash32,
+        FileFamily, Hash32, decode_writer_segment, encode_writer_segment_header,
         git::{GitHashAlgorithm, GitSourceRecord},
-        hash32,
+        hash32, header_field_string, required_header_string, single_body_range_index,
+        table::{TableRow, WriterBodyTable, decode_writer_body_tables, encode_writer_body_tables},
+        unix_nanos_from_rfc3339,
+        writer::{
+            WriterBuildOutput, WriterFamily, WriterSegmentBuildInput,
+            build_writer_segment_logical_file, canonical_logical_file_id,
+        },
     },
     storage::Storage,
+    writer_segment_catalog::{
+        WriterSegmentCatalogRecord, latest_writer_segment_catalog_record,
+        read_writer_segment_catalog_record, write_writer_segment_catalog_record,
+    },
 };
 use anyhow::{Result, anyhow};
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 const GIT_SOURCE_INDEX_REF_PREFIX: &str = "git_source_index:";
-const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
+const GIT_SOURCE_INDEX_CATALOG_FAMILY: &str = "git_source_index";
+const TABLE_GIT_SOURCE_RECORD: u16 = 0x0901;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GitSourceIndexHeader {
@@ -53,14 +62,21 @@ pub async fn write_git_source_index(
     let mut records = input.records.to_vec();
     ensure_record_algorithms(input.hash_algorithm, &records)?;
     records.sort_by(compare_git_source_records);
-    let body = encode_git_source_body(&records);
+    let body = encode_git_source_body(&records)?;
     let source_hash = hex::encode(input.source_hash);
+    let segment_hash = hash32(&body);
     let ref_name = git_source_index_ref_name(
         input.tenant_id,
         input.repository_id,
         input.generation,
         &source_hash,
     )?;
+    let logical_file_id = canonical_logical_file_id(
+        WriterFamily::GitSource,
+        input.generation,
+        &ref_name,
+        &segment_hash,
+    );
 
     let header = GitSourceIndexHeader {
         tenant_id: input.tenant_id.to_string(),
@@ -69,57 +85,60 @@ pub async fn write_git_source_index(
         source_hash,
         hash_algorithm: hash_algorithm_name(input.hash_algorithm).to_string(),
         key_order: "repository_commit_tree_path_object".to_string(),
-        codec: "none".to_string(),
+        codec: "writer-body-table-v1".to_string(),
         created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
     };
-    let header_json = serde_json::to_vec(&header)?;
-    let envelope = BinaryEnvelopeHeader::new(FileFamily::GitSourceIndex, 0, 0, header_json);
-    let encoded_header = envelope.encode();
     let (first_hash, last_hash) = record_hash_bounds(&records);
-    let footer = BinaryFileFooter::new(
-        &encoded_header,
-        &body,
-        records.len() as u64,
-        first_hash,
-        last_hash,
-    );
-
-    let mut bytes = Vec::with_capacity(encoded_header.len() + body.len() + COMMON_FOOTER_LEN);
-    bytes.extend_from_slice(&encoded_header);
-    bytes.extend_from_slice(&body);
-    bytes.extend_from_slice(&footer.encode());
+    let header_proto = encode_git_source_header_proto(&logical_file_id, &header);
+    let range_index =
+        single_body_range_index(body.len(), records.len() as u64, first_hash, last_hash)?;
+    let built_segment = build_writer_segment_logical_file(WriterSegmentBuildInput {
+        file_family: FileFamily::GitSourceIndex,
+        writer_family: WriterFamily::GitSource,
+        writer_generation: input.generation,
+        logical_file_id,
+        header_proto,
+        body,
+        range_index,
+        record_count: records.len() as u64,
+        first_record_hash: first_hash,
+        last_record_hash: last_hash,
+        boundary_values: Vec::new(),
+        mutation_id: format!(
+            "git-source-index:{}:{}:{}",
+            input.tenant_id, input.repository_id, input.generation
+        ),
+        region_id: "local".to_string(),
+        pipeline_policy: CorePipelinePolicy::default(),
+        trace_context: CoreTraceContext::default(),
+    })?;
     let store = CoreStore::new(storage.clone()).await?;
-    let object_ref = store
-        .write_logical_file_ref(WriteLogicalFileRequest {
-            writer_family: "git_source".to_string(),
+    let receipt = store
+        .write_format_build_output(WriterBuildOutput {
+            logical_files: vec![built_segment.logical_file],
+            core_meta_mutations: Vec::new(),
+        })
+        .await?;
+    let written = receipt
+        .written_logical_files
+        .first()
+        .ok_or_else(|| anyhow!("CoreFormatWriter returned no git source logical file"))?;
+    let object_ref = core_object_ref_from_logical_file_write(written);
+    write_writer_segment_catalog_record(
+        storage,
+        &WriterSegmentCatalogRecord {
+            family: GIT_SOURCE_INDEX_CATALOG_FAMILY.to_string(),
+            scope: git_source_index_scope(input.tenant_id, input.repository_id)?,
+            segment_ref: ref_name.clone(),
+            core_object_ref_target: encode_core_object_ref_target(&object_ref)?,
+            segment_hash: hex::encode(segment_hash),
+            segment_length: written.manifest.logical_size,
             generation: input.generation,
-            logical_file_id: ref_name.clone(),
-            source: bytes,
-            range_hints: Vec::new(),
-            pipeline_policy: CorePipelinePolicy::default(),
-            trace_context: CoreTraceContext::default(),
-            boundary_values: Vec::new(),
-            mutation_id: format!(
-                "git-source-index:{}:{}:{}",
-                input.tenant_id, input.repository_id, input.generation
-            ),
-            region_id: "local".to_string(),
-        })
-        .await?;
-    store
-        .compare_and_swap_ref(CompareAndSwapRef {
-            ref_name: ref_name.clone(),
-            expected_generation: None,
-            expected_target: None,
-            require_absent: true,
-            require_present: false,
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-            new_target: encode_core_object_ref_target(&object_ref)?,
-            transaction_id: None,
-        })
-        .await?;
+            source_cursor: input.generation,
+            created_at_unix_nanos: unix_nanos_from_rfc3339(&header.created_at),
+        },
+    )
+    .await?;
     Ok(ref_name)
 }
 
@@ -127,28 +146,23 @@ pub async fn read_git_source_index(
     storage: &Storage,
     index_ref: &str,
 ) -> Result<DecodedGitSourceIndex> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let ref_value = store
-        .read_ref(index_ref)
-        .await?
-        .ok_or_else(|| anyhow!("git source index ref is missing"))?;
-    let bytes = store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
-        })
-        .await?;
+    let bytes = read_git_source_index_bytes(storage, index_ref).await?;
     decode_git_source_index(&bytes)
 }
 
 pub async fn read_git_source_index_bytes(storage: &Storage, index_ref: &str) -> Result<Vec<u8>> {
+    let parsed = parse_git_source_index_ref(index_ref)?;
+    let record = read_writer_segment_catalog_record(
+        storage,
+        GIT_SOURCE_INDEX_CATALOG_FAMILY,
+        &git_source_index_scope(parsed.tenant_id, &parsed.repository_id)?,
+        index_ref,
+    )?
+    .ok_or_else(|| anyhow!("git source index catalog row is missing"))?;
     let store = CoreStore::new(storage.clone()).await?;
-    let ref_value = store
-        .read_ref(index_ref)
-        .await?
-        .ok_or_else(|| anyhow!("git source index ref is missing"))?;
     store
         .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+            object_ref: decode_core_object_ref_target(&record.core_object_ref_target)?,
         })
         .await
 }
@@ -158,63 +172,112 @@ pub async fn latest_git_source_index_ref(
     tenant_id: i64,
     repository_id: &str,
 ) -> Result<Option<String>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let mut refs = store
-        .list_ref_names(&git_source_index_ref_prefix(tenant_id, repository_id)?)
-        .await?;
-    refs.sort_by_key(|value| generation_from_ref(value).unwrap_or(0));
-    Ok(refs.pop())
+    Ok(latest_writer_segment_catalog_record(
+        storage,
+        GIT_SOURCE_INDEX_CATALOG_FAMILY,
+        &git_source_index_scope(tenant_id, repository_id)?,
+    )?
+    .map(|record| record.segment_ref))
 }
 
 pub fn decode_git_source_index(bytes: &[u8]) -> Result<DecodedGitSourceIndex> {
-    let envelope = BinaryEnvelopeHeader::decode(bytes)?;
-    if envelope.family != FileFamily::GitSourceIndex {
-        return Err(anyhow!("git source index file family mismatch"));
-    }
-    if bytes.len() < COMMON_FOOTER_LEN {
-        return Err(anyhow!("git source index is shorter than footer"));
-    }
-    let header_end = COMMON_HEADER_LEN
-        .checked_add(envelope.header_json.len())
-        .ok_or_else(|| anyhow!("git source index header length overflow"))?;
-    let footer_start = bytes
-        .len()
-        .checked_sub(COMMON_FOOTER_LEN)
-        .ok_or_else(|| anyhow!("git source index footer length overflow"))?;
-    if footer_start < header_end {
-        return Err(anyhow!("git source index body overlaps header"));
-    }
-    let encoded_header = &bytes[..header_end];
-    let body = &bytes[header_end..footer_start];
-    let footer = BinaryFileFooter::decode(&bytes[footer_start..])?;
-    footer.verify(encoded_header, body)?;
-    let header: GitSourceIndexHeader = serde_json::from_slice(&envelope.header_json)?;
+    let segment = decode_writer_segment(bytes, FileFamily::GitSourceIndex)?;
+    let header = decode_git_source_header_proto(&segment.header)?;
     let hash_algorithm = parse_hash_algorithm(&header.hash_algorithm)?;
-    let records = decode_git_source_body(body, hash_algorithm)?;
+    let records = decode_git_source_body(segment.body, hash_algorithm)?;
     ensure_sorted(&records)?;
     Ok(DecodedGitSourceIndex { header, records })
 }
 
-fn encode_git_source_body(records: &[GitSourceRecord]) -> Vec<u8> {
-    let len = records.iter().map(|record| record.encode().len()).sum();
-    let mut out = Vec::with_capacity(len);
-    for record in records {
-        out.extend_from_slice(&record.encode());
-    }
-    out
+fn encode_git_source_header_proto(logical_file_id: &str, header: &GitSourceIndexHeader) -> Vec<u8> {
+    encode_writer_segment_header(
+        "anvil.git.source_index_header.v1",
+        logical_file_id,
+        FileFamily::GitSourceIndex,
+        header.generation,
+        None,
+        None,
+        unix_nanos_from_rfc3339(&header.created_at),
+        vec![
+            header_field_string("tenant_id", header.tenant_id.clone()),
+            header_field_string("repository_id", header.repository_id.clone()),
+            header_field_string("source_hash", header.source_hash.clone()),
+            header_field_string("hash_algorithm", header.hash_algorithm.clone()),
+            header_field_string("key_order", header.key_order.clone()),
+            header_field_string("codec", header.codec.clone()),
+            header_field_string("created_at", header.created_at.clone()),
+        ],
+    )
+}
+
+fn decode_git_source_header_proto(
+    header: &crate::formats::WriterSegmentHeaderProto,
+) -> Result<GitSourceIndexHeader> {
+    Ok(GitSourceIndexHeader {
+        tenant_id: required_header_string(header, "tenant_id")?,
+        repository_id: required_header_string(header, "repository_id")?,
+        generation: header.writer_generation,
+        source_hash: required_header_string(header, "source_hash")?,
+        hash_algorithm: required_header_string(header, "hash_algorithm")?,
+        key_order: required_header_string(header, "key_order")?,
+        codec: required_header_string(header, "codec")?,
+        created_at: required_header_string(header, "created_at")?,
+    })
+}
+
+fn encode_git_source_body(records: &[GitSourceRecord]) -> Result<Vec<u8>> {
+    let rows = records
+        .iter()
+        .map(|record| TableRow {
+            key: git_source_record_key(record),
+            value: record.encode(),
+        })
+        .collect::<Vec<_>>();
+    encode_writer_body_tables(&[WriterBodyTable {
+        table_id: TABLE_GIT_SOURCE_RECORD,
+        row_type_id: TABLE_GIT_SOURCE_RECORD,
+        rows,
+    }])
+    .map_err(anyhow::Error::from)
 }
 
 fn decode_git_source_body(
-    mut input: &[u8],
+    input: &[u8],
     hash_algorithm: GitHashAlgorithm,
 ) -> Result<Vec<GitSourceRecord>> {
     let mut records = Vec::new();
-    while !input.is_empty() {
-        let (record, used) = GitSourceRecord::decode(input, hash_algorithm)?;
-        records.push(record);
-        input = &input[used..];
+    for table in decode_writer_body_tables(input)? {
+        if table.table_id != TABLE_GIT_SOURCE_RECORD {
+            return Err(anyhow!(
+                "git source index contains unexpected table {:04x}",
+                table.table_id
+            ));
+        }
+        for row in table.rows {
+            let (record, used) = GitSourceRecord::decode(&row.value, hash_algorithm)?;
+            if used != row.value.len() {
+                return Err(anyhow!("git source index row has trailing bytes"));
+            }
+            if row.key != git_source_record_key(&record) {
+                return Err(anyhow!(
+                    "git source index row key does not match encoded record"
+                ));
+            }
+            records.push(record);
+        }
     }
     Ok(records)
+}
+
+fn git_source_record_key(record: &GitSourceRecord) -> Vec<u8> {
+    let mut key = Vec::new();
+    key.extend_from_slice(&record.repository_id);
+    key.push(0);
+    key.extend_from_slice(&record.commit_id);
+    key.push(0);
+    key.extend_from_slice(&hash32(&record.tree_path));
+    key.extend_from_slice(&record.object_id);
+    key
 }
 
 fn ensure_record_algorithms(
@@ -290,6 +353,51 @@ fn git_source_index_ref_prefix(tenant_id: i64, repository_id: &str) -> Result<St
     ))
 }
 
+#[derive(Debug, Clone)]
+struct ParsedGitSourceIndexRef {
+    tenant_id: i64,
+    repository_id: String,
+}
+
+fn parse_git_source_index_ref(index_ref: &str) -> Result<ParsedGitSourceIndexRef> {
+    let parts = index_ref.split(':').collect::<Vec<_>>();
+    if parts.len() != 9
+        || parts[0] != "git_source_index"
+        || parts[1] != "tenant"
+        || parts[3] != "repository"
+        || parts[5] != "generation"
+        || parts[7] != "source"
+    {
+        return Err(anyhow!("git source index ref is malformed"));
+    }
+    let tenant_id = parts[2]
+        .parse::<i64>()
+        .map_err(|_| anyhow!("git source index ref tenant id is invalid"))?;
+    let generation = parts[6]
+        .parse::<u64>()
+        .map_err(|_| anyhow!("git source index ref generation is invalid"))?;
+    if tenant_id <= 0 {
+        return Err(anyhow!("git source index ref tenant id must be positive"));
+    }
+    if generation == 0 {
+        return Err(anyhow!("git source index ref generation must be positive"));
+    }
+    require_safe_component(parts[4], "git repository id")?;
+    validate_hex32(parts[8], "git source hash")?;
+    Ok(ParsedGitSourceIndexRef {
+        tenant_id,
+        repository_id: parts[4].to_string(),
+    })
+}
+
+fn git_source_index_scope(tenant_id: i64, repository_id: &str) -> Result<String> {
+    if tenant_id <= 0 {
+        return Err(anyhow!("git source index tenant id must be positive"));
+    }
+    require_safe_component(repository_id, "git repository id")?;
+    Ok(format!("tenant/{tenant_id}/repository/{repository_id}"))
+}
+
 fn git_source_index_ref_name(
     tenant_id: i64,
     repository_id: &str,
@@ -301,16 +409,6 @@ fn git_source_index_ref_name(
         "{}generation:{generation:020}:source:{source_hash}",
         git_source_index_ref_prefix(tenant_id, repository_id)?
     ))
-}
-
-fn generation_from_ref(ref_name: &str) -> Option<u64> {
-    ref_name
-        .rsplit_once(":generation:")?
-        .1
-        .split(':')
-        .next()?
-        .parse()
-        .ok()
 }
 
 fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
@@ -335,19 +433,11 @@ fn require_safe_component(value: &str, field: &'static str) -> Result<()> {
 }
 
 fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
-    Ok(format!(
-        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
-    ))
+    crate::core_store::encode_core_object_ref_target(object_ref)
 }
 
 fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
-    let encoded = target
-        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
-        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
-    Ok(serde_json::from_slice(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded)?,
-    )?)
+    crate::core_store::decode_core_object_ref_target(target)
 }
 
 #[cfg(test)]
@@ -421,7 +511,7 @@ mod tests {
         let mut bytes = read_git_source_index_bytes(&storage, &index_ref)
             .await
             .unwrap();
-        bytes[COMMON_HEADER_LEN + 1] ^= 1;
+        bytes[crate::formats::WRITER_SEGMENT_FIXED_HEADER_LEN + 1] ^= 1;
         assert!(decode_git_source_index(&bytes).is_err());
     }
 

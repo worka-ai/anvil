@@ -1,8 +1,9 @@
 use crate::{
     formats::{Hash32, hash32, personaldb::PersonalDbLogRecord},
     personaldb_commit_store::{
-        read_personaldb_changeset_payload_by_index, read_personaldb_changeset_payload_ref,
-        read_personaldb_commit_certificate, read_personaldb_commit_certificate_ref,
+        decode_commit_certificate, read_personaldb_changeset_payload_by_index,
+        read_personaldb_changeset_payload_ref, read_personaldb_commit_certificate,
+        read_personaldb_commit_certificate_ref,
     },
     personaldb_control::PersonalDbCommitCertificate,
     personaldb_heads::{
@@ -398,14 +399,13 @@ async fn verify_record_certificate(
     record: &PersonalDbLogRecord,
     signing_key: &[u8],
 ) -> std::result::Result<(), PersonalDbLogChainRepairReason> {
-    let certificate = if !record.inline_certificate_json.is_empty() {
-        serde_json::from_slice::<PersonalDbCommitCertificate>(&record.inline_certificate_json)
-            .map_err(
-                |err| PersonalDbLogChainRepairReason::InvalidCommitCertificate {
-                    log_index: record.log_index,
-                    message: err.to_string(),
-                },
-            )?
+    let certificate = if !record.inline_certificate_bytes.is_empty() {
+        decode_commit_certificate(&record.inline_certificate_bytes).map_err(|err| {
+            PersonalDbLogChainRepairReason::InvalidCommitCertificate {
+                log_index: record.log_index,
+                message: err.to_string(),
+            }
+        })?
     } else if !record.certificate_ref.is_empty() {
         let certificate_ref = std::str::from_utf8(&record.certificate_ref).map_err(|err| {
             PersonalDbLogChainRepairReason::InvalidCommitCertificate {
@@ -742,11 +742,11 @@ fn hex32(value: &str) -> Result<Hash32> {
 mod tests {
     use super::*;
     use crate::{
-        core_store::CoreStore,
         personaldb_commit_store::{
             write_personaldb_changeset_payload, write_personaldb_commit_certificate,
         },
         personaldb_control::{PersonalDbCommitCertificate, PersonalDbGroupManifest},
+        personaldb_coremeta::delete_personaldb_data_locator_row,
         personaldb_heads::{
             PersonalDbCommittedHead, write_personaldb_committed_head,
             write_personaldb_group_manifest,
@@ -772,12 +772,15 @@ mod tests {
     #[tokio::test]
     async fn missing_payload_requires_operator_review() {
         let fixture = Fixture::create().await;
-        CoreStore::new(fixture.storage.clone())
-            .await
-            .unwrap()
-            .delete_ref(&fixture.payload_ref, None, None, true)
-            .await
-            .unwrap();
+        delete_personaldb_data_locator_row(
+            &fixture.storage,
+            7,
+            "db-alpha",
+            &fixture.payload_ref,
+            "test-delete-payload-locator",
+        )
+        .await
+        .unwrap();
 
         let report = repair_personaldb_log_chain(&fixture.storage, 7, "db-alpha", 9, KEY, KEY)
             .await
@@ -795,12 +798,15 @@ mod tests {
     #[tokio::test]
     async fn missing_certificate_requires_operator_review() {
         let fixture = Fixture::create().await;
-        CoreStore::new(fixture.storage.clone())
-            .await
-            .unwrap()
-            .delete_ref(&fixture.certificate_ref, None, None, true)
-            .await
-            .unwrap();
+        delete_personaldb_data_locator_row(
+            &fixture.storage,
+            7,
+            "db-alpha",
+            &fixture.certificate_ref,
+            "test-delete-certificate-locator",
+        )
+        .await
+        .unwrap();
 
         let report = repair_personaldb_log_chain(&fixture.storage, 7, "db-alpha", 9, KEY, KEY)
             .await
@@ -933,7 +939,7 @@ mod tests {
                 database_id: "db-alpha".to_string(),
                 log_index: 1,
                 log_hash: hex::encode(record.entry_hash),
-                segment_path: segment_ref,
+                segment_ref: segment_ref,
                 row_index_generation: 0,
                 policy_epoch: 1,
                 membership_epoch: 1,

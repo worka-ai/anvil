@@ -219,7 +219,7 @@ async fn handle_hf_ingestion(
             .ok_or_else(|| anyhow!("ingestion job not found"))?;
         let key_id = job.key_id;
         let tenant_id = job.tenant_id;
-        let _requester_app_id = job.requester_app_id;
+        let requester_app_id = job.requester_app_id;
         let repo_str = job.repo;
         let revision = job.revision;
         let target_bucket = job.target_bucket;
@@ -227,6 +227,12 @@ async fn handle_hf_ingestion(
         let target_prefix = job.target_prefix;
         let include_globs = job.include_globs;
         let exclude_globs = job.exclude_globs;
+        let requester_claims = crate::auth::Claims {
+            sub: requester_app_id.to_string(),
+            exp: usize::MAX,
+            tenant_id,
+            jti: None,
+        };
         info!(
             repo = %repo_str,
             revision = %revision,
@@ -241,6 +247,7 @@ async fn handle_hf_ingestion(
         let token = String::from_utf8(token_bytes)?;
         debug!("Decrypted token.");
 
+        // Local ingestion cache only; model files are durable after ObjectManager uploads to CoreStore.
         let cache_dir = tempfile::tempdir()?;
         let api = ApiBuilder::new()
             .with_cache_dir(cache_dir.path().to_path_buf())
@@ -364,17 +371,15 @@ async fn handle_hf_ingestion(
             };
 
             let mut reader = make_reader().await?;
-            let scopes = vec!["object:write|*".to_string()];
             let mut attempt = 0;
             loop {
                 attempt += 1;
                 info!("Putting object, attempt {}", attempt);
                 let res = object_manager
                     .put_object(
-                        tenant_id,
+                        &requester_claims,
                         &target_bucket,
                         &full_key,
-                        &scopes,
                         reader,
                         crate::object_manager::ObjectWriteOptions::default(),
                     )
@@ -481,14 +486,16 @@ async fn handle_hf_ingestion(
 
             let res: Result<Object, Status> = object_manager
                 .put_object(
-                    tenant_id,
+                    &requester_claims,
                     &target_bucket,
                     &index_key,
-                    &vec!["object:write|*".to_string()], // Scopes
                     index_stream,
                     crate::object_manager::ObjectWriteOptions {
                         content_type: Some("application/json".to_string()),
                         user_metadata: None,
+                        transaction_id: None,
+                        transaction_principal: None,
+                        storage_class_id: None,
                     },
                 )
                 .await;
@@ -615,6 +622,7 @@ mod tests {
                 11,
                 "etag-a",
                 Some("text/plain"),
+                None,
                 None,
                 None,
                 None,

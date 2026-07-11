@@ -1,4 +1,6 @@
 use super::*;
+use crate::core_store::{CoreObjectRef, GetBlob};
+use base64::Engine;
 
 pub(super) fn version_sorts_after_marker(
     order: usize,
@@ -19,71 +21,80 @@ pub(super) async fn write_segment_file(
     header: SegmentHeader,
     records: &[SegmentRecord],
 ) -> Result<WrittenSegment> {
-    let header_json = serde_json::to_vec(&header)?;
-    let envelope = BinaryEnvelopeHeader::new(family, 0, 0, header_json);
-    let encoded_header = envelope.encode();
-    let body = SegmentBody::from_uncompressed_records(records)?.encode();
+    let body = encode_object_segment_body_table(family, records)?;
     let (first_record_hash, last_record_hash) = segment_record_hash_bounds(records);
-    let footer = BinaryFileFooter::new(
-        &encoded_header,
-        &body,
+    let body_hash = hash32(&body);
+    let stable_name = format!(
+        "object-metadata:{}:{}:{}:{}",
+        bucket.tenant_id,
+        bucket.id,
+        file_family_name(family),
+        generation
+    );
+    let range_index = single_body_range_index(
+        body.len(),
         records.len() as u64,
         first_record_hash,
         last_record_hash,
+    )?;
+    let logical_file_id = canonical_logical_file_id(
+        WriterFamily::ObjectBlob,
+        generation,
+        &stable_name,
+        &body_hash,
     );
-    let file_hash = hex::encode(footer.file_hash);
+    let header_proto = encode_segment_header_proto(family, &logical_file_id, &header);
+    let built_segment = build_writer_segment_logical_file(WriterSegmentBuildInput {
+        file_family: family,
+        writer_family: WriterFamily::ObjectBlob,
+        writer_generation: generation,
+        logical_file_id,
+        header_proto,
+        body,
+        range_index,
+        record_count: records.len() as u64,
+        first_record_hash,
+        last_record_hash,
+        boundary_values: Vec::new(),
+        mutation_id: format!(
+            "metadata-segment:{}:{}:{}",
+            bucket.tenant_id, bucket.id, generation
+        ),
+        region_id: "local".to_string(),
+        pipeline_policy: CorePipelinePolicy::default(),
+        trace_context: CoreTraceContext::default(),
+    })?;
+    let file_hash = hex::encode(built_segment.encoded.segment_hash);
     let ref_name = metadata_segment_ref_name(bucket, generation, family, &file_hash)?;
-    let mut bytes = Vec::with_capacity(encoded_header.len() + body.len() + COMMON_FOOTER_LEN);
-    bytes.extend_from_slice(&encoded_header);
-    bytes.extend_from_slice(&body);
-    bytes.extend_from_slice(&footer.encode());
 
     let store = CoreStore::new(storage.clone()).await?;
-    let object_ref = store
-        .write_logical_file_ref(WriteLogicalFileRequest {
-            writer_family: "object_metadata".to_string(),
-            generation,
-            logical_file_id: ref_name.clone(),
-            source: bytes,
-            range_hints: Vec::new(),
-            pipeline_policy: CorePipelinePolicy::default(),
-            trace_context: CoreTraceContext::default(),
-            boundary_values: Vec::new(),
-            mutation_id: format!(
-                "metadata-segment:{}:{}:{}",
-                bucket.tenant_id, bucket.id, generation
-            ),
-            region_id: "local".to_string(),
+    let receipt = store
+        .write_format_build_output(WriterBuildOutput {
+            logical_files: vec![built_segment.logical_file],
+            core_meta_mutations: Vec::new(),
         })
         .await?;
-    let new_target = encode_core_object_ref_target(&object_ref)?;
-    match store
-        .compare_and_swap_ref(CompareAndSwapRef {
-            ref_name: ref_name.clone(),
-            expected_generation: None,
-            expected_target: None,
-            require_absent: true,
-            require_present: false,
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-            new_target: new_target.clone(),
-            transaction_id: None,
-        })
-        .await
-    {
-        Ok(_) => {}
-        Err(error) if error.to_string().contains("must be absent") => {
-            let existing = store
-                .read_ref(&ref_name)
-                .await?
-                .ok_or_else(|| anyhow!("metadata segment ref disappeared after CAS conflict"))?;
-            if existing.target != new_target {
-                return Err(error);
-            }
-        }
-        Err(error) => return Err(error),
-    }
+    let written = receipt
+        .written_logical_files
+        .first()
+        .ok_or_else(|| anyhow!("CoreFormatWriter returned no object metadata logical file"))?;
+    let object_ref = core_object_ref_from_logical_file_write(written);
+    write_writer_segment_catalog_record(
+        storage,
+        &WriterSegmentCatalogRecord {
+            family: OBJECT_METADATA_SEGMENT_CATALOG_FAMILY.to_string(),
+            scope: object_metadata_segment_scope(&ref_name),
+            segment_ref: ref_name.clone(),
+            core_object_ref_target: encode_core_object_ref_target(&object_ref)?,
+            segment_hash: file_hash.clone(),
+            segment_length: written.manifest.logical_size,
+            generation,
+            source_cursor: generation,
+            created_at_unix_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                as u64,
+        },
+    )
+    .await?;
     Ok(WrittenSegment {
         family,
         ref_name,
@@ -92,11 +103,61 @@ pub(super) async fn write_segment_file(
     })
 }
 
+pub(super) fn encode_object_segment_body_table(
+    family: FileFamily,
+    records: &[SegmentRecord],
+) -> Result<Vec<u8>> {
+    let table_id = object_segment_table_id(family)?;
+    let rows = records
+        .iter()
+        .map(|record| crate::formats::table::TableRow {
+            key: record.key.clone(),
+            value: record.value.clone(),
+        })
+        .collect::<Vec<_>>();
+    crate::formats::table::encode_writer_body_tables(&object_segment_tables(table_id, rows))
+        .map_err(anyhow::Error::from)
+}
+
+pub(super) fn decode_object_segment_body_table(body: &[u8]) -> Result<Vec<SegmentRecord>> {
+    Ok(crate::formats::table::decode_writer_body_tables(body)?
+        .into_iter()
+        .flat_map(|table| table.rows)
+        .map(|row| SegmentRecord::new(row.key, row.value))
+        .collect::<Vec<_>>())
+}
+
+fn object_segment_table_id(family: FileFamily) -> Result<u16> {
+    match family {
+        FileFamily::MetadataSegment => Ok(0x0101),
+        FileFamily::DirectorySegment => Ok(0x0103),
+        _ => Err(anyhow!("unsupported object segment table family")),
+    }
+}
+
+fn object_segment_tables(
+    active_table_id: u16,
+    active_rows: Vec<crate::formats::table::TableRow>,
+) -> Vec<crate::formats::table::WriterBodyTable> {
+    [0x0101, 0x0102, 0x0103]
+        .into_iter()
+        .map(|table_id| crate::formats::table::WriterBodyTable {
+            table_id,
+            row_type_id: table_id,
+            rows: if table_id == active_table_id {
+                active_rows.clone()
+            } else {
+                Vec::new()
+            },
+        })
+        .collect()
+}
+
 pub(super) async fn write_partition_manifest(
     storage: &Storage,
     bucket: &Bucket,
     generation: u64,
-    frames: &[JournalFrame],
+    records: &[ObjectMetadataRecord],
     segments: &[WrittenSegment],
     manifest_signing_key: &[u8],
     fence_token: u64,
@@ -105,18 +166,18 @@ pub(super) async fn write_partition_manifest(
     if manifest_signing_key.is_empty() {
         return Err(anyhow!("partition manifest signing key must not be empty"));
     }
-    let last_record_hash = frames
+    let last_record_hash = records
         .last()
-        .map(|frame| hex::encode(frame.record_hash))
-        .ok_or_else(|| anyhow!("partition manifest requires at least one journal frame"))?;
+        .map(|record| record.event_hash.clone())
+        .ok_or_else(|| anyhow!("partition manifest requires at least one stream record"))?;
     let journal_ref = ManifestJournalRef {
         path: format!(
             "corestream:{}",
             object_metadata_stream_id(bucket.tenant_id, bucket.id)
         ),
-        first_sequence: frames
+        first_sequence: records
             .first()
-            .map(|frame| frame.partition_sequence)
+            .map(|record| record.partition_sequence)
             .unwrap_or(0),
         last_sequence: generation,
         last_record_hash: last_record_hash.clone(),
@@ -152,14 +213,21 @@ pub(super) async fn write_partition_manifest(
     let manifest_signature = sign_manifest(&manifest_hash, &manifest, manifest_signing_key)?;
     manifest.manifest_hash = Some(manifest_hash.clone());
     manifest.manifest_signature = Some(manifest_signature);
-    let encoded = serde_json::to_vec_pretty(&manifest)?;
+    let encoded = encode_partition_manifest(&manifest)?;
     let manifest_ref = metadata_manifest_ref_name(bucket)?;
+    let manifest_bytes_hash = hash32(&encoded);
+    let logical_file_id = canonical_logical_file_id(
+        WriterFamily::ObjectBlob,
+        generation,
+        &manifest_ref,
+        &manifest_bytes_hash,
+    );
     let store = CoreStore::new(storage.clone()).await?;
     let object_ref = store
         .write_logical_file_ref(WriteLogicalFileRequest {
-            writer_family: "object_metadata".to_string(),
+            writer_family: WriterFamily::ObjectBlob.as_str().to_string(),
             generation,
-            logical_file_id: manifest_ref.clone(),
+            logical_file_id,
             source: encoded,
             range_hints: Vec::new(),
             pipeline_policy: CorePipelinePolicy::default(),
@@ -172,7 +240,16 @@ pub(super) async fn write_partition_manifest(
             region_id: "local".to_string(),
         })
         .await?;
-    let new_target = encode_core_object_ref_target(&object_ref)?;
+    let manifest_target = encode_core_object_ref_target(&object_ref)?;
+    let manifest_row = ObjectMetadataPartitionManifestRow {
+        manifest_ref: manifest_ref.clone(),
+        object_ref_target: manifest_target,
+        manifest_hash: hex::encode(manifest_bytes_hash),
+        generation,
+        published_at: manifest.published_at.clone(),
+    };
+    let manifest_payload = encode_object_metadata_partition_manifest_row(bucket, &manifest_row)?;
+    let manifest_tuple_key = object_metadata_partition_manifest_row_key(bucket)?;
     if let Some(precondition) = partition_precondition {
         store
             .commit_mutation_batch(CoreMutationBatch {
@@ -183,27 +260,32 @@ pub(super) async fn write_partition_manifest(
                 scope_partition: manifest.partition_id.clone(),
                 committed_by_principal: object_metadata_partition_principal(bucket),
                 preconditions: vec![precondition],
-                operations: vec![CoreMutationOperation::RefUpdate {
+                operations: vec![CoreMutationOperation::CoreMetaPut {
                     partition_id: manifest.partition_id.clone(),
-                    ref_name: manifest_ref.clone(),
-                    new_target,
+                    cf: CF_OBJECT_HEADS.to_string(),
+                    table_id: TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW,
+                    tuple_key: manifest_tuple_key,
+                    payload: manifest_payload,
                 }],
             })
             .await?;
     } else {
+        // No extra CoreStore metadata mirror is published here. The manifest's current
+        // pointer is compact CoreMeta state in the object metadata manifest row.
         store
-            .compare_and_swap_ref(CompareAndSwapRef {
-                ref_name: manifest_ref.clone(),
-                expected_generation: None,
-                expected_target: None,
-                require_absent: false,
-                require_present: false,
-                fence: None,
-                authz_revision: None,
-                source_watch_cursor: None,
-                new_target,
-                transaction_id: None,
-            })
+            .commit_coremeta_batch_by_embedded_roots(
+                &format!(
+                    "object-metadata-manifest:{}:{}:{}",
+                    bucket.tenant_id, bucket.id, generation
+                ),
+                &[CoreMetaBatchOp {
+                    cf: CF_OBJECT_HEADS,
+                    table_id: TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW,
+                    tuple_key: &manifest_tuple_key,
+                    common: None,
+                    kind: CoreMetaBatchOpKind::Put(&manifest_payload),
+                }],
+            )
             .await?;
     }
     Ok((manifest, manifest_ref))
@@ -213,7 +295,9 @@ pub fn decode_partition_manifest(
     input: &[u8],
     manifest_signing_key: &[u8],
 ) -> Result<PartitionManifest> {
-    let manifest: PartitionManifest = serde_json::from_slice(input)?;
+    let proto = PartitionManifestProto::decode(input)?;
+    ensure_deterministic_proto(&proto, input, "partition manifest")?;
+    let manifest = partition_manifest_from_proto(proto)?;
     verify_partition_manifest(&manifest, manifest_signing_key)?;
     Ok(manifest)
 }
@@ -223,13 +307,13 @@ pub(crate) async fn read_latest_partition_manifest(
     bucket: &Bucket,
     manifest_signing_key: &[u8],
 ) -> Result<Option<PartitionManifest>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(&metadata_manifest_ref_name(bucket)?).await? else {
+    let Some(record) = read_object_metadata_partition_manifest_row(storage, bucket)? else {
         return Ok(None);
     };
+    let store = CoreStore::new(storage.clone()).await?;
     let bytes = store
         .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+            object_ref: decode_core_object_ref_target(&record.object_ref_target)?,
         })
         .await?;
     Ok(Some(decode_partition_manifest(
@@ -239,11 +323,7 @@ pub(crate) async fn read_latest_partition_manifest(
 }
 
 pub(super) async fn partition_manifest_exists(storage: &Storage, bucket: &Bucket) -> Result<bool> {
-    Ok(CoreStore::new(storage.clone())
-        .await?
-        .read_ref(&metadata_manifest_ref_name(bucket)?)
-        .await?
-        .is_some())
+    Ok(read_object_metadata_partition_manifest_row(storage, bucket)?.is_some())
 }
 
 pub(super) async fn read_manifest_segment(
@@ -253,15 +333,18 @@ pub(super) async fn read_manifest_segment(
     let ref_name = segment
         .path
         .strip_prefix(MANIFEST_SEGMENT_REF_PREFIX)
-        .ok_or_else(|| anyhow!("partition segment manifest entry is not a CoreStore ref"))?;
+        .ok_or_else(|| anyhow!("partition segment manifest entry is not a CoreMeta segment ref"))?;
+    let record = read_writer_segment_catalog_record(
+        storage,
+        OBJECT_METADATA_SEGMENT_CATALOG_FAMILY,
+        &object_metadata_segment_scope(ref_name),
+        ref_name,
+    )?
+    .ok_or_else(|| anyhow!("partition segment catalog row is missing"))?;
     let store = CoreStore::new(storage.clone()).await?;
-    let ref_value = store
-        .read_ref(ref_name)
-        .await?
-        .ok_or_else(|| anyhow!("partition segment ref is missing"))?;
     store
         .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+            object_ref: decode_core_object_ref_target(&record.core_object_ref_target)?,
         })
         .await
 }
@@ -271,14 +354,17 @@ pub(super) async fn read_core_ref_uri_payload(storage: &Storage, ref_uri: &str) 
     let ref_name = ref_uri
         .strip_prefix(MANIFEST_SEGMENT_REF_PREFIX)
         .unwrap_or(ref_uri);
+    let record = read_writer_segment_catalog_record(
+        storage,
+        OBJECT_METADATA_SEGMENT_CATALOG_FAMILY,
+        &object_metadata_segment_scope(ref_name),
+        ref_name,
+    )?
+    .ok_or_else(|| anyhow!("CoreStore writer segment catalog row is missing"))?;
     let store = CoreStore::new(storage.clone()).await?;
-    let ref_value = store
-        .read_ref(ref_name)
-        .await?
-        .ok_or_else(|| anyhow!("CoreStore ref is missing"))?;
     store
         .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+            object_ref: decode_core_object_ref_target(&record.core_object_ref_target)?,
         })
         .await
 }
@@ -302,7 +388,7 @@ pub(super) fn compute_manifest_hash(manifest: &PartitionManifest) -> Result<Stri
     let mut unsigned = manifest.clone();
     unsigned.manifest_hash = None;
     unsigned.manifest_signature = None;
-    Ok(hex::encode(hash32(&serde_json::to_vec(&unsigned)?)))
+    Ok(hex::encode(hash32(&encode_partition_manifest(&unsigned)?)))
 }
 
 pub(super) fn sign_manifest(
@@ -325,7 +411,6 @@ pub(super) fn sign_manifest(
 
 pub(super) fn file_family_name(family: FileFamily) -> &'static str {
     match family {
-        FileFamily::MetadataJournal => "metadata_journal",
         FileFamily::MetadataSegment => "metadata_segment",
         FileFamily::DirectorySegment => "directory_segment",
         FileFamily::FullTextSegment => "full_text_segment",
@@ -336,6 +421,8 @@ pub(super) fn file_family_name(family: FileFamily) -> &'static str {
         FileFamily::PersonalDbRowIndex => "personaldb_row_index",
         FileFamily::GitSourceIndex => "git_source_index",
         FileFamily::TypedFieldSegment => "typed_field_segment",
+        FileFamily::RegistrySegment => "registry_segment",
+        FileFamily::MeshControlSegment => "mesh_control_segment",
     }
 }
 
@@ -347,14 +434,6 @@ pub(super) fn file_family_from_manifest_name(name: &str) -> Result<FileFamily> {
             "unsupported segment family in partition manifest: {other}"
         )),
     }
-}
-
-pub(super) fn decode_segment_body_records(body: &SegmentBody) -> Result<Vec<SegmentRecord>> {
-    let mut records = Vec::new();
-    for block in &body.data_blocks {
-        records.extend(block.decode_uncompressed_records()?);
-    }
-    Ok(records)
 }
 
 pub(super) fn object_from_body(body: &ObjectVersionBody) -> Result<Object> {
@@ -380,41 +459,10 @@ pub(super) fn object_from_body(body: &ObjectVersionBody) -> Result<Object> {
             .as_deref()
             .map(parse_body_timestamp)
             .transpose()?,
-        storage_class: body.storage_class,
+        storage_class: body.storage_class.clone(),
         user_meta: body.user_meta.clone(),
         shard_map: body.shard_map.clone(),
         checksum: body.checksum.clone(),
-        link: body.link.clone(),
-    })
-}
-
-pub(super) fn object_from_directory_body(body: &DirectoryEntryBody) -> Result<Object> {
-    Ok(Object {
-        id: body.id,
-        tenant_id: body.tenant_id,
-        bucket_id: body.bucket_id,
-        key: body.object_key.clone(),
-        kind: body.kind,
-        content_hash: body.content_hash.clone(),
-        size: body.size,
-        etag: body.etag.clone(),
-        content_type: body.content_type.clone(),
-        version_id: uuid::Uuid::parse_str(&body.version_id)?,
-        mutation_id: uuid::Uuid::parse_str(&body.mutation_id)?,
-        index_policy_snapshot: body.index_policy_snapshot.clone(),
-        user_metadata_hash: body.user_metadata_hash.clone(),
-        authz_revision: body.authz_revision,
-        record_hash: body.record_hash.clone(),
-        created_at: parse_body_timestamp(&body.created_at)?,
-        deleted_at: body
-            .deleted_at
-            .as_deref()
-            .map(parse_body_timestamp)
-            .transpose()?,
-        storage_class: body.storage_class,
-        user_meta: body.user_meta.clone(),
-        shard_map: body.shard_map.clone(),
-        checksum: None,
         link: body.link.clone(),
     })
 }
@@ -440,6 +488,35 @@ pub(super) fn segment_header(
         block_size_uncompressed: 64 * 1024,
         bloom_bits_per_key: 0,
     }
+}
+
+fn encode_segment_header_proto(
+    family: FileFamily,
+    logical_file_id: &str,
+    header: &SegmentHeader,
+) -> Vec<u8> {
+    encode_writer_segment_header(
+        "anvil.object_metadata.segment_header.v1",
+        logical_file_id,
+        family,
+        header.generation,
+        None,
+        None,
+        0,
+        vec![
+            header_field_string("tenant_id", header.tenant_id.clone()),
+            header_field_string("bucket_id", header.bucket_id.clone()),
+            header_field_string("partition_family", header.partition_family),
+            header_field_string("partition_id", header.partition_id.clone()),
+            header_field_string("key_order", header.key_order),
+            header_field_string("compression", header.compression),
+            header_field_u64(
+                "block_size_uncompressed",
+                u64::from(header.block_size_uncompressed),
+            ),
+            header_field_u64("bloom_bits_per_key", u64::from(header.bloom_bits_per_key)),
+        ],
+    )
 }
 
 pub(super) fn segment_record_hash_bounds(records: &[SegmentRecord]) -> (Hash32, Hash32) {
@@ -503,19 +580,11 @@ pub(super) fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
 }
 
 pub(super) fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
-    Ok(format!(
-        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
-    ))
+    crate::core_store::encode_core_object_ref_target(object_ref)
 }
 
 pub(super) fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
-    let encoded = target
-        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
-        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
-    Ok(serde_json::from_slice(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded)?,
-    )?)
+    crate::core_store::decode_core_object_ref_target(target)
 }
 
 pub async fn active_object_journal_stats(
@@ -530,24 +599,29 @@ pub async fn active_object_journal_stats(
         compacted_through_sequence = manifest.compacted_through_sequence;
     }
 
-    let frames = read_all_metadata_journal_frames(storage, bucket).await?;
+    let records = read_all_metadata_journal_records(storage, bucket).await?;
     let mut stats = ActiveObjectJournalStats {
-        last_sequence: frames
+        last_sequence: records
             .last()
-            .map(|frame| frame.partition_sequence)
+            .map(|record| record.partition_sequence)
             .unwrap_or(0),
         compacted_through_sequence,
         ..ActiveObjectJournalStats::default()
     };
-    for frame in frames {
-        if frame.partition_sequence <= compacted_through_sequence {
+    let mut tombstone_debt = 0_u64;
+    for record in records {
+        if record.partition_sequence <= compacted_through_sequence {
             continue;
         }
         stats.uncompacted_frame_count = stats.uncompacted_frame_count.saturating_add(1);
         stats.uncompacted_encoded_bytes = stats
             .uncompacted_encoded_bytes
-            .saturating_add(frame.encode().len() as u64);
+            .saturating_add(record.payload.len() as u64);
+        if record.record_kind == ObjectMetadataRecordKind::DeleteMarker {
+            tombstone_debt = tombstone_debt.saturating_add(1);
+        }
     }
+    crate::perf::record_tombstone_debt("object_blob", tombstone_debt);
     Ok(stats)
 }
 
@@ -580,35 +654,35 @@ pub async fn object_metadata_source_checkpoint_hash(
         hasher.update(&[0; 32]);
     }
 
-    for frame in read_all_metadata_journal_frames(storage, bucket).await? {
-        if frame.partition_sequence <= compacted_through_sequence
-            || frame.partition_sequence > max_sequence
+    for record in read_all_metadata_journal_records(storage, bucket).await? {
+        if record.partition_sequence <= compacted_through_sequence
+            || record.partition_sequence > max_sequence
         {
             continue;
         }
-        hasher.update(&frame.partition_sequence.to_le_bytes());
-        hasher.update(&frame.record_hash);
+        hasher.update(&record.partition_sequence.to_le_bytes());
+        hasher.update(record.event_hash.as_bytes());
     }
 
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-pub(super) async fn read_manifest_journal_ref_frames(
+pub(super) async fn read_manifest_journal_ref_records(
     storage: &Storage,
     journal_ref: &ManifestJournalRef,
-) -> Result<Vec<JournalFrame>> {
+) -> Result<Vec<ObjectMetadataRecord>> {
     let stream_id = journal_ref
         .path
         .strip_prefix("corestream:")
         .ok_or_else(|| anyhow!("object metadata manifest journal ref must use corestream:"))?;
     let core_store = CoreStore::new(storage.clone()).await?;
-    read_metadata_journal_frames_from_store(&core_store, stream_id).await
+    read_metadata_journal_records_from_store(&core_store, stream_id).await
 }
 
-pub(super) async fn read_metadata_journal_frames_from_store(
+pub(super) async fn read_metadata_journal_records_from_store(
     core_store: &CoreStore,
     stream_id: &str,
-) -> Result<Vec<JournalFrame>> {
+) -> Result<Vec<ObjectMetadataRecord>> {
     let records = core_store
         .read_stream(ReadStream {
             stream_id: stream_id.to_string(),
@@ -616,31 +690,28 @@ pub(super) async fn read_metadata_journal_frames_from_store(
             limit: 0,
         })
         .await?;
-    let mut frames = Vec::new();
+    let mut decoded = Vec::new();
     for record in records {
-        if record.record_kind != "object_metadata" {
+        if !record.record_kind.starts_with("object_metadata.") {
             continue;
         }
-        frames.push(JournalFrame::decode(&record.payload)?);
+        decoded.push(metadata_record_from_stream_record(record)?);
     }
-    validate_journal_chain(&frames)?;
-    Ok(frames)
+    Ok(decoded)
 }
 
-pub(super) async fn read_raw_metadata_journal_frames_from_store(
-    core_store: &CoreStore,
-    stream_id: &str,
-) -> Result<Vec<JournalFrame>> {
-    let records = core_store.read_raw_stream(stream_id).await?;
-    let mut frames = Vec::new();
-    for record in records {
-        if record.record_kind != "object_metadata" {
-            continue;
-        }
-        frames.push(JournalFrame::decode(&record.payload)?);
-    }
-    validate_journal_chain(&frames)?;
-    Ok(frames)
+pub(super) fn metadata_record_from_stream_record(
+    record: crate::core_store::StreamRecord,
+) -> Result<ObjectMetadataRecord> {
+    let record_kind = ObjectMetadataRecordKind::from_str(&record.record_kind)?;
+    let body = decode_object_metadata_body_proto(&record.payload)?;
+    Ok(ObjectMetadataRecord {
+        partition_sequence: record.sequence,
+        event_hash: record.event_hash,
+        record_kind,
+        payload: record.payload,
+        body,
+    })
 }
 
 pub(super) fn object_metadata_stream_id(tenant_id: i64, bucket_id: i64) -> String {
@@ -654,49 +725,119 @@ pub(super) fn object_metadata_partition_principal(bucket: &Bucket) -> String {
     )
 }
 
-pub(super) fn current_object_ref_name(bucket: &Bucket, object_key: &str) -> String {
-    let key_hash = hex::encode(hash32(object_key.as_bytes()));
-    format!(
-        "{CURRENT_OBJECT_REF_PREFIX}tenant:{}:bucket:{}:key:{key_hash}",
-        bucket.tenant_id, bucket.id
-    )
+pub(super) fn object_metadata_manifest_scope(bucket: &Bucket) -> String {
+    format!("tenant/{}/bucket/{}", bucket.tenant_id, bucket.id)
 }
 
-pub(super) fn current_object_ref_target(stream_id: &str, frame: &JournalFrame) -> String {
-    format!(
-        "corestream:{stream_id}:sequence:{}:hash:{}",
-        frame.partition_sequence,
-        hex::encode(frame.record_hash)
-    )
+pub(super) fn object_metadata_segment_scope(segment_ref: &str) -> String {
+    format!("segment/{segment_ref}")
 }
 
-pub(super) fn parse_current_object_ref_target(target: &str) -> Result<(String, u64, String)> {
-    let rest = target
-        .strip_prefix("corestream:")
-        .ok_or_else(|| anyhow!("current object ref target must use corestream scheme"))?;
-    let (stream_id, rest) = rest
-        .split_once(":sequence:")
-        .ok_or_else(|| anyhow!("current object ref target is missing sequence"))?;
-    let (sequence, frame_hash) = rest
-        .split_once(":hash:")
-        .ok_or_else(|| anyhow!("current object ref target is missing hash"))?;
-    validate_hex32(frame_hash, "current object ref frame hash")?;
-    Ok((
-        stream_id.to_string(),
-        sequence.parse()?,
-        frame_hash.to_string(),
-    ))
+pub(super) fn object_metadata_partition_manifest_row_key(bucket: &Bucket) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("object-metadata-manifest"),
+        CoreMetaTuplePart::I64(bucket.tenant_id),
+        CoreMetaTuplePart::I64(bucket.id),
+    ])
+}
+
+pub(super) fn encode_object_metadata_partition_manifest_row(
+    bucket: &Bucket,
+    row: &ObjectMetadataPartitionManifestRow,
+) -> Result<Vec<u8>> {
+    if row.manifest_ref != metadata_manifest_ref_name(bucket)? {
+        return Err(anyhow!("object metadata manifest row ref scope mismatch"));
+    }
+    validate_hex32(&row.manifest_hash, "object metadata manifest payload hash")?;
+    encode_deterministic_proto(&ObjectMetadataPartitionManifestRowProto {
+        common: Some(core_meta_committed_row_common(
+            object_metadata_manifest_scope(bucket),
+            core_meta_root_key_hash(&format!(
+                "object-metadata-manifest/{}/{}",
+                bucket.tenant_id, bucket.id
+            )),
+            row.generation,
+            format!(
+                "object-metadata-manifest:{}:{}:{}",
+                bucket.tenant_id, bucket.id, row.generation
+            ),
+            unix_nanos_from_rfc3339(&row.published_at),
+        )),
+        schema: OBJECT_METADATA_PARTITION_MANIFEST_ROW_SCHEMA.to_string(),
+        manifest_ref: row.manifest_ref.clone(),
+        object_ref_target: row.object_ref_target.clone(),
+        manifest_hash: row.manifest_hash.clone(),
+        generation: row.generation,
+        published_at: row.published_at.clone(),
+    })
+}
+
+pub(super) fn decode_object_metadata_partition_manifest_row(
+    bucket: &Bucket,
+    bytes: &[u8],
+) -> Result<ObjectMetadataPartitionManifestRow> {
+    let proto = decode_deterministic_proto::<ObjectMetadataPartitionManifestRowProto>(
+        bytes,
+        "object metadata partition manifest row",
+    )?;
+    if proto.schema != OBJECT_METADATA_PARTITION_MANIFEST_ROW_SCHEMA {
+        return Err(anyhow!(
+            "object metadata partition manifest row has invalid schema"
+        ));
+    }
+    let common = proto
+        .common
+        .ok_or_else(|| anyhow!("object metadata partition manifest row missing CoreMeta common"))?;
+    if common.realm_id != object_metadata_manifest_scope(bucket) {
+        return Err(anyhow!(
+            "object metadata partition manifest row realm mismatch"
+        ));
+    }
+    if proto.manifest_ref != metadata_manifest_ref_name(bucket)? {
+        return Err(anyhow!(
+            "object metadata partition manifest row ref scope mismatch"
+        ));
+    }
+    validate_hex32(
+        &proto.manifest_hash,
+        "object metadata manifest payload hash",
+    )?;
+    Ok(ObjectMetadataPartitionManifestRow {
+        manifest_ref: proto.manifest_ref,
+        object_ref_target: proto.object_ref_target,
+        manifest_hash: proto.manifest_hash,
+        generation: proto.generation,
+        published_at: proto.published_at,
+    })
+}
+
+pub(super) fn read_object_metadata_partition_manifest_row(
+    storage: &Storage,
+    bucket: &Bucket,
+) -> Result<Option<ObjectMetadataPartitionManifestRow>> {
+    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
+    let Some(payload) = meta.get(
+        CF_OBJECT_HEADS,
+        TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW,
+        &object_metadata_partition_manifest_row_key(bucket)?,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(decode_object_metadata_partition_manifest_row(
+        bucket, &payload,
+    )?))
 }
 
 #[cfg(test)]
-pub(crate) async fn read_object_metadata_frame_fences_for_test(
+pub(crate) async fn read_object_metadata_record_fences_for_test(
     storage: &Storage,
     bucket: &Bucket,
 ) -> Result<Vec<u64>> {
-    Ok(read_all_metadata_journal_frames(storage, bucket)
+    Ok(read_all_metadata_journal_records(storage, bucket)
         .await?
         .into_iter()
-        .map(|frame| frame.fence_token)
+        .map(|record| record.body.fence_token)
         .collect())
 }
 
@@ -722,22 +863,11 @@ pub(super) fn require_object_metadata_permit(
     Ok(())
 }
 
-pub(super) fn object_version_key_hash(bucket: &Bucket, object: &Object) -> Hash32 {
-    hash32(
-        format!(
-            "tenant/{}/bucket/{}/object/{}/version/{}",
-            bucket.tenant_id, bucket.id, object.key, object.version_id
-        )
-        .as_bytes(),
-    )
-}
-
-pub(super) fn directory_key_hash(bucket: &Bucket, object: &Object) -> Hash32 {
-    hash32(
-        format!(
-            "tenant/{}/bucket/{}/directory/{}",
-            bucket.tenant_id, bucket.id, object.key
-        )
-        .as_bytes(),
-    )
+pub(super) fn segment_payload_bytes(records: &[SegmentRecord]) -> u64 {
+    records.iter().fold(0_u64, |total, record| {
+        total
+            .saturating_add(record.key.len() as u64)
+            .saturating_add(record.value.len() as u64)
+            .saturating_add(record.value_hash.len() as u64)
+    })
 }

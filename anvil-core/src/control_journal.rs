@@ -1,16 +1,22 @@
 use crate::core_store::{
-    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreStore, ReadStream,
+    CF_MESH, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
+    CoreStore, TABLE_CONTROL_CURRENT_ROW, core_meta_committed_row_common, core_meta_root_key_hash,
+    core_meta_tuple_key,
 };
-use crate::formats::{Hash32, JournalFrame, JournalRecordKind, hash32, validate_journal_chain};
-use crate::partition_fence::{PartitionWritePermit, partition_write_ref_precondition};
+use crate::formats::{Hash32, hash32};
+use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
 use crate::persistence::{App, AppDetails, Tenant};
 use crate::storage::Storage;
-use anyhow::{Result, anyhow};
-use serde::{Deserialize, Serialize};
+use anyhow::{Result, anyhow, bail};
+use prost::{Message, Oneof};
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "event", rename_all = "snake_case")]
+const CONTROL_EVENT_SCHEMA: &str = "anvil.control.event.v1";
+const CONTROL_CURRENT_SCHEMA: &str = "anvil.control.current.v1";
+const CONTROL_CURRENT_TARGET_MAX_BYTES: usize = 32 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ControlEventBody {
     RegionUpsert {
         name: String,
@@ -33,15 +39,29 @@ enum ControlEventBody {
     AppDelete {
         app_id: i64,
     },
-    AppPolicyGrant {
-        app_id: i64,
-        resource: String,
-        action: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ControlCurrentRecord {
+    IdAllocator {
+        max_allocated_id: i64,
     },
-    AppPolicyRevoke {
-        app_id: i64,
-        resource: String,
-        action: String,
+    Region {
+        name: String,
+        active: bool,
+    },
+    Tenant {
+        id: i64,
+        name: String,
+        active: bool,
+    },
+    App {
+        id: i64,
+        tenant_id: i64,
+        name: String,
+        client_id: String,
+        client_secret_encrypted: Vec<u8>,
+        active: bool,
     },
 }
 
@@ -51,7 +71,6 @@ pub struct ControlState {
     regions: BTreeSet<String>,
     tenants: BTreeMap<i64, Tenant>,
     apps: BTreeMap<i64, StoredControlApp>,
-    app_policies: BTreeSet<StoredControlPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,18 +82,144 @@ struct StoredControlApp {
     client_secret_encrypted: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct StoredControlPolicy {
-    app_id: i64,
-    resource: String,
-    action: String,
+#[derive(Clone, PartialEq, Message)]
+struct ControlEventProto {
+    #[prost(string, tag = "1")]
+    schema: String,
+    #[prost(string, tag = "2")]
+    emitted_at: String,
+    #[prost(uint64, tag = "3")]
+    fence_token: u64,
+    #[prost(string, tag = "4")]
+    mutation_id: String,
+    #[prost(oneof = "control_event_proto::Event", tags = "10, 11, 12, 13, 14")]
+    event: Option<control_event_proto::Event>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredAppPolicy {
-    pub app_id: i64,
-    pub resource: String,
-    pub action: String,
+mod control_event_proto {
+    use super::*;
+
+    #[derive(Clone, PartialEq, Oneof)]
+    pub(super) enum Event {
+        #[prost(message, tag = "10")]
+        RegionUpsert(super::RegionUpsertProto),
+        #[prost(message, tag = "11")]
+        TenantUpsert(super::TenantUpsertProto),
+        #[prost(message, tag = "12")]
+        AppCreate(super::AppCreateProto),
+        #[prost(message, tag = "13")]
+        AppSecretUpdate(super::AppSecretUpdateProto),
+        #[prost(message, tag = "14")]
+        AppDelete(super::AppDeleteProto),
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ControlCurrentProto {
+    #[prost(message, optional, tag = "1")]
+    common: Option<crate::core_store::CoreMetaRowCommonProto>,
+    #[prost(string, tag = "2")]
+    schema: String,
+    #[prost(oneof = "control_current_proto::Record", tags = "10, 11, 12, 13")]
+    record: Option<control_current_proto::Record>,
+}
+
+mod control_current_proto {
+    use super::*;
+
+    #[derive(Clone, PartialEq, Oneof)]
+    pub(super) enum Record {
+        #[prost(message, tag = "10")]
+        IdAllocator(super::IdAllocatorCurrentProto),
+        #[prost(message, tag = "11")]
+        Region(super::RegionCurrentProto),
+        #[prost(message, tag = "12")]
+        Tenant(super::TenantCurrentProto),
+        #[prost(message, tag = "13")]
+        App(super::AppCurrentProto),
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct RegionUpsertProto {
+    #[prost(string, tag = "1")]
+    name: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct TenantUpsertProto {
+    #[prost(int64, tag = "1")]
+    id: i64,
+    #[prost(string, tag = "2")]
+    name: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct AppCreateProto {
+    #[prost(int64, tag = "1")]
+    id: i64,
+    #[prost(int64, tag = "2")]
+    tenant_id: i64,
+    #[prost(string, tag = "3")]
+    name: String,
+    #[prost(string, tag = "4")]
+    client_id: String,
+    #[prost(bytes, tag = "5")]
+    client_secret_encrypted: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct AppSecretUpdateProto {
+    #[prost(int64, tag = "1")]
+    app_id: i64,
+    #[prost(bytes, tag = "2")]
+    client_secret_encrypted: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct AppDeleteProto {
+    #[prost(int64, tag = "1")]
+    app_id: i64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct IdAllocatorCurrentProto {
+    #[prost(int64, tag = "1")]
+    max_allocated_id: i64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct RegionCurrentProto {
+    #[prost(string, tag = "1")]
+    name: String,
+    #[prost(bool, tag = "2")]
+    active: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct TenantCurrentProto {
+    #[prost(int64, tag = "1")]
+    id: i64,
+    #[prost(string, tag = "2")]
+    name: String,
+    #[prost(bool, tag = "3")]
+    active: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct AppCurrentProto {
+    #[prost(int64, tag = "1")]
+    id: i64,
+    #[prost(int64, tag = "2")]
+    tenant_id: i64,
+    #[prost(string, tag = "3")]
+    name: String,
+    #[prost(string, tag = "4")]
+    client_id: String,
+    #[prost(bytes, tag = "5")]
+    client_secret_encrypted: Vec<u8>,
+    #[prost(bool, tag = "6")]
+    active: bool,
 }
 
 impl ControlState {
@@ -126,49 +271,90 @@ impl ControlState {
                 client_secret_encrypted: app.client_secret_encrypted.clone(),
             })
     }
-
-    pub fn policies_for_app(&self, app_id: i64) -> Vec<String> {
-        self.app_policies
-            .iter()
-            .filter(|policy| policy.app_id == app_id)
-            .map(|policy| format!("{}|{}", policy.action, policy.resource))
-            .collect()
-    }
-
-    pub fn policy_records_for_app(&self, app_id: i64) -> Vec<StoredAppPolicy> {
-        self.app_policies
-            .iter()
-            .filter(|policy| policy.app_id == app_id)
-            .map(|policy| StoredAppPolicy {
-                app_id: policy.app_id,
-                resource: policy.resource.clone(),
-                action: policy.action.clone(),
-            })
-            .collect()
-    }
-
-    pub fn policy_summaries(&self) -> Vec<String> {
-        let mut policies = self
-            .app_policies
-            .iter()
-            .map(|policy| format!("{}:{}", policy.action, policy.resource))
-            .collect::<Vec<_>>();
-        policies.sort();
-        policies.dedup();
-        policies
-    }
 }
 
 pub async fn read_control_state(storage: &Storage) -> Result<ControlState> {
-    let frames = read_control_journal_frames(storage).await?;
+    let core_store = CoreStore::new(storage.clone()).await?;
+    read_control_state_from_coremeta_rows(&core_store)
+}
+
+fn read_control_state_from_coremeta_rows(core_store: &CoreStore) -> Result<ControlState> {
     let mut state = ControlState::default();
-    for frame in frames {
-        if frame.record_kind != JournalRecordKind::ControlPlane {
-            continue;
+
+    if let Some(value) = core_store.read_coremeta_row(
+        CF_MESH,
+        TABLE_CONTROL_CURRENT_ROW,
+        &id_allocator_tuple_key()?,
+    )? {
+        match decode_control_current_row(&value)? {
+            ControlCurrentRecord::IdAllocator { max_allocated_id } => {
+                state.next_id = max_allocated_id;
+            }
+            _ => bail!("control id allocator row contains a different record type"),
         }
-        let body: ControlEventBody = serde_json::from_slice(&frame.body)?;
-        apply_event(&mut state, body);
     }
+
+    for row in core_store.scan_coremeta_prefix(
+        CF_MESH,
+        TABLE_CONTROL_CURRENT_ROW,
+        &region_tuple_prefix()?,
+    )? {
+        match decode_control_current_row(&row.payload)? {
+            ControlCurrentRecord::Region { name, active } => {
+                if active {
+                    state.regions.insert(name);
+                }
+            }
+            _ => bail!("control region row contains a different record type"),
+        }
+    }
+
+    for row in core_store.scan_coremeta_prefix(
+        CF_MESH,
+        TABLE_CONTROL_CURRENT_ROW,
+        &tenant_tuple_prefix()?,
+    )? {
+        match decode_control_current_row(&row.payload)? {
+            ControlCurrentRecord::Tenant { id, name, active } => {
+                state.next_id = state.next_id.max(id);
+                if active {
+                    state.tenants.insert(id, Tenant { id, name });
+                }
+            }
+            _ => bail!("control tenant row contains a different record type"),
+        }
+    }
+
+    for row in
+        core_store.scan_coremeta_prefix(CF_MESH, TABLE_CONTROL_CURRENT_ROW, &app_tuple_prefix()?)?
+    {
+        match decode_control_current_row(&row.payload)? {
+            ControlCurrentRecord::App {
+                id,
+                tenant_id,
+                name,
+                client_id,
+                client_secret_encrypted,
+                active,
+            } => {
+                state.next_id = state.next_id.max(id);
+                if active {
+                    state.apps.insert(
+                        id,
+                        StoredControlApp {
+                            id,
+                            tenant_id,
+                            name,
+                            client_id,
+                            client_secret_encrypted,
+                        },
+                    );
+                }
+            }
+            _ => bail!("control app row contains a different record type"),
+        }
+    }
+
     Ok(state)
 }
 
@@ -210,7 +396,10 @@ async fn create_region_inner(
         ControlEventBody::RegionUpsert {
             name: name.to_string(),
         },
-        region_key_hash(name),
+        vec![ControlCurrentRecord::Region {
+            name: name.to_string(),
+            active: true,
+        }],
         fence_token,
         partition_precondition,
     )
@@ -261,7 +450,16 @@ async fn create_tenant_inner(
             id: tenant.id,
             name: tenant.name.clone(),
         },
-        tenant_key_hash(&tenant.name),
+        vec![
+            ControlCurrentRecord::IdAllocator {
+                max_allocated_id: tenant.id,
+            },
+            ControlCurrentRecord::Tenant {
+                id: tenant.id,
+                name: tenant.name.clone(),
+                active: true,
+            },
+        ],
         fence_token,
         partition_precondition,
     )
@@ -345,7 +543,19 @@ async fn create_app_inner(
             client_id: app.client_id.clone(),
             client_secret_encrypted: encrypted_secret.to_vec(),
         },
-        app_key_hash(tenant_id, name),
+        vec![
+            ControlCurrentRecord::IdAllocator {
+                max_allocated_id: app.id,
+            },
+            ControlCurrentRecord::App {
+                id: app.id,
+                tenant_id,
+                name: app.name.clone(),
+                client_id: app.client_id.clone(),
+                client_secret_encrypted: encrypted_secret.to_vec(),
+                active: true,
+            },
+        ],
         fence_token,
         partition_precondition,
     )
@@ -385,16 +595,24 @@ async fn update_app_secret_inner(
     partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
     let state = read_control_state(storage).await?;
-    if !state.apps.contains_key(&app_id) {
-        return Err(anyhow!("app not found"));
-    }
+    let existing = state
+        .apps
+        .get(&app_id)
+        .ok_or_else(|| anyhow!("app not found"))?;
     append_control_event(
         storage,
         ControlEventBody::AppSecretUpdate {
             app_id,
             client_secret_encrypted: encrypted_secret.to_vec(),
         },
-        app_id_key_hash(app_id),
+        vec![ControlCurrentRecord::App {
+            id: existing.id,
+            tenant_id: existing.tenant_id,
+            name: existing.name.clone(),
+            client_id: existing.client_id.clone(),
+            client_secret_encrypted: encrypted_secret.to_vec(),
+            active: true,
+        }],
         fence_token,
         partition_precondition,
     )
@@ -431,107 +649,14 @@ async fn delete_app_inner(
     append_control_event(
         storage,
         ControlEventBody::AppDelete { app_id },
-        app_id_key_hash(app_id),
-        fence_token,
-        partition_precondition,
-    )
-    .await
-}
-
-#[cfg(test)]
-async fn grant_policy(storage: &Storage, app_id: i64, resource: &str, action: &str) -> Result<()> {
-    grant_policy_inner(storage, app_id, resource, action, 0, None).await
-}
-
-pub(crate) async fn grant_policy_with_permit(
-    storage: &Storage,
-    app_id: i64,
-    resource: &str,
-    action: &str,
-    permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
-) -> Result<()> {
-    let partition_precondition =
-        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    grant_policy_inner(
-        storage,
-        app_id,
-        resource,
-        action,
-        permit.fence_token,
-        Some(partition_precondition),
-    )
-    .await
-}
-
-async fn grant_policy_inner(
-    storage: &Storage,
-    app_id: i64,
-    resource: &str,
-    action: &str,
-    fence_token: u64,
-    partition_precondition: Option<CoreMutationPrecondition>,
-) -> Result<()> {
-    let state = read_control_state(storage).await?;
-    if !state.apps.contains_key(&app_id) {
-        return Err(anyhow!("app not found"));
-    }
-    append_control_event(
-        storage,
-        ControlEventBody::AppPolicyGrant {
-            app_id,
-            resource: resource.to_string(),
-            action: action.to_string(),
-        },
-        policy_key_hash(app_id, resource, action),
-        fence_token,
-        partition_precondition,
-    )
-    .await
-}
-
-#[cfg(test)]
-async fn revoke_policy(storage: &Storage, app_id: i64, resource: &str, action: &str) -> Result<()> {
-    revoke_policy_inner(storage, app_id, resource, action, 0, None).await
-}
-
-pub(crate) async fn revoke_policy_with_permit(
-    storage: &Storage,
-    app_id: i64,
-    resource: &str,
-    action: &str,
-    permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
-) -> Result<()> {
-    let partition_precondition =
-        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    revoke_policy_inner(
-        storage,
-        app_id,
-        resource,
-        action,
-        permit.fence_token,
-        Some(partition_precondition),
-    )
-    .await
-}
-
-async fn revoke_policy_inner(
-    storage: &Storage,
-    app_id: i64,
-    resource: &str,
-    action: &str,
-    fence_token: u64,
-    partition_precondition: Option<CoreMutationPrecondition>,
-) -> Result<()> {
-    append_control_event(
-        storage,
-        ControlEventBody::AppPolicyRevoke {
-            app_id,
-            resource: resource.to_string(),
-            action: action.to_string(),
-        },
-        policy_key_hash(app_id, resource, action),
+        vec![ControlCurrentRecord::App {
+            id: app_id,
+            tenant_id: 0,
+            name: String::new(),
+            client_id: String::new(),
+            client_secret_encrypted: Vec::new(),
+            active: false,
+        }],
         fence_token,
         partition_precondition,
     )
@@ -541,140 +666,64 @@ async fn revoke_policy_inner(
 async fn append_control_event(
     storage: &Storage,
     event: ControlEventBody,
-    key_hash: Hash32,
+    current_updates: Vec<ControlCurrentRecord>,
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    let previous = read_control_journal_frames_from_store(&core_store)
-        .await
-        .unwrap_or_default();
-    let sequence = previous
-        .last()
-        .map(|frame| frame.partition_sequence + 1)
-        .unwrap_or(1);
-    let previous_hash = previous
-        .last()
-        .map(|frame| frame.record_hash)
-        .unwrap_or([0; 32]);
     let mutation_id = uuid::Uuid::new_v4();
-    let frame = JournalFrame::new(
-        JournalRecordKind::ControlPlane,
-        sequence,
-        fence_token,
-        *mutation_id.as_bytes(),
-        key_hash,
-        previous_hash,
-        serde_json::to_vec(&event)?,
-    );
+    let row_generation = current_unix_nanos();
+    let payload = encode_control_event_body(&event, fence_token, mutation_id)?;
     let partition_id = hex::encode(control_partition_id());
+    let mut operations = current_updates
+        .into_iter()
+        .map(|record| control_current_update(record, &mutation_id.to_string(), row_generation))
+        .collect::<Result<Vec<_>>>()?;
+    operations.push(CoreMutationOperation::StreamAppend {
+        partition_id: partition_id.clone(),
+        stream_id: control_plane_stream_id(),
+        record_kind: "control_plane".to_string(),
+        payload,
+        idempotency_key: Some(format!("control-plane:{mutation_id}")),
+    });
     core_store
         .commit_mutation_batch(CoreMutationBatch {
             transaction_id: format!("control-plane:{mutation_id}"),
-            scope_partition: partition_id.clone(),
+            scope_partition: partition_id,
             committed_by_principal: control_partition_principal(),
             preconditions: partition_precondition.into_iter().collect(),
-            operations: vec![CoreMutationOperation::StreamAppend {
-                partition_id,
-                stream_id: control_plane_stream_id(),
-                record_kind: "control_plane".to_string(),
-                payload: frame.encode(),
-                idempotency_key: Some(format!("control-plane:{mutation_id}")),
-            }],
+            operations,
         })
         .await?;
     Ok(())
 }
 
-async fn read_control_journal_frames(storage: &Storage) -> Result<Vec<JournalFrame>> {
+#[cfg(test)]
+#[cfg(test)]
+async fn read_control_journal_bodies(storage: &Storage) -> Result<Vec<ControlEventBody>> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    read_control_journal_frames_from_store(&core_store).await
+    read_control_journal_bodies_from_store(&core_store).await
 }
 
-async fn read_control_journal_frames_from_store(
+#[cfg(test)]
+async fn read_control_journal_bodies_from_store(
     core_store: &CoreStore,
-) -> Result<Vec<JournalFrame>> {
+) -> Result<Vec<ControlEventBody>> {
     let records = core_store
-        .read_stream(ReadStream {
+        .read_stream(crate::core_store::ReadStream {
             stream_id: control_plane_stream_id(),
             after_sequence: 0,
             limit: 0,
         })
         .await?;
-    let mut frames = Vec::new();
+    let mut bodies = Vec::new();
     for record in records {
         if record.record_kind != "control_plane" {
             continue;
         }
-        frames.push(JournalFrame::decode(&record.payload)?);
+        bodies.push(decode_control_event_body(&record.payload)?);
     }
-    validate_journal_chain(&frames)?;
-    Ok(frames)
-}
-
-fn apply_event(state: &mut ControlState, event: ControlEventBody) {
-    match event {
-        ControlEventBody::RegionUpsert { name } => {
-            state.regions.insert(name);
-        }
-        ControlEventBody::TenantUpsert { id, name } => {
-            state.next_id = state.next_id.max(id);
-            state.tenants.insert(id, Tenant { id, name });
-        }
-        ControlEventBody::AppCreate {
-            id,
-            tenant_id,
-            name,
-            client_id,
-            client_secret_encrypted,
-        } => {
-            state.next_id = state.next_id.max(id);
-            state.apps.insert(
-                id,
-                StoredControlApp {
-                    id,
-                    tenant_id,
-                    name,
-                    client_id,
-                    client_secret_encrypted,
-                },
-            );
-        }
-        ControlEventBody::AppSecretUpdate {
-            app_id,
-            client_secret_encrypted,
-        } => {
-            if let Some(app) = state.apps.get_mut(&app_id) {
-                app.client_secret_encrypted = client_secret_encrypted;
-            }
-        }
-        ControlEventBody::AppDelete { app_id } => {
-            state.apps.remove(&app_id);
-            state.app_policies.retain(|policy| policy.app_id != app_id);
-        }
-        ControlEventBody::AppPolicyGrant {
-            app_id,
-            resource,
-            action,
-        } => {
-            state.app_policies.insert(StoredControlPolicy {
-                app_id,
-                resource,
-                action,
-            });
-        }
-        ControlEventBody::AppPolicyRevoke {
-            app_id,
-            resource,
-            action,
-        } => {
-            state.app_policies.remove(&StoredControlPolicy {
-                app_id,
-                resource,
-                action,
-            });
-        }
-    }
+    Ok(bodies)
 }
 
 fn app_record(app: &StoredControlApp) -> App {
@@ -685,24 +734,351 @@ fn app_record(app: &StoredControlApp) -> App {
     }
 }
 
-fn region_key_hash(name: &str) -> Hash32 {
-    hash32(format!("region\0{name}").as_bytes())
+fn control_current_update(
+    record: ControlCurrentRecord,
+    mutation_id: &str,
+    row_generation: u64,
+) -> Result<CoreMutationOperation> {
+    Ok(CoreMutationOperation::CoreMetaPut {
+        partition_id: hex::encode(control_partition_id()),
+        cf: CF_MESH.to_string(),
+        table_id: TABLE_CONTROL_CURRENT_ROW,
+        tuple_key: control_current_tuple_key(&record)?,
+        payload: encode_control_current_row(&record, mutation_id, row_generation)?,
+    })
 }
 
-fn tenant_key_hash(name: &str) -> Hash32 {
-    hash32(format!("tenant\0{name}").as_bytes())
+fn control_current_tuple_key(record: &ControlCurrentRecord) -> Result<Vec<u8>> {
+    match record {
+        ControlCurrentRecord::IdAllocator { .. } => id_allocator_tuple_key(),
+        ControlCurrentRecord::Region { name, .. } => region_tuple_key(name),
+        ControlCurrentRecord::Tenant { id, .. } => tenant_tuple_key(*id),
+        ControlCurrentRecord::App { id, .. } => app_tuple_key(*id),
+    }
 }
 
-fn app_key_hash(tenant_id: i64, name: &str) -> Hash32 {
-    hash32(format!("app\0{tenant_id}\0{name}").as_bytes())
+fn encode_control_event_body(
+    event: &ControlEventBody,
+    fence_token: u64,
+    mutation_id: uuid::Uuid,
+) -> Result<Vec<u8>> {
+    let proto = ControlEventProto {
+        schema: CONTROL_EVENT_SCHEMA.to_string(),
+        emitted_at: chrono::Utc::now().to_rfc3339(),
+        fence_token,
+        mutation_id: mutation_id.to_string(),
+        event: Some(match event {
+            ControlEventBody::RegionUpsert { name } => {
+                control_event_proto::Event::RegionUpsert(RegionUpsertProto { name: name.clone() })
+            }
+            ControlEventBody::TenantUpsert { id, name } => {
+                control_event_proto::Event::TenantUpsert(TenantUpsertProto {
+                    id: *id,
+                    name: name.clone(),
+                })
+            }
+            ControlEventBody::AppCreate {
+                id,
+                tenant_id,
+                name,
+                client_id,
+                client_secret_encrypted,
+            } => control_event_proto::Event::AppCreate(AppCreateProto {
+                id: *id,
+                tenant_id: *tenant_id,
+                name: name.clone(),
+                client_id: client_id.clone(),
+                client_secret_encrypted: client_secret_encrypted.clone(),
+            }),
+            ControlEventBody::AppSecretUpdate {
+                app_id,
+                client_secret_encrypted,
+            } => control_event_proto::Event::AppSecretUpdate(AppSecretUpdateProto {
+                app_id: *app_id,
+                client_secret_encrypted: client_secret_encrypted.clone(),
+            }),
+            ControlEventBody::AppDelete { app_id } => {
+                control_event_proto::Event::AppDelete(AppDeleteProto { app_id: *app_id })
+            }
+        }),
+    };
+    let mut bytes = Vec::new();
+    proto.encode(&mut bytes)?;
+    ensure_deterministic_control_proto(&proto, &bytes, "control event")?;
+    if bytes.len() > CONTROL_CURRENT_TARGET_MAX_BYTES {
+        bail!(
+            "control event protobuf is {} bytes, exceeding {} bytes",
+            bytes.len(),
+            CONTROL_CURRENT_TARGET_MAX_BYTES
+        );
+    }
+    Ok(bytes)
 }
 
-fn app_id_key_hash(app_id: i64) -> Hash32 {
-    hash32(format!("app\0{app_id}").as_bytes())
+#[cfg(test)]
+fn decode_control_event_body(bytes: &[u8]) -> Result<ControlEventBody> {
+    let proto = ControlEventProto::decode(bytes)?;
+    ensure_deterministic_control_proto(&proto, bytes, "control event")?;
+    if proto.schema != CONTROL_EVENT_SCHEMA {
+        bail!("control event protobuf has invalid schema");
+    }
+    let _mutation_id = uuid::Uuid::parse_str(&proto.mutation_id)
+        .map_err(|_| anyhow!("control event protobuf has invalid mutation id"))?;
+    match proto
+        .event
+        .ok_or_else(|| anyhow!("control event protobuf is missing event"))?
+    {
+        control_event_proto::Event::RegionUpsert(value) => {
+            Ok(ControlEventBody::RegionUpsert { name: value.name })
+        }
+        control_event_proto::Event::TenantUpsert(value) => Ok(ControlEventBody::TenantUpsert {
+            id: value.id,
+            name: value.name,
+        }),
+        control_event_proto::Event::AppCreate(value) => Ok(ControlEventBody::AppCreate {
+            id: value.id,
+            tenant_id: value.tenant_id,
+            name: value.name,
+            client_id: value.client_id,
+            client_secret_encrypted: value.client_secret_encrypted,
+        }),
+        control_event_proto::Event::AppSecretUpdate(value) => {
+            Ok(ControlEventBody::AppSecretUpdate {
+                app_id: value.app_id,
+                client_secret_encrypted: value.client_secret_encrypted,
+            })
+        }
+        control_event_proto::Event::AppDelete(value) => Ok(ControlEventBody::AppDelete {
+            app_id: value.app_id,
+        }),
+    }
 }
 
-fn policy_key_hash(app_id: i64, resource: &str, action: &str) -> Hash32 {
-    hash32(format!("policy\0{app_id}\0{resource}\0{action}").as_bytes())
+#[cfg(test)]
+#[cfg(test)]
+fn decode_control_event_body_fence(bytes: &[u8]) -> Result<u64> {
+    let proto = ControlEventProto::decode(bytes)?;
+    ensure_deterministic_control_proto(&proto, bytes, "control event")?;
+    if proto.schema != CONTROL_EVENT_SCHEMA {
+        bail!("control event protobuf has invalid schema");
+    }
+    let _mutation_id = uuid::Uuid::parse_str(&proto.mutation_id)
+        .map_err(|_| anyhow!("control event protobuf has invalid mutation id"))?;
+    Ok(proto.fence_token)
+}
+
+fn ensure_deterministic_control_proto(
+    message: &impl Message,
+    bytes: &[u8],
+    label: &str,
+) -> Result<()> {
+    let mut canonical = Vec::with_capacity(message.encoded_len());
+    message.encode(&mut canonical)?;
+    if canonical != bytes {
+        bail!("{label} protobuf is not deterministic");
+    }
+    Ok(())
+}
+
+fn encode_control_current_row(
+    record: &ControlCurrentRecord,
+    mutation_id: &str,
+    row_generation: u64,
+) -> Result<Vec<u8>> {
+    let proto = ControlCurrentProto {
+        common: Some(core_meta_committed_row_common(
+            control_current_realm_id(record),
+            control_current_root_key_hash(record),
+            row_generation,
+            mutation_id.to_string(),
+            row_generation,
+        )),
+        schema: CONTROL_CURRENT_SCHEMA.to_string(),
+        record: Some(match record {
+            ControlCurrentRecord::IdAllocator { max_allocated_id } => {
+                control_current_proto::Record::IdAllocator(IdAllocatorCurrentProto {
+                    max_allocated_id: *max_allocated_id,
+                })
+            }
+            ControlCurrentRecord::Region { name, active } => {
+                control_current_proto::Record::Region(RegionCurrentProto {
+                    name: name.clone(),
+                    active: *active,
+                })
+            }
+            ControlCurrentRecord::Tenant { id, name, active } => {
+                control_current_proto::Record::Tenant(TenantCurrentProto {
+                    id: *id,
+                    name: name.clone(),
+                    active: *active,
+                })
+            }
+            ControlCurrentRecord::App {
+                id,
+                tenant_id,
+                name,
+                client_id,
+                client_secret_encrypted,
+                active,
+            } => control_current_proto::Record::App(AppCurrentProto {
+                id: *id,
+                tenant_id: *tenant_id,
+                name: name.clone(),
+                client_id: client_id.clone(),
+                client_secret_encrypted: client_secret_encrypted.clone(),
+                active: *active,
+            }),
+        }),
+    };
+    let mut bytes = Vec::new();
+    proto.encode(&mut bytes)?;
+    ensure_deterministic_control_proto(&proto, &bytes, "control current")?;
+    if bytes.len() > CONTROL_CURRENT_TARGET_MAX_BYTES {
+        bail!(
+            "control current protobuf is {} bytes, exceeding {} bytes",
+            bytes.len(),
+            CONTROL_CURRENT_TARGET_MAX_BYTES
+        );
+    }
+    Ok(bytes)
+}
+
+fn decode_control_current_row(bytes: &[u8]) -> Result<ControlCurrentRecord> {
+    if bytes.len() > CONTROL_CURRENT_TARGET_MAX_BYTES {
+        bail!(
+            "control current protobuf is {} bytes, exceeding {} bytes",
+            bytes.len(),
+            CONTROL_CURRENT_TARGET_MAX_BYTES
+        );
+    }
+    let proto = ControlCurrentProto::decode(bytes)?;
+    ensure_deterministic_control_proto(&proto, bytes, "control current")?;
+    if proto.schema != CONTROL_CURRENT_SCHEMA {
+        bail!("control current protobuf has invalid schema");
+    }
+    let common = proto
+        .common
+        .as_ref()
+        .ok_or_else(|| anyhow!("control current row missing CoreMeta common"))?;
+    if common.root_key_hash.is_empty() {
+        bail!("control current row missing root hash");
+    }
+    match proto
+        .record
+        .ok_or_else(|| anyhow!("control current protobuf is missing record"))?
+    {
+        control_current_proto::Record::IdAllocator(value) => {
+            Ok(ControlCurrentRecord::IdAllocator {
+                max_allocated_id: value.max_allocated_id,
+            })
+        }
+        control_current_proto::Record::Region(value) => Ok(ControlCurrentRecord::Region {
+            name: value.name,
+            active: value.active,
+        }),
+        control_current_proto::Record::Tenant(value) => Ok(ControlCurrentRecord::Tenant {
+            id: value.id,
+            name: value.name,
+            active: value.active,
+        }),
+        control_current_proto::Record::App(value) => Ok(ControlCurrentRecord::App {
+            id: value.id,
+            tenant_id: value.tenant_id,
+            name: value.name,
+            client_id: value.client_id,
+            client_secret_encrypted: value.client_secret_encrypted,
+            active: value.active,
+        }),
+    }
+}
+
+fn stable_suffix(bytes: &[u8]) -> String {
+    hex::encode(hash32(bytes))
+}
+
+fn id_allocator_tuple_key() -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("control-current"),
+        CoreMetaTuplePart::Utf8("id-allocator"),
+    ])
+}
+
+fn region_tuple_key(name: &str) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("control-current"),
+        CoreMetaTuplePart::Utf8("region"),
+        CoreMetaTuplePart::Hash(&stable_suffix(name.as_bytes())),
+        CoreMetaTuplePart::Utf8(name),
+    ])
+}
+
+fn region_tuple_prefix() -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("control-current"),
+        CoreMetaTuplePart::Utf8("region"),
+    ])
+}
+
+fn tenant_tuple_key(id: i64) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("control-current"),
+        CoreMetaTuplePart::Utf8("tenant"),
+        CoreMetaTuplePart::I64(id),
+    ])
+}
+
+fn tenant_tuple_prefix() -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("control-current"),
+        CoreMetaTuplePart::Utf8("tenant"),
+    ])
+}
+
+fn app_tuple_key(id: i64) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("control-current"),
+        CoreMetaTuplePart::Utf8("app"),
+        CoreMetaTuplePart::I64(id),
+    ])
+}
+
+fn app_tuple_prefix() -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("control-current"),
+        CoreMetaTuplePart::Utf8("app"),
+    ])
+}
+
+fn control_current_realm_id(record: &ControlCurrentRecord) -> String {
+    match record {
+        ControlCurrentRecord::IdAllocator { .. } | ControlCurrentRecord::Region { .. } => {
+            "system".to_string()
+        }
+        ControlCurrentRecord::Tenant { id, .. } => format!("tenant/{id}"),
+        ControlCurrentRecord::App { tenant_id, .. } => format!("tenant/{tenant_id}"),
+    }
+}
+
+fn control_current_root_key_hash(record: &ControlCurrentRecord) -> String {
+    match record {
+        ControlCurrentRecord::IdAllocator { .. } => core_meta_root_key_hash("control/id-allocator"),
+        ControlCurrentRecord::Region { .. } => core_meta_root_key_hash("control/regions"),
+        ControlCurrentRecord::Tenant { id, .. } => {
+            core_meta_root_key_hash(&format!("control/tenant/{id}"))
+        }
+        ControlCurrentRecord::App { id, .. } => {
+            core_meta_root_key_hash(&format!("control/app/{id}"))
+        }
+    }
+}
+
+fn current_unix_nanos() -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    now.as_secs()
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::from(now.subsec_nanos()))
 }
 
 pub fn control_partition_id() -> Hash32 {
@@ -719,11 +1095,18 @@ fn control_partition_principal() -> String {
 
 #[cfg(test)]
 pub(crate) async fn read_control_frame_fences_for_test(storage: &Storage) -> Result<Vec<u64>> {
-    Ok(read_control_journal_frames(storage)
+    let core_store = CoreStore::new(storage.clone()).await?;
+    Ok(core_store
+        .read_stream(crate::core_store::ReadStream {
+            stream_id: control_plane_stream_id(),
+            after_sequence: 0,
+            limit: 0,
+        })
         .await?
         .into_iter()
-        .map(|frame| frame.fence_token)
-        .collect())
+        .filter(|record| record.record_kind == "control_plane")
+        .map(|record| decode_control_event_body_fence(&record.payload))
+        .collect::<Result<Vec<_>>>()?)
 }
 
 async fn control_write_precondition(
@@ -732,7 +1115,7 @@ async fn control_write_precondition(
     partition_owner_signing_key: &[u8],
 ) -> Result<CoreMutationPrecondition> {
     require_control_permit(permit)?;
-    Ok(partition_write_ref_precondition(storage, permit, partition_owner_signing_key).await?)
+    Ok(partition_write_precondition(storage, permit, partition_owner_signing_key).await?)
 }
 
 fn require_control_permit(permit: &PartitionWritePermit) -> Result<()> {
@@ -762,7 +1145,7 @@ mod tests {
     const KEY: &[u8] = b"control-plane partition owner key";
 
     #[tokio::test]
-    async fn control_journal_replays_regions_tenants_apps_and_policies() {
+    async fn control_state_reads_current_rows_and_keeps_history_for_watch() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
 
@@ -775,35 +1158,134 @@ mod tests {
         let app = create_app(&storage, tenant.id, "demo", "client-a", b"secret-a")
             .await
             .unwrap();
-        grant_policy(&storage, app.id, "*", "*").await.unwrap();
-        grant_policy(&storage, app.id, "bucket-a", "bucket:create")
-            .await
-            .unwrap();
         update_app_secret(&storage, app.id, b"secret-b")
             .await
             .unwrap();
-        revoke_policy(&storage, app.id, "bucket-a", "bucket:create")
-            .await
-            .unwrap();
 
-        let replayed = read_control_state(&storage).await.unwrap();
-        assert_eq!(replayed.regions(), vec!["local".to_string()]);
-        assert_eq!(replayed.tenant_by_name("default").unwrap().id, tenant.id);
-        assert_eq!(replayed.app_by_name("demo").unwrap().id, app.id);
+        let current = read_control_state(&storage).await.unwrap();
+        assert_eq!(current.regions(), vec!["local".to_string()]);
+        assert_eq!(current.tenant_by_name("default").unwrap().id, tenant.id);
+        assert_eq!(current.app_by_name("demo").unwrap().id, app.id);
         assert_eq!(
-            replayed.app_details_by_client_id("client-a").unwrap().id,
+            current.app_details_by_client_id("client-a").unwrap().id,
             app.id
         );
         assert_eq!(
-            replayed
+            current
                 .app_details_by_client_id("client-a")
                 .unwrap()
                 .client_secret_encrypted,
             b"secret-b".to_vec()
         );
-        assert_eq!(replayed.policies_for_app(app.id), vec!["*|*".to_string()]);
-        let frames = read_control_journal_frames(&storage).await.unwrap();
-        assert_eq!(frames.len(), 7);
+        let bodies = read_control_journal_bodies(&storage).await.unwrap();
+        assert_eq!(bodies.len(), 4);
+        assert!(matches!(bodies[0], ControlEventBody::RegionUpsert { .. }));
+    }
+
+    #[tokio::test]
+    async fn control_current_state_does_not_replay_control_history_stream() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let core_store = CoreStore::new(storage.clone()).await.unwrap();
+        let event = ControlEventBody::TenantUpsert {
+            id: 41,
+            name: "history-only".to_string(),
+        };
+        let mutation_id = uuid::Uuid::new_v4();
+        let payload = encode_control_event_body(&event, 0, mutation_id).unwrap();
+        core_store
+            .commit_mutation_batch(CoreMutationBatch {
+                transaction_id: format!("history-only:{mutation_id}"),
+                scope_partition: hex::encode(control_partition_id()),
+                committed_by_principal: control_partition_principal(),
+                preconditions: Vec::new(),
+                operations: vec![CoreMutationOperation::StreamAppend {
+                    partition_id: hex::encode(control_partition_id()),
+                    stream_id: control_plane_stream_id(),
+                    record_kind: "control_plane".to_string(),
+                    payload,
+                    idempotency_key: Some(format!("history-only:{mutation_id}")),
+                }],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_control_journal_bodies(&storage).await.unwrap().len(),
+            1
+        );
+        let state = read_control_state(&storage).await.unwrap();
+        assert!(state.tenants().is_empty());
+        assert!(state.tenant_by_name("history-only").is_none());
+    }
+
+    #[tokio::test]
+    async fn control_current_rows_are_sufficient_without_control_history_stream() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let core_store = CoreStore::new(storage.clone()).await.unwrap();
+        let tenant = Tenant {
+            id: 1,
+            name: "default".to_string(),
+        };
+        let app = StoredControlApp {
+            id: 2,
+            tenant_id: tenant.id,
+            name: "demo".to_string(),
+            client_id: "client-a".to_string(),
+            client_secret_encrypted: b"secret-a".to_vec(),
+        };
+        core_store
+            .commit_mutation_batch(CoreMutationBatch {
+                transaction_id: "current-row-seed".to_string(),
+                scope_partition: hex::encode(control_partition_id()),
+                committed_by_principal: control_partition_principal(),
+                preconditions: Vec::new(),
+                operations: vec![
+                    ControlCurrentRecord::IdAllocator {
+                        max_allocated_id: app.id,
+                    },
+                    ControlCurrentRecord::Region {
+                        name: "local".to_string(),
+                        active: true,
+                    },
+                    ControlCurrentRecord::Tenant {
+                        id: tenant.id,
+                        name: tenant.name.clone(),
+                        active: true,
+                    },
+                    ControlCurrentRecord::App {
+                        id: app.id,
+                        tenant_id: app.tenant_id,
+                        name: app.name.clone(),
+                        client_id: app.client_id.clone(),
+                        client_secret_encrypted: app.client_secret_encrypted.clone(),
+                        active: true,
+                    },
+                ]
+                .into_iter()
+                .map(|record| {
+                    control_current_update(record, "current-row-seed", current_unix_nanos())
+                })
+                .collect::<Result<Vec<_>>>()
+                .unwrap(),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            read_control_journal_bodies(&storage)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let state = read_control_state(&storage).await.unwrap();
+        assert_eq!(state.regions(), vec!["local".to_string()]);
+        let loaded_tenant = state.tenant_by_name("default").unwrap();
+        assert_eq!(loaded_tenant.id, tenant.id);
+        assert_eq!(loaded_tenant.name, tenant.name);
+        assert_eq!(state.app_by_id(app.id).unwrap().client_id, app.client_id);
+        assert_eq!(state.allocate_id(), 3);
     }
 
     #[tokio::test]
@@ -822,7 +1304,7 @@ mod tests {
     }
 
     #[tokio::test]
-    pub(crate) async fn control_journal_with_permit_writes_fenced_frames_and_header() {
+    pub(crate) async fn control_journal_with_permit_writes_fenced_payloads_and_current_rows() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, "node-a").await;
@@ -847,23 +1329,13 @@ mod tests {
         )
         .await
         .unwrap();
-        grant_policy_with_permit(&storage, app.id, "*", "*", &permit, KEY)
-            .await
-            .unwrap();
         update_app_secret_with_permit(&storage, app.id, b"secret-b", &permit, KEY)
             .await
             .unwrap();
-        revoke_policy_with_permit(&storage, app.id, "*", "*", &permit, KEY)
-            .await
-            .unwrap();
 
-        let frames = read_control_journal_frames(&storage).await.unwrap();
-        assert_eq!(frames.len(), 6);
-        assert!(
-            frames
-                .iter()
-                .all(|frame| frame.fence_token == permit.fence_token)
-        );
+        let fences = read_control_frame_fences_for_test(&storage).await.unwrap();
+        assert_eq!(fences.len(), 4);
+        assert!(fences.iter().all(|fence| *fence == permit.fence_token));
     }
 
     #[tokio::test]
@@ -890,7 +1362,7 @@ mod tests {
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, "node-a").await;
         let stale_permit = owner.write_permit().unwrap();
-        let stale_precondition = partition_write_ref_precondition(&storage, &stale_permit, KEY)
+        let stale_precondition = partition_write_precondition(&storage, &stale_permit, KEY)
             .await
             .unwrap();
         let newer = ready_owner(&storage, "node-b").await;

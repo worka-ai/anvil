@@ -1,4 +1,21 @@
 use super::*;
+use prost::Message;
+
+#[derive(Clone, PartialEq, Message)]
+struct ActiveIndexPolicySnapshotProto {
+    #[prost(message, repeated, tag = "1")]
+    definitions: Vec<ActiveIndexPolicyDefinitionProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ActiveIndexPolicyDefinitionProto {
+    #[prost(string, tag = "1")]
+    name: String,
+    #[prost(string, tag = "2")]
+    kind: String,
+    #[prost(int64, tag = "3")]
+    version: i64,
+}
 
 impl Persistence {
     pub async fn get_tenant_by_name(&self, name: &str) -> Result<Option<Tenant>> {
@@ -17,12 +34,6 @@ impl Persistence {
         Ok(control_journal::read_control_state(&self.storage)
             .await?
             .app_details_by_client_id(client_id))
-    }
-
-    pub async fn get_policies_for_app(&self, app_id: i64) -> Result<Vec<String>> {
-        Ok(control_journal::read_control_state(&self.storage)
-            .await?
-            .policies_for_app(app_id))
     }
 
     pub async fn create_tenant(&self, name: &str, idempotency_key: &str) -> Result<Tenant> {
@@ -94,41 +105,6 @@ impl Persistence {
         control_journal::delete_app_with_permit(
             &self.storage,
             app_id,
-            &permit,
-            &self.partition_owner_signing_key,
-        )
-        .await
-    }
-
-    pub(crate) async fn list_policies_for_app(
-        &self,
-        app_id: i64,
-    ) -> Result<Vec<control_journal::StoredAppPolicy>> {
-        Ok(control_journal::read_control_state(&self.storage)
-            .await?
-            .policy_records_for_app(app_id))
-    }
-
-    pub async fn grant_policy(&self, app_id: i64, resource: &str, action: &str) -> Result<()> {
-        let permit = self.control_write_permit().await?;
-        control_journal::grant_policy_with_permit(
-            &self.storage,
-            app_id,
-            resource,
-            action,
-            &permit,
-            &self.partition_owner_signing_key,
-        )
-        .await
-    }
-
-    pub async fn revoke_policy(&self, app_id: i64, resource: &str, action: &str) -> Result<()> {
-        let permit = self.control_write_permit().await?;
-        control_journal::revoke_policy_with_permit(
-            &self.storage,
-            app_id,
-            resource,
-            action,
             &permit,
             &self.partition_owner_signing_key,
         )
@@ -255,10 +231,6 @@ impl Persistence {
         Ok(bucket)
     }
 
-    pub async fn get_public_bucket_by_name(&self, name: &str) -> Result<Option<Bucket>> {
-        bucket_journal::read_public_bucket_by_name(&self.storage, name).await
-    }
-
     pub async fn set_bucket_public_access(
         &self,
         tenant_id: i64,
@@ -281,32 +253,6 @@ impl Persistence {
         )
         .await?;
         self.cache.invalidate_bucket(tenant_id, bucket_name).await;
-        Ok(out)
-    }
-
-    pub async fn set_bucket_public_access_by_name(
-        &self,
-        bucket_name: &str,
-        is_public: bool,
-    ) -> Result<Bucket> {
-        let mut out = bucket_journal::read_current_bucket_by_name(&self.storage, bucket_name)
-            .await?
-            .ok_or_else(|| anyhow!("bucket not found"))?;
-        out.is_public_read = is_public;
-        let tenant_permit = self.bucket_tenant_write_permit(out.tenant_id).await?;
-        let global_permit = self.bucket_global_write_permit().await?;
-        bucket_journal::append_bucket_mutation_with_permits(
-            &self.storage,
-            &out,
-            BucketJournalMutation::Update,
-            &tenant_permit,
-            &global_permit,
-            &self.partition_owner_signing_key,
-        )
-        .await?;
-        self.cache
-            .invalidate_bucket(out.tenant_id, bucket_name)
-            .await;
         Ok(out)
     }
 
@@ -421,14 +367,21 @@ impl Persistence {
             false,
         )
         .await?;
-        Ok(blake3::hash(&serde_json::to_vec(
-            &defs
+        let snapshot = ActiveIndexPolicySnapshotProto {
+            definitions: defs
                 .iter()
-                .map(|d| (&d.name, &d.kind, d.version))
-                .collect::<Vec<_>>(),
-        )?)
-        .to_hex()
-        .to_string())
+                .map(|definition| ActiveIndexPolicyDefinitionProto {
+                    name: definition.name.clone(),
+                    kind: definition.kind.clone(),
+                    version: definition.version,
+                })
+                .collect(),
+        };
+        Ok(
+            blake3::hash(&crate::core_store::encode_deterministic_proto(&snapshot))
+                .to_hex()
+                .to_string(),
+        )
     }
 
     pub async fn latest_authz_revision(&self, tenant_id: i64) -> Result<i64> {

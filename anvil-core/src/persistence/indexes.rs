@@ -118,6 +118,29 @@ impl Persistence {
         index: &IndexDefinition,
         event_type: &str,
     ) -> Result<IndexDefinitionEvent> {
+        self.create_index_definition_event_with_transaction(
+            tenant_id,
+            bucket_id,
+            bucket_name,
+            index,
+            event_type,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_index_definition_event_with_transaction(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        bucket_name: &str,
+        index: &IndexDefinition,
+        event_type: &str,
+        transaction_id: Option<&str>,
+        transaction_principal: Option<&str>,
+    ) -> Result<IndexDefinitionEvent> {
         let event = IndexDefinitionEvent {
             id: index_journal::read_index_definition_events(
                 &self.storage,
@@ -160,11 +183,13 @@ impl Persistence {
         let permit = self
             .index_definition_write_permit(tenant_id, bucket_id)
             .await?;
-        index_journal::append_index_definition_event_with_permit(
+        index_journal::append_index_definition_event_with_permit_in_transaction(
             &self.storage,
             &event,
             &permit,
             &self.partition_owner_signing_key,
+            transaction_id,
+            transaction_principal,
         )
         .await?;
         Ok(event)

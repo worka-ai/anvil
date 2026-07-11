@@ -1,4 +1,8 @@
-use crate::core_store::{AuthzScopeRef, CoreObjectRef, CoreStore, GetBlob, SourceId, SourceKind};
+use crate::core_store::{
+    AuthzScopeRef, CoreBoundaryValue, CoreByteRange, CoreManifestLocator, CoreObjectRef,
+    CorePrefetchPolicy, CoreStore, GetBlob, ReadLogicalRangeRequest, SourceId, SourceKind,
+    decode_core_object_ref_target, decode_manifest_locator_proto,
+};
 use crate::embedding_provider::{EmbeddingProviderRegistry, TEST_ONLY_EMBEDDING_PROVIDER};
 use crate::formats::{
     full_text::FullTextDocument,
@@ -7,7 +11,6 @@ use crate::formats::{
     vector::{VectorIndexDefinition, VectorMetric, VectorPayload, VectorRecord},
 };
 use crate::full_text_segment::{self, FullTextSegmentWrite};
-use crate::index_journal;
 use crate::index_partition_watch::{self, IndexPartitionWatchPayload};
 use crate::media_extraction::{
     DerivedAssetPolicy, DerivedOutputKind, MediaExtractionRequest, MediaObjectRef,
@@ -29,11 +32,13 @@ use crate::{
     derived_index_proof::{self, DerivedIndexProofWrite},
     watch_checkpoint::{self, WatchCheckpointUpdate, WatchCheckpointWriteAuthority},
 };
+use crate::{index_coremeta, index_journal};
 use anyhow::{Context, Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use prost::Message;
 use serde::Deserialize;
-use serde::Serialize;
 use serde_json::Value as JsonValue;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexBuildOutcome {
@@ -56,12 +61,46 @@ pub struct IndexBuildDiagnostic {
     pub details: JsonValue,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 struct DocumentTableRow<'a> {
     document_id: u64,
     field_id: u16,
     object_key: &'a str,
     version_id: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct FullTextDocumentTableProto {
+    #[prost(string, tag = "1")]
+    schema: String,
+    #[prost(message, repeated, tag = "2")]
+    rows: Vec<FullTextDocumentTableRowProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct FullTextDocumentTableRowProto {
+    #[prost(uint64, tag = "1")]
+    document_id: u64,
+    #[prost(uint32, tag = "2")]
+    field_id: u32,
+    #[prost(string, tag = "3")]
+    object_key: String,
+    #[prost(string, tag = "4")]
+    version_id: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct IndexDefinitionDigestProto {
+    #[prost(string, tag = "1")]
+    schema: String,
+    #[prost(string, tag = "2")]
+    index_kind: String,
+    #[prost(bytes = "vec", tag = "3")]
+    selector_json: Vec<u8>,
+    #[prost(bytes = "vec", tag = "4")]
+    extractor_json: Vec<u8>,
+    #[prost(bytes = "vec", tag = "5")]
+    build_policy_json: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +160,114 @@ struct TypedJsonBuildField {
     required: bool,
 }
 
+async fn boundary_values_for_objects(
+    storage: &Storage,
+    objects: &[Object],
+) -> Result<Vec<CoreBoundaryValue>> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let mut values: Vec<CoreBoundaryValue> = Vec::new();
+    for object in objects {
+        let Some(shard_map) = object.shard_map.as_ref() else {
+            continue;
+        };
+        if shard_map.get("schema").and_then(JsonValue::as_str)
+            != Some("anvil.core.object_data_target.v1")
+        {
+            continue;
+        }
+        let Some(kind) = shard_map.get("kind").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let Some(target) = shard_map.get("target").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        match kind {
+            "logical_file" => {
+                let bytes = URL_SAFE_NO_PAD.decode(target)?;
+                let locator = decode_manifest_locator_proto(&bytes)?;
+                let manifest = store.read_logical_file_manifest(&locator).await?;
+                for range in manifest.ranges {
+                    for value in range.boundary_values {
+                        if !values.contains(&value) {
+                            values.push(value);
+                        }
+                    }
+                }
+            }
+            _ => continue,
+        }
+    }
+    Ok(values)
+}
+
+fn encode_full_text_document_table(rows: &[DocumentTableRow<'_>]) -> Result<Vec<u8>> {
+    let proto = FullTextDocumentTableProto {
+        schema: "anvil.index.full_text.document_table.v1".to_string(),
+        rows: rows
+            .iter()
+            .map(|row| FullTextDocumentTableRowProto {
+                document_id: row.document_id,
+                field_id: u32::from(row.field_id),
+                object_key: row.object_key.to_string(),
+                version_id: row.version_id.clone(),
+            })
+            .collect(),
+    };
+    encode_deterministic_proto(&proto)
+}
+
+fn index_definition_hash(
+    index_kind: &str,
+    selector: &JsonValue,
+    extractor: &JsonValue,
+    build_policy: &JsonValue,
+) -> Result<String> {
+    let proto = IndexDefinitionDigestProto {
+        schema: "anvil.index.definition_digest.v1".to_string(),
+        index_kind: index_kind.to_string(),
+        selector_json: canonical_json_bytes(selector)?,
+        extractor_json: canonical_json_bytes(extractor)?,
+        build_policy_json: canonical_json_bytes(build_policy)?,
+    };
+    Ok(blake3::hash(&encode_deterministic_proto(&proto)?)
+        .to_hex()
+        .to_string())
+}
+
+fn canonical_json_bytes(value: &JsonValue) -> Result<Vec<u8>> {
+    serde_json::to_vec(&canonical_json(value)).map_err(Into::into)
+}
+
+fn canonical_json(value: &JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Array(values) => JsonValue::Array(values.iter().map(canonical_json).collect()),
+        JsonValue::Object(values) => {
+            let mut sorted = serde_json::Map::new();
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                sorted.insert(key.clone(), canonical_json(&values[key]));
+            }
+            JsonValue::Object(sorted)
+        }
+        scalar => scalar.clone(),
+    }
+}
+
+fn encode_deterministic_proto(message: &impl Message) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(message.encoded_len());
+    message.encode(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn latest_index_segment_generation(storage: &Storage, index_storage_id: &str) -> Result<u64> {
+    Ok(
+        index_coremeta::latest_index_segment_coremeta_record(storage, index_storage_id)?
+            .map(|record| record.generation)
+            .unwrap_or(0),
+    )
+}
+
 pub async fn build_full_text_index(
     storage: &Storage,
     bucket: &Bucket,
@@ -139,11 +286,7 @@ pub async fn build_full_text_index(
         .map_err(|error| anyhow!("invalid full text index definition: {error}"))?;
     let index_storage_id =
         index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
-    let latest_generation =
-        full_text_segment::read_latest_full_text_segment(storage, &index_storage_id)
-            .await?
-            .map(|segment| segment.header.generation)
-            .unwrap_or(0);
+    let latest_generation = latest_index_segment_generation(storage, &index_storage_id)?;
     let latest_checkpoint_generation =
         latest_index_checkpoint_generation(storage, &index_storage_id, partition_owner_signing_key)
             .await?;
@@ -169,6 +312,7 @@ pub async fn build_full_text_index(
         source_cursor,
     )
     .await?;
+    let boundary_values = boundary_values_for_objects(storage, &objects).await?;
     let core_store = CoreStore::new(storage.clone()).await?;
     let mut owned_documents = Vec::new();
     let mut diagnostics = Vec::new();
@@ -230,17 +374,16 @@ pub async fn build_full_text_index(
         &borrowed_documents,
         &definition.tokenizer,
     );
-    let document_table = serde_json::to_vec(
-        &owned_documents
-            .iter()
-            .map(|document| DocumentTableRow {
-                document_id: document.document_id,
-                field_id: document.field_id,
-                object_key: &document.object_key,
-                version_id: uuid::Uuid::from_bytes(document.object_version_id).to_string(),
-            })
-            .collect::<Vec<_>>(),
-    )?;
+    let document_table_rows = owned_documents
+        .iter()
+        .map(|document| DocumentTableRow {
+            document_id: document.document_id,
+            field_id: document.field_id,
+            object_key: &document.object_key,
+            version_id: uuid::Uuid::from_bytes(document.object_version_id).to_string(),
+        })
+        .collect::<Vec<_>>();
+    let document_table = encode_full_text_document_table(&document_table_rows)?;
     let segment_ref = full_text_segment::write_full_text_segment(
         storage,
         FullTextSegmentWrite {
@@ -250,6 +393,7 @@ pub async fn build_full_text_index(
             scorer: serde_json::json!({ "kind": "bm25" }),
             source_cursor: u64::try_from(source_cursor).unwrap_or(u64::MAX),
             authz_revision: latest_authz_revision_for_documents(&owned_documents),
+            boundary_values: &boundary_values,
             built_postings: &built,
             document_table: &document_table,
         },
@@ -355,11 +499,7 @@ pub async fn build_typed_json_index(
     let definition = parse_typed_json_build_definition(index)?;
     let index_storage_id =
         index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
-    let latest_generation =
-        typed_field_segment::read_latest_typed_field_segment(storage, &index_storage_id)
-            .await?
-            .map(|segment| segment.header.generation)
-            .unwrap_or(0);
+    let latest_generation = latest_index_segment_generation(storage, &index_storage_id)?;
     let latest_checkpoint_generation =
         latest_index_checkpoint_generation(storage, &index_storage_id, partition_owner_signing_key)
             .await?;
@@ -379,7 +519,7 @@ pub async fn build_typed_json_index(
         .max(1);
 
     let core_store = CoreStore::new(storage.clone()).await?;
-    let (rows, diagnostics) = match definition.source_kind.as_str() {
+    let (rows, diagnostics, boundary_values) = match definition.source_kind.as_str() {
         "object_current" => {
             build_typed_json_object_rows(
                 storage,
@@ -404,9 +544,12 @@ pub async fn build_typed_json_index(
         .iter()
         .map(|field| field.name.clone())
         .collect::<Vec<_>>();
-    let definition_hash = blake3::hash(index.build_policy.to_string().as_bytes())
-        .to_hex()
-        .to_string();
+    let definition_hash = index_definition_hash(
+        "typed_json",
+        &index.selector,
+        &index.extractor,
+        &index.build_policy,
+    )?;
     let segment_ref = typed_field_segment::write_typed_field_segment(
         storage,
         TypedFieldSegmentWrite {
@@ -415,6 +558,7 @@ pub async fn build_typed_json_index(
             source_kind: &definition.source_kind,
             source_cursor: u64::try_from(source_cursor).unwrap_or(u64::MAX),
             authz_revision: latest_authz_revision_for_typed_rows(&rows),
+            boundary_values: &boundary_values,
             definition_hash: &definition_hash,
             field_names: &field_names,
             rows: &rows,
@@ -523,11 +667,7 @@ pub async fn build_metadata_backed_index(
     }
     let index_storage_id =
         index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
-    let latest_generation =
-        typed_field_segment::read_latest_typed_field_segment(storage, &index_storage_id)
-            .await?
-            .map(|segment| segment.header.generation)
-            .unwrap_or(0);
+    let latest_generation = latest_index_segment_generation(storage, &index_storage_id)?;
     let latest_checkpoint_generation =
         latest_index_checkpoint_generation(storage, &index_storage_id, partition_owner_signing_key)
             .await?;
@@ -553,6 +693,8 @@ pub async fn build_metadata_backed_index(
         source_cursor,
     )
     .await?;
+    let boundary_values = boundary_values_for_objects(storage, &objects).await?;
+
     let mut rows = Vec::new();
     let mut field_names = BTreeMap::<String, ()>::new();
     for object in objects {
@@ -566,18 +708,12 @@ pub async fn build_metadata_backed_index(
         rows.push(row);
     }
     let field_names = field_names.into_keys().collect::<Vec<_>>();
-    let definition_hash = blake3::hash(
-        serde_json::json!({
-            "kind": index.kind,
-            "selector": index.selector,
-            "extractor": index.extractor,
-            "build_policy": index.build_policy,
-        })
-        .to_string()
-        .as_bytes(),
-    )
-    .to_hex()
-    .to_string();
+    let definition_hash = index_definition_hash(
+        &index.kind,
+        &index.selector,
+        &index.extractor,
+        &index.build_policy,
+    )?;
     let segment_ref = typed_field_segment::write_typed_field_segment(
         storage,
         TypedFieldSegmentWrite {
@@ -586,6 +722,7 @@ pub async fn build_metadata_backed_index(
             source_kind: "object_metadata",
             source_cursor: u64::try_from(source_cursor).unwrap_or(u64::MAX),
             authz_revision: latest_authz_revision_for_typed_rows(&rows),
+            boundary_values: &boundary_values,
             definition_hash: &definition_hash,
             field_names: &field_names,
             rows: &rows,
@@ -793,10 +930,7 @@ async fn build_vector_index_with_policy(
         .map_err(|error| anyhow!("invalid vector index definition: {error}"))?;
     let index_storage_id =
         index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
-    let latest_generation = vector_segment::read_latest_vector_segment(storage, &index_storage_id)
-        .await?
-        .map(|segment| segment.header.generation)
-        .unwrap_or(0);
+    let latest_generation = latest_index_segment_generation(storage, &index_storage_id)?;
     let latest_checkpoint_generation =
         latest_index_checkpoint_generation(storage, &index_storage_id, partition_owner_signing_key)
             .await?;
@@ -822,6 +956,7 @@ async fn build_vector_index_with_policy(
         source_cursor,
     )
     .await?;
+    let boundary_values = boundary_values_for_objects(storage, &objects).await?;
     let core_store = CoreStore::new(storage.clone()).await?;
     let mut vector_documents = Vec::new();
     let mut diagnostics = Vec::new();
@@ -911,9 +1046,7 @@ async fn build_vector_index_with_policy(
         })
         .collect::<Vec<_>>();
     let deleted_bitset = vec![0; entries.len().div_ceil(8)];
-    let definition_hash = blake3::hash(build_policy.to_string().as_bytes())
-        .to_hex()
-        .to_string();
+    let definition_hash = definition.definition_hash.clone();
     let segment_ref = vector_segment::write_vector_segment(
         storage,
         VectorSegmentWrite {
@@ -934,6 +1067,7 @@ async fn build_vector_index_with_policy(
             hnsw_ef_construction: definition.hnsw_ef_construction,
             source_cursor: u64::try_from(source_cursor).unwrap_or(u64::MAX),
             authz_revision: latest_authz_revision_for_vectors(&vector_documents),
+            boundary_values: &boundary_values,
             entries: &entries,
             deleted_bitset: &deleted_bitset,
         },
@@ -1065,6 +1199,8 @@ async fn publish_index_build_proof_and_checkpoint(
         )),
         consumer_id: index_storage_id.to_string(),
         cursor: source_cursor,
+        source_cursor_high: source_cursor,
+        lag_record_count_hint: 0,
         source_manifest_hash: source_manifest_hash.to_string(),
         generation,
         updated_by_node: builder_node_id.to_string(),
