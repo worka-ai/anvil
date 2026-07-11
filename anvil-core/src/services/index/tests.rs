@@ -135,6 +135,7 @@ fn index_page_token_binds_principal_mesh_authz_and_index_inputs() {
         principal_hash: stable_string_hash("principal-hash"),
         scope_hash: stable_string_hash("scope-hash"),
         revision: 11,
+        system_revision: 11,
     };
     let binding = IndexPageTokenBinding::single_index(
         &config,

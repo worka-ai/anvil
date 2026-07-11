@@ -1658,6 +1658,7 @@ fn expected_schema_markers(table_id: u16) -> Option<&'static [&'static str]> {
         TABLE_MESH_PARTITION_ROW => Some(&[
             "anvil.coremeta.mesh_lifecycle_projection.v1",
             "anvil.coremeta.mesh_directory_projection.v1",
+            "anvil.mesh.control_checkpoint.v1",
         ]),
         TABLE_BUCKET_CURRENT_BY_NAME_ROW | TABLE_BUCKET_CURRENT_BY_ID_ROW => {
             Some(&["anvil.core.bucket_current.v1"])

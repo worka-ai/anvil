@@ -127,17 +127,19 @@ async fn test_cli_auth_grant() {
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
 
+    let bucket_name = format!("grant-bucket-{}", uuid::Uuid::new_v4());
+    let output = run_cli(
+        &["bucket", "create", &bucket_name, "test-region-1"],
+        config_dir.path(),
+    )
+    .await;
+    assert!(output.status.success());
+
     let grantee_app_name = format!("grantee-app-{}", uuid::Uuid::new_v4());
     let (_grantee_client_id, _) = create_app(&cluster, &grantee_app_name).await;
 
     let output = run_cli(
-        &[
-            "auth",
-            "grant",
-            &grantee_app_name,
-            "read",
-            "bucket:my-bucket",
-        ],
+        &["auth", "grant", &grantee_app_name, "bucket:read", &bucket_name],
         config_dir.path(),
     )
     .await;
@@ -153,17 +155,19 @@ async fn test_cli_auth_revoke() {
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
 
+    let bucket_name = format!("revoke-bucket-{}", uuid::Uuid::new_v4());
+    let output = run_cli(
+        &["bucket", "create", &bucket_name, "test-region-1"],
+        config_dir.path(),
+    )
+    .await;
+    assert!(output.status.success());
+
     let grantee_app_name = format!("grantee-app-{}", uuid::Uuid::new_v4());
     let (_grantee_client_id, _) = create_app(&cluster, &grantee_app_name).await;
 
     let output = run_cli(
-        &[
-            "auth",
-            "grant",
-            &grantee_app_name,
-            "read",
-            "bucket:my-bucket",
-        ],
+        &["auth", "grant", &grantee_app_name, "bucket:read", &bucket_name],
         config_dir.path(),
     )
     .await;
@@ -174,8 +178,8 @@ async fn test_cli_auth_revoke() {
             "auth",
             "revoke",
             &grantee_app_name,
-            "read",
-            "bucket:my-bucket",
+            "bucket:read",
+            &bucket_name,
         ],
         config_dir.path(),
     )

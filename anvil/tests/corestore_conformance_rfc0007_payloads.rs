@@ -390,9 +390,10 @@ fn boundary_values_are_indexed_in_coremeta_boundary_rows() {
 #[test]
 fn index_writer_internal_tables_use_binary_or_protobuf_records() {
     let source = format!(
-        "{}\n{}",
+        "{}\n{}\n{}",
         workspace_file("anvil-core/src/index_builder.rs"),
         workspace_file("anvil-core/src/typed_field_segment.rs"),
+        workspace_file("anvil-core/src/full_text_segment.rs"),
     );
 
     assert_contains_all(
