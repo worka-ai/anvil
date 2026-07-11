@@ -10,6 +10,8 @@ pub enum StreamCommands {
     Create {
         bucket: String,
         stream_key: String,
+        #[clap(long)]
+        transaction_id: Option<String>,
     },
     Append {
         bucket: String,
@@ -20,6 +22,8 @@ pub enum StreamCommands {
         content_type: Option<String>,
         #[clap(long, default_value = "{}")]
         user_metadata_json: String,
+        #[clap(long)]
+        transaction_id: Option<String>,
     },
     Read {
         bucket: String,
@@ -47,6 +51,8 @@ pub enum StreamCommands {
         bucket: String,
         stream_key: String,
         stream_id: String,
+        #[clap(long)]
+        transaction_id: Option<String>,
     },
 }
 
@@ -54,8 +60,19 @@ pub async fn handle_stream_command(command: &StreamCommands, ctx: &Context) -> a
     let mut client = ObjectServiceClient::connect(ctx.profile.host.clone()).await?;
     let token = ctx.get_bearer_token().await?;
     match command {
-        StreamCommands::Create { bucket, stream_key } => {
-            let mc = native_mutation_context(ctx, &token, bucket, "stream-create").await?;
+        StreamCommands::Create {
+            bucket,
+            stream_key,
+            transaction_id,
+        } => {
+            let mc = native_mutation_context(
+                ctx,
+                &token,
+                bucket,
+                "stream-create",
+                transaction_id.clone(),
+            )
+            .await?;
             let mut request = tonic::Request::new(api::CreateAppendStreamRequest {
                 bucket_name: bucket.clone(),
                 stream_key: stream_key.clone(),
@@ -75,8 +92,16 @@ pub async fn handle_stream_command(command: &StreamCommands, ctx: &Context) -> a
             payload,
             content_type,
             user_metadata_json,
+            transaction_id,
         } => {
-            let mc = native_mutation_context(ctx, &token, bucket, "stream-append").await?;
+            let mc = native_mutation_context(
+                ctx,
+                &token,
+                bucket,
+                "stream-append",
+                transaction_id.clone(),
+            )
+            .await?;
             let mut request = tonic::Request::new(api::AppendStreamRecordRequest {
                 bucket_name: bucket.clone(),
                 stream_key: stream_key.clone(),
@@ -109,6 +134,8 @@ pub async fn handle_stream_command(command: &StreamCommands, ctx: &Context) -> a
                 after_sequence: *after_sequence,
                 limit: *limit,
                 include_payload: *include_payload,
+
+                ..Default::default()
             });
             add_auth(&mut request, &token);
             let response = client.read_append_stream(request).await?.into_inner();
@@ -157,8 +184,11 @@ pub async fn handle_stream_command(command: &StreamCommands, ctx: &Context) -> a
             bucket,
             stream_key,
             stream_id,
+            transaction_id,
         } => {
-            let mc = native_mutation_context(ctx, &token, bucket, "stream-seal").await?;
+            let mc =
+                native_mutation_context(ctx, &token, bucket, "stream-seal", transaction_id.clone())
+                    .await?;
             let mut request = tonic::Request::new(api::SealAppendStreamSegmentRequest {
                 bucket_name: bucket.clone(),
                 stream_key: stream_key.clone(),

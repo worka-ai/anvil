@@ -61,7 +61,6 @@ pub async fn handle_auth_command(command: &AuthCommands, ctx: &Context) -> anyho
                 c.get_access_token(api::GetAccessTokenRequest {
                     client_id: id,
                     client_secret: secret,
-                    scopes: vec![],
                 }),
             )
             .await

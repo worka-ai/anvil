@@ -6,9 +6,18 @@ use clap::Subcommand;
 #[derive(Subcommand)]
 pub enum BucketCommands {
     /// Create a new bucket
-    Create { name: String, region: String },
+    Create {
+        name: String,
+        region: String,
+        #[clap(long)]
+        transaction_id: Option<String>,
+    },
     /// Remove a bucket
-    Rm { name: String },
+    Rm {
+        name: String,
+        #[clap(long)]
+        transaction_id: Option<String>,
+    },
     /// List buckets
     Ls,
     /// Set public access for a bucket
@@ -16,6 +25,8 @@ pub enum BucketCommands {
         name: String,
         #[clap(long, action = clap::ArgAction::Set)]
         allow: bool,
+        #[clap(long)]
+        transaction_id: Option<String>,
     },
 }
 
@@ -24,10 +35,15 @@ pub async fn handle_bucket_command(command: &BucketCommands, ctx: &Context) -> a
     let token = ctx.get_bearer_token().await?;
 
     match command {
-        BucketCommands::Create { name, region } => {
+        BucketCommands::Create {
+            name,
+            region,
+            transaction_id,
+        } => {
             let mut request = tonic::Request::new(api::CreateBucketRequest {
                 bucket_name: name.clone(),
                 region: region.clone(),
+                options: write_options(transaction_id),
             });
             request.metadata_mut().insert(
                 "authorization",
@@ -36,9 +52,13 @@ pub async fn handle_bucket_command(command: &BucketCommands, ctx: &Context) -> a
             client.create_bucket(request).await?;
             println!("Bucket {} created", name);
         }
-        BucketCommands::Rm { name } => {
+        BucketCommands::Rm {
+            name,
+            transaction_id,
+        } => {
             let mut request = tonic::Request::new(api::DeleteBucketRequest {
                 bucket_name: name.clone(),
+                options: write_options(transaction_id),
             });
             request.metadata_mut().insert(
                 "authorization",
@@ -58,10 +78,15 @@ pub async fn handle_bucket_command(command: &BucketCommands, ctx: &Context) -> a
                 println!("{}\t{}", bucket.name, bucket.creation_date);
             }
         }
-        BucketCommands::SetPublic { name, allow } => {
+        BucketCommands::SetPublic {
+            name,
+            allow,
+            transaction_id,
+        } => {
             let mut request = tonic::Request::new(api::PutBucketPolicyRequest {
                 bucket_name: name.clone(),
                 policy_json: format!("{{\"is_public_read\": {}}}", allow),
+                options: write_options(transaction_id),
             });
             request.metadata_mut().insert(
                 "authorization",
@@ -72,4 +97,17 @@ pub async fn handle_bucket_command(command: &BucketCommands, ctx: &Context) -> a
         }
     }
     Ok(())
+}
+
+fn write_options(transaction_id: &Option<String>) -> Option<api::WriteOptions> {
+    transaction_id
+        .as_ref()
+        .map(|transaction_id| api::WriteOptions {
+            idempotency_key: uuid::Uuid::new_v4().to_string(),
+            consistency: api::ConsistencyMode::Committed as i32,
+            wait_for_finalization: false,
+            preconditions: Vec::new(),
+            boundary_values: Vec::new(),
+            transaction_id: Some(transaction_id.clone()),
+        })
 }

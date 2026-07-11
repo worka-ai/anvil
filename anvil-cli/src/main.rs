@@ -94,6 +94,16 @@ enum Commands {
         #[clap(subcommand)]
         command: cli::stream::StreamCommands,
     },
+    /// Manage explicit CoreStore transactions
+    Transaction {
+        #[clap(subcommand)]
+        command: cli::transaction::TransactionCommands,
+    },
+    /// Manage package registry catalogue entries
+    Registry {
+        #[clap(subcommand)]
+        command: cli::registry::RegistryCommands,
+    },
     /// Manage coordination leases
     Lease {
         #[clap(subcommand)]
@@ -196,6 +206,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Stream { command } => {
             cli::stream::handle_stream_command(command, &ctx).await?;
+        }
+        Commands::Transaction { command } => {
+            cli::transaction::handle_transaction_command(command, &ctx).await?;
+        }
+        Commands::Registry { command } => {
+            cli::registry::handle_registry_command(command, &ctx).await?;
         }
         Commands::Lease { command } => {
             cli::lease::handle_lease_command(command, &ctx).await?;

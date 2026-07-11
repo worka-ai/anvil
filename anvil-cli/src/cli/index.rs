@@ -9,6 +9,8 @@ pub enum IndexCommands {
         bucket: String,
         name: String,
         kind: String,
+        #[clap(long)]
+        transaction_id: Option<String>,
         #[clap(long, default_value = "{}")]
         selector_json: String,
         #[clap(long, default_value = "{}")]
@@ -21,6 +23,8 @@ pub enum IndexCommands {
     Update {
         bucket: String,
         name: String,
+        #[clap(long)]
+        transaction_id: Option<String>,
         #[clap(long, default_value = "{}")]
         selector_json: String,
         #[clap(long, default_value = "{}")]
@@ -33,10 +37,14 @@ pub enum IndexCommands {
     Disable {
         bucket: String,
         name: String,
+        #[clap(long)]
+        transaction_id: Option<String>,
     },
     Drop {
         bucket: String,
         name: String,
+        #[clap(long)]
+        transaction_id: Option<String>,
     },
     List {
         bucket: String,
@@ -58,6 +66,8 @@ pub enum IndexCommands {
         path_prefix: String,
         #[clap(long, default_value = "{}")]
         metadata_filters_json: String,
+        #[clap(long, default_value = "[]")]
+        boundary_predicates_json: String,
         #[clap(long, default_value = "{}")]
         typed_predicates_json: String,
         #[clap(long, default_value = "[]")]
@@ -90,6 +100,7 @@ pub async fn handle_index_command(command: &IndexCommands, ctx: &Context) -> any
             bucket,
             name,
             kind,
+            transaction_id,
             selector_json,
             extractor_json,
             authorization_mode,
@@ -103,6 +114,8 @@ pub async fn handle_index_command(command: &IndexCommands, ctx: &Context) -> any
                 extractor_json: extractor_json.clone(),
                 authorization_mode: authorization_mode.clone(),
                 build_policy_json: build_policy_json.clone(),
+
+                options: write_options(transaction_id),
             });
             add_auth(&mut request, &token);
             print_index(client.create_index(request).await?.into_inner().index);
@@ -110,6 +123,7 @@ pub async fn handle_index_command(command: &IndexCommands, ctx: &Context) -> any
         IndexCommands::Update {
             bucket,
             name,
+            transaction_id,
             selector_json,
             extractor_json,
             authorization_mode,
@@ -122,22 +136,36 @@ pub async fn handle_index_command(command: &IndexCommands, ctx: &Context) -> any
                 extractor_json: extractor_json.clone(),
                 authorization_mode: authorization_mode.clone(),
                 build_policy_json: build_policy_json.clone(),
+
+                options: write_options(transaction_id),
             });
             add_auth(&mut request, &token);
             print_index(client.update_index(request).await?.into_inner().index);
         }
-        IndexCommands::Disable { bucket, name } => {
+        IndexCommands::Disable {
+            bucket,
+            name,
+            transaction_id,
+        } => {
             let mut request = tonic::Request::new(api::DisableIndexRequest {
                 bucket_name: bucket.clone(),
                 name: name.clone(),
+
+                options: write_options(transaction_id),
             });
             add_auth(&mut request, &token);
             print_index(client.disable_index(request).await?.into_inner().index);
         }
-        IndexCommands::Drop { bucket, name } => {
+        IndexCommands::Drop {
+            bucket,
+            name,
+            transaction_id,
+        } => {
             let mut request = tonic::Request::new(api::DropIndexRequest {
                 bucket_name: bucket.clone(),
                 name: name.clone(),
+
+                options: write_options(transaction_id),
             });
             add_auth(&mut request, &token);
             client.drop_index(request).await?;
@@ -165,6 +193,7 @@ pub async fn handle_index_command(command: &IndexCommands, ctx: &Context) -> any
             phrase,
             path_prefix,
             metadata_filters_json,
+            boundary_predicates_json,
             typed_predicates_json,
             typed_order_json,
             page_token,
@@ -180,6 +209,7 @@ pub async fn handle_index_command(command: &IndexCommands, ctx: &Context) -> any
                 phrase: *phrase,
                 path_prefix: path_prefix.clone(),
                 metadata_filters_json: metadata_filters_json.clone(),
+                boundary_predicates_json: boundary_predicates_json.clone(),
                 typed_predicates_json: typed_predicates_json.clone(),
                 typed_order_json: typed_order_json.clone(),
                 page_token: page_token.clone(),
@@ -254,6 +284,21 @@ fn print_index(index: Option<api::IndexDefinitionRecord>) {
             index.version
         );
     }
+}
+
+fn write_options(transaction_id: &Option<String>) -> Option<api::WriteOptions> {
+    let transaction_id = transaction_id.as_ref()?.trim();
+    if transaction_id.is_empty() {
+        return None;
+    }
+    Some(api::WriteOptions {
+        idempotency_key: format!("index-cli-{}", uuid::Uuid::new_v4()),
+        consistency: api::ConsistencyMode::Committed as i32,
+        wait_for_finalization: false,
+        preconditions: Vec::new(),
+        boundary_values: Vec::new(),
+        transaction_id: Some(transaction_id.to_string()),
+    })
 }
 
 fn add_auth<T>(request: &mut tonic::Request<T>, token: &str) {

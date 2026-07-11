@@ -11,6 +11,8 @@ pub mod index;
 pub mod lease;
 pub mod object;
 pub mod personaldb;
+pub mod registry;
 pub mod repair;
 pub mod stream;
+pub mod transaction;
 pub mod watch;

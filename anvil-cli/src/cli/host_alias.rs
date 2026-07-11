@@ -13,6 +13,8 @@ pub enum HostAliasCommands {
         region: Option<String>,
         #[clap(long, default_value = "")]
         prefix: String,
+        #[clap(long)]
+        transaction_id: Option<String>,
     },
     /// Read host alias metadata.
     Read { hostname: String },
@@ -22,6 +24,8 @@ pub enum HostAliasCommands {
         observed_challenge: String,
         #[clap(long)]
         expected_generation: u64,
+        #[clap(long)]
+        transaction_id: Option<String>,
     },
     /// List host aliases visible to the current tenant application.
     List {
@@ -35,6 +39,8 @@ pub enum HostAliasCommands {
         hostname: String,
         #[clap(long)]
         expected_generation: u64,
+        #[clap(long)]
+        transaction_id: Option<String>,
     },
 }
 
@@ -51,9 +57,14 @@ pub async fn handle_host_alias_command(
             bucket_name,
             region,
             prefix,
+            transaction_id,
         } => {
             let mut request = tonic::Request::new(api::CreateHostAliasRequest {
-                context: Some(public_context("host-alias-create", 0)),
+                context: Some(public_context(
+                    "host-alias-create",
+                    0,
+                    transaction_id.clone(),
+                )),
                 hostname: hostname.clone(),
                 tenant_id: String::new(),
                 bucket_name: bucket_name.clone(),
@@ -87,9 +98,14 @@ pub async fn handle_host_alias_command(
             hostname,
             observed_challenge,
             expected_generation,
+            transaction_id,
         } => {
             let mut request = tonic::Request::new(api::VerifyHostAliasRequest {
-                context: Some(public_context("host-alias-verify", *expected_generation)),
+                context: Some(public_context(
+                    "host-alias-verify",
+                    *expected_generation,
+                    transaction_id.clone(),
+                )),
                 hostname: hostname.clone(),
                 observed_challenge: observed_challenge.clone(),
             });
@@ -126,9 +142,14 @@ pub async fn handle_host_alias_command(
         HostAliasCommands::Delete {
             hostname,
             expected_generation,
+            transaction_id,
         } => {
             let mut request = tonic::Request::new(api::DeleteHostAliasRequest {
-                context: Some(public_context("host-alias-delete", *expected_generation)),
+                context: Some(public_context(
+                    "host-alias-delete",
+                    *expected_generation,
+                    transaction_id.clone(),
+                )),
                 hostname: hostname.clone(),
             });
             attach_auth(&mut request, &token)?;
@@ -143,11 +164,16 @@ pub async fn handle_host_alias_command(
     Ok(())
 }
 
-fn public_context(tag: &str, expected_generation: u64) -> api::PublicMutationContext {
+fn public_context(
+    tag: &str,
+    expected_generation: u64,
+    transaction_id: Option<String>,
+) -> api::PublicMutationContext {
     api::PublicMutationContext {
         request_id: format!("{tag}-{}", uuid::Uuid::new_v4()),
         idempotency_key: uuid::Uuid::new_v4().to_string(),
         expected_generation,
+        transaction_id,
     }
 }
 

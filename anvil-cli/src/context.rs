@@ -91,7 +91,6 @@ impl Context {
             .get_access_token(api::GetAccessTokenRequest {
                 client_id,
                 client_secret,
-                scopes: vec![],
             })
             .await?
             .into_inner();

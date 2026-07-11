@@ -1,41 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cp anvil-core/proto/anvil.proto clients/typescript/proto/anvil.proto
-cp anvil-core/proto/anvil.proto clients/python/src/anvil_storage_client/proto/anvil.proto
-python3 - <<'PYFILTER'
+python3 - <<'PYSYNC'
 from pathlib import Path
-import re
 
-src = Path('anvil-core/proto/anvil.proto').read_text()
-for name in [
-    'PutShardRequest',
-    'PutShardResponse',
-    'CommitShardRequest',
-    'CommitShardResponse',
-    'GetShardRequest',
-    'GetShardResponse',
-    'DeleteShardRequest',
-    'DeleteShardResponse',
-    'ProxyHeader',
-    'ProxyRequestHeader',
-    'ProxyRequestChunk',
-    'ProxyResponseHeader',
-    'ProxyResponseChunk',
+src = Path('anvil-core/proto/anvil.proto').read_text().rstrip() + '\n'
+for path in [
+    Path('clients/rust/proto/anvil.proto'),
+    Path('clients/typescript/proto/anvil.proto'),
+    Path('clients/python/src/anvil_storage_client/proto/anvil.proto'),
 ]:
-    src = re.sub(r'\nmessage ' + name + r' \{\}\n', '\n', src)
-    src = re.sub(
-        r'\nmessage ' + name + r' \{\n(?:[^{}]*|\{[^{}]*\})*?\}\n',
-        '\n',
-        src,
-        flags=re.S,
-    )
-src = src.replace(
-    '''\n// Internal Service for node-to-node communication\nservice InternalAnvilService {\n  rpc PutShard(stream PutShardRequest) returns (PutShardResponse);\n  rpc GetShard(GetShardRequest) returns (stream GetShardResponse);\n  rpc CommitShard(CommitShardRequest) returns (CommitShardResponse);\n  rpc DeleteShard(DeleteShardRequest) returns (DeleteShardResponse);\n}\n''',
-    '\n',
-)
-src = src.replace(
-    '''\nservice InternalProxyService {\n  rpc ProxyObject(stream ProxyRequestChunk) returns (stream ProxyResponseChunk);\n}\n''',
-    '\n',
-)
-Path('clients/rust/proto/anvil.proto').write_text(src)
-PYFILTER
+    path.write_text(src)
+PYSYNC
