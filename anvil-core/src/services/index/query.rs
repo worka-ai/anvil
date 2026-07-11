@@ -432,19 +432,6 @@ pub(super) fn select_query_spec_indexes(
     ))
 }
 
-pub(super) fn typed_json_index_has_field(
-    index: &crate::persistence::IndexDefinition,
-    field_name: &str,
-) -> Result<bool, Status> {
-    if index.kind != "typed_json" {
-        return Ok(false);
-    }
-    Ok(TypedJsonIndexDefinition::from_index(index)?
-        .fields
-        .iter()
-        .any(|field| field.name == field_name))
-}
-
 pub(super) fn typed_json_index_covers(
     index: &crate::persistence::IndexDefinition,
     shape: &QuerySpecShape,
@@ -482,10 +469,6 @@ pub(super) fn typed_json_index_covers(
     Ok(true)
 }
 
-pub(super) fn query_spec_overfetch_limit(requested: u32) -> u32 {
-    requested.saturating_mul(10).clamp(100, 1000)
-}
-
 pub(super) fn boundary_predicate_field(predicate: &JsonValue) -> Option<&str> {
     let direct = predicate
         .get("dimension")
@@ -506,145 +489,6 @@ pub(super) fn boundary_predicate_field(predicate: &JsonValue) -> Option<&str> {
         }
     }
     None
-}
-
-pub(super) fn composite_query_spec_index_name(
-    primary: &crate::persistence::IndexDefinition,
-    typed_filter: &crate::persistence::IndexDefinition,
-) -> String {
-    format!("{}+{}", primary.name, typed_filter.name)
-}
-
-pub(super) fn composite_index_definition_version(
-    primary: &crate::persistence::IndexDefinition,
-    typed_filter: &crate::persistence::IndexDefinition,
-) -> u64 {
-    let primary = u64::try_from(primary.version).unwrap_or(0);
-    let typed_filter = u64::try_from(typed_filter.version).unwrap_or(0);
-    primary.max(typed_filter)
-}
-
-pub(super) fn composite_query_spec_predicate_hash(
-    plan: &QuerySpecPlan,
-    primary_generation: u64,
-    typed_generation: u64,
-) -> String {
-    let shape = serde_json::json!({
-        "canonical_query_hash": plan.canonical_query_hash,
-        "primary_index": plan.index.name,
-        "primary_generation": primary_generation,
-        "typed_filter_index": plan.typed_filter_index.as_ref().map(|index| index.name.as_str()),
-        "typed_generation": typed_generation,
-    });
-    authz_aware_query_scope_hash("predicate", &plan.authz_scope, shape)
-}
-
-pub(super) fn composite_query_spec_order_hash(plan: &QuerySpecPlan) -> String {
-    if plan.typed_order.is_empty() {
-        score_order_hash(&plan.authz_scope)
-    } else {
-        authz_aware_query_scope_hash(
-            "order",
-            &plan.authz_scope,
-            serde_json::json!({
-                "schema": "anvil.query.order.v1",
-                "terms": plan.typed_order,
-            }),
-        )
-    }
-}
-
-pub(super) fn typed_values_from_query_hit(
-    hit: &IndexQueryHit,
-) -> Result<BTreeMap<String, JsonValue>, Status> {
-    let metadata: JsonValue = serde_json::from_str(&hit.metadata_json)
-        .map_err(|e| Status::internal(format!("Invalid query hit metadata_json: {e}")))?;
-    let Some(values) = metadata.get("typed_values").and_then(JsonValue::as_object) else {
-        return Err(Status::internal(
-            "typed query hit metadata is missing typed_values",
-        ));
-    };
-    Ok(values
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect())
-}
-
-pub(super) fn merge_composite_metadata(
-    primary_metadata_json: &str,
-    typed_values: &BTreeMap<String, JsonValue>,
-) -> Result<String, Status> {
-    let primary = serde_json::from_str::<JsonValue>(primary_metadata_json)
-        .unwrap_or_else(|_| JsonValue::String(primary_metadata_json.to_string()));
-    serde_json::to_string(&serde_json::json!({
-        "primary": primary,
-        "typed_values": typed_values,
-    }))
-    .map_err(|e| Status::internal(format!("Serialize composite metadata: {e}")))
-}
-
-pub(super) fn compare_query_spec_hits_by_typed_order(
-    left: &IndexQueryHit,
-    right: &IndexQueryHit,
-    plan: &QuerySpecPlan,
-) -> std::cmp::Ordering {
-    let left_values = typed_values_from_query_hit(left).unwrap_or_default();
-    let right_values = typed_values_from_query_hit(right).unwrap_or_default();
-    for term in &plan.typed_order {
-        let ordering = compare_json_values(
-            left_values.get(&term.field).unwrap_or(&JsonValue::Null),
-            right_values.get(&term.field).unwrap_or(&JsonValue::Null),
-        );
-        let ordering = if term.direction == "desc" {
-            ordering.reverse()
-        } else {
-            ordering
-        };
-        if !ordering.is_eq() {
-            return ordering;
-        }
-    }
-    left.object_version_id.cmp(&right.object_version_id)
-}
-
-pub(super) fn query_spec_hit_sort_values(
-    hit: &IndexQueryHit,
-    plan: &QuerySpecPlan,
-) -> Result<BTreeMap<String, JsonValue>, Status> {
-    if plan.typed_order.is_empty() {
-        Ok(score_sort_values(hit.score, &hit.object_version_id))
-    } else {
-        typed_values_from_query_hit(hit)
-    }
-}
-
-pub(super) fn query_spec_hit_after_cursor(
-    hit: &IndexQueryHit,
-    token: &IndexPageToken,
-    plan: &QuerySpecPlan,
-) -> Result<bool, Status> {
-    if plan.typed_order.is_empty() {
-        return score_after_cursor(hit.score, &hit.object_version_id, token);
-    }
-    let values = typed_values_from_query_hit(hit)?;
-    for term in &plan.typed_order {
-        let ordering = compare_json_values(
-            values.get(&term.field).unwrap_or(&JsonValue::Null),
-            token
-                .last_sort_values
-                .get(&term.field)
-                .unwrap_or(&JsonValue::Null),
-        );
-        let ordering = if term.direction == "desc" {
-            ordering.reverse()
-        } else {
-            ordering
-        };
-        if !ordering.is_eq() {
-            return Ok(ordering.is_gt());
-        }
-    }
-    Ok(hit.object_version_id > token.last_source_identity)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -677,27 +521,6 @@ impl QueryObjectRef {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub(super) struct QueryPermissionFilter {
-    pub(super) allow_all: bool,
-    pub(super) object_keys: BTreeSet<String>,
-    pub(super) authorized_labels: BTreeSet<[u8; 32]>,
-}
-
-impl QueryPermissionFilter {
-    pub(super) fn all() -> Self {
-        Self {
-            allow_all: true,
-            object_keys: BTreeSet::new(),
-            authorized_labels: BTreeSet::new(),
-        }
-    }
-
-    pub(super) fn allows_object_key(&self, object_key: &str) -> bool {
-        self.allow_all || self.object_keys.contains(object_key)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct QueryAuthzScope {
     pub(super) realm_id: String,
@@ -707,6 +530,7 @@ pub(super) struct QueryAuthzScope {
     pub(super) principal_hash: String,
     pub(super) scope_hash: String,
     pub(super) revision: u64,
+    pub(super) system_revision: u64,
 }
 
 impl QueryAuthzScope {
@@ -718,6 +542,7 @@ impl QueryAuthzScope {
         requested_relation: &str,
         explicit_scope: Option<&JsonValue>,
         revision: u64,
+        system_revision: u64,
     ) -> Self {
         let relation = if requested_relation == "read" {
             "reader"
@@ -739,6 +564,7 @@ impl QueryAuthzScope {
             "principal_hash": principal_hash,
             "explicit_scope": explicit_scope.cloned().unwrap_or(JsonValue::Null),
             "revision": revision,
+            "system_revision": system_revision,
         });
         Self {
             realm_id: DEFAULT_AUTHZ_REALM_ID.to_string(),
@@ -748,6 +574,7 @@ impl QueryAuthzScope {
             principal_hash,
             scope_hash: stable_prefixed_json_hash(&scope_shape),
             revision,
+            system_revision,
         }
     }
 
@@ -760,33 +587,24 @@ impl QueryAuthzScope {
             "principal_hash": self.principal_hash.clone(),
             "scope_hash": self.scope_hash.clone(),
             "revision": self.revision,
+            "system_revision": self.system_revision,
         })
+    }
+
+    pub(super) fn revision_fence(&self) -> u64 {
+        self.revision.max(self.system_revision)
     }
 }
 
-pub(super) fn authz_label_filter_for_index_candidate_set<'a>(
+pub(super) fn authz_label_filter_for_index_candidate_set(
     _authorization_mode: &str,
-    _permission_filter: Option<&'a QueryPermissionFilter>,
     _indexed_authz_revision: u64,
     _query_authz_revision: u64,
-) -> Result<Option<&'a BTreeSet<[u8; 32]>>, Status> {
+) -> Result<Option<&'static BTreeSet<[u8; 32]>>, Status> {
     // Label filters are an optimisation hint only and must not replace Zanzibar
     // visibility checks. Returning None keeps the candidate set broad; callers
     // must run query_hit_visible() before returning a hit.
     Ok(None)
-}
-
-pub(super) fn query_object_authz_label_hash(
-    bucket: &crate::persistence::Bucket,
-    object: &crate::persistence::Object,
-) -> [u8; 32] {
-    hash32(
-        format!(
-            "tenant:{}:bucket:{}:object:{}:authz:{}",
-            bucket.tenant_id, bucket.id, object.key, object.authz_revision
-        )
-        .as_bytes(),
-    )
 }
 
 #[derive(Debug, Clone, Default)]
@@ -975,6 +793,12 @@ impl TypedPredicate {
                 .values
                 .first()
                 .is_some_and(|expected| !compare_json_values(actual, expected).is_lt()),
+            "prefix" => self.values.first().is_some_and(|expected| {
+                actual
+                    .as_str()
+                    .zip(expected.as_str())
+                    .is_some_and(|(actual, prefix)| actual.starts_with(prefix))
+            }),
             "exists" => !actual.is_null(),
             "is_null" => actual.is_null(),
             _ => false,
@@ -1360,6 +1184,7 @@ pub(super) fn record_query_plan_metrics(
     input_candidate_count: u64,
     boundary_candidate_count: u64,
     authz_candidate_count: u64,
+    index_candidate_count: u64,
     intersection_candidate_count: u64,
 ) {
     let labels = [("index_kind", index_kind), ("authz_mode", authz_mode)];
@@ -1377,6 +1202,11 @@ pub(super) fn record_query_plan_metrics(
         "anvil_query_authz_candidate_count",
         &labels,
         authz_candidate_count,
+    );
+    crate::perf::record_counter(
+        "anvil_query_index_candidate_count",
+        &labels,
+        index_candidate_count,
     );
     crate::perf::record_counter(
         "anvil_query_intersection_candidate_count",

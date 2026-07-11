@@ -1645,9 +1645,10 @@ fn expected_schema_markers(table_id: u16) -> Option<&'static [&'static str]> {
         TABLE_BOUNDARY_SCHEMA_ROW => Some(&["anvil.core.boundary_schema.v1"]),
         TABLE_BOUNDARY_VALUE_ROW => Some(&["anvil.core.boundary_value.v1"]),
         TABLE_BOUNDARY_MIGRATION_ROW => Some(&["anvil.boundary_migration.v1"]),
-        TABLE_AUTHZ_SCHEMA_ROW | TABLE_AUTHZ_TUPLE_PAGE_ROW => {
-            Some(&["anvil.authz.coremeta_payload_row.v1"])
-        }
+        TABLE_AUTHZ_SCHEMA_ROW | TABLE_AUTHZ_TUPLE_PAGE_ROW => Some(&[
+            "anvil.authz.coremeta_payload_row.v1",
+            "anvil.authz.derived_userset_index_row.v1",
+        ]),
         TABLE_GATEWAY_METADATA_ROW => Some(&["anvil.gateway.coremeta_record.v1"]),
         TABLE_GIT_SOURCE_MANIFEST_ROW => Some(&["anvil.coremeta.git_source_manifest.v1"]),
         TABLE_MESH_NODE_ROW => Some(&[

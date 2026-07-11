@@ -1,8 +1,9 @@
 use crate::authz_coremeta_payload::{decode_authz_payload_row, encode_authz_payload_row};
 use crate::authz_segment;
 use crate::authz_userset_index::{
-    DEFAULT_DERIVED_USERSET_INDEX_ID, list_derived_userset_objects_at_revision,
-    lookup_derived_userset_index_at_revision,
+    DEFAULT_DERIVED_USERSET_INDEX_ID, advance_derived_userset_index_from_batch,
+    list_derived_userset_objects_at_revision, lookup_derived_userset_index_at_revision,
+    read_derived_userset_index,
 };
 use crate::core_store::{
     CF_AUTHZ, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore, CoreMetaTuplePart,
@@ -18,7 +19,7 @@ use anyhow::{Context, Result, anyhow};
 use prost::Message;
 use std::collections::{BTreeMap, BTreeSet};
 
-mod resolver;
+pub(crate) mod resolver;
 
 const AUTHZ_TUPLE_JOURNAL_BODY_SCHEMA: &str = "anvil.authz_tuple.journal_body.v1";
 const AUTHZ_TUPLE_BATCH_JOURNAL_BODY_SCHEMA: &str = "anvil.authz_tuple.batch_journal_body.v1";
@@ -333,6 +334,13 @@ async fn append_authz_tuple_record_inner(
         "authz_journal.append_record write_current_rows",
         step_started_at.elapsed(),
     );
+    advance_authz_materialization(
+        storage,
+        record.tenant_id,
+        std::slice::from_ref(record),
+        fence_token,
+    )
+    .await?;
     Ok(())
 }
 
@@ -386,6 +394,7 @@ async fn append_authz_tuple_batch_inner(
         "authz_journal.append_batch write_current_rows",
         step_started_at.elapsed(),
     );
+    advance_authz_materialization(storage, tenant_id, records, fence_token).await?;
     Ok(())
 }
 
@@ -395,16 +404,22 @@ pub(crate) async fn materialize_authz_tuple_segment(
     source_fence_token: u64,
 ) -> Result<String> {
     let step_started_at = std::time::Instant::now();
-    let records = read_all_authz_tuple_records(storage, tenant_id).await?;
+    let records = read_all_authz_tuple_records_from_journal(storage, tenant_id).await?;
     crate::emit_test_timing(
         "authz_journal.materialize_segment read_all_current_records",
         step_started_at.elapsed(),
     );
     let step_started_at = std::time::Instant::now();
-    let segment_ref = authz_segment::write_authz_tuple_segment_with_fence(
+    let derived_entries =
+        read_derived_userset_index(storage, tenant_id, DEFAULT_DERIVED_USERSET_INDEX_ID)
+            .await?
+            .map(|index| index.entries)
+            .unwrap_or_default();
+    let segment_ref = authz_segment::write_authz_tuple_segment_with_derived(
         storage,
         tenant_id,
         &records,
+        &derived_entries,
         source_fence_token,
     )
     .await?;
@@ -413,6 +428,22 @@ pub(crate) async fn materialize_authz_tuple_segment(
         step_started_at.elapsed(),
     );
     Ok(segment_ref)
+}
+
+async fn advance_authz_materialization(
+    storage: &Storage,
+    tenant_id: i64,
+    batch_records: &[AuthzTupleRecord],
+    source_fence_token: u64,
+) -> Result<String> {
+    advance_derived_userset_index_from_batch(
+        storage,
+        tenant_id,
+        DEFAULT_DERIVED_USERSET_INDEX_ID,
+        batch_records,
+    )
+    .await?;
+    materialize_authz_tuple_segment(storage, tenant_id, source_fence_token).await
 }
 
 pub async fn latest_authz_revision(storage: &Storage, tenant_id: i64) -> Result<i64> {
@@ -731,13 +762,13 @@ async fn current_authz_view_at_revision(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct TupleViewKey {
-    namespace: String,
-    object_id: String,
-    relation: String,
-    subject_kind: String,
-    subject_id: String,
-    caveat_hash: String,
+pub(crate) struct TupleViewKey {
+    pub(crate) namespace: String,
+    pub(crate) object_id: String,
+    pub(crate) relation: String,
+    pub(crate) subject_kind: String,
+    pub(crate) subject_id: String,
+    pub(crate) caveat_hash: String,
 }
 
 impl From<&AuthzTupleRecord> for TupleViewKey {
@@ -1708,6 +1739,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authz_schema_writes_materialize_segment_schema_tables() {
+        use crate::anvil_api::{AuthzNamespaceSchema, AuthzRelationRule, AuthzRelationSchema};
+        use crate::authz_scope::encode_realm_namespace;
+
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let schema = crate::authz_realm_schema::put_schema_revision(
+            &storage,
+            42,
+            "workspace-authz",
+            vec![AuthzNamespaceSchema {
+                namespace: "document".to_string(),
+                relations: vec![AuthzRelationSchema {
+                    relation: "viewer".to_string(),
+                    rules: vec![AuthzRelationRule {
+                        kind: "inherit".to_string(),
+                        relation: "editor".to_string(),
+                        tuple_relation: String::new(),
+                        target_relation: String::new(),
+                    }],
+                }],
+                schema_json: String::new(),
+                schema_hash: String::new(),
+                schema_version: 0,
+                authz_revision: 0,
+                applied_at: String::new(),
+            }],
+            10,
+            "tester",
+            "put schema",
+        )
+        .await
+        .unwrap();
+
+        let segment = authz_segment::read_latest_authz_tuple_segment(&storage, 42)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(segment.header.generation, 10);
+        assert!(segment.records.is_empty());
+        assert!(segment.schema_descriptors.iter().any(|row| {
+            row.realm_id.is_empty()
+                && row.namespace == "document"
+                && row.schema_id == "workspace-authz"
+                && row.schema_revision == 1
+        }));
+        assert!(segment.relation_rules.iter().any(|row| {
+            row.realm_id.is_empty()
+                && row.namespace == "document"
+                && row.relation == "viewer"
+                && row.rule_kind == "inherit"
+                && row.inherited_relation == "editor"
+        }));
+
+        crate::authz_realm_schema::bind_schema(
+            &storage,
+            42,
+            "workspace-a",
+            schema.schema_ref,
+            None,
+            11,
+            "tester",
+            "bind schema",
+        )
+        .await
+        .unwrap();
+        let bound_segment = authz_segment::read_latest_authz_tuple_segment(&storage, 42)
+            .await
+            .unwrap()
+            .unwrap();
+        let bound_namespace = encode_realm_namespace("workspace-a", "document");
+        assert_eq!(bound_segment.header.generation, 11);
+        assert!(bound_segment.schema_descriptors.iter().any(|row| {
+            row.realm_id == "workspace-a"
+                && row.namespace == bound_namespace
+                && row.schema_id == "workspace-authz"
+                && row.binding_generation == 1
+        }));
+        assert!(bound_segment.relation_rules.iter().any(|row| {
+            row.realm_id == "workspace-a"
+                && row.namespace == bound_namespace
+                && row.relation == "viewer"
+                && row.rule_kind == "inherit"
+                && row.inherited_relation == "editor"
+        }));
+        assert_eq!(bound_segment.revision_checkpoints[0].revision, 11);
+    }
+
+    #[tokio::test]
     async fn authz_current_tuple_reads_filter_active_adds_only() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
@@ -1790,6 +1910,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authz_tuple_writes_materialize_userset_and_reverse_lookup_segments() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        for record in [
+            tuple(1, "group", "engineering", "member", "user", "alice", "add"),
+            tuple(
+                2,
+                "folder",
+                "platform",
+                "viewer",
+                "userset",
+                "group/engineering#member",
+                "add",
+            ),
+            tuple(
+                3,
+                "document",
+                "alpha",
+                "viewer",
+                "userset",
+                "folder/platform#viewer",
+                "add",
+            ),
+        ] {
+            append_authz_tuple_record(&storage, &record).await.unwrap();
+        }
+
+        let segment = authz_segment::read_latest_authz_tuple_segment(&storage, 42)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(segment.header.generation, 3);
+        assert_eq!(segment.records.len(), 3);
+        assert_eq!(segment.revision_checkpoints[0].tuple_record_count, 3);
+        assert!(segment.userset_edges.iter().any(|row| {
+            row.namespace == "document"
+                && row.object_id == "alpha"
+                && row.relation == "viewer"
+                && row.subject_kind == "user"
+                && row.subject_id == "alice"
+                && row.source == "derived_userset"
+        }));
+        assert!(segment.list_objects.iter().any(|row| {
+            row.namespace == "document"
+                && row.relation == "viewer"
+                && row.subject_kind == "user"
+                && row.subject_id == "alice"
+                && row.object_id == "alpha"
+        }));
+        assert!(segment.list_subjects.iter().any(|row| {
+            row.namespace == "document"
+                && row.object_id == "alpha"
+                && row.relation == "viewer"
+                && row.subject_kind == "user"
+                && row.subject_id == "alice"
+        }));
+    }
+
+    #[tokio::test]
     async fn authz_journal_permit_sets_payload_and_segment_fence() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
@@ -1809,21 +1988,16 @@ mod tests {
             .unwrap();
         assert_eq!(fences, vec![permit.fence_token]);
 
-        assert!(
-            authz_segment::read_latest_authz_tuple_segment(&storage, 42)
-                .await
-                .unwrap()
-                .is_none(),
-            "authz tuple writes should not synchronously rebuild the full segment"
-        );
-        materialize_authz_tuple_segment(&storage, 42, permit.fence_token)
-            .await
-            .unwrap();
         let segment = authz_segment::read_latest_authz_tuple_segment(&storage, 42)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(segment.header.source_fence_token, permit.fence_token);
+        assert_eq!(segment.revision_checkpoints.len(), 1);
+        assert_eq!(
+            segment.revision_checkpoints[0].source_fence_token,
+            permit.fence_token
+        );
     }
 
     #[tokio::test]

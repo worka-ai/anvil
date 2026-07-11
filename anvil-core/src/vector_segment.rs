@@ -339,7 +339,7 @@ pub async fn query_vector_segment_ranges(
         graph_table,
         cache: BTreeMap::new(),
     };
-    let hits = query_hnsw_graph_with_range_reader(
+    let mut hits = query_hnsw_graph_with_range_reader(
         &entrypoints,
         &mut graph_reader,
         &mut entry_reader,
@@ -350,7 +350,67 @@ pub async fn query_vector_segment_ranges(
         usize::from(header.hnsw_ef_construction).max(limit.saturating_mul(20).max(80)),
     )
     .await?;
+    if hits.len() < limit {
+        fill_vector_search_results_from_entry_table(
+            &segment,
+            entry_table,
+            header.dimension,
+            query,
+            metric,
+            authorized_labels,
+            limit,
+            &mut hits,
+        )
+        .await?;
+    }
     Ok((header, hits))
+}
+
+async fn fill_vector_search_results_from_entry_table(
+    segment: &RangeAddressedWriterSegment,
+    entry_table: &crate::formats::table::WriterBodyTableDirectoryEntry,
+    dimension: u16,
+    query: &[f32],
+    metric: VectorMetric,
+    authorized_labels: Option<&BTreeSet<Hash32>>,
+    limit: usize,
+    hits: &mut Vec<VectorSearchResult>,
+) -> Result<()> {
+    let mut seen = hits
+        .iter()
+        .map(|hit| hit.vector_id)
+        .collect::<BTreeSet<_>>();
+    let table = crate::formats::table::decode_writer_body_table(
+        entry_table,
+        &segment.read_table_bytes(entry_table).await?,
+    )?;
+    for row in table.rows {
+        let entry = decode_vector_entry_row(&row.value, dimension)?;
+        if !seen.insert(entry.record.vector_id) {
+            continue;
+        }
+        if !authorized_labels.is_none_or(|labels| labels.contains(&entry.record.authz_label_hash)) {
+            continue;
+        }
+        hits.push(VectorSearchResult {
+            vector_id: entry.record.vector_id,
+            source_id_binary: entry.source_id_binary,
+            score: vector_score(query, &entry.payload.values, metric)?,
+            object_version_id: entry.record.object_version_id,
+            chunk_id: entry.record.chunk_id,
+            source_start: entry.record.source_start,
+            source_len: entry.record.source_len,
+        });
+    }
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.vector_id.cmp(&right.vector_id))
+    });
+    hits.truncate(limit);
+    Ok(())
 }
 
 pub async fn latest_vector_segment_ref(
@@ -1151,6 +1211,7 @@ async fn query_hnsw_graph_with_range_reader(
         })
         .map(|(score, _, entry)| VectorSearchResult {
             vector_id: entry.record.vector_id,
+            source_id_binary: entry.source_id_binary.clone(),
             score,
             object_version_id: entry.record.object_version_id,
             chunk_id: entry.record.chunk_id,

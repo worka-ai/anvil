@@ -3,6 +3,7 @@ use super::*;
 #[derive(Debug, Clone)]
 pub(super) struct HybridAccum {
     pub(super) object_version_id: [u8; 16],
+    pub(super) object_key: String,
     pub(super) text_score: f32,
     pub(super) vector_score: f32,
     pub(super) score: f32,
@@ -21,6 +22,7 @@ impl HybridAccum {
     pub(super) fn new(object_version_id: [u8; 16]) -> Self {
         Self {
             object_version_id,
+            object_key: String::new(),
             text_score: 0.0,
             vector_score: 0.0,
             score: 0.0,

@@ -382,42 +382,44 @@ impl IndexService for AppState {
         let plan = self
             .plan_query_spec(&claims, &bucket, &spec, req.accept_degraded)
             .await?;
-        let response = if plan.typed_filter_index.is_some() {
-            self.execute_composite_query_spec(
-                &claims,
-                &bucket,
-                &plan,
-                &req.page_token,
-                req.lag_timeout_ms,
-            )
-            .await?
-        } else {
-            let query_req =
-                plan.single_query_request(&bucket.name, &req.page_token, req.lag_timeout_ms)?;
-            match plan.index.kind.as_str() {
-                "path" | "metadata_filter" => {
-                    self.query_metadata_backed_index(&claims, &bucket, &plan.index, query_req)
-                        .await?
+        let response = {
+            if plan.typed_filter_index.is_some() {
+                self.query_composite_query_spec(
+                    &claims,
+                    &bucket,
+                    &plan,
+                    &req.page_token,
+                    req.lag_timeout_ms,
+                )
+                .await?
+            } else {
+                let query_req =
+                    plan.single_query_request(&bucket.name, &req.page_token, req.lag_timeout_ms)?;
+                match plan.index.kind.as_str() {
+                    "path" | "metadata_filter" => {
+                        self.query_metadata_backed_index(&claims, &bucket, &plan.index, query_req)
+                            .await?
+                    }
+                    "typed_json" => {
+                        self.query_typed_json_index(&claims, &bucket, &plan.index, query_req)
+                            .await?
+                    }
+                    "full_text" => {
+                        self.query_full_text_index(&claims, &bucket, &plan.index, query_req)
+                            .await?
+                    }
+                    "vector" => {
+                        self.query_vector_index(&claims, &bucket, &plan.index, query_req)
+                            .await?
+                    }
+                    "hybrid" => {
+                        self.query_hybrid_index(&claims, &bucket, &plan.index, query_req)
+                            .await?
+                    }
+                    _ => return Err(Status::failed_precondition("IndexDoesNotSupportQuerySpec")),
                 }
-                "typed_json" => {
-                    self.query_typed_json_index(&claims, &bucket, &plan.index, query_req)
-                        .await?
-                }
-                "full_text" => {
-                    self.query_full_text_index(&claims, &bucket, &plan.index, query_req)
-                        .await?
-                }
-                "vector" => {
-                    self.query_vector_index(&claims, &bucket, &plan.index, query_req)
-                        .await?
-                }
-                "hybrid" => {
-                    self.query_hybrid_index(&claims, &bucket, &plan.index, query_req)
-                        .await?
-                }
-                _ => return Err(Status::failed_precondition("IndexDoesNotSupportQuerySpec")),
+                .into_inner()
             }
-            .into_inner()
         };
         if spec.consistency.allow_stale_index == Some(false) && !response.is_caught_up {
             return Err(Status::failed_precondition("IndexLagging"));

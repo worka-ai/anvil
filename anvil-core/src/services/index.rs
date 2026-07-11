@@ -32,12 +32,15 @@ type HmacSha256 = Hmac<Sha256>;
 const INDEX_PAGE_TOKEN_VERSION: u8 = 1;
 const INDEX_PAGE_TOKEN_DOMAIN: &[u8] = b"anvil-index-page-token-v1";
 const INDEX_PAGE_TOKEN_TTL_SECONDS: i64 = 15 * 60;
+mod lifecycle;
 mod operations;
 mod query;
 mod query_boundary;
 mod query_candidates;
 mod query_hybrid;
 mod query_page_token;
+mod query_planner_adapter;
+mod query_value_index;
 mod rpc;
 mod validation_helpers;
 
@@ -46,6 +49,8 @@ use query_boundary::*;
 use query_candidates::*;
 use query_hybrid::*;
 use query_page_token::*;
+use query_planner_adapter::*;
+use query_value_index::*;
 pub(crate) use validation_helpers::index_kind_value_from_str;
 use validation_helpers::*;
 

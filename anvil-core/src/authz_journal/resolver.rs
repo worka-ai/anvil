@@ -10,21 +10,21 @@ use anyhow::{Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) struct SubjectRef {
-    pub(super) kind: String,
-    pub(super) id: String,
-    pub(super) caveat_hash: String,
+pub(crate) struct SubjectRef {
+    pub(crate) kind: String,
+    pub(crate) id: String,
+    pub(crate) caveat_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) struct UsersetRef {
-    pub(super) namespace: String,
-    pub(super) object_id: String,
-    pub(super) relation: String,
+pub(crate) struct UsersetRef {
+    pub(crate) namespace: String,
+    pub(crate) object_id: String,
+    pub(crate) relation: String,
 }
 
 #[derive(Debug, Clone, Default)]
-pub(super) struct SchemaRuleIndex {
+pub(crate) struct SchemaRuleIndex {
     rules_by_userset: BTreeMap<UsersetRuleKey, Vec<AuthzRelationRule>>,
 }
 
@@ -35,7 +35,7 @@ struct UsersetRuleKey {
 }
 
 impl SchemaRuleIndex {
-    pub(super) async fn load<'a, I>(
+    pub(crate) async fn load<'a, I>(
         storage: &Storage,
         tenant_id: i64,
         current: &BTreeMap<TupleViewKey, AuthzTupleRecord>,
@@ -103,7 +103,7 @@ impl SchemaRuleIndex {
     }
 }
 
-pub(super) fn resolve_userset(
+pub(crate) fn resolve_userset(
     current: &BTreeMap<TupleViewKey, AuthzTupleRecord>,
     schema_index: &SchemaRuleIndex,
     userset: &UsersetRef,
@@ -113,7 +113,7 @@ pub(super) fn resolve_userset(
     resolve_userset_inner(current, schema_index, userset, subject, &mut visited)
 }
 
-pub(super) fn collect_subjects_for_userset(
+pub(crate) fn collect_subjects_for_userset(
     current: &BTreeMap<TupleViewKey, AuthzTupleRecord>,
     schema_index: &SchemaRuleIndex,
     userset: &UsersetRef,

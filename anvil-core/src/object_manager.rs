@@ -11,16 +11,13 @@ use crate::{
     },
     error_codes::AnvilErrorCode,
     formats::writer::WriterFamily,
-    metadata_journal, object_links,
+    object_links,
     observability::{
         OBJECT_READ_LATENCY, OBJECT_WRITE_LATENCY, Observability, PREFIX_LIST_LATENCY,
         RESERVED_NAMESPACE_REJECTION_COUNT,
     },
     permissions::AnvilAction,
-    persistence::{
-        Bucket, MetadataMutationReceipt, Object, ObjectVersion, ObjectVersionsPage,
-        ObjectWatchEvent, Persistence,
-    },
+    persistence::{Bucket, MetadataMutationReceipt, Object, ObjectWatchEvent, Persistence},
     routing::{self, CrossRegionRoutingPolicy},
     storage::Storage,
     validation, watch_log,
@@ -1388,56 +1385,6 @@ mod read;
 
 fn normalized_list_limit(limit: i32) -> i32 {
     if limit <= 0 { 1000 } else { limit }
-}
-
-fn visible_object_listing(
-    objects: Vec<Object>,
-    prefix: &str,
-    limit: i32,
-    delimiter: &str,
-) -> metadata_journal::NativeObjectListing {
-    let limit = limit.max(1) as usize;
-    if delimiter.is_empty() {
-        return metadata_journal::NativeObjectListing {
-            objects: objects.into_iter().take(limit).collect(),
-            common_prefixes: Vec::new(),
-        };
-    }
-
-    enum ListingEntry {
-        Object(Object),
-        CommonPrefix(String),
-    }
-
-    let mut merged = std::collections::BTreeMap::<String, ListingEntry>::new();
-    for object in objects {
-        let suffix = &object.key[prefix.len()..];
-        if let Some(position) = suffix.find(delimiter) {
-            let common_prefix = format!("{}{}", prefix, &suffix[..position + delimiter.len()]);
-            merged
-                .entry(common_prefix.clone())
-                .or_insert(ListingEntry::CommonPrefix(common_prefix));
-        } else {
-            merged.insert(object.key.clone(), ListingEntry::Object(object));
-        }
-        if merged.len() >= limit {
-            break;
-        }
-    }
-
-    let mut listing = metadata_journal::NativeObjectListing {
-        objects: Vec::new(),
-        common_prefixes: Vec::new(),
-    };
-    for (_, entry) in merged.into_iter().take(limit) {
-        match entry {
-            ListingEntry::Object(object) => listing.objects.push(object),
-            ListingEntry::CommonPrefix(common_prefix) => {
-                listing.common_prefixes.push(common_prefix)
-            }
-        }
-    }
-    listing
 }
 
 async fn collect_stream_bytes(

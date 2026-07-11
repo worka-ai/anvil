@@ -175,7 +175,18 @@ pub async fn put_schema_revision(
         created_at: chrono::Utc::now().to_rfc3339(),
     };
     match write_schema_record(storage, tenant_id, &record).await {
-        Ok(()) => Ok(record),
+        Ok(()) => {
+            if authz_revision == 0 {
+                return Ok(record);
+            }
+            crate::authz_journal::materialize_authz_tuple_segment(
+                storage,
+                tenant_id,
+                authz_revision,
+            )
+            .await?;
+            Ok(record)
+        }
         Err(err) => {
             // Concurrent bootstrap/schema writers may race on the same deterministic
             // revision ref. If the winner wrote the identical schema digest, the
@@ -266,6 +277,10 @@ pub async fn bind_schema(
         false,
     )
     .await?;
+    if authz_revision > 0 {
+        crate::authz_journal::materialize_authz_tuple_segment(storage, tenant_id, authz_revision)
+            .await?;
+    }
     Ok(binding)
 }
 
@@ -281,6 +296,59 @@ pub async fn read_schema_binding(
         schema_binding_tuple_key(tenant_id, realm_id)?,
     )
     .await
+}
+
+pub async fn list_schema_revisions(
+    storage: &Storage,
+    tenant_id: i64,
+) -> Result<Vec<StoredAuthzSchemaRevision>> {
+    validate_storage_tenant(tenant_id)?;
+    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
+    let prefix = core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(AUTHZ_SCHEMA_REVISION_ROW_KIND),
+        CoreMetaTuplePart::I64(tenant_id),
+    ])?;
+    let mut records = Vec::new();
+    for row in meta.scan_prefix(CF_AUTHZ, TABLE_AUTHZ_SCHEMA_ROW, &prefix)? {
+        records.push(
+            decode_schema_record_row::<StoredAuthzSchemaRevision>(storage, tenant_id, &row.payload)
+                .await?,
+        );
+    }
+    records.sort_by(|left, right| {
+        (
+            &left.schema_ref.schema_id,
+            left.schema_ref.schema_revision,
+            &left.schema_ref.schema_digest,
+        )
+            .cmp(&(
+                &right.schema_ref.schema_id,
+                right.schema_ref.schema_revision,
+                &right.schema_ref.schema_digest,
+            ))
+    });
+    Ok(records)
+}
+
+pub async fn list_schema_bindings(
+    storage: &Storage,
+    tenant_id: i64,
+) -> Result<Vec<StoredAuthzSchemaBinding>> {
+    validate_storage_tenant(tenant_id)?;
+    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
+    let prefix = core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(AUTHZ_SCHEMA_BINDING_ROW_KIND),
+        CoreMetaTuplePart::I64(tenant_id),
+    ])?;
+    let mut records = Vec::new();
+    for row in meta.scan_prefix(CF_AUTHZ, TABLE_AUTHZ_SCHEMA_ROW, &prefix)? {
+        records.push(
+            decode_schema_record_row::<StoredAuthzSchemaBinding>(storage, tenant_id, &row.payload)
+                .await?,
+        );
+    }
+    records.sort_by(|left, right| left.realm_id.cmp(&right.realm_id));
+    Ok(records)
 }
 
 pub async fn read_bound_namespace_schema(

@@ -194,13 +194,9 @@ pub(super) fn internal_candidate_limit_for_request(
     }
 }
 
-pub(super) fn score_index_candidate_limit(
-    base_limit: usize,
-    available_candidates: u64,
-    permission_filter: Option<&QueryPermissionFilter>,
-) -> usize {
+pub(super) fn score_index_candidate_limit(base_limit: usize, available_candidates: u64) -> usize {
     let base_limit = base_limit.max(1);
-    let _ = (available_candidates, permission_filter);
+    let _ = available_candidates;
     base_limit
 }
 

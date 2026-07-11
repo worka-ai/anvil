@@ -10,7 +10,7 @@ use crate::formats::{
     hash32,
     vector::{VectorIndexDefinition, VectorMetric, VectorPayload, VectorRecord},
 };
-use crate::full_text_segment::{self, FullTextSegmentWrite};
+use crate::full_text_segment::{self, FullTextDocumentTableRow, FullTextSegmentWrite};
 use crate::index_partition_watch::{self, IndexPartitionWatchPayload};
 use crate::media_extraction::{
     DerivedAssetPolicy, DerivedOutputKind, MediaExtractionRequest, MediaObjectRef,
@@ -59,34 +59,6 @@ pub struct IndexBuildDiagnostic {
     pub code: String,
     pub message: String,
     pub details: JsonValue,
-}
-
-#[derive(Debug, Clone)]
-struct DocumentTableRow<'a> {
-    document_id: u64,
-    field_id: u16,
-    object_key: &'a str,
-    version_id: String,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct FullTextDocumentTableProto {
-    #[prost(string, tag = "1")]
-    schema: String,
-    #[prost(message, repeated, tag = "2")]
-    rows: Vec<FullTextDocumentTableRowProto>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct FullTextDocumentTableRowProto {
-    #[prost(uint64, tag = "1")]
-    document_id: u64,
-    #[prost(uint32, tag = "2")]
-    field_id: u32,
-    #[prost(string, tag = "3")]
-    object_key: String,
-    #[prost(string, tag = "4")]
-    version_id: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -198,22 +170,6 @@ async fn boundary_values_for_objects(
         }
     }
     Ok(values)
-}
-
-fn encode_full_text_document_table(rows: &[DocumentTableRow<'_>]) -> Result<Vec<u8>> {
-    let proto = FullTextDocumentTableProto {
-        schema: "anvil.index.full_text.document_table.v1".to_string(),
-        rows: rows
-            .iter()
-            .map(|row| FullTextDocumentTableRowProto {
-                document_id: row.document_id,
-                field_id: u32::from(row.field_id),
-                object_key: row.object_key.to_string(),
-                version_id: row.version_id.clone(),
-            })
-            .collect(),
-    };
-    encode_deterministic_proto(&proto)
 }
 
 fn index_definition_hash(
@@ -376,14 +332,14 @@ pub async fn build_full_text_index(
     );
     let document_table_rows = owned_documents
         .iter()
-        .map(|document| DocumentTableRow {
+        .map(|document| FullTextDocumentTableRow {
             document_id: document.document_id,
             field_id: document.field_id,
-            object_key: &document.object_key,
-            version_id: uuid::Uuid::from_bytes(document.object_version_id).to_string(),
+            object_key: document.object_key.clone(),
+            version_id: uuid::Uuid::from_bytes(document.object_version_id),
         })
         .collect::<Vec<_>>();
-    let document_table = encode_full_text_document_table(&document_table_rows)?;
+    let document_table = full_text_segment::encode_full_text_document_table(&document_table_rows)?;
     let segment_ref = full_text_segment::write_full_text_segment(
         storage,
         FullTextSegmentWrite {

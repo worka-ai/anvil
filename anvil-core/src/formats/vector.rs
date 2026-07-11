@@ -770,6 +770,7 @@ pub struct VectorSearchCandidate {
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorSearchResult {
     pub vector_id: u64,
+    pub source_id_binary: Vec<u8>,
     pub score: f32,
     pub object_version_id: [u8; 16],
     pub chunk_id: u32,
@@ -849,6 +850,7 @@ pub fn select_authorized_vector_results(
         .take(result_count)
         .map(|(score, _, candidate)| VectorSearchResult {
             vector_id: candidate.record.vector_id,
+            source_id_binary: Vec::new(),
             score,
             object_version_id: candidate.record.object_version_id,
             chunk_id: candidate.record.chunk_id,

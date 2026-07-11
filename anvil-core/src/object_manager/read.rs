@@ -1,5 +1,12 @@
 use super::*;
 use crate::core_store::ReadLogicalRangeRequest;
+use crate::query_planner::{
+    AuthzCandidateRequest, BoundaryCandidateRequest, CandidateSet, CandidateSetKind,
+    CandidateSetScope, CoreDocId, IndexCandidateRequest, ObjectAuthzKey, OrderedDocTuple,
+    QueryPlanRequest, RangePlanRequest, ReadRangePlan, stable_doc_ordinal,
+};
+use crate::query_planner::{BoundaryCandidateReader, IndexCandidateReader};
+use std::collections::BTreeMap;
 
 impl ObjectManager {
     pub async fn get_object(
@@ -650,33 +657,69 @@ impl ObjectManager {
             .authorized_bucket_reader_claims(claims.as_ref(), &bucket, consistency.authz_revision())
             .await?;
 
-        let mut objects = if let Some(root_generation) = consistency.root_generation() {
-            self.core_store
-                .list_current_object_metadata_at_generation(&bucket, root_generation)
-                .await
-        } else {
-            self.core_store.list_current_object_metadata(&bucket).await
+        self.planner_backed_object_listing(
+            &reader_claims,
+            &bucket,
+            prefix,
+            start_after,
+            limit,
+            delimiter,
+            consistency,
+        )
+        .await
+    }
+
+    async fn planner_backed_object_listing(
+        &self,
+        claims: &auth::Claims,
+        bucket: &Bucket,
+        prefix: &str,
+        start_after: &str,
+        limit: i32,
+        delimiter: &str,
+        consistency: ObjectReadConsistency,
+    ) -> Result<(Vec<Object>, Vec<String>), Status> {
+        let mut objects = match consistency.root_generation() {
+            Some(root_generation) => {
+                self.core_store
+                    .list_current_object_metadata_at_generation(bucket, root_generation)
+                    .await
+            }
+            None => self.core_store.list_current_object_metadata(bucket).await,
         }
         .map_err(|e| Status::internal(e.to_string()))?;
         objects.retain(|object| {
             object.key.starts_with(prefix)
                 && object.key.as_str() > start_after
                 && !validation::is_reserved_internal_key(&object.key)
+                && object.deleted_at.is_none()
         });
         objects.sort_by(|left, right| left.key.cmp(&right.key));
 
-        objects = self
-            .filter_objects_visible_to_reader(
-                &reader_claims,
-                bucket_name,
-                objects,
-                consistency.authz_revision(),
+        let system_revision = self
+            .object_listing_authz_revision(consistency)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let root_generation = consistency
+            .root_generation()
+            .unwrap_or_else(|| object_listing_root_generation(&objects));
+        let docs = object_listing_docs(bucket, objects, "object-list-current");
+        let plan = self
+            .execute_object_listing_plan(
+                claims,
+                bucket,
+                docs,
+                root_generation,
+                system_revision,
+                "object-list-current",
+                prefix,
+                start_after,
+                delimiter,
+                normalized_list_limit(limit) as u32,
             )
             .await?;
-
-        let listing =
-            visible_object_listing(objects, prefix, normalized_list_limit(limit), delimiter);
-        Ok((listing.objects, listing.common_prefixes))
+        let objects = object_listing_objects_from_plan(&plan);
+        Ok(shape_object_listing(objects, prefix, delimiter, limit))
     }
 
     pub async fn list_object_versions(
@@ -743,17 +786,190 @@ impl ObjectManager {
         let reader_claims = self
             .authorized_bucket_reader_claims(claims.as_ref(), &bucket, consistency.authz_revision())
             .await?;
-        self.list_visible_object_versions(
-            &reader_claims,
-            bucket_name,
-            &bucket,
-            prefix,
-            key_marker,
-            version_id_marker,
+        let unbounded_limit = i32::MAX;
+        let page = match consistency.root_generation() {
+            Some(root_generation) => {
+                self.core_store
+                    .list_object_versions_metadata_at_generation(
+                        &bucket,
+                        prefix,
+                        key_marker,
+                        version_id_marker,
+                        unbounded_limit,
+                        root_generation,
+                    )
+                    .await
+            }
+            None => {
+                self.core_store
+                    .list_object_versions_metadata(
+                        &bucket,
+                        prefix,
+                        key_marker,
+                        version_id_marker,
+                        unbounded_limit,
+                    )
+                    .await
+            }
+        }
+        .map_err(|e| Status::internal(e.to_string()))?;
+        let versions = page
+            .versions
+            .into_iter()
+            .filter(|version| !validation::is_reserved_internal_key(&version.object.key))
+            .collect::<Vec<_>>();
+        let system_revision = self
+            .object_listing_authz_revision(consistency)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let root_generation = consistency
+            .root_generation()
+            .unwrap_or_else(|| object_version_listing_root_generation(&versions));
+        let docs = object_version_listing_docs(&bucket, versions, "object-list-versions");
+        let plan = self
+            .execute_object_listing_plan(
+                &reader_claims,
+                &bucket,
+                docs,
+                root_generation,
+                system_revision,
+                "object-list-versions",
+                prefix,
+                key_marker,
+                version_id_marker
+                    .as_ref()
+                    .map(uuid::Uuid::to_string)
+                    .as_deref()
+                    .unwrap_or(""),
+                normalized_list_limit(limit).saturating_add(1) as u32,
+            )
+            .await?;
+        let versions = object_listing_versions_from_plan(&plan);
+        Ok(shape_object_version_listing(
+            versions,
             normalized_list_limit(limit),
-            consistency,
+        ))
+    }
+
+    async fn object_listing_authz_revision(
+        &self,
+        consistency: ObjectReadConsistency,
+    ) -> AnyhowResult<u64> {
+        if let Some(revision) = consistency.authz_revision() {
+            return Ok(u64::try_from(revision.max(0))?);
+        }
+        Ok(crate::authz_segment::read_latest_authz_tuple_segment(
+            &self.storage,
+            crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
         )
-        .await
+        .await?
+        .map(|segment| segment.header.generation)
+        .unwrap_or(0))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_object_listing_plan(
+        &self,
+        claims: &auth::Claims,
+        bucket: &Bucket,
+        docs: Vec<ObjectListingPlanDoc>,
+        root_generation: u64,
+        system_revision: u64,
+        family: &str,
+        predicate_a: &str,
+        predicate_b: &str,
+        order: &str,
+        limit: u32,
+    ) -> Result<ObjectListingPlanOutput, Status> {
+        if !matches!(family, "object-list-current" | "object-list-versions") {
+            return Err(Status::failed_precondition(
+                "IndexCapabilityMissing: object listing requires a planner-backed path/object-list candidate reader",
+            ));
+        }
+        let partition_id = object_listing_partition_id(bucket, family);
+        let object_namespace =
+            access_control::system_realm_namespace(crate::system_realm::SYSTEM_OBJECT_NAMESPACE);
+        let scope = CandidateSetScope {
+            root_key_hash: object_listing_hash(&[
+                "root",
+                &bucket.tenant_id.to_string(),
+                &bucket.id.to_string(),
+                &root_generation.to_string(),
+            ]),
+            root_generation,
+            index_id: format!("{family}:{}:{}", bucket.tenant_id, bucket.id),
+            index_generation: root_generation,
+            authz_realm_id: crate::system_realm::SYSTEM_REALM_ID.to_string(),
+            authz_scope_hash: object_listing_hash(&[
+                "authz-scope",
+                &bucket.tenant_id.to_string(),
+                &bucket.id.to_string(),
+                &system_revision.to_string(),
+            ]),
+            authz_object_namespace: object_namespace.clone(),
+            authz_relation: "get".to_string(),
+            authz_principal_hash: object_listing_hash(&["principal", &claims.sub]),
+            authz_revision: system_revision,
+            boundary_schema_generation_hash: object_listing_hash(&[
+                "boundary",
+                &bucket.tenant_id.to_string(),
+                &bucket.id.to_string(),
+            ]),
+            predicate_hash: object_listing_hash(&["predicate", family, predicate_a, predicate_b]),
+            order_hash: object_listing_hash(&["order", family, order]),
+        };
+        let reader = ObjectListingCandidateReader::new(scope.clone(), partition_id, docs);
+        let authz_reader = crate::authz_segment::AuthzSegmentCandidateReader::new(
+            self.storage.clone(),
+            crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
+        );
+        let planner = crate::query_planner::CoreStoreQueryPlanner {
+            boundary_reader: &reader,
+            authz_reader: &authz_reader,
+            index_reader: &reader,
+        };
+        let request = QueryPlanRequest {
+            boundary: BoundaryCandidateRequest {
+                root_key_hash: scope.root_key_hash.clone(),
+                root_generation: scope.root_generation,
+                bucket_name: bucket.name.clone(),
+                boundary_schema_generation_hash: scope.boundary_schema_generation_hash.clone(),
+                boundary_predicate_json: String::new(),
+            },
+            authz: AuthzCandidateRequest {
+                authz_scope: scope.authz_scope_hash.clone(),
+                candidate_scope: scope.clone(),
+                partition_id,
+                subject: format!("{}:{}", access_control::APP_SUBJECT_KIND, claims.sub),
+                relation: "get".to_string(),
+                object_namespace,
+                revision: system_revision,
+                system_revision,
+                root_generation,
+            },
+            index: IndexCandidateRequest {
+                index_id: scope.index_id.clone(),
+                predicate_json: scope.predicate_hash.clone(),
+                order_json: Some(scope.order_hash.clone()),
+                generation: scope.index_generation,
+                boundary_predicate_json: None,
+            },
+            limit,
+            page_token: None,
+        };
+        let result = planner
+            .plan(request)
+            .await
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        let mut objects = Vec::new();
+        for range in result.ranges {
+            let index = usize::try_from(range.logical_start)
+                .map_err(|_| Status::internal("Object listing range overflow"))?;
+            if let Some(doc) = reader.docs.get(index) {
+                objects.push(doc.clone());
+            }
+        }
+        Ok(ObjectListingPlanOutput { docs: objects })
     }
 
     pub async fn current_object_for_write_precondition(
@@ -1273,122 +1489,6 @@ impl ObjectManager {
         Err(Status::permission_denied("Permission denied"))
     }
 
-    async fn filter_objects_visible_to_reader(
-        &self,
-        claims: &auth::Claims,
-        bucket_name: &str,
-        objects: Vec<Object>,
-        authz_revision: Option<i64>,
-    ) -> Result<Vec<Object>, Status> {
-        let mut visible = Vec::new();
-        for object in objects {
-            if self
-                .object_read_allowed(claims, bucket_name, &object.key, authz_revision)
-                .await?
-            {
-                visible.push(object);
-            }
-        }
-        Ok(visible)
-    }
-
-    async fn list_visible_object_versions(
-        &self,
-        claims: &auth::Claims,
-        bucket_name: &str,
-        bucket: &Bucket,
-        prefix: &str,
-        key_marker: &str,
-        version_id_marker: Option<uuid::Uuid>,
-        limit: i32,
-        consistency: ObjectReadConsistency,
-    ) -> Result<ObjectVersionsPage, Status> {
-        let requested_limit = normalized_list_limit(limit).max(1) as usize;
-        let visible_target = requested_limit.saturating_add(1);
-        let page_limit = i32::try_from(visible_target.max(100)).unwrap_or(i32::MAX);
-        let mut visible = Vec::<ObjectVersion>::new();
-        let mut current_key_marker = key_marker.to_string();
-        let mut current_version_marker = version_id_marker;
-
-        loop {
-            let page = if let Some(root_generation) = consistency.root_generation() {
-                self.core_store
-                    .list_object_versions_metadata_at_generation(
-                        bucket,
-                        prefix,
-                        &current_key_marker,
-                        current_version_marker,
-                        page_limit,
-                        root_generation,
-                    )
-                    .await
-            } else {
-                self.core_store
-                    .list_object_versions_metadata(
-                        bucket,
-                        prefix,
-                        &current_key_marker,
-                        current_version_marker,
-                        page_limit,
-                    )
-                    .await
-            }
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-            for version in page.versions {
-                if self
-                    .object_read_allowed(
-                        claims,
-                        bucket_name,
-                        &version.object.key,
-                        consistency.authz_revision(),
-                    )
-                    .await?
-                {
-                    visible.push(version);
-                    if visible.len() >= visible_target {
-                        break;
-                    }
-                }
-            }
-
-            if visible.len() >= visible_target || !page.is_truncated {
-                break;
-            }
-
-            let Some(next_key_marker) = page.next_key_marker else {
-                break;
-            };
-            current_key_marker = next_key_marker;
-            current_version_marker = page.next_version_id_marker;
-        }
-
-        let is_truncated = visible.len() > requested_limit;
-        if is_truncated {
-            visible.truncate(requested_limit);
-        }
-        let (next_key_marker, next_version_id_marker) = if is_truncated {
-            visible
-                .last()
-                .map(|version| {
-                    (
-                        Some(version.object.key.clone()),
-                        Some(version.object.version_id),
-                    )
-                })
-                .unwrap_or((None, None))
-        } else {
-            (None, None)
-        };
-
-        Ok(ObjectVersionsPage {
-            versions: visible,
-            is_truncated,
-            next_key_marker,
-            next_version_id_marker,
-        })
-    }
-
     pub(crate) async fn publish_object_watch_event(
         &self,
         tenant_id: i64,
@@ -1498,5 +1598,293 @@ impl ObjectManager {
         }
 
         Ok(bucket)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ObjectListingPlanDoc {
+    doc_id: CoreDocId,
+    object: Object,
+    version_is_latest: bool,
+    is_delete_marker: bool,
+    authz_key: ObjectAuthzKey,
+    order_tuple: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+struct ObjectListingPlanOutput {
+    docs: Vec<ObjectListingPlanDoc>,
+}
+
+#[derive(Debug, Clone)]
+struct ObjectListingCandidateReader {
+    scope: CandidateSetScope,
+    partition_id: u64,
+    docs: Vec<ObjectListingPlanDoc>,
+}
+
+impl ObjectListingCandidateReader {
+    fn new(scope: CandidateSetScope, partition_id: u64, docs: Vec<ObjectListingPlanDoc>) -> Self {
+        Self {
+            scope,
+            partition_id,
+            docs,
+        }
+    }
+}
+
+impl BoundaryCandidateReader for ObjectListingCandidateReader {
+    async fn boundary_candidates(
+        &self,
+        request: BoundaryCandidateRequest,
+    ) -> AnyhowResult<CandidateSet> {
+        if self.scope.root_key_hash != request.root_key_hash
+            || self.scope.root_generation != request.root_generation
+            || self.scope.boundary_schema_generation_hash != request.boundary_schema_generation_hash
+        {
+            bail!("IndexGenerationMismatch");
+        }
+        Ok(CandidateSet::all_within_partition(
+            self.scope.clone(),
+            self.partition_id,
+        ))
+    }
+}
+
+impl IndexCandidateReader for ObjectListingCandidateReader {
+    async fn predicate_candidates(
+        &self,
+        request: IndexCandidateRequest,
+    ) -> AnyhowResult<CandidateSet> {
+        if self.scope.index_id != request.index_id
+            || self.scope.index_generation != request.generation
+            || self.scope.predicate_hash != request.predicate_json
+            || request
+                .order_json
+                .as_ref()
+                .is_some_and(|order_hash| *order_hash != self.scope.order_hash)
+        {
+            bail!("IndexGenerationMismatch");
+        }
+        Ok(CandidateSet {
+            scope: self.scope.clone(),
+            kind: CandidateSetKind::OrderedTuples {
+                partition_id: self.partition_id,
+                tuples: self
+                    .docs
+                    .iter()
+                    .map(|doc| OrderedDocTuple {
+                        order_tuple: doc.order_tuple.clone(),
+                        doc_id: doc.doc_id,
+                    })
+                    .collect(),
+            },
+        })
+    }
+
+    async fn range_plan(&self, request: RangePlanRequest) -> AnyhowResult<Vec<ReadRangePlan>> {
+        request
+            .candidates
+            .scope
+            .ensure_compatible_with(&self.scope)?;
+        let limit = usize::try_from(request.limit).unwrap_or(usize::MAX);
+        Ok(self
+            .docs
+            .iter()
+            .enumerate()
+            .filter(|(_, doc)| request.candidates.contains_doc_id(doc.doc_id))
+            .take(limit)
+            .map(|(index, doc)| ReadRangePlan {
+                manifest_hash: self.scope.index_id.clone(),
+                logical_start: index as u64,
+                logical_end: index as u64 + 1,
+                doc_ids: vec![doc.doc_id],
+                authz_keys: vec![doc.authz_key.clone()],
+            })
+            .collect())
+    }
+}
+
+fn object_listing_docs(
+    bucket: &Bucket,
+    objects: Vec<Object>,
+    family: &str,
+) -> Vec<ObjectListingPlanDoc> {
+    objects
+        .into_iter()
+        .map(|object| object_listing_doc(bucket, object, family, false))
+        .collect()
+}
+
+fn object_version_listing_docs(
+    bucket: &Bucket,
+    versions: Vec<crate::persistence::ObjectVersion>,
+    family: &str,
+) -> Vec<ObjectListingPlanDoc> {
+    versions
+        .into_iter()
+        .map(|version| {
+            let mut doc = object_listing_doc(bucket, version.object, family, version.is_latest);
+            doc.is_delete_marker = version.is_delete_marker;
+            doc
+        })
+        .collect()
+}
+
+fn object_listing_doc(
+    bucket: &Bucket,
+    object: Object,
+    family: &str,
+    version_is_latest: bool,
+) -> ObjectListingPlanDoc {
+    let namespace =
+        access_control::system_realm_namespace(crate::system_realm::SYSTEM_OBJECT_NAMESPACE);
+    let object_id = access_control::object_object_id(bucket, &object.key);
+    let authz_key = ObjectAuthzKey::realm_object(namespace, object_id);
+    let partition_id = object_listing_partition_id(bucket, family);
+    let doc_id = authz_key.doc_id(partition_id);
+    let order_tuple = vec![
+        object.key.as_bytes().to_vec(),
+        object.created_at.to_rfc3339().as_bytes().to_vec(),
+        object.version_id.as_bytes().to_vec(),
+    ];
+    let is_delete_marker = object.deleted_at.is_some();
+    ObjectListingPlanDoc {
+        doc_id,
+        object,
+        version_is_latest,
+        is_delete_marker,
+        authz_key,
+        order_tuple,
+    }
+}
+
+fn object_listing_root_generation(objects: &[Object]) -> u64 {
+    objects
+        .iter()
+        .map(|object| object.id.max(0) as u64)
+        .max()
+        .unwrap_or(0)
+}
+
+fn object_version_listing_root_generation(versions: &[crate::persistence::ObjectVersion]) -> u64 {
+    versions
+        .iter()
+        .map(|version| version.object.id.max(0) as u64)
+        .max()
+        .unwrap_or(0)
+}
+
+fn object_listing_partition_id(bucket: &Bucket, family: &str) -> u64 {
+    stable_doc_ordinal(&[
+        "object-list-partition",
+        family,
+        &bucket.tenant_id.to_string(),
+        &bucket.id.to_string(),
+    ])
+}
+
+fn object_listing_hash(parts: &[&str]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for part in parts {
+        hasher.update(&(part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    format!("blake3:{hex}")
+}
+
+fn object_listing_objects_from_plan(plan: &ObjectListingPlanOutput) -> Vec<Object> {
+    plan.docs.iter().map(|doc| doc.object.clone()).collect()
+}
+
+fn object_listing_versions_from_plan(
+    plan: &ObjectListingPlanOutput,
+) -> Vec<crate::persistence::ObjectVersion> {
+    plan.docs
+        .iter()
+        .map(|doc| crate::persistence::ObjectVersion {
+            object: doc.object.clone(),
+            is_latest: doc.version_is_latest,
+            is_delete_marker: doc.is_delete_marker,
+        })
+        .collect()
+}
+
+fn shape_object_listing(
+    objects: Vec<Object>,
+    prefix: &str,
+    delimiter: &str,
+    limit: i32,
+) -> (Vec<Object>, Vec<String>) {
+    let limit = normalized_list_limit(limit).max(1) as usize;
+    if delimiter.is_empty() {
+        return (objects.into_iter().take(limit).collect(), Vec::new());
+    }
+
+    enum ListingEntry {
+        Object(Object),
+        CommonPrefix(String),
+    }
+
+    let mut merged = BTreeMap::<String, ListingEntry>::new();
+    for object in objects {
+        let suffix = &object.key[prefix.len()..];
+        if let Some(position) = suffix.find(delimiter) {
+            let common_prefix = format!("{}{}", prefix, &suffix[..position + delimiter.len()]);
+            merged
+                .entry(common_prefix.clone())
+                .or_insert(ListingEntry::CommonPrefix(common_prefix));
+        } else {
+            merged.insert(object.key.clone(), ListingEntry::Object(object));
+        }
+        if merged.len() >= limit {
+            break;
+        }
+    }
+
+    let mut listed = Vec::new();
+    let mut common_prefixes = Vec::new();
+    for (_, entry) in merged.into_iter().take(limit) {
+        match entry {
+            ListingEntry::Object(object) => listed.push(object),
+            ListingEntry::CommonPrefix(prefix) => common_prefixes.push(prefix),
+        }
+    }
+    (listed, common_prefixes)
+}
+
+fn shape_object_version_listing(
+    mut versions: Vec<crate::persistence::ObjectVersion>,
+    limit: i32,
+) -> crate::persistence::ObjectVersionsPage {
+    let limit = normalized_list_limit(limit).max(1) as usize;
+    let is_truncated = versions.len() > limit;
+    if is_truncated {
+        versions.truncate(limit);
+    }
+    let (next_key_marker, next_version_id_marker) = if is_truncated {
+        versions
+            .last()
+            .map(|version| {
+                (
+                    Some(version.object.key.clone()),
+                    Some(version.object.version_id),
+                )
+            })
+            .unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
+    crate::persistence::ObjectVersionsPage {
+        versions,
+        is_truncated,
+        next_key_marker,
+        next_version_id_marker,
     }
 }

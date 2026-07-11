@@ -411,6 +411,7 @@ fn result_from_entry(
 ) -> Result<VectorSearchResult, FormatError> {
     Ok(VectorSearchResult {
         vector_id: entry.record.vector_id,
+        source_id_binary: entry.source_id_binary.clone(),
         score: vector_score(query, &entry.payload.values, metric)?,
         object_version_id: entry.record.object_version_id,
         chunk_id: entry.record.chunk_id,

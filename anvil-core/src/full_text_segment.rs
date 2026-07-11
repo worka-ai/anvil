@@ -10,7 +10,10 @@ use crate::{
         },
         hash32, header_field_bytes, header_field_string, header_field_u64, required_header_bytes,
         required_header_string, required_header_u64, single_body_range_index,
-        table::{TableRow, WriterBodyTable, decode_writer_body_tables, encode_writer_body_tables},
+        table::{
+            TableRow, WriterBodyTable, decode_writer_body_table, decode_writer_body_tables,
+            encode_writer_body_tables,
+        },
         unix_nanos_from_rfc3339,
         writer::{
             WriterBuildOutput, WriterFamily, WriterSegmentBuildInput,
@@ -24,7 +27,7 @@ use crate::{
 use anyhow::{Context, Result, anyhow};
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use std::convert::TryInto;
+use std::{collections::BTreeMap, convert::TryInto};
 
 const FULL_TEXT_SEGMENT_REF_PREFIX: &str = "full_text_segment:";
 
@@ -64,6 +67,88 @@ struct FullTextAnalyserCatalogProto {
     scorer_json: Vec<u8>,
     #[prost(string, tag = "4")]
     codec: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct FullTextDocumentTableProto {
+    #[prost(string, tag = "1")]
+    schema: String,
+    #[prost(message, repeated, tag = "2")]
+    rows: Vec<FullTextDocumentTableRowProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct FullTextDocumentTableRowProto {
+    #[prost(uint64, tag = "1")]
+    document_id: u64,
+    #[prost(uint32, tag = "2")]
+    field_id: u32,
+    #[prost(string, tag = "3")]
+    object_key: String,
+    #[prost(string, tag = "4")]
+    version_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullTextDocumentRef {
+    pub document_id: u64,
+    pub field_id: u16,
+    pub object_key: String,
+    pub version_id: uuid::Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullTextDocumentTableRow {
+    pub document_id: u64,
+    pub field_id: u16,
+    pub object_key: String,
+    pub version_id: uuid::Uuid,
+}
+
+pub fn encode_full_text_document_table(rows: &[FullTextDocumentTableRow]) -> Result<Vec<u8>> {
+    encode_proto_message(FullTextDocumentTableProto {
+        schema: "anvil.index.full_text.document_table.v1".to_string(),
+        rows: rows
+            .iter()
+            .map(|row| FullTextDocumentTableRowProto {
+                document_id: row.document_id,
+                field_id: u32::from(row.field_id),
+                object_key: row.object_key.clone(),
+                version_id: row.version_id.to_string(),
+            })
+            .collect(),
+    })
+}
+
+pub fn decode_full_text_document_table(
+    bytes: &[u8],
+) -> Result<BTreeMap<(u64, u16), FullTextDocumentRef>> {
+    let proto =
+        FullTextDocumentTableProto::decode(bytes).context("decode full text document table")?;
+    if proto.schema != "anvil.index.full_text.document_table.v1" {
+        return Err(anyhow!(
+            "full text document table schema mismatch: found {:?} in {} bytes",
+            proto.schema,
+            bytes.len()
+        ));
+    }
+    let mut out = BTreeMap::new();
+    for row in proto.rows {
+        let field_id =
+            u16::try_from(row.field_id).context("full text document table field id exceeds u16")?;
+        let version_id = uuid::Uuid::parse_str(&row.version_id)
+            .context("full text document table version id is not a UUID")?;
+        out.insert(
+            (row.document_id, field_id),
+            FullTextDocumentRef {
+                document_id: row.document_id,
+                field_id,
+                object_key: row.object_key,
+                version_id,
+            },
+        );
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,6 +370,8 @@ pub async fn read_full_text_segment_terms(
         RangeAddressedWriterSegment::table_entry(&directory, TABLE_FULL_TEXT_TERM_DICTIONARY)?;
     let postings_entry =
         RangeAddressedWriterSegment::table_entry(&directory, TABLE_FULL_TEXT_POSTINGS_BY_TERM)?;
+    let stored_fields_entry =
+        RangeAddressedWriterSegment::table_entry(&directory, TABLE_FULL_TEXT_STORED_FIELDS)?;
 
     let mut terms = Vec::new();
     let mut postings_bytes = Vec::new();
@@ -320,6 +407,15 @@ pub async fn read_full_text_segment_terms(
         terms.push(term);
     }
 
+    let stored_fields_bytes = segment.read_table_bytes(stored_fields_entry).await?;
+    let stored_fields_table = decode_writer_body_table(stored_fields_entry, &stored_fields_bytes)?;
+    let document_table = stored_fields_table
+        .rows
+        .into_iter()
+        .find(|row| row.key == b"document-table".as_slice())
+        .map(|row| row.value)
+        .ok_or_else(|| anyhow!("full text document table missing"))?;
+
     Ok(DecodedFullTextSegment {
         header,
         body_header: FullTextBodyHeader {
@@ -331,7 +427,7 @@ pub async fn read_full_text_segment_terms(
         postings,
         posting_skips: Vec::new(),
         postings_bytes,
-        document_table: Vec::new(),
+        document_table,
     })
 }
 

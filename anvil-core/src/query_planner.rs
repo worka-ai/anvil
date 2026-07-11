@@ -21,6 +21,20 @@ impl CoreDocId {
     }
 }
 
+pub fn stable_doc_ordinal(parts: &[&str]) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    for part in parts {
+        hasher.update(&(part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    let hash = hasher.finalize();
+    u64::from_le_bytes(
+        hash.as_bytes()[0..8]
+            .try_into()
+            .expect("hash prefix is eight bytes"),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CandidateSetScope {
     pub root_key_hash: String,
@@ -40,19 +54,57 @@ pub struct CandidateSetScope {
 
 impl CandidateSetScope {
     pub fn compatible_with(&self, other: &Self) -> bool {
-        self.root_key_hash == other.root_key_hash
-            && self.root_generation == other.root_generation
-            && self.index_id == other.index_id
-            && self.index_generation == other.index_generation
-            && self.authz_realm_id == other.authz_realm_id
-            && self.authz_scope_hash == other.authz_scope_hash
-            && self.authz_object_namespace == other.authz_object_namespace
-            && self.authz_relation == other.authz_relation
-            && self.authz_principal_hash == other.authz_principal_hash
-            && self.authz_revision == other.authz_revision
-            && self.boundary_schema_generation_hash == other.boundary_schema_generation_hash
-            && self.predicate_hash == other.predicate_hash
-            && self.order_hash == other.order_hash
+        self.compatibility_mismatch(other).is_none()
+    }
+
+    pub fn ensure_compatible_with(&self, other: &Self) -> Result<()> {
+        if let Some(field) = self.compatibility_mismatch(other) {
+            bail!("CandidateSetScopeMismatch:{field}");
+        }
+        Ok(())
+    }
+
+    pub fn compatibility_mismatch(&self, other: &Self) -> Option<&'static str> {
+        if self.root_key_hash != other.root_key_hash {
+            return Some("root_key_hash");
+        }
+        if self.root_generation != other.root_generation {
+            return Some("root_generation");
+        }
+        if self.index_id != other.index_id {
+            return Some("index_id");
+        }
+        if self.index_generation != other.index_generation {
+            return Some("index_generation");
+        }
+        if self.authz_realm_id != other.authz_realm_id {
+            return Some("authz_realm_id");
+        }
+        if self.authz_scope_hash != other.authz_scope_hash {
+            return Some("authz_scope_hash");
+        }
+        if self.authz_object_namespace != other.authz_object_namespace {
+            return Some("authz_object_namespace");
+        }
+        if self.authz_relation != other.authz_relation {
+            return Some("authz_relation");
+        }
+        if self.authz_principal_hash != other.authz_principal_hash {
+            return Some("authz_principal_hash");
+        }
+        if self.authz_revision != other.authz_revision {
+            return Some("authz_revision");
+        }
+        if self.boundary_schema_generation_hash != other.boundary_schema_generation_hash {
+            return Some("boundary_schema_generation_hash");
+        }
+        if self.predicate_hash != other.predicate_hash {
+            return Some("predicate_hash");
+        }
+        if self.order_hash != other.order_hash {
+            return Some("order_hash");
+        }
+        None
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -65,11 +117,12 @@ impl CandidateSetScope {
         )?;
         ensure_algorithm_prefixed_hash(&self.predicate_hash, "predicate_hash")?;
         ensure_algorithm_prefixed_hash(&self.order_hash, "order_hash")?;
-        if self.authz_realm_id.trim().is_empty()
+        if self.index_id.trim().is_empty()
+            || self.authz_realm_id.trim().is_empty()
             || self.authz_object_namespace.trim().is_empty()
             || self.authz_relation.trim().is_empty()
         {
-            bail!("AuthzScopeMissing");
+            bail!("CandidateSetScopeMissing");
         }
         Ok(())
     }
@@ -101,7 +154,7 @@ pub enum CandidateSetKind {
     },
     Bitmap {
         partition_id: u64,
-        roaring_bitmap_bytes: Vec<u8>,
+        ordinal_bitmap_bytes: Vec<u8>,
     },
     SortedDocIdRanges {
         partition_id: u64,
@@ -127,6 +180,76 @@ impl CandidateSet {
         }
     }
 
+    pub fn all_within_partition(scope: CandidateSetScope, partition_id: u64) -> Self {
+        Self {
+            scope,
+            kind: CandidateSetKind::AllWithinPartition { partition_id },
+        }
+    }
+
+    pub fn bitmap_from_ordinals(
+        scope: CandidateSetScope,
+        partition_id: u64,
+        ordinals: impl IntoIterator<Item = u64>,
+    ) -> Self {
+        let ordinals = ordinals.into_iter().collect::<BTreeSet<_>>();
+        if ordinals.is_empty() {
+            return Self::empty(scope);
+        }
+        let mut bytes = Vec::with_capacity(ordinals.len() * 8);
+        for ordinal in ordinals {
+            bytes.extend_from_slice(&ordinal.to_le_bytes());
+        }
+        Self {
+            scope,
+            kind: CandidateSetKind::Bitmap {
+                partition_id,
+                ordinal_bitmap_bytes: bytes,
+            },
+        }
+    }
+
+    pub fn sorted_ranges(
+        scope: CandidateSetScope,
+        partition_id: u64,
+        ranges: impl IntoIterator<Item = DocIdRange>,
+    ) -> Self {
+        let mut ranges = ranges
+            .into_iter()
+            .filter(|range| range.start_inclusive < range.end_exclusive)
+            .collect::<Vec<_>>();
+        ranges.sort_by_key(|range| range.start_inclusive);
+        let ranges = merge_doc_id_ranges(ranges);
+        if ranges.is_empty() {
+            return Self::empty(scope);
+        }
+        Self {
+            scope,
+            kind: CandidateSetKind::SortedDocIdRanges {
+                partition_id,
+                ranges,
+            },
+        }
+    }
+
+    pub fn ordered_tuples(
+        scope: CandidateSetScope,
+        partition_id: u64,
+        tuples: impl IntoIterator<Item = OrderedDocTuple>,
+    ) -> Self {
+        let tuples = tuples.into_iter().collect::<Vec<_>>();
+        if tuples.is_empty() {
+            return Self::empty(scope);
+        }
+        Self {
+            scope,
+            kind: CandidateSetKind::OrderedTuples {
+                partition_id,
+                tuples,
+            },
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         matches!(self.kind, CandidateSetKind::Empty)
     }
@@ -136,9 +259,9 @@ impl CandidateSet {
             CandidateSetKind::Empty => 0,
             CandidateSetKind::AllWithinPartition { .. } => u64::MAX,
             CandidateSetKind::Bitmap {
-                roaring_bitmap_bytes,
+                ordinal_bitmap_bytes,
                 ..
-            } => decode_bitmap_ordinals(roaring_bitmap_bytes)
+            } => decode_bitmap_ordinals(ordinal_bitmap_bytes)
                 .map(|ordinals| ordinals.len() as u64)
                 .unwrap_or(0),
             CandidateSetKind::SortedDocIdRanges { ranges, .. } => ranges
@@ -166,12 +289,56 @@ impl CandidateSet {
         }
     }
 
-    pub fn intersect(&self, other: &Self) -> Result<Self> {
+    pub fn validate(&self) -> Result<()> {
         self.scope.validate()?;
-        other.scope.validate()?;
-        if !self.scope.compatible_with(&other.scope) {
-            bail!("IndexGenerationMismatch");
+        match &self.kind {
+            CandidateSetKind::Empty | CandidateSetKind::AllWithinPartition { .. } => Ok(()),
+            CandidateSetKind::Bitmap {
+                ordinal_bitmap_bytes,
+                ..
+            } => {
+                decode_bitmap_ordinals(ordinal_bitmap_bytes)?;
+                Ok(())
+            }
+            CandidateSetKind::SortedDocIdRanges {
+                partition_id,
+                ranges,
+            } => {
+                let mut last_end = None;
+                for range in ranges {
+                    if range.start_inclusive.partition_id() != *partition_id
+                        || range.end_exclusive.partition_id() != *partition_id
+                    {
+                        bail!("CandidateRangePartitionMismatch");
+                    }
+                    if range.start_inclusive >= range.end_exclusive {
+                        bail!("CandidateRangeEmpty");
+                    }
+                    if last_end.is_some_and(|end| range.start_inclusive < end) {
+                        bail!("CandidateRangesUnsortedOrOverlapping");
+                    }
+                    last_end = Some(range.end_exclusive);
+                }
+                Ok(())
+            }
+            CandidateSetKind::OrderedTuples {
+                partition_id,
+                tuples,
+            } => {
+                for tuple in tuples {
+                    if tuple.doc_id.partition_id() != *partition_id {
+                        bail!("CandidateOrderedTuplePartitionMismatch");
+                    }
+                }
+                Ok(())
+            }
         }
+    }
+
+    pub fn intersect(&self, other: &Self) -> Result<Self> {
+        self.validate()?;
+        other.validate()?;
+        self.scope.ensure_compatible_with(&other.scope)?;
         if self.is_empty() || other.is_empty() {
             return Ok(Self::empty(self.scope.clone()));
         }
@@ -179,7 +346,7 @@ impl CandidateSet {
             return Ok(Self::empty(self.scope.clone()));
         }
         match (&self.kind, &other.kind) {
-            (CandidateSetKind::Empty, CandidateSetKind::Empty) => {
+            (CandidateSetKind::Empty, _) | (_, CandidateSetKind::Empty) => {
                 Ok(Self::empty(self.scope.clone()))
             }
             (CandidateSetKind::AllWithinPartition { .. }, _) => Ok(other.clone()),
@@ -193,13 +360,11 @@ impl CandidateSet {
                     ranges: right_ranges,
                     ..
                 },
-            ) => Ok(Self {
-                scope: self.scope.clone(),
-                kind: CandidateSetKind::SortedDocIdRanges {
-                    partition_id: *left_partition,
-                    ranges: intersect_ranges(left_ranges, right_ranges),
-                },
-            }),
+            ) => Ok(Self::sorted_ranges(
+                self.scope.clone(),
+                *left_partition,
+                intersect_ranges(left_ranges, right_ranges),
+            )),
             (
                 CandidateSetKind::OrderedTuples {
                     partition_id,
@@ -227,70 +392,49 @@ impl CandidateSet {
             (
                 CandidateSetKind::Bitmap {
                     partition_id: left_partition,
-                    roaring_bitmap_bytes: left,
+                    ordinal_bitmap_bytes: left,
                 },
                 CandidateSetKind::Bitmap {
-                    roaring_bitmap_bytes: right,
+                    ordinal_bitmap_bytes: right,
                     ..
                 },
             ) => {
                 let left = decode_bitmap_ordinals(left)?;
                 let right = decode_bitmap_ordinals(right)?;
-                let ordinals = left.intersection(&right).copied().collect::<Vec<_>>();
                 Ok(Self::bitmap_from_ordinals(
                     self.scope.clone(),
                     *left_partition,
-                    ordinals,
+                    left.intersection(&right).copied(),
                 ))
             }
-            (CandidateSetKind::Bitmap { partition_id, .. }, rhs)
-            | (rhs, CandidateSetKind::Bitmap { partition_id, .. }) => {
-                let ordinals = candidate_kind_ordinals(rhs)?;
-                let filtered = candidate_kind_ordinals(&self.kind)?
-                    .intersection(&ordinals)
-                    .copied()
-                    .collect::<Vec<_>>();
+            (
+                CandidateSetKind::Bitmap {
+                    partition_id,
+                    ordinal_bitmap_bytes,
+                },
+                rhs,
+            ) => {
+                let filtered = bitmap_ordinals_intersect_kind(ordinal_bitmap_bytes, rhs)?;
                 Ok(Self::bitmap_from_ordinals(
                     self.scope.clone(),
                     *partition_id,
                     filtered,
                 ))
             }
-            (CandidateSetKind::SortedDocIdRanges { partition_id, .. }, rhs)
-            | (rhs, CandidateSetKind::SortedDocIdRanges { partition_id, .. }) => {
-                let lhs_ordinals = candidate_kind_ordinals(&self.kind)?;
-                let rhs_ordinals = candidate_kind_ordinals(rhs)?;
-                let filtered = lhs_ordinals
-                    .intersection(&rhs_ordinals)
-                    .copied()
-                    .collect::<Vec<_>>();
+            (
+                lhs,
+                CandidateSetKind::Bitmap {
+                    partition_id,
+                    ordinal_bitmap_bytes,
+                },
+            ) => {
+                let filtered = bitmap_ordinals_intersect_kind(ordinal_bitmap_bytes, lhs)?;
                 Ok(Self::bitmap_from_ordinals(
                     self.scope.clone(),
                     *partition_id,
                     filtered,
                 ))
             }
-        }
-    }
-
-    fn bitmap_from_ordinals(
-        scope: CandidateSetScope,
-        partition_id: u64,
-        ordinals: Vec<u64>,
-    ) -> Self {
-        if ordinals.is_empty() {
-            return Self::empty(scope);
-        }
-        let mut bytes = Vec::with_capacity(ordinals.len() * 8);
-        for ordinal in ordinals {
-            bytes.extend_from_slice(&ordinal.to_le_bytes());
-        }
-        Self {
-            scope,
-            kind: CandidateSetKind::Bitmap {
-                partition_id,
-                roaring_bitmap_bytes: bytes,
-            },
         }
     }
 
@@ -317,6 +461,23 @@ impl CandidateSet {
             }
         }
     }
+
+    pub fn intersect_all<'a>(
+        mut candidates: impl Iterator<Item = &'a CandidateSet>,
+    ) -> Result<CandidateSet> {
+        let Some(first) = candidates.next() else {
+            bail!("CandidateSetRequired");
+        };
+        let mut acc = first.clone();
+        for candidate in candidates {
+            acc = acc.intersect(candidate)?;
+        }
+        Ok(acc)
+    }
+
+    pub fn contains_doc_id(&self, doc_id: CoreDocId) -> bool {
+        candidate_kind_contains(&self.kind, doc_id)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,6 +487,13 @@ pub struct ObjectAuthzKey {
 }
 
 impl ObjectAuthzKey {
+    pub fn realm_object(namespace: impl AsRef<str>, canonical_object_id: impl AsRef<str>) -> Self {
+        Self {
+            namespace: namespace.as_ref().to_string(),
+            canonical_object_id: canonical_object_id.as_ref().to_string(),
+        }
+    }
+
     pub fn object(
         bucket_id: impl AsRef<str>,
         object_key: impl AsRef<str>,
@@ -366,15 +534,25 @@ impl ObjectAuthzKey {
             ),
         }
     }
+
+    pub fn doc_id(&self, partition_id: u64) -> CoreDocId {
+        CoreDocId::new(
+            partition_id,
+            stable_doc_ordinal(&[&self.namespace, &self.canonical_object_id]),
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthzCandidateRequest {
     pub authz_scope: String,
+    pub candidate_scope: CandidateSetScope,
+    pub partition_id: u64,
     pub subject: String,
     pub relation: String,
     pub object_namespace: String,
     pub revision: u64,
+    pub system_revision: u64,
     pub root_generation: u64,
 }
 
@@ -409,6 +587,7 @@ pub struct ReadRangePlan {
     pub logical_start: u64,
     pub logical_end: u64,
     pub doc_ids: Vec<CoreDocId>,
+    pub authz_keys: Vec<ObjectAuthzKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -504,13 +683,7 @@ where
             .await?;
         let authz_keys = ranges
             .iter()
-            .flat_map(|range| {
-                range
-                    .doc_ids
-                    .iter()
-                    .copied()
-                    .map(|doc_id| ObjectAuthzKey::index_doc(&request.index.index_id, doc_id))
-            })
+            .flat_map(|range| range.authz_keys.iter().cloned())
             .collect::<Vec<_>>();
         let final_authz = self
             .authz_reader
@@ -578,32 +751,43 @@ fn intersect_ranges(left: &[DocIdRange], right: &[DocIdRange]) -> Vec<DocIdRange
     out
 }
 
-fn candidate_kind_ordinals(kind: &CandidateSetKind) -> Result<BTreeSet<u64>> {
-    match kind {
-        CandidateSetKind::Empty => Ok(BTreeSet::new()),
-        CandidateSetKind::AllWithinPartition { .. } => bail!("IndexCapabilityMissing"),
-        CandidateSetKind::Bitmap {
-            roaring_bitmap_bytes,
-            ..
-        } => decode_bitmap_ordinals(roaring_bitmap_bytes),
-        CandidateSetKind::SortedDocIdRanges { ranges, .. } => {
-            let mut out = BTreeSet::new();
-            for range in ranges {
-                let start_partition = range.start_inclusive.partition_id();
-                let end_partition = range.end_exclusive.partition_id();
-                if start_partition != end_partition {
-                    bail!("IndexCapabilityMissing");
-                }
-                for ordinal in range.start_inclusive.ordinal()..range.end_exclusive.ordinal() {
-                    out.insert(ordinal);
-                }
-            }
-            Ok(out)
-        }
-        CandidateSetKind::OrderedTuples { tuples, .. } => {
-            Ok(tuples.iter().map(|tuple| tuple.doc_id.ordinal()).collect())
-        }
+fn merge_doc_id_ranges(mut ranges: Vec<DocIdRange>) -> Vec<DocIdRange> {
+    if ranges.is_empty() {
+        return ranges;
     }
+    ranges.sort_by_key(|range| range.start_inclusive);
+    let mut merged: Vec<DocIdRange> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(last) = merged.last_mut()
+            && last.end_exclusive >= range.start_inclusive
+        {
+            last.end_exclusive = last.end_exclusive.max(range.end_exclusive);
+            continue;
+        }
+        merged.push(range);
+    }
+    merged
+}
+
+fn bitmap_ordinals_intersect_kind(
+    bitmap_bytes: &[u8],
+    filter: &CandidateSetKind,
+) -> Result<Vec<u64>> {
+    let bitmap_ordinals = decode_bitmap_ordinals(bitmap_bytes)?;
+    let filtered = bitmap_ordinals
+        .into_iter()
+        .filter(|ordinal| {
+            let partition_id = match filter {
+                CandidateSetKind::Empty => return false,
+                CandidateSetKind::AllWithinPartition { partition_id }
+                | CandidateSetKind::SortedDocIdRanges { partition_id, .. }
+                | CandidateSetKind::OrderedTuples { partition_id, .. }
+                | CandidateSetKind::Bitmap { partition_id, .. } => *partition_id,
+            };
+            candidate_kind_contains(filter, CoreDocId::new(partition_id, *ordinal))
+        })
+        .collect();
+    Ok(filtered)
 }
 
 fn candidate_kind_contains(kind: &CandidateSetKind, doc_id: CoreDocId) -> bool {
@@ -619,11 +803,14 @@ fn candidate_kind_contains(kind: &CandidateSetKind, doc_id: CoreDocId) -> bool {
             tuples.iter().any(|tuple| tuple.doc_id == doc_id)
         }
         CandidateSetKind::Bitmap {
-            roaring_bitmap_bytes,
-            ..
-        } => decode_bitmap_ordinals(roaring_bitmap_bytes)
-            .map(|docs| docs.contains(&doc_id.ordinal()))
-            .unwrap_or(false),
+            partition_id,
+            ordinal_bitmap_bytes,
+        } => {
+            doc_id.partition_id() == *partition_id
+                && decode_bitmap_ordinals(ordinal_bitmap_bytes)
+                    .map(|docs| docs.contains(&doc_id.ordinal()))
+                    .unwrap_or(false)
+        }
     }
 }
 
@@ -679,17 +866,7 @@ mod tests {
     }
 
     fn bitmap(ordinals: &[u64]) -> CandidateSet {
-        let mut bytes = Vec::new();
-        for ordinal in ordinals {
-            bytes.extend_from_slice(&ordinal.to_le_bytes());
-        }
-        CandidateSet {
-            scope: scope(),
-            kind: CandidateSetKind::Bitmap {
-                partition_id: 4,
-                roaring_bitmap_bytes: bytes,
-            },
-        }
+        CandidateSet::bitmap_from_ordinals(scope(), 4, ordinals.iter().copied())
     }
 
     #[test]
@@ -740,6 +917,57 @@ mod tests {
                 .map(|tuple| tuple.doc_id.ordinal())
                 .collect::<Vec<_>>(),
             vec![2, 8]
+        );
+    }
+
+    #[test]
+    fn candidate_sets_fail_closed_on_scope_mismatch() {
+        let left = bitmap(&[1, 2, 3]);
+        let mut right = bitmap(&[2, 3, 4]);
+        right.scope.authz_revision += 1;
+
+        let err = left.intersect(&right).unwrap_err().to_string();
+        assert!(err.contains("CandidateSetScopeMismatch:authz_revision"));
+    }
+
+    #[test]
+    fn candidate_set_intersect_all_preserves_shared_scope() {
+        let first = bitmap(&[1, 2, 3, 4]);
+        let second = CandidateSet::sorted_ranges(
+            scope(),
+            4,
+            [DocIdRange {
+                start_inclusive: CoreDocId::new(4, 2),
+                end_exclusive: CoreDocId::new(4, 5),
+            }],
+        );
+        let third = CandidateSet::ordered_tuples(
+            scope(),
+            4,
+            [
+                OrderedDocTuple {
+                    order_tuple: vec![b"b".to_vec()],
+                    doc_id: CoreDocId::new(4, 2),
+                },
+                OrderedDocTuple {
+                    order_tuple: vec![b"d".to_vec()],
+                    doc_id: CoreDocId::new(4, 4),
+                },
+            ],
+        );
+
+        let sets = [&first, &second, &third];
+        let intersected = CandidateSet::intersect_all(sets.iter().copied()).unwrap();
+        assert_eq!(intersected.scope, scope());
+        let CandidateSetKind::OrderedTuples { tuples, .. } = intersected.kind else {
+            panic!("ordered intersection should keep order tuples");
+        };
+        assert_eq!(
+            tuples
+                .iter()
+                .map(|tuple| tuple.doc_id.ordinal())
+                .collect::<Vec<_>>(),
+            vec![2, 4]
         );
     }
 }
