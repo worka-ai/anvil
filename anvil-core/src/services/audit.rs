@@ -1,6 +1,6 @@
 use crate::anvil_api::audit_service_server::AuditService;
 use crate::anvil_api::*;
-use crate::{AppState, auth, tenant_audit};
+use crate::{AppState, access_control, auth, permissions::AnvilAction, tenant_audit};
 use base64::Engine;
 use hmac::Mac;
 use tonic::{Request, Response, Status};
@@ -17,6 +17,14 @@ impl AuditService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::AppRead,
+            "tenant",
+        )
+        .await?;
         let limit = page_limit(req.page.as_ref());
         let filter = tenant_audit::TenantAuditEventFilter {
             principal_id: none_if_empty(&req.principal_id),
@@ -140,8 +148,16 @@ fn decode_tenant_audit_cursor(
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(cursor)
         .map_err(|_| Status::invalid_argument("Invalid tenant audit cursor"))?;
-    let token: TenantAuditCursor = serde_json::from_slice(&bytes)
-        .map_err(|_| Status::invalid_argument("Invalid tenant audit cursor"))?;
+    let token = tenant_audit_cursor_from_proto(
+        crate::core_store::decode_deterministic_proto::<TenantAuditCursorProto>(
+            &bytes,
+            "tenant audit cursor",
+        )
+        .map_err(|_| Status::invalid_argument("Invalid tenant audit cursor"))?,
+    )?;
+    if token.version != 1 {
+        return Err(Status::invalid_argument("Invalid tenant audit cursor"));
+    }
     let expected_signature = sign_cursor(&token.without_signature(), key)?;
     if !constant_time_eq::constant_time_eq(
         token.signature.as_bytes(),
@@ -174,12 +190,12 @@ fn encode_tenant_audit_cursor(
 ) -> Result<String, Status> {
     let mut token = cursor_claims(position, claims, req, limit, revision);
     token.signature = sign_cursor(&token.without_signature(), key)?;
-    let bytes = serde_json::to_vec(&token)
-        .map_err(|_| Status::internal("Failed to encode tenant audit cursor"))?;
+    let bytes =
+        crate::core_store::encode_deterministic_proto(&tenant_audit_cursor_to_proto(&token));
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 struct TenantAuditCursor {
     version: u8,
     scope: String,
@@ -189,6 +205,28 @@ struct TenantAuditCursor {
     filter_hash: String,
     limit: u32,
     revision: String,
+    signature: String,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct TenantAuditCursorProto {
+    #[prost(uint32, tag = "1")]
+    version: u32,
+    #[prost(string, tag = "2")]
+    scope: String,
+    #[prost(string, tag = "3")]
+    position: String,
+    #[prost(int64, tag = "4")]
+    tenant_id: i64,
+    #[prost(string, tag = "5")]
+    principal_hash: String,
+    #[prost(string, tag = "6")]
+    filter_hash: String,
+    #[prost(uint32, tag = "7")]
+    limit: u32,
+    #[prost(string, tag = "8")]
+    revision: String,
+    #[prost(string, tag = "9")]
     signature: String,
 }
 
@@ -205,6 +243,37 @@ impl TenantAuditCursor {
             revision: &self.revision,
         }
     }
+}
+
+fn tenant_audit_cursor_to_proto(token: &TenantAuditCursor) -> TenantAuditCursorProto {
+    TenantAuditCursorProto {
+        version: u32::from(token.version),
+        scope: token.scope.clone(),
+        position: token.position.clone(),
+        tenant_id: token.tenant_id,
+        principal_hash: token.principal_hash.clone(),
+        filter_hash: token.filter_hash.clone(),
+        limit: token.limit,
+        revision: token.revision.clone(),
+        signature: token.signature.clone(),
+    }
+}
+
+fn tenant_audit_cursor_from_proto(
+    proto: TenantAuditCursorProto,
+) -> Result<TenantAuditCursor, Status> {
+    Ok(TenantAuditCursor {
+        version: u8::try_from(proto.version)
+            .map_err(|_| Status::invalid_argument("Invalid tenant audit cursor"))?,
+        scope: proto.scope,
+        position: proto.position,
+        tenant_id: proto.tenant_id,
+        principal_hash: proto.principal_hash,
+        filter_hash: proto.filter_hash,
+        limit: proto.limit,
+        revision: proto.revision,
+        signature: proto.signature,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]

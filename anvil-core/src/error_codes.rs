@@ -29,8 +29,10 @@ pub enum AnvilErrorCode {
     StaleFence,
     LeaseOwnerMismatch,
     LeaseCasConflict,
-    ResourceExhaustedWalBacklog,
+    ResourceExhaustedMetadataBacklog,
     BoundaryRequiredMissing,
+    BoundaryBlockLimitUnsatisfied,
+    BoundaryRequiredSingleValueViolation,
     BoundaryTypeMismatch,
     BoundaryExtractorUnsupportedContentType,
     BoundaryExtractorBodyTooLarge,
@@ -42,7 +44,7 @@ pub enum AnvilErrorCode {
 }
 
 impl AnvilErrorCode {
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; 41] = [
         Self::Unauthorized,
         Self::UnauthorizedReservedNamespace,
         Self::ForbiddenByPolicy,
@@ -72,8 +74,10 @@ impl AnvilErrorCode {
         Self::StaleFence,
         Self::LeaseOwnerMismatch,
         Self::LeaseCasConflict,
-        Self::ResourceExhaustedWalBacklog,
+        Self::ResourceExhaustedMetadataBacklog,
         Self::BoundaryRequiredMissing,
+        Self::BoundaryBlockLimitUnsatisfied,
+        Self::BoundaryRequiredSingleValueViolation,
         Self::BoundaryTypeMismatch,
         Self::BoundaryExtractorUnsupportedContentType,
         Self::BoundaryExtractorBodyTooLarge,
@@ -117,8 +121,10 @@ impl AnvilErrorCode {
             Self::StaleFence => "StaleFence",
             Self::LeaseOwnerMismatch => "LeaseOwnerMismatch",
             Self::LeaseCasConflict => "LeaseCasConflict",
-            Self::ResourceExhaustedWalBacklog => "ResourceExhaustedWalBacklog",
+            Self::ResourceExhaustedMetadataBacklog => "ResourceExhaustedMetadataBacklog",
             Self::BoundaryRequiredMissing => "BoundaryRequiredMissing",
+            Self::BoundaryBlockLimitUnsatisfied => "BoundaryBlockLimitUnsatisfied",
+            Self::BoundaryRequiredSingleValueViolation => "BoundaryRequiredSingleValueViolation",
             Self::BoundaryTypeMismatch => "BoundaryTypeMismatch",
             Self::BoundaryExtractorUnsupportedContentType => {
                 "BoundaryExtractorUnsupportedContentType"
@@ -193,8 +199,10 @@ mod tests {
                 "StaleFence",
                 "LeaseOwnerMismatch",
                 "LeaseCasConflict",
-                "ResourceExhaustedWalBacklog",
+                "ResourceExhaustedMetadataBacklog",
                 "BoundaryRequiredMissing",
+                "BoundaryBlockLimitUnsatisfied",
+                "BoundaryRequiredSingleValueViolation",
                 "BoundaryTypeMismatch",
                 "BoundaryExtractorUnsupportedContentType",
                 "BoundaryExtractorBodyTooLarge",

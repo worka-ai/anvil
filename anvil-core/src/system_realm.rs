@@ -4,32 +4,57 @@ use crate::{
     authz_scope::encode_realm_namespace,
     config::Config,
     core_store::{
-        AcquireFence, CompareAndSwapRef, CorePipelinePolicy, CoreStore, CoreTraceContext,
-        WriteLogicalFileRequest,
+        AcquireFence, CF_MESH, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore,
+        CoreMetaTuplePart, CoreStore, TABLE_SYSTEM_BOOTSTRAP_MARKER_ROW,
+        commit_coremeta_batch_for_storage, core_meta_committed_row_common, core_meta_root_key_hash,
+        core_meta_tuple_key, encode_deterministic_proto,
     },
     crypto::EncryptionKeyring,
+    formats::unix_nanos_from_rfc3339,
     persistence::{App, AuthzTupleBatchMutation, Persistence},
     storage::Storage,
 };
 use anyhow::{Context, Result, anyhow};
-use serde::{Deserialize, Serialize};
+use prost::Message;
+use serde::Serialize;
 use std::path::Path;
 
 pub const SYSTEM_STORAGE_TENANT_ID: i64 = 0;
-pub const SYSTEM_REALM_ID: &str = "system";
+pub const SYSTEM_REALM_ID: &str = "_anvil/system";
 pub const SYSTEM_SCHEMA_ID: &str = "anvil-system";
-pub const SYSTEM_MESH_NAMESPACE: &str = "anvil_mesh";
+pub const SYSTEM_NAMESPACE: &str = "system";
+pub const SYSTEM_OBJECT_ID: &str = "_anvil";
+pub const SYSTEM_STORAGE_TENANT_NAMESPACE: &str = "storage_tenant";
+pub const SYSTEM_BUCKET_NAMESPACE: &str = "bucket";
+pub const SYSTEM_OBJECT_NAMESPACE: &str = "object";
+pub const SYSTEM_STREAM_NAMESPACE: &str = "stream";
+pub const SYSTEM_INDEX_NAMESPACE: &str = "index";
+pub const SYSTEM_AUTHZ_REALM_NAMESPACE: &str = "authz_realm";
+pub const SYSTEM_REGISTRY_NAMESPACE: &str = "registry_namespace";
+pub const SYSTEM_PERSONALDB_GROUP_NAMESPACE: &str = "personaldb_group";
+pub const SYSTEM_REGION_NAMESPACE: &str = "region";
+pub const SYSTEM_CELL_NAMESPACE: &str = "cell";
+pub const SYSTEM_NODE_NAMESPACE: &str = "node";
+pub const SYSTEM_PARTITION_NAMESPACE: &str = "partition";
 pub const SYSTEM_ADMIN_SUBJECT_KIND_APP: &str = "app";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemAdminRelation {
+    BootstrapAdmin,
+    Admin,
+    ManageSystem,
+    ViewSystem,
+    ManageAdminPrincipals,
+    RotateSecretKeys,
     ManageTenants,
     ManageApps,
     ManagePolicies,
     ManageSecretEncryptionKeys,
     ManageBuckets,
     ManageNodes,
+    ManageCells,
     ManageRegions,
+    ManagePartitions,
     ManageRouting,
     ManageHostAliases,
     ManageLinks,
@@ -41,14 +66,20 @@ pub enum SystemAdminRelation {
 impl SystemAdminRelation {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::BootstrapAdmin => "bootstrap_admin",
+            Self::Admin => "admin",
+            Self::ManageSystem => "manage_system",
+            Self::ViewSystem => "view_system",
+            Self::ManageAdminPrincipals => "manage_admin_principals",
+            Self::RotateSecretKeys | Self::ManageSecretEncryptionKeys => "rotate_secret_keys",
             Self::ManageTenants => "manage_tenants",
             Self::ManageApps => "manage_apps",
             Self::ManagePolicies => "manage_policies",
-            Self::ManageSecretEncryptionKeys => "manage_secret_encryption_keys",
             Self::ManageBuckets => "manage_buckets",
             Self::ManageNodes => "manage_nodes",
+            Self::ManageCells => "manage_cells",
             Self::ManageRegions => "manage_regions",
-            Self::ManageRouting => "manage_routing",
+            Self::ManagePartitions | Self::ManageRouting => "manage_partitions",
             Self::ManageHostAliases => "manage_host_aliases",
             Self::ManageLinks => "manage_links",
             Self::RunRepair => "run_repair",
@@ -79,7 +110,7 @@ impl From<&auth::Claims> for AdminPrincipal {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 struct BootstrapMarker {
     schema: &'static str,
     mesh_id: String,
@@ -96,6 +127,57 @@ struct BootstrapCredentialFile<'a> {
     app_name: &'a str,
     client_id: &'a str,
     client_secret: &'a str,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct BootstrapMarkerProto {
+    #[prost(string, tag = "1")]
+    schema: String,
+    #[prost(string, tag = "2")]
+    mesh_id: String,
+    #[prost(string, tag = "3")]
+    authz_realm_id: String,
+    #[prost(string, tag = "4")]
+    completed_at: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct BootstrapMarkerRowProto {
+    #[prost(message, optional, tag = "1")]
+    common: Option<crate::core_store::CoreMetaRowCommonProto>,
+    #[prost(string, tag = "2")]
+    schema: String,
+    #[prost(bytes, tag = "3")]
+    marker_bytes: Vec<u8>,
+}
+
+impl From<&BootstrapMarker> for BootstrapMarkerProto {
+    fn from(marker: &BootstrapMarker) -> Self {
+        Self {
+            schema: marker.schema.to_string(),
+            mesh_id: marker.mesh_id.clone(),
+            authz_realm_id: marker.authz_realm_id.clone(),
+            completed_at: marker.completed_at.clone(),
+        }
+    }
+}
+
+fn encode_bootstrap_marker(marker: &BootstrapMarker) -> Vec<u8> {
+    encode_deterministic_proto(&BootstrapMarkerProto::from(marker))
+}
+
+fn encode_bootstrap_marker_row(marker: &BootstrapMarker) -> Result<Vec<u8>> {
+    Ok(encode_deterministic_proto(&BootstrapMarkerRowProto {
+        common: Some(core_meta_committed_row_common(
+            SYSTEM_REALM_ID,
+            core_meta_root_key_hash(&format!("system-realm-bootstrap/{}", marker.mesh_id)),
+            1,
+            format!("system-realm-bootstrap:{}", marker.mesh_id),
+            unix_nanos_from_rfc3339(&marker.completed_at),
+        )),
+        schema: "anvil.coremeta.system_bootstrap_marker.v1".to_string(),
+        marker_bytes: encode_bootstrap_marker(marker),
+    }))
 }
 
 pub async fn ensure_bootstrapped(
@@ -140,13 +222,13 @@ pub async fn check_admin_relation(
     claims: &auth::Claims,
     relation: SystemAdminRelation,
 ) -> Result<bool> {
-    let mesh_id = normalized_mesh_id(mesh_id);
+    let object_id = system_mesh_object_id(mesh_id);
     let revision = authz_journal::latest_authz_revision(storage, SYSTEM_STORAGE_TENANT_ID).await?;
     authz_journal::resolve_permission_at_revision(
         storage,
         SYSTEM_STORAGE_TENANT_ID,
         &system_namespace(),
-        &mesh_id,
+        &object_id,
         relation.as_str(),
         SYSTEM_ADMIN_SUBJECT_KIND_APP,
         &claims.sub,
@@ -164,7 +246,6 @@ pub async fn principal_has_any_admin_relation(
     let claims = auth::Claims {
         sub: app_id.to_string(),
         exp: usize::MAX,
-        scopes: Vec::new(),
         tenant_id: 0,
         jti: None,
     };
@@ -177,11 +258,11 @@ pub async fn principal_has_any_admin_relation(
 }
 
 pub fn system_namespace() -> String {
-    encode_realm_namespace(SYSTEM_REALM_ID, SYSTEM_MESH_NAMESPACE)
+    encode_realm_namespace(SYSTEM_REALM_ID, SYSTEM_NAMESPACE)
 }
 
-pub fn system_mesh_object_id(mesh_id: &str) -> String {
-    normalized_mesh_id(mesh_id)
+pub fn system_mesh_object_id(_mesh_id: &str) -> String {
+    SYSTEM_OBJECT_ID.to_string()
 }
 
 fn normalized_mesh_id(mesh_id: &str) -> String {
@@ -195,13 +276,20 @@ fn normalized_mesh_id(mesh_id: &str) -> String {
 
 fn all_admin_relations() -> &'static [SystemAdminRelation] {
     &[
+        SystemAdminRelation::BootstrapAdmin,
+        SystemAdminRelation::Admin,
+        SystemAdminRelation::ManageSystem,
+        SystemAdminRelation::ViewSystem,
+        SystemAdminRelation::ManageAdminPrincipals,
+        SystemAdminRelation::RotateSecretKeys,
         SystemAdminRelation::ManageTenants,
         SystemAdminRelation::ManageApps,
         SystemAdminRelation::ManagePolicies,
-        SystemAdminRelation::ManageSecretEncryptionKeys,
         SystemAdminRelation::ManageBuckets,
         SystemAdminRelation::ManageNodes,
+        SystemAdminRelation::ManageCells,
         SystemAdminRelation::ManageRegions,
+        SystemAdminRelation::ManagePartitions,
         SystemAdminRelation::ManageRouting,
         SystemAdminRelation::ManageHostAliases,
         SystemAdminRelation::ManageLinks,
@@ -212,10 +300,12 @@ fn all_admin_relations() -> &'static [SystemAdminRelation] {
 }
 
 async fn bootstrap_marker_exists(storage: &Storage, mesh_id: &str) -> Result<bool> {
-    let store = CoreStore::new(storage.clone()).await?;
-    Ok(store
-        .read_ref(&bootstrap_marker_ref(mesh_id))
-        .await?
+    Ok(CoreMetaStore::open(storage.core_store_meta_path())?
+        .get(
+            CF_MESH,
+            TABLE_SYSTEM_BOOTSTRAP_MARKER_ROW,
+            &bootstrap_marker_tuple_key(mesh_id)?,
+        )?
         .is_some())
 }
 
@@ -289,6 +379,8 @@ async fn resolve_bootstrap_subject(
             "system realm is missing; configure bootstrap_system_admin_app_name and bootstrap_system_admin_credential_output_path, or configure an explicit bootstrap system admin subject"
         ));
     }
+    let output_path = Path::new(output_path);
+    reject_bootstrap_credential_output_path(config, output_path)?;
 
     let tenant = match persistence.get_tenant_by_name("system").await? {
         Some(tenant) => tenant,
@@ -313,7 +405,7 @@ async fn resolve_bootstrap_subject(
                 secret_keyring,
                 tenant.id,
                 app_name,
-                Path::new(output_path),
+                output_path,
             )
             .await?
         }
@@ -322,6 +414,15 @@ async fn resolve_bootstrap_subject(
         SYSTEM_ADMIN_SUBJECT_KIND_APP.to_string(),
         app.id.to_string(),
     ))
+}
+
+fn reject_bootstrap_credential_output_path(config: &Config, output_path: &Path) -> Result<()> {
+    crate::storage::ensure_operator_path_outside_storage(
+        &config.storage_path,
+        output_path,
+        "bootstrap_system_admin_credential_output_path",
+        "bootstrap credential JSON export",
+    )
 }
 
 async fn create_bootstrap_app(
@@ -355,6 +456,7 @@ async fn create_bootstrap_app(
 }
 
 fn write_bootstrap_credential(path: &Path, credential: &BootstrapCredentialFile<'_>) -> Result<()> {
+    // Operator export only; reject_bootstrap_credential_output_path keeps it outside Anvil storage.
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -380,7 +482,7 @@ async fn install_system_schema(storage: &Storage) -> Result<()> {
         storage,
         SYSTEM_STORAGE_TENANT_ID,
         SYSTEM_SCHEMA_ID,
-        vec![system_mesh_schema()],
+        system_mesh_schema(),
         u64::try_from(latest_revision.max(0)).unwrap_or(0),
         "system-realm-bootstrap",
         "install built-in system realm schema",
@@ -441,37 +543,541 @@ async fn install_system_schema(storage: &Storage) -> Result<()> {
     Ok(())
 }
 
-fn system_mesh_schema() -> AuthzNamespaceSchema {
-    let mut relations = Vec::new();
-    for relation in ["owner", "admin"] {
-        relations.push(AuthzRelationSchema {
-            relation: relation.to_string(),
-            rules: Vec::new(),
-        });
-    }
-    for relation in all_admin_relations() {
-        relations.push(AuthzRelationSchema {
-            relation: relation.as_str().to_string(),
-            rules: vec![
-                inherit_rule("owner"),
-                inherit_rule("admin"),
-                inherit_rule(relation.as_str()),
-            ],
-        });
-    }
+fn system_mesh_schema() -> Vec<AuthzNamespaceSchema> {
+    vec![
+        system_namespace_schema(),
+        storage_tenant_namespace_schema(),
+        bucket_namespace_schema(),
+        object_namespace_schema(),
+        stream_namespace_schema(),
+        index_namespace_schema(),
+        authz_realm_namespace_schema(),
+        registry_namespace_schema(),
+        personaldb_group_namespace_schema(),
+        region_namespace_schema(),
+        cell_namespace_schema(),
+        node_namespace_schema(),
+        partition_namespace_schema(),
+    ]
+}
+
+fn system_namespace_schema() -> AuthzNamespaceSchema {
     AuthzNamespaceSchema {
-        namespace: SYSTEM_MESH_NAMESPACE.to_string(),
-        relations,
-        schema_json: serde_json::json!({
-            "schema": "anvil.system.authz_schema.v1",
-            "description": "Built-in Anvil system realm. Tenant APIs cannot mutate this schema."
-        })
-        .to_string(),
+        namespace: SYSTEM_NAMESPACE.to_string(),
+        relations: relations(&[
+            relation("bootstrap_admin", &[]),
+            relation("admin", &[inherit_rule("bootstrap_admin")]),
+            relation("auditor", &[]),
+            relation("operator", &[]),
+            relation("support", &[]),
+            relation(
+                "manage_system",
+                &[inherit_rule("bootstrap_admin"), inherit_rule("admin")],
+            ),
+            relation(
+                "view_system",
+                &[inherit_rule("manage_system"), inherit_rule("auditor")],
+            ),
+            relation(
+                "manage_admin_principals",
+                &[inherit_rule("bootstrap_admin")],
+            ),
+            relation(
+                "rotate_secret_keys",
+                &[inherit_rule("bootstrap_admin"), inherit_rule("admin")],
+            ),
+            relation(
+                "manage_regions",
+                &[inherit_rule("admin"), inherit_rule("operator")],
+            ),
+            relation(
+                "manage_cells",
+                &[inherit_rule("admin"), inherit_rule("operator")],
+            ),
+            relation(
+                "manage_nodes",
+                &[inherit_rule("admin"), inherit_rule("operator")],
+            ),
+            relation(
+                "manage_partitions",
+                &[inherit_rule("admin"), inherit_rule("operator")],
+            ),
+            relation("manage_tenants", &[inherit_rule("manage_system")]),
+            relation("manage_apps", &[inherit_rule("manage_system")]),
+            relation("manage_policies", &[inherit_rule("manage_system")]),
+            relation("manage_buckets", &[inherit_rule("manage_system")]),
+            relation("manage_host_aliases", &[inherit_rule("manage_system")]),
+            relation("manage_links", &[inherit_rule("manage_system")]),
+            relation(
+                "run_repair",
+                &[inherit_rule("manage_system"), inherit_rule("operator")],
+            ),
+            relation(
+                "view_diagnostics",
+                &[
+                    inherit_rule("view_system"),
+                    inherit_rule("operator"),
+                    inherit_rule("support"),
+                ],
+            ),
+            relation(
+                "view_audit_log",
+                &[inherit_rule("view_system"), inherit_rule("auditor")],
+            ),
+        ]),
+        schema_json: system_schema_json(SYSTEM_NAMESPACE),
         schema_hash: String::new(),
         schema_version: 0,
         authz_revision: 0,
         applied_at: String::new(),
     }
+}
+
+fn storage_tenant_namespace_schema() -> AuthzNamespaceSchema {
+    AuthzNamespaceSchema {
+        namespace: SYSTEM_STORAGE_TENANT_NAMESPACE.to_string(),
+        relations: relations(&[
+            relation("owner", &[]),
+            relation("admin", &[]),
+            relation("writer", &[]),
+            relation("reader", &[]),
+            relation("auditor", &[]),
+            relation(
+                "manage_tenant",
+                &[inherit_rule("owner"), inherit_rule("admin")],
+            ),
+            relation("create_bucket", &[inherit_rule("manage_tenant")]),
+            relation(
+                "list_buckets",
+                &[inherit_rule("manage_tenant"), inherit_rule("auditor")],
+            ),
+            relation(
+                "read_tenant",
+                &[inherit_rule("manage_tenant"), inherit_rule("auditor")],
+            ),
+            relation("grant_access", &[inherit_rule("manage_tenant")]),
+            relation("revoke_access", &[inherit_rule("manage_tenant")]),
+            relation(
+                "read_access_grants",
+                &[inherit_rule("manage_tenant"), inherit_rule("auditor")],
+            ),
+            relation(
+                "lease_read",
+                &[inherit_rule("manage_tenant"), inherit_rule("auditor")],
+            ),
+            relation("lease_write", &[inherit_rule("manage_tenant")]),
+            relation("lease_admin", &[inherit_rule("manage_tenant")]),
+        ]),
+        schema_json: system_schema_json(SYSTEM_STORAGE_TENANT_NAMESPACE),
+        schema_hash: String::new(),
+        schema_version: 0,
+        authz_revision: 0,
+        applied_at: String::new(),
+    }
+}
+
+fn bucket_namespace_schema() -> AuthzNamespaceSchema {
+    AuthzNamespaceSchema {
+        namespace: SYSTEM_BUCKET_NAMESPACE.to_string(),
+        relations: relations(&[
+            relation("parent_tenant", &[]),
+            relation("owner", &[]),
+            relation("admin", &[]),
+            relation("writer", &[]),
+            relation("reader", &[]),
+            relation("auditor", &[]),
+            relation(
+                "manage_bucket",
+                &[
+                    inherit_rule("owner"),
+                    inherit_rule("admin"),
+                    computed_rule("parent_tenant", "manage_tenant"),
+                ],
+            ),
+            relation(
+                "put_object",
+                &[inherit_rule("manage_bucket"), inherit_rule("writer")],
+            ),
+            relation(
+                "get_object",
+                &[inherit_rule("manage_bucket"), inherit_rule("reader")],
+            ),
+            relation(
+                "list_objects",
+                &[
+                    inherit_rule("manage_bucket"),
+                    inherit_rule("reader"),
+                    inherit_rule("auditor"),
+                ],
+            ),
+            relation(
+                "delete_object",
+                &[inherit_rule("manage_bucket"), inherit_rule("writer")],
+            ),
+            relation(
+                "manage_links",
+                &[inherit_rule("manage_bucket"), inherit_rule("writer")],
+            ),
+            relation(
+                "manage_indexes",
+                &[inherit_rule("manage_bucket"), inherit_rule("admin")],
+            ),
+            relation(
+                "query_indexes",
+                &[inherit_rule("manage_bucket"), inherit_rule("reader")],
+            ),
+            relation(
+                "manage_boundary_schema",
+                &[inherit_rule("manage_bucket"), inherit_rule("admin")],
+            ),
+        ]),
+        schema_json: system_schema_json(SYSTEM_BUCKET_NAMESPACE),
+        schema_hash: String::new(),
+        schema_version: 0,
+        authz_revision: 0,
+        applied_at: String::new(),
+    }
+}
+
+fn object_namespace_schema() -> AuthzNamespaceSchema {
+    AuthzNamespaceSchema {
+        namespace: SYSTEM_OBJECT_NAMESPACE.to_string(),
+        relations: relations(&[
+            relation("parent_bucket", &[]),
+            relation("owner", &[]),
+            relation("reader", &[]),
+            relation("writer", &[]),
+            relation(
+                "get",
+                &[
+                    inherit_rule("owner"),
+                    inherit_rule("reader"),
+                    computed_rule("parent_bucket", "get_object"),
+                ],
+            ),
+            relation(
+                "put",
+                &[
+                    inherit_rule("owner"),
+                    inherit_rule("writer"),
+                    computed_rule("parent_bucket", "put_object"),
+                ],
+            ),
+            relation(
+                "delete",
+                &[
+                    inherit_rule("owner"),
+                    inherit_rule("writer"),
+                    computed_rule("parent_bucket", "delete_object"),
+                ],
+            ),
+            relation(
+                "link",
+                &[
+                    inherit_rule("owner"),
+                    inherit_rule("writer"),
+                    computed_rule("parent_bucket", "manage_links"),
+                ],
+            ),
+        ]),
+        schema_json: system_schema_json(SYSTEM_OBJECT_NAMESPACE),
+        schema_hash: String::new(),
+        schema_version: 0,
+        authz_revision: 0,
+        applied_at: String::new(),
+    }
+}
+
+fn stream_namespace_schema() -> AuthzNamespaceSchema {
+    AuthzNamespaceSchema {
+        namespace: SYSTEM_STREAM_NAMESPACE.to_string(),
+        relations: relations(&[
+            relation("parent_bucket", &[]),
+            relation("owner", &[]),
+            relation("producer", &[]),
+            relation("consumer", &[]),
+            relation(
+                "append",
+                &[
+                    inherit_rule("owner"),
+                    inherit_rule("producer"),
+                    computed_rule("parent_bucket", "put_object"),
+                ],
+            ),
+            relation(
+                "read",
+                &[
+                    inherit_rule("owner"),
+                    inherit_rule("consumer"),
+                    computed_rule("parent_bucket", "get_object"),
+                ],
+            ),
+            relation(
+                "seal_segment",
+                &[
+                    inherit_rule("owner"),
+                    computed_rule("parent_bucket", "manage_bucket"),
+                ],
+            ),
+        ]),
+        schema_json: system_schema_json(SYSTEM_STREAM_NAMESPACE),
+        schema_hash: String::new(),
+        schema_version: 0,
+        authz_revision: 0,
+        applied_at: String::new(),
+    }
+}
+
+fn index_namespace_schema() -> AuthzNamespaceSchema {
+    AuthzNamespaceSchema {
+        namespace: SYSTEM_INDEX_NAMESPACE.to_string(),
+        relations: relations(&[
+            relation("parent_bucket", &[]),
+            relation("owner", &[]),
+            relation("reader", &[]),
+            relation("writer", &[]),
+            relation(
+                "define",
+                &[
+                    inherit_rule("owner"),
+                    computed_rule("parent_bucket", "manage_indexes"),
+                ],
+            ),
+            relation(
+                "query",
+                &[
+                    inherit_rule("owner"),
+                    inherit_rule("reader"),
+                    computed_rule("parent_bucket", "query_indexes"),
+                ],
+            ),
+            relation(
+                "repair",
+                &[
+                    inherit_rule("owner"),
+                    computed_rule("parent_bucket", "manage_indexes"),
+                ],
+            ),
+        ]),
+        schema_json: system_schema_json(SYSTEM_INDEX_NAMESPACE),
+        schema_hash: String::new(),
+        schema_version: 0,
+        authz_revision: 0,
+        applied_at: String::new(),
+    }
+}
+
+fn authz_realm_namespace_schema() -> AuthzNamespaceSchema {
+    AuthzNamespaceSchema {
+        namespace: SYSTEM_AUTHZ_REALM_NAMESPACE.to_string(),
+        relations: relations(&[
+            relation("parent_tenant", &[]),
+            relation("owner", &[]),
+            relation("schema_admin", &[]),
+            relation("tuple_writer", &[]),
+            relation("checker", &[]),
+            relation("auditor", &[]),
+            relation(
+                "put_schema",
+                &[
+                    inherit_rule("owner"),
+                    inherit_rule("schema_admin"),
+                    computed_rule("parent_tenant", "manage_tenant"),
+                ],
+            ),
+            relation(
+                "bind_schema",
+                &[
+                    inherit_rule("owner"),
+                    inherit_rule("schema_admin"),
+                    computed_rule("parent_tenant", "manage_tenant"),
+                ],
+            ),
+            relation(
+                "write_tuples",
+                &[
+                    inherit_rule("owner"),
+                    inherit_rule("tuple_writer"),
+                    computed_rule("parent_tenant", "manage_tenant"),
+                ],
+            ),
+            relation(
+                "check",
+                &[
+                    inherit_rule("owner"),
+                    inherit_rule("checker"),
+                    inherit_rule("auditor"),
+                    computed_rule("parent_tenant", "read_tenant"),
+                ],
+            ),
+            relation(
+                "list",
+                &[
+                    inherit_rule("owner"),
+                    inherit_rule("auditor"),
+                    computed_rule("parent_tenant", "read_tenant"),
+                ],
+            ),
+        ]),
+        schema_json: system_schema_json(SYSTEM_AUTHZ_REALM_NAMESPACE),
+        schema_hash: String::new(),
+        schema_version: 0,
+        authz_revision: 0,
+        applied_at: String::new(),
+    }
+}
+
+fn registry_namespace_schema() -> AuthzNamespaceSchema {
+    AuthzNamespaceSchema {
+        namespace: SYSTEM_REGISTRY_NAMESPACE.to_string(),
+        relations: relations(&[
+            relation("parent_tenant", &[]),
+            relation("owner", &[]),
+            relation("publisher", &[]),
+            relation("reader", &[]),
+            relation(
+                "publish",
+                &[
+                    inherit_rule("owner"),
+                    inherit_rule("publisher"),
+                    computed_rule("parent_tenant", "manage_tenant"),
+                ],
+            ),
+            relation(
+                "read",
+                &[
+                    inherit_rule("owner"),
+                    inherit_rule("reader"),
+                    computed_rule("parent_tenant", "read_tenant"),
+                ],
+            ),
+            relation(
+                "manage_refs",
+                &[
+                    inherit_rule("owner"),
+                    inherit_rule("publisher"),
+                    computed_rule("parent_tenant", "manage_tenant"),
+                ],
+            ),
+        ]),
+        schema_json: system_schema_json(SYSTEM_REGISTRY_NAMESPACE),
+        schema_hash: String::new(),
+        schema_version: 0,
+        authz_revision: 0,
+        applied_at: String::new(),
+    }
+}
+
+fn personaldb_group_namespace_schema() -> AuthzNamespaceSchema {
+    AuthzNamespaceSchema {
+        namespace: SYSTEM_PERSONALDB_GROUP_NAMESPACE.to_string(),
+        relations: relations(&[
+            relation("parent_tenant", &[]),
+            relation("owner", &[]),
+            relation("writer", &[]),
+            relation("reader", &[]),
+            relation("witness", &[inherit_rule("owner")]),
+            relation(
+                "apply_changeset",
+                &[inherit_rule("owner"), inherit_rule("writer")],
+            ),
+            relation(
+                "get_snapshot",
+                &[inherit_rule("owner"), inherit_rule("reader")],
+            ),
+            relation("watch", &[inherit_rule("owner"), inherit_rule("reader")]),
+        ]),
+        schema_json: system_schema_json(SYSTEM_PERSONALDB_GROUP_NAMESPACE),
+        schema_hash: String::new(),
+        schema_version: 0,
+        authz_revision: 0,
+        applied_at: String::new(),
+    }
+}
+
+fn region_namespace_schema() -> AuthzNamespaceSchema {
+    AuthzNamespaceSchema {
+        namespace: SYSTEM_REGION_NAMESPACE.to_string(),
+        relations: relations(&[
+            relation("system", &[]),
+            relation("manage", &[computed_rule("system", "manage_regions")]),
+            relation("view", &[computed_rule("system", "view_system")]),
+        ]),
+        schema_json: system_schema_json(SYSTEM_REGION_NAMESPACE),
+        schema_hash: String::new(),
+        schema_version: 0,
+        authz_revision: 0,
+        applied_at: String::new(),
+    }
+}
+
+fn cell_namespace_schema() -> AuthzNamespaceSchema {
+    AuthzNamespaceSchema {
+        namespace: SYSTEM_CELL_NAMESPACE.to_string(),
+        relations: relations(&[
+            relation("parent_region", &[]),
+            relation("manage", &[computed_rule("parent_region", "manage")]),
+            relation("view", &[computed_rule("parent_region", "view")]),
+        ]),
+        schema_json: system_schema_json(SYSTEM_CELL_NAMESPACE),
+        schema_hash: String::new(),
+        schema_version: 0,
+        authz_revision: 0,
+        applied_at: String::new(),
+    }
+}
+
+fn node_namespace_schema() -> AuthzNamespaceSchema {
+    AuthzNamespaceSchema {
+        namespace: SYSTEM_NODE_NAMESPACE.to_string(),
+        relations: relations(&[
+            relation("parent_cell", &[]),
+            relation("manage", &[computed_rule("parent_cell", "manage")]),
+            relation("drain", &[computed_rule("parent_cell", "manage")]),
+            relation("view", &[computed_rule("parent_cell", "view")]),
+        ]),
+        schema_json: system_schema_json(SYSTEM_NODE_NAMESPACE),
+        schema_hash: String::new(),
+        schema_version: 0,
+        authz_revision: 0,
+        applied_at: String::new(),
+    }
+}
+
+fn partition_namespace_schema() -> AuthzNamespaceSchema {
+    AuthzNamespaceSchema {
+        namespace: SYSTEM_PARTITION_NAMESPACE.to_string(),
+        relations: relations(&[
+            relation("system", &[]),
+            relation("move", &[computed_rule("system", "manage_partitions")]),
+            relation("view", &[computed_rule("system", "view_system")]),
+        ]),
+        schema_json: system_schema_json(SYSTEM_PARTITION_NAMESPACE),
+        schema_hash: String::new(),
+        schema_version: 0,
+        authz_revision: 0,
+        applied_at: String::new(),
+    }
+}
+
+fn relations(definitions: &[AuthzRelationSchema]) -> Vec<AuthzRelationSchema> {
+    definitions.to_vec()
+}
+
+fn relation(name: &str, rules: &[AuthzRelationRule]) -> AuthzRelationSchema {
+    AuthzRelationSchema {
+        relation: name.to_string(),
+        rules: rules.to_vec(),
+    }
+}
+
+fn system_schema_json(namespace: &str) -> String {
+    serde_json::json!({
+        "schema": "anvil.system.authz_schema.v1",
+        "namespace": namespace,
+        "description": "Built-in Anvil system realm. Public tenant APIs cannot mutate this schema."
+    })
+    .to_string()
 }
 
 fn inherit_rule(relation: &str) -> AuthzRelationRule {
@@ -483,54 +1089,35 @@ fn inherit_rule(relation: &str) -> AuthzRelationRule {
     }
 }
 
+fn computed_rule(tuple_relation: &str, target_relation: &str) -> AuthzRelationRule {
+    AuthzRelationRule {
+        kind: "computed".to_string(),
+        relation: String::new(),
+        tuple_relation: tuple_relation.to_string(),
+        target_relation: target_relation.to_string(),
+    }
+}
+
 async fn write_system_relation_tuples(
     persistence: &Persistence,
-    mesh_id: &str,
+    _mesh_id: &str,
     subject_kind: &str,
     subject_id: &str,
 ) -> Result<()> {
     let namespace = system_namespace();
-    let mut mutations = vec![AuthzTupleBatchMutation {
-        namespace: namespace.clone(),
-        object_id: mesh_id.to_string(),
-        relation: "owner".to_string(),
-        subject_kind: subject_kind.to_string(),
-        subject_id: subject_id.to_string(),
-        caveat_hash: String::new(),
-        operation: "add".to_string(),
-        reason: "grant initial system owner".to_string(),
-    }];
-
-    let owner_userset = format!("{namespace}/{mesh_id}#owner");
-    let admin_userset = format!("{namespace}/{mesh_id}#admin");
-    mutations.push(AuthzTupleBatchMutation {
-        namespace: namespace.clone(),
-        object_id: mesh_id.to_string(),
-        relation: "admin".to_string(),
-        subject_kind: "userset".to_string(),
-        subject_id: owner_userset.clone(),
-        caveat_hash: String::new(),
-        operation: "add".to_string(),
-        reason: "owner implies admin".to_string(),
-    });
-    for relation in all_admin_relations() {
-        for userset in [&owner_userset, &admin_userset] {
-            mutations.push(AuthzTupleBatchMutation {
-                namespace: namespace.clone(),
-                object_id: mesh_id.to_string(),
-                relation: relation.as_str().to_string(),
-                subject_kind: "userset".to_string(),
-                subject_id: userset.to_string(),
-                caveat_hash: String::new(),
-                operation: "add".to_string(),
-                reason: "system admin relation inheritance".to_string(),
-            });
-        }
-    }
     persistence
         .write_authz_tuple_batch(
             SYSTEM_STORAGE_TENANT_ID,
-            mutations,
+            vec![AuthzTupleBatchMutation {
+                namespace,
+                object_id: SYSTEM_OBJECT_ID.to_string(),
+                relation: "bootstrap_admin".to_string(),
+                subject_kind: subject_kind.to_string(),
+                subject_id: subject_id.to_string(),
+                caveat_hash: String::new(),
+                operation: "add".to_string(),
+                reason: "grant initial system bootstrap administrator".to_string(),
+            }],
             "system-realm-bootstrap",
         )
         .await?;
@@ -538,55 +1125,35 @@ async fn write_system_relation_tuples(
 }
 
 async fn write_bootstrap_marker(storage: &Storage, mesh_id: &str) -> Result<()> {
-    let store = CoreStore::new(storage.clone()).await?;
     let marker = BootstrapMarker {
         schema: "anvil.system_realm.bootstrap_marker.v1",
         mesh_id: mesh_id.to_string(),
         authz_realm_id: SYSTEM_REALM_ID.to_string(),
         completed_at: chrono::Utc::now().to_rfc3339(),
     };
-    let object_ref = store
-        .write_logical_file_ref(WriteLogicalFileRequest {
-            writer_family: "system_realm".to_string(),
-            generation: 1,
-            logical_file_id: bootstrap_marker_ref(mesh_id),
-            source: serde_json::to_vec_pretty(&marker)?,
-            range_hints: Vec::new(),
-            pipeline_policy: CorePipelinePolicy::default(),
-            trace_context: CoreTraceContext::default(),
-            boundary_values: Vec::new(),
-            mutation_id: format!("system-realm-bootstrap:{}", uuid::Uuid::new_v4().simple()),
-            region_id: "local".to_string(),
-        })
-        .await?;
-    match store
-        .compare_and_swap_ref(CompareAndSwapRef {
-            ref_name: bootstrap_marker_ref(mesh_id),
-            expected_generation: None,
-            expected_target: None,
-            require_absent: true,
-            require_present: false,
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-            new_target: format!("core-object-ref:{}", serde_json::to_string(&object_ref)?),
-            transaction_id: None,
-        })
-        .await
-    {
-        Ok(_) => Ok(()),
-        Err(err) => {
-            if bootstrap_marker_exists(storage, mesh_id).await? {
-                Ok(())
-            } else {
-                Err(err)
-            }
-        }
-    }
+    let payload = encode_bootstrap_marker_row(&marker)?;
+    let tuple_key = bootstrap_marker_tuple_key(mesh_id)?;
+    let op = CoreMetaBatchOp {
+        cf: CF_MESH,
+        table_id: TABLE_SYSTEM_BOOTSTRAP_MARKER_ROW,
+        tuple_key: &tuple_key,
+        common: None,
+        kind: CoreMetaBatchOpKind::Put(&payload),
+    };
+    commit_coremeta_batch_for_storage(
+        storage,
+        &format!("system-realm-bootstrap:{}", uuid::Uuid::new_v4().simple()),
+        &[op],
+    )
+    .await?;
+    Ok(())
 }
 
-fn bootstrap_marker_ref(mesh_id: &str) -> String {
-    format!("system_realm_bootstrap:{mesh_id}")
+fn bootstrap_marker_tuple_key(mesh_id: &str) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("system-realm-bootstrap"),
+        CoreMetaTuplePart::Utf8(mesh_id),
+    ])
 }
 
 #[cfg(test)]
@@ -611,6 +1178,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bootstrap_marker_encoding_is_canonical_protobuf_not_json() {
+        let marker = BootstrapMarker {
+            schema: "anvil.system_realm.bootstrap_marker.v1",
+            mesh_id: "mesh-a".to_string(),
+            authz_realm_id: SYSTEM_REALM_ID.to_string(),
+            completed_at: "2026-07-09T00:00:00Z".to_string(),
+        };
+        let bytes = encode_bootstrap_marker(&marker);
+        assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_err());
+        let decoded = crate::core_store::decode_deterministic_proto::<BootstrapMarkerProto>(
+            &bytes,
+            "system realm bootstrap marker",
+        )
+        .unwrap();
+        assert_eq!(decoded.mesh_id, marker.mesh_id);
+        assert_eq!(decoded.authz_realm_id, marker.authz_realm_id);
+    }
+
     #[tokio::test]
     async fn system_realm_bootstrap_creates_builtin_schema_and_owner_tuple() {
         let temp = tempdir().unwrap();
@@ -629,7 +1215,6 @@ mod tests {
             &auth::Claims {
                 sub: "admin-principal".to_string(),
                 exp: usize::MAX,
-                scopes: Vec::new(),
                 tenant_id: 0,
                 jti: None,
             },
@@ -645,7 +1230,6 @@ mod tests {
             &auth::Claims {
                 sub: "ordinary-app".to_string(),
                 exp: usize::MAX,
-                scopes: vec!["*|*".to_string()],
                 tenant_id: 0,
                 jti: None,
             },
@@ -678,7 +1262,6 @@ mod tests {
             &auth::Claims {
                 sub: "new-bootstrap-subject".to_string(),
                 exp: usize::MAX,
-                scopes: Vec::new(),
                 tenant_id: 0,
                 jti: None,
             },
@@ -705,11 +1288,38 @@ mod tests {
         assert!(err.to_string().contains("system realm is missing"));
     }
 
+    #[test]
+    fn bootstrap_credential_output_path_must_not_live_under_storage_path() {
+        let temp = tempdir().unwrap();
+        let storage_path = temp.path().join("storage");
+        std::fs::create_dir_all(&storage_path).unwrap();
+        let mut config = test_config(&storage_path);
+
+        let storage_sidecar = storage_path.join("bootstrap-admin.json");
+        let err = reject_bootstrap_credential_output_path(&config, &storage_sidecar).unwrap_err();
+        assert!(
+            err.to_string().contains("must be outside storage_path"),
+            "unexpected error: {err:#}"
+        );
+
+        config.bootstrap_system_admin_credential_output_path = temp
+            .path()
+            .join("bootstrap-admin.json")
+            .to_string_lossy()
+            .to_string();
+        reject_bootstrap_credential_output_path(
+            &config,
+            Path::new(&config.bootstrap_system_admin_credential_output_path),
+        )
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn system_realm_bootstrap_runs_before_listeners_start() {
         let temp = tempdir().unwrap();
-        let mut config = test_config(temp.path());
-        config.storage_path = temp.path().to_string_lossy().to_string();
+        let storage_path = temp.path().join("storage");
+        let mut config = test_config(&storage_path);
+        config.storage_path = storage_path.to_string_lossy().to_string();
         config.bootstrap_system_admin_subject_kind.clear();
         config.bootstrap_system_admin_subject_id.clear();
 
@@ -742,7 +1352,6 @@ mod tests {
             &auth::Claims {
                 sub: "admin-principal".to_string(),
                 exp: usize::MAX,
-                scopes: Vec::new(),
                 tenant_id: 0,
                 jti: None,
             },
@@ -782,7 +1391,6 @@ mod tests {
             &auth::Claims {
                 sub: "admin-principal".to_string(),
                 exp: usize::MAX,
-                scopes: Vec::new(),
                 tenant_id: 0,
                 jti: None,
             },
@@ -805,9 +1413,8 @@ mod tests {
             .await
             .unwrap();
         let forged_claims = auth::Claims {
-            sub: "legacy-bootstrap-token".to_string(),
+            sub: "forged-bootstrap-token".to_string(),
             exp: usize::MAX,
-            scopes: vec!["*|*".to_string()],
             tenant_id: 0,
             jti: None,
         };

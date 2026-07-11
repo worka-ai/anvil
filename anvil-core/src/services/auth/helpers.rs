@@ -1,4 +1,5 @@
 use super::*;
+use base64::Engine;
 
 pub(super) fn authz_resource(namespace: &str, object_id: &str, relation: &str) -> String {
     format!("{}/{}#{}", namespace, object_id, relation)
@@ -44,7 +45,7 @@ pub(super) fn resolve_authz_scope(
         resolved.anvil_storage_tenant_id = claims.tenant_id.to_string();
     }
     validate_storage_tenant(claims, &resolved.anvil_storage_tenant_id)?;
-    validate_tuple_component("authz_realm_id", &resolved.authz_realm_id)?;
+    validate_authz_realm_id(&resolved.authz_realm_id)?;
     Ok(resolved)
 }
 
@@ -122,6 +123,40 @@ pub(super) fn validate_tuple_component(name: &str, value: &str) -> Result<(), St
     Ok(())
 }
 
+pub(super) fn validate_authz_realm_id(value: &str) -> Result<(), Status> {
+    if is_reserved_authz_realm_id(value) {
+        return Err(Status::permission_denied("UnauthorizedReservedNamespace"));
+    }
+    validate_tuple_component("authz_realm_id", value)
+}
+
+pub(super) fn is_reserved_authz_realm_id(value: &str) -> bool {
+    matches!(value, "_anvil" | "_system" | "system")
+        || value.starts_with("_anvil/")
+        || value.starts_with("_system/")
+}
+
+pub(super) fn validate_public_authz_namespace(value: &str) -> Result<(), Status> {
+    validate_tuple_component("namespace", value)?;
+    if is_reserved_authz_namespace(value) {
+        return Err(Status::permission_denied("UnauthorizedReservedNamespace"));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_optional_public_authz_namespace(value: &str) -> Result<(), Status> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    validate_public_authz_namespace(value)
+}
+
+pub(super) fn is_reserved_authz_namespace(value: &str) -> bool {
+    matches!(value, "_anvil" | "_system" | "system" | "anvil_mesh")
+        || value.starts_with("_anvil/")
+        || value.starts_with("_system/")
+}
+
 pub(super) fn validate_optional_tuple_component(name: &str, value: &str) -> Result<(), Status> {
     if value.is_empty() {
         return Ok(());
@@ -149,7 +184,7 @@ pub(super) async fn write_authz_tuple_record(
     claims: &auth::Claims,
     req: AuthzTupleMutation,
 ) -> Result<crate::persistence::AuthzTupleRecord, Status> {
-    let operation = validate_authz_tuple_mutation(claims, &req)?;
+    let operation = validate_authz_tuple_mutation(state, claims, &req).await?;
     let scope = resolve_authz_scope(claims, req.scope.as_ref())?;
     let record = state
         .persistence
@@ -170,29 +205,35 @@ pub(super) async fn write_authz_tuple_record(
             &req.reason,
         )
         .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+        .map_err(|e| Status::internal(format!("{e:#}")))?;
     emit_authz_tuple_write_side_effects(state, claims.tenant_id, &record).await?;
     Ok(record)
 }
 
-pub(super) fn validate_authz_tuple_mutation<'a>(
+pub(super) async fn validate_authz_tuple_mutation<'a>(
+    state: &AppState,
     claims: &auth::Claims,
     req: &'a AuthzTupleMutation,
 ) -> Result<&'a str, Status> {
-    validate_tuple_component("namespace", &req.namespace)?;
+    validate_public_authz_namespace(&req.namespace)?;
     validate_tuple_field("object_id", &req.object_id)?;
     validate_tuple_component("relation", &req.relation)?;
     validate_tuple_component("subject_kind", &req.subject_kind)?;
     validate_tuple_field("subject_id", &req.subject_id)?;
     validate_caveat_hash(&req.caveat_hash)?;
+    let scope = resolve_authz_scope(claims, req.scope.as_ref())?;
     let operation = match req.operation.as_str() {
         "add" | "remove" => req.operation.as_str(),
         _ => return Err(Status::invalid_argument("operation must be add or remove")),
     };
-    let resource = authz_resource(&req.namespace, &req.object_id, &req.relation);
-    if !auth::is_authorized(AnvilAction::AuthzTupleWrite, &resource, &claims.scopes) {
-        return Err(Status::permission_denied("Permission denied"));
-    }
+    crate::access_control::require_action(
+        &state.storage,
+        &state.persistence,
+        claims,
+        AnvilAction::AuthzTupleWrite,
+        &scope.authz_realm_id,
+    )
+    .await?;
     Ok(operation)
 }
 
@@ -225,7 +266,7 @@ pub(super) async fn emit_authz_tuple_batch_side_effects(
         records,
     )
     .await
-    .map_err(|e| Status::internal(e.to_string()))?;
+    .map_err(|e| Status::internal(format!("{e:#}")))?;
     let processed_revision = revision_to_u64(last_record.revision)?;
     authz_derived_lag_watch::append_authz_derived_lag_watch_record(
         &state.storage,
@@ -244,7 +285,7 @@ pub(super) async fn emit_authz_tuple_batch_side_effects(
         },
     )
     .await
-    .map_err(|e| Status::internal(e.to_string()))?;
+    .map_err(|e| Status::internal(format!("{e:#}")))?;
     Ok(())
 }
 
@@ -253,17 +294,21 @@ pub(super) async fn check_permission_response(
     claims: &auth::Claims,
     req: CheckPermissionRequest,
 ) -> Result<CheckPermissionResponse, Status> {
-    validate_tuple_component("namespace", &req.namespace)?;
+    validate_public_authz_namespace(&req.namespace)?;
     validate_tuple_field("object_id", &req.object_id)?;
     validate_tuple_component("relation", &req.relation)?;
     validate_tuple_component("subject_kind", &req.subject_kind)?;
     validate_tuple_field("subject_id", &req.subject_id)?;
     validate_caveat_hash(&req.caveat_hash)?;
     let scope = resolve_authz_scope(claims, req.scope.as_ref())?;
-    let resource = authz_resource(&req.namespace, &req.object_id, &req.relation);
-    if !auth::is_authorized(AnvilAction::AuthzCheck, &resource, &claims.scopes) {
-        return Err(Status::permission_denied("Permission denied"));
-    }
+    crate::access_control::require_action(
+        &state.storage,
+        &state.persistence,
+        claims,
+        AnvilAction::AuthzCheck,
+        &scope.authz_realm_id,
+    )
+    .await?;
     let consistency = AuthzConsistency::from_request(&req.consistency, &req.zookie)?;
     let response_revision =
         resolve_authz_response_revision(&state.storage, claims.tenant_id, consistency).await?;
@@ -279,7 +324,7 @@ pub(super) async fn check_permission_response(
         response_revision,
     )
     .await
-    .map_err(|e| Status::internal(e.to_string()))?;
+    .map_err(|e| Status::internal(format!("{e:#}")))?;
 
     Ok(CheckPermissionResponse {
         allowed,
@@ -300,7 +345,7 @@ pub(super) async fn resolve_authz_response_revision(
 ) -> Result<i64, Status> {
     let latest_revision = authz_journal::latest_authz_revision(storage, tenant_id)
         .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+        .map_err(|e| Status::internal(format!("{e:#}")))?;
     if let Some(required_revision) = consistency.required_revision()
         && latest_revision < required_revision
     {
@@ -450,13 +495,29 @@ pub(super) fn paginate_authz<T>(
     ))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub(super) struct AuthzPageToken {
     version: u8,
     tenant_id: i64,
     pub(super) revision: i64,
     filter_hash: String,
     pub(super) offset: usize,
+    signature: String,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct AuthzPageTokenProto {
+    #[prost(uint32, tag = "1")]
+    version: u32,
+    #[prost(int64, tag = "2")]
+    tenant_id: i64,
+    #[prost(int64, tag = "3")]
+    revision: i64,
+    #[prost(string, tag = "4")]
+    filter_hash: String,
+    #[prost(uint64, tag = "5")]
+    offset: u64,
+    #[prost(string, tag = "6")]
     signature: String,
 }
 
@@ -480,8 +541,13 @@ pub(super) fn parse_authz_page_token(
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(value)
         .map_err(|_| Status::invalid_argument("Invalid authz page token"))?;
-    let token: AuthzPageToken = serde_json::from_slice(&bytes)
-        .map_err(|_| Status::invalid_argument("Invalid authz page token"))?;
+    let token = authz_page_token_from_proto(
+        crate::core_store::decode_deterministic_proto::<AuthzPageTokenProto>(
+            &bytes,
+            "authz page token",
+        )
+        .map_err(|_| Status::invalid_argument("Invalid authz page token"))?,
+    )?;
     if token.version != 1
         || token.tenant_id != expected_tenant_id
         || token.filter_hash != expected_filter_hash
@@ -517,9 +583,33 @@ fn encode_authz_page_token(
         offset: claims.offset,
         signature: sign_authz_page_token(claims, signing_key)?,
     };
-    let bytes = serde_json::to_vec(&token)
-        .map_err(|_| Status::internal("Failed to encode authz page token"))?;
+    let bytes = crate::core_store::encode_deterministic_proto(&authz_page_token_to_proto(&token)?);
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn authz_page_token_to_proto(token: &AuthzPageToken) -> Result<AuthzPageTokenProto, Status> {
+    Ok(AuthzPageTokenProto {
+        version: u32::from(token.version),
+        tenant_id: token.tenant_id,
+        revision: token.revision,
+        filter_hash: token.filter_hash.clone(),
+        offset: u64::try_from(token.offset)
+            .map_err(|_| Status::invalid_argument("Invalid authz page token"))?,
+        signature: token.signature.clone(),
+    })
+}
+
+fn authz_page_token_from_proto(proto: AuthzPageTokenProto) -> Result<AuthzPageToken, Status> {
+    Ok(AuthzPageToken {
+        version: u8::try_from(proto.version)
+            .map_err(|_| Status::invalid_argument("Invalid authz page token"))?,
+        tenant_id: proto.tenant_id,
+        revision: proto.revision,
+        filter_hash: proto.filter_hash,
+        offset: usize::try_from(proto.offset)
+            .map_err(|_| Status::invalid_argument("Invalid authz page token"))?,
+        signature: proto.signature,
+    })
 }
 
 fn sign_authz_page_token(
@@ -726,9 +816,15 @@ pub(super) fn validate_public_delegation_resource(
     }
     if resource == "*"
         || resource.starts_with("system:")
+        || resource == "anvil_mesh"
         || resource.starts_with("anvil_mesh:")
+        || resource.starts_with("anvil_mesh/")
+        || resource == "_system"
+        || resource.starts_with("_system/")
+        || resource == "_anvil"
         || resource.starts_with("_anvil/")
         || resource.contains("/_anvil/")
+        || resource.contains("/_system/")
     {
         return Err(Status::permission_denied(
             "Public policy delegation cannot grant system, reserved, or wildcard authority",
@@ -753,17 +849,19 @@ pub(super) fn validate_public_delegation_resource(
     Ok(())
 }
 
-pub(super) fn require_app_management_scope(
+pub(super) async fn require_app_management_permission(
+    state: &AppState,
     claims: &auth::Claims,
     action: AnvilAction,
 ) -> Result<(), Status> {
-    if !auth::is_authorized(
+    crate::access_control::require_action(
+        &state.storage,
+        &state.persistence,
+        claims,
         action,
         &format!("tenant:{}", claims.tenant_id),
-        &claims.scopes,
-    ) {
-        return Err(Status::permission_denied("Permission denied"));
-    }
+    )
+    .await?;
     Ok(())
 }
 

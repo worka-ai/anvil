@@ -1,6 +1,8 @@
 use crate::anvil_api::coordination_service_server::CoordinationService;
 use crate::anvil_api::*;
-use crate::{AppState, auth, partition_fence, permissions::AnvilAction, task_lease};
+use crate::{
+    AppState, access_control, auth, partition_fence, permissions::AnvilAction, task_lease,
+};
 use anyhow::{Result, anyhow};
 use tonic::{Request, Response, Status};
 
@@ -18,13 +20,14 @@ impl CoordinationService for AppState {
         let req = request.into_inner();
         validate_task_lease_id(&req.task_id)?;
         let resource = task_lease_resource(&req.task_id);
-        if !auth::is_authorized(
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
             AnvilAction::CoordinationLeaseWrite,
             &resource,
-            &claims.scopes,
-        ) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        )
+        .await?;
 
         let now_nanos = current_time_nanos().map_err(|e| Status::internal(e.to_string()))?;
         let ttl_nanos =
@@ -62,13 +65,14 @@ impl CoordinationService for AppState {
         let req = request.into_inner();
         validate_task_lease_id(&req.task_id)?;
         let resource = task_lease_resource(&req.task_id);
-        if !auth::is_authorized(
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
             AnvilAction::CoordinationLeaseWrite,
             &resource,
-            &claims.scopes,
-        ) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        )
+        .await?;
 
         let owner = lease_owner_from_claims(&claims, "");
         let lease = self
@@ -99,13 +103,14 @@ impl CoordinationService for AppState {
         let req = request.into_inner();
         validate_task_lease_id(&req.task_id)?;
         let resource = task_lease_resource(&req.task_id);
-        if !auth::is_authorized(
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
             AnvilAction::CoordinationLeaseWrite,
             &resource,
-            &claims.scopes,
-        ) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        )
+        .await?;
 
         let owner = lease_owner_from_claims(&claims, "");
         let lease = self
@@ -137,13 +142,14 @@ impl CoordinationService for AppState {
         let req = request.into_inner();
         validate_task_lease_id(&req.task_id)?;
         let resource = task_lease_resource(&req.task_id);
-        if !auth::is_authorized(
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
             AnvilAction::CoordinationLeaseRead,
             &resource,
-            &claims.scopes,
-        ) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        )
+        .await?;
 
         let lease = self
             .persistence
@@ -169,13 +175,14 @@ impl CoordinationService for AppState {
         let req = request.into_inner();
         validate_task_lease_id(&req.task_id)?;
         let resource = task_lease_resource(&req.task_id);
-        if !auth::is_authorized(
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
             AnvilAction::CoordinationLeaseAdmin,
             &resource,
-            &claims.scopes,
-        ) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        )
+        .await?;
 
         let released = self
             .persistence
@@ -200,7 +207,13 @@ impl CoordinationService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
         let resource = ownership_resource_from_proto(req.resource)?;
-        ensure_ownership_authorized(&claims, &resource, AnvilAction::CoordinationLeaseWrite)?;
+        ensure_ownership_authorized(
+            self,
+            &claims,
+            &resource,
+            AnvilAction::CoordinationLeaseWrite,
+        )
+        .await?;
 
         let now_nanos = current_time_nanos().map_err(|e| Status::internal(e.to_string()))?;
         let ttl_nanos = ownership_ttl_nanos(req.requested_lease_ms)?;
@@ -243,7 +256,13 @@ impl CoordinationService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
         let resource = ownership_resource_from_proto(req.resource)?;
-        ensure_ownership_authorized(&claims, &resource, AnvilAction::CoordinationLeaseWrite)?;
+        ensure_ownership_authorized(
+            self,
+            &claims,
+            &resource,
+            AnvilAction::CoordinationLeaseWrite,
+        )
+        .await?;
 
         let now_nanos = current_time_nanos().map_err(|e| Status::internal(e.to_string()))?;
         let ttl_nanos = ownership_ttl_nanos(req.requested_lease_ms)?;
@@ -286,7 +305,13 @@ impl CoordinationService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
         let resource = ownership_resource_from_proto(req.resource)?;
-        ensure_ownership_authorized(&claims, &resource, AnvilAction::CoordinationLeaseWrite)?;
+        ensure_ownership_authorized(
+            self,
+            &claims,
+            &resource,
+            AnvilAction::CoordinationLeaseWrite,
+        )
+        .await?;
 
         let now_nanos = current_time_nanos().map_err(|e| Status::internal(e.to_string()))?;
         let ttl_nanos = ownership_ttl_nanos(partition_fence::MAX_OWNERSHIP_LEASE_MS)?;
@@ -343,7 +368,7 @@ impl CoordinationService for AppState {
         let req = request.into_inner();
         let resource = ownership_resource_from_proto(req.resource)?;
         let action = ownership_release_action(req.administrative_force);
-        ensure_ownership_authorized(&claims, &resource, action)?;
+        ensure_ownership_authorized(self, &claims, &resource, action).await?;
 
         let now_nanos = current_time_nanos().map_err(|e| Status::internal(e.to_string()))?;
         let signing_key = ownership_signing_key(self)?;
@@ -386,7 +411,13 @@ impl CoordinationService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
         let resource = ownership_resource_from_proto(req.resource)?;
-        ensure_ownership_authorized(&claims, &resource, AnvilAction::CoordinationLeaseAdmin)?;
+        ensure_ownership_authorized(
+            self,
+            &claims,
+            &resource,
+            AnvilAction::CoordinationLeaseAdmin,
+        )
+        .await?;
 
         let now_nanos = current_time_nanos().map_err(|e| Status::internal(e.to_string()))?;
         let signing_key = ownership_signing_key(self)?;
@@ -694,17 +725,21 @@ fn ownership_release_action(administrative_force: bool) -> AnvilAction {
     }
 }
 
-fn ensure_ownership_authorized(
+async fn ensure_ownership_authorized(
+    state: &AppState,
     claims: &auth::Claims,
     resource: &partition_fence::OwnershipResource,
     action: AnvilAction,
 ) -> Result<(), Status> {
     let auth_resource = ownership_auth_resource(claims.tenant_id, resource);
-    if auth::is_authorized(action, &auth_resource, &claims.scopes) {
-        Ok(())
-    } else {
-        Err(Status::permission_denied("Permission denied"))
-    }
+    access_control::require_action(
+        &state.storage,
+        &state.persistence,
+        claims,
+        action,
+        &auth_resource,
+    )
+    .await
 }
 
 fn ownership_auth_resource(
@@ -837,48 +872,20 @@ mod tests {
     }
 
     #[test]
-    fn ownership_scope_is_bound_to_authenticated_tenant() {
+    fn ownership_auth_resource_is_bound_to_authenticated_tenant() {
         let resource = ownership_resource();
-        let tenant_two_scope = format!(
-            "coordination:lease_write|{}",
-            ownership_auth_resource(2, &resource)
-        );
-        let tenant_one_scope = format!(
-            "coordination:lease_write|{}",
-            ownership_auth_resource(1, &resource)
-        );
-
-        let tenant_one_with_tenant_two_scope = claims(1, vec![tenant_two_scope]);
         assert_eq!(
-            ensure_ownership_authorized(
-                &tenant_one_with_tenant_two_scope,
-                &resource,
-                AnvilAction::CoordinationLeaseWrite,
-            )
-            .unwrap_err()
-            .code(),
-            Code::PermissionDenied
+            ownership_auth_resource(1, &resource),
+            "ownership/tenant-1/bucket_primary/tenant-acme/releases"
         );
-
-        let tenant_one = claims(1, vec![tenant_one_scope]);
-        ensure_ownership_authorized(&tenant_one, &resource, AnvilAction::CoordinationLeaseWrite)
-            .unwrap();
+        assert_eq!(
+            ownership_auth_resource(2, &resource),
+            "ownership/tenant-2/bucket_primary/tenant-acme/releases"
+        );
     }
 
     #[test]
-    fn force_release_and_expire_require_admin_scope() {
-        let resource = ownership_resource();
-        let write_scope = format!(
-            "coordination:lease_write|{}",
-            ownership_auth_resource(1, &resource)
-        );
-        let admin_scope = format!(
-            "coordination:lease_admin|{}",
-            ownership_auth_resource(1, &resource)
-        );
-        let write_only = claims(1, vec![write_scope]);
-        let admin = claims(1, vec![admin_scope]);
-
+    fn force_release_and_expire_require_admin_action() {
         assert_eq!(
             ownership_release_action(false),
             AnvilAction::CoordinationLeaseWrite
@@ -887,30 +894,11 @@ mod tests {
             ownership_release_action(true),
             AnvilAction::CoordinationLeaseAdmin
         );
-        assert_eq!(
-            ensure_ownership_authorized(&write_only, &resource, ownership_release_action(true),)
-                .unwrap_err()
-                .code(),
-            Code::PermissionDenied
-        );
-        assert_eq!(
-            ensure_ownership_authorized(
-                &write_only,
-                &resource,
-                AnvilAction::CoordinationLeaseAdmin,
-            )
-            .unwrap_err()
-            .code(),
-            Code::PermissionDenied
-        );
-        ensure_ownership_authorized(&admin, &resource, ownership_release_action(true)).unwrap();
-        ensure_ownership_authorized(&admin, &resource, AnvilAction::CoordinationLeaseAdmin)
-            .unwrap();
     }
 
     #[test]
     fn owner_label_does_not_replace_claim_identity() {
-        let claims = claims(7, vec!["*|*".to_string()]);
+        let claims = claims(7);
         let owner =
             ownership_owner_from_claims(&claims, "node-shared", "eu-west-1", "cell-a").unwrap();
         assert_eq!(owner.tenant_id, 7);
@@ -926,11 +914,10 @@ mod tests {
         }
     }
 
-    fn claims(tenant_id: i64, scopes: Vec<String>) -> auth::Claims {
+    fn claims(tenant_id: i64) -> auth::Claims {
         auth::Claims {
             sub: "app-a".to_string(),
             exp: usize::MAX,
-            scopes,
             tenant_id,
             jti: Some("token-a".to_string()),
         }

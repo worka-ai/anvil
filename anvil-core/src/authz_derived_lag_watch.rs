@@ -1,9 +1,13 @@
 use crate::{
-    core_store::{AppendStreamRecord, CoreStore, ReadStream},
+    core_store::{
+        AppendStreamRecord, CoreStore, ReadStream, decode_deterministic_proto,
+        encode_deterministic_proto,
+    },
     formats::{Hash32, hash32, watch::WatchRecord},
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
+use prost::Message;
 use serde::{Deserialize, Serialize};
 
 const AUTHZ_DERIVED_LAG_PARTITION_FAMILY: u16 = 8;
@@ -19,6 +23,26 @@ pub struct AuthzDerivedLagWatchPayload {
     pub source_manifest_hash: String,
     pub generation: u64,
     pub emitted_at: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct AuthzDerivedLagWatchPayloadProto {
+    #[prost(string, tag = "1")]
+    derived_index_id: String,
+    #[prost(string, tag = "2")]
+    derived_index_kind: String,
+    #[prost(uint64, tag = "3")]
+    processed_revision: u64,
+    #[prost(uint64, tag = "4")]
+    latest_revision: u64,
+    #[prost(string, tag = "5")]
+    source_cursor: String,
+    #[prost(string, tag = "6")]
+    source_manifest_hash: String,
+    #[prost(uint64, tag = "7")]
+    generation: u64,
+    #[prost(string, tag = "8")]
+    emitted_at: String,
 }
 
 impl AuthzDerivedLagWatchPayload {
@@ -57,7 +81,7 @@ pub async fn append_authz_derived_lag_watch_record(
         payload.latest_revision,
         payload.generation,
         0,
-        serde_json::to_vec(&payload)?,
+        encode_lag_watch_payload(&payload),
     );
     core_store
         .append_stream(AppendStreamRecord {
@@ -65,6 +89,8 @@ pub async fn append_authz_derived_lag_watch_record(
             partition_id: hex::encode(partition_id(tenant_id, &payload.derived_index_id)),
             record_kind: "authz_derived_lag_watch".to_string(),
             payload: record.encode(),
+            content_type: None,
+            user_metadata_json: "{}".to_string(),
             fence: None,
             transaction_id: None,
             idempotency_key: Some(format!(
@@ -101,7 +127,7 @@ pub async fn list_authz_derived_lag_watch_events(
         {
             continue;
         }
-        let payload: AuthzDerivedLagWatchPayload = serde_json::from_slice(&record.payload)?;
+        let payload = decode_lag_watch_payload(&record.payload)?;
         if payload.derived_index_id != derived_index_id {
             return Err(anyhow!("authz derived lag watch payload scope mismatch"));
         }
@@ -161,16 +187,53 @@ async fn read_watch_or_empty(core_store: &CoreStore, stream_id: &str) -> Result<
         .into_iter()
         .filter(|record| record.record_kind == "authz_derived_lag_watch")
         .map(|record| {
-            WatchRecord::decode(&record.payload)
-                .map(|(record, _)| record)
-                .map_err(Into::into)
+            let (watch_record, used) = WatchRecord::decode(&record.payload)?;
+            if used != record.payload.len() {
+                return Err(anyhow!(
+                    "authz derived lag watch CoreStore record has trailing bytes"
+                ));
+            }
+            Ok(watch_record)
         })
         .collect()
 }
 
+fn encode_lag_watch_payload(payload: &AuthzDerivedLagWatchPayload) -> Vec<u8> {
+    encode_deterministic_proto(&AuthzDerivedLagWatchPayloadProto {
+        derived_index_id: payload.derived_index_id.clone(),
+        derived_index_kind: payload.derived_index_kind.clone(),
+        processed_revision: payload.processed_revision,
+        latest_revision: payload.latest_revision,
+        source_cursor: payload.source_cursor.to_string(),
+        source_manifest_hash: payload.source_manifest_hash.clone(),
+        generation: payload.generation,
+        emitted_at: payload.emitted_at.clone(),
+    })
+}
+
+fn decode_lag_watch_payload(bytes: &[u8]) -> Result<AuthzDerivedLagWatchPayload> {
+    let proto = decode_deterministic_proto::<AuthzDerivedLagWatchPayloadProto>(
+        bytes,
+        "authorization derived lag watch payload",
+    )?;
+    Ok(AuthzDerivedLagWatchPayload {
+        derived_index_id: proto.derived_index_id,
+        derived_index_kind: proto.derived_index_kind,
+        processed_revision: proto.processed_revision,
+        latest_revision: proto.latest_revision,
+        source_cursor: proto
+            .source_cursor
+            .parse()
+            .map_err(|_| anyhow!("authorization derived lag source_cursor is not u128"))?,
+        source_manifest_hash: proto.source_manifest_hash,
+        generation: proto.generation,
+        emitted_at: proto.emitted_at,
+    })
+}
+
 fn validate_payload(payload: &AuthzDerivedLagWatchPayload) -> Result<()> {
-    require_nonempty(&payload.derived_index_id, "derived_index_id")?;
-    require_nonempty(&payload.derived_index_kind, "derived_index_kind")?;
+    require_safe_component(&payload.derived_index_id, "derived_index_id")?;
+    require_safe_component(&payload.derived_index_kind, "derived_index_kind")?;
     validate_hex32(&payload.source_manifest_hash, "source_manifest_hash")?;
     if payload.generation == 0 {
         return Err(anyhow!(
@@ -208,6 +271,20 @@ fn require_nonempty(value: &str, field: &'static str) -> Result<()> {
     Ok(())
 }
 
+fn require_safe_component(value: &str, field: &'static str) -> Result<()> {
+    require_nonempty(value, field)?;
+    if value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains(':')
+        || value.chars().any(|ch| ch == '\0' || ch.is_control())
+    {
+        return Err(anyhow!("{field} is not a safe component"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +305,15 @@ mod tests {
             authz_derived_lag_watch_stream_id(11, "derived-userset-primary"),
             "watch:authz_derived_lag:tenant:11:derived:derived-userset-primary"
         );
+        let core_store = CoreStore::new(storage.clone()).await.unwrap();
+        let raw = read_watch_or_empty(
+            &core_store,
+            &authz_derived_lag_watch_stream_id(11, "derived-userset-primary"),
+        )
+        .await
+        .unwrap();
+        assert_ne!(raw[0].payload.first().copied(), Some(b'{'));
+        assert!(decode_lag_watch_payload(&raw[0].payload).is_ok());
 
         let events =
             list_authz_derived_lag_watch_events(&storage, 11, "derived-userset-primary", 1, 10)

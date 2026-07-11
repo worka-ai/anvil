@@ -1,21 +1,22 @@
 use crate::{
     anvil_api::{AuthzNamespaceSchema, AuthzRelationRule, AuthzRelationSchema},
+    authz_coremeta_payload::{decode_authz_payload_row, encode_authz_payload_row},
     core_store::{
-        CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
-        WriteLogicalFileRequest,
+        CF_AUTHZ, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore, CoreMetaTuplePart,
+        TABLE_AUTHZ_SCHEMA_ROW, commit_coremeta_batch_for_storage, core_meta_committed_row_common,
+        core_meta_root_key_hash, core_meta_tuple_key, decode_deterministic_proto,
+        encode_deterministic_proto,
     },
     formats::hash32,
     storage::Storage,
 };
 use anyhow::{Context, Result, anyhow};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-const AUTHZ_NAMESPACE_SCHEMA_REF_PREFIX: &str = "authz_namespace_schema:";
-const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
+const AUTHZ_NAMESPACE_SCHEMA_ROW_KIND: &str = "namespace_schema";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuthzNamespaceSchemaRecord {
@@ -45,6 +46,56 @@ pub struct AuthzRelationRuleRecord {
     pub relation: String,
     pub tuple_relation: String,
     pub target_relation: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct AuthzNamespaceSchemaRecordProto {
+    #[prost(message, optional, tag = "1")]
+    common: Option<crate::core_store::CoreMetaRowCommonProto>,
+    #[prost(uint32, tag = "2")]
+    version: u32,
+    #[prost(int64, tag = "3")]
+    tenant_id: i64,
+    #[prost(string, tag = "4")]
+    namespace: String,
+    #[prost(message, repeated, tag = "5")]
+    relations: Vec<AuthzRelationSchemaRecordProto>,
+    #[prost(string, tag = "6")]
+    schema_json: String,
+    #[prost(string, tag = "7")]
+    schema_hash: String,
+    #[prost(uint64, tag = "8")]
+    schema_version: u64,
+    #[prost(uint64, tag = "9")]
+    authz_revision: u64,
+    #[prost(string, tag = "10")]
+    applied_by: String,
+    #[prost(string, tag = "11")]
+    reason: String,
+    #[prost(string, tag = "12")]
+    applied_at: String,
+    #[prost(string, tag = "13")]
+    record_hash: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct AuthzRelationSchemaRecordProto {
+    #[prost(string, tag = "1")]
+    relation: String,
+    #[prost(message, repeated, tag = "2")]
+    rules: Vec<AuthzRelationRuleRecordProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct AuthzRelationRuleRecordProto {
+    #[prost(string, tag = "1")]
+    kind: String,
+    #[prost(string, tag = "2")]
+    relation: String,
+    #[prost(string, tag = "3")]
+    tuple_relation: String,
+    #[prost(string, tag = "4")]
+    target_relation: String,
 }
 
 pub async fn write_authz_namespace_schema(
@@ -86,7 +137,7 @@ pub async fn write_authz_namespace_schema(
     };
     record.record_hash = record_hash(&record)?;
     validate_record(&record, tenant_id, &record.namespace)?;
-    write_namespace_schema_ref(storage, &record).await?;
+    write_namespace_schema_row(storage, &record).await?;
     Ok(record)
 }
 
@@ -95,10 +146,7 @@ pub async fn read_authz_namespace_schema(
     tenant_id: i64,
     namespace: &str,
 ) -> Result<Option<AuthzNamespaceSchemaRecord>> {
-    let Some(record) =
-        read_namespace_schema_ref(storage, &namespace_schema_ref_name(tenant_id, namespace)?)
-            .await?
-    else {
+    let Some(record) = read_namespace_schema_row(storage, tenant_id, namespace).await? else {
         return Ok(None);
     };
     validate_record(&record, tenant_id, namespace)?;
@@ -109,15 +157,14 @@ pub async fn list_authz_namespace_schemas(
     storage: &Storage,
     tenant_id: i64,
 ) -> Result<Vec<AuthzNamespaceSchemaRecord>> {
-    let store = CoreStore::new(storage.clone()).await?;
     let mut records = Vec::new();
-    for ref_name in store
-        .list_ref_names(&namespace_schema_ref_prefix(tenant_id)?)
-        .await?
-    {
-        let Some(record) = read_namespace_schema_ref(storage, &ref_name).await? else {
-            continue;
-        };
+    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
+    for row in meta.scan_prefix(
+        CF_AUTHZ,
+        TABLE_AUTHZ_SCHEMA_ROW,
+        &namespace_schema_tuple_prefix(tenant_id)?,
+    )? {
+        let record = decode_namespace_schema_row_payload(storage, tenant_id, &row.payload).await?;
         validate_record(&record, tenant_id, &record.namespace)?;
         records.push(record);
     }
@@ -237,13 +284,15 @@ fn require_empty(value: &str, name: &str) -> Result<()> {
 
 fn schema_hash(schema: &AuthzNamespaceSchema) -> Result<String> {
     let canonical = canonical_schema(schema);
-    Ok(hex::encode(hash32(&serde_json::to_vec(&canonical)?)))
+    Ok(hex::encode(hash32(&encode_authz_schema(&canonical))))
 }
 
 fn record_hash(record: &AuthzNamespaceSchemaRecord) -> Result<String> {
     let mut unsigned = record.clone();
     unsigned.record_hash.clear();
-    Ok(hex::encode(hash32(&serde_json::to_vec(&unsigned)?)))
+    Ok(hex::encode(hash32(&encode_namespace_schema_record(
+        &unsigned,
+    )?)))
 }
 
 fn canonical_schema(schema: &AuthzNamespaceSchema) -> AuthzNamespaceSchema {
@@ -274,105 +323,262 @@ fn canonical_schema(schema: &AuthzNamespaceSchema) -> AuthzNamespaceSchema {
     schema
 }
 
-async fn write_namespace_schema_ref(
+async fn write_namespace_schema_row(
     storage: &Storage,
     record: &AuthzNamespaceSchemaRecord,
 ) -> Result<()> {
-    let ref_name = namespace_schema_ref_name(record.tenant_id, &record.namespace)?;
-    let current = read_namespace_schema_ref_state(storage, &ref_name).await?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let object_ref = store
-        .write_logical_file_ref(WriteLogicalFileRequest {
-            writer_family: "authz".to_string(),
-            generation: current
-                .as_ref()
-                .map(|(value, _)| value.generation + 1)
-                .unwrap_or(1),
-            logical_file_id: ref_name.clone(),
-            source: serde_json::to_vec_pretty(record)?,
-            range_hints: Vec::new(),
-            pipeline_policy: CorePipelinePolicy::default(),
-            trace_context: CoreTraceContext::default(),
-            boundary_values: Vec::new(),
-            mutation_id: format!(
-                "authz-namespace-schema:{}:{}:{}:{}",
-                record.tenant_id, record.namespace, record.schema_version, record.record_hash
-            ),
-            region_id: "local".to_string(),
-        })
-        .await?;
-    store
-        .compare_and_swap_ref(CompareAndSwapRef {
-            ref_name,
-            expected_generation: current.as_ref().map(|(value, _)| value.generation),
-            expected_target: current.as_ref().map(|(value, _)| value.target.clone()),
-            require_absent: current.is_none(),
-            require_present: current.is_some(),
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-            new_target: encode_core_object_ref_target(&object_ref)?,
-            transaction_id: None,
-        })
-        .await?;
+    validate_record(record, record.tenant_id, &record.namespace)?;
+    let tuple_key = namespace_schema_tuple_key(record.tenant_id, &record.namespace)?;
+    let record_payload = encode_namespace_schema_record(record)?;
+    let payload = encode_authz_payload_row(
+        storage,
+        namespace_record_common(record),
+        AUTHZ_NAMESPACE_SCHEMA_ROW_KIND,
+        &format!("tenant/{}/namespace/{}", record.tenant_id, record.namespace),
+        record.schema_version,
+        &record.record_hash,
+        record_payload,
+    )
+    .await?;
+    let op = CoreMetaBatchOp {
+        cf: CF_AUTHZ,
+        table_id: TABLE_AUTHZ_SCHEMA_ROW,
+        tuple_key: &tuple_key,
+        common: None,
+        kind: CoreMetaBatchOpKind::Put(&payload),
+    };
+    commit_coremeta_batch_for_storage(
+        storage,
+        &format!(
+            "authz-namespace-schema:{}:{}:{}",
+            record.tenant_id, record.namespace, record.schema_version
+        ),
+        &[op],
+    )
+    .await?;
     Ok(())
 }
 
-async fn read_namespace_schema_ref(
+async fn read_namespace_schema_row(
     storage: &Storage,
-    ref_name: &str,
+    tenant_id: i64,
+    namespace: &str,
 ) -> Result<Option<AuthzNamespaceSchemaRecord>> {
-    Ok(read_namespace_schema_ref_state(storage, ref_name)
-        .await?
-        .map(|(_, record)| record))
-}
-
-async fn read_namespace_schema_ref_state(
-    storage: &Storage,
-    ref_name: &str,
-) -> Result<Option<(crate::core_store::CoreRefValue, AuthzNamespaceSchemaRecord)>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(ref_name).await? else {
+    let Some(bytes) = CoreMetaStore::open(storage.core_store_meta_path())?.get(
+        CF_AUTHZ,
+        TABLE_AUTHZ_SCHEMA_ROW,
+        &namespace_schema_tuple_key(tenant_id, namespace)?,
+    )?
+    else {
         return Ok(None);
     };
-    let object_ref = decode_core_object_ref_target(&ref_value.target)?;
-    let bytes = store.get_blob(GetBlob { object_ref }).await?;
-    let record = serde_json::from_slice(&bytes).with_context(|| format!("decode {ref_name}"))?;
-    Ok(Some((ref_value, record)))
+    let record = decode_namespace_schema_row_payload(storage, tenant_id, &bytes)
+        .await
+        .with_context(|| format!("decode authorization namespace schema {namespace}"))?;
+    validate_record(&record, tenant_id, namespace)?;
+    Ok(Some(record))
 }
 
-fn namespace_schema_ref_prefix(tenant_id: i64) -> Result<String> {
+async fn decode_namespace_schema_row_payload(
+    storage: &Storage,
+    tenant_id: i64,
+    row_payload: &[u8],
+) -> Result<AuthzNamespaceSchemaRecord> {
+    let record_payload = decode_authz_payload_row(
+        storage,
+        tenant_id,
+        row_payload,
+        AUTHZ_NAMESPACE_SCHEMA_ROW_KIND,
+    )
+    .await?;
+    decode_namespace_schema_record(&record_payload)
+}
+
+fn encode_namespace_schema_record(record: &AuthzNamespaceSchemaRecord) -> Result<Vec<u8>> {
+    Ok(encode_deterministic_proto(&namespace_record_to_proto(
+        record,
+    )))
+}
+
+fn decode_namespace_schema_record(bytes: &[u8]) -> Result<AuthzNamespaceSchemaRecord> {
+    namespace_record_from_proto(
+        decode_deterministic_proto::<AuthzNamespaceSchemaRecordProto>(
+            bytes,
+            "authorization namespace schema record",
+        )?,
+    )
+}
+
+fn encode_authz_schema(schema: &AuthzNamespaceSchema) -> Vec<u8> {
+    encode_deterministic_proto(&authz_schema_to_proto(schema))
+}
+
+fn namespace_record_to_proto(
+    record: &AuthzNamespaceSchemaRecord,
+) -> AuthzNamespaceSchemaRecordProto {
+    AuthzNamespaceSchemaRecordProto {
+        common: Some(namespace_record_common(record)),
+        version: u32::from(record.version),
+        tenant_id: record.tenant_id,
+        namespace: record.namespace.clone(),
+        relations: record
+            .relations
+            .iter()
+            .map(relation_record_to_proto)
+            .collect(),
+        schema_json: record.schema_json.clone(),
+        schema_hash: record.schema_hash.clone(),
+        schema_version: record.schema_version,
+        authz_revision: record.authz_revision,
+        applied_by: record.applied_by.clone(),
+        reason: record.reason.clone(),
+        applied_at: record.applied_at.clone(),
+        record_hash: record.record_hash.clone(),
+    }
+}
+
+fn namespace_record_common(
+    record: &AuthzNamespaceSchemaRecord,
+) -> crate::core_store::CoreMetaRowCommonProto {
+    core_meta_committed_row_common(
+        format!("tenant/{}", record.tenant_id),
+        core_meta_root_key_hash(&format!("authz-schema/{}", record.tenant_id)),
+        record.schema_version,
+        record.record_hash.clone(),
+        0,
+    )
+}
+
+fn namespace_record_from_proto(
+    proto: AuthzNamespaceSchemaRecordProto,
+) -> Result<AuthzNamespaceSchemaRecord> {
+    proto
+        .common
+        .as_ref()
+        .ok_or_else(|| anyhow!("authorization namespace schema row missing CoreMeta common"))?;
+    Ok(AuthzNamespaceSchemaRecord {
+        version: u16::try_from(proto.version)
+            .map_err(|_| anyhow!("authorization namespace schema version exceeds u16"))?,
+        tenant_id: proto.tenant_id,
+        namespace: proto.namespace,
+        relations: proto
+            .relations
+            .into_iter()
+            .map(relation_record_from_proto)
+            .collect(),
+        schema_json: proto.schema_json,
+        schema_hash: proto.schema_hash,
+        schema_version: proto.schema_version,
+        authz_revision: proto.authz_revision,
+        applied_by: proto.applied_by,
+        reason: proto.reason,
+        applied_at: proto.applied_at,
+        record_hash: proto.record_hash,
+    })
+}
+
+fn authz_schema_to_proto(schema: &AuthzNamespaceSchema) -> AuthzNamespaceSchemaRecordProto {
+    AuthzNamespaceSchemaRecordProto {
+        common: Some(core_meta_committed_row_common(
+            "system",
+            core_meta_root_key_hash("authz-schema/preview"),
+            schema.schema_version,
+            String::new(),
+            0,
+        )),
+        version: 1,
+        tenant_id: 0,
+        namespace: schema.namespace.clone(),
+        relations: schema
+            .relations
+            .iter()
+            .map(|relation| AuthzRelationSchemaRecordProto {
+                relation: relation.relation.clone(),
+                rules: relation
+                    .rules
+                    .iter()
+                    .map(|rule| AuthzRelationRuleRecordProto {
+                        kind: rule.kind.clone(),
+                        relation: rule.relation.clone(),
+                        tuple_relation: rule.tuple_relation.clone(),
+                        target_relation: rule.target_relation.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        schema_json: schema.schema_json.clone(),
+        schema_hash: String::new(),
+        schema_version: 0,
+        authz_revision: 0,
+        applied_by: String::new(),
+        reason: String::new(),
+        applied_at: String::new(),
+        record_hash: String::new(),
+    }
+}
+
+fn relation_record_to_proto(
+    relation: &AuthzRelationSchemaRecord,
+) -> AuthzRelationSchemaRecordProto {
+    AuthzRelationSchemaRecordProto {
+        relation: relation.relation.clone(),
+        rules: relation.rules.iter().map(rule_record_to_proto).collect(),
+    }
+}
+
+fn relation_record_from_proto(proto: AuthzRelationSchemaRecordProto) -> AuthzRelationSchemaRecord {
+    AuthzRelationSchemaRecord {
+        relation: proto.relation,
+        rules: proto
+            .rules
+            .into_iter()
+            .map(rule_record_from_proto)
+            .collect(),
+    }
+}
+
+fn rule_record_to_proto(rule: &AuthzRelationRuleRecord) -> AuthzRelationRuleRecordProto {
+    AuthzRelationRuleRecordProto {
+        kind: rule.kind.clone(),
+        relation: rule.relation.clone(),
+        tuple_relation: rule.tuple_relation.clone(),
+        target_relation: rule.target_relation.clone(),
+    }
+}
+
+fn rule_record_from_proto(proto: AuthzRelationRuleRecordProto) -> AuthzRelationRuleRecord {
+    AuthzRelationRuleRecord {
+        kind: proto.kind,
+        relation: proto.relation,
+        tuple_relation: proto.tuple_relation,
+        target_relation: proto.target_relation,
+    }
+}
+
+fn namespace_schema_tuple_prefix(tenant_id: i64) -> Result<Vec<u8>> {
     if tenant_id < 0 {
         return Err(anyhow!(
             "authorization schema tenant id must be nonnegative"
         ));
     }
-    Ok(format!(
-        "{AUTHZ_NAMESPACE_SCHEMA_REF_PREFIX}tenant:{tenant_id}:namespace:"
-    ))
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(AUTHZ_NAMESPACE_SCHEMA_ROW_KIND),
+        CoreMetaTuplePart::I64(tenant_id),
+    ])
 }
 
-fn namespace_schema_ref_name(tenant_id: i64, namespace: &str) -> Result<String> {
+fn namespace_schema_tuple_key(tenant_id: i64, namespace: &str) -> Result<Vec<u8>> {
+    if tenant_id < 0 {
+        return Err(anyhow!(
+            "authorization schema tenant id must be nonnegative"
+        ));
+    }
     validate_component(namespace, "namespace")?;
-    Ok(format!(
-        "{}{}",
-        namespace_schema_ref_prefix(tenant_id)?,
-        namespace
-    ))
-}
-
-fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
-    Ok(format!(
-        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
-    ))
-}
-
-fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
-    let encoded = target
-        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
-        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
-    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(AUTHZ_NAMESPACE_SCHEMA_ROW_KIND),
+        CoreMetaTuplePart::I64(tenant_id),
+        CoreMetaTuplePart::Utf8(namespace),
+    ])
 }
 
 impl From<AuthzRelationRule> for AuthzRelationRuleRecord {

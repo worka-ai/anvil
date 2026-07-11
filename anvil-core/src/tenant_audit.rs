@@ -1,8 +1,12 @@
 use crate::{
-    core_store::{AppendStreamRecord, CoreStore, ReadStream},
+    core_store::{
+        AppendStreamRecord, CoreStore, ReadStream, decode_deterministic_proto,
+        encode_deterministic_proto,
+    },
     storage::Storage,
 };
 use anyhow::Result;
+use prost::Message;
 use serde::{Deserialize, Serialize};
 
 pub const TENANT_AUDIT_EVENT_SCHEMA: &str = "anvil.tenant.audit_event.v1";
@@ -20,6 +24,28 @@ pub struct TenantAuditEvent {
     pub details_json: String,
 }
 
+#[derive(Clone, PartialEq, Message)]
+struct TenantAuditEventProto {
+    #[prost(string, tag = "1")]
+    schema: String,
+    #[prost(string, tag = "2")]
+    audit_event_id: String,
+    #[prost(string, tag = "3")]
+    request_id: String,
+    #[prost(int64, tag = "4")]
+    tenant_id: i64,
+    #[prost(string, tag = "5")]
+    principal_id: String,
+    #[prost(string, tag = "6")]
+    resource_id: String,
+    #[prost(string, tag = "7")]
+    action: String,
+    #[prost(string, tag = "8")]
+    created_at: String,
+    #[prost(string, tag = "9")]
+    details_json: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TenantAuditEventFilter<'a> {
     pub principal_id: Option<&'a str>,
@@ -34,7 +60,9 @@ pub async fn append_tenant_audit_event(storage: &Storage, event: &TenantAuditEve
             stream_id: tenant_audit_stream_id(event.tenant_id),
             partition_id: format!("tenant:{}", event.tenant_id),
             record_kind: "tenant_audit_event".to_string(),
-            payload: serde_json::to_vec(event)?,
+            payload: encode_tenant_audit_event(event),
+            content_type: None,
+            user_metadata_json: "{}".to_string(),
             fence: None,
             transaction_id: None,
             idempotency_key: Some(event.audit_event_id.clone()),
@@ -58,7 +86,7 @@ pub async fn list_tenant_audit_events(
         })
         .await?
     {
-        let event: TenantAuditEvent = serde_json::from_slice(&record.payload)?;
+        let event = decode_tenant_audit_event(&record.payload)?;
         if event.tenant_id == tenant_id && matches_filter(&event, &filter) {
             events.push(event);
         }
@@ -113,6 +141,36 @@ pub fn collection_revision<'a>(events: impl IntoIterator<Item = &'a TenantAuditE
 
 fn tenant_audit_stream_id(tenant_id: i64) -> String {
     format!("tenant_audit:{tenant_id}")
+}
+
+fn encode_tenant_audit_event(event: &TenantAuditEvent) -> Vec<u8> {
+    encode_deterministic_proto(&TenantAuditEventProto {
+        schema: event.schema.clone(),
+        audit_event_id: event.audit_event_id.clone(),
+        request_id: event.request_id.clone(),
+        tenant_id: event.tenant_id,
+        principal_id: event.principal_id.clone(),
+        resource_id: event.resource_id.clone(),
+        action: event.action.clone(),
+        created_at: event.created_at.clone(),
+        details_json: event.details_json.clone(),
+    })
+}
+
+fn decode_tenant_audit_event(bytes: &[u8]) -> Result<TenantAuditEvent> {
+    let proto =
+        decode_deterministic_proto::<TenantAuditEventProto>(bytes, "tenant audit event payload")?;
+    Ok(TenantAuditEvent {
+        schema: proto.schema,
+        audit_event_id: proto.audit_event_id,
+        request_id: proto.request_id,
+        tenant_id: proto.tenant_id,
+        principal_id: proto.principal_id,
+        resource_id: proto.resource_id,
+        action: proto.action,
+        created_at: proto.created_at,
+        details_json: proto.details_json,
+    })
 }
 
 fn matches_filter(event: &TenantAuditEvent, filter: &TenantAuditEventFilter<'_>) -> bool {

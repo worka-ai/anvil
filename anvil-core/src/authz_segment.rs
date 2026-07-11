@@ -1,25 +1,41 @@
 use crate::{
     core_store::{
-        CompareAndSwapRef, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
-        WriteLogicalFileRequest, core_object_ref_from_logical_file_manifest,
+        CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
+        core_object_ref_from_logical_file_write,
     },
     formats::{
-        BinaryEnvelopeHeader, BinaryFileFooter, COMMON_FOOTER_LEN, COMMON_HEADER_LEN, FileFamily,
-        Hash32,
+        FileFamily, Hash32,
         authz::{TupleKey, TupleOperation, TupleValue},
-        hash32,
-        segment::{SegmentBody, SegmentRecord},
+        decode_writer_segment, encode_writer_segment_header, hash32, header_field_string,
+        header_field_u64, required_header_string, required_header_u64,
+        segment::SegmentRecord,
+        single_body_range_index,
+        table::{TableRow, WriterBodyTable, decode_writer_body_tables, encode_writer_body_tables},
+        unix_nanos_from_rfc3339,
+        writer::{
+            WriterBuildOutput, WriterFamily, WriterSegmentBuildInput,
+            build_writer_segment_logical_file, canonical_logical_file_id,
+        },
     },
     persistence::AuthzTupleRecord,
     storage::Storage,
+    writer_segment_catalog::{
+        WriterSegmentCatalogRecord, latest_writer_segment_catalog_record,
+        read_writer_segment_catalog_record, write_writer_segment_catalog_record,
+    },
 };
 use anyhow::{Context, Result, anyhow};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
 const AUTHZ_TUPLE_SEGMENT_REF_PREFIX: &str = "authz_tuple_segment:";
-const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
+const AUTHZ_TUPLE_SEGMENT_CATALOG_FAMILY: &str = "authz_tuple";
+const TABLE_AUTHZ_SCHEMA_DESCRIPTOR: u16 = 0x0501;
+const TABLE_AUTHZ_TUPLE: u16 = 0x0502;
+const TABLE_AUTHZ_RELATION_RULE: u16 = 0x0503;
+const TABLE_AUTHZ_USERSET_EDGE: u16 = 0x0504;
+const TABLE_AUTHZ_REVISION_LOG: u16 = 0x0506;
+const TABLE_AUTHZ_LIST_OBJECTS: u16 = 0x0507;
+const TABLE_AUTHZ_LIST_SUBJECTS: u16 = 0x0508;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuthzSegmentHeader {
@@ -80,67 +96,65 @@ async fn write_authz_tuple_segment_inner(
         source_fence_token,
         key_order: "tuple_key_revision".to_string(),
         created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-        codec: "none".to_string(),
+        codec: "writer-body-table-v1".to_string(),
     };
-    let header_json = serde_json::to_vec(&header)?;
-    let envelope = BinaryEnvelopeHeader::new(FileFamily::AuthzTupleSegment, 0, 0, header_json);
-    let encoded_header = envelope.encode();
     let segment_records = segment_records_from_authz_records(records)?;
-    let body = SegmentBody::from_uncompressed_records(&segment_records)?.encode();
+    let body = encode_writer_body_tables(&authz_writer_tables(&segment_records))?;
+    let segment_hash = hash32(&body);
+    let logical_file_id =
+        canonical_logical_file_id(WriterFamily::Authz, generation, &ref_name, &segment_hash);
     let (first_hash, last_hash) = segment_record_hash_bounds(&segment_records);
-    let footer = BinaryFileFooter::new(
-        &encoded_header,
-        &body,
+    let header_proto = encode_authz_header_proto(&logical_file_id, &header);
+    let range_index = single_body_range_index(
+        body.len(),
         segment_records.len() as u64,
         first_hash,
         last_hash,
-    );
-    let file_hash = hex::encode(footer.file_hash);
-
-    let mut bytes = Vec::with_capacity(encoded_header.len() + body.len() + COMMON_FOOTER_LEN);
-    bytes.extend_from_slice(&encoded_header);
-    bytes.extend_from_slice(&body);
-    bytes.extend_from_slice(&footer.encode());
-
+    )?;
+    let built_segment = build_writer_segment_logical_file(WriterSegmentBuildInput {
+        file_family: FileFamily::AuthzTupleSegment,
+        writer_family: WriterFamily::Authz,
+        writer_generation: generation,
+        logical_file_id,
+        header_proto,
+        body,
+        range_index,
+        record_count: segment_records.len() as u64,
+        first_record_hash: first_hash,
+        last_record_hash: last_hash,
+        boundary_values: Vec::new(),
+        mutation_id: format!("authz-tuple-segment:{tenant_id}:{generation}"),
+        region_id: "local".to_string(),
+        pipeline_policy: CorePipelinePolicy::default(),
+        trace_context: CoreTraceContext::default(),
+    })?;
     let store = CoreStore::new(storage.clone()).await?;
-    let manifest = store
-        .write_logical_file(WriteLogicalFileRequest {
-            writer_family: "authz".to_string(),
-            generation,
-            logical_file_id: ref_name.clone(),
-            source: bytes,
-            range_hints: Vec::new(),
-            pipeline_policy: CorePipelinePolicy::default(),
-            trace_context: CoreTraceContext::default(),
-            boundary_values: Vec::new(),
-            mutation_id: format!("authz-tuple-segment:{tenant_id}:{generation}:{file_hash}"),
-            region_id: "local".to_string(),
+    let receipt = store
+        .write_format_build_output(WriterBuildOutput {
+            logical_files: vec![built_segment.logical_file],
+            core_meta_mutations: Vec::new(),
         })
         .await?;
-    let object_ref = core_object_ref_from_logical_file_manifest(&manifest);
-    match store
-        .compare_and_swap_ref(CompareAndSwapRef {
-            ref_name: ref_name.clone(),
-            expected_generation: None,
-            expected_target: None,
-            require_absent: true,
-            require_present: false,
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-            new_target: encode_core_object_ref_target(&object_ref)?,
-            transaction_id: None,
-        })
-        .await
-    {
-        Ok(_) => {}
-        Err(error) => {
-            if store.read_ref(&ref_name).await?.is_some() {
-                return Ok(ref_name);
-            }
-            return Err(error);
-        }
-    }
+    let written = receipt
+        .written_logical_files
+        .first()
+        .ok_or_else(|| anyhow!("CoreFormatWriter returned no authz logical file"))?;
+    let object_ref = core_object_ref_from_logical_file_write(written);
+    write_writer_segment_catalog_record(
+        storage,
+        &WriterSegmentCatalogRecord {
+            family: AUTHZ_TUPLE_SEGMENT_CATALOG_FAMILY.to_string(),
+            scope: authz_tuple_segment_scope(tenant_id)?,
+            segment_ref: ref_name.clone(),
+            core_object_ref_target: encode_core_object_ref_target(&object_ref)?,
+            segment_hash: hex::encode(segment_hash),
+            segment_length: written.manifest.logical_size,
+            generation,
+            source_cursor: generation,
+            created_at_unix_nanos: unix_nanos_from_rfc3339(&header.created_at),
+        },
+    )
+    .await?;
     Ok(ref_name)
 }
 
@@ -151,62 +165,77 @@ pub async fn read_latest_authz_tuple_segment(
     let Some(segment_ref) = latest_authz_tuple_segment_ref(storage, tenant_id).await? else {
         return Ok(None);
     };
+    let record = read_authz_tuple_segment_catalog_record(storage, tenant_id, &segment_ref)?
+        .ok_or_else(|| anyhow!("authz tuple segment catalog row is missing"))?;
     let store = CoreStore::new(storage.clone()).await?;
-    let ref_value = store
-        .read_ref(&segment_ref)
-        .await?
-        .ok_or_else(|| anyhow!("authz tuple segment ref is missing"))?;
     let bytes = store
         .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+            object_ref: decode_core_object_ref_target(&record.core_object_ref_target)?,
         })
         .await?;
     Ok(Some(decode_authz_tuple_segment(&bytes)?))
 }
 
 pub fn decode_authz_tuple_segment(bytes: &[u8]) -> Result<DecodedAuthzSegment> {
-    let envelope = BinaryEnvelopeHeader::decode(bytes)?;
-    if envelope.family != FileFamily::AuthzTupleSegment {
-        return Err(anyhow!("authz tuple segment file family mismatch"));
-    }
-    if bytes.len() < COMMON_FOOTER_LEN {
-        return Err(anyhow!("authz tuple segment is shorter than footer"));
-    }
-    let header_end = COMMON_HEADER_LEN
-        .checked_add(envelope.header_json.len())
-        .ok_or_else(|| anyhow!("authz tuple segment header length overflow"))?;
-    let footer_start = bytes
-        .len()
-        .checked_sub(COMMON_FOOTER_LEN)
-        .ok_or_else(|| anyhow!("authz tuple segment footer length overflow"))?;
-    if footer_start < header_end {
-        return Err(anyhow!("authz tuple segment body overlaps header"));
-    }
-    let encoded_header = &bytes[..header_end];
-    let body_bytes = &bytes[header_end..footer_start];
-    let footer = BinaryFileFooter::decode(&bytes[footer_start..])?;
-    footer.verify(encoded_header, body_bytes)?;
-    let header: AuthzSegmentHeader = serde_json::from_slice(&envelope.header_json)?;
-    let body = SegmentBody::decode(body_bytes)?;
+    let segment = decode_writer_segment(bytes, FileFamily::AuthzTupleSegment)?;
+    let header = decode_authz_header_proto(&segment.header)?;
     let mut records = Vec::new();
-    for block in &body.data_blocks {
-        for record in block.decode_uncompressed_records()? {
-            records.push(authz_record_from_segment_record(record)?);
+    for table in decode_writer_body_tables(segment.body)? {
+        for row in table.rows {
+            records.push(authz_record_from_segment_record(SegmentRecord::new(
+                row.key, row.value,
+            ))?);
         }
     }
     Ok(DecodedAuthzSegment { header, records })
+}
+
+fn encode_authz_header_proto(logical_file_id: &str, header: &AuthzSegmentHeader) -> Vec<u8> {
+    encode_writer_segment_header(
+        "anvil.authz.tuple_segment_header.v1",
+        logical_file_id,
+        FileFamily::AuthzTupleSegment,
+        header.generation,
+        None,
+        None,
+        unix_nanos_from_rfc3339(&header.created_at),
+        vec![
+            header_field_string("tenant_id", header.tenant_id.clone()),
+            header_field_string("partition_family", header.partition_family.clone()),
+            header_field_string("partition_id", header.partition_id.clone()),
+            header_field_u64("source_fence_token", header.source_fence_token),
+            header_field_string("key_order", header.key_order.clone()),
+            header_field_string("created_at", header.created_at.clone()),
+            header_field_string("codec", header.codec.clone()),
+        ],
+    )
+}
+
+fn decode_authz_header_proto(
+    header: &crate::formats::WriterSegmentHeaderProto,
+) -> Result<AuthzSegmentHeader> {
+    Ok(AuthzSegmentHeader {
+        tenant_id: required_header_string(header, "tenant_id")?,
+        partition_family: required_header_string(header, "partition_family")?,
+        partition_id: required_header_string(header, "partition_id")?,
+        generation: header.writer_generation,
+        source_fence_token: required_header_u64(header, "source_fence_token")?,
+        key_order: required_header_string(header, "key_order")?,
+        created_at: required_header_string(header, "created_at")?,
+        codec: required_header_string(header, "codec")?,
+    })
 }
 
 async fn latest_authz_tuple_segment_ref(
     storage: &Storage,
     tenant_id: i64,
 ) -> Result<Option<String>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let mut refs = store
-        .list_ref_names(&authz_tuple_segment_ref_prefix(tenant_id)?)
-        .await?;
-    refs.sort_by_key(|ref_name| segment_generation_from_ref(ref_name).unwrap_or(0));
-    Ok(refs.pop())
+    Ok(latest_writer_segment_catalog_record(
+        storage,
+        AUTHZ_TUPLE_SEGMENT_CATALOG_FAMILY,
+        &authz_tuple_segment_scope(tenant_id)?,
+    )?
+    .map(|record| record.segment_ref))
 }
 
 fn authz_tuple_segment_ref_prefix(tenant_id: i64) -> Result<String> {
@@ -225,22 +254,32 @@ fn authz_tuple_segment_ref_name(tenant_id: i64, generation: u64) -> Result<Strin
     ))
 }
 
-fn segment_generation_from_ref(ref_name: &str) -> Option<u64> {
-    ref_name.rsplit_once(":generation:")?.1.parse().ok()
+fn authz_tuple_segment_scope(tenant_id: i64) -> Result<String> {
+    if tenant_id < 0 {
+        return Err(anyhow!("authz tuple segment tenant id must be nonnegative"));
+    }
+    Ok(format!("tenant/{tenant_id}"))
+}
+
+fn read_authz_tuple_segment_catalog_record(
+    storage: &Storage,
+    tenant_id: i64,
+    segment_ref: &str,
+) -> Result<Option<WriterSegmentCatalogRecord>> {
+    read_writer_segment_catalog_record(
+        storage,
+        AUTHZ_TUPLE_SEGMENT_CATALOG_FAMILY,
+        &authz_tuple_segment_scope(tenant_id)?,
+        segment_ref,
+    )
 }
 
 fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
-    Ok(format!(
-        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
-    ))
+    crate::core_store::encode_core_object_ref_target(object_ref)
 }
 
 fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
-    let encoded = target
-        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
-        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
-    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
+    crate::core_store::decode_core_object_ref_target(target)
 }
 
 fn segment_records_from_authz_records(records: &[AuthzTupleRecord]) -> Result<Vec<SegmentRecord>> {
@@ -253,6 +292,32 @@ fn segment_records_from_authz_records(records: &[AuthzTupleRecord]) -> Result<Ve
     }
     output.sort_by(|left, right| left.key.cmp(&right.key));
     Ok(output)
+}
+
+fn authz_writer_tables(records: &[SegmentRecord]) -> Vec<WriterBodyTable> {
+    let tuple_rows = records
+        .iter()
+        .map(|record| TableRow {
+            key: record.key.clone(),
+            value: record.value.clone(),
+        })
+        .collect::<Vec<_>>();
+    [
+        (TABLE_AUTHZ_SCHEMA_DESCRIPTOR, Vec::new()),
+        (TABLE_AUTHZ_TUPLE, tuple_rows),
+        (TABLE_AUTHZ_RELATION_RULE, Vec::new()),
+        (TABLE_AUTHZ_USERSET_EDGE, Vec::new()),
+        (TABLE_AUTHZ_REVISION_LOG, Vec::new()),
+        (TABLE_AUTHZ_LIST_OBJECTS, Vec::new()),
+        (TABLE_AUTHZ_LIST_SUBJECTS, Vec::new()),
+    ]
+    .into_iter()
+    .map(|(table_id, rows)| WriterBodyTable {
+        table_id,
+        row_type_id: table_id,
+        rows,
+    })
+    .collect()
 }
 
 fn authz_record_from_segment_record(record: SegmentRecord) -> Result<AuthzTupleRecord> {

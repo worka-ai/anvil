@@ -118,6 +118,7 @@ pub async fn request_id_mw(
     let started_at = Instant::now();
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
+    let tenant_present = req.headers().contains_key("authorization");
     let plane = if path.starts_with("/anvil.AdminService/") {
         "admin"
     } else if path.starts_with("/anvil.") {
@@ -137,17 +138,34 @@ pub async fn request_id_mw(
     ];
     let mut response = crate::perf::with_context(context, next.run(req)).await;
     let status = response.status().as_u16().to_string();
-    crate::perf::record_duration(
-        "anvil_request",
-        &[
-            ("request_id", request_id.as_str()),
-            ("plane", plane),
-            ("method", method.as_str()),
-            ("path", path.as_str()),
-            ("status", status.as_str()),
-        ],
+    crate::perf::record_request_duration(
+        plane,
+        method.as_str(),
+        path.as_str(),
+        status.as_str(),
+        tenant_present,
+        false,
         started_at.elapsed(),
     );
+    crate::perf::record_trace_event(crate::perf::TraceEvent {
+        trace_id: &request_id,
+        span_id: "api-request",
+        parent_span_id: None,
+        request_id: Some(&request_id),
+        component: "api",
+        operation: "api.request",
+        writer_family: None,
+        bucket_hash: None,
+        boundary_schema_generation: None,
+        duration: started_at.elapsed(),
+        bytes_in: 0,
+        bytes_out: 0,
+        fsync_count: 0,
+        status: status.as_str(),
+    });
+    if response.status().is_client_error() || response.status().is_server_error() {
+        crate::perf::record_protocol_errors_total(path.as_str(), status.as_str());
+    }
     if let Ok(header_value) = HeaderValue::from_str(&request_id) {
         response
             .headers_mut()
